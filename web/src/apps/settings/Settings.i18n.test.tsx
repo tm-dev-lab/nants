@@ -210,7 +210,25 @@ describe("Configurações em en", () => {
 
   it("Máquina: diagnóstico pelo code neutro (detalhe, partes em GB, correção), pendência e Acesso pela rede", async () => {
     reachEnvironment.pageHostname = () => "localhost";
-    await open("en", { readiness: readiness() });
+    const view = await open("en", { readiness: readiness() });
+    view.server.reply("GET", /^\/api\/config\/network$/, () => ({
+      status: 200,
+      body: {
+        env: "wsl_nat",
+        saved_lan: false,
+        lan: false,
+        mode_source: "saved",
+        port: 3001,
+        lan_port: 3000,
+        view_ports: { start: 3001, end: 3010 },
+        windows_redirect: "yes",
+        windows_redirect_target: "this_wsl",
+        coherence: "still_redirected",
+        firewall_rule: "yes",
+        restart_required: false,
+        restart_command: "nants",
+      },
+    }));
     act(() => {
       appStore.setState((s) => (s.config === null ? s : { config: { ...s.config, network: { nants_port: 3000, lan_view_ports: { start: 3001, end: 3010 }, wsl: true } } }));
     });
@@ -230,10 +248,15 @@ describe("Configurações em en", () => {
     expect(within(w).getByRole("button", { name: "Check again" })).toBeTruthy();
     const network = w.querySelector("[data-network-section]") as HTMLElement;
     expect(network.querySelector("[data-network-address]")?.textContent).toBe("http://<IP of this computer>:3000");
-    expect(network.querySelector("[data-network-state]")?.textContent).toBe("Pending");
-    expect(within(network).getByRole("button", { name: "Mark as allowed" })).toBeTruthy();
-    expect(network.querySelector("summary")?.textContent).toBe("How to allow it on Windows (WSL)");
-    expect(within(network).getByLabelText("PowerShell script")).toBeTruthy();
+    // WSL com o Windows conferido: o estado real, sem a marcação manual.
+    expect(network.querySelector("[data-network-state]")?.textContent).toBe("Allowed on Windows");
+    expect(within(network).queryByRole("button", { name: "Mark as allowed" })).toBeNull();
+    expect(within(network).getByRole("switch", { name: "Local network access" }).getAttribute("aria-checked")).toBe("false");
+    expect(network.querySelector("[data-network-coherence]")?.textContent).toBe(
+      "Windows still redirects the ports: run the undo script. That is why Nants may be on a port other than 3000.",
+    );
+    expect([...network.querySelectorAll("summary")].map((el) => el.textContent)).toEqual(["Script to enable it on Windows", "Script to undo it on Windows"]);
+    expect(within(network).getByLabelText("PowerShell script: Script to undo it on Windows")).toBeTruthy();
     expect(w.querySelector("[data-nants-version]")?.textContent).toBe("Nants version 0.1.0");
     expectNoPortuguese();
   });

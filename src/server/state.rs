@@ -192,6 +192,10 @@ pub struct AppState {
     langs: Arc<Mutex<std::collections::HashMap<String, SharedLang>>>,
     /// Último idioma informado em qualquer requisição: o inicial de um projeto ainda sem idioma.
     last_lang: SharedLang,
+    /// Conferência do Windows para Configurações > Acesso pela rede (spec 111; injetável).
+    net_probe: super::lan::NetProbe,
+    /// Modo de rede desta execução (spec 111).
+    network_run: super::lan::NetworkRun,
     /// Pausas de teste (vazio em produção).
     #[cfg(test)]
     gates: Arc<Mutex<Vec<PauseGate>>>,
@@ -244,9 +248,39 @@ impl AppState {
             ui_state_lock: Arc::new(tokio::sync::Mutex::new(())),
             langs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             last_lang: SharedLang::default(),
+            #[cfg(not(test))]
+            net_probe: super::lan::NetProbe::real(),
+            // Testes nunca consultam o Windows de verdade: fora do WSL e sem programas.
+            #[cfg(test)]
+            net_probe: super::lan::NetProbe {
+                tools: super::portproxy::WinTools { run: Arc::new(|_: &str, _: &[&str]| None), exists: Arc::new(|_: &str| false) },
+                wsl: false,
+                local_ips: Some(Vec::new()),
+            },
+            network_run: super::lan::NetworkRun { lan: false, source: super::lan::ModeSource::Default, requested_port: port },
             #[cfg(test)]
             gates: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Conferência do Windows usada por `GET /api/config/network` (testes injetam uma falsa).
+    pub fn with_net_probe(mut self, probe: super::lan::NetProbe) -> Self {
+        self.net_probe = probe;
+        self
+    }
+
+    pub fn net_probe(&self) -> &super::lan::NetProbe {
+        &self.net_probe
+    }
+
+    /// Modo de rede desta execução (spec 111), decidido ao subir.
+    pub fn with_network_run(mut self, run: super::lan::NetworkRun) -> Self {
+        self.network_run = run;
+        self
+    }
+
+    pub fn network_run(&self) -> super::lan::NetworkRun {
+        self.network_run
     }
 
     /// Idioma ativo do projeto (spec 102), compartilhado: quem guarda o handle (agentes de uma

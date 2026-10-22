@@ -168,6 +168,10 @@ pub struct ServerConfig {
     /// seguintes à porta efetiva do Nants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_view_ports: Option<LanViewPortsConfig>,
+    /// Acesso pela rede local (spec 111), ligado e desligado em Configurações > Acesso pela rede.
+    /// Ausente: a pessoa nunca escolheu (o `nants` pode adotar o que o Windows já tem).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -176,6 +180,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
             lan_view_ports: None,
+            lan: None,
         }
     }
 }
@@ -483,5 +488,18 @@ mod price_source_tests {
         let fora = |n| AgentConfig { max_steps: Some(n), ..AgentConfig::default() };
         assert_eq!(fora(3).max_steps_or(150), 10);
         assert_eq!(fora(5000).max_steps_or(150), 1000);
+    }
+
+    #[test]
+    fn server_lan_is_absent_until_chosen_and_round_trips() {
+        let cfg: Config = toml::from_str("[server]\nport = 3000\n").expect("sem lan");
+        assert_eq!(cfg.server.lan, None, "ausente = nunca escolhida");
+        assert!(!toml::to_string(&cfg).expect("ser").contains("lan ="));
+        for value in [true, false] {
+            let cfg: Config = toml::from_str(&format!("[server]\nlan = {value}\n")).expect("com lan");
+            assert_eq!(cfg.server.lan, Some(value));
+            let back: Config = toml::from_str(&toml::to_string(&cfg).expect("ser")).expect("de");
+            assert_eq!(back.server.lan, Some(value));
+        }
     }
 }

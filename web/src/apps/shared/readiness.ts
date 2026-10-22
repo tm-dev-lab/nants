@@ -85,6 +85,7 @@ const MACHINE_LABEL_KEYS: Readonly<Record<string, MessageKey>> = {
   disk: "prereq.machine.disk",
   wsl: "prereq.machine.wsl",
   playwright_images: "prereq.machine.playwright_images",
+  windows_port_redirect: "prereq.machine.windows_port_redirect",
 };
 
 /** Comando de correção de cada item da máquina pelo `id` estável (o mesmo do `nants doctor`). */
@@ -95,6 +96,7 @@ const MACHINE_FIX_KEYS: Readonly<Record<string, MessageKey>> = {
   docker_permission: "prereq.fix.docker_permission",
   docker_compose: "prereq.fix.docker_compose",
   disk: "prereq.fix.disk",
+  windows_port_redirect: "prereq.fix.windows_port_redirect",
 };
 
 /** Rótulo de cada `code` neutro do `/api/readiness` (spec 102 T05). */

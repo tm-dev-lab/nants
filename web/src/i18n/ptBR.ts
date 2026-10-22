@@ -1110,6 +1110,7 @@ export const ptBR = {
   "prereq.machine.disk": "Espaço em disco",
   "prereq.machine.wsl": "WSL",
   "prereq.machine.playwright_images": "Imagens do Playwright",
+  "prereq.machine.windows_port_redirect": "Acesso pela rede local",
   "prereq.fix.git": "Instale o Git: sudo apt install git (Debian/Ubuntu/WSL). Depois recarregue esta tela.",
   "prereq.fix.docker_cli":
     "Instale o Docker Engine (https://docs.docker.com/engine/install/) ou, no Windows, o Docker Desktop com a integração WSL ligada (Settings > Resources > WSL integration). O Nants não instala o Docker.",
@@ -1119,6 +1120,8 @@ export const ptBR = {
     "Adicione seu usuário ao grupo docker: sudo usermod -aG docker $USER e reabra a sessão (feche e abra o terminal; no WSL, rode wsl --shutdown no Windows).",
   "prereq.fix.docker_compose": "Instale o plugin Compose v2: sudo apt install docker-compose-plugin (ou atualize o Docker Desktop).",
   "prereq.fix.disk": "Libere espaço em disco: o Nants precisa de pelo menos 5 GB livres para as imagens Docker e os projetos.",
+  "prereq.fix.windows_port_redirect":
+    "Abra Configurações > Acesso pela rede: ligue ou desligue o acesso pela rede local e rode o script indicado ali (ligar ou desfazer) no PowerShell como administrador.",
   "prereq.detail.git_missing": "git não encontrado",
   "prereq.detail.docker_missing": "docker não encontrado",
   "prereq.detail.depends_on_cli": "depende do Docker CLI",
@@ -1138,6 +1141,30 @@ export const ptBR = {
   "prereq.detail.playwright_list_failed": "não foi possível listar as imagens. O primeiro teste de navegador de um projeto baixa cerca de 2 GB",
   "prereq.detail.playwright_none": "nenhuma baixada ainda: o primeiro teste de navegador de um projeto baixa cerca de 2 GB",
   "prereq.detail.playwright_some": "já baixadas: {tags}. Projetos com outra versão baixam cerca de 2 GB no primeiro teste de navegador",
+  "prereq.detail.env_wsl_nat":
+    "WSL no modo de rede NAT (o padrão); o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+  "prereq.detail.env_wsl_mirrored":
+    "WSL no modo de rede espelhado; o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+  "prereq.detail.env_wsl_unknown":
+    "WSL (não foi possível conferir o modo de rede; tratado como NAT); o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+  "prereq.detail.windows_redirect_on":
+    "o Windows está redirecionando a porta {port} para o WSL (acesso pela rede configurado antes), mas o acesso pela rede local está desligado: no modo local, o navegador não abre a página nessa porta e o nants usa outra. Ligue o acesso pela rede local ou desfaça o redirecionamento",
+  "prereq.detail.windows_redirect_off": "acesso pela rede local desligado e o Windows não redireciona a porta {port}",
+  "prereq.detail.windows_redirect_unknown": "não foi possível conferir pelo netsh.exe do Windows",
+  "prereq.detail.firewall_unknown": "não foi possível conferir a regra de firewall pelo PowerShell do Windows",
+  "prereq.detail.lan_on_ok": "acesso pela rede local ligado e o Windows configurado para a porta {port}",
+  "prereq.detail.lan_on_mirrored_ok": "acesso pela rede local ligado e a regra de firewall Nants presente no Windows (modo espelhado, porta {port})",
+  "prereq.detail.lan_on_no_redirect":
+    "acesso pela rede local ligado, mas o Windows não redireciona a porta {port} para o WSL: outros aparelhos não alcançam o Nants. Rode o script",
+  "prereq.detail.lan_on_other_target":
+    "acesso pela rede local ligado, mas o Windows redireciona a porta {port} para outro endereço (o IP do WSL muda quando o Windows reinicia). Rode o script de novo",
+  "prereq.detail.lan_on_no_firewall":
+    "acesso pela rede local ligado, mas falta a regra de firewall Nants no Windows: outros aparelhos não alcançam a porta {port}. Rode o script",
+  "prereq.detail.lan_will_adopt":
+    "o Windows já redireciona a porta {port} para este WSL e tem a regra de firewall Nants: o próximo início do nants liga o acesso pela rede local",
+  "prereq.detail.lan_linux_on":
+    "ligado: o Nants escuta na rede local (porta {port}); se outro aparelho não abrir, libere a porta no firewall do Linux",
+  "prereq.detail.lan_linux_off": "desligado: o Nants só abre neste computador; para ligar, use Configurações > Acesso pela rede",
 
   // Mensagens fixas do servidor (campo `error`), pelo texto pt-BR conhecido.
   "serverMessage.attachmentInvalid": "imagem anexada inválida ou inexistente; anexe de novo",
@@ -1358,7 +1385,6 @@ export const ptBR = {
   "settings.network.state": "Estado",
   "settings.network.thisComputer": "<IP deste computador>",
   "settings.network.script": "Script do PowerShell",
-  "settings.network.wslTitle": "Como liberar no Windows (WSL)",
   "settings.network.wslIntro":
     "Rode no PowerShell como administrador. O script refaz o encaminhamento da porta do Nants e de cada porta da faixa e cria uma regra no firewall; pode rodar quantas vezes quiser. A liberação vale só para aparelhos da rede local, com a rede marcada como privada no Windows.",
   "settings.network.wslRestart": "O IP do WSL muda quando o Windows reinicia: depois de reiniciar, basta rodar o script de novo.",
@@ -1366,6 +1392,33 @@ export const ptBR = {
     "Se outro aparelho não abrir, o Windows provavelmente trata a rede como pública. Para mudar: Configurações do Windows, Rede e Internet, propriedades da rede, Rede privada.",
   "settings.network.wslMirrored":
     "Alternativa: a rede espelhada do WSL (networkingMode=mirrored no arquivo .wslconfig) dispensa o encaminhamento de portas.",
+  "settings.network.lanLabel": "Acesso pela rede local",
+  "settings.network.lanHint": "Quando ligado, outros aparelhos da rede, como o celular, abrem o Nants.",
+  "settings.network.loading": "Conferindo a rede e o Windows.",
+  "settings.network.loadFailed": "Não foi possível ler o estado da rede agora.",
+  "settings.network.saveFailed": "Não foi possível salvar: {message}",
+  "settings.network.nextStart": "Vale a partir do próximo início. Para reiniciar:",
+  "settings.network.restartTail": "no terminal e depois",
+  "settings.network.savedNow": "Salvo. Já vale nesta execução.",
+  "settings.network.runOn": "Nesta execução, o Nants está na rede local.",
+  "settings.network.runOff": "Nesta execução, o Nants abre só neste computador.",
+  "settings.network.fromFlag": "O modo desta execução veio do --lan, que não fica salvo.",
+  "settings.network.missingScript": "Falta rodar o script de ligar no Windows.",
+  "settings.network.missingFirewall": "Falta a regra de firewall Nants no Windows: rode o script de ligar.",
+  "settings.network.otherTarget": "O Windows redireciona a porta para outro endereço (o IP do WSL muda quando o Windows reinicia): rode o script de ligar de novo.",
+  "settings.network.willAdopt": "O Windows já está configurado para este WSL: o próximo início liga o acesso pela rede local.",
+  "settings.network.stillRedirected": "O Windows ainda redireciona as portas: rode o script de desfazer. Por isso o Nants pode estar numa porta diferente da {port}.",
+  "settings.network.linuxHint": "Se houver firewall no Linux, libere as portas {ports}.",
+  "settings.network.linuxHintAbove": "Se houver firewall no Linux, libere a porta do Nants e as portas de visualização acima.",
+  "settings.network.windowsReleased": "Liberada no Windows",
+  "settings.network.windowsPending": "Pendente no Windows",
+  "settings.network.enableTitle": "Script para ligar no Windows",
+  "settings.network.undoTitle": "Script para desfazer no Windows",
+  "settings.network.undoIntro": "Rode no PowerShell como administrador. Remove o redirecionamento das portas e a regra Nants e, no fim, mostra o que sobrou. Pode rodar quantas vezes quiser.",
+  "settings.network.mirroredIntro": "WSL no modo espelhado: só a regra de firewall do Windows, sem redirecionamento de portas.",
+  "settings.network.mirroredEnableIntro": "Rode no PowerShell como administrador. Cria a regra de firewall Nants, só para a rede local; pode rodar quantas vezes quiser.",
+  "settings.network.mirroredUndoIntro": "Rode no PowerShell como administrador. Remove a regra de firewall Nants.",
+  "settings.network.unknownNote": "Não deu para conferir o modo de rede do WSL. No modo espelhado, só a parte do firewall é necessária.",
 
   // Janela Projeto.
   "project.copyPath": "Copiar o caminho da pasta",
@@ -1442,6 +1495,7 @@ export const ptBR = {
   "setup.status.ok": "ok",
   "setup.status.fail": "com problema",
   "setup.status.info": "informativo",
+  "setup.status.warn": "atenção",
   "setup.subtitle.checking": "Verificando",
   "setup.subtitle.ready": "Tudo pronto",
   "setup.subtitle.pending.one": "{count} etapa pendente",

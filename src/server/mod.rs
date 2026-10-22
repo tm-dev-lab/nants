@@ -25,12 +25,14 @@ pub mod file_explorer;
 pub mod fs_browse;
 pub mod image_gen;
 pub mod judge;
+pub mod lan;
 pub mod lang;
 pub mod live_activity;
 pub mod models_api;
 pub mod netinfo;
 pub mod plan_changes;
 pub mod plan_review;
+pub mod portproxy;
 pub mod price_catalog;
 pub mod prereqs;
 pub mod projects;
@@ -69,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/pricing/estimate", get(config_api::get_estimate))
         .route("/api/config/pricing/autofill", post(config_api::post_autofill))
         .route("/api/config/projects-root", put(config_api::put_projects_root))
+        .route("/api/config/network", get(lan::get_network).put(lan::put_network))
         .route("/api/projects/:id/usage", get(usage::get_usage))
         .route("/api/projects/:id/specs/:spec/budget", put(usage::put_budget))
         .route(

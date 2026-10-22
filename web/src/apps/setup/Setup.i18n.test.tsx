@@ -76,10 +76,10 @@ const DIAGNOSIS: PrereqItem[] = [
   { id: "futuro", label: "Item futuro", ok: true, detail: "detalhe do servidor", detail_code: "nao_existe", detail_params: {} },
 ];
 
-async function open(lang: Lang) {
+async function open(lang: Lang, diagnosis: PrereqItem[] = DIAGNOSIS) {
   setLanguage(lang, { persist: false });
   const view = await renderShell({ projects: [], readiness: readiness() });
-  view.server.reply("GET", /^\/api\/system\/prereqs$/, () => ({ status: 200, body: DIAGNOSIS }));
+  view.server.reply("GET", /^\/api\/system\/prereqs$/, () => ({ status: 200, body: diagnosis }));
   // Relê o diagnóstico com a resposta acima (a janela abriu sozinha antes do `reply`).
   await act(async () => {
     fireEvent.click(within(win(lang)).getByRole("button", { name: lang === "en" ? /^Connection/ : /^Conexão/ }));
@@ -166,6 +166,48 @@ describe("Primeiros passos em en", () => {
     const dialog = screen.getByRole("dialog", { name: "New project" });
     expect(within(dialog).getByLabelText("Project name").getAttribute("placeholder")).toBe("e.g.: Corner shop");
     expectNoPortuguese();
+  });
+
+  it("Sua máquina: ambiente e Acesso pela rede local vindos do servidor, com o aviso em âmbar (111/T03)", async () => {
+    const items: PrereqItem[] = [
+      { id: "git", label: "Git", ok: true, version: "git version 2.43.0" },
+      { id: "wsl", label: "WSL", ok: true, info: true, detail: "WSL no modo de rede NAT", detail_code: "env_wsl_nat", detail_params: {} },
+      {
+        id: "windows_port_redirect",
+        label: "Acesso pela rede local",
+        ok: true,
+        warn: true,
+        detail: "acesso pela rede local ligado, mas",
+        detail_code: "lan_on_no_redirect",
+        detail_params: { port: "3000" },
+        fix: "Abra Configurações > Acesso pela rede",
+      },
+      { id: "playwright_images", label: "Imagens do Playwright", ok: true, info: true, detail: "nenhuma", detail_code: "playwright_none", detail_params: {} },
+    ];
+    await open("en", items);
+    const list = within(win()).getByRole("list", { name: "Machine diagnosis" });
+    const row = (id: string): HTMLElement => list.querySelector(`[data-prereq='${id}']`) as HTMLElement;
+    expect(row("wsl").textContent).toContain("WSL in NAT networking mode (the default)");
+    const lan = row("windows_port_redirect");
+    expect(lan.getAttribute("data-status")).toBe("warn");
+    expect(lan.textContent).toContain("Local network access: attention");
+    expect(lan.textContent).toContain("local network access is on, but Windows does not redirect port 3000 to WSL");
+    expect(lan.querySelector("code")?.textContent).toMatch(/^Open Settings > Network access/);
+    expect(lan.querySelector("[data-status='warn']")).not.toBeNull();
+    expectNoPortuguese();
+    cleanup();
+
+    await open("pt-BR", [
+      { id: "wsl", label: "WSL", ok: true, info: true, detail: "x", detail_code: "env_wsl_mirrored", detail_params: {} },
+      { id: "windows_port_redirect", label: "Acesso pela rede local", ok: true, detail: "x", detail_code: "lan_on_mirrored_ok", detail_params: { port: "3000" } },
+    ]);
+    const w = screen.getByRole("region", { name: "Primeiros passos" });
+    const ptRow = (id: string): HTMLElement => w.querySelector(`[data-prereq='${id}']`) as HTMLElement;
+    expect(ptRow("wsl").textContent).toContain("WSL no modo de rede espelhado");
+    expect(ptRow("windows_port_redirect").getAttribute("data-status")).toBe("ok");
+    expect(ptRow("windows_port_redirect").textContent).toContain("Acesso pela rede local");
+    expect(ptRow("windows_port_redirect").textContent).toContain("regra de firewall Nants presente no Windows (modo espelhado, porta 3000)");
+    expect(ptRow("windows_port_redirect").querySelector("code")).toBeNull();
   });
 
   it("subtítulo da janela: verificando, etapas pendentes e tudo pronto", () => {

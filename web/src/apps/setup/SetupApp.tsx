@@ -77,11 +77,11 @@ function MachineDiagnosis({ load, fixShownAbove }: { load: DiagnosisLoad; fixSho
         const status = diagnosisStatus(item);
         const detail = item.version !== undefined && item.version !== "" ? item.version : prereqDetail(item);
         const label = prereqLabel(item);
-        const fix = item.ok || fixShownAbove.has(item.id) ? undefined : prereqFix(item);
+        const fix = (item.ok && status !== "warn") || fixShownAbove.has(item.id) ? undefined : prereqFix(item);
         return (
           <li key={item.id} className="nd-prereq" data-prereq={item.id} data-status={status} data-ok={item.ok ? "true" : "false"}>
             <span className="nd-row">
-              <span className="nd-prereq-mark" data-ok={item.ok ? "true" : "false"}>
+              <span className="nd-prereq-mark" data-ok={item.ok ? "true" : "false"} data-status={status}>
                 <Icon name={status === "ok" ? "check" : status === "info" ? "info" : "alert"} size={14} />
               </span>
               <span className="nd-strong">{label}</span>

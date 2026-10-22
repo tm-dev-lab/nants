@@ -19,6 +19,7 @@ import type {
   ChatReply,
   ConfigView,
   NetworkView,
+  NetworkSaveResult,
   ModelPricing,
   SpecBudget,
   UsageView,
@@ -450,6 +451,20 @@ export function getConfig(opts?: RequestOptions): Promise<ApiResult<ConfigView>>
   return request<ConfigView>({ method: "GET", path: "/api/config", timeoutMs: opts?.timeoutMs }).then(
     (r) => asObject<ConfigView>(r),
   );
+}
+
+/** GET /api/config/network (spec 111): validado por `parseNetworkConfig` em quem exibe. */
+export function getNetworkConfig(opts?: RequestOptions): Promise<ApiResult<unknown>> {
+  return request<unknown>({ method: "GET", path: "/api/config/network", timeoutMs: opts?.timeoutMs }).then((r) => asObject<unknown>(r));
+}
+
+/** PUT /api/config/network `{lan}`: grava a opção salva; vale a partir do próximo início. */
+export function putNetworkConfig(lan: boolean): Promise<ApiResult<NetworkSaveResult>> {
+  return request<NetworkSaveResult>({
+    method: "PUT",
+    path: "/api/config/network",
+    body: JSON.stringify({ lan }),
+  }).then((r) => asObject<NetworkSaveResult>(r));
 }
 
 /**

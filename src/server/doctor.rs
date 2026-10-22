@@ -4,7 +4,9 @@
 //! daemon, permissão no socket e Compose v2, com os mesmos `id`) e acrescenta:
 //! - `port`: uma porta livre para o Nants (a configurada ou uma das seguintes, como no `nants`);
 //! - `disk`: espaço livre na pasta de dados e na pasta de projetos;
-//! - `wsl`: WSL detectado (informativo);
+//! - `wsl`: o ambiente (Linux, WSL NAT, WSL espelhado; informativo; spec 111);
+//! - `windows_port_redirect`: o acesso pela rede local salvo comparado com o Windows (spec 111;
+//!   aviso que não bloqueia, ver [`network_item`] e [`super::lan`]);
 //! - `playwright_images`: imagens `mcr.microsoft.com/playwright` já baixadas (informativo; nada é
 //!   baixado aqui);
 //! - `version`: versão local x `latest.json` publicado (informativo; sem rede ou sem manifesto, só
@@ -13,10 +15,12 @@
 //! Só os itens obrigatórios ([`REQUIRED_IDS`]) decidem o código de saída. Primeiros passos mostra
 //! os mesmos itens da máquina pelo `GET /api/system/prereqs` ([`machine_extras`]).
 
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::lan::{FirewallState, NetworkEnv, RedirectTarget};
+use super::portproxy::WinTools;
 use super::prereqs::{fix_for, label_for, CmdRunner, PrereqItem, REQUIRED_IDS};
 use crate::config::Config;
 use crate::i18n::{Lang, Msg};
@@ -48,6 +52,7 @@ fn info(id: &'static str, detail: Msg, fix: Option<String>) -> PrereqItem {
         detail: Some(detail.render(Lang::PtBr)),
         fix,
         info: true,
+        warn: false,
         detail_msg: Some(detail),
     }
 }
@@ -61,6 +66,7 @@ fn check(id: &'static str, ok: bool, detail: Msg) -> PrereqItem {
         detail: Some(detail.render(Lang::PtBr)),
         fix: if ok { None } else { Some(fix_for(id)) },
         info: false,
+        warn: false,
         detail_msg: Some(detail),
     }
 }
@@ -157,6 +163,58 @@ pub fn disk_item(paths: &[PathBuf], free: impl Fn(&Path) -> Option<u64>) -> Prer
 pub fn wsl_item(wsl: bool) -> PrereqItem {
     let key = if wsl { "doctor.detail.wsl_detected" } else { "doctor.detail.wsl_absent" };
     info("wsl", Msg::new(key), None)
+}
+
+/// Ambiente (spec 111): Linux, WSL NAT, WSL espelhado ou WSL com o modo desconhecido (informativo).
+/// O `nants doctor` e Primeiros passos (`GET /api/system/prereqs`) mostram este item no lugar do
+/// [`wsl_item`] ([`place_network_items`]).
+pub fn env_item(env: NetworkEnv) -> PrereqItem {
+    let key = match env {
+        NetworkEnv::Linux => "doctor.detail.wsl_absent",
+        NetworkEnv::WslNat => "doctor.detail.env_wsl_nat",
+        NetworkEnv::WslMirrored => "doctor.detail.env_wsl_mirrored",
+        NetworkEnv::WslUnknown => "doctor.detail.env_wsl_unknown",
+    };
+    info("wsl", Msg::new(key), None)
+}
+
+/// Id do item do acesso pela rede local (o da T01, estável).
+pub const NETWORK_ID: &str = "windows_port_redirect";
+
+fn network_warn(detail: Msg) -> PrereqItem {
+    PrereqItem { warn: true, fix: Some(fix_for(NETWORK_ID)), ..check(NETWORK_ID, true, detail) }
+}
+
+/// Acesso pela rede local (spec 111): a opção salva comparada com o Windows, pela regra única
+/// [`super::lan::network_check`] (a mesma do campo `coherence` da API). Nunca bloqueia: OK, AVISO
+/// (com o que fazer) ou INFO (não deu para conferir; no Linux direto, só informa a opção).
+pub fn network_item(env: NetworkEnv, saved: Option<bool>, target: RedirectTarget, firewall: FirewallState, port: u16) -> PrereqItem {
+    use super::lan::CheckLevel;
+    let check_result = super::lan::network_check(env, saved, target, firewall);
+    let detail = Msg::new(check_result.detail_key());
+    let detail = if check_result.has_port() { detail.arg("port", port.to_string()) } else { detail };
+    match check_result.level() {
+        CheckLevel::Ok => check(NETWORK_ID, true, detail),
+        CheckLevel::Warn => network_warn(detail),
+        CheckLevel::Info => info(NETWORK_ID, detail, None),
+    }
+}
+
+/// Troca o item `wsl` pelo ambiente ([`env_item`]) e põe logo depois dele o item "Acesso pela rede
+/// local" ([`network_item`]) da `port`. A mesma regra para o `nants doctor` e para a API.
+pub fn place_network_items(
+    items: &mut Vec<PrereqItem>,
+    view: &super::lan::WindowsView,
+    saved: Option<bool>,
+    port: u16,
+    local_ips: &[Ipv4Addr],
+) {
+    let at = items.iter().position(|i| i.id == "wsl").map_or(items.len(), |i| i + 1);
+    if let Some(env) = items.get_mut(at.saturating_sub(1)).filter(|i| i.id == "wsl") {
+        *env = env_item(view.env);
+    }
+    let target = view.target(port, local_ips);
+    items.insert(at, network_item(view.env, saved, target, view.firewall, port));
 }
 
 /// Imagens do Playwright já baixadas (informativo; nada é baixado aqui).
@@ -273,23 +331,43 @@ pub async fn version_check(local: &str, base: Option<String>, timeout: Duration)
 /// Entradas do `nants doctor` (injetáveis nos testes).
 pub struct DoctorInput {
     pub runner: CmdRunner,
+    /// Consultas ao Windows (spec 111), com o prazo próprio [`super::portproxy::NETSH_TIMEOUT`].
+    pub windows: WinTools,
     pub port: u16,
     pub disk_paths: Vec<PathBuf>,
     pub wsl: bool,
+    /// Opção salva `[server] lan` (`None` = nunca escolhida).
+    pub saved_lan: Option<bool>,
+    /// IPv4 deste WSL (destino esperado do redirecionamento).
+    pub local_ips: Vec<Ipv4Addr>,
     pub releases_base: Option<String>,
     pub local_version: String,
     pub version_timeout: Duration,
 }
 
 /// Todos os itens do `nants doctor`, na ordem de exibição. A parte bloqueante (subprocessos,
-/// portas, disco) roda em `spawn_blocking`, em paralelo com a consulta da versão.
+/// portas, disco) roda em `spawn_blocking`, em paralelo com a consulta da versão; as consultas ao
+/// Windows rodam em paralelo entre si.
 pub async fn collect(input: DoctorInput) -> Vec<PrereqItem> {
-    let DoctorInput { runner, port, disk_paths, wsl, releases_base, local_version, version_timeout } = input;
+    let DoctorInput {
+        runner,
+        windows,
+        port,
+        disk_paths,
+        wsl,
+        saved_lan,
+        local_ips,
+        releases_base,
+        local_version,
+        version_timeout,
+    } = input;
     let blocking = tokio::task::spawn_blocking(move || {
+        let view = super::lan::probe(&windows, wsl, super::lan::Needs::ALL, &local_ips, super::lan::PROBE_DEADLINE);
         let mut items = super::prereqs::diagnose(&runner);
         let extras = machine_extras(&runner, &items, &disk_paths, wsl);
         items.push(port_item(port, loopback_port_free));
         items.extend(extras);
+        place_network_items(&mut items, &view, saved_lan, port, &local_ips);
         items
     });
     let version = version_check(&local_version, releases_base, version_timeout);
@@ -299,10 +377,12 @@ pub async fn collect(input: DoctorInput) -> Vec<PrereqItem> {
     items
 }
 
-/// Rótulo do estado na linha: `OK`, `FALHA`/`FAIL` ou `INFO`.
+/// Rótulo do estado na linha: `OK`, `FALHA`/`FAIL`, `AVISO`/`WARN` ou `INFO`.
 pub fn status_word(item: &PrereqItem, lang: Lang) -> String {
     let key = if !item.ok {
         "doctor.status.fail"
+    } else if item.warn {
+        "doctor.status.warn"
     } else if item.info {
         "doctor.status.info"
     } else {
@@ -428,6 +508,145 @@ mod tests {
     }
 
     #[test]
+    fn environment_item_names_linux_nat_and_mirrored() {
+        let line = |env, lang| format_line(&env_item(env), lang);
+        assert!(line(NetworkEnv::Linux, Lang::PtBr).starts_with("INFO  WSL: não detectado (Linux)"));
+        assert!(line(NetworkEnv::WslNat, Lang::PtBr).contains("WSL no modo de rede NAT"), "{}", line(NetworkEnv::WslNat, Lang::PtBr));
+        assert!(line(NetworkEnv::WslMirrored, Lang::PtBr).contains("WSL no modo de rede espelhado"));
+        assert!(line(NetworkEnv::WslUnknown, Lang::PtBr).contains("tratado como NAT"));
+        assert!(line(NetworkEnv::WslNat, Lang::En).contains("WSL in NAT networking mode"));
+        assert!(line(NetworkEnv::WslMirrored, Lang::En).contains("WSL in mirrored networking mode"));
+        assert!(env_item(NetworkEnv::WslNat).info);
+    }
+
+    #[test]
+    fn network_item_compares_the_saved_option_with_windows() {
+        use FirewallState::{Absent, Present, Unknown as FwUnknown};
+        use NetworkEnv::{Linux, WslMirrored, WslNat, WslUnknown};
+        use RedirectTarget::{None as NoRedirect, Other, ThisWsl, Unknown};
+        let kind = |i: &PrereqItem| {
+            assert!(i.ok, "nunca bloqueia: {i:?}");
+            assert_eq!(i.warn, i.fix.is_some(), "aviso traz a orientação: {i:?}");
+            if i.warn {
+                "warn"
+            } else if i.info {
+                "info"
+            } else {
+                "ok"
+            }
+        };
+        let cases = [
+            // Rede ligada com o Windows configurado: OK.
+            (WslNat, Some(true), ThisWsl, Present, "ok", "lan_on_ok"),
+            (WslNat, Some(true), ThisWsl, FwUnknown, "ok", "lan_on_ok"),
+            (WslMirrored, Some(true), NoRedirect, Present, "ok", "lan_on_mirrored_ok"),
+            // Rede ligada sem o Windows configurado: AVISO, rodar o script.
+            (WslNat, Some(true), NoRedirect, Present, "warn", "lan_on_no_redirect"),
+            (WslUnknown, Some(true), NoRedirect, FwUnknown, "warn", "lan_on_no_redirect"),
+            (WslNat, Some(true), Other, Present, "warn", "lan_on_other_target"),
+            (WslNat, Some(true), ThisWsl, Absent, "warn", "lan_on_no_firewall"),
+            (WslMirrored, Some(true), NoRedirect, Absent, "warn", "lan_on_no_firewall"),
+            // Rede desligada com o Windows redirecionando: AVISO, desfazer ou ligar.
+            (WslNat, Some(false), ThisWsl, Present, "warn", "windows_redirect_on"),
+            (WslNat, None, Other, Present, "warn", "windows_redirect_on"),
+            (WslNat, None, ThisWsl, Absent, "warn", "windows_redirect_on"),
+            (WslUnknown, None, ThisWsl, Present, "warn", "windows_redirect_on"),
+            (WslMirrored, Some(false), ThisWsl, Present, "warn", "windows_redirect_on"),
+            // Nunca escolhida e o Windows configurado: o próximo início adota.
+            (WslNat, None, ThisWsl, Present, "ok", "lan_will_adopt"),
+            // Desligada e sem redirecionamento: OK.
+            (WslNat, Some(false), NoRedirect, Absent, "ok", "windows_redirect_off"),
+            (WslNat, None, NoRedirect, FwUnknown, "ok", "windows_redirect_off"),
+            // Não deu para conferir: INFO.
+            (WslNat, Some(false), Unknown, FwUnknown, "info", "windows_redirect_unknown"),
+            (WslNat, Some(true), Unknown, Present, "info", "windows_redirect_unknown"),
+            (WslMirrored, Some(true), NoRedirect, FwUnknown, "info", "firewall_unknown"),
+            // Linux direto: só informa a opção.
+            (Linux, Some(true), NoRedirect, Absent, "info", "lan_linux_on"),
+            (Linux, None, NoRedirect, Absent, "info", "lan_linux_off"),
+            (Linux, Some(false), NoRedirect, Absent, "info", "lan_linux_off"),
+        ];
+        for (env, saved, target, fw, want, key) in cases {
+            let item = network_item(env, saved, target, fw, 3000);
+            let case = format!("{env:?} {saved:?} {target:?} {fw:?}");
+            assert_eq!(kind(&item), want, "{case}");
+            let msg = item.detail_msg.as_ref().expect("detalhe");
+            assert_eq!(msg.neutral("doctor.detail.").code, key, "{case}");
+        }
+        let warn = network_item(WslNat, Some(false), ThisWsl, Present, 3000);
+        let line = format_line(&warn, Lang::PtBr);
+        assert!(line.starts_with("AVISO Acesso pela rede local: o Windows está redirecionando a porta 3000"), "{line}");
+        assert!(line.contains("Configurações > Acesso pela rede") && line.contains("PowerShell como administrador"), "{line}");
+        let line = format_line(&warn, Lang::En);
+        assert!(line.starts_with("WARN  Local network access: Windows is redirecting port 3000"), "{line}");
+        assert!(line.contains("Settings > Network access") && line.contains("PowerShell as administrator"), "{line}");
+        // O aviso não muda o "Tudo pronto".
+        let mut items = crate::server::prereqs::diagnose(&healthy(""));
+        items.push(warn);
+        assert!(required_ok(&items));
+        assert!(format_report("0.1.0", &items, Lang::PtBr).contains("Tudo pronto"));
+    }
+
+    /// Windows falso: `netsh` com a saída dada, `wslinfo` com o modo e o PowerShell com a contagem.
+    fn windows(netsh: Option<&'static str>, mode: Option<&'static str>, rules: Option<&'static str>) -> WinTools {
+        WinTools {
+            run: Arc::new(move |p, a| match p {
+                "netsh.exe" => {
+                    assert_eq!(a, crate::server::portproxy::NETSH_ARGS);
+                    netsh.and_then(ok)
+                }
+                "wslinfo" => mode.and_then(ok),
+                "powershell.exe" => {
+                    assert_eq!(a, crate::server::lan::FIREWALL_ARGS, "só leitura");
+                    rules.and_then(ok)
+                }
+                other => panic!("programa inesperado: {other}"),
+            }),
+            exists: Arc::new(|p| ["netsh.exe", "wslinfo", "powershell.exe"].contains(&p)),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_shows_the_environment_and_the_network_item() {
+        let pt_out = "Escuta em ipv4:  Conectar-se a ipv4:\r\n\r\nEndereço Porta Endereço Porta\r\n--- --- --- ---\r\n0.0.0.0 3000 172.21.154.252 3000\r\n";
+        let wsl_input = |netsh, mode, rules, saved| {
+            let mut i = input(healthy(""));
+            i.windows = windows(netsh, mode, rules);
+            i.wsl = true;
+            i.port = 3000;
+            i.saved_lan = saved;
+            i.local_ips = vec![Ipv4Addr::new(172, 21, 154, 252)];
+            i
+        };
+        // Desligada (nunca escolhida) e redirecionada sem a regra: aviso.
+        let items = collect(wsl_input(Some(pt_out), Some("nat\n"), Some("0\r\n"), None)).await;
+        let ids: Vec<&str> = items.iter().map(|i| i.id).collect();
+        let at = ids.iter().position(|i| *i == "wsl").expect("wsl");
+        assert_eq!(ids.get(at + 1), Some(&NETWORK_ID), "{ids:?}");
+        assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("modo de rede NAT"));
+        assert!(by_id(&items, NETWORK_ID).warn);
+        assert!(required_ok(&items));
+        // Ligada e configurada: OK.
+        let items = collect(wsl_input(Some(pt_out), Some("nat"), Some("1"), Some(true))).await;
+        let item = by_id(&items, NETWORK_ID);
+        assert!(item.ok && !item.warn && !item.info, "{item:?}");
+        // Espelhado, ligada, sem a regra: aviso.
+        let items = collect(wsl_input(Some(""), Some("mirrored"), Some("0"), Some(true))).await;
+        assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("espelhado"));
+        assert!(by_id(&items, NETWORK_ID).warn);
+        // Sem interop: só informa, e o ambiente fica desconhecido.
+        let items = collect(wsl_input(None, None, None, Some(false))).await;
+        assert!(by_id(&items, NETWORK_ID).info);
+        assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("tratado como NAT"));
+        // Fora do WSL: nada do Windows roda (o executor falso entraria em pânico) e o item só informa.
+        let mut linux = input(healthy(""));
+        linux.windows = WinTools { run: Arc::new(|p, _| panic!("executou {p}")), exists: Arc::new(|_| true) };
+        let items = collect(linux).await;
+        assert!(by_id(&items, NETWORK_ID).info);
+        assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("não detectado"));
+    }
+
+    #[test]
     fn playwright_lists_existing_images_without_pulling() {
         let none = playwright_item(&healthy(""), true);
         assert!(none.info && none.ok);
@@ -506,9 +725,12 @@ mod tests {
     fn input(runner: CmdRunner) -> DoctorInput {
         DoctorInput {
             runner,
+            windows: windows(None, None, None),
             port: 0,
             disk_paths: vec![PathBuf::from("/")],
             wsl: false,
+            saved_lan: None,
+            local_ips: Vec::new(),
             releases_base: Some("ftp://invalido".into()),
             local_version: "0.1.0".into(),
             version_timeout: Duration::from_secs(1),
@@ -530,6 +752,7 @@ mod tests {
                 "port",
                 "disk",
                 "wsl",
+                "windows_port_redirect",
                 "playwright_images",
                 "version"
             ]
@@ -612,6 +835,10 @@ mod tests {
             disk_item(&p, |_| None),
             wsl_item(true),
             wsl_item(false),
+            env_item(NetworkEnv::Linux),
+            env_item(NetworkEnv::WslNat),
+            env_item(NetworkEnv::WslMirrored),
+            env_item(NetworkEnv::WslUnknown),
             playwright_item(&healthy(""), true),
             playwright_item(&healthy("v1"), true),
             playwright_item(&healthy(""), false),
@@ -624,6 +851,15 @@ mod tests {
             items.push(version_item("0.1.0", Err(Msg::new(key))));
         }
         items.push(version_item("0.1.0", Err(Msg::new("doctor.why.http").arg("status", "500"))));
+        for env in [NetworkEnv::Linux, NetworkEnv::WslNat, NetworkEnv::WslMirrored, NetworkEnv::WslUnknown] {
+            for saved in [None, Some(false), Some(true)] {
+                for target in [RedirectTarget::ThisWsl, RedirectTarget::Other, RedirectTarget::None, RedirectTarget::Unknown] {
+                    for fw in [FirewallState::Present, FirewallState::Absent, FirewallState::Unknown] {
+                        items.push(network_item(env, saved, target, fw, 3000));
+                    }
+                }
+            }
+        }
         let absent: CmdRunner = Arc::new(|_, _| None);
         let denied: CmdRunner = Arc::new(|p, a| match (p, a.first().copied()) {
             ("docker", Some("info")) => fail("permission denied"),

@@ -79,6 +79,8 @@ The installer verifies the SHA-256 of the package and installs the executable to
 ```sh
 nants                     # start Nants and open it in your browser
 nants doctor              # check Docker, Compose, Git, the port and disk space
+nants --lan               # also accept access from your local network, for this run only
+                          # (to keep it on: Settings > Network access)
 nants --help              # all commands and options
 ```
 
@@ -102,6 +104,33 @@ gh attestation verify nants-X.Y.Z-x86_64-linux.tar.gz --repo tm-dev-lab/nants
    the model for each agent.
 2. Create a project: just give it a name. Nants creates a Git repository in `~/NantsProjects`.
 3. Describe your idea in the Conversation, answer the Architect and approve the plan.
+
+## Use it from your phone (local network)
+
+By default, Nants opens only on your computer. To open it from your phone or another device on
+the same network, turn on **Local network access** in **Settings > Network access**. The page
+shows what your environment still needs:
+
+- **Linux:** nothing else. If you use a firewall, allow the Nants port and the preview ports.
+- **WSL (NAT, the default):** run the **Script to enable it on Windows** once, in PowerShell as
+  administrator. It forwards the ports to WSL and creates the Nants firewall rule. The WSL IP
+  changes when Windows restarts; if so, run it again.
+- **WSL (mirrored):** the same script, which here only creates the Windows firewall rule.
+
+The option is saved and applies from the next start: stop Nants with Ctrl+C and run `nants`
+again. To turn it off, switch it off on the same page and, on WSL, run the **Script to undo it
+on Windows**. `nants --lan` turns it on for a single run, without saving.
+
+Use it only on a network you trust: Nants has no login, so any device on the network can
+control it.
+
+## Troubleshooting
+
+**The page does not open in the Windows browser.** An old Windows port redirect, set up for
+network access, takes the Nants port. Nants detects it, starts on the next free port and
+explains it in the terminal. To undo it, run the **Script to undo it on Windows** from
+**Settings > Network access**, or turn local network access on if you want to keep it.
+`nants doctor` shows your environment and whether Windows matches the saved option.
 
 ## Build from source
 

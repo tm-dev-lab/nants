@@ -1059,6 +1059,7 @@ export const en: Record<MessageKey, string> = {
   "prereq.machine.disk": "Disk space",
   "prereq.machine.wsl": "WSL",
   "prereq.machine.playwright_images": "Playwright images",
+  "prereq.machine.windows_port_redirect": "Local network access",
   "prereq.fix.git": "Install Git: sudo apt install git (Debian/Ubuntu/WSL). Then reload this screen.",
   "prereq.fix.docker_cli":
     "Install Docker Engine (https://docs.docker.com/engine/install/) or, on Windows, Docker Desktop with WSL integration turned on (Settings > Resources > WSL integration). Nants does not install Docker.",
@@ -1068,6 +1069,8 @@ export const en: Record<MessageKey, string> = {
     "Add your user to the docker group: sudo usermod -aG docker $USER and start a new session (close and reopen the terminal; on WSL, run wsl --shutdown on Windows).",
   "prereq.fix.docker_compose": "Install the Compose v2 plugin: sudo apt install docker-compose-plugin (or update Docker Desktop).",
   "prereq.fix.disk": "Free up disk space: Nants needs at least 5 GB free for Docker images and projects.",
+  "prereq.fix.windows_port_redirect":
+    "Open Settings > Network access: turn local network access on or off and run the script shown there (enable or undo) in PowerShell as administrator.",
   "prereq.detail.git_missing": "git not found",
   "prereq.detail.docker_missing": "docker not found",
   "prereq.detail.depends_on_cli": "depends on the Docker CLI",
@@ -1087,6 +1090,30 @@ export const en: Record<MessageKey, string> = {
   "prereq.detail.playwright_list_failed": "could not list the images. The first browser test of a project downloads about 2 GB",
   "prereq.detail.playwright_none": "none downloaded yet: the first browser test of a project downloads about 2 GB",
   "prereq.detail.playwright_some": "already downloaded: {tags}. Projects with another version download about 2 GB on the first browser test",
+  "prereq.detail.env_wsl_nat":
+    "WSL in NAT networking mode (the default); Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+  "prereq.detail.env_wsl_mirrored":
+    "WSL in mirrored networking mode; Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+  "prereq.detail.env_wsl_unknown":
+    "WSL (could not check the networking mode; treated as NAT); Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+  "prereq.detail.windows_redirect_on":
+    "Windows is redirecting port {port} to WSL (network access set up before), but local network access is off: in local mode the browser does not open the page on that port and nants uses another one. Turn local network access on or undo the redirect",
+  "prereq.detail.windows_redirect_off": "local network access is off and Windows does not redirect port {port}",
+  "prereq.detail.windows_redirect_unknown": "could not check with the Windows netsh.exe",
+  "prereq.detail.firewall_unknown": "could not check the Windows firewall rule with PowerShell",
+  "prereq.detail.lan_on_ok": "local network access is on and Windows is set up for port {port}",
+  "prereq.detail.lan_on_mirrored_ok": "local network access is on and the Windows firewall rule Nants exists (mirrored mode, port {port})",
+  "prereq.detail.lan_on_no_redirect":
+    "local network access is on, but Windows does not redirect port {port} to WSL: other devices cannot reach Nants. Run the script",
+  "prereq.detail.lan_on_other_target":
+    "local network access is on, but Windows redirects port {port} to another address (the WSL IP changes when Windows restarts). Run the script again",
+  "prereq.detail.lan_on_no_firewall":
+    "local network access is on, but the Windows firewall rule Nants is missing: other devices cannot reach port {port}. Run the script",
+  "prereq.detail.lan_will_adopt":
+    "Windows already redirects port {port} to this WSL and has the firewall rule Nants: the next nants start turns local network access on",
+  "prereq.detail.lan_linux_on":
+    "on: Nants listens on the local network (port {port}); if another device cannot open it, allow the port in the Linux firewall",
+  "prereq.detail.lan_linux_off": "off: Nants opens only on this computer; to turn it on, use Settings > Network access",
 
   "serverMessage.attachmentInvalid": "Invalid or missing attached image; attach it again",
   "serverMessage.attachmentsMax": "attachments can have at most 4 images",
@@ -1304,7 +1331,6 @@ export const en: Record<MessageKey, string> = {
   "settings.network.state": "Status",
   "settings.network.thisComputer": "<IP of this computer>",
   "settings.network.script": "PowerShell script",
-  "settings.network.wslTitle": "How to allow it on Windows (WSL)",
   "settings.network.wslIntro":
     "Run it in PowerShell as administrator. The script redoes the forwarding of the Nants port and of each port in the range and creates a firewall rule; you can run it as many times as you like. The access only applies to devices on the local network, with the network marked as private on Windows.",
   "settings.network.wslRestart": "The WSL IP changes when Windows restarts: after a restart, just run the script again.",
@@ -1312,6 +1338,33 @@ export const en: Record<MessageKey, string> = {
     "If another device does not open it, Windows probably treats the network as public. To change it: Windows Settings, Network and Internet, network properties, Private network.",
   "settings.network.wslMirrored":
     "Alternative: WSL mirrored networking (networkingMode=mirrored in the .wslconfig file) makes port forwarding unnecessary.",
+  "settings.network.lanLabel": "Local network access",
+  "settings.network.lanHint": "When on, other devices on the network, like your phone, open Nants.",
+  "settings.network.loading": "Checking the network and Windows.",
+  "settings.network.loadFailed": "Could not read the network state now.",
+  "settings.network.saveFailed": "Could not save: {message}",
+  "settings.network.nextStart": "Applies from the next start. To restart:",
+  "settings.network.restartTail": "in the terminal, then",
+  "settings.network.savedNow": "Saved. Already in effect in this run.",
+  "settings.network.runOn": "In this run, Nants is on the local network.",
+  "settings.network.runOff": "In this run, Nants opens only on this computer.",
+  "settings.network.fromFlag": "This run's mode came from --lan, which is not saved.",
+  "settings.network.missingScript": "The enable script still needs to run on Windows.",
+  "settings.network.missingFirewall": "The Nants firewall rule is missing on Windows: run the enable script.",
+  "settings.network.otherTarget": "Windows redirects the port to another address (the WSL IP changes when Windows restarts): run the enable script again.",
+  "settings.network.willAdopt": "Windows is already set up for this WSL: the next start turns local network access on.",
+  "settings.network.stillRedirected": "Windows still redirects the ports: run the undo script. That is why Nants may be on a port other than {port}.",
+  "settings.network.linuxHint": "If Linux has a firewall, allow ports {ports}.",
+  "settings.network.linuxHintAbove": "If Linux has a firewall, allow the Nants port and the preview ports above.",
+  "settings.network.windowsReleased": "Allowed on Windows",
+  "settings.network.windowsPending": "Pending on Windows",
+  "settings.network.enableTitle": "Script to enable it on Windows",
+  "settings.network.undoTitle": "Script to undo it on Windows",
+  "settings.network.undoIntro": "Run it in PowerShell as administrator. It removes the port redirects and the Nants rule and, at the end, shows what is left. You can run it as many times as you like.",
+  "settings.network.mirroredIntro": "WSL in mirrored mode: only the Windows firewall rule, no port redirects.",
+  "settings.network.mirroredEnableIntro": "Run it in PowerShell as administrator. It creates the Nants firewall rule, only for the local network; you can run it as many times as you like.",
+  "settings.network.mirroredUndoIntro": "Run it in PowerShell as administrator. It removes the Nants firewall rule.",
+  "settings.network.unknownNote": "Could not check the WSL networking mode. In mirrored mode, only the firewall part is needed.",
 
   "project.copyPath": "Copy the folder path",
   "project.limitsInvalid": "Enter whole numbers from 1 to 10.",
@@ -1385,6 +1438,7 @@ export const en: Record<MessageKey, string> = {
   "setup.status.ok": "ok",
   "setup.status.fail": "has a problem",
   "setup.status.info": "informational",
+  "setup.status.warn": "attention",
   "setup.subtitle.checking": "Checking",
   "setup.subtitle.ready": "All set",
   "setup.subtitle.pending.one": "{count} step pending",

@@ -318,7 +318,7 @@ fn validate_api_key(key: &str) -> Result<(), ApiError> {
 
 /// Decodifica o corpo. JSON malformado vira 400; campos com tipo/valor inválido, 422.
 /// Mensagens de tipo não ecoam valores, para não vazar chaves informadas por engano.
-fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+pub(super) fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
             ApiError::unprocessable("corpo JSON com campos inválidos")
@@ -357,7 +357,7 @@ pub fn save_atomic(path: &Path, cfg: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-async fn persist(state: &AppState, cfg: &Config) -> Result<(), ApiError> {
+pub(super) async fn persist(state: &AppState, cfg: &Config) -> Result<(), ApiError> {
     let path = state.config_path().to_path_buf();
     let snapshot = cfg.clone();
     tokio::task::spawn_blocking(move || save_atomic(&path, &snapshot))

@@ -112,6 +112,53 @@ export interface NetworkView {
   wsl: boolean;
 }
 
+/** Ambiente de rede do servidor (spec 111): Linux direto, WSL NAT, WSL espelhado ou WSL sem o modo conferido. */
+export type NetworkEnv = "linux" | "wsl_nat" | "wsl_mirrored" | "wsl_unknown";
+
+/** De onde veio o modo desta execução (spec 111): `--lan`, `--host`, opção salva, adoção ou padrão. */
+export type NetworkModeSource = "flag" | "host" | "saved" | "adopted" | "default";
+
+/** Sim, não ou não deu para conferir (consulta só de leitura ao Windows). */
+export type TriState = "yes" | "no" | "unknown";
+
+/** Para onde o Windows redireciona a porta do Nants. */
+export type RedirectTarget = "this_wsl" | "other" | "none" | "unknown";
+
+/**
+ * Coerência entre a opção salva e o Windows, calculada no servidor pela mesma regra do item do
+ * `nants doctor` (spec 111, T03).
+ */
+export type NetworkCoherenceCode = "ok" | "will_adopt" | "needs_script" | "other_target" | "missing_rule" | "still_redirected" | "unknown";
+
+/**
+ * `GET /api/config/network` (spec 111, T02): ambiente, opção salva (`null` = nunca escolhida),
+ * modo desta execução, portas e o que o Windows mostra.
+ */
+export interface NetworkConfig {
+  env: NetworkEnv;
+  saved_lan: boolean | null;
+  lan: boolean;
+  mode_source: NetworkModeSource;
+  port: number;
+  lan_port: number;
+  view_ports: LanRange | null;
+  windows_redirect: TriState;
+  windows_redirect_target: RedirectTarget;
+  coherence: NetworkCoherenceCode;
+  firewall_rule: TriState;
+  restart_required: boolean;
+  restart_command: string;
+}
+
+/** Resposta de `PUT /api/config/network` (spec 111, T02). */
+export interface NetworkSaveResult {
+  saved_lan: boolean;
+  lan: boolean;
+  applies_on_next_start: boolean;
+  restart_required: boolean;
+  restart_command: string;
+}
+
 /** Preço de um modelo em US$ por 1 milhão de tokens. */
 export interface ModelPricing {
   input_per_mtok: number;
@@ -795,4 +842,8 @@ export interface PrereqItem {
   detail_code?: unknown;
   detail_params?: unknown;
   detail_parts?: unknown;
+  /** Item só informativo (spec 103 T02). */
+  info?: boolean;
+  /** Aviso que não bloqueia (spec 111: acesso pela rede local diferente do Windows); o item segue `ok`. */
+  warn?: boolean;
 }

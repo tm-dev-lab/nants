@@ -50,6 +50,9 @@ pub struct PrereqItem {
     pub fix: Option<String>,
     /// Item só informativo (spec 103 T02: WSL, imagens do Playwright, versão): nunca bloqueia.
     pub info: bool,
+    /// Aviso que não bloqueia (spec 111: acesso pela rede local diferente do Windows). O item segue
+    /// `ok` (não muda a prontidão); a API manda `"warn": true` para Primeiros passos.
+    pub warn: bool,
     /// O `detail` por chave do dicionário (spec 102): o `nants doctor` o mostra no idioma do
     /// terminal; a API o manda na forma neutra ([`Msg::neutral`]).
     pub detail_msg: Option<Msg>,
@@ -103,6 +106,9 @@ impl Serialize for PrereqItem {
         if self.info {
             map.serialize_entry("info", &true)?;
         }
+        if self.warn {
+            map.serialize_entry("warn", &true)?;
+        }
         map.end()
     }
 }
@@ -121,18 +127,17 @@ pub fn real_runner(timeout: Duration) -> CmdRunner {
             .stderr(Stdio::piped())
             .spawn()
             .ok()?;
-        let mut out = child.stdout.take()?;
-        let mut err = child.stderr.take()?;
-        let t_out = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = (&mut out).take(MAX_OUT).read_to_string(&mut s);
-            s
-        });
-        let t_err = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = (&mut err).take(MAX_OUT).read_to_string(&mut s);
-            s
-        });
+        let out = child.stdout.take()?;
+        let err = child.stderr.take()?;
+        // Bytes e não UTF-8 obrigatório: o `netsh.exe` do Windows responde em CP850 ou Latin-1
+        // (spec 111); o que não for UTF-8 vira caractere de substituição em vez de saída vazia.
+        let read_lossy = |mut pipe: Box<dyn Read + Send>| {
+            let mut buf = Vec::new();
+            let _ = (&mut pipe).take(MAX_OUT).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let t_out = std::thread::spawn(move || read_lossy(Box::new(out)));
+        let t_err = std::thread::spawn(move || read_lossy(Box::new(err)));
         let start = Instant::now();
         let status = loop {
             match child.try_wait() {
@@ -252,6 +257,7 @@ fn item(id: &'static str, ok: bool, version: Option<String>, detail: Option<Msg>
         detail: detail.as_ref().map(|m| m.render(Lang::PtBr)),
         fix: if ok { None } else { Some(fix_for(id)) },
         info: false,
+        warn: false,
         detail_msg: detail,
     }
 }
@@ -306,21 +312,37 @@ pub fn diagnose(run: &CmdRunner) -> Vec<PrereqItem> {
 }
 
 /// `GET /api/system/prereqs`: os itens obrigatórios (com cache) e, depois deles, os itens da
-/// máquina que o `nants doctor` também mostra (espaço em disco, WSL e imagens do Playwright; spec
-/// 103 T02). A porta e a versão ficam só no `doctor`: o servidor já está numa porta e a interface
-/// não consulta a rede.
+/// máquina que o `nants doctor` também mostra (espaço em disco, ambiente, acesso pela rede local e
+/// imagens do Playwright; spec 103 T02 e spec 111). A porta e a versão ficam só no `doctor`: o
+/// servidor já está numa porta e a interface não consulta a internet.
+///
+/// A consulta ao Windows (só leitura, com prazo curto) roda em paralelo com o resto; se ela falhar,
+/// o item `wsl` fica como veio e o da rede não entra.
 pub async fn get_prereqs(State(state): State<AppState>) -> Json<Vec<PrereqItem>> {
     let checker = state.prereqs().clone();
-    let paths = super::doctor::disk_paths(&*state.config().read().await);
-    let wsl = super::netinfo::running_on_wsl();
-    let items = tokio::task::spawn_blocking(move || {
+    let (paths, saved) = {
+        let cfg = state.config().read().await;
+        (super::doctor::disk_paths(&cfg), cfg.server.lan)
+    };
+    let probe = state.net_probe().clone();
+    let wsl = probe.wsl;
+    let port = super::lan::lan_port(state.network_run(), state.bound_port());
+    let network = tokio::task::spawn_blocking(move || {
+        let ips = probe.ips();
+        let view = super::lan::probe(&probe.tools, probe.wsl, super::lan::Needs::ALL, &ips, super::lan::PROBE_DEADLINE);
+        (view, ips)
+    });
+    let machine = tokio::task::spawn_blocking(move || {
         let mut items = checker.check();
         let extras = super::doctor::machine_extras(&checker.runner, &items, &paths, wsl);
         items.extend(extras);
         items
-    })
-    .await
-    .unwrap_or_default();
+    });
+    let (network, machine) = tokio::join!(network, machine);
+    let mut items = machine.unwrap_or_default();
+    if let Ok((view, ips)) = network {
+        super::doctor::place_network_items(&mut items, &view, saved, port, &ips);
+    }
     Json(items)
 }
 
@@ -483,17 +505,32 @@ mod route_tests {
         let ids: Vec<&str> = v.as_array().expect("array").iter().filter_map(|i| i["id"].as_str()).collect();
         assert_eq!(
             ids,
-            ["git", "docker_cli", "docker_daemon", "docker_permission", "docker_compose", "disk", "wsl", "playwright_images"]
+            [
+                "git",
+                "docker_cli",
+                "docker_daemon",
+                "docker_permission",
+                "docker_compose",
+                "disk",
+                "wsl",
+                "windows_port_redirect",
+                "playwright_images"
+            ]
         );
         assert_eq!(v[0]["ok"], true);
         assert!(v[0].get("info").is_none(), "itens obrigatórios não levam info");
         assert_eq!(v[6]["info"], true);
-        assert_eq!(v[7]["info"], true);
-        assert!(v[7]["detail"].as_str().unwrap_or("").contains("v1"));
+        assert_eq!(v[8]["info"], true);
+        assert!(v[8]["detail"].as_str().unwrap_or("").contains("v1"));
         // Spec 102 T05: o detalhe também na forma neutra de idioma.
-        assert_eq!(v[7]["detail_code"], "playwright_some");
-        assert_eq!(v[7]["detail_params"], serde_json::json!({"tags": "v1"}));
-        assert!(["wsl_detected", "wsl_absent"].contains(&v[6]["detail_code"].as_str().unwrap_or("")), "{}", v[6]);
+        assert_eq!(v[8]["detail_code"], "playwright_some");
+        assert_eq!(v[8]["detail_params"], serde_json::json!({"tags": "v1"}));
+        // Spec 111: o ambiente e a rede local, como no `nants doctor` (os testes rodam como Linux).
+        assert_eq!(v[6]["detail_code"], "wsl_absent", "{}", v[6]);
+        assert_eq!(v[7]["detail_code"], "lan_linux_off", "{}", v[7]);
+        assert_eq!(v[7]["detail_params"], serde_json::json!({"port": "3000"}));
+        assert_eq!((v[7]["ok"].as_bool(), v[7]["info"].as_bool()), (Some(true), Some(true)));
+        assert!(v.as_array().expect("array").iter().all(|i| i.get("warn").is_none()), "sem aviso no Linux");
         match v[5]["detail_code"].as_str() {
             Some("disk") => {
                 let parts = v[5]["detail_parts"].as_array().expect("partes");

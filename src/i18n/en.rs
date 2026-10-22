@@ -5,13 +5,15 @@ pub const MESSAGES: &[(&str, &str)] = &[
     // Help and executable messages.
     (
         "cli.usage",
-        "usage: nants [--no-open] [--port N] [--config PATH] | nants serve [--port N] [--host H] [--config PATH] [--allow-remote] [--no-open] | nants doctor [--config PATH] | nants uninstall [--purge] | nants --version\n\
-nants         starts Nants on 127.0.0.1 and opens the browser (--no-open turns this off)\n\
+        "usage: nants [--no-open] [--lan] [--port N] [--config PATH] | nants serve [--port N] [--host H | --lan] [--config PATH] [--allow-remote] [--no-open] | nants doctor [--config PATH] | nants uninstall [--purge] | nants --version\n\
+nants         starts Nants and opens the browser (--no-open turns this off); on 127.0.0.1, or on the local network if turned on in Settings > Network access\n\
 nants serve   starts Nants without opening the browser\n\
 nants doctor  checks the environment (Docker, Compose, Git, port, disk) without changing anything\n\
 nants uninstall          removes the executable; keeps settings, data and projects (asks first)\n\
 nants uninstall --purge  also removes the settings and data; never the projects or Docker\n\
---port N      fixed port; fails if it is busy (without --port, the default 3000 or the next free one)",
+--port N      fixed port; fails if it is busy (without --port, the default 3000 or the next free one)\n\
+--lan         accepts access from the local network (0.0.0.0) for this run only, with the app preview ports right after the port (3001 to 3010); to keep it on, use Settings > Network access\n\
+--allow-remote  allows a --host outside loopback (the server is exposed on that address)",
     ),
     ("cli.unknown_command", "unknown command: {command}"),
     ("cli.unknown_arg", "unknown argument: {arg}"),
@@ -35,7 +37,20 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("cli.exposed", "warning: server exposed on {host}; the Host check only accepts loopback names"),
     ("cli.local_addr_failed", "could not get the local address: {error}"),
     ("cli.view_ports", "  app preview ports: {start} to {end}"),
-    ("cli.lan_warning", "warning: --lan mode; any device on the local network can control Nants (no authentication)"),
+    ("cli.lan_warning", "warning: local network access is on; any device on the local network can control Nants (no authentication)"),
+    (
+        "cli.lan_adopted",
+        "Local network access turned on (Windows is already set up). To turn it off: Settings > Network access.",
+    ),
+    ("cli.lan_save_failed", "warning: could not save the option in the settings ({error}); it applies only to this run"),
+    (
+        "cli.port_redirected",
+        "port {port} is redirected by Windows (network access set up before); Nants is on port {next}. To use port {port} again, turn local network access on in Settings > Network access or undo the redirect there.",
+    ),
+    (
+        "cli.port_redirected_explicit",
+        "port {port} is redirected by Windows (network access set up before), so in local mode the browser would not open the page. Pick another one with --port N, turn local network access on in Settings > Network access or undo the redirect there.",
+    ),
     ("cli.open_browser", "open in the browser: {url}"),
     ("cli.open_failed", "could not open the browser; open {url} yourself"),
     ("cli.server_error", "server error: {error}"),
@@ -77,6 +92,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("doctor.status.ok", "OK"),
     ("doctor.status.fail", "FAIL"),
     ("doctor.status.info", "INFO"),
+    ("doctor.status.warn", "WARN"),
     ("doctor.action", ". Action: {fix}"),
     ("doctor.summary.ok", "All set. Type nants to open Nants in the browser."),
     ("doctor.summary.fail", "Something required is missing: follow the action of the FAIL items and run nants doctor again."),
@@ -89,6 +105,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("doctor.label.port", "Nants port"),
     ("doctor.label.disk", "Disk space"),
     ("doctor.label.wsl", "WSL"),
+    ("doctor.label.windows_port_redirect", "Local network access"),
     ("doctor.label.playwright_images", "Playwright images"),
     ("doctor.label.version", "Nants version"),
     // nants doctor: suggested action by the stable item id.
@@ -112,6 +129,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("doctor.fix.port", "Close the program using these ports or pick another one with nants --port N."),
     ("doctor.fix.disk", "Free up disk space: Nants needs at least 5 GB free for Docker images and projects."),
     ("doctor.fix.version", "To update, run: {command}"),
+    (
+        "doctor.fix.windows_port_redirect",
+        "Open Settings > Network access: turn local network access on or off and run the script shown there (set up or undo) in PowerShell as administrator.",
+    ),
     // nants doctor: details.
     ("doctor.detail.git_missing", "git not found"),
     ("doctor.detail.docker_missing", "docker not found"),
@@ -134,6 +155,54 @@ nants uninstall --purge  also removes the settings and data; never the projects 
         "detected: Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
     ),
     ("doctor.detail.wsl_absent", "not detected (Linux)"),
+    (
+        "doctor.detail.env_wsl_nat",
+        "WSL in NAT networking mode (the default); Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+    ),
+    (
+        "doctor.detail.env_wsl_mirrored",
+        "WSL in mirrored networking mode; Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+    ),
+    (
+        "doctor.detail.env_wsl_unknown",
+        "WSL (could not check the networking mode; treated as NAT); Docker may be Docker Desktop with WSL integration turned on or Docker Engine inside the distribution",
+    ),
+    (
+        "doctor.detail.windows_redirect_on",
+        "Windows is redirecting port {port} to WSL (network access set up before), but local network access is off: in local mode the browser does not open the page on that port and nants uses another one. Turn local network access on or undo the redirect",
+    ),
+    ("doctor.detail.windows_redirect_off", "local network access is off and Windows does not redirect port {port}"),
+    ("doctor.detail.windows_redirect_unknown", "could not check with the Windows netsh.exe"),
+    ("doctor.detail.firewall_unknown", "could not check the Windows firewall rule with PowerShell"),
+    ("doctor.detail.lan_on_ok", "local network access is on and Windows is set up for port {port}"),
+    (
+        "doctor.detail.lan_on_mirrored_ok",
+        "local network access is on and the Windows firewall rule Nants exists (mirrored mode, port {port})",
+    ),
+    (
+        "doctor.detail.lan_on_no_redirect",
+        "local network access is on, but Windows does not redirect port {port} to WSL: other devices cannot reach Nants. Run the script",
+    ),
+    (
+        "doctor.detail.lan_on_other_target",
+        "local network access is on, but Windows redirects port {port} to another address (the WSL IP changes when Windows restarts). Run the script again",
+    ),
+    (
+        "doctor.detail.lan_on_no_firewall",
+        "local network access is on, but the Windows firewall rule Nants is missing: other devices cannot reach port {port}. Run the script",
+    ),
+    (
+        "doctor.detail.lan_will_adopt",
+        "Windows already redirects port {port} to this WSL and has the firewall rule Nants: the next nants start turns local network access on",
+    ),
+    (
+        "doctor.detail.lan_linux_on",
+        "on: Nants listens on the local network (port {port}); if another device cannot open it, allow the port in the Linux firewall",
+    ),
+    (
+        "doctor.detail.lan_linux_off",
+        "off: Nants opens only on this computer; to turn it on, use Settings > Network access",
+    ),
     (
         "doctor.detail.playwright_no_docker",
         "not checked: Docker unavailable. The first browser test of a project downloads about 2 GB",

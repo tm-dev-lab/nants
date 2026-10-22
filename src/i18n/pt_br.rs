@@ -5,13 +5,15 @@ pub const MESSAGES: &[(&str, &str)] = &[
     // Ajuda e mensagens do executável.
     (
         "cli.usage",
-        "uso: nants [--no-open] [--port N] [--config PATH] | nants serve [--port N] [--host H] [--config PATH] [--allow-remote] [--no-open] | nants doctor [--config PATH] | nants uninstall [--purge] | nants --version\n\
-nants         sobe o Nants em 127.0.0.1 e abre o navegador (--no-open desliga)\n\
+        "uso: nants [--no-open] [--lan] [--port N] [--config PATH] | nants serve [--port N] [--host H | --lan] [--config PATH] [--allow-remote] [--no-open] | nants doctor [--config PATH] | nants uninstall [--purge] | nants --version\n\
+nants         sobe o Nants e abre o navegador (--no-open desliga); em 127.0.0.1, ou na rede local se ligada em Configurações > Acesso pela rede\n\
 nants serve   sobe o Nants sem abrir o navegador\n\
 nants doctor  confere o ambiente (Docker, Compose, Git, porta, disco) sem alterar nada\n\
 nants uninstall          remove o executável; mantém configuração, dados e projetos (pede confirmação)\n\
 nants uninstall --purge  remove também a configuração e os dados; nunca os projetos nem o Docker\n\
---port N      porta fixa; se estiver ocupada, falha (sem --port, a padrão 3000 ou a próxima livre)",
+--port N      porta fixa; se estiver ocupada, falha (sem --port, a padrão 3000 ou a próxima livre)\n\
+--lan         aceita acesso pela rede local (0.0.0.0) só nesta execução, com as portas das prévias dos apps logo após a porta (3001 a 3010); para deixar ligado, use Configurações > Acesso pela rede\n\
+--allow-remote  permite um --host fora do loopback (o servidor fica exposto nesse endereço)",
     ),
     ("cli.unknown_command", "comando desconhecido: {command}"),
     ("cli.unknown_arg", "argumento desconhecido: {arg}"),
@@ -38,7 +40,20 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("cli.exposed", "aviso: servidor exposto em {host}; a validação de Host aceita apenas nomes de loopback"),
     ("cli.local_addr_failed", "erro ao obter endereço local: {error}"),
     ("cli.view_ports", "  portas de visualização dos apps: {start} a {end}"),
-    ("cli.lan_warning", "aviso: modo --lan; qualquer aparelho da rede local pode controlar o Nants (sem autenticação)"),
+    ("cli.lan_warning", "aviso: acesso pela rede local ligado; qualquer aparelho da rede local pode controlar o Nants (sem autenticação)"),
+    (
+        "cli.lan_adopted",
+        "Acesso pela rede local ligado (o Windows já está configurado). Para desligar: Configurações > Acesso pela rede.",
+    ),
+    ("cli.lan_save_failed", "aviso: não foi possível salvar a opção na configuração ({error}); ela vale só nesta execução"),
+    (
+        "cli.port_redirected",
+        "a porta {port} está redirecionada pelo Windows (acesso pela rede configurado antes); o Nants está na porta {next}. Para usar a {port} de novo, ligue o acesso pela rede local em Configurações > Acesso pela rede ou desfaça o redirecionamento lá.",
+    ),
+    (
+        "cli.port_redirected_explicit",
+        "a porta {port} está redirecionada pelo Windows (acesso pela rede configurado antes) e, no modo local, o navegador não abriria a página. Escolha outra com --port N, ligue o acesso pela rede local em Configurações > Acesso pela rede ou desfaça o redirecionamento lá.",
+    ),
     ("cli.open_browser", "abra no navegador: {url}"),
     ("cli.open_failed", "não foi possível abrir o navegador; abra {url} manualmente"),
     ("cli.server_error", "erro no servidor: {error}"),
@@ -80,6 +95,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("doctor.status.ok", "OK"),
     ("doctor.status.fail", "FALHA"),
     ("doctor.status.info", "INFO"),
+    ("doctor.status.warn", "AVISO"),
     ("doctor.action", ". Ação: {fix}"),
     ("doctor.summary.ok", "Tudo pronto. Digite nants para abrir o Nants no navegador."),
     ("doctor.summary.fail", "Falta algo obrigatório: siga a ação dos itens com FALHA e rode nants doctor de novo."),
@@ -92,6 +108,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("doctor.label.port", "Porta do Nants"),
     ("doctor.label.disk", "Espaço em disco"),
     ("doctor.label.wsl", "WSL"),
+    ("doctor.label.windows_port_redirect", "Acesso pela rede local"),
     ("doctor.label.playwright_images", "Imagens do Playwright"),
     ("doctor.label.version", "Versão do Nants"),
     // nants doctor: ação sugerida pelo id estável do item.
@@ -118,6 +135,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "Libere espaço em disco: o Nants precisa de pelo menos 5 GB livres para as imagens Docker e os projetos.",
     ),
     ("doctor.fix.version", "Para atualizar, rode: {command}"),
+    (
+        "doctor.fix.windows_port_redirect",
+        "Abra Configurações > Acesso pela rede: ligue ou desligue o acesso pela rede local e rode o script indicado ali (configurar ou desfazer) no PowerShell como administrador.",
+    ),
     // nants doctor: detalhes.
     ("doctor.detail.git_missing", "git não encontrado"),
     ("doctor.detail.docker_missing", "docker não encontrado"),
@@ -140,6 +161,54 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "detectado: o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
     ),
     ("doctor.detail.wsl_absent", "não detectado (Linux)"),
+    (
+        "doctor.detail.env_wsl_nat",
+        "WSL no modo de rede NAT (o padrão); o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+    ),
+    (
+        "doctor.detail.env_wsl_mirrored",
+        "WSL no modo de rede espelhado; o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+    ),
+    (
+        "doctor.detail.env_wsl_unknown",
+        "WSL (não foi possível conferir o modo de rede; tratado como NAT); o Docker pode ser o Docker Desktop com a integração WSL ligada ou o Docker Engine dentro da distribuição",
+    ),
+    (
+        "doctor.detail.windows_redirect_on",
+        "o Windows está redirecionando a porta {port} para o WSL (acesso pela rede configurado antes), mas o acesso pela rede local está desligado: no modo local, o navegador não abre a página nessa porta e o nants usa outra. Ligue o acesso pela rede local ou desfaça o redirecionamento",
+    ),
+    ("doctor.detail.windows_redirect_off", "acesso pela rede local desligado e o Windows não redireciona a porta {port}"),
+    ("doctor.detail.windows_redirect_unknown", "não foi possível conferir pelo netsh.exe do Windows"),
+    ("doctor.detail.firewall_unknown", "não foi possível conferir a regra de firewall pelo PowerShell do Windows"),
+    ("doctor.detail.lan_on_ok", "acesso pela rede local ligado e o Windows configurado para a porta {port}"),
+    (
+        "doctor.detail.lan_on_mirrored_ok",
+        "acesso pela rede local ligado e a regra de firewall Nants presente no Windows (modo espelhado, porta {port})",
+    ),
+    (
+        "doctor.detail.lan_on_no_redirect",
+        "acesso pela rede local ligado, mas o Windows não redireciona a porta {port} para o WSL: outros aparelhos não alcançam o Nants. Rode o script",
+    ),
+    (
+        "doctor.detail.lan_on_other_target",
+        "acesso pela rede local ligado, mas o Windows redireciona a porta {port} para outro endereço (o IP do WSL muda quando o Windows reinicia). Rode o script de novo",
+    ),
+    (
+        "doctor.detail.lan_on_no_firewall",
+        "acesso pela rede local ligado, mas falta a regra de firewall Nants no Windows: outros aparelhos não alcançam a porta {port}. Rode o script",
+    ),
+    (
+        "doctor.detail.lan_will_adopt",
+        "o Windows já redireciona a porta {port} para este WSL e tem a regra de firewall Nants: o próximo início do nants liga o acesso pela rede local",
+    ),
+    (
+        "doctor.detail.lan_linux_on",
+        "ligado: o Nants escuta na rede local (porta {port}); se outro aparelho não abrir, libere a porta no firewall do Linux",
+    ),
+    (
+        "doctor.detail.lan_linux_off",
+        "desligado: o Nants só abre neste computador; para ligar, use Configurações > Acesso pela rede",
+    ),
     (
         "doctor.detail.playwright_no_docker",
         "não verificado: Docker indisponível. O primeiro teste de navegador de um projeto baixa cerca de 2 GB",

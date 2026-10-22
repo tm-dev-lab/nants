@@ -174,9 +174,12 @@ async fn doctor_command(args: &[String], lang: Lang) -> ExitCode {
     };
     let input = server::doctor::DoctorInput {
         runner: server::prereqs::real_runner(server::prereqs::PREREQ_CMD_TIMEOUT),
+        windows: server::portproxy::WinTools::real(),
         port: cfg.server.port,
         disk_paths: server::doctor::disk_paths(&cfg),
         wsl: server::netinfo::running_on_wsl(),
+        saved_lan: cfg.server.lan,
+        local_ips: server::netinfo::local_ipv4_addrs(),
         releases_base: env::var(server::doctor::RELEASES_URL_ENV).ok(),
         local_version: nants::version().to_string(),
         version_timeout: server::doctor::VERSION_CHECK_TIMEOUT,
@@ -251,30 +254,68 @@ fn uninstall_command(args: &[String], lang: Lang) -> ExitCode {
     }
 }
 
-/// Abre a porta do servidor. Com a porta escolhida pelo usuário (`--port`, inclusive 0) ou em
-/// `--lan`, só tenta a pedida. Sem isso, se a porta estiver ocupada, tenta as
+/// Abre a porta do servidor. Com a porta escolhida pelo usuário (`--port`, inclusive 0) ou no
+/// acesso pela rede local, só tenta a pedida. Sem isso, se a porta estiver ocupada, tenta as
 /// `PORT_FALLBACK_TRIES` seguintes e devolve a primeira livre.
-async fn bind_listener(host: &str, port: u16, allow_fallback: bool, lang: Lang) -> Result<TcpListener, String> {
+///
+/// `redirected` são as portas que o Windows redireciona para o WSL (spec 111; vazio fora do modo
+/// local no WSL ou quando não deu para conferir): no modo local elas contam como ocupadas, porque
+/// o navegador do Windows não abriria a página nelas. Com a porta pedida explicitamente e
+/// redirecionada, falha com a explicação.
+async fn bind_listener(
+    host: &str,
+    port: u16,
+    allow_fallback: bool,
+    redirected: &[u16],
+    lang: Lang,
+) -> Result<TcpListener, String> {
     let (port_s, host_s) = (port.to_string(), host.to_string());
-    match TcpListener::bind((host, port)).await {
-        Ok(listener) => Ok(listener),
-        Err(e) if allow_fallback && e.kind() == std::io::ErrorKind::AddrInUse => {
-            let last = port.saturating_add(PORT_FALLBACK_TRIES);
-            let mut next = port;
-            while next < last {
-                next += 1;
-                if let Ok(listener) = TcpListener::bind((host, next)).await {
-                    println!("{}", tr(lang, "cli.port_fallback", &[("port", &port_s), ("next", &next.to_string())]));
-                    return Ok(listener);
-                }
-            }
-            Err(tr(lang, "cli.ports_busy", &[("port", &port_s), ("last", &last.to_string()), ("host", &host_s)]))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            Err(tr(lang, "cli.port_in_use", &[("port", &port_s), ("host", &host_s)]))
-        }
-        Err(e) => Err(tr(lang, "cli.bind_failed", &[("host", &host_s), ("port", &port_s), ("error", &e.to_string())])),
+    let port_redirected = redirected.contains(&port);
+    if port_redirected && !allow_fallback {
+        return Err(tr(lang, "cli.port_redirected_explicit", &[("port", &port_s)]));
     }
+    if !port_redirected {
+        match TcpListener::bind((host, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if allow_fallback && e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(tr(lang, "cli.port_in_use", &[("port", &port_s), ("host", &host_s)]));
+            }
+            Err(e) => {
+                return Err(tr(lang, "cli.bind_failed", &[("host", &host_s), ("port", &port_s), ("error", &e.to_string())]));
+            }
+        }
+    }
+    let last = port.saturating_add(PORT_FALLBACK_TRIES);
+    for next in server::lan::candidate_ports(port, PORT_FALLBACK_TRIES, redirected).into_iter().filter(|p| *p != port) {
+        if let Ok(listener) = TcpListener::bind((host, next)).await {
+            let key = if port_redirected { "cli.port_redirected" } else { "cli.port_fallback" };
+            println!("{}", tr(lang, key, &[("port", &port_s), ("next", &next.to_string())]));
+            return Ok(listener);
+        }
+    }
+    Err(tr(lang, "cli.ports_busy", &[("port", &port_s), ("last", &last.to_string()), ("host", &host_s)]))
+}
+
+/// Conferência do Windows ao subir (spec 111): só no WSL e só o que a decisão precisa, em paralelo
+/// e com prazo curto. `None` quando nada precisa ser conferido.
+async fn startup_windows_view(
+    parsed: &ServeArgs,
+    saved: Option<bool>,
+    port: u16,
+    local_ips: &[std::net::Ipv4Addr],
+) -> Option<server::lan::WindowsView> {
+    if !server::netinfo::running_on_wsl() || port == 0 {
+        return None;
+    }
+    let needs = server::lan::startup_needs(parsed.lan, parsed.host.is_some(), saved, port)?;
+    let ips = local_ips.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let tools = server::portproxy::WinTools::real();
+        server::lan::probe(&tools, true, needs, &ips, server::lan::PROBE_DEADLINE)
+    })
+    .await
+    .ok()
 }
 
 /// URL para abrir no navegador: sempre por loopback quando o servidor escuta em todas as
@@ -296,23 +337,17 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
             return ExitCode::from(2);
         }
     };
-    let lan = parsed.lan;
     let open_browser = open_browser && !parsed.no_open;
     let explicit_port = parsed.port.is_some();
-    let host = if lan {
-        "0.0.0.0".to_string()
-    } else {
-        parsed.host.unwrap_or_else(|| DEFAULT_HOST.to_string())
-    };
-    if !lan && !is_loopback_host(&host) {
+    if let Some(host) = parsed.host.as_deref().filter(|h| !is_loopback_host(h)) {
         if !parsed.allow_remote {
-            eprintln!("{}", err(&tr(lang, "cli.not_loopback", &[("host", &host)])));
+            eprintln!("{}", err(&tr(lang, "cli.not_loopback", &[("host", host)])));
             return ExitCode::from(2);
         }
-        eprintln!("{}", tr(lang, "cli.exposed", &[("host", &host)]));
+        eprintln!("{}", tr(lang, "cli.exposed", &[("host", host)]));
     }
 
-    let config_path = match parsed.config {
+    let config_path = match parsed.config.clone() {
         Some(path) => path,
         None => match config::default_path() {
             Ok(path) => path,
@@ -322,7 +357,7 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
             }
         },
     };
-    let cfg = match Config::load_from(&config_path) {
+    let mut cfg = match Config::load_from(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
             let path = config_path.display().to_string();
@@ -332,6 +367,32 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
         }
     };
     let port = parsed.port.unwrap_or(cfg.server.port);
+
+    // Modo desta execução (spec 111): `--lan`/`--host`, a opção salva, a adoção ou o modo local.
+    let local_ips = server::netinfo::local_ipv4_addrs();
+    let windows = startup_windows_view(&parsed, cfg.server.lan, port, &local_ips).await;
+    let adoptable = windows
+        .as_ref()
+        .is_some_and(|v| server::lan::adoption_applies(v.env, v.target(port, &local_ips), v.firewall));
+    let decision = server::lan::decide_mode(parsed.lan, parsed.host.is_some(), cfg.server.lan, adoptable);
+    if decision.source == server::lan::ModeSource::Adopted {
+        cfg.server.lan = Some(true);
+        if let Err(e) = server::config_api::save_atomic(&config_path, &cfg) {
+            eprintln!("{}", tr(lang, "cli.lan_save_failed", &[("error", &describe_config_error(&e, lang))]));
+        }
+        println!("{}", text(lang, "cli.lan_adopted"));
+    }
+    let lan = decision.lan;
+    let host = if lan {
+        "0.0.0.0".to_string()
+    } else {
+        parsed.host.clone().unwrap_or_else(|| DEFAULT_HOST.to_string())
+    };
+    // No modo local, as portas redirecionadas pelo Windows contam como ocupadas.
+    let redirected = match (&windows, lan) {
+        (Some(view), false) => server::lan::redirected_ports(view.table.as_deref()),
+        _ => Vec::new(),
+    };
     // Faixa das portas de visualização (spec 097): validada antes de abrir a porta. Com
     // `--port 0` a porta efetiva só é conhecida depois do bind e a faixa é validada de novo lá.
     if port != 0 {
@@ -342,7 +403,7 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
     }
     let configured_view_ports = cfg.server.lan_view_ports;
 
-    let listener = match bind_listener(&host, port, !explicit_port && !lan && port != 0, lang).await {
+    let listener = match bind_listener(&host, port, !explicit_port && !lan && port != 0, &redirected, lang).await {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("{}", err(&e));
@@ -364,7 +425,8 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
             return ExitCode::from(2);
         }
     };
-    let mut state = AppState::new(config_path, cfg, addr.port());
+    let run = server::lan::NetworkRun { lan, source: decision.source, requested_port: port };
+    let mut state = AppState::new(config_path, cfg, addr.port()).with_network_run(run);
     if lan {
         for ip in server::netinfo::local_ipv4_addrs() {
             println!("  http://{ip}:{}", addr.port());
@@ -427,7 +489,12 @@ mod tests {
         for u in [&pt, &en] {
             assert!(u.contains("--no-open") && u.contains("nants serve") && u.contains("nants doctor"), "{u}");
             assert!(u.contains("nants uninstall --purge"), "{u}");
+            assert!(u.contains("[--lan]") && u.contains("\n--lan ") && u.contains("3001"), "{u}");
+            assert!(u.contains("\n--allow-remote "), "{u}");
         }
+        assert!(pt.contains("acesso pela rede local") && en.contains("access from the local network"));
+        assert!(pt.contains("só nesta execução") && pt.contains("Configurações > Acesso pela rede"), "{pt}");
+        assert!(en.contains("for this run only") && en.contains("Settings > Network access"), "{en}");
         assert_eq!(parse_serve_args(&args(&["--wat"]), Lang::En), Err("unknown argument: --wat".into()));
         assert_eq!(parse_serve_args(&args(&["--wat"]), Lang::PtBr), Err("argumento desconhecido: --wat".into()));
         assert_eq!(parse_serve_args(&args(&["--port"]), Lang::En), Err("--port needs a value".into()));
@@ -493,15 +560,57 @@ mod tests {
     async fn bind_listener_falls_back_only_when_allowed() {
         let busy = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
         let port = busy.local_addr().expect("addr").port();
-        let err = bind_listener("127.0.0.1", port, false, Lang::PtBr).await.expect_err("ocupada");
+        let err = bind_listener("127.0.0.1", port, false, &[], Lang::PtBr).await.expect_err("ocupada");
         assert!(err.contains("já está em uso") && err.contains("--port"), "{err}");
-        let err = bind_listener("127.0.0.1", port, false, Lang::En).await.expect_err("ocupada");
+        let err = bind_listener("127.0.0.1", port, false, &[], Lang::En).await.expect_err("ocupada");
         assert!(err.contains("is already in use") && err.contains("--port"), "{err}");
         if port < u16::MAX - PORT_FALLBACK_TRIES {
-            let other = bind_listener("127.0.0.1", port, true, Lang::PtBr).await.expect("fallback");
+            let other = bind_listener("127.0.0.1", port, true, &[], Lang::PtBr).await.expect("fallback");
             let chosen = other.local_addr().expect("addr").port();
             assert!(chosen > port && chosen <= port + PORT_FALLBACK_TRIES, "{chosen}");
         }
+    }
+
+    #[tokio::test]
+    async fn redirected_ports_count_as_busy_and_explicit_one_fails_with_the_reason() {
+        // Porta livre (aberta e fechada) tratada como redirecionada pelo Windows.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        if port >= u16::MAX - PORT_FALLBACK_TRIES {
+            return;
+        }
+        // A seguinte também está redirecionada: o Nants pula as duas.
+        let redirected = [port, port + 1];
+        let chosen = bind_listener("127.0.0.1", port, true, &redirected, Lang::PtBr).await.expect("pula");
+        let chosen = chosen.local_addr().expect("addr").port();
+        assert!(chosen > port + 1 && chosen <= port + PORT_FALLBACK_TRIES, "{chosen}");
+        // `--port` explícito numa porta redirecionada falha com a explicação, nos dois idiomas.
+        let err = bind_listener("127.0.0.1", port, false, &redirected, Lang::PtBr).await.expect_err("explícita");
+        assert!(err.contains("redirecionada pelo Windows") && err.contains("Configurações > Acesso pela rede"), "{err}");
+        let err = bind_listener("127.0.0.1", port, false, &redirected, Lang::En).await.expect_err("explícita");
+        assert!(err.contains("redirected by Windows") && err.contains("Settings > Network access"), "{err}");
+        // Sem conferência (lista vazia), nada muda: usa a pedida.
+        let same = bind_listener("127.0.0.1", port, false, &[], Lang::PtBr).await.expect("livre");
+        assert_eq!(same.local_addr().expect("addr").port(), port);
+    }
+
+    #[test]
+    fn redirect_messages_explain_and_point_to_the_settings() {
+        for (lang, words) in [
+            (Lang::PtBr, ["a porta 3000 está redirecionada pelo Windows", "o Nants está na porta 3001", "Configurações > Acesso pela rede"]),
+            (Lang::En, ["port 3000 is redirected by Windows", "Nants is on port 3001", "Settings > Network access"]),
+        ] {
+            let line = tr(lang, "cli.port_redirected", &[("port", "3000"), ("next", "3001")]);
+            for w in words {
+                assert!(line.contains(w), "{line}");
+            }
+        }
+        assert_eq!(
+            text(Lang::PtBr, "cli.lan_adopted"),
+            "Acesso pela rede local ligado (o Windows já está configurado). Para desligar: Configurações > Acesso pela rede."
+        );
+        assert!(text(Lang::En, "cli.lan_adopted").starts_with("Local network access turned on (Windows is already set up)."));
     }
 
     #[test]

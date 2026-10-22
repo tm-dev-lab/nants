@@ -47,14 +47,18 @@ export function firstPendingStep(readiness: Readiness | null, projectCount: numb
   return SETUP_STEPS.find((step) => !stepDone(readiness, step, projectCount)) ?? "project";
 }
 
-/** Item do diagnóstico da máquina (`GET /api/system/prereqs`), com o marcador informativo da spec 103. */
-export type DiagnosisItem = PrereqItem & { info?: boolean };
+/**
+ * Item do diagnóstico da máquina (`GET /api/system/prereqs`), com o marcador informativo da spec 103
+ * e o aviso que não bloqueia da spec 111 (`warn`), ambos vindos do servidor.
+ */
+export type DiagnosisItem = PrereqItem;
 
-type DiagnosisStatus = "ok" | "fail" | "info";
+type DiagnosisStatus = "ok" | "fail" | "info" | "warn";
 
-/** Estado de uma linha do diagnóstico: o mesmo OK, FALHA e INFO do `nants doctor`. */
+/** Estado de uma linha do diagnóstico: o mesmo OK, FALHA, INFO e AVISO do `nants doctor`. */
 export function diagnosisStatus(item: DiagnosisItem): DiagnosisStatus {
   if (!item.ok) return "fail";
+  if (item.warn === true) return "warn";
   return item.info === true ? "info" : "ok";
 }
 
@@ -63,6 +67,7 @@ export const DIAGNOSIS_STATUS_LABELS: Readonly<Record<DiagnosisStatus, string>> 
   ok: "setup.status.ok",
   fail: "setup.status.fail",
   info: "setup.status.info",
+  warn: "setup.status.warn",
 });
 
 /** Subtítulo vivo da janela. */

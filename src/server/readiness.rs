@@ -293,6 +293,7 @@ fn timed_out_items() -> Vec<PrereqItem> {
                 detail: detail.as_ref().map(|m| m.render(Lang::PtBr)),
                 fix: pending.then(|| fix_for("docker_daemon")),
                 info: false,
+                warn: false,
                 detail_msg: detail,
             }
         })
