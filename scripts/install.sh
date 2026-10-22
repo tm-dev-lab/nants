@@ -3,12 +3,14 @@
 #
 #   curl -fsSL https://nants.tmdevlab.com/install.sh | sh
 #   curl -fsSL https://nants.tmdevlab.com/install.sh | NANTS_VERSION=0.1.0 sh
+#   curl -fsSL https://nants.tmdevlab.com/install.sh | NANTS_VERSION=0.1.0-rc.1 sh
 #
 # O que faz, sem perguntar nada e sem sudo:
 #   1. confere o sistema (Linux ou WSL2; x86_64 ou aarch64) e as ferramentas (curl, tar, gzip,
 #      sha256sum);
 #   2. lê o manifesto ${NANTS_RELEASES_URL:-https://nants.tmdevlab.com}/latest.json e escolhe o
-#      pacote da arquitetura (com NANTS_VERSION=X.Y.Z, a versão pedida, no mesmo endereço);
+#      pacote da arquitetura (com NANTS_VERSION=X.Y.Z ou X.Y.Z-rc.N, a versão pedida, no mesmo
+#      endereço);
 #   3. baixa o pacote para uma pasta temporária, confere o SHA-256 e só então grava
 #      ~/.local/bin/nants (rodar de novo atualiza);
 #   4. avisa se ~/.local/bin não está no PATH e roda nants doctor.
@@ -50,7 +52,7 @@ msg() {
       os_unsupported) f='Sistema não suportado: %s. O Nants roda no Linux e no WSL2 do Windows.' ;;
       arch_unsupported) f='Arquitetura não suportada: %s. O Nants roda em x86_64 e aarch64.' ;;
       missing_tool) f='Falta o comando %s. Instale-o (ex.: sudo apt install %s) e rode o instalador de novo.' ;;
-      bad_version) f='NANTS_VERSION inválida: %s. Use o formato X.Y.Z, ex.: NANTS_VERSION=0.1.0' ;;
+      bad_version) f='NANTS_VERSION inválida: %s. Use o formato X.Y.Z ou X.Y.Z-rc.N, ex.: NANTS_VERSION=0.1.0' ;;
       manifest) f='Lendo as versões em %s' ;;
       manifest_failed) f='Não foi possível ler %s. Confira a conexão e tente de novo.' ;;
       manifest_bad) f='O manifesto %s está incompleto ou inválido. Tente de novo mais tarde.' ;;
@@ -63,6 +65,8 @@ msg() {
       install_failed) f='Não foi possível gravar %s.' ;;
       installed) f='Nants %s instalado em %s' ;;
       updated) f='Nants atualizado em %s (antes: %s, agora: %s)' ;;
+      replaced) f='Nants %s instalado em %s, no lugar do executável anterior (que também diz %s).' ;;
+      prerelease) f='Esta é uma pré-release: o nants --version mostra %s.' ;;
       path_missing) f='%s não está no PATH. Para usar agora, rode:' ;;
       path_forever) f='Para valer sempre, inclua a linha no seu %s e feche e reabra o terminal:' ;;
       doctor) f='Conferindo o ambiente (nants doctor):' ;;
@@ -78,7 +82,7 @@ msg() {
       os_unsupported) f='Unsupported system: %s. Nants runs on Linux and on Windows WSL2.' ;;
       arch_unsupported) f='Unsupported architecture: %s. Nants runs on x86_64 and aarch64.' ;;
       missing_tool) f='The %s command is missing. Install it (e.g. sudo apt install %s) and run the installer again.' ;;
-      bad_version) f='Invalid NANTS_VERSION: %s. Use the X.Y.Z format, e.g. NANTS_VERSION=0.1.0' ;;
+      bad_version) f='Invalid NANTS_VERSION: %s. Use the X.Y.Z or X.Y.Z-rc.N format, e.g. NANTS_VERSION=0.1.0' ;;
       manifest) f='Reading the versions at %s' ;;
       manifest_failed) f='Could not read %s. Check your connection and try again.' ;;
       manifest_bad) f='The manifest %s is incomplete or invalid. Try again later.' ;;
@@ -91,6 +95,8 @@ msg() {
       install_failed) f='Could not write %s.' ;;
       installed) f='Nants %s installed at %s' ;;
       updated) f='Nants updated at %s (before: %s, now: %s)' ;;
+      replaced) f='Nants %s installed at %s, replacing the previous executable (which also reports %s).' ;;
+      prerelease) f='This is a pre-release: nants --version shows %s.' ;;
       path_missing) f='%s is not in your PATH. To use it now, run:' ;;
       path_forever) f='To keep it, add the line to your %s and close and reopen the terminal:' ;;
       doctor) f='Checking the environment (nants doctor):' ;;
@@ -164,12 +170,19 @@ json_obj() {
   printf '%s\n' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p"
 }
 
+# X.Y.Z ou a pré-release X.Y.Z-rc.N, e nada além disso.
 is_version() {
-  # Só dígitos e pontos, numa linha só (o grep abaixo olharia linha a linha).
+  # Só dígitos, pontos, "-", "r" e "c", numa linha só (o grep abaixo olharia linha a linha).
   case $1 in
-    '' | *[!0-9.]*) return 1 ;;
+    '' | *[!0-9.rc-]*) return 1 ;;
   esac
-  printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+  printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+}
+
+# Número que o próprio executável mostra no --version: o da pré-release X.Y.Z-rc.N é o X.Y.Z
+# (o Cargo.toml não tem o sufixo).
+core_version() {
+  printf '%s\n' "${1%%-rc.*}"
 }
 
 is_sha256() {
@@ -206,9 +219,10 @@ resolve_package() {
     SHA=$latest_sha
     return 0
   fi
-  # Versão específica: mesma base de endereço do pacote atual (o que vem antes de /vA.B.C/arquivo,
-  # ex.: https://github.com/tm-dev-lab/nants/releases/download), em vX.Y.Z/, com o .sha256 ao lado.
-  base=$(printf '%s\n' "$latest_url" | sed 's#/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/[^/]*$##')
+  # Versão específica: mesma base de endereço do pacote atual (o que vem antes de
+  # /vA.B.C/arquivo ou /vA.B.C-rc.N/arquivo, ex.: https://github.com/tm-dev-lab/nants/releases/download),
+  # em vX.Y.Z/ (ou vX.Y.Z-rc.N/), com o .sha256 ao lado.
+  base=$(printf '%s\n' "$latest_url" | sed 's#/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-rc\.[0-9][0-9]*\)\{0,1\}/[^/]*$##')
   [ -n "$base" ] && [ "$base" != "$latest_url" ] || die no_base "$WANTED"
   VERSION=$WANTED
   URL="$base/v$VERSION/nants-$VERSION-$TARGET.tar.gz"
@@ -244,11 +258,17 @@ install_binary() {
     rm -f "$staged"
     die install_failed "$dest"
   fi
-  if [ -n "$previous" ]; then
-    say updated "$dest" "$previous" "$VERSION"
-  else
+  # O --version da pré-release mostra o X.Y.Z dela: sem comparar rc, só diz o que se sabe. Se o
+  # anterior diz o mesmo número (a mesma versão de novo, ou a rc e a final dela), só registra a troca.
+  core=$(core_version "$VERSION")
+  if [ -z "$previous" ]; then
     say installed "$VERSION" "$dest"
+  elif [ "$previous" = "$core" ]; then
+    say replaced "$VERSION" "$dest" "$previous"
+  else
+    say updated "$dest" "$previous" "$VERSION"
   fi
+  [ "$core" = "$VERSION" ] || say prerelease "$core"
 }
 
 # Arquivo de inicialização do shell da pessoa, para a linha do PATH.

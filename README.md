@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
-  <a href="https://nants.tmdevlab.com/en/#install"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fnants.tmdevlab.com%2Flatest.json&query=%24.version&label=version&color=8b5cf6" alt="Latest version"></a>
+  <a href="https://github.com/tm-dev-lab/nants/releases"><img src="https://img.shields.io/github/v/release/tm-dev-lab/nants?include_prereleases&sort=semver&label=version&color=8b5cf6" alt="Latest version"></a>
   <a href="https://github.com/tm-dev-lab/nants/actions/workflows/ci.yml"><img src="https://github.com/tm-dev-lab/nants/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 

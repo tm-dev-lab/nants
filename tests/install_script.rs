@@ -96,8 +96,10 @@ fn serve(root: PathBuf) -> Server {
     Server { url: format!("http://127.0.0.1:{port}"), hits }
 }
 
-/// `nants` falso empacotado: `--version` e `doctor` (que, como sem Docker, sai com 1).
-fn fake_nants(version: &str, arch: &str) -> String {
+/// `nants` falso empacotado: `--version` e `doctor` (que, como sem Docker, sai com 1). Como o de
+/// verdade, o da pré-release `X.Y.Z-rc.N` diz só `nants X.Y.Z` (o Cargo.toml não tem o sufixo).
+fn fake_nants(label: &str, arch: &str) -> String {
+    let version = label.split("-rc.").next().unwrap_or(label);
     format!(
         "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"nants {version}\" ;;\n  doctor) echo \"doctor {version} {arch}\" >> \"$FAKE_LOG\"; echo \"DOCTOR FALSO {version}\"; exit 1 ;;\nesac\n"
     )
@@ -431,6 +433,115 @@ fn nants_version_works_with_github_release_urls() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(installed(&f).is_some_and(|b| b.contains("nants 0.4.2")), "{}", text(&out));
     assert_eq!(tmp_left(&f), 0);
+}
+
+/// Spec 110, T03: até a versão final, o site aponta para a pré-release `X.Y.Z-rc.N`.
+const GH: &str = "tm-dev-lab/nants/releases/download";
+
+/// Servidor com a `0.1.0-rc.1` (x86_64 e aarch64) como a última, nas Releases do GitHub, e a
+/// `0.1.0-rc.2` e a `0.1.0` (x86_64) disponíveis ao lado.
+fn rc_fixture(tag: &str) -> Fixture {
+    let f = fixture(tag, false, &[]);
+    let root = f.base.0.join("www");
+    let sum_x = package_at(&root, GH, "0.1.0-rc.1", "x86_64");
+    let sum_a = package_at(&root, GH, "0.1.0-rc.1", "aarch64");
+    package_at(&root, GH, "0.1.0-rc.2", "x86_64");
+    package_at(&root, GH, "0.1.0", "x86_64");
+    let json = manifest_at(&f.server.url, GH, "0.1.0-rc.1", &[("x86_64", sum_x), ("aarch64", sum_a)], false);
+    assert!(json.contains("\"version\": \"0.1.0-rc.1\""), "{json}");
+    write(&root.join("latest.json"), json.as_bytes());
+    f
+}
+
+fn hits(f: &Fixture) -> Vec<String> {
+    f.server.hits.lock().map(|h| h.clone()).unwrap_or_default()
+}
+
+#[test]
+fn rc_manifest_installs_the_prerelease_and_says_so() {
+    let f = rc_fixture("rc");
+    let out = run(&f, LINUX, &[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(installed(&f).is_some_and(|b| b.contains("nants 0.1.0\"") && b.contains("x86_64")), "{all}");
+    assert!(all.contains("Baixando o Nants 0.1.0-rc.1 (x86_64-linux)"), "{all}");
+    assert!(all.contains("Nants 0.1.0-rc.1 instalado em"), "{all}");
+    assert!(all.contains("pré-release: o nants --version mostra 0.1.0."), "{all}");
+    assert_eq!(hits(&f), ["/latest.json".to_string(), format!("/{GH}/v0.1.0-rc.1/nants-0.1.0-rc.1-x86_64-linux.tar.gz")]);
+    // De novo: o anterior também diz 0.1.0; sem inventar comparação de rc, só registra a troca.
+    let out = run(&f, Env { lang: "en_US.UTF-8", ..LINUX }, &[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(all.contains("Nants 0.1.0-rc.1 installed at"), "{all}");
+    assert!(all.contains("replacing the previous executable (which also reports 0.1.0)"), "{all}");
+    assert!(all.contains("This is a pre-release: nants --version shows 0.1.0."), "{all}");
+    assert!(!all.contains("updated"), "{all}");
+    assert_eq!(home_files(&f), [".local/bin/nants"]);
+    assert_eq!(tmp_left(&f), 0);
+}
+
+#[test]
+fn nants_version_rc_and_final_from_an_rc_manifest() {
+    let f = rc_fixture("rc-version");
+    // A base sai da URL da rc (.../v0.1.0-rc.1/arquivo); a rc pedida fica ao lado, com o .sha256.
+    let out = run(&f, LINUX, &[("NANTS_VERSION", "0.1.0-rc.2")]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(all.contains("Nants 0.1.0-rc.2 instalado em") && all.contains("pré-release"), "{all}");
+    assert_eq!(
+        hits(&f),
+        [
+            "/latest.json".to_string(),
+            format!("/{GH}/v0.1.0-rc.2/nants-0.1.0-rc.2-x86_64-linux.tar.gz.sha256"),
+            format!("/{GH}/v0.1.0-rc.2/nants-0.1.0-rc.2-x86_64-linux.tar.gz"),
+        ]
+    );
+    // A final pela mesma base, com o "v" opcional; nada de aviso de pré-release.
+    let out = run(&f, LINUX, &[("NANTS_VERSION", "v0.1.0")]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(all.contains("Nants 0.1.0 instalado em") && all.contains("que também diz 0.1.0"), "{all}");
+    assert!(!all.contains("pré-release"), "{all}");
+    assert!(hits(&f).ends_with(&[
+        format!("/{GH}/v0.1.0/nants-0.1.0-x86_64-linux.tar.gz.sha256"),
+        format!("/{GH}/v0.1.0/nants-0.1.0-x86_64-linux.tar.gz"),
+    ]));
+    // Inválidas: recusadas antes de baixar qualquer coisa.
+    let before = hits(&f).len();
+    for bad in ["0.1.0-beta", "0.1.0-rc", "0.1.0-rc.1.2", "0.1.0-rc.", "0.1.0-rc.1\n", "0.1.0-rc.1 ", "0.1.0-rc..1", "0.1.0-rc/1"] {
+        let out = run(&f, LINUX, &[("NANTS_VERSION", bad)]);
+        assert!(!out.status.success() && text(&out).contains("NANTS_VERSION inválida"), "{bad:?}: {}", text(&out));
+        assert!(text(&out).contains("X.Y.Z-rc.N"), "{}", text(&out));
+    }
+    assert_eq!(hits(&f).len(), before, "recusa antes de baixar");
+    assert!(installed(&f).is_some_and(|b| b.contains("nants 0.1.0")));
+}
+
+#[test]
+fn nants_version_rc_from_a_final_manifest() {
+    let f = fixture("final-to-rc", false, &[]);
+    let root = f.base.0.join("www");
+    package_at(&root, "files", "0.4.3-rc.1", "x86_64");
+    let out = run(&f, LINUX, &[("NANTS_VERSION", "0.4.3-rc.1")]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(installed(&f).is_some_and(|b| b.contains("nants 0.4.3\"")), "{all}");
+    assert!(all.contains("pré-release: o nants --version mostra 0.4.3."), "{all}");
+    assert!(hits(&f).ends_with(&["/files/v0.4.3-rc.1/nants-0.4.3-rc.1-x86_64-linux.tar.gz".to_string()]));
+}
+
+#[test]
+fn rc_manifest_with_a_bad_version_is_refused() {
+    for bad in ["0.1.0-rc", "0.1.0-beta.1", "0.1.0-rc.1.2"] {
+        let f = rc_fixture("rc-bad");
+        let path = f.base.0.join("www/latest.json");
+        let json = std::fs::read_to_string(&path).expect("latest.json").replace("\"version\": \"0.1.0-rc.1\"", &format!("\"version\": \"{bad}\""));
+        assert!(json.contains(&format!("\"version\": \"{bad}\"")), "{json}");
+        write(&path, json.as_bytes());
+        let out = run(&f, LINUX, &[]);
+        assert!(!out.status.success() && text(&out).contains("incompleto ou inválido"), "{bad}: {}", text(&out));
+        assert!(installed(&f).is_none());
+    }
 }
 
 #[test]
