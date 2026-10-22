@@ -328,6 +328,17 @@ fn browser_url(addr: std::net::SocketAddr) -> String {
     }
 }
 
+/// Link de entrada de uso único deste computador (spec 112), no endereço que o navegador abre
+/// (loopback quando a escuta é em todas as interfaces).
+fn entry_link_url(addr: std::net::SocketAddr, token: &str) -> String {
+    format!("{}{}?t={token}", browser_url(addr), server::devices::PAIR_LINK_PATH)
+}
+
+/// A escuta exige dispositivo autorizado (spec 112): qualquer endereço fora do loopback.
+fn listen_requires_device(addr: std::net::SocketAddr) -> bool {
+    !addr.ip().to_canonical().is_loopback()
+}
+
 async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitCode {
     let err = |message: &str| tr(lang, "cli.error", &[("message", message)]);
     let parsed = match parse_serve_args(args, lang) {
@@ -426,7 +437,8 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
         }
     };
     let run = server::lan::NetworkRun { lan, source: decision.source, requested_port: port };
-    let mut state = AppState::new(config_path, cfg, addr.port()).with_network_run(run);
+    let exposed = listen_requires_device(addr);
+    let mut state = AppState::new(config_path, cfg, addr.port()).with_network_run(run).with_exposed(exposed);
     if lan {
         for ip in server::netinfo::local_ipv4_addrs() {
             println!("  http://{ip}:{}", addr.port());
@@ -439,9 +451,32 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
         eprintln!("{}", text(lang, "cli.lan_warning"));
         state = state.with_host_policy(server::security::HostPolicy::Lan);
     }
+    // Em modo rede ou com escuta fora do loopback (spec 112), o navegador deste computador entra
+    // pelo link de uso único.
+    let entry_link = if lan || exposed {
+        match state.devices().issue_entry_link(lang) {
+            Ok(token) => {
+                let url = entry_link_url(addr, &token);
+                println!("{}", tr(lang, "cli.entry_link", &[("url", &url)]));
+                Some(url)
+            }
+            Err(_) => {
+                eprintln!("{}", err(&text(lang, "cli.entry_link_failed")));
+                None
+            }
+        }
+    } else {
+        None
+    };
     if open_browser {
-        let url = browser_url(addr);
-        println!("{}", tr(lang, "cli.open_browser", &[("url", &url)]));
+        let url = match entry_link {
+            Some(link) => link,
+            None => {
+                let url = browser_url(addr);
+                println!("{}", tr(lang, "cli.open_browser", &[("url", &url)]));
+                url
+            }
+        };
         // Em paralelo e com tempo limite curto: o servidor nunca espera pelo navegador.
         tokio::spawn(async move {
             if server::browser_open::open_default(&url).await.is_none() {
@@ -541,6 +576,26 @@ mod tests {
         assert!(view_ports_for(true, bad, 3000).expect_err("inclui a porta").contains("lan_view_ports"));
         assert!(view_ports_for(false, bad, 3000).is_err(), "configuração inválida falha mesmo sem --lan");
         assert!(view_ports_for(true, None, 65530).is_err());
+    }
+
+    #[test]
+    fn entry_link_goes_through_loopback_with_the_single_use_token() {
+        let any: std::net::SocketAddr = "0.0.0.0:3000".parse().expect("addr");
+        assert_eq!(entry_link_url(any, "abc123"), "http://127.0.0.1:3000/pair?t=abc123");
+        let host: std::net::SocketAddr = "192.168.1.5:3002".parse().expect("addr");
+        assert_eq!(entry_link_url(host, "x"), "http://192.168.1.5:3002/pair?t=x");
+        for exposed in ["0.0.0.0:3000", "192.168.1.5:3000", "[::]:3000", "[fe80::1]:3000"] {
+            assert!(listen_requires_device(exposed.parse().expect("addr")), "{exposed}");
+        }
+        for local in ["127.0.0.1:3000", "127.0.0.2:3000", "[::1]:3000"] {
+            assert!(!listen_requires_device(local.parse().expect("addr")), "{local}");
+        }
+        for lang in [Lang::PtBr, Lang::En] {
+            let line = tr(lang, "cli.entry_link", &[("url", "http://127.0.0.1:3000/pair?t=x")]);
+            assert!(line.ends_with("http://127.0.0.1:3000/pair?t=x") && line.contains("10"), "{line}");
+            let u = usage(lang);
+            assert!(u.contains("10 minut"), "{u}");
+        }
     }
 
     #[test]

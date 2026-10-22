@@ -16,6 +16,7 @@ pub mod chat;
 pub mod chat_attachments;
 pub mod choices;
 pub mod config_api;
+pub mod devices;
 pub mod dialog;
 pub mod doctor;
 pub mod envs;
@@ -52,7 +53,7 @@ pub mod ui_state;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::{from_fn, from_fn_with_state};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use tokio::net::TcpListener;
 
@@ -167,9 +168,26 @@ pub fn router(state: AppState) -> Router {
         .route("/api/readiness/refresh", post(readiness::post_refresh))
         .route("/api/fs/browse", get(fs_browse::browse))
         .route("/api/events", get(events::stream_events))
+        // Dispositivos autorizados na rede local (spec 112).
+        .route(devices::PAIR_LINK_PATH, get(devices::get_pair_link))
+        .route(devices::PAIR_API_PATH, post(devices::post_pair))
+        .route(
+            "/api/devices",
+            get(devices::get_devices).delete(devices::delete_devices),
+        )
+        .route(
+            "/api/devices/code",
+            get(devices::get_code).post(devices::post_code).delete(devices::delete_code),
+        )
+        .route(
+            "/api/devices/:id",
+            patch(devices::patch_device).delete(devices::delete_device),
+        )
         .fallback(static_ui::static_handler)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(from_fn_with_state(state.clone(), lang::capture))
+        // Depois da guarda de Host/Origin: em modo rede, exige dispositivo autorizado.
+        .layer(from_fn_with_state(state.clone(), devices::require_device))
         .layer(from_fn_with_state(state.clone(), security::guard))
         .layer(from_fn(security::finalize))
         .with_state(state)
@@ -194,7 +212,9 @@ where
     let apps = state.apps().clone();
     let env_state = state.clone();
     let grace = state.shutdown_grace();
-    let result = axum::serve(listener, router(state))
+    // Com a origem da conexão: a camada de dispositivos reconhece o loopback de verdade.
+    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.await;
             trigger.trigger_shutdown();

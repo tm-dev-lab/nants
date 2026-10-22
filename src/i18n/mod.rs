@@ -314,6 +314,31 @@ mod tests {
         }
     }
 
+    /// Spec 113 T04 (sentinela): as mensagens do sistema que chegam à pessoa pela conversa, pelo
+    /// relatório ou citadas ao modelo (runner, conselheiro, levantamento, relatório e rótulos da
+    /// interface) não podem ter texto em pt no dicionário en, e o pt-BR precisa diferir do en.
+    #[test]
+    fn system_messages_have_no_portuguese_in_english() {
+        const PREFIXES: [&str; 5] = ["runner.", "advisor.", "survey.", "report.", "ui."];
+        const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
+        const PT_WORDS: [&str; 19] = [
+            "testes", "checagem", "checagens", "não", "esgotado", "arquivos", "coberto", "limite", "nao", "falhou", "reaproveitado", "arvore",
+            "verificação", "bloqueante", "executado", "pergunta", "resposta", "levantamento", "iniciar",
+        ];
+        let system: Vec<&(&str, &str)> = en::MESSAGES.iter().filter(|(k, _)| PREFIXES.iter().any(|p| k.starts_with(p))).collect();
+        assert!(system.len() >= 20, "chaves do sistema: {}", system.len());
+        for (key, value) in system {
+            assert!(!value.chars().any(|c| PT_LETTERS.contains(c)), "letra do pt em en {key}: {value}");
+            let lower = value.to_lowercase();
+            for word in PT_WORDS {
+                assert!(!lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == word), "palavra do pt em en {key}: {value}");
+            }
+            let pt = lookup(Lang::PtBr, key).unwrap_or_default();
+            let neutral = key.starts_with("report.traceability.commit");
+            assert!(neutral || pt != *value, "pt-BR igual ao en em {key}: {value}");
+        }
+    }
+
     #[test]
     fn locale_order_is_lc_all_then_lc_messages_then_lang() {
         assert_eq!(Lang::from_locale_vars(Some("pt_BR.UTF-8"), Some("en_US"), Some("en_US")), Lang::PtBr);

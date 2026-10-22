@@ -375,6 +375,34 @@ describe("Execução: console", () => {
     expect(within(win).getByRole("button", { name: "Copiado" })).toBeTruthy();
   });
 
+  it("registro com ANSI (Vite real): a tela e o Copiar registro mostram texto limpo (spec 113)", async () => {
+    const E = "\u001b";
+    const raw = [
+      `web-1  | ${E}[32m${E}[1mVITE${E}[22m v6.2.2${E}[39m  ${E}[2mready in ${E}[0m${E}[1m412${E}[22m${E}[2m${E}[0m ms${E}[22m`,
+      `web-1  | ${E}[38;5;208mwarn${E}[0m`,
+      `web-1  | building 10%\r${E}[2Kbuilding 100%`,
+    ].join("\n");
+    const clean = "web-1  | VITE v6.2.2  ready in 412 ms\nweb-1  | warn\nweb-1  | building 100%";
+    await mountRun({ app: { status: running(), logs: raw }, open: ["Execução"] });
+    const win = execWindow();
+    const log = within(win).getByRole("log");
+    expect(log.textContent).toBe(clean);
+    expect(log.textContent).not.toMatch(/[\u001b\u009b]/);
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    await act(async () => {
+      fireEvent.click(within(win).getByRole("button", { name: "Copiar registro" }));
+    });
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(clean));
+  });
+
+  it("detalhe da falha com ANSI chega limpo (spec 113)", async () => {
+    const detail = "container exited (1)\n\u001b[31mnpm ERR!\u001b[39m boom";
+    await mountRun({ app: { start: { status: 422, body: { error: "x", reason: "docker_failed", detail } } }, open: ["Execução"] });
+    await startFromExecution();
+    expect(within(execWindow()).getByLabelText("Detalhes da falha").textContent).toBe("container exited (1)\nnpm ERR! boom");
+  });
+
   it("encerrado: para a consulta", async () => {
     const view = await mountRun({ app: { status: running() }, open: [] });
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });

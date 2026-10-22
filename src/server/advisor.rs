@@ -21,13 +21,14 @@ use crate::agents::arch_memory;
 use crate::agents::architect::truncate_bytes;
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_client::{ChatMessage, ChatRequest, Role as ChatRole};
-use crate::agents::prompts::{with_writing_style, ADVICE_RECOVERY_RULE};
+use crate::agents::prompts::{output_language_rule, with_writing_style, ADVICE_RECOVERY_RULE};
 use crate::agents::runner::{
     latest_recovery, section_text, validate_text_block, ADVICE_SECTION, EventSink, RunnerEvent, TaskEditor, ACCEPTANCE, OBJECTIVE,
 };
 use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
 use crate::config::Effort;
-use crate::harness::tools::{filter_scope_add, Advice, Advisor, AskContext, Role, ScopeRefusal, SCOPE_LIMIT_NOTICE};
+use crate::i18n::tr;
+use crate::harness::tools::{filter_scope_add, Advice, Advisor, AskContext, Role, ScopeRefusal};
 use crate::sdd::{read_task, Settings};
 use crate::server::events::SecretSet;
 
@@ -67,6 +68,8 @@ pub struct ArchitectAdvisor {
     events: Arc<dyn EventSink>,
     /// Parada pedida pelo usuário na execução (spec 087 T06): abandona a pergunta em curso.
     stop: Option<watch::Receiver<bool>>,
+    /// Idioma do projeto: pergunta e resposta mostradas na conversa saem nele (spec 113 T04).
+    lang: crate::i18n::SharedLang,
 }
 
 impl ArchitectAdvisor {
@@ -89,7 +92,14 @@ impl ArchitectAdvisor {
             editor,
             events,
             stop: None,
+            lang: crate::i18n::SharedLang::default(),
         }
+    }
+
+    /// Idioma do projeto para as linhas fixas da conversa ("Pergunta ao Arquiteto", "Resposta ao").
+    pub fn with_lang(mut self, lang: crate::i18n::SharedLang) -> Self {
+        self.lang = lang;
+        self
     }
 
     /// Liga a parada da execução: com ela pedida, a pergunta em curso é abandonada e devolve
@@ -174,7 +184,7 @@ impl ArchitectAdvisor {
         let req = ChatRequest {
             model: self.model.clone(),
             messages: vec![
-                ChatMessage::text(ChatRole::System, system_prompt()),
+                ChatMessage::text(ChatRole::System, system_prompt(self.lang.get())),
                 ChatMessage::text(ChatRole::User, briefing),
             ],
             tools: Vec::new(),
@@ -190,10 +200,11 @@ impl ArchitectAdvisor {
     }
 }
 
-/// Prompt de sistema da resposta ao `ask_architect`: regras, estratégia de recuperação vigente e
-/// estilo da escrita (spec 095 T08).
-fn system_prompt() -> String {
-    with_writing_style(&format!("{SYSTEM} {ADVICE_RECOVERY_RULE}"))
+/// Prompt de sistema da resposta ao `ask_architect`: regras, estratégia de recuperação vigente,
+/// idioma de saída do projeto (spec 113 T04: a resposta aparece na conversa) e estilo da escrita
+/// (spec 095 T08).
+fn system_prompt(lang: crate::i18n::Lang) -> String {
+    with_writing_style(&format!("{SYSTEM} {ADVICE_RECOVERY_RULE}\n\n{}", output_language_rule(lang)))
 }
 
 /// Últimos `max` bytes de `text` (em fronteira de caractere).
@@ -206,6 +217,17 @@ fn tail_bytes(text: &str, max: usize) -> String {
         start += 1;
     }
     text[start..].to_string()
+}
+
+/// Motivo de um caminho recusado, para a conversa, no idioma do projeto (spec 113 T04). Em pt-BR
+/// é o mesmo texto de [`ScopeRefusal::describe`], que vai ao registro da tarefa e ao modelo.
+fn refusal_text(lang: crate::i18n::Lang, refusal: &ScopeRefusal) -> String {
+    match refusal {
+        ScopeRefusal::Covered { path, by } => tr(lang, "advisor.scope_covered", &[("path", path), ("by", by)]),
+        ScopeRefusal::Limit { path, limit } => {
+            tr(lang, "advisor.scope_limit", &[("path", path), ("limit", &limit.to_string())])
+        }
+    }
 }
 
 fn asker_name(role: Role) -> &'static str {
@@ -269,7 +291,7 @@ impl Advisor for ArchitectAdvisor {
         Box::pin(async move {
             let who = asker_name(ctx.asker);
             let shown_question = scrub_text(&self.secrets, question);
-            self.say(who, &ctx.task_id, format!("Pergunta ao Arquiteto: {shown_question}"));
+            self.say(who, &ctx.task_id, tr(self.lang.get(), "advisor.question", &[("question", &shown_question)]));
             let raw = tokio::select! {
                 raw = self.call_model(ctx, self.briefing(ctx, question)) => raw?,
                 () = super::approvals::wait_stop(self.stop.clone()) => return Err(ASK_CANCELLED.to_string()),
@@ -297,18 +319,19 @@ impl Advisor for ArchitectAdvisor {
                 .unwrap_or_default();
             let mut shown = answer.clone();
             if !ext.added.is_empty() {
-                shown.push_str(&format!("\n\nallowed_scope ampliado: {}", ext.added.join(", ")));
+                let globs = ext.added.join(", ");
+                shown.push_str(&format!("\n\n{}", tr(self.lang.get(), "advisor.scope_added", &[("globs", &globs)])));
             }
             for refusal in &ext.refused {
-                shown.push_str(&format!("\n\n{}", refusal.describe()));
+                shown.push_str(&format!("\n\n{}", refusal_text(self.lang.get(), refusal)));
             }
             if ext.refused.iter().any(ScopeRefusal::is_limit) {
-                shown.push_str(&format!("\n\n{SCOPE_LIMIT_NOTICE}"));
+                shown.push_str(&format!("\n\n{}", crate::i18n::text(self.lang.get(), "advisor.scope_limit_notice")));
             }
             if rewritten {
-                shown.push_str("\n\nCritérios de aceitação reescritos.");
+                shown.push_str(&format!("\n\n{}", crate::i18n::text(self.lang.get(), "advisor.criteria_rewritten")));
             }
-            self.say("architect", &ctx.task_id, format!("Resposta ao {who}: {shown}"));
+            self.say("architect", &ctx.task_id, tr(self.lang.get(), "advisor.answer", &[("who", who), ("answer", &shown)]));
             Ok(Advice {
                 answer,
                 scope_add: ext.added,
@@ -358,6 +381,26 @@ mod tests {
         }
     }
 
+    /// Guarda o prompt de sistema de cada pedido e responde um texto fixo.
+    struct Recording(std::sync::Mutex<Vec<String>>, Canned);
+
+    impl Default for Recording {
+        fn default() -> Self {
+            Self(std::sync::Mutex::default(), Canned("ok".into()))
+        }
+    }
+
+    impl ChatBackend for Recording {
+        fn complete<'a>(
+            &'a self,
+            req: &'a ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::agents::llm_client::ChatResponse, crate::agents::LlmError>> + Send + 'a>> {
+            let system = req.messages.first().map(|m| m.content.clone()).unwrap_or_default();
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(system);
+            self.1.complete(req)
+        }
+    }
+
     #[derive(Default)]
     struct Mem(std::sync::Mutex<Vec<String>>);
 
@@ -393,6 +436,28 @@ mod tests {
         let said = events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(said[0], "reviewer: Pergunta ao Arquiteto: dúvida?");
         assert!(said[1].starts_with("architect: Resposta ao reviewer: sem json aqui"));
+    }
+
+    /// Spec 113 T04: com o projeto em en, as linhas fixas da pergunta e da resposta saem em en.
+    #[tokio::test]
+    async fn question_and_answer_lines_follow_project_language_en() {
+        let events = Arc::new(Mem::default());
+        let advisor = ArchitectAdvisor::new(
+            Arc::new(Canned("plain answer".into())),
+            "arq",
+            None,
+            std::env::temp_dir().join("nants-advisor-none-en"),
+            Arc::new(SecretSet::new(Vec::<String>::new())),
+            TaskEditor::new(std::env::temp_dir().join("nants-advisor-none-en"), Default::default()),
+            events.clone(),
+        )
+        .with_lang(crate::i18n::SharedLang::new(crate::i18n::Lang::En));
+        let ctx = AskContext { spec_id: "s".into(), task_id: "T01".into(), asker: Role::Developer };
+        advisor.ask(&ctx, "doubt?").await.expect("resposta");
+        let said = events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(said[0], "developer: Question to the Architect: doubt?");
+        assert!(said[1].starts_with("architect: Answer to the developer: plain answer"), "{}", said[1]);
+        assert!(!said.iter().any(|t| t.contains("Pergunta") || t.contains("Resposta")), "{said:?}");
     }
 
     fn advisor_root(tag: &str, settings: &str) -> PathBuf {
@@ -433,8 +498,41 @@ mod tests {
         assert!(b.contains("## Modo\nPadrão"), "{b}");
         assert!(b.contains("Resposta: mantenha o lock"), "{b}");
         assert!(SYSTEM.contains("coerência") && SYSTEM.contains("Aprovação automática"));
-        let system = system_prompt();
+        let system = system_prompt(crate::i18n::Lang::PtBr);
         assert!(system.ends_with(crate::agents::prompts::WRITING_STYLE_RULE) && !system.contains("YOLO"), "{system}");
+    }
+
+    /// Spec 113 T04: a resposta do conselheiro chega à pessoa, então o prompt leva a mesma regra de
+    /// idioma de saída dos outros papéis, no idioma do projeto.
+    #[test]
+    fn system_prompt_carries_output_language_rule_in_both_languages() {
+        use crate::agents::prompts::output_language_rule;
+        use crate::i18n::Lang;
+        let pt = system_prompt(Lang::PtBr);
+        let en = system_prompt(Lang::En);
+        assert!(pt.contains(&output_language_rule(Lang::PtBr)) && !pt.contains(&output_language_rule(Lang::En)), "{pt}");
+        assert!(en.contains(&output_language_rule(Lang::En)) && !en.contains(&output_language_rule(Lang::PtBr)), "{en}");
+        assert!(en.contains("inglês (en)") && en.starts_with(SYSTEM), "{en}");
+    }
+
+    /// O pedido ao modelo usa o idioma do projeto ligado com `with_lang`.
+    #[tokio::test]
+    async fn request_uses_project_language_prompt() {
+        let backend = Arc::new(Recording::default());
+        let advisor = ArchitectAdvisor::new(
+            backend.clone(),
+            "arq",
+            None,
+            std::env::temp_dir().join("nants-advisor-none-lang"),
+            Arc::new(SecretSet::new(Vec::<String>::new())),
+            TaskEditor::new(std::env::temp_dir().join("nants-advisor-none-lang"), Default::default()),
+            Arc::new(Mem::default()),
+        )
+        .with_lang(crate::i18n::SharedLang::new(crate::i18n::Lang::En));
+        let ctx = AskContext { spec_id: "s".into(), task_id: "T01".into(), asker: Role::Developer };
+        advisor.ask(&ctx, "doubt?").await.expect("resposta");
+        let systems = backend.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(systems.as_slice(), [system_prompt(crate::i18n::Lang::En)]);
     }
 
     /// Spec 079: a estratégia de recuperação vigente (a última análise) vai no contexto da resposta.
@@ -497,7 +595,21 @@ mod tests {
         assert!(history.contains("- `deps.edn` não ampliado: limite de 32 entradas no allowed_scope"), "{history}");
         let said = events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(!said[1].contains("allowed_scope ampliado"), "{}", said[1]);
-        assert!(said[1].contains(SCOPE_LIMIT_NOTICE), "{}", said[1]);
+        assert!(said[1].contains(crate::harness::tools::SCOPE_LIMIT_NOTICE), "{}", said[1]);
+    }
+
+    /// Spec 113 T04: recusas e aviso de limite na conversa, no idioma do projeto; em pt-BR o texto
+    /// é o mesmo do registro da tarefa e do aviso ao Desenvolvedor.
+    #[test]
+    fn refusal_lines_in_both_languages() {
+        use crate::i18n::Lang;
+        let covered = ScopeRefusal::Covered { path: "src/a.rs".into(), by: "src/**".into() };
+        let limit = ScopeRefusal::Limit { path: "deps.edn".into(), limit: 32 };
+        assert_eq!(refusal_text(Lang::PtBr, &covered), covered.describe());
+        assert_eq!(refusal_text(Lang::PtBr, &limit), limit.describe());
+        assert_eq!(crate::i18n::text(Lang::PtBr, "advisor.scope_limit_notice"), crate::harness::tools::SCOPE_LIMIT_NOTICE);
+        assert_eq!(refusal_text(Lang::En, &covered), "`src/a.rs` already covered by `src/**`");
+        assert_eq!(refusal_text(Lang::En, &limit), "`deps.edn` not added: limit of 32 entries in allowed_scope");
     }
 
     #[test]

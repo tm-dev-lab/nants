@@ -375,7 +375,7 @@ mod tests {
     }
 
     /// Real: precisa de Docker e baixa a imagem do Playwright (grande, vários minutos na primeira
-    /// vez). Rode com `cargo test -- --ignored real_playwright_version`.
+    /// vez). Rode com `NANTS_TEST_REAL_DOCKER=1 cargo test -- --ignored real_playwright_version`.
     #[test]
     #[ignore]
     fn real_playwright_version() {

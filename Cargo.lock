@@ -607,6 +607,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "getrandom 0.2.17",
  "http-body-util",
  "libc",
  "reqwest",
@@ -614,6 +615,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "toml",

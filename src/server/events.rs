@@ -82,6 +82,10 @@ pub enum EventType {
     ChatTurnStarted,
     /// Turno do Arquiteto terminou (`turn_id`, `ok`).
     ChatTurnEnded,
+    /// Lista de dispositivos autorizados mudou (`reason`: added, renamed ou revoked; spec 112).
+    DevicesChanged,
+    /// Janela de adicionar dispositivo invalidada por tentativas erradas (`reason`; spec 112).
+    DeviceCodeLocked,
 }
 
 impl EventType {
@@ -104,6 +108,8 @@ impl EventType {
             Self::AgentActivity => "agent_activity",
             Self::ChatTurnStarted => "chat_turn_started",
             Self::ChatTurnEnded => "chat_turn_ended",
+            Self::DevicesChanged => "devices_changed",
+            Self::DeviceCodeLocked => "device_code_locked",
         }
     }
 }
@@ -331,10 +337,13 @@ const MORE_LINES_MARK: &str = "…";
 const TEXT_JSON_LIMIT: usize = MAX_MESSAGE_BYTES - 1024;
 
 /// Normalização única do texto de mensagem (evento ao vivo, gravação e GET usam esta função):
-/// `\r\n` e `\r` viram `\n`; `\n` e `\t` são preservados; demais controles (C0, DEL, C1) e
-/// formatação perigosa (bidi, largura zero, BOM) viram espaço; no máximo `MAX_MESSAGE_LINES` linhas.
+/// sequências de terminal (CSI e OSC, 7 e 8 bits, e escapes curtos) saem antes de tudo
+/// ([`strip_escape_sequences`], spec 113); `\r\n` e `\r` viram `\n`; `\n` e `\t` são preservados;
+/// demais controles (C0, DEL, C1) e formatação perigosa (bidi, largura zero, BOM) viram espaço; no
+/// máximo `MAX_MESSAGE_LINES` linhas.
 pub fn normalize_text(text: &str) -> String {
-    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    let stripped = strip_escape_sequences(text);
+    let unified = stripped.replace("\r\n", "\n").replace('\r', "\n");
     let flat: String = unified
         .chars()
         .map(|c| match c {
@@ -350,6 +359,74 @@ pub fn normalize_text(text: &str) -> String {
     } else {
         kept.join("\n")
     }
+}
+
+const ESC: char = '\u{1b}';
+const CSI_8BIT: char = '\u{9b}';
+const OSC_8BIT: char = '\u{9d}';
+const ST_8BIT: char = '\u{9c}';
+const BEL: char = '\u{7}';
+
+/// Remove sequências de terminal de saídas de processo (cores do Vite, do npm, dos testes), numa
+/// passada linear sem regex:
+/// - CSI (`ESC [` ou `\u{9b}`): parâmetros `0x30..=0x3f`, intermediários `0x20..=0x2f` e o final
+///   `0x40..=0x7e`. Sem final válido, só o introdutor e o que já foi lido saem;
+/// - OSC (`ESC ]` ou `\u{9d}`): até BEL, `\u{9c}` ou `ESC \`; sem terminador, para antes da
+///   quebra de linha (nunca engole o resto da mensagem);
+/// - escapes curtos com intermediário (`ESC ( B`, `ESC # 8`) e os de cursor e teclado
+///   (`ESC 7`, `ESC 8`, `ESC =`, `ESC >`).
+///
+/// Um ESC seguido de letra ou solto fica: o passo seguinte da normalização o troca por espaço
+/// (a letra é texto, como em `h\u{1b}i`).
+pub fn strip_escape_sequences(text: &str) -> String {
+    if !text.contains([ESC, CSI_8BIT, OSC_8BIT]) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let kind = match c {
+            CSI_8BIT => Some('['),
+            OSC_8BIT => Some(']'),
+            ESC => match chars.peek() {
+                Some(&n @ ('[' | ']')) => {
+                    chars.next();
+                    Some(n)
+                }
+                Some(&n) if ('\u{20}'..='\u{2f}').contains(&n) || matches!(n, '7' | '8' | '=' | '>') => Some('e'),
+                _ => None,
+            },
+            _ => None,
+        };
+        match kind {
+            Some('[') => {
+                while chars.next_if(|n| ('\u{30}'..='\u{3f}').contains(n)).is_some() {}
+                while chars.next_if(|n| ('\u{20}'..='\u{2f}').contains(n)).is_some() {}
+                chars.next_if(|n| ('\u{40}'..='\u{7e}').contains(n));
+            }
+            Some(']') => {
+                while let Some(&n) = chars.peek() {
+                    if n == '\n' || n == '\r' {
+                        break;
+                    }
+                    chars.next();
+                    if n == BEL || n == ST_8BIT {
+                        break;
+                    }
+                    if n == ESC {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                while chars.next_if(|n| ('\u{20}'..='\u{2f}').contains(n)).is_some() {}
+                chars.next_if(|n| ('\u{30}'..='\u{7e}').contains(n));
+            }
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// Caracteres de formatação que reordenam ou escondem texto (bidi, largura zero, BOM).
@@ -1742,5 +1819,24 @@ mod tests {
         assert_eq!(with_task.payload["task_id"], "T02");
         assert_eq!(with_task.payload["code"], "task.worktree_dirty");
         assert!(valid_message_code("run.stopped") && !valid_message_code("1run") && !valid_message_code(""));
+    }
+
+    #[test]
+    fn normalize_text_strips_terminal_sequences_before_flattening_controls() {
+        let vite = "\u{1b}[32m\u{1b}[1mVITE\u{1b}[22m v6.2.2\u{1b}[39m  \u{1b}[2mready in \u{1b}[0m\u{1b}[1m412\u{1b}[22m ms";
+        assert_eq!(normalize_text(vite), "VITE v6.2.2  ready in 412 ms");
+        assert_eq!(normalize_text("\u{1b}[38;5;208mwarn\u{1b}[0m \u{1b}[48;2;255;100;0mx\u{1b}[m"), "warn x");
+        assert_eq!(normalize_text("\u{9b}31mrojo\u{9b}0m"), "rojo");
+        assert_eq!(normalize_text("\u{1b}[?25l\u{1b}[2K\u{1b}[1Gok\u{1b}[?25h"), "ok");
+        assert_eq!(normalize_text("a\u{1b}]0;titulo\u{7}b\u{1b}]8;;http://x\u{1b}\\c\u{9d}t\u{9c}d"), "abcd");
+        assert_eq!(normalize_text("\u{1b}(Bx\u{1b}7y\u{1b}=z"), "xyz");
+        // OSC sem terminador para na quebra de linha; ESC solto vira espaço; CSI incompleto some.
+        assert_eq!(normalize_text("a\u{1b}]0;sem fim\nlinha"), "a\nlinha");
+        assert_eq!(normalize_text("fim\u{1b}"), "fim ");
+        assert_eq!(normalize_text("x\u{1b}["), "x");
+        assert_eq!(normalize_text("Ø café ➜"), "Ø café ➜");
+        let out = normalize_text("\u{1b}[31m\u{1b}[1mFAIL\u{1b}[22m\u{1b}[39m src/a.test.ts\r\n");
+        assert_eq!(out, "FAIL src/a.test.ts\n");
+        assert!(!out.contains('[') && !out.contains('\u{1b}'));
     }
 }

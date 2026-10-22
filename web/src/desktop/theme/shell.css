@@ -582,6 +582,24 @@
   color: var(--ink3);
 }
 
+/*
+ * Rótulo com uma ação discreta à direita (113/T05): a linha tem exatamente a altura de um rótulo
+ * sozinho, então o campo fica na mesma altura dos campos vizinhos (Conexão, Modelo, Esforço).
+ */
+.nd-field-labelrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  height: calc(var(--fs-label) * var(--lh-body));
+  min-width: 0;
+}
+
+.nd-field-labelrow > .nd-field-label {
+  flex: 0 0 auto;
+  line-height: var(--lh-body);
+}
+
 .nd-field-hint {
   margin: 0;
   font-size: var(--fs-label);

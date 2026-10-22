@@ -398,14 +398,15 @@ function RoleCard({
         {errors?.connection !== undefined ? <p className="nd-field-error">{errors.connection}</p> : null}
       </div>
       <div className="nd-field">
-        <div className="nd-row nd-row-between">
+        {/* Linha do rótulo na altura do rótulo (113/T05): a ação discreta não empurra o campo. */}
+        <div className="nd-field-labelrow">
           <label htmlFor={modelId} className="nd-field-label">
             {t("settings.agents.model")} <span className="nd-sr-only">{t("settings.agents.ofRole", { role: info.label })}</span>
           </label>
           {modelsEntry !== undefined && !follows ? (
-            <button type="button" className="nd-btn nd-btn-sm" data-variant="ghost" onClick={onRefresh} disabled={loading}>
+            <button type="button" className="nd-btn nd-label-action" data-variant="ghost" onClick={onRefresh} disabled={loading}>
               <Icon name="refresh" size={14} />
-              {t("settings.agents.refreshList")}
+              <span>{t("settings.agents.refreshList")}</span>
             </button>
           ) : null}
         </div>

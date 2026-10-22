@@ -134,11 +134,14 @@ async fn run_survey(state: &AppState, project: &Project) {
     let mut shutdown = state.shutdown_signal();
     let text = match survey(state, &project.id, &root, &secrets, &mut shutdown).await {
         Ok(summary) => summary,
-        Err(code) => format!(
-            "Não consegui concluir o levantamento da arquitetura ({code}). Use \"Refazer levantamento\" na aba Arquitetura."
-        ),
+        Err(code) => survey_failed_text(state.project_lang(&project.id).get(), code),
     };
     publish(state, &project.id, &root, &secrets, &text).await;
+}
+
+/// Aviso de falha do levantamento na conversa, no idioma do projeto (spec 113 T04).
+fn survey_failed_text(lang: crate::i18n::Lang, code: &str) -> String {
+    crate::i18n::tr(lang, "survey.failed", &[("code", code)])
 }
 
 async fn publish(state: &AppState, project_id: &str, root: &Path, secrets: &SecretSet, text: &str) {
@@ -487,6 +490,26 @@ mod tests {
         let msg = wait_message(&mut rx).await;
         assert!(msg.contains("base_suja"), "{msg}");
         assert!(!root.join(ARCH_FILE).exists());
+    }
+
+    /// Spec 113 T04: o aviso de falha sai no idioma do projeto e aponta o caminho real (o
+    /// Arquiteto cria o ARCHITECTURE.md ao planejar), sem citar botão ou aba que não existem.
+    #[test]
+    fn survey_failure_text_in_both_languages() {
+        use crate::i18n::Lang;
+        let pt = survey_failed_text(Lang::PtBr, "timeout");
+        assert!(pt.starts_with("Não consegui concluir o levantamento da arquitetura (timeout)."), "{pt}");
+        assert!(pt.contains("Arquiteto na conversa") && pt.contains("cria o ARCHITECTURE.md junto com o plano"), "{pt}");
+        let en = survey_failed_text(Lang::En, "timeout");
+        assert!(en.starts_with("I could not finish the architecture survey (timeout)."), "{en}");
+        assert!(en.contains("Architect in the conversation") && en.contains("creates ARCHITECTURE.md along with the plan"), "{en}");
+        for text in [&pt, &en] {
+            for gone in ["Refazer", "levantamento\" na aba", "Redo", "tab", "botão", "button"] {
+                assert!(!text.contains(gone), "caminho inexistente ({gone}): {text}");
+            }
+        }
+        // O caminho citado existe: o prompt do Arquiteto manda criar o ARCHITECTURE.md ao planejar.
+        assert!(crate::agents::prompts::architect_system().contains("se NÃO existir, escreva o inicial junto com o plano"));
     }
 
     #[tokio::test]

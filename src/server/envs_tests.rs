@@ -327,3 +327,14 @@ async fn container_that_exits_after_up_fails_with_logs_and_is_downed() {
     assert!(calls.iter().any(|(_, a)| a[0] == "down"), "{calls:?}");
     assert!(!apps.is_running("p"));
 }
+
+/// Sentinela (spec 113 T01): o provider sem executor injetado nunca alcança o docker real nos
+/// testes; a varredura de órfãos falha com o motivo em vez de listar containers do host.
+#[test]
+fn default_provider_never_reaches_real_docker_in_tests() {
+    if std::env::var("NANTS_TEST_REAL_DOCKER").is_ok_and(|v| v == "1") {
+        return;
+    }
+    let err = sweep_orphans(&ComposeProvider::default(), &[], &|_| false).expect_err("docker real recusado");
+    assert!(err.contains("teste chamou o docker real"), "{err}");
+}

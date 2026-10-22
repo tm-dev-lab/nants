@@ -354,3 +354,223 @@
 .nd-settings-wsl-list > p {
   margin: 0;
 }
+
+/*
+ * Jornada guiada do Acesso pela rede (spec 112, T02): passos numerados, sem caixa. A marca do passo
+ * é um círculo `--control` com o número (ou o visto, em verde, quando pronto); o passo bloqueado
+ * fica esmaecido no título. O código grande usa a escala (`--fs-display`) com números tabulares.
+ */
+.nd-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+.nd-step {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: start;
+}
+
+.nd-step-mark {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-pill);
+  background: var(--control);
+  color: var(--ink2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-label);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-step-mark[data-step-mark="done"],
+.nd-step-mark[data-step-mark="ready"] {
+  color: var(--pill-green-ink);
+}
+
+.nd-step-mark[data-step-mark="pending"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-step-mark[data-step-mark="blocked"] {
+  color: var(--muted);
+}
+
+.nd-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-step-body > p {
+  margin: 0;
+}
+
+.nd-step-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 24px;
+}
+
+.nd-step[data-step-status="blocked"] .nd-step-title {
+  color: var(--muted);
+}
+
+/* Adicionar dispositivo: o código, o endereço com o QR e a lista. */
+.nd-device-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.nd-device-code {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  min-width: 0;
+}
+
+.nd-device-code > p {
+  margin: 0;
+}
+
+.nd-device-code-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+}
+
+.nd-device-code-row .nd-label {
+  flex-basis: 100%;
+}
+
+.nd-device-digits {
+  font-size: var(--fs-numeral);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.06em;
+  color: var(--ink);
+  line-height: 1.1;
+}
+
+.nd-device-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+.nd-qr {
+  flex-shrink: 0;
+  border-radius: var(--r-md);
+}
+
+.nd-device-entry-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+  flex: 1 1 200px;
+}
+
+.nd-device-url {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  color: var(--ink);
+}
+
+.nd-device-other-urls {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-device-help-list {
+  margin: var(--sp-2) 0;
+  padding-left: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-device-help > p {
+  margin: 0;
+}
+
+.nd-device-list-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-device-list-wrap > h4,
+.nd-device-list-wrap > p {
+  margin: 0;
+}
+
+.nd-device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.nd-device-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-device-row:last-child {
+  border-bottom: 0;
+}
+
+.nd-device-main,
+.nd-device-rename {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-device-rename .nd-input {
+  flex: 1 1 auto;
+}
+
+.nd-device-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.nd-device-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+}
+
+.nd-device-revoke-all {
+  justify-content: flex-end;
+}

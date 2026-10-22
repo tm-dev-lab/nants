@@ -25,10 +25,10 @@ export const NETWORK_TEXT = localized({
   script: "settings.network.script",
   wslIntro: "settings.network.wslIntro",
   wslRestart: "settings.network.wslRestart",
-  wslPrivate: "settings.network.wslPrivate",
   wslMirrored: "settings.network.wslMirrored",
   lanLabel: "settings.network.lanLabel",
   lanHint: "settings.network.lanHint",
+  security: "settings.network.security",
   loading: "settings.network.loading",
   loadFailed: "settings.network.loadFailed",
   nextStart: "settings.network.nextStart",
@@ -79,14 +79,22 @@ function portList(nantsPort: number, range: LanRange | null): string {
 
 const REMOVE_RULE = `Remove-NetFirewallRule -DisplayName "${FIREWALL_RULE_NAME}" -ErrorAction SilentlyContinue`;
 
+/**
+ * Regra "Nants" para qualquer perfil de rede (Privado e Público, spec 112, decisão 5), ainda restrita
+ * à sub-rede local. Sem `-Profile`: quem protege o Nants é o dispositivo autorizado, não o perfil.
+ */
 function newRule(nantsPort: number, range: LanRange | null): string {
-  return `New-NetFirewallRule -DisplayName "${FIREWALL_RULE_NAME}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort ${firewallPorts(nantsPort, range)} -Profile Private -RemoteAddress LocalSubnet`;
+  return `New-NetFirewallRule -DisplayName "${FIREWALL_RULE_NAME}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort ${firewallPorts(nantsPort, range)} -RemoteAddress LocalSubnet`;
 }
 
 /**
  * Script de ligar no WSL NAT (PowerShell como administrador), idempotente: lê o IP do WSL na hora,
  * remove e recria o `portproxy` da porta do Nants e de cada porta da faixa e recria a regra de
- * firewall, restrita ao perfil Privado e à sub-rede local (spec 099).
+ * firewall, para qualquer perfil e restrita à sub-rede local (spec 112).
+ *
+ * Segurança (spec 112): o `connectaddress` é sempre o IP do WSL (`$ip`), nunca 127.0.0.1. Apontando
+ * para 127.0.0.1, as conexões dos aparelhos chegariam ao Nants como loopback e entrariam sem
+ * dispositivo autorizado.
  */
 export function wslPowerShellScript(nantsPort: number, range: LanRange | null): string {
   return [

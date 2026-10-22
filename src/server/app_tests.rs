@@ -99,7 +99,12 @@ fn req_host(method: Method, uri: &str, host: &str, body: &str) -> Request<Body> 
         .expect("requisição")
 }
 
-async fn call(state: &AppState, request: Request<Body>) -> (StatusCode, String) {
+async fn call(state: &AppState, mut request: Request<Body>) -> (StatusCode, String) {
+    // Conexão de loopback (spec 112): estes testes não tratam de dispositivo autorizado.
+    if request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().is_none() {
+        let peer: std::net::SocketAddr = ([127, 0, 0, 1], 50000).into();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    }
     let resp = router(state.clone()).oneshot(request).await.expect("resposta");
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.expect("corpo");

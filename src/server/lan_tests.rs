@@ -244,6 +244,11 @@ fn req(method: Method, uri: &str, body: &str) -> Request<Body> {
 
 /// Chama a rota; o `Host` padrão passa a usar a porta ligada do estado.
 async fn call(state: &AppState, mut request: Request<Body>) -> (StatusCode, Value) {
+    // Conexão de loopback (spec 112): estes testes não tratam de dispositivo autorizado.
+    if request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().is_none() {
+        let peer: std::net::SocketAddr = ([127, 0, 0, 1], 50000).into();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    }
     if request.headers().get(header::HOST).is_some_and(|h| h == HOST) {
         let host = format!("127.0.0.1:{}", state.bound_port());
         request.headers_mut().insert(header::HOST, host.parse().expect("host"));
@@ -517,4 +522,52 @@ async fn api_reports_coherence_from_the_server_rule() {
     let state = AppState::new(dir.path().join("config.toml"), Config::default(), 4000).with_net_probe(wsl_probe(Some(TABLE), Some("nat"), Some("1")));
     let (_, body) = call(&state, req(Method::GET, "/api/config/network", "")).await;
     assert_eq!((body["windows_redirect_target"].as_str(), body["coherence"].as_str()), (Some("other"), Some("still_redirected")), "{body}");
+}
+
+/// Saída simulada da consulta dos IPv4 do Windows (spec 112): Wi-Fi, Ethernet, vEthernet do WSL e
+/// do Hyper-V, APIPA e loopback.
+const WINDOWS_IPS: &str = "127.0.0.1|Loopback Pseudo-Interface 1|0|1\r\n\
+169.254.12.7|Ethernet 2|0|0\r\n\
+172.21.144.1|vEthernet (WSL (Hyper-V firewall))|0|1\r\n\
+172.30.0.1|vEthernet (Default Switch)|0|1\r\n\
+10.0.0.9|Ethernet|0|1\r\n\
+192.168.0.68|Wi-Fi|1|1\r\n\
+lixo sem campos\r\n";
+
+#[test]
+fn windows_ips_skip_loopback_apipa_and_virtual_and_prefer_the_default_route() {
+    assert_eq!(
+        windows_ips_from_output(ok(WINDOWS_IPS)),
+        Some(vec![Ipv4Addr::new(192, 168, 0, 68), Ipv4Addr::new(10, 0, 0, 9)])
+    );
+    // Adaptador sem rota padrão e desligado só entra se não houver outro melhor.
+    assert_eq!(windows_ips_from_output(ok("10.1.1.1|Ethernet|0|0\n")), Some(vec![Ipv4Addr::new(10, 1, 1, 1)]));
+    assert_eq!(
+        windows_ips_from_output(ok("10.1.1.1|Ethernet|0|0\n192.168.1.2|Wi-Fi|0|1\n")),
+        Some(vec![Ipv4Addr::new(192, 168, 1, 2)])
+    );
+    assert_eq!(windows_ips_from_output(ok("172.21.144.1|vEthernet (WSL)|1|1\n")), Some(Vec::new()));
+    // Não deu para conferir.
+    assert_eq!(windows_ips_from_output(None), None);
+    assert_eq!(windows_ips_from_output(Some(CmdOutput { success: false, stdout: WINDOWS_IPS.into(), stderr: String::new() })), None);
+}
+
+#[test]
+fn windows_ips_only_read_and_only_in_wsl() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    let tools = WinTools {
+        run: Arc::new(move |p, a| {
+            assert_eq!((p, a), ("powershell.exe", &WINDOWS_IPS_ARGS[..]), "só Get-NetIPAddress");
+            c.fetch_add(1, Ordering::SeqCst);
+            ok(WINDOWS_IPS)
+        }),
+        exists: Arc::new(|p| p == "powershell.exe"),
+    };
+    for word in ["Set-", "New-", "Remove-", "Disable-", "Enable-"] {
+        assert!(!WINDOWS_IPS_QUERY.contains(word), "{word}");
+    }
+    assert_eq!(windows_ips_with(&tools, false), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "fora do WSL nada roda");
+    assert_eq!(windows_ips_with(&tools, true).map(|v| v.len()), Some(2));
 }

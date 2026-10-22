@@ -12,8 +12,8 @@ nants doctor  confere o ambiente (Docker, Compose, Git, porta, disco) sem altera
 nants uninstall          remove o executável; mantém configuração, dados e projetos (pede confirmação)\n\
 nants uninstall --purge  remove também a configuração e os dados; nunca os projetos nem o Docker\n\
 --port N      porta fixa; se estiver ocupada, falha (sem --port, a padrão 3000 ou a próxima livre)\n\
---lan         aceita acesso pela rede local (0.0.0.0) só nesta execução, com as portas das prévias dos apps logo após a porta (3001 a 3010); para deixar ligado, use Configurações > Acesso pela rede\n\
---allow-remote  permite um --host fora do loopback (o servidor fica exposto nesse endereço)",
+--lan         aceita acesso pela rede local (0.0.0.0) só nesta execução, com as portas das prévias dos apps logo após a porta (3001 a 3010); para deixar ligado, use Configurações > Acesso pela rede; em modo rede, só aparelhos que você adicionar abrem o Nants, e o terminal mostra o link de entrada deste computador (uso único, vale 10 minutos)\n\
+--allow-remote  permite um --host fora do loopback (o servidor fica exposto nesse endereço; como no modo rede, só aparelhos que você adicionar abrem o Nants, e o terminal mostra o link de entrada deste computador)",
     ),
     ("cli.unknown_command", "comando desconhecido: {command}"),
     ("cli.unknown_arg", "argumento desconhecido: {arg}"),
@@ -40,7 +40,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("cli.exposed", "aviso: servidor exposto em {host}; a validação de Host aceita apenas nomes de loopback"),
     ("cli.local_addr_failed", "erro ao obter endereço local: {error}"),
     ("cli.view_ports", "  portas de visualização dos apps: {start} a {end}"),
-    ("cli.lan_warning", "aviso: acesso pela rede local ligado; qualquer aparelho da rede local pode controlar o Nants (sem autenticação)"),
+    ("cli.lan_warning", "aviso: acesso pela rede local ligado; só aparelhos que você adicionar abrem o Nants (o tráfego na rede é HTTP, sem criptografia)"),
     (
         "cli.lan_adopted",
         "Acesso pela rede local ligado (o Windows já está configurado). Para desligar: Configurações > Acesso pela rede.",
@@ -152,6 +152,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("doctor.detail.port_auto", "porta escolhida pelo sistema ao iniciar"),
     ("doctor.detail.port_free", "a porta {port} está livre"),
     ("doctor.detail.port_fallback", "a porta {port} está ocupada (talvez o Nants já esteja aberto); o nants usará a {next}"),
+    ("doctor.detail.port_redirected", "a porta {port} está redirecionada pelo Windows; o Nants usará a {next}"),
     ("doctor.detail.port_all_busy", "as portas {port} a {last} estão ocupadas"),
     ("doctor.detail.disk_unmeasured", "não foi possível medir o espaço livre"),
     ("doctor.detail.disk", "{list}"),
@@ -180,10 +181,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("doctor.detail.windows_redirect_off", "acesso pela rede local desligado e o Windows não redireciona a porta {port}"),
     ("doctor.detail.windows_redirect_unknown", "não foi possível conferir pelo netsh.exe do Windows"),
     ("doctor.detail.firewall_unknown", "não foi possível conferir a regra de firewall pelo PowerShell do Windows"),
-    ("doctor.detail.lan_on_ok", "acesso pela rede local ligado e o Windows configurado para a porta {port}"),
+    ("doctor.detail.lan_on_ok", "acesso pela rede local ligado e o Windows configurado para a porta {port}; só aparelhos que você adicionar abrem o Nants"),
     (
         "doctor.detail.lan_on_mirrored_ok",
-        "acesso pela rede local ligado e a regra de firewall Nants presente no Windows (modo espelhado, porta {port})",
+        "acesso pela rede local ligado e a regra de firewall Nants presente no Windows (modo espelhado, porta {port}); só aparelhos que você adicionar abrem o Nants",
     ),
     (
         "doctor.detail.lan_on_no_redirect",
@@ -203,7 +204,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ),
     (
         "doctor.detail.lan_linux_on",
-        "ligado: o Nants escuta na rede local (porta {port}); se outro aparelho não abrir, libere a porta no firewall do Linux",
+        "ligado: o Nants escuta na rede local (porta {port}) e só aparelhos que você adicionar abrem o Nants; se outro aparelho não abrir, libere a porta no firewall do Linux",
     ),
     (
         "doctor.detail.lan_linux_off",
@@ -246,4 +247,45 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("report.traceability.no_task", "sem tarefa declarada"),
     // Runner: tarefa de correção criada pela verificação final (spec 107), gravada no Txx.md.
     ("runner.final_fix_title", "Correção da verificação final"),
+    // Runner: mensagens do agente `tests` na conversa (spec 113 T04), no idioma do projeto.
+    ("runner.tests.passed_command", "testes ✓{place} (`{command}`)"),
+    ("runner.tests.passed_checks", "testes ✓{place} · {checks}"),
+    ("runner.tests.on_base", " na base"),
+    ("runner.tests.failed_cycle", "test_command falhou ({count}/{max})"),
+    ("runner.tests.reused", "testes e checagens não repetidos na base: árvore idêntica à testada em {sha} (fora de .sdd/)"),
+    ("runner.tests.reused_summary", "reaproveitado: árvore idêntica à testada em {sha}"),
+    ("runner.checks.list", "checagens: {list}"),
+    ("runner.checks.non_blocking", "{name} {mark} (não bloqueante)"),
+    ("runner.checks.non_blocking_regression", "{name} {mark} (não bloqueante, regressão desta tarefa)"),
+    ("runner.checks.not_run", "{name} não executado"),
+    ("runner.checks.failed_on_base", "checagem {name} falhou na base:"),
+    ("runner.final_base.prefix", "verificação final na base"),
+    ("runner.final_base.line", "{prefix}: testes {mark}{checks}"),
+    ("runner.final_base.not_run", "não executado"),
+    // Conselheiro (ask_architect): pergunta e resposta mostradas na conversa.
+    ("advisor.question", "Pergunta ao Arquiteto: {question}"),
+    ("advisor.answer", "Resposta ao {who}: {answer}"),
+    ("advisor.scope_added", "allowed_scope ampliado: {globs}"),
+    ("advisor.criteria_rewritten", "Critérios de aceitação reescritos."),
+    // Levantamento da arquitetura: aviso de falha na conversa.
+    ("survey.failed", "Não consegui concluir o levantamento da arquitetura ({code}). O projeto segue normalmente: ao planejar a primeira especificação com o Arquiteto na conversa, ele lê o código e cria o ARCHITECTURE.md junto com o plano."),
+    // Rótulos da interface citados ao modelo (o mesmo texto do botão na interface).
+    ("ui.app_start", "Iniciar o app"),
+    // Runner: formatação automática (spec 078) na conversa, agente `tests`.
+    ("runner.format.failed", "formatação automática falhou (não bloqueia): {why}"),
+    ("runner.format.tool_failed", "formatação automática ({name}) falhou (não bloqueia): {why}"),
+    ("runner.format.applied", "formatação automática: {count} arquivos ({names})"),
+    ("runner.format.timed_out", "tempo esgotado"),
+    ("runner.format.exit", "saída {code}: {output}"),
+    // Conselheiro: caminhos de scope_add que não entraram (mesmo texto do registro da tarefa).
+    ("advisor.scope_covered", "`{path}` já coberto por `{by}`"),
+    ("advisor.scope_limit", "`{path}` não ampliado: limite de {limit} entradas no allowed_scope"),
+    ("advisor.scope_limit_notice", "o escopo não pôde ser ampliado (limite); peça ao Arquiteto outra saída ou declare o impedimento"),
+    // Dispositivos autorizados (spec 112).
+    ("devices.this_computer", "Este computador"),
+    ("devices.fallback_name", "Dispositivo"),
+    ("devices.browser", "Navegador"),
+    ("devices.name_browser_os", "{browser} no {os}"),
+    ("cli.entry_link", "link de entrada deste computador (uso único, vale 10 minutos): {url}"),
+    ("cli.entry_link_failed", "não foi possível gerar o link de entrada; reinicie o nants"),
 ];

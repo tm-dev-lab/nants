@@ -7,6 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Agents, ConnectionView } from "../../api/types";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { cssRuleBody } from "../../desktop/test-utils";
 import { installFetch } from "../../test-utils";
 import { AgentsForm } from "./AgentsForm";
 
@@ -266,6 +269,51 @@ describe("AgentsForm: lista de modelos", () => {
     await waitFor(() =>
       expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain(modelsUrl("openai-direct", true)),
     );
+  });
+
+  it("113/T05: nos três papéis, Atualizar lista fica na linha do rótulo, discreto, focável e com rótulo", async () => {
+    installFetch(routes());
+    renderPanel();
+    for (const role of ["Arquiteto", "Desenvolvedor", "Revisor"]) {
+      const region = roleRegion(role);
+      const button = await within(region).findByRole("button", { name: "Atualizar lista" });
+      const row = button.parentElement;
+      // A linha do rótulo do Modelo é a `.nd-field-labelrow` (altura de um rótulo sozinho), com o
+      // rótulo do Modelo e o botão; o campo vem logo depois, como em Conexão e Esforço.
+      expect(row?.className).toBe("nd-field-labelrow");
+      expect(row?.querySelector("label.nd-field-label")?.textContent).toContain("Modelo");
+      expect(row?.nextElementSibling?.querySelector('[role="combobox"]')).not.toBeNull();
+      // Botão fantasma do conjunto único, sem o tamanho pequeno (26 px) que empurrava o campo.
+      expect(button.className.split(" ")).toEqual(["nd-btn", "nd-label-action"]);
+      expect(button.getAttribute("data-variant")).toBe("ghost");
+      button.focus();
+      expect(document.activeElement).toBe(button);
+      // Os três campos (Conexão, Modelo, Esforço) seguem a mesma estrutura: um rótulo (ou a linha do
+      // rótulo) seguido do controle, sem outro elemento entre eles.
+      const fields = [...region.querySelectorAll(":scope > .nd-field")].slice(0, 3);
+      expect(fields).toHaveLength(3);
+      for (const field of fields) {
+        const head = field.firstElementChild;
+        expect(head?.matches(".nd-field-label, .nd-field-labelrow")).toBe(true);
+      }
+    }
+  });
+
+  it("113/T05: a linha do rótulo tem a altura de um rótulo e o botão não passa dela (inclusive no celular)", () => {
+    const css = (path: string): string => readFileSync(resolve(process.cwd(), "src", path), "utf8");
+    const shell = css("desktop/theme/shell.css");
+    const desktop = css("desktop/theme/desktop.css");
+    const mobile = css("desktop/theme/mobile.css");
+    expect(cssRuleBody(shell, ".nd-field-labelrow")).toContain("height: calc(var(--fs-label) * var(--lh-body));");
+    expect(cssRuleBody(shell, ".nd-field-labelrow > .nd-field-label")).toContain("line-height: var(--lh-body);");
+    const action = cssRuleBody(desktop, ".nd-label-action");
+    expect(action).toContain("height: 100%;");
+    expect(action).toContain("font-size: var(--fs-label);");
+    // Modificador de tamanho depois do `.nd-btn` (a ordem decide, mesma especificidade).
+    expect(desktop.indexOf(".nd-label-action {")).toBeGreaterThan(desktop.indexOf(".nd-btn {"));
+    // Celular: a caixa não cresce para 44 px; o alvo de toque vem da área invisível.
+    expect(cssRuleBody(mobile, '.nd-root[data-mobile="true"] .nd-label-action')).toContain("min-height: 0;");
+    expect(cssRuleBody(mobile, '.nd-root[data-mobile="true"] .nd-label-action::after')).toContain("inset: calc((100% - 44px) / 2) 0;");
   });
 
   it("trocar a conexão carrega a nova lista, mantém o modelo digitado e avisa se ele não consta", async () => {

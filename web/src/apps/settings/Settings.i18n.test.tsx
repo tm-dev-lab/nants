@@ -255,7 +255,7 @@ describe("Configurações em en", () => {
     expect(network.querySelector("[data-network-coherence]")?.textContent).toBe(
       "Windows still redirects the ports: run the undo script. That is why Nants may be on a port other than 3000.",
     );
-    expect([...network.querySelectorAll("summary")].map((el) => el.textContent)).toEqual(["Script to enable it on Windows", "Script to undo it on Windows"]);
+    expect([...network.querySelectorAll("summary")].map((el) => el.textContent)).toEqual(["Script to undo it on Windows"]);
     expect(within(network).getByLabelText("PowerShell script: Script to undo it on Windows")).toBeTruthy();
     expect(w.querySelector("[data-nants-version]")?.textContent).toBe("Nants version 0.1.0");
     expectNoPortuguese();

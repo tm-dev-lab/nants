@@ -56,6 +56,7 @@ use crate::agents::usage::BudgetGuard;
 use crate::harness::compose::ComposeEnv;
 use crate::harness::git::{Git, LOCAL_SETTINGS};
 use crate::harness::GitError;
+use crate::i18n::{self, Lang};
 use crate::sdd::formatting;
 use crate::sdd::reconciler::is_task_commit;
 use crate::sdd::{
@@ -220,20 +221,31 @@ pub fn checks_summary(outcomes: &[CheckOutcome]) -> String {
 /// Como [`checks_summary`], marcando as checagens não bloqueantes em `regressions` (passam na base,
 /// falham na branch): `lint ✗ (não bloqueante, regressão desta tarefa)` (spec 080 T01).
 pub fn checks_summary_marked(outcomes: &[CheckOutcome], regressions: &[String]) -> String {
+    checks_summary_in(Lang::PtBr, outcomes, regressions)
+}
+
+/// [`checks_summary_marked`] no idioma do projeto (spec 113 T04): é texto da conversa.
+pub fn checks_summary_in(lang: Lang, outcomes: &[CheckOutcome], regressions: &[String]) -> String {
+    i18n::tr(lang, "runner.checks.list", &[("list", &checks_list_in(lang, outcomes, regressions))])
+}
+
+/// Só a lista de [`checks_summary_in`], sem o rótulo `checagens:`.
+fn checks_list_in(lang: Lang, outcomes: &[CheckOutcome], regressions: &[String]) -> String {
     let parts: Vec<String> = outcomes
         .iter()
         .map(|o| {
             let mark = if o.passed { "✓" } else { "✗" };
+            let args: [(&str, &str); 2] = [("name", &o.name), ("mark", mark)];
             if o.passed || o.blocking {
                 format!("{} {mark}", o.name)
             } else if regressions.contains(&o.name) {
-                format!("{} {mark} (não bloqueante, {REGRESSION_LABEL})", o.name)
+                i18n::tr(lang, "runner.checks.non_blocking_regression", &args)
             } else {
-                format!("{} {mark} (não bloqueante)", o.name)
+                i18n::tr(lang, "runner.checks.non_blocking", &args)
             }
         })
         .collect();
-    format!("checagens: {}", parts.join(", "))
+    parts.join(", ")
 }
 
 /// Rótulo da checagem não bloqueante que passa na base e falha na branch da tarefa.
@@ -247,6 +259,20 @@ pub fn pass_summary(place: &str, command: &str, checks: Option<&str>) -> String 
         Some(c) => format!("testes ✓{place} · {c}"),
         None => format!("testes ✓{place} (`{command}`)"),
     }
+}
+
+/// [`pass_summary`] no idioma do projeto (spec 113 T04); `on_base` acrescenta "na base".
+pub fn pass_summary_in(lang: Lang, on_base: bool, command: &str, checks: Option<&str>) -> String {
+    let place = if on_base { i18n::text(lang, "runner.tests.on_base") } else { String::new() };
+    match checks {
+        Some(c) => i18n::tr(lang, "runner.tests.passed_checks", &[("place", &place), ("checks", c)]),
+        None => i18n::tr(lang, "runner.tests.passed_command", &[("place", &place), ("command", command)]),
+    }
+}
+
+/// Início da linha da verificação final na base no idioma (ver [`FINAL_BASE_PREFIX`]).
+pub fn final_base_prefix(lang: Lang) -> String {
+    i18n::text(lang, "runner.final_base.prefix")
 }
 
 /// Alerta anexado à evidência quando um comando termina com 0 sem saída própria.
@@ -1911,7 +1937,8 @@ impl TaskRunner {
         attempt: u32,
         selected: &[&Formatter],
     ) -> Result<(), RunnerError> {
-        let failed = |why: String| format!("formatação automática falhou (não bloqueia): {why}");
+        let lang = self.lang.get();
+        let failed = |why: String| i18n::tr(lang, "runner.format.failed", &[("why", &why)]);
         if let Err(why) = formatting::snapshot(wt) {
             self.tests_message(task, attempt, self.scrub(&failed(why)));
             return Ok(());
@@ -1928,12 +1955,12 @@ impl TaskRunner {
             }
             let problem = match result {
                 Ok(r) if r.passed => None,
-                Ok(r) if r.timed_out => Some("tempo esgotado".to_string()),
-                Ok(r) => Some(format!(
-                    "saída {}: {}",
-                    r.exit_code.map_or_else(|| "?".to_string(), |c| c.to_string()),
-                    tail_bytes(r.output.trim_end(), FORMATTER_TAIL_BYTES)
-                )),
+                Ok(r) if r.timed_out => Some(i18n::text(lang, "runner.format.timed_out")),
+                Ok(r) => {
+                    let code = r.exit_code.map_or_else(|| "?".to_string(), |c| c.to_string());
+                    let output = tail_bytes(r.output.trim_end(), FORMATTER_TAIL_BYTES);
+                    Some(i18n::tr(lang, "runner.format.exit", &[("code", &code), ("output", output)]))
+                }
                 Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
                 Err(e) => Some(e.to_string()),
             };
@@ -1954,7 +1981,7 @@ impl TaskRunner {
                         self.tests_message(task, attempt, self.scrub(&failed(e)));
                         return Ok(());
                     }
-                    let text = self.scrub(&format!("formatação automática ({}) falhou (não bloqueia): {why}", f.name));
+                    let text = self.scrub(&i18n::tr(lang, "runner.format.tool_failed", &[("name", &f.name), ("why", &why)]));
                     let first = self
                         .formatter_failures
                         .lock()
@@ -1973,7 +2000,11 @@ impl TaskRunner {
         match formatting::finalize(wt, &task.frontmatter.allowed_scope, &message) {
             Ok(files) if files.is_empty() => {}
             Ok(files) => {
-                let text = format!("formatação automática: {} arquivos ({})", files.len(), applied.join(", "));
+                let text = i18n::tr(
+                    lang,
+                    "runner.format.applied",
+                    &[("count", &files.len().to_string()), ("names", &applied.join(", "))],
+                );
                 self.tests_message(task, attempt, text);
             }
             Err(why) => {
@@ -2268,10 +2299,10 @@ impl TaskRunner {
                 } else {
                     Vec::new()
                 };
-                let summary = checks_summary_marked(&outcomes, &regressions);
+                let summary = checks_summary_in(self.lang.get(), &outcomes, &regressions);
                 // Só afirma "testes ✓" se nenhuma checagem bloqueante falhou (senão contradiz a falha).
                 let text = if blocking_failed.is_empty() {
-                    pass_summary("", &self.scrub(&settings.test_command), Some(&summary))
+                    pass_summary_in(self.lang.get(), false, &self.scrub(&settings.test_command), Some(&summary))
                 } else {
                     summary
                 };
@@ -2302,7 +2333,7 @@ impl TaskRunner {
             } else if test.passed {
                 self.events.emit(RunnerEvent::AgentMessage {
                     agent: "tests".into(),
-                    text: pass_summary("", &self.scrub(&settings.test_command), None),
+                    text: pass_summary_in(self.lang.get(), false, &self.scrub(&settings.test_command), None),
                     task_id: Some(task.frontmatter.id.clone()),
                     attempt: Some(attempt),
                 });
@@ -2337,7 +2368,11 @@ impl TaskRunner {
             task.frontmatter.tested_at = None;
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "tests".into(),
-                text: format!("test_command falhou ({failed_runs}/{max_cycles})"),
+                text: i18n::tr(
+                    self.lang.get(),
+                    "runner.tests.failed_cycle",
+                    &[("count", &failed_runs.to_string()), ("max", &max_cycles.to_string())],
+                ),
                 task_id: Some(task.frontmatter.id.clone()),
                 attempt: Some(attempt),
             });
@@ -2630,9 +2665,7 @@ impl TaskRunner {
             let short = sha.get(..7).unwrap_or(sha);
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "tests".into(),
-                text: format!(
-                    "testes e checagens não repetidos na base: árvore idêntica à testada em {short} (fora de .sdd/)"
-                ),
+                text: i18n::tr(self.lang.get(), "runner.tests.reused", &[("sha", short)]),
                 task_id: Some(id.clone()),
                 attempt: Some(task.frontmatter.attempts + 1),
             });
@@ -2640,7 +2673,7 @@ impl TaskRunner {
                 command: self.scrub(&settings.test_command),
                 exit_code: Some(0),
                 at: crate::server::projects::now_rfc3339(),
-                summary: format!("reaproveitado: árvore idêntica à testada em {short}"),
+                summary: i18n::tr(self.lang.get(), "runner.tests.reused_summary", &[("sha", short)]),
             }
         } else {
             match self.run_tracked(settings, root.root(), &settings.test_command, true, None, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await {
@@ -2685,7 +2718,11 @@ impl TaskRunner {
                 Ok(t) => {
                     self.events.emit(RunnerEvent::AgentMessage {
                         agent: "tests".into(),
-                        text: format!("checagem {} falhou na base:\n{}", check.name, tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES)),
+                        text: format!(
+                            "{}\n{}",
+                            i18n::tr(self.lang.get(), "runner.checks.failed_on_base", &[("name", &check.name)]),
+                            tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES)
+                        ),
                         task_id: Some(id.clone()),
                         attempt: Some(task.frontmatter.attempts + 1),
                     });
@@ -2712,10 +2749,11 @@ impl TaskRunner {
         if reused_sha.is_none() {
             let blocking: Vec<String> =
                 settings.checks.iter().filter(|c| c.blocking).map(|c| format!("{} ✓", c.name)).collect();
-            let checks = (!blocking.is_empty()).then(|| format!("checagens: {}", blocking.join(", ")));
+            let lang = self.lang.get();
+            let checks = (!blocking.is_empty()).then(|| i18n::tr(lang, "runner.checks.list", &[("list", &blocking.join(", "))]));
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "tests".into(),
-                text: pass_summary(" na base", &self.scrub(&settings.test_command), checks.as_deref()),
+                text: pass_summary_in(lang, true, &self.scrub(&settings.test_command), checks.as_deref()),
                 task_id: Some(id.clone()),
                 attempt: Some(task.frontmatter.attempts + 1),
             });
@@ -3415,10 +3453,11 @@ impl TaskRunner {
         let root = self.repo_root.as_path();
         let mut fail_tail = String::new();
         let command = self.scrub(&settings.test_command);
-        let mut test_mark = "não executado";
+        let lang = self.lang.get();
+        let mut test_mark = i18n::text(lang, "runner.final_base.not_run");
         let test_text = match self.run_tracked(settings, root, &settings.test_command, true, None, WHERE, "FINAL", 1).await {
             Ok(t) => {
-                test_mark = if t.passed { "✓" } else { "✗" };
+                test_mark = if t.passed { "✓" } else { "✗" }.to_string();
                 let status = if t.passed { "passou" } else { "FALHOU" };
                 let code = t.exit_code.map_or("?".to_string(), |c| c.to_string());
                 let tail = self.scrub(tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES));
@@ -3447,7 +3486,7 @@ impl TaskRunner {
                 }),
                 Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
                 Err(e) => {
-                    not_run_names.push(format!("{} não executado", check.name));
+                    not_run_names.push(i18n::tr(lang, "runner.checks.not_run", &[("name", &check.name)]));
                     not_run.push(format!("### {} - não executado: {e}\n$ {}", check.name, self.scrub(&check.command)));
                 }
             }
@@ -3456,13 +3495,21 @@ impl TaskRunner {
         // o relatório lê esta linha como fato da verificação final.
         let mut parts: Vec<String> = Vec::new();
         if !outcomes.is_empty() {
-            parts.push(checks_summary(&outcomes).trim_start_matches("checagens: ").to_string());
+            parts.push(checks_list_in(lang, &outcomes, &[]));
         }
         parts.extend(not_run_names);
-        let checks_part = if parts.is_empty() { String::new() } else { format!(" · checagens: {}", parts.join(", ")) };
+        let checks_part = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", i18n::tr(lang, "runner.checks.list", &[("list", &parts.join(", "))]))
+        };
         self.events.emit(RunnerEvent::AgentMessage {
             agent: "tests".into(),
-            text: format!("{FINAL_BASE_PREFIX}: testes {test_mark}{checks_part}"),
+            text: i18n::tr(
+                lang,
+                "runner.final_base.line",
+                &[("prefix", &final_base_prefix(lang)), ("mark", &test_mark), ("checks", &checks_part)],
+            ),
             task_id: None,
             attempt: None,
         });
@@ -6606,6 +6653,60 @@ mod tests {
         (tests_texts(&rec), seen)
     }
 
+    /// Executor do shell que simula tempo esgotado nos comandos com `SLOW` (spec 113 T04).
+    struct SlowShell(ShellTestExecutor);
+
+    impl TestExecutor for SlowShell {
+        fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            if command.contains("SLOW") {
+                return Box::pin(async { Ok(TestResult { passed: false, output: String::new(), exit_code: None, timed_out: true }) });
+            }
+            self.0.run(dir, command)
+        }
+    }
+
+    /// Formatador que aplica, um que sai 3 e um que estoura o tempo, no idioma pedido; devolve as
+    /// mensagens `tests`.
+    async fn formatter_texts_in(lang: crate::i18n::Lang, name: &str) -> Vec<String> {
+        let fx = Fixture::new(name, "true");
+        set_formatters(
+            &fx,
+            vec![
+                formatter("web", "for f in *.txt; do tr a-z A-Z < \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; done", "web", &["web/**"]),
+                formatter("boom", "echo oops-text; exit 3", ".", &["**"]),
+                formatter("slow", "echo SLOW", ".", &["**"]),
+            ],
+        );
+        fx.add_task(&module_task());
+        let rec = Recorder::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(FilesDev(vec![("web/a.txt", "abc\n")])),
+            Box::new(FakeReviewer::new(|_, _| approved(vec![]))),
+            Box::new(SlowShell(ShellTestExecutor::new())),
+            Box::new(rec.clone()),
+        )
+        .with_lang(crate::i18n::SharedLang::new(lang));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        tests_texts(&rec)
+    }
+
+    #[tokio::test]
+    async fn formatter_messages_follow_project_language() {
+        let pt = formatter_texts_in(crate::i18n::Lang::PtBr, "fmt-idioma-pt").await;
+        assert!(pt.iter().any(|t| t.starts_with("formatação automática (boom) falhou (não bloqueia): saída 3: ") && t.contains("oops-text")), "{pt:?}");
+        assert!(pt.contains(&"formatação automática (slow) falhou (não bloqueia): tempo esgotado".to_string()), "{pt:?}");
+        assert!(pt.contains(&"formatação automática: 1 arquivos (web)".to_string()), "{pt:?}");
+
+        let en = formatter_texts_in(crate::i18n::Lang::En, "fmt-idioma-en").await;
+        assert!(en.iter().any(|t| t.starts_with("automatic formatting (boom) failed (does not block): exit 3: ") && t.contains("oops-text")), "{en:?}");
+        assert!(en.contains(&"automatic formatting (slow) failed (does not block): timed out".to_string()), "{en:?}");
+        assert!(en.contains(&"automatic formatting: 1 files (web)".to_string()), "{en:?}");
+        assert_no_pt(&en);
+        assert_eq!(i18n::tr(crate::i18n::Lang::En, "runner.format.failed", &[("why", "x")]), "automatic formatting failed (does not block): x");
+        assert_eq!(i18n::tr(crate::i18n::Lang::PtBr, "runner.format.failed", &[("why", "x")]), "formatação automática falhou (não bloqueia): x");
+    }
+
     #[tokio::test]
     async fn formatters_run_by_module_commit_only_scope_and_failures_do_not_block() {
         let fx = Fixture::new("fmt-modulos", "true");
@@ -8286,6 +8387,153 @@ mod tests {
         assert_eq!(fx.read_task("T02").frontmatter.status, TaskStatus::Done);
         assert!(!fx.task_path("T03").exists(), "no máximo uma rodada de correção");
         assert_eq!(rev.inputs().iter().filter(|i| i.task_id == "FINAL").count(), 2);
+    }
+
+    /// Spec 113 T04: palavras do pt-BR que não podem aparecer nas mensagens `tests` com o projeto
+    /// em en (sentinela: falha se um texto fixo em pt voltar ao caminho en).
+    const PT_SENTINEL: [&str; 16] = [
+        "testes", "checagem", "checagens", "na base", "não", "falhou", "reaproveitado", "árvore",
+        "verificação", "bloqueante", "executado", "regressão", "formatação", "esgotado", "saída", "arquivos",
+    ];
+
+    fn assert_no_pt(texts: &[String]) {
+        for t in texts {
+            let lower = t.to_lowercase();
+            for word in PT_SENTINEL {
+                assert!(!lower.contains(word), "texto em pt no caminho en ({word}): {t}");
+            }
+        }
+    }
+
+    fn en() -> crate::i18n::SharedLang {
+        crate::i18n::SharedLang::new(crate::i18n::Lang::En)
+    }
+
+    #[tokio::test]
+    async fn tests_messages_follow_project_language_en() {
+        let fx = Fixture::new("resultado-en", "true");
+        set_checks(&fx, vec![check("build", "true", true), check("lint", "true", false)]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = base_moving_reviewer(fx.repo.clone());
+        // worktree: teste falha (1/N), depois teste, build ✓ e lint ✗ (regressão: passa na base); base: teste, build.
+        let tests = ScriptedTests::new(vec![false, true, true, false, true, true]);
+        fx.runner(&dev, &rev, tests, &rec).with_lang(en()).run_task(SPEC, "T01").await.unwrap();
+        let texts = tests_texts(&rec);
+        assert_eq!(texts[0], "test_command failed (1/5)", "{texts:?}");
+        assert_eq!(
+            texts[1..],
+            ["tests ✓ · checks: build ✓, lint ✗ (non-blocking, regression from this task)", "tests ✓ on the base · checks: build ✓"],
+            "{texts:?}"
+        );
+        assert_no_pt(&texts);
+
+        let fx = Fixture::new("resultado-en-sem-checks", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = base_moving_reviewer(fx.repo.clone());
+        fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_lang(en()).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(tests_texts(&rec), vec!["tests ✓ (`true`)", "tests ✓ on the base (`true`)"]);
+    }
+
+    #[tokio::test]
+    async fn failed_cycle_message_in_pt_br() {
+        let fx = Fixture::new("ciclo-pt", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = base_moving_reviewer(fx.repo.clone());
+        fx.runner(&dev, &rev, ScriptedTests::new(vec![false]), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(tests_texts(&rec)[0], "test_command falhou (1/5)");
+    }
+
+    #[tokio::test]
+    async fn reused_base_message_follows_project_language_en() {
+        let fx = Fixture::new("reuso-en", "true");
+        set_checks(&fx, vec![check("build", "true", true)]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_lang(en()).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        let t = fx.read_task("T01");
+        let short = t.frontmatter.reviewed_sha.as_deref().unwrap()[..7].to_string();
+        assert_eq!(t.frontmatter.test_run.expect("test_run").summary, format!("reused: tree identical to the one tested at {short}"));
+        let texts = tests_texts(&rec);
+        assert!(
+            texts.contains(&format!("tests and checks not repeated on the base: tree identical to the one tested at {short} (outside .sdd/)")),
+            "{texts:?}"
+        );
+        assert_no_pt(&texts);
+    }
+
+    #[tokio::test]
+    async fn failed_base_check_message_in_both_languages() {
+        for (lang, name, expected) in [
+            (crate::i18n::Lang::PtBr, "check-base-pt", "checagem build falhou na base:\n"),
+            (crate::i18n::Lang::En, "check-base-en", "check build failed on the base:\n"),
+        ] {
+            let fx = Fixture::new(name, "true");
+            set_checks(&fx, vec![check("build", "true", true)]);
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let (dev, rec) = (FakeDev::default(), Recorder::default());
+            let rev = base_moving_reviewer(fx.repo.clone());
+            // worktree: teste, build; base: teste ✓, build ✗.
+            let tests = ScriptedTests::new(vec![true, true, true, false]);
+            let runner = fx.runner(&dev, &rev, tests, &rec).with_lang(crate::i18n::SharedLang::new(lang));
+            let out = runner.run_task(SPEC, "T01").await.unwrap();
+            assert!(matches!(out, Outcome::Blocked { .. }), "{out:?}");
+            let texts = tests_texts(&rec);
+            assert!(texts.iter().any(|t| t.starts_with(expected)), "{texts:?}");
+            if lang == crate::i18n::Lang::En {
+                assert_no_pt(&texts);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_base_message_follows_project_language_en() {
+        let fx = Fixture::new("final-msg-en", "true");
+        set_checks(&fx, vec![check("build", "echo build-ok", true), check("lint", "echo lint-ruim", false)]);
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = FakeReviewer::new(|_, i| if i.task_id == "FINAL" { matrix(true) } else { approved(vec![]) });
+        let mut probe = BaseProbe::new(&fx.repo);
+        probe.fail_cmd = Some("echo lint-ruim".into());
+        fx.runner(&dev, &rev, probe, &rec).with_lang(en()).run_spec(SPEC).await.unwrap();
+        let msgs = final_base_messages(&rec);
+        assert_eq!(msgs, vec!["final verification on the base: tests ✓ · checks: build ✓, lint ✗ (non-blocking)"]);
+        assert!(msgs[0].starts_with(&final_base_prefix(crate::i18n::Lang::En)));
+        assert_no_pt(&msgs);
+
+        let fx = Fixture::new("final-msg-en-nao-exec", "true");
+        set_checks(&fx, vec![check("build", "echo build-ok", true)]);
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = FakeReviewer::new(|_, i| if i.task_id == "FINAL" { matrix(true) } else { approved(vec![]) });
+        let mut probe = BaseProbe::new(&fx.repo);
+        probe.err_tests = true;
+        fx.runner(&dev, &rev, probe, &rec).with_lang(en()).run_spec(SPEC).await.unwrap();
+        assert_eq!(final_base_messages(&rec), vec!["final verification on the base: tests not run · checks: build ✓"]);
+    }
+
+    #[test]
+    fn summaries_in_both_languages_and_pt_prefix_constant() {
+        use crate::i18n::Lang;
+        let o = |n: &str, b: bool, p: bool| CheckOutcome { name: n.into(), command: String::new(), blocking: b, passed: p, output: String::new(), exit_code: None, timed_out: false };
+        let outcomes = [o("lint", false, false), o("fmt", false, false), o("build", true, true)];
+        assert_eq!(
+            checks_summary_in(Lang::PtBr, &outcomes, &["lint".into()]),
+            "checagens: lint ✗ (não bloqueante, regressão desta tarefa), fmt ✗ (não bloqueante), build ✓"
+        );
+        let en = checks_summary_in(Lang::En, &outcomes, &["lint".into()]);
+        assert_eq!(en, "checks: lint ✗ (non-blocking, regression from this task), fmt ✗ (non-blocking), build ✓");
+        assert_no_pt(&[en]);
+        assert_eq!(pass_summary_in(Lang::PtBr, true, "make", None), pass_summary(" na base", "make", None));
+        assert_eq!(pass_summary_in(Lang::PtBr, false, "make", Some("checagens: a ✓")), pass_summary("", "make", Some("checagens: a ✓")));
+        assert_eq!(pass_summary_in(Lang::En, true, "make", None), "tests ✓ on the base (`make`)");
+        assert_eq!(final_base_prefix(Lang::PtBr), FINAL_BASE_PREFIX);
+        assert!(REGRESSIONS_MARK.contains("Regressões") && i18n::text(Lang::PtBr, "runner.checks.non_blocking_regression").contains(REGRESSION_LABEL));
     }
 
     /// Spec 107 T01: a tarefa de correção sai no idioma ativo do projeto, com a marca estável

@@ -478,6 +478,26 @@
   gap: var(--sp-2);
 }
 
+/*
+ * Ação discreta na linha do rótulo de um campo (ex.: "Atualizar lista" do Modelo, 113/T05): fantasma,
+ * com a altura da linha do rótulo (`.nd-field-labelrow`), para não empurrar o campo para baixo.
+ */
+.nd-label-action {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  padding: 0 var(--sp-1);
+  margin-right: calc(-1 * var(--sp-1));
+  font-size: var(--fs-label);
+  line-height: 1;
+  gap: var(--sp-1);
+}
+
+.nd-label-action > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Botões da barra superior (variante secundária ou fantasma do conjunto único), na altura do mockup. */
 .nd-bar-btn {
   height: 30px;

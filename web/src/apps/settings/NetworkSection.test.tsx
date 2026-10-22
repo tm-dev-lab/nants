@@ -165,12 +165,12 @@ describe("Configurações: Acesso pela rede local (111/T03)", () => {
     expect(puts).toEqual([{ lan: true }]);
     expect(view.server.count("GET", /^\/api\/config\/network$/)).toBe(2);
     expect(lanSwitch().getAttribute("aria-checked")).toBe("true");
-    const restart = must(section().querySelector<HTMLElement>("[data-network-restart]"));
-    expect(restart.textContent).toContain("Vale a partir do próximo início");
-    expect(restart.textContent).toContain("Ctrl+C no terminal");
-    expect(restart.textContent).toContain("Nesta execução, o Nants abre só neste computador.");
-    expect(restart.querySelector("code")?.textContent).toBe("nants");
-    // Ligada e sem redirecionamento no WSL NAT: falta rodar o script, e o de ligar abre.
+    // Salva ligada e sem reiniciar (spec 112, decisão 8): o passo 1 fica pronto com a pendência
+    // discreta do reinício, e o passo 2 já libera, com o script de ligar aberto.
+    expect(section().querySelector("[data-network-restart]")).toBeNull();
+    expect(section().querySelector("[data-step='enable'] [data-step-detail]")?.textContent).toBe("Ligada; vale ao reiniciar (Ctrl+C e nants).");
+    const windows = must(section().querySelector<HTMLElement>("[data-step='windows']"));
+    expect(windows.getAttribute("data-step-status")).toBe("pending");
     expect(section().querySelector("[data-network-coherence]")?.textContent).toBe("Falta rodar o script de ligar no Windows.");
     expect(must(section().querySelector("details[data-network-script-block='enable']")).hasAttribute("open")).toBe(true);
     // Desligar de novo: volta a coincidir com esta execução; nada de reinício.
@@ -266,7 +266,9 @@ describe("Configurações: Acesso pela rede local (111/T03)", () => {
     expect(enable.querySelector("[data-network-script]")?.textContent).toBe(wslPowerShellScript(3000, RANGE));
     expect(undo.querySelector("[data-network-script]")?.textContent).toBe(wslUndoScript(3000, RANGE));
     expect(enable.textContent).toContain("PowerShell como administrador");
-    expect(enable.querySelector("[data-network-private-note]")?.textContent).toBe(NETWORK_TEXT.wslPrivate);
+    expect(enable.querySelector("[data-network-private-note]")).toBeNull();
+    expect(s.textContent).not.toMatch(/marcada como privada|Rede privada/);
+    expect(s.querySelector("[data-network-security]")?.textContent).toBe(NETWORK_TEXT.security);
     expect(enable.textContent).toContain("networkingMode=mirrored");
     expect(undo.textContent).toContain("PowerShell como administrador");
     await act(async () => {
@@ -286,7 +288,8 @@ describe("Configurações: Acesso pela rede local (111/T03)", () => {
       "O Windows ainda redireciona as portas: rode o script de desfazer. Por isso o Nants pode estar numa porta diferente da 3000.",
     );
     expect(must(s.querySelector("details[data-network-script-block='undo']")).hasAttribute("open")).toBe(true);
-    expect(must(s.querySelector("details[data-network-script-block='enable']")).hasAttribute("open")).toBe(false);
+    // Rede desligada: o passo 2 espera o passo 1 e mostra só o script de desfazer.
+    expect(s.querySelector("details[data-network-script-block='enable']")).toBeNull();
   });
 
   it("WSL NAT ligado com outro destino ou sem a regra: rodar o script de ligar", async () => {

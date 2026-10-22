@@ -14,7 +14,9 @@
  *   veredito) só aumentam `wanted`, e `pumpStatus` faz no máximo um GET em voo, só com alguma
  *   leitora visível (montada minimizada, nenhuma requisição);
  * - registro (`GET .../app/logs`): só com a Execução visível (`logViewers`), uma leitura ao ficar
- *   visível e a cada `LOGS_POLL_MS` enquanto o app está no ar;
+ *   visível e a cada `LOGS_POLL_MS` enquanto o app está no ar. O registro e os detalhes da falha
+ *   chegam limpos de sequências ANSI (`cleanComposeLog`, spec 113): a tela e o "Copiar registro"
+ *   usam o mesmo texto puro;
  * - eventos `app_started`/`app_exited` (store global) são aplicados UMA vez por sessão;
  * - aviso "App no ar": na transição sem endereço → com endereço, uma vez por partida (`launch`,
  *   contada ao pedir a execução ou ao ver um `app_started` de outra aba), pelo `onLive` registrado
@@ -28,6 +30,7 @@ import type { Readiness, ReadinessItem } from "../../desktop/api";
 import { translateCode } from "../../i18n/serverCodes";
 import { appStore } from "../../store";
 import { isPrereqFailure, prereqItems, prereqMessage } from "../shared/readiness";
+import { cleanComposeLog } from "../shared/terminalText";
 import {
   EMBED_RETRY_LIMIT,
   EMBED_RETRY_MS,
@@ -249,7 +252,7 @@ function requestStatus(s: Session): void {
 function refreshLogs(s: Session): void {
   if (!s.alive || s.logViewers.size === 0) return;
   void getAppLogs(s.snap.projectId).then((r) => {
-    if (s.alive && r.ok) update(s, { logs: r.data });
+    if (s.alive && r.ok) update(s, { logs: cleanComposeLog(r.data) });
   });
 }
 
@@ -385,7 +388,7 @@ function start(s: Session, deps: StartDeps): void {
         update(s, { problem: { message: prereqMessage(missing), missing, prereq: true } });
         return;
       }
-      update(s, { problem: { message: appErrorMessage(r.error.status, r.error.reason), failure: r.error, missing: null, prereq: false }, errorDetail: r.error.detail ?? null });
+      update(s, { problem: { message: appErrorMessage(r.error.status, r.error.reason), failure: r.error, missing: null, prereq: false }, errorDetail: typeof r.error.detail === "string" ? cleanComposeLog(r.error.detail) : null });
       return;
     }
     // O evento `app_started` pode já ter chegado; a resposta só completa o que faltar.

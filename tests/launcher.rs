@@ -8,6 +8,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[path = "support/fake_docker.rs"]
+mod fake_docker;
+use fake_docker::without_real_docker;
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -48,6 +52,7 @@ impl Drop for ChildGuard {
 /// Inicia o binário com `args` e devolve o filho e as linhas do stdout (drenadas numa thread).
 fn spawn(args: &[&str], browser: Option<&Path>) -> (ChildGuard, mpsc::Receiver<String>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nants"));
+    without_real_docker(&mut cmd);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     // Mensagens em pt-BR (spec 102: o terminal segue LC_ALL > LC_MESSAGES > LANG).
     cmd.env("LC_ALL", "pt_BR.UTF-8");
@@ -156,7 +161,7 @@ fn port_explicita_ocupada_falha_com_mensagem_clara() {
     let port = busy.local_addr().expect("addr").port();
     let dir = temp_dir("explicit");
     let config = write_config(&dir, 3000);
-    let output = Command::new(env!("CARGO_BIN_EXE_nants"))
+    let output = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
         .args(["serve", "--port", &port.to_string(), "--config", config.to_str().expect("utf8")])
         .env("LC_ALL", "pt_BR.UTF-8")
         .stdin(Stdio::null())
@@ -196,6 +201,7 @@ fn ajuda_e_erros_seguem_o_locale_do_terminal() {
     let dir = temp_dir("locale-listen");
     let config = write_config(&dir, 0);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nants"));
+    without_real_docker(&mut cmd);
     cmd.args(["serve", "--port", "0", "--config", config.to_str().expect("utf8")])
         .env("LC_ALL", "C")
         .stdin(Stdio::null())

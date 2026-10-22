@@ -206,6 +206,12 @@ export const LIGHT_WINDOW_SEPARATION = 1.15;
 /** Opacidade do controle desabilitado (o mesmo em todos os controles). */
 export const DISABLED_OPACITY = 0.6;
 
+/**
+ * QR code do endereço de entrada (spec 112): módulos pretos sobre fundo branco nos dois temas, o
+ * contraste que os leitores de QR esperam (invertido, muitos não leem).
+ */
+export const QR_COLORS = { light: "#ffffff", dark: "#000000" } as const;
+
 /** Anel de seleção (item escolhido numa grade de opções): fino, na cor de seleção (≥ 3:1). */
 export const SELECTED_RING = "0 0 0 1px var(--selected-edge)";
 

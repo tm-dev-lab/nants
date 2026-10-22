@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use crate::agents::runner::{manual_criteria, section_text, ACCEPTANCE, FINAL_BASE_PREFIX};
+use crate::agents::runner::{final_base_prefix, manual_criteria, section_text, ACCEPTANCE, FINAL_BASE_PREFIX};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
@@ -631,14 +631,19 @@ fn skills_facts(root: &Path, settings: Option<&Settings>, secrets: &SecretSet) -
 
 /// Spec 077 T02: texto da última mensagem `tests` sem tarefa que começa com "verificação final na base"
 /// (grava o runner em `dialog.jsonl`), sem o prefixo, redigido e truncado. `None` se não houver.
+/// O prefixo vale em qualquer idioma suportado (spec 113 T04: a linha sai no idioma do projeto).
 fn final_base_fact(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<String> {
+    let prefixes: Vec<String> = std::iter::once(FINAL_BASE_PREFIX.to_string())
+        .chain([Lang::PtBr, Lang::En].into_iter().map(final_base_prefix))
+        .collect();
     let page = super::dialog::read_page(root, spec_id, 0, usize::MAX);
-    let line = page
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.agent == "tests" && m.task_id.is_none() && m.text.starts_with(FINAL_BASE_PREFIX))?;
-    let rest = line.text[FINAL_BASE_PREFIX.len()..].trim_start_matches(':').trim();
+    let (line, prefix) = page.messages.iter().rev().find_map(|m| {
+        if m.agent != "tests" || m.task_id.is_some() {
+            return None;
+        }
+        prefixes.iter().find(|p| m.text.starts_with(p.as_str())).map(|p| (m, p))
+    })?;
+    let rest = line.text[prefix.len()..].trim_start_matches(':').trim();
     let text = if rest.is_empty() { line.text.trim() } else { rest };
     Some(truncate_bytes(&scrub_text(secrets, text), MAX_FINAL_BASE_BYTES))
 }
@@ -825,6 +830,22 @@ mod final_base_tests {
         write_dialog(&root, &[(1, "tests", Some("T01"), "verificação final na base: por tarefa, ignorada"), (2, "architect", None, "oi")]);
         let facts = build_facts(&root, SPEC, &secrets).expect("fatos");
         assert!(!facts.contains("Verificação final na base"), "{facts}");
+    }
+
+    /// Spec 113 T04: com o projeto em en, a linha da verificação final sai em en e segue lida.
+    #[test]
+    fn facts_read_final_base_line_written_in_english() {
+        let secrets = SecretSet::new(Vec::new());
+        let root = root("fato-en");
+        write_dialog(
+            &root,
+            &[
+                (1, "tests", None, "verificação final na base: testes ✗"),
+                (2, "tests", None, "final verification on the base: tests ✓ · checks: build ✓"),
+            ],
+        );
+        let fact = final_base_fact(&root, SPEC, &secrets).expect("fato");
+        assert_eq!(fact, "tests ✓ · checks: build ✓");
     }
 }
 

@@ -423,6 +423,29 @@ fn escalation_context_has_structured_fields_and_scrubs() {
 }
 
 #[test]
+fn escalation_excerpt_with_ansi_reaches_the_message_clean() {
+    let loaded = Loaded {
+        facts: String::new(),
+        allowed_scope: Vec::new(),
+        cycles: 1,
+        environmental: false,
+        config_suspect: false,
+        yolo: false,
+        rounds: 0,
+        env_fixes: 0,
+        command: "npm run check".into(),
+        exit_code: "1".into(),
+        error_tail: "\u{1b}[31m\u{1b}[1mFAIL\u{1b}[22m\u{1b}[39m src/a.test.ts\n\u{1b}[38;5;9m> 1 | x\u{1b}[0m".into(),
+        env_note: String::new(),
+    };
+    let context = escalation_context(&SecretSet::default(), &loaded, &Decision::escalate("teste falha"));
+    // A mensagem gravada passa por `message_text` (normalização única do chat).
+    let text = crate::server::events::message_text(&SecretSet::default(), &context);
+    assert!(text.contains("      FAIL src/a.test.ts\n      > 1 | x"), "{text}");
+    assert!(!text.contains("[31m") && !text.contains("[0m") && !text.contains('\u{1b}'), "{text}");
+}
+
+#[test]
 fn global_criteria_extracts_only_that_section() {
     let spec = "---\nid: x\n---\n## Contexto\nabc\n## Critérios globais\n- npm test executa Playwright\n## Outro\nz\n";
     let got = global_criteria(spec);

@@ -1,18 +1,27 @@
 /*
- * Seção "Acesso pela rede" da aba Máquina (spec 097, decisão 5; spec 111, T03).
+ * Seção "Acesso pela rede" da aba Máquina (spec 097, decisão 5; spec 111, T03; spec 112, T02).
  *
- * - O interruptor "Acesso pela rede local" mostra e grava a opção salva (`GET`/`PUT
- *   /api/config/network`). A mudança vale a partir do próximo início: a seção diz isso e mostra o
- *   comando para reiniciar. O `GET` leva cerca de 1,5 s no WSL (consulta ao Windows): enquanto
- *   isso, só uma linha discreta, sem travar o resto das Configurações.
- * - Instruções por ambiente: no Linux, uma dica do firewall; no WSL, os scripts do PowerShell para
- *   ligar e para desfazer, em blocos recolhidos (o Nants nunca os executa).
- * - Coerência com o Windows: falta rodar o script, ou o Windows ainda redireciona as portas.
- * - Com o Nants na rede nesta execução (`lan_view_ports`), o endereço e a faixa de visualização,
- *   uma vez só, e o estado: no WSL com o Windows conferido, o estado real; no Linux ou sem conferir,
- *   Liberada ou Pendente pela marcação manual (a mesma do "Já liberei" do App).
+ * Jornada guiada em passos (spec 112, decisão 8), numerados por ambiente:
+ * - WSL NAT: ligar, preparar o Windows, adicionar; espelhado: ligar, firewall, adicionar;
+ *   Linux direto: ligar, adicionar.
+ * - Cada passo mostra o estado conferido pelo servidor (`GET /api/config/network`), e o seguinte
+ *   só fica habilitado quando o anterior estiver pronto; desabilitado, ele diz o motivo. Com o
+ *   Windows não conferido, o passo de adicionar fica habilitado com a ressalva.
+ * - Volta automática: o estado é relido a cada 30 s com a aba visível; se o Windows deixar de
+ *   estar pronto (o IP do WSL mudou), o passo 2 volta a ficar pendente sozinho, com o script.
+ *
+ * Passo 1: o interruptor "Acesso pela rede local" mostra e grava a opção salva (`PUT`); a mudança
+ * vale a partir do próximo início (a seção mostra o comando para reiniciar). O `GET` leva cerca de
+ * 1,5 s no WSL (consulta ao Windows): enquanto isso, só uma linha discreta.
+ * Passo 2 (WSL): os scripts do PowerShell da 111, para ligar e para desfazer, em blocos recolhidos
+ * (o Nants nunca os executa), e a coerência com o Windows. Com a rede desligada, só o de desfazer.
+ * Passo 3: adicionar dispositivo e a lista (`DevicesStep`).
+ *
+ * Com o Nants na rede nesta execução (`lan_view_ports`), o endereço e a faixa de visualização,
+ * uma vez só, e o estado: no WSL com o Windows conferido, o estado real; no Linux ou sem conferir,
+ * Liberada ou Pendente pela marcação manual (a mesma do "Já liberei" do App).
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { getNetworkConfig, putNetworkConfig } from "../../api/client";
 import type { NetworkConfig } from "../../api/types";
 import { Icon } from "../../desktop/Icon";
@@ -22,6 +31,8 @@ import { useNetworkView } from "../../desktop/useNetwork";
 import { useT } from "../../i18n/react";
 import { reachEnvironment } from "../app/runSession";
 import { copyText } from "../conversation/ResultMessage";
+import { journeySteps, stepIsDone, type JourneyStep } from "./devicesModel";
+import { DevicesStep } from "./DevicesStep";
 import {
   NETWORK_TEXT,
   coherenceIsWarning,
@@ -36,6 +47,12 @@ import {
 } from "./networkModel";
 
 type Load = { status: "loading" } | { status: "error" } | { status: "ok"; net: NetworkConfig };
+
+/** Releitura do estado para a volta automática (substituível nos testes). */
+export const networkRefresh = {
+  intervalMs: 30_000,
+  visible: (): boolean => typeof document === "undefined" || document.visibilityState !== "hidden",
+};
 
 /** Script em bloco recolhido, com o botão de copiar. */
 function ScriptBlock({ kind, title, script, open, children }: { kind: "enable" | "undo"; title: string; script: string; open: boolean; children: ReactNode }) {
@@ -70,21 +87,24 @@ function ScriptBlock({ kind, title, script, open, children }: { kind: "enable" |
   );
 }
 
-/**
- * Instruções do ambiente: dica do Linux ou os scripts do WSL. Com o endereço e a faixa já na lista
- * acima (`factsShown`), a dica do Linux só aponta para eles, sem repetir.
- */
-function EnvInstructions({ net, factsShown }: { net: NetworkConfig; factsShown: boolean }) {
+/** Dica curta do firewall do Linux (o Nants não mexe nele). */
+function LinuxHint({ net, factsShown }: { net: NetworkConfig; factsShown: boolean }) {
   const { t } = useT();
+  const ports = net.view_ports === null ? String(net.lan_port) : `${net.lan_port}, ${rangeLabel(net.view_ports)}`;
+  return (
+    <p className="nd-field-hint" data-network-linux="">
+      {factsShown ? NETWORK_TEXT.linuxHintAbove : t("settings.network.linuxHint", { ports })}
+    </p>
+  );
+}
+
+/**
+ * Scripts do WSL (passo 2). Com o passo bloqueado (rede desligada nesta execução), só o de desfazer,
+ * como na 111; senão, o de ligar e o de desfazer.
+ */
+function WslScripts({ net, onlyUndo }: { net: NetworkConfig; onlyUndo: boolean }) {
   const scripts = networkScripts(net);
-  if (scripts === null) {
-    const ports = net.view_ports === null ? String(net.lan_port) : `${net.lan_port}, ${rangeLabel(net.view_ports)}`;
-    return (
-      <p className="nd-field-hint" data-network-linux="">
-        {factsShown ? NETWORK_TEXT.linuxHintAbove : t("settings.network.linuxHint", { ports })}
-      </p>
-    );
-  }
+  if (scripts === null) return null;
   const mirrored = net.env === "wsl_mirrored";
   const open = scriptForCoherence(net.coherence);
   return (
@@ -95,18 +115,57 @@ function EnvInstructions({ net, factsShown }: { net: NetworkConfig; factsShown: 
           {NETWORK_TEXT.unknownNote}
         </p>
       ) : null}
-      <ScriptBlock kind="enable" title={NETWORK_TEXT.enableTitle} script={scripts.enable} open={open === "enable"}>
-        <p className="nd-field-hint">{mirrored ? NETWORK_TEXT.mirroredEnableIntro : NETWORK_TEXT.wslIntro}</p>
-        <p className="nd-field-hint" data-network-private-note="">
-          {NETWORK_TEXT.wslPrivate}
-        </p>
-        {mirrored ? null : <p className="nd-field-hint">{NETWORK_TEXT.wslRestart}</p>}
-        {net.env === "wsl_nat" ? <p className="nd-field-hint">{NETWORK_TEXT.wslMirrored}</p> : null}
-      </ScriptBlock>
+      {onlyUndo ? null : (
+        <ScriptBlock kind="enable" title={NETWORK_TEXT.enableTitle} script={scripts.enable} open={open === "enable"}>
+          <p className="nd-field-hint">{mirrored ? NETWORK_TEXT.mirroredEnableIntro : NETWORK_TEXT.wslIntro}</p>
+          {mirrored ? null : <p className="nd-field-hint">{NETWORK_TEXT.wslRestart}</p>}
+          {net.env === "wsl_nat" ? <p className="nd-field-hint">{NETWORK_TEXT.wslMirrored}</p> : null}
+        </ScriptBlock>
+      )}
       <ScriptBlock kind="undo" title={NETWORK_TEXT.undoTitle} script={scripts.undo} open={open === "undo"}>
         <p className="nd-field-hint">{mirrored ? NETWORK_TEXT.mirroredUndoIntro : NETWORK_TEXT.undoIntro}</p>
       </ScriptBlock>
     </div>
+  );
+}
+
+/** Marca do passo: o número, ou o visto quando pronto. */
+function StepMark({ n, step }: { n: number; step: JourneyStep }) {
+  return (
+    <span className="nd-step-mark" data-step-mark={step.status} aria-hidden="true">
+      {stepIsDone(step.status) ? <Icon name="check" size={14} /> : n}
+    </span>
+  );
+}
+
+/** Um passo: número, título, o estado conferido (ou o motivo) e o corpo. */
+function Step({
+  n,
+  step,
+  detailId,
+  coherence,
+  children,
+}: {
+  n: number;
+  step: JourneyStep;
+  detailId?: string;
+  /** Aviso de coerência do servidor que diz o mesmo, mais preciso: entra no lugar do estado. */
+  coherence?: { code: string; text: string } | null;
+  children?: ReactNode;
+}) {
+  const { t } = useT();
+  const warn = (step.status === "pending" && step.id === "windows") || (coherence ?? null) !== null;
+  return (
+    <li className="nd-step" data-step={step.id} data-step-status={step.status} aria-label={`${t("devices.stepNumber", { n })}: ${t(step.title)}`}>
+      <StepMark n={n} step={step} />
+      <div className="nd-step-body">
+        <h4 className="nd-step-title nd-strong">{t(step.title)}</h4>
+        <p id={detailId} className={warn ? "nd-field-warn" : "nd-field-hint"} data-step-detail="" data-network-coherence={coherence?.code}>
+          {coherence?.text ?? t(step.detail)}
+        </p>
+        {children}
+      </div>
+    </li>
   );
 }
 
@@ -120,6 +179,7 @@ export function NetworkSection() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
   const alive = useRef(true);
+  const addReasonId = useId();
 
   const seq = useRef(0);
   const reload = useCallback(async (): Promise<NetworkConfig | null> => {
@@ -138,6 +198,21 @@ export function NetworkSection() {
     return () => {
       alive.current = false;
     };
+  }, [reload]);
+
+  // Volta automática: relê o estado conferido de tempos em tempos (só com a aba visível).
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (!networkRefresh.visible()) return;
+      void reload().then((net) => {
+        // `reload` só devolve a leitura mais recente: ela vale também depois de gravar (limpa o `stale`
+        // se tomou o lugar da releitura do interruptor).
+        if (!alive.current || net === null) return;
+        setStale(false);
+        setLoad((prev) => (prev.status === "ok" && JSON.stringify(prev.net) === JSON.stringify(net) ? prev : { status: "ok", net }));
+      });
+    }, networkRefresh.intervalMs);
+    return () => clearInterval(timer);
   }, [reload]);
 
   const toggle = useCallback(async (net: NetworkConfig) => {
@@ -167,11 +242,97 @@ export function NetworkSection() {
   const released = range !== null && rangeReleased(shell.lanReleased, range);
   const net = load.status === "ok" ? load.net : null;
   const on = net !== null && savedLan(net);
-  const restart = net !== null && restartNeeded(net, changedHere);
+  // Salva ligada e ainda fora da rede: o passo 1 já diz que vale ao reiniciar (sem repetir aqui).
+  const restart = net !== null && restartNeeded(net, changedHere) && !(savedLan(net) && !net.lan);
   // A coerência vem do servidor; depois de gravar, ela é relida (até lá, nada é dito).
   const coherence = net === null || stale ? null : coherenceText(net.coherence, net);
   // No WSL com o Windows conferido, o estado real; a marcação manual só no Linux ou sem conferir.
   const checked = net === null ? null : windowsReleased(net);
+  const steps = net === null ? [] : journeySteps(net);
+  const factsShown = range !== null && network !== null;
+
+  /** Aviso que pede o script de ligar, no lugar do estado do passo 2 (dizem o mesmo). */
+  const windowsCoherence = (step: JourneyStep): { code: string; text: string } | null => {
+    if (net === null || coherence === null || step.id !== "windows" || step.status === "blocked") return null;
+    return scriptForCoherence(net.coherence) === "enable" ? { code: net.coherence, text: coherence } : null;
+  };
+
+  /** Texto de coerência no passo certo: a adoção no passo 1; o resto no passo 2 (no WSL). */
+  const coherenceLine = (where: "enable" | "windows", step: JourneyStep): ReactNode => {
+    if (net === null || coherence === null) return null;
+    const inEnable = net.coherence === "will_adopt" || net.env === "linux";
+    if ((where === "enable") !== inEnable) return null;
+    // Passo 2 bloqueado (rede desligada nesta execução): só o aviso de desfazer.
+    if (where === "windows" && step.status === "blocked" && net.coherence !== "still_redirected") return null;
+    // O aviso que pede o script de ligar já está no estado do passo 2.
+    if (where === "windows" && windowsCoherence(step) !== null) return null;
+    return (
+      <p className={coherenceIsWarning(net.coherence) ? "nd-field-warn" : "nd-field-hint"} data-network-coherence={net.coherence}>
+        {coherence}
+      </p>
+    );
+  };
+
+  const stepBody = (step: JourneyStep): ReactNode => {
+    if (net === null) return null;
+    switch (step.id) {
+      case "enable":
+        return (
+          <>
+            <div className="nd-settings-lan">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={on}
+                aria-busy={saving}
+                disabled={saving}
+                className="nd-btn nd-toggle"
+                data-variant="ghost"
+                data-network-lan=""
+                onClick={() => void toggle(net)}
+              >
+                <span className="nd-switch" data-on={on ? "true" : undefined} aria-hidden="true" />
+                <span>{NETWORK_TEXT.lanLabel}</span>
+              </button>
+              <p className="nd-field-hint">{NETWORK_TEXT.lanHint}</p>
+              <p className="nd-field-hint" data-network-security="">
+                {NETWORK_TEXT.security}
+              </p>
+            </div>
+            {saveError !== null ? (
+              <p role="alert" className="nd-field-error" data-network-save-error="">
+                {saveError}
+              </p>
+            ) : null}
+            {restart ? (
+              <p className="nd-field-hint" role="status" data-network-restart="">
+                {net.lan ? NETWORK_TEXT.runOn : NETWORK_TEXT.runOff} {NETWORK_TEXT.nextStart} <kbd>Ctrl+C</kbd> {NETWORK_TEXT.restartTail} <code className="nd-mono nd-code">{net.restart_command}</code>
+              </p>
+            ) : changedHere ? (
+              <p className="nd-field-hint" role="status" data-network-saved="">
+                {NETWORK_TEXT.savedNow}
+              </p>
+            ) : null}
+            {net.mode_source === "flag" ? (
+              <p className="nd-muted" data-network-flag="">
+                {NETWORK_TEXT.fromFlag}
+              </p>
+            ) : null}
+            {coherenceLine("enable", step)}
+            {net.env === "linux" ? <LinuxHint net={net} factsShown={factsShown} /> : null}
+          </>
+        );
+      case "windows":
+        return (
+          <>
+            {coherenceLine("windows", step)}
+            <WslScripts net={net} onlyUndo={step.status === "blocked"} />
+          </>
+        );
+      case "add":
+        return <DevicesStep step={step} lanPort={net.lan_port} reasonId={addReasonId} />;
+    }
+  };
 
   return (
     <section className="nd-settings-network" aria-label={NETWORK_TEXT.title} data-network-section="">
@@ -186,52 +347,7 @@ export function NetworkSection() {
           {NETWORK_TEXT.loadFailed}
         </p>
       ) : null}
-      {net !== null ? (
-        <>
-          <div className="nd-settings-lan">
-            <button
-              type="button"
-              role="switch"
-              aria-checked={on}
-              aria-busy={saving}
-              disabled={saving}
-              className="nd-btn nd-toggle"
-              data-variant="ghost"
-              data-network-lan=""
-              onClick={() => void toggle(net)}
-            >
-              <span className="nd-switch" data-on={on ? "true" : undefined} aria-hidden="true" />
-              <span>{NETWORK_TEXT.lanLabel}</span>
-            </button>
-            <p className="nd-field-hint">{NETWORK_TEXT.lanHint}</p>
-          </div>
-          {saveError !== null ? (
-            <p role="alert" className="nd-field-error" data-network-save-error="">
-              {saveError}
-            </p>
-          ) : null}
-          {restart ? (
-            <p className="nd-field-hint" role="status" data-network-restart="">
-              {net.lan ? NETWORK_TEXT.runOn : NETWORK_TEXT.runOff} {NETWORK_TEXT.nextStart} <kbd>Ctrl+C</kbd> {NETWORK_TEXT.restartTail} <code className="nd-mono nd-code">{net.restart_command}</code>
-            </p>
-          ) : changedHere ? (
-            <p className="nd-field-hint" role="status" data-network-saved="">
-              {NETWORK_TEXT.savedNow}
-            </p>
-          ) : null}
-          {net.mode_source === "flag" ? (
-            <p className="nd-muted" data-network-flag="">
-              {NETWORK_TEXT.fromFlag}
-            </p>
-          ) : null}
-          {coherence !== null ? (
-            <p className={coherenceIsWarning(net.coherence) ? "nd-field-warn" : "nd-field-hint"} data-network-coherence={net.coherence}>
-              {coherence}
-            </p>
-          ) : null}
-        </>
-      ) : null}
-      {range !== null && network !== null ? (
+      {factsShown ? (
         <>
           <p className="nd-field-hint">{NETWORK_TEXT.hint}</p>
           <dl className="nd-facts">
@@ -264,7 +380,15 @@ export function NetworkSection() {
           ) : null}
         </>
       ) : null}
-      {net !== null ? <EnvInstructions net={net} factsShown={range !== null} /> : null}
+      {net !== null ? (
+        <ol className="nd-steps" aria-label={t("devices.steps")} data-network-steps={net.env}>
+          {steps.map((step, i) => (
+            <Step key={step.id} n={i + 1} step={step} detailId={step.id === "add" ? addReasonId : undefined} coherence={windowsCoherence(step)}>
+              {stepBody(step)}
+            </Step>
+          ))}
+        </ol>
+      ) : null}
     </section>
   );
 }

@@ -108,21 +108,40 @@ gh attestation verify nants-X.Y.Z-x86_64-linux.tar.gz --repo tm-dev-lab/nants
 ## Use it from your phone (local network)
 
 By default, Nants opens only on your computer. To open it from your phone or another device on
-the same network, turn on **Local network access** in **Settings > Network access**. The page
-shows what your environment still needs:
+the same network, go to **Settings > Network access**. The page guides you in steps and checks
+each one before enabling the next:
 
-- **Linux:** nothing else. If you use a firewall, allow the Nants port and the preview ports.
-- **WSL (NAT, the default):** run the **Script to enable it on Windows** once, in PowerShell as
-  administrator. It forwards the ports to WSL and creates the Nants firewall rule. The WSL IP
-  changes when Windows restarts; if so, run it again.
-- **WSL (mirrored):** the same script, which here only creates the Windows firewall rule.
+- **WSL (NAT, the default):**
+  1. Turn on **Local network access** and restart Nants (Ctrl+C, then `nants`).
+  2. Run the **Script to enable it on Windows** once, in PowerShell as administrator. It forwards
+     the ports to WSL and creates the Nants firewall rule, for any network type and only for the
+     local subnet. The WSL IP changes when Windows restarts; the step goes back to pending and you
+     run the script again.
+  3. Add your devices.
+- **WSL (mirrored):** the same steps; the script only creates the Windows firewall rule.
+- **Linux:** turn it on, restart and add your devices. If you use a firewall, allow the Nants
+  port and the preview ports.
 
-The option is saved and applies from the next start: stop Nants with Ctrl+C and run `nants`
-again. To turn it off, switch it off on the same page and, on WSL, run the **Script to undo it
-on Windows**. `nants --lan` turns it on for a single run, without saving.
+**This computer.** In network mode, the terminal prints a sign-in link for this computer and
+opens it in the browser. It works once and for 10 minutes. On a real loopback connection, no link
+is needed.
 
-Use it only on a network you trust: Nants has no login, so any device on the network can
-control it.
+**Add a device.** Click **Add device**. Nants shows a 6-digit code that changes every 60 seconds,
+the address to open and a QR code of that address. On the other device, open the address or scan
+the QR code and type the code. The code only works while that window is open, up to 10 minutes;
+after 5 wrong attempts, generate another one.
+
+**Authorized devices.** The list shows each device with when it joined and its last access. You
+can rename or revoke it; revoking cuts its open sessions right away. **Revoke all** is there too.
+If you revoke this computer, sign in again with the terminal link.
+
+To turn it off, switch it off on the same page and, on WSL, run the **Script to undo it on
+Windows**. The device list is kept. `nants --lan` turns it on for a single run, without saving.
+
+Only devices you add can open Nants. This holds for any address outside loopback, including
+`--host` with `--allow-remote`. The preview ports (3001 to 3010) serve the generated app, not
+Nants, and do not ask for a device. On the local network, traffic is plain HTTP, not encrypted: for
+the most security, use it on a network you trust. See [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
@@ -131,6 +150,18 @@ network access, takes the Nants port. Nants detects it, starts on the next free 
 explains it in the terminal. To undo it, run the **Script to undo it on Windows** from
 **Settings > Network access**, or turn local network access on if you want to keep it.
 `nants doctor` shows your environment and whether Windows matches the saved option.
+
+**The sign-in link expired.** The link works once and for 10 minutes. Restart Nants for a new
+one, or add this browser as a device with a code from a device that is already authorized.
+
+**It does not open on the other device?** Common causes:
+
+- the device is on another network or on a guest network;
+- the router isolates devices from each other;
+- step 2 is still pending (on WSL, the IP may have changed after a Windows restart);
+- the address was typed wrong; prefer the QR code.
+
+If the sign-in page opens on the device, the network is fine.
 
 ## Build from source
 

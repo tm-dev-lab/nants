@@ -41,6 +41,52 @@ pub const FIREWALL_RULE: &str = "Nants";
 /// em qualquer outro erro (que vira "não deu para conferir").
 pub const FIREWALL_QUERY: &str = "try { @(Get-NetFirewallRule -DisplayName 'Nants' -ErrorAction Stop).Count } catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 0 } else { exit 2 } }";
 pub const FIREWALL_ARGS: [&str; 4] = ["-NoProfile", "-NonInteractive", "-Command", FIREWALL_QUERY];
+/// Consulta só de leitura dos IPv4 do Windows (spec 112): uma linha `ip|interface|gw|up` por
+/// endereço, com `gw` = 1 se a interface tem rota padrão e `up` = 1 se o adaptador está Up.
+pub const WINDOWS_IPS_QUERY: &str = "$gw = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceIndex }); $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex }); Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.IPAddress, $_.InterfaceAlias, [int]($gw -contains $_.InterfaceIndex), [int]($up -contains $_.InterfaceIndex) }";
+pub const WINDOWS_IPS_ARGS: [&str; 4] = ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_IPS_QUERY];
+/// Validade da lista de IPs do Windows em memória (a tela consulta o código a cada segundo).
+pub const WINDOWS_IPS_TTL: Duration = Duration::from_secs(30);
+
+/// IPv4 de rede do Windows pela saída de [`WINDOWS_IPS_QUERY`]: sem loopback, APIPA (169.254) e
+/// interfaces virtuais (vEthernet do WSL e do Hyper-V); primeiro as com rota padrão e Up. Havendo
+/// alguma com rota padrão ou Up, as demais ficam de fora. `None`: não deu para conferir.
+pub fn windows_ips_from_output(out: Option<CmdOutput>) -> Option<Vec<Ipv4Addr>> {
+    let out = out.filter(|o| o.success)?;
+    let mut found: Vec<(Ipv4Addr, bool, bool)> = Vec::new();
+    for line in out.stdout.lines() {
+        let fields: Vec<&str> = line.trim().split('|').collect();
+        let [ip, alias, gw, up] = fields.as_slice() else {
+            continue;
+        };
+        let Ok(ip) = ip.trim().parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let alias = alias.trim().to_ascii_lowercase();
+        let virtual_if = alias.starts_with("vethernet") || alias.contains("wsl") || alias.contains("hyper-v") || alias.contains("loopback");
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || virtual_if {
+            continue;
+        }
+        if !found.iter().any(|(f, _, _)| *f == ip) {
+            found.push((ip, gw.trim() == "1", up.trim() == "1"));
+        }
+    }
+    if found.iter().any(|(_, gw, up)| *gw || *up) {
+        found.retain(|(_, gw, up)| *gw || *up);
+    }
+    // Ordem estável: rota padrão e Up primeiro.
+    found.sort_by_key(|(_, gw, up)| std::cmp::Reverse((*gw && *up, *gw, *up)));
+    Some(found.into_iter().map(|(ip, _, _)| ip).collect())
+}
+
+/// IPv4 de rede do Windows (só no WSL; fora dele, `None`). Só leitura, com o prazo do executor.
+pub fn windows_ips_with(tools: &WinTools, wsl: bool) -> Option<Vec<Ipv4Addr>> {
+    if !wsl {
+        return None;
+    }
+    windows_ips_from_output(tools.run_first(&POWERSHELL_PROGRAMS, &WINDOWS_IPS_ARGS))
+}
+
 /// Prazo total da conferência em paralelo (o prazo de cada consulta e uma folga para as threads).
 pub const PROBE_DEADLINE: Duration = Duration::from_millis(NETSH_TIMEOUT.as_millis() as u64 + 300);
 /// Comando para reiniciar o Nants, mostrado pela interface.

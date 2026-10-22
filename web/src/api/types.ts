@@ -762,7 +762,19 @@ export type ApiEvent =
   | ApiEventEnvelope<"recovery_started", RecoveryStartedPayload>
   | ApiEventEnvelope<"recovery_decided", RecoveryDecidedPayload>
   | ApiEventEnvelope<"app_started", AppStartedPayload>
-  | ApiEventEnvelope<"app_exited", AppExitedPayload>;
+  | ApiEventEnvelope<"app_exited", AppExitedPayload>
+  | ApiEventEnvelope<"devices_changed", DevicesChangedPayload>
+  | ApiEventEnvelope<"device_code_locked", DeviceCodeLockedPayload>;
+
+/** `devices_changed` (spec 112): a lista de dispositivos mudou (`added`, `renamed` ou `revoked`). */
+interface DevicesChangedPayload {
+  reason: string;
+}
+
+/** `device_code_locked` (spec 112): várias tentativas erradas invalidaram o código. */
+interface DeviceCodeLockedPayload {
+  reason: string;
+}
 
 export type ApiEventType = ApiEvent["event_type"];
 

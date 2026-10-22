@@ -334,7 +334,10 @@ fn nants_texts_have_no_dashes_emoji_yolo_or_old_button_name() {
         ("i18n/en.rs", "environment check"),
         ("agents/runner.rs", "verificação humana, não bloqueia"),
         ("agents/prompts.rs", "ESTILO DA ESCRITA"),
-        ("agents/prompts.rs", "Iniciar o app"),
+        // Spec 113 T04: o nome do botão vem do dicionário (idioma do relatório).
+        ("agents/prompts.rs", "START_APP_LABEL"),
+        ("i18n/pt_br.rs", "Iniciar o app"),
+        ("i18n/en.rs", "Start the app"),
         ("server/judge.rs", "juiz de segurança da aprovação automática"),
         ("harness/tools/generate_image.rs", "generate_image"),
     ] {

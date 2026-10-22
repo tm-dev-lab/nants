@@ -2,7 +2,8 @@
 //!
 //! Reaproveita o [`prereqs::diagnose`](super::prereqs::diagnose) do servidor (Git, Docker CLI,
 //! daemon, permissão no socket e Compose v2, com os mesmos `id`) e acrescenta:
-//! - `port`: uma porta livre para o Nants (a configurada ou uma das seguintes, como no `nants`);
+//! - `port`: uma porta livre para o Nants (a configurada ou uma das seguintes, como no `nants`;
+//!   no modo local, pula as redirecionadas pelo Windows, como ao subir);
 //! - `disk`: espaço livre na pasta de dados e na pasta de projetos;
 //! - `wsl`: o ambiente (Linux, WSL NAT, WSL espelhado; informativo; spec 111);
 //! - `windows_port_redirect`: o acesso pela rede local salvo comparado com o Windows (spec 111;
@@ -80,27 +81,53 @@ pub fn required_ok(items: &[PrereqItem]) -> bool {
     REQUIRED_IDS.iter().all(|id| item_ok(items, id))
 }
 
-/// Porta para o Nants. `is_free` testa uma porta; a configurada 0 deixa o sistema escolher.
-pub fn port_item(port: u16, is_free: impl Fn(u16) -> bool) -> PrereqItem {
+/// Porta para o Nants, pela mesma escolha do início ([`super::lan::candidate_ports`]): `redirected`
+/// são as portas redirecionadas pelo Windows que o modo local pula ([`local_mode_redirected`]);
+/// `is_free` testa uma porta; a configurada 0 deixa o sistema escolher.
+pub fn port_item(port: u16, redirected: &[u16], is_free: impl Fn(u16) -> bool) -> PrereqItem {
     if port == 0 {
         return check("port", true, Msg::new("doctor.detail.port_auto"));
     }
-    if is_free(port) {
+    let port_redirected = redirected.contains(&port);
+    if !port_redirected && is_free(port) {
         return check("port", true, Msg::new("doctor.detail.port_free").arg("port", port.to_string()));
     }
     let last = port.saturating_add(PORT_FALLBACK_TRIES);
-    match (port.saturating_add(1)..=last).find(|p| is_free(*p)) {
-        Some(next) => check(
-            "port",
-            true,
-            Msg::new("doctor.detail.port_fallback").arg("port", port.to_string()).arg("next", next.to_string()),
-        ),
+    let next = super::lan::candidate_ports(port, PORT_FALLBACK_TRIES, redirected)
+        .into_iter()
+        .filter(|p| *p != port)
+        .find(|p| is_free(*p));
+    match next {
+        Some(next) => {
+            let key = if port_redirected { "doctor.detail.port_redirected" } else { "doctor.detail.port_fallback" };
+            check("port", true, Msg::new(key).arg("port", port.to_string()).arg("next", next.to_string()))
+        }
         None => check(
             "port",
             false,
             Msg::new("doctor.detail.port_all_busy").arg("port", port.to_string()).arg("last", last.to_string()),
         ),
     }
+}
+
+/// Portas redirecionadas pelo Windows que o `nants` (sem `--lan` nem `--host`) pularia ao subir:
+/// só no modo local, decidido como no início ([`super::lan::decide_mode`], com a adoção). Com a
+/// rede ligada (salva ou adotada), ou sem conferência, nenhuma.
+pub fn local_mode_redirected(
+    view: &super::lan::WindowsView,
+    saved: Option<bool>,
+    port: u16,
+    local_ips: &[Ipv4Addr],
+) -> Vec<u16> {
+    use super::lan::{adoption_applies, decide_mode, redirected_ports};
+    if port == 0 {
+        return Vec::new();
+    }
+    let adoptable = adoption_applies(view.env, view.target(port, local_ips), view.firewall);
+    if decide_mode(false, false, saved, adoptable).lan {
+        return Vec::new();
+    }
+    redirected_ports(view.table.as_deref())
 }
 
 /// Testa se a porta está livre em 127.0.0.1 (abre e fecha na hora).
@@ -365,7 +392,8 @@ pub async fn collect(input: DoctorInput) -> Vec<PrereqItem> {
         let view = super::lan::probe(&windows, wsl, super::lan::Needs::ALL, &local_ips, super::lan::PROBE_DEADLINE);
         let mut items = super::prereqs::diagnose(&runner);
         let extras = machine_extras(&runner, &items, &disk_paths, wsl);
-        items.push(port_item(port, loopback_port_free));
+        let redirected = local_mode_redirected(&view, saved_lan, port, &local_ips);
+        items.push(port_item(port, &redirected, loopback_port_free));
         items.extend(extras);
         place_network_items(&mut items, &view, saved_lan, port, &local_ips);
         items
@@ -470,14 +498,58 @@ mod tests {
 
     #[test]
     fn port_free_busy_with_fallback_and_all_busy() {
-        assert!(port_item(3000, |_| true).ok);
-        let fb = port_item(3000, |p| p == 3003);
+        assert!(port_item(3000, &[], |_| true).ok);
+        let fb = port_item(3000, &[], |p| p == 3003);
         assert!(fb.ok && fb.detail.as_deref().unwrap_or("").contains("usará a 3003"), "{fb:?}");
-        let none = port_item(3000, |_| false);
+        let none = port_item(3000, &[], |_| false);
         assert!(!none.ok && !none.info);
         assert!(none.detail.as_deref().unwrap_or("").contains("3000 a 3020"));
         assert!(none.fix.as_deref().unwrap_or("").contains("--port"));
-        assert!(port_item(0, |_| false).ok);
+        assert!(port_item(0, &[], |_| false).ok);
+    }
+
+    #[test]
+    fn port_item_follows_the_startup_choice_with_redirected_ports() {
+        // Livre e sem redirecionamento: como antes.
+        let free = port_item(3000, &[], |_| true);
+        assert!(free.ok && free.detail.as_deref().unwrap_or("").contains("3000 está livre"), "{free:?}");
+        // Redirecionada pelo Windows: livre no loopback, mas pulada, como no início; continua OK.
+        let red = port_item(3000, &[3000, 3001, 3002], |_| true);
+        assert!(red.ok && !red.warn && !red.info, "{red:?}");
+        let msg = red.detail_msg.clone().expect("msg");
+        assert_eq!(msg.render(Lang::PtBr), "a porta 3000 está redirecionada pelo Windows; o Nants usará a 3003");
+        assert_eq!(msg.render(Lang::En), "port 3000 is redirected by Windows; Nants will use 3003");
+        no_forbidden_glyphs(&msg.render(Lang::PtBr));
+        no_forbidden_glyphs(&msg.render(Lang::En));
+        // Redirecionada e todas as seguintes ocupadas: falha com a faixa.
+        let none = port_item(3000, &[3000], |_| false);
+        assert!(!none.ok && none.detail.as_deref().unwrap_or("").contains("3000 a 3020"), "{none:?}");
+        // Ocupada sem redirecionamento: a seguinte livre, com a mensagem de ocupada.
+        let busy = port_item(3000, &[3002], |p| p != 3000 && p != 3001);
+        assert!(busy.ok && busy.detail.as_deref().unwrap_or("").contains("ocupada"), "{busy:?}");
+        assert!(busy.detail.as_deref().unwrap_or("").contains("usará a 3003"), "{busy:?}");
+    }
+
+    #[test]
+    fn local_mode_redirected_matches_the_startup_decision() {
+        use crate::server::lan::WindowsView;
+        use crate::server::portproxy::Redirect;
+        let ip = Ipv4Addr::new(172, 21, 154, 252);
+        let table = vec![Redirect { listen_port: 3000, connect_addr: ip.to_string() }];
+        let view = |firewall| WindowsView { env: NetworkEnv::WslNat, table: Some(table.clone()), firewall };
+        // Desligada: pula a redirecionada.
+        assert_eq!(local_mode_redirected(&view(FirewallState::Absent), Some(false), 3000, &[ip]), vec![3000]);
+        // Nunca escolhida e sem a regra (sem adoção): modo local, pula.
+        assert_eq!(local_mode_redirected(&view(FirewallState::Absent), None, 3000, &[ip]), vec![3000]);
+        // Nunca escolhida com adoção: rede ligada, nada muda.
+        assert!(local_mode_redirected(&view(FirewallState::Present), None, 3000, &[ip]).is_empty());
+        // Ligada: nada muda.
+        assert!(local_mode_redirected(&view(FirewallState::Absent), Some(true), 3000, &[ip]).is_empty());
+        // Sem conferência (tabela desconhecida): nada muda.
+        let unknown = WindowsView { env: NetworkEnv::WslUnknown, table: None, firewall: FirewallState::Unknown };
+        assert!(local_mode_redirected(&unknown, Some(false), 3000, &[ip]).is_empty());
+        // Porta 0: nada muda.
+        assert!(local_mode_redirected(&view(FirewallState::Absent), Some(false), 0, &[ip]).is_empty());
     }
 
     #[test]
@@ -626,10 +698,13 @@ mod tests {
         assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("modo de rede NAT"));
         assert!(by_id(&items, NETWORK_ID).warn);
         assert!(required_ok(&items));
+        let port = by_id(&items, "port");
+        assert!(port.detail.as_deref().unwrap_or("").contains("3000 está redirecionada pelo Windows"), "{port:?}");
         // Ligada e configurada: OK.
         let items = collect(wsl_input(Some(pt_out), Some("nat"), Some("1"), Some(true))).await;
         let item = by_id(&items, NETWORK_ID);
         assert!(item.ok && !item.warn && !item.info, "{item:?}");
+        assert!(!by_id(&items, "port").detail.as_deref().unwrap_or("").contains("redirecionada"), "rede ligada: como antes");
         // Espelhado, ligada, sem a regra: aviso.
         let items = collect(wsl_input(Some(""), Some("mirrored"), Some("0"), Some(true))).await;
         assert!(by_id(&items, "wsl").detail.as_deref().unwrap_or("").contains("espelhado"));
@@ -827,10 +902,11 @@ mod tests {
     fn every_item_detail_and_fix_exists_in_both_languages() {
         let p = vec![PathBuf::from("/")];
         let mut items = vec![
-            port_item(0, |_| true),
-            port_item(3000, |_| true),
-            port_item(3000, |p| p == 3001),
-            port_item(3000, |_| false),
+            port_item(0, &[], |_| true),
+            port_item(3000, &[], |_| true),
+            port_item(3000, &[], |p| p == 3001),
+            port_item(3000, &[], |_| false),
+            port_item(3000, &[3000], |_| true),
             disk_item(&p, |_| Some(1024)),
             disk_item(&p, |_| None),
             wsl_item(true),

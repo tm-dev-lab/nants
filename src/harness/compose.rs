@@ -140,8 +140,35 @@ fn read_limited(mut r: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>
     })
 }
 
+/// Variável que libera o Docker real só nos testes reais marcados `#[ignore]` (`real_*`).
+#[cfg(test)]
+pub(crate) const TEST_REAL_DOCKER_VAR: &str = "NANTS_TEST_REAL_DOCKER";
+
+/// Sentinela dos testes (spec 113 T01): em `cfg(test)` o `docker` real é recusado, venha de
+/// onde vier (executor Compose padrão, navegador, prerequisitos), salvo com
+/// `NANTS_TEST_REAL_DOCKER=1`. Um `down -v` com nome de projeto de teste apagaria volumes reais
+/// do host; quem precisa de Compose num teste injeta um executor falso (`envs::tests::Rec`).
+/// `Some(motivo)` quando a chamada deve ser recusada.
+#[cfg(test)]
+pub(crate) fn refuse_real_docker_in_tests(program: &str) -> Option<String> {
+    let name = Path::new(program).file_name().and_then(|n| n.to_str()).unwrap_or(program);
+    if name != "docker" || std::env::var(TEST_REAL_DOCKER_VAR).is_ok_and(|v| v == "1") {
+        return None;
+    }
+    let reason = format!(
+        "teste chamou o docker real ({program}); injete um executor falso (envs::tests::Rec) \
+         ou, num teste real #[ignore], rode com {TEST_REAL_DOCKER_VAR}=1"
+    );
+    eprintln!("SENTINELA: {reason}");
+    Some(reason)
+}
+
 impl ComposeRunner for RealComposeRunner {
     fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+        #[cfg(test)]
+        if let Some(reason) = refuse_real_docker_in_tests(&self.program) {
+            return Err(reason);
+        }
         let mut child = Command::new(&self.program)
             .args(&call.args)
             .current_dir(&call.cwd)
@@ -1648,7 +1675,29 @@ mod tests {
         assert!(out.output.contains("NANTS_WORKTREE="));
     }
 
-    /// Teste real: precisa de docker. `cargo test -- --ignored real_compose_roundtrip`.
+    /// Sentinela (spec 113 T01): nos testes, o executor real recusa o `docker` antes de criar o
+    /// processo; outros programas seguem normais.
+    #[test]
+    fn real_runner_refuses_real_docker_in_tests() {
+        if std::env::var(TEST_REAL_DOCKER_VAR).is_ok_and(|v| v == "1") {
+            return; // rodada real explícita (`#[ignore]`): a sentinela está desligada de propósito
+        }
+        let call = ComposeCall {
+            args: ["compose", "-p", "nants-proj-test", "down", "-v"].map(String::from).to_vec(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            timeout: Duration::from_secs(5),
+        };
+        for program in ["docker", "/usr/bin/docker"] {
+            let err = RealComposeRunner::with_program(program).run(&call).expect_err("docker real recusado");
+            assert!(err.contains("teste chamou o docker real"), "{err}");
+        }
+        assert!(RealComposeRunner::default().run(&call).is_err());
+        assert_eq!(refuse_real_docker_in_tests("sh"), None);
+    }
+
+    /// Teste real: precisa de docker. `NANTS_TEST_REAL_DOCKER=1 cargo test -- --ignored real_compose_roundtrip`.
+    /// Todos os `real_*` daqui pedem a variável (sentinela [`refuse_real_docker_in_tests`]).
     #[test]
     #[ignore]
     fn real_compose_roundtrip() {
@@ -1664,7 +1713,7 @@ mod tests {
         assert!(out.success() && out.output.contains("ola") && out.output.contains("ok"), "{}", out.output);
     }
     /// Teste real: precisa de docker. O workspace roda com o uid do host e o reparo devolve a posse
-    /// de arquivos criados como root. `cargo test -- --ignored real_workspace_uid_and_repair`.
+    /// de arquivos criados como root. `NANTS_TEST_REAL_DOCKER=1 cargo test -- --ignored real_workspace_uid_and_repair`.
     #[test]
     #[ignore]
     fn real_workspace_uid_and_repair() {

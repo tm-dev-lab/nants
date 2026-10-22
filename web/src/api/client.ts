@@ -276,7 +276,7 @@ interface RequestOptions {
 }
 
 interface RawRequest {
-  method: "GET" | "PUT" | "POST" | "DELETE";
+  method: "GET" | "PUT" | "POST" | "PATCH" | "DELETE";
   path: string;
   /** Corpo JSON já serializado (somente mutações). */
   body?: string;
@@ -318,6 +318,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * mantém é o i18n (`setLanguage`); `null` = não envia (o servidor segue com o último informado).
  */
 export const LANG_HEADER = "X-Nants-Lang";
+
+/** Página de entrada do aparelho sem autorização (spec 112). */
+export const ENTRY_PATH = "/connect";
+
+/**
+ * Aparelho sem autorização (spec 112): com a rede local ligada, a API responde 401
+ * `device_required` (cookie perdido ou dispositivo revogado). A interface vai para a página de
+ * entrada, que pede o código. Substituível nos testes.
+ */
+export const deviceAuth = {
+  onDeviceRequired(): void {
+    if (typeof window === "undefined" || window.location.pathname === ENTRY_PATH) return;
+    window.location.assign(ENTRY_PATH);
+  },
+};
+
+function isDeviceRequired(status: number, body: unknown): boolean {
+  return status === 401 && isRecord(body) && body.code === "device_required";
+}
 let requestLanguage: "pt-BR" | "en" | null = null;
 
 /** Define o idioma enviado em `X-Nants-Lang` (chamado pelo i18n a cada troca). */
@@ -377,6 +396,7 @@ export async function request<T>(
     raw.onResponse?.(response);
     if (!response.ok) {
       const body = await safeJson(response);
+      if (isDeviceRequired(response.status, body)) deviceAuth.onDeviceRequired();
       const special = raw.onHttpError?.(response.status, body) ?? null;
       if (special !== null) return { ok: false, error: withCodes(special, body) };
       const missing = response.status === 412 ? prereqMissingIds(body) : null;

@@ -19,6 +19,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+#[path = "support/fake_docker.rs"]
+mod fake_docker;
+use fake_docker::without_real_docker;
+
 /// Chave literal usada nas configs de teste: nunca pode aparecer em respostas.
 const SECRET_KEY: &str = "sk-SMOKE-LITERAL-KEY-98765";
 
@@ -254,7 +258,7 @@ async fn binario_real_serve_com_porta_efemera_e_encerra_com_sigint() {
     let dir = temp_dir("bin");
     let config = write_config(&dir);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nants"))
+    let mut child = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
         .args(["serve", "--port", "0", "--config"])
         .arg(&config)
         .stdin(Stdio::null())
@@ -296,7 +300,7 @@ async fn binario_real_serve_com_porta_efemera_e_encerra_com_sigint() {
 
 #[test]
 fn binario_recusa_bind_nao_loopback_sem_allow_remote() {
-    let output = Command::new(env!("CARGO_BIN_EXE_nants"))
+    let output = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
         .args(["serve", "--host", "0.0.0.0", "--port", "0"])
         .stdin(Stdio::null())
         .output()

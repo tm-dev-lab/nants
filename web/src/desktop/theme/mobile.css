@@ -123,6 +123,20 @@
 }
 
 /*
+ * Ação na linha do rótulo (113/T05): a caixa fica na altura do rótulo, para não desalinhar rótulo e
+ * campo; o alvo de toque de 44 px vem de uma área invisível centrada no botão.
+ */
+.nd-root[data-mobile="true"] .nd-label-action {
+  min-height: 0;
+}
+
+.nd-root[data-mobile="true"] .nd-label-action::after {
+  content: "";
+  position: absolute;
+  inset: calc((100% - 44px) / 2) 0;
+}
+
+/*
  * --- Campos com 16 px ---
  * Abaixo de 16 px o Safari do iPhone amplia a página ao focar o campo. A especificidade (0,2,1)
  * vence as regras de fonte dos campos (`.nd-input.nd-mono`, `.nd-composer-input`, `.nd-affix input`).

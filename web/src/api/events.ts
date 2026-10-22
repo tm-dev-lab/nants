@@ -42,6 +42,8 @@ export const KNOWN_EVENT_TYPES: readonly ApiEventType[] = [
   "recovery_decided",
   "app_started",
   "app_exited",
+  "devices_changed",
+  "device_code_locked",
 ];
 
 const LAGGED = "lagged";
@@ -266,6 +268,9 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
       return (
         optionalOrNull(p.code, (v) => typeof v === "number" && Number.isSafeInteger(v)) && optionalOrNull(p.reason, isStr)
       );
+    case "devices_changed":
+    case "device_code_locked":
+      return p.reason === undefined || isStr(p.reason);
     default:
       return false;
   }
@@ -291,7 +296,9 @@ export function parseApiEvent(raw: unknown): ApiEvent | null {
                 code: typeof payload.code === "number" ? payload.code : null,
                 reason: isStr(payload.reason) ? payload.reason : "exited",
               }
-            : payload;
+            : event_type === "devices_changed" || event_type === "device_code_locked"
+              ? { reason: isStr(payload.reason) ? payload.reason : "" }
+              : payload;
   return { event_type, project_id, payload: clean } as ApiEvent;
 }
 

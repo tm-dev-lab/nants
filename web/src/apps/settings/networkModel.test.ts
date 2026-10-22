@@ -25,7 +25,7 @@ const EXPECTED_3000 = [
   "  netsh interface portproxy add v4tov4 listenport=$p listenaddress=0.0.0.0 connectport=$p connectaddress=$ip",
   "}",
   'Remove-NetFirewallRule -DisplayName "Nants" -ErrorAction SilentlyContinue',
-  'New-NetFirewallRule -DisplayName "Nants" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3000,3001-3010 -Profile Private -RemoteAddress LocalSubnet',
+  'New-NetFirewallRule -DisplayName "Nants" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3000,3001-3010 -RemoteAddress LocalSubnet',
 ].join("\n");
 
 describe("script do PowerShell (WSL)", () => {
@@ -33,9 +33,9 @@ describe("script do PowerShell (WSL)", () => {
     expect(wslPowerShellScript(3000, { start: 3001, end: 3010 })).toBe(EXPECTED_3000);
     const other = wslPowerShellScript(8080, { start: 9000, end: 9019 });
     expect(other).toContain("foreach ($p in @(8080) + (9000..9019)) {");
-    expect(other).toContain("-LocalPort 8080,9000-9019 -Profile Private -RemoteAddress LocalSubnet");
+    expect(other).toContain("-LocalPort 8080,9000-9019 -RemoteAddress LocalSubnet");
     expect(other).not.toContain("3000");
-    expect(wslPowerShellScript(3000, { start: 3001, end: 3001 }).endsWith("-LocalPort 3000,3001 -Profile Private -RemoteAddress LocalSubnet")).toBe(
+    expect(wslPowerShellScript(3000, { start: 3001, end: 3001 }).endsWith("-LocalPort 3000,3001 -RemoteAddress LocalSubnet")).toBe(
       true,
     );
   });
@@ -51,13 +51,32 @@ describe("script do PowerShell (WSL)", () => {
     expect(remove).toBeGreaterThan(-1);
     expect(remove).toBeLessThan(create);
     expect(lines[remove]).toBe('Remove-NetFirewallRule -DisplayName "Nants" -ErrorAction SilentlyContinue');
-    // Só a rede local: perfil Privado e sub-rede local, no fim da linha (spec 099).
-    expect(lines[create]).toMatch(/ -Profile Private -RemoteAddress LocalSubnet$/);
+    // Qualquer perfil (sem -Profile, spec 112), ainda só a sub-rede local, no fim da linha.
+    expect(lines[create]).toMatch(/ -RemoteAddress LocalSubnet$/);
+    expect(lines[create]).not.toContain("-Profile");
     expect(lines.filter((l) => l.includes("NetFirewallRule"))).toHaveLength(2);
     expect(lines[0]).toContain("wsl hostname -I");
     // Nenhum IP fixo: o destino é sempre o lido na hora.
     expect(lines.join("\n").replaceAll("0.0.0.0", "")).not.toMatch(/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/);
     expect(lines.filter((l) => l.includes("connectaddress=$ip"))).toHaveLength(1);
+  });
+
+  it("o redirecionamento aponta para o IP do WSL, nunca para o loopback (spec 112)", () => {
+    // Apontando para 127.0.0.1, os aparelhos chegariam ao Nants como loopback e entrariam sem dispositivo.
+    for (const script of [wslPowerShellScript(3000, { start: 3001, end: 3010 }), wslPowerShellScript(8080, null)]) {
+      const lines = script.split("\n");
+      expect(lines[0]).toBe("$ip = (wsl hostname -I).Trim().Split(' ')[0]");
+      const targets = lines.filter((l) => l.includes("connectaddress=")).map((l) => l.match(/connectaddress=(\S+)/)?.[1]);
+      expect(targets).toEqual(["$ip"]);
+      expect(script).not.toMatch(/127\.0\.0\.1|localhost|::1/);
+    }
+  });
+
+  it("qualquer perfil de rede: nenhum script de ligar restringe o perfil (spec 112)", () => {
+    for (const script of [wslPowerShellScript(3000, { start: 3001, end: 3010 }), mirroredEnableScript(3000, { start: 3001, end: 3010 }), mirroredEnableScript(8080, null)]) {
+      expect(script).not.toContain("-Profile");
+      expect(script).toMatch(/New-NetFirewallRule .* -RemoteAddress LocalSubnet$/m);
+    }
   });
 });
 
@@ -68,16 +87,19 @@ describe("textos da seção", () => {
   });
 
   it("sem travessão nem emoji", () => {
-    for (const text of [NETWORK_TEXT.hint, NETWORK_TEXT.unverified, NETWORK_TEXT.wslIntro, NETWORK_TEXT.wslPrivate, NETWORK_TEXT.wslRestart, NETWORK_TEXT.wslMirrored]) {
+    for (const text of [NETWORK_TEXT.hint, NETWORK_TEXT.unverified, NETWORK_TEXT.wslIntro, NETWORK_TEXT.security, NETWORK_TEXT.lanHint, NETWORK_TEXT.wslRestart, NETWORK_TEXT.wslMirrored]) {
       expect(forbiddenGlyphIn(text)).toBeNull();
     }
     // O script é código (tem `+` do PowerShell), mas também sem travessão nem emoji.
     expect(EXPECTED_3000).not.toMatch(/[\u2013\u2014]|\p{Extended_Pictographic}/u);
     expect(NETWORK_TEXT.wslIntro).toContain("PowerShell como administrador");
     expect(NETWORK_TEXT.wslIntro).toContain("só para aparelhos da rede local");
-    expect(NETWORK_TEXT.wslIntro).toContain("marcada como privada no Windows");
-    expect(NETWORK_TEXT.wslPrivate).toContain("rede como pública");
-    expect(NETWORK_TEXT.wslPrivate).toContain("Configurações do Windows, Rede e Internet, propriedades da rede, Rede privada");
+    // Spec 112: a regra vale para qualquer perfil; nada manda marcar a rede como privada.
+    expect(NETWORK_TEXT.wslIntro).toContain("qualquer tipo de rede");
+    expect(NETWORK_TEXT.wslIntro).not.toContain("marcada como privada");
+    expect(NETWORK_TEXT.security).toContain("Só aparelhos que você adicionar abrem o Nants");
+    expect(NETWORK_TEXT.security).toContain("HTTP, sem criptografia");
+    expect(NETWORK_TEXT.hint).toContain("não o Nants, e não pedem dispositivo");
     expect(NETWORK_TEXT.wslRestart).toContain("reiniciar");
     expect(NETWORK_TEXT.wslMirrored).toContain("networkingMode=mirrored");
   });
@@ -127,7 +149,7 @@ describe("scripts por ambiente (111/T03)", () => {
     expect(enable).toBe(
       [
         'Remove-NetFirewallRule -DisplayName "Nants" -ErrorAction SilentlyContinue',
-        'New-NetFirewallRule -DisplayName "Nants" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3000,3001-3010 -Profile Private -RemoteAddress LocalSubnet',
+        'New-NetFirewallRule -DisplayName "Nants" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3000,3001-3010 -RemoteAddress LocalSubnet',
       ].join("\n"),
     );
     expect(mirroredUndoScript()).toBe('Remove-NetFirewallRule -DisplayName "Nants" -ErrorAction SilentlyContinue');

@@ -9,6 +9,8 @@ import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-500.css";
 import "./styles.css";
 import { Shell } from "./desktop/Shell";
+import { ENTRY_PATH } from "./api/client";
+import { ConnectPage } from "./connect/ConnectPage";
 import { clearStaleStorage } from "./staleStorage";
 import { UiStateSync } from "./desktop/uiState";
 import { initLanguage } from "./i18n";
@@ -16,13 +18,19 @@ import { bindLanguageToUiState } from "./i18n/uiStateBinding";
 
 clearStaleStorage();
 
+// Página de entrada (spec 112): o aparelho sem dispositivo autorizado só vê o pedido do código.
+// Nenhuma chamada à API além da troca do código (as outras respondem 401).
+const entry = window.location.pathname === ENTRY_PATH;
+
 // Idioma (spec 101): `<html lang>` e o idioma ativo saem do espelho local e do navegador antes do
 // primeiro render; depois a preferência salva no servidor (seção global `language`) vence. Este
 // cliente só lê (sem cache próprio); as trocas de outras abas chegam pelo canal do ui-state.
 initLanguage();
-const languageSource = new UiStateSync({ kind: "global" }, { storage: null });
-bindLanguageToUiState(languageSource);
-void languageSource.start();
+if (!entry) {
+  const languageSource = new UiStateSync({ kind: "global" }, { storage: null });
+  bindLanguageToUiState(languageSource);
+  void languageSource.start();
+}
 
 const container = document.getElementById("root");
 if (container === null) {
@@ -30,7 +38,5 @@ if (container === null) {
 }
 
 createRoot(container).render(
-  <StrictMode>
-    <Shell />
-  </StrictMode>,
+  <StrictMode>{entry ? <ConnectPage /> : <Shell />}</StrictMode>,
 );

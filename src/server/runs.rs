@@ -410,7 +410,8 @@ impl RunnerFactory for ConfiguredRunnerFactory {
                     events,
                 )
                 .with_usage(usage.clone())
-                .with_stop(job.stop.clone()),
+                .with_stop(job.stop.clone())
+                .with_lang(job.lang.clone()),
             ) as Arc<dyn crate::harness::tools::Advisor>
         });
         let developer = LlmDeveloper::new(
@@ -3308,9 +3309,27 @@ mod tests {
     const TEST_GRACE: Duration = Duration::from_millis(200);
 
     fn state_with(root: &Path, cfg: Config, script: Script) -> AppState {
+        state_with_compose(root, cfg, script, &Arc::new(crate::server::envs::tests::Rec::default()))
+    }
+
+    /// Como [`state_with`], com o executor Compose falso `rec` (o teste confere as chamadas).
+    /// Nenhum teste daqui chama o `docker` real: a limpeza do `-test` depois do `integrated`
+    /// fica local e instantânea, e os overrides vão para a pasta do próprio teste.
+    fn state_with_compose(root: &Path, cfg: Config, script: Script, rec: &Arc<crate::server::envs::tests::Rec>) -> AppState {
+        let compose = crate::server::envs::ComposeProvider::with_runner(rec.clone(), root.with_file_name("compose-overrides"));
         AppState::new(root.with_file_name("config.toml"), crate::server::readiness::chat_ready(cfg), PORT)
             .with_runner_factory(Arc::new(Scripted(script)))
             .with_shutdown_grace(TEST_GRACE)
+            .with_compose_provider(compose)
+    }
+
+    /// Apaga a pasta do teste ao sair do escopo, passe ou falhe.
+    struct TempGuard(PathBuf);
+
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     fn state(root: &Path, script: Script) -> AppState {
@@ -3543,6 +3562,7 @@ mod tests {
     #[tokio::test]
     async fn completed_run_publishes_report_ready_after_integrated() {
         let root = setup("report-trigger", true);
+        let _cleanup = TempGuard(root.parent().expect("pasta do teste").to_path_buf());
         let mut cfg = config_for(&root);
         cfg.agents.architect = AgentConfig {
             connection_id: "literal".into(),
@@ -3553,7 +3573,8 @@ mod tests {
         let backend = crate::agents::architect::testing::Scripted::new(vec![
             crate::agents::architect::testing::text("# Relatório\n\n## Como executar\n1. `cargo run`"),
         ]);
-        let state = state_with(&root, cfg, Script::Complete).with_report_backend(backend);
+        let rec = Arc::new(crate::server::envs::tests::Rec::default());
+        let state = state_with_compose(&root, cfg, Script::Complete, &rec).with_report_backend(backend);
         let mut rx = state.events().subscribe();
         let (status, body) = call(&state, approve_req(PROJECT, SPEC, "")).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -3570,6 +3591,10 @@ mod tests {
         .await
         .expect("report_ready dentro do prazo");
         assert_eq!(ready.payload["spec_id"], SPEC);
+        // A limpeza do `-test` antes do relatório passou pelo executor falso, não pelo docker real.
+        let downs: Vec<_> = rec.compose_calls().into_iter().filter(|(_, args)| args.first().is_some_and(|a| a == "down")).collect();
+        assert_eq!(downs.len(), 1, "{downs:?}");
+        assert!(downs[0].1.iter().any(|a| a == "-v"), "{downs:?}");
         let report = root.join(".sdd/specs").join(SPEC).join("report.md");
         assert!(fs::read_to_string(report).expect("relatório").contains("cargo run"));
         // O fim da finalização é sinalizado depois da atualização de arquitetura e da vaga liberada.

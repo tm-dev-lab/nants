@@ -1,0 +1,94 @@
+/*
+ * Página de entrada (spec 112, T02): só tokens. Um bloco centrado, sem cartão contornado, com a
+ * logo, o slogan logo depois dela e o pedido do código. Rola sozinho em telas baixas (a raiz
+ * `.nd-root` corta o excesso).
+ */
+.nd-connect {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: var(--sp-12) var(--sp-5) var(--sp-8);
+  box-sizing: border-box;
+}
+
+.nd-connect-card {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-connect-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.nd-connect-name {
+  font-size: var(--fs-display);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-connect-slogan {
+  margin: 0;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-connect-title {
+  margin: var(--sp-4) 0 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-connect-text,
+.nd-connect-note,
+.nd-connect-hint {
+  margin: 0;
+}
+
+.nd-connect-note {
+  color: var(--pill-amber-ink);
+}
+
+.nd-connect-hint {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-connect-label {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-connect-input.nd-input {
+  height: 52px;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  font-size: var(--fs-numeral);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.3em;
+}
+
+.nd-connect-submit.nd-btn {
+  height: 44px;
+  justify-content: center;
+}
+
+.nd-connect-error {
+  margin: 0;
+  color: var(--danger-ink);
+}

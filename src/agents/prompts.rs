@@ -877,7 +877,7 @@ pub fn report_system_for(lang: Lang) -> String {
      - Como testar: comando exato e resultado esperado.\n\
      - Projeto em Docker (a seção Ambiente do bloco FATOS diz docker; você não lê `.nants`): \
      Pré-requisitos = Docker com Compose, sem runtime da linguagem no host; use os comandos \
-     \"Executar/Testar fora do Nants\" e as portas da seção Ambiente. Em Como executar, a forma principal é o botão \"Iniciar o app\" do Nants. Fora do Nants, o \
+     \"Executar/Testar fora do Nants\" e as portas da seção Ambiente. Em Como executar, a forma principal é o botão \"START_APP_LABEL\" do Nants (cite o nome do botão exatamente assim). Fora do Nants, o \
      comando equivalente é `docker compose -f .nants/compose.yaml run --rm --service-ports workspace \
      sh -lc '<run_command>'`, com o run_command da spec. Nunca escreva \"no terminal do workspace\".\n\
      - Primeiros passos: uso básico, em poucos passos.\n\
@@ -887,7 +887,10 @@ pub fn report_system_for(lang: Lang) -> String {
      \n\
      Seja objetivo: no máximo cerca de 1700 palavras.";
     // Ordem decrescente: `## T10` antes de `## T1`.
-    let mut out = text.replace("LANG_NAME", lang_name(lang));
+    // O nome do botão vem do idioma do relatório, que é o da interface (spec 113 T04).
+    let mut out = text
+        .replace("LANG_NAME", lang_name(lang))
+        .replace("START_APP_LABEL", &crate::i18n::text(lang, "ui.app_start"));
     for (i, title) in t.iter().enumerate().rev() {
         out = out.replace(&format!("## T{i}"), &format!("## {title}"));
     }
@@ -1129,6 +1132,21 @@ mod tests {
         ] {
             assert!(p.contains(token), "falta {token}");
         }
+    }
+
+    /// Spec 113 T04: o botão citado ao modelo no relatório tem o nome da interface no idioma do
+    /// relatório (o mesmo texto de `app.start` nos dicionários da web).
+    #[test]
+    fn report_prompt_cites_start_button_in_report_language() {
+        let pt = report_system_for(Lang::PtBr);
+        let en = report_system_for(Lang::En);
+        assert!(pt.contains("o botão \"Iniciar o app\" do Nants"), "{pt}");
+        assert!(en.contains("o botão \"Start the app\" do Nants"), "{en}");
+        assert!(!en.contains("Iniciar o app") && !en.contains("START_APP_LABEL"), "{en}");
+        let web_pt = include_str!("../../web/src/i18n/ptBR.ts");
+        let web_en = include_str!("../../web/src/i18n/en.ts");
+        assert!(web_pt.contains(&format!("\"app.start\": \"{}\"", crate::i18n::text(Lang::PtBr, "ui.app_start"))));
+        assert!(web_en.contains(&format!("\"app.start\": \"{}\"", crate::i18n::text(Lang::En, "ui.app_start"))));
     }
 
     #[test]

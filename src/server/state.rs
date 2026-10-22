@@ -196,6 +196,12 @@ pub struct AppState {
     net_probe: super::lan::NetProbe,
     /// Modo de rede desta execução (spec 111).
     network_run: super::lan::NetworkRun,
+    /// Dispositivos autorizados na rede local (spec 112), em `devices.json` da pasta de dados.
+    devices: Arc<super::devices::DeviceStore>,
+    /// O endereço de escuta não é loopback (spec 112): exige dispositivo como o modo rede.
+    exposed: bool,
+    /// IPv4 de rede do Windows conferidos há pouco (spec 112), com o instante da conferência.
+    windows_ips: Arc<tokio::sync::Mutex<Option<(Instant, Option<Vec<std::net::Ipv4Addr>>)>>>,
     /// Pausas de teste (vazio em produção).
     #[cfg(test)]
     gates: Arc<Mutex<Vec<PauseGate>>>,
@@ -206,6 +212,15 @@ impl AppState {
     /// efetivamente ligada, usada na validação de `Host` e `Origin`.
     pub fn new(config_path: PathBuf, config: Config, port: u16) -> Self {
         let events = EventBus::new();
+        #[cfg(not(test))]
+        let data_dir: Option<Arc<PathBuf>> = crate::config::data_dir().map(Arc::new);
+        // Testes nunca escrevem na pasta de dados real do usuário.
+        #[cfg(test)]
+        let data_dir: Option<Arc<PathBuf>> =
+            Some(Arc::new(std::env::temp_dir().join(format!("nants-test-data-{}", std::process::id()))));
+        let devices = Arc::new(super::devices::DeviceStore::new(
+            data_dir.as_deref().map(|d| d.join(super::devices::DEVICES_FILE)),
+        ));
         Self {
             apps: AppManager::new(events.clone()),
             config_path: Arc::new(config_path),
@@ -240,11 +255,7 @@ impl AppState {
             price_fetcher: PriceFetcherHandle(Arc::new(super::price_catalog::StaticPriceFetcher(None))),
             web_search_rejected: Arc::new(Mutex::new(HashSet::new())),
             image_capability: ImageCapability::new(Arc::new(Instant::now)),
-            #[cfg(not(test))]
-            data_dir: crate::config::data_dir().map(Arc::new),
-            // Testes nunca escrevem na pasta de dados real do usuário.
-            #[cfg(test)]
-            data_dir: Some(Arc::new(std::env::temp_dir().join(format!("nants-test-data-{}", std::process::id())))),
+            data_dir,
             ui_state_lock: Arc::new(tokio::sync::Mutex::new(())),
             langs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             last_lang: SharedLang::default(),
@@ -258,6 +269,9 @@ impl AppState {
                 local_ips: Some(Vec::new()),
             },
             network_run: super::lan::NetworkRun { lan: false, source: super::lan::ModeSource::Default, requested_port: port },
+            devices,
+            exposed: false,
+            windows_ips: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             gates: Arc::new(Mutex::new(Vec::new())),
         }
@@ -281,6 +295,57 @@ impl AppState {
 
     pub fn network_run(&self) -> super::lan::NetworkRun {
         self.network_run
+    }
+
+    /// Modo rede (spec 112): o servidor aceita conexões de fora do loopback. Vale a escuta fora do
+    /// loopback, a política de `Host` da rede ou o modo desta execução (qualquer um liga a exigência
+    /// de dispositivo).
+    pub fn lan_mode(&self) -> bool {
+        self.exposed || self.host_policy == super::security::HostPolicy::Lan || self.network_run.lan
+    }
+
+    /// Escuta fora do loopback (por exemplo `--host` com `--allow-remote`): exige dispositivo.
+    pub fn with_exposed(mut self, exposed: bool) -> Self {
+        self.exposed = exposed;
+        self
+    }
+
+    /// IPv4 de rede do Windows (spec 112), só no WSL, com cache de [`super::lan::WINDOWS_IPS_TTL`].
+    /// `None`: fora do WSL ou não deu para conferir.
+    pub async fn windows_ips(&self) -> Option<Vec<std::net::Ipv4Addr>> {
+        if !self.net_probe.wsl {
+            return None;
+        }
+        let mut cache = self.windows_ips.lock().await;
+        if let Some((at, ips)) = cache.as_ref() {
+            if at.elapsed() < super::lan::WINDOWS_IPS_TTL {
+                return ips.clone();
+            }
+        }
+        let tools = self.net_probe.tools.clone();
+        let ips = tokio::time::timeout(
+            super::lan::PROBE_DEADLINE,
+            tokio::task::spawn_blocking(move || super::lan::windows_ips_with(&tools, true)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+        *cache = Some((Instant::now(), ips.clone()));
+        ips
+    }
+
+    /// Dispositivos autorizados (spec 112).
+    pub fn devices(&self) -> &Arc<super::devices::DeviceStore> {
+        &self.devices
+    }
+
+    /// Relógio dos dispositivos (testes), mantendo o arquivo atual.
+    #[cfg(test)]
+    pub fn with_device_clock(mut self, clock: super::devices::DeviceClock) -> Self {
+        let path = self.devices.path().map(Path::to_path_buf);
+        self.devices = Arc::new(super::devices::DeviceStore::with_clock(path, clock));
+        self
     }
 
     /// Idioma ativo do projeto (spec 102), compartilhado: quem guarda o handle (agentes de uma
@@ -308,6 +373,7 @@ impl AppState {
 
     /// Substitui o diretório de dados do Nants (testes: diretório temporário próprio).
     pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
+        self.devices = Arc::new(super::devices::DeviceStore::new(Some(dir.join(super::devices::DEVICES_FILE))));
         self.data_dir = Some(Arc::new(dir));
         self
     }

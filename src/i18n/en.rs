@@ -12,8 +12,8 @@ nants doctor  checks the environment (Docker, Compose, Git, port, disk) without 
 nants uninstall          removes the executable; keeps settings, data and projects (asks first)\n\
 nants uninstall --purge  also removes the settings and data; never the projects or Docker\n\
 --port N      fixed port; fails if it is busy (without --port, the default 3000 or the next free one)\n\
---lan         accepts access from the local network (0.0.0.0) for this run only, with the app preview ports right after the port (3001 to 3010); to keep it on, use Settings > Network access\n\
---allow-remote  allows a --host outside loopback (the server is exposed on that address)",
+--lan         accepts access from the local network (0.0.0.0) for this run only, with the app preview ports right after the port (3001 to 3010); to keep it on, use Settings > Network access; in network mode, only devices you add can open Nants, and the terminal shows the sign-in link for this computer (single use, valid for 10 minutes)\n\
+--allow-remote  allows a --host outside loopback (the server is exposed on that address; as in network mode, only devices you add can open Nants, and the terminal shows the sign-in link for this computer)",
     ),
     ("cli.unknown_command", "unknown command: {command}"),
     ("cli.unknown_arg", "unknown argument: {arg}"),
@@ -37,7 +37,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("cli.exposed", "warning: server exposed on {host}; the Host check only accepts loopback names"),
     ("cli.local_addr_failed", "could not get the local address: {error}"),
     ("cli.view_ports", "  app preview ports: {start} to {end}"),
-    ("cli.lan_warning", "warning: local network access is on; any device on the local network can control Nants (no authentication)"),
+    ("cli.lan_warning", "warning: local network access is on; only devices you add can open Nants (traffic on the network is plain HTTP, not encrypted)"),
     (
         "cli.lan_adopted",
         "Local network access turned on (Windows is already set up). To turn it off: Settings > Network access.",
@@ -146,6 +146,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("doctor.detail.port_auto", "port chosen by the system at startup"),
     ("doctor.detail.port_free", "port {port} is free"),
     ("doctor.detail.port_fallback", "port {port} is busy (maybe Nants is already open); nants will use {next}"),
+    ("doctor.detail.port_redirected", "port {port} is redirected by Windows; Nants will use {next}"),
     ("doctor.detail.port_all_busy", "ports {port} to {last} are busy"),
     ("doctor.detail.disk_unmeasured", "could not measure free space"),
     ("doctor.detail.disk", "{list}"),
@@ -174,10 +175,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("doctor.detail.windows_redirect_off", "local network access is off and Windows does not redirect port {port}"),
     ("doctor.detail.windows_redirect_unknown", "could not check with the Windows netsh.exe"),
     ("doctor.detail.firewall_unknown", "could not check the Windows firewall rule with PowerShell"),
-    ("doctor.detail.lan_on_ok", "local network access is on and Windows is set up for port {port}"),
+    ("doctor.detail.lan_on_ok", "local network access is on and Windows is set up for port {port}; only devices you add can open Nants"),
     (
         "doctor.detail.lan_on_mirrored_ok",
-        "local network access is on and the Windows firewall rule Nants exists (mirrored mode, port {port})",
+        "local network access is on and the Windows firewall rule Nants exists (mirrored mode, port {port}); only devices you add can open Nants",
     ),
     (
         "doctor.detail.lan_on_no_redirect",
@@ -197,7 +198,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ),
     (
         "doctor.detail.lan_linux_on",
-        "on: Nants listens on the local network (port {port}); if another device cannot open it, allow the port in the Linux firewall",
+        "on: Nants listens on the local network (port {port}) and only devices you add can open it; if another device cannot open it, allow the port in the Linux firewall",
     ),
     (
         "doctor.detail.lan_linux_off",
@@ -237,4 +238,45 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("report.traceability.no_task", "no task declared"),
     // Runner: tarefa de correção criada pela verificação final (spec 107), gravada no Txx.md.
     ("runner.final_fix_title", "Final verification fix"),
+    // Runner: `tests` agent messages in the conversation (spec 113 T04), in the project language.
+    ("runner.tests.passed_command", "tests ✓{place} (`{command}`)"),
+    ("runner.tests.passed_checks", "tests ✓{place} · {checks}"),
+    ("runner.tests.on_base", " on the base"),
+    ("runner.tests.failed_cycle", "test_command failed ({count}/{max})"),
+    ("runner.tests.reused", "tests and checks not repeated on the base: tree identical to the one tested at {sha} (outside .sdd/)"),
+    ("runner.tests.reused_summary", "reused: tree identical to the one tested at {sha}"),
+    ("runner.checks.list", "checks: {list}"),
+    ("runner.checks.non_blocking", "{name} {mark} (non-blocking)"),
+    ("runner.checks.non_blocking_regression", "{name} {mark} (non-blocking, regression from this task)"),
+    ("runner.checks.not_run", "{name} not run"),
+    ("runner.checks.failed_on_base", "check {name} failed on the base:"),
+    ("runner.final_base.prefix", "final verification on the base"),
+    ("runner.final_base.line", "{prefix}: tests {mark}{checks}"),
+    ("runner.final_base.not_run", "not run"),
+    // Advisor (ask_architect): question and answer shown in the conversation.
+    ("advisor.question", "Question to the Architect: {question}"),
+    ("advisor.answer", "Answer to the {who}: {answer}"),
+    ("advisor.scope_added", "allowed_scope extended: {globs}"),
+    ("advisor.criteria_rewritten", "Acceptance criteria rewritten."),
+    // Architecture survey: failure notice in the conversation.
+    ("survey.failed", "I could not finish the architecture survey ({code}). The project goes on as usual: when you plan the first specification with the Architect in the conversation, it reads the code and creates ARCHITECTURE.md along with the plan."),
+    // Interface labels quoted to the model (the same text as the button in the interface).
+    ("ui.app_start", "Start the app"),
+    // Runner: automatic formatting (spec 078) in the conversation, `tests` agent.
+    ("runner.format.failed", "automatic formatting failed (does not block): {why}"),
+    ("runner.format.tool_failed", "automatic formatting ({name}) failed (does not block): {why}"),
+    ("runner.format.applied", "automatic formatting: {count} files ({names})"),
+    ("runner.format.timed_out", "timed out"),
+    ("runner.format.exit", "exit {code}: {output}"),
+    // Advisor: scope_add paths that were not added (same text as the task record).
+    ("advisor.scope_covered", "`{path}` already covered by `{by}`"),
+    ("advisor.scope_limit", "`{path}` not added: limit of {limit} entries in allowed_scope"),
+    ("advisor.scope_limit_notice", "the scope could not be extended (limit); ask the Architect for another way out or report the blocker"),
+    // Authorized devices (spec 112).
+    ("devices.this_computer", "This computer"),
+    ("devices.fallback_name", "Device"),
+    ("devices.browser", "Browser"),
+    ("devices.name_browser_os", "{browser} on {os}"),
+    ("cli.entry_link", "sign-in link for this computer (single use, valid for 10 minutes): {url}"),
+    ("cli.entry_link_failed", "could not create the sign-in link; restart nants"),
 ];

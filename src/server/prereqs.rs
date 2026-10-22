@@ -120,6 +120,11 @@ pub const REQUIRED_IDS: [&str; 5] = ["git", "docker_cli", "docker_daemon", "dock
 /// Executor real: sem shell, stdin nulo, timeout com kill.
 pub fn real_runner(timeout: Duration) -> CmdRunner {
     Arc::new(move |prog: &str, args: &[&str]| {
+        // Sentinela dos testes (spec 113 T01): nenhum teste chama o docker real.
+        #[cfg(test)]
+        if crate::harness::compose::refuse_real_docker_in_tests(prog).is_some() {
+            return None;
+        }
         let mut child = Command::new(prog)
             .args(args)
             .stdin(Stdio::null())
@@ -350,6 +355,17 @@ pub async fn get_prereqs(State(state): State<AppState>) -> Json<Vec<PrereqItem>>
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Sentinela (spec 113 T01): o executor real dos prerequisitos não chama o docker nos testes.
+    #[test]
+    fn real_runner_refuses_real_docker_in_tests() {
+        if std::env::var("NANTS_TEST_REAL_DOCKER").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let run = real_runner(Duration::from_secs(5));
+        assert!(run("docker", &["info"]).is_none());
+        assert!(run("sh", &["-c", "true"]).is_some_and(|o| o.success));
+    }
 
     fn ok(s: &str) -> Option<CmdOutput> {
         Some(CmdOutput { success: true, stdout: s.into(), stderr: String::new() })
