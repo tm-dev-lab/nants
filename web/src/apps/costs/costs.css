@@ -1,0 +1,340 @@
+/*
+ * Janela Custos (spec 093, T07; enxuta na 095/T05, `reference/Main.dc.html`). Só variáveis dos
+ * tokens. Em destaque: o total de 32 px, a barra do orçamento e os três maiores itens; o resto
+ * fica em "Ver detalhes por tarefa e modelo". Divisórias `--divider` no lugar de contornos.
+ */
+.nd-costs {
+  display: flex;
+  flex-direction: column;
+  /* Respiro entre as seções (094/T08, A-06; 14 a 16 px no mockup). */
+  gap: var(--sp-4);
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+/*
+ * Margem inferior garantida na área de rolagem (094/T08, A-06): um espaçador de `--sp-4` como
+ * último item do flex entra sempre na área rolável (o `padding-bottom` de um contêiner com
+ * rolagem nem sempre entra), e a última linha não encosta na borda da janela.
+ */
+.nd-costs.nd-app-page {
+  padding-bottom: 0;
+}
+
+.nd-costs::after {
+  content: "";
+  flex: none;
+  height: var(--sp-4);
+  margin-top: calc(var(--sp-4) * -1);
+}
+
+.nd-costs-total {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* O total em destaque: 32 px em 600, `tabular-nums`, letras levemente juntas (mockup). */
+.nd-costs-amount {
+  margin: 0;
+  font-size: var(--fs-numeral);
+  font-weight: var(--fw-semibold);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.nd-costs-amount-note {
+  font-size: var(--fs-label);
+  font-weight: var(--fw-regular);
+  letter-spacing: normal;
+  color: var(--muted);
+}
+
+/* Orçamento da spec: "Spec s1: US$ 0,10 de US$ 5,00" e a barra de progresso. */
+.nd-costs-budget-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-costs-budget-line {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+.nd-costs-budget-used {
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-costs-budget-track {
+  display: block;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--control);
+  overflow: hidden;
+}
+
+.nd-costs-budget-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+
+.nd-costs-budget-bar[data-over="true"] .nd-costs-budget-fill {
+  background: var(--icon-rose);
+}
+
+/* Os três maiores itens: lista simples com `--divider` acima (mockup). */
+.nd-costs-top {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--divider);
+}
+
+.nd-costs-top-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  font-size: var(--fs-control);
+}
+
+.nd-costs-top-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.nd-costs-top-label {
+  min-width: 0;
+  color: var(--muted);
+}
+
+.nd-costs-top-value {
+  flex-shrink: 0;
+  color: var(--ink);
+}
+
+/*
+ * "Ver detalhes por tarefa e modelo" e o orçamento: `<details>` sem caixa (o resumo parece um
+ * link, como no mockup); aberto, as seções ficam separadas por `--divider`.
+ */
+.nd-costs-more {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+.nd-costs-more-summary {
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  color: var(--accent);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+.nd-costs-more-summary .nd-details-chevron {
+  flex-shrink: 0;
+  margin-right: var(--sp-1);
+  transition: transform 0.12s ease;
+}
+
+.nd-costs-more[open] > .nd-costs-more-summary .nd-details-chevron {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-costs-more-summary .nd-details-chevron {
+    transition: none;
+  }
+}
+
+.nd-costs-more-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding-top: var(--sp-3);
+}
+
+.nd-cost-bars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-cost-bar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-cost-bar {
+  display: grid;
+  grid-template-columns: minmax(80px, 30%) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-cost-bar-label {
+  color: var(--ink3);
+}
+
+.nd-cost-bar-track {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--control);
+  overflow: hidden;
+}
+
+.nd-cost-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+
+.nd-cost-bar-value {
+  text-align: right;
+  color: var(--ink2);
+}
+
+/* Chamadas sem preço: texto âmbar e "Configurar", sem caixa. */
+.nd-costs-note {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  color: var(--pill-amber-ink);
+}
+
+.nd-usage-table-wrap {
+  overflow-x: auto;
+}
+
+.nd-usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-label);
+  font-variant-numeric: tabular-nums;
+}
+
+.nd-usage-table th,
+.nd-usage-table td {
+  padding: var(--sp-2) var(--sp-2);
+  border-bottom: 1px solid var(--divider);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.nd-usage-table thead th {
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nd-usage-table th[scope="row"],
+.nd-usage-table thead th:first-child {
+  text-align: left;
+  font-weight: var(--fw-regular);
+  color: var(--ink);
+  white-space: normal;
+}
+
+.nd-usage-table tfoot th,
+.nd-usage-table tfoot td {
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+  border-bottom: 0;
+}
+
+.nd-usage-unpriced {
+  display: block;
+  font-size: var(--fs-micro);
+}
+
+.nd-usage-stack {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nd-usage-stack-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.nd-usage-stack-item:last-child {
+  border-bottom: 0;
+}
+
+.nd-usage-stack-item[data-variant="total"] .nd-strong {
+  color: var(--ink);
+}
+
+.nd-usage-stack-item .nd-row {
+  justify-content: space-between;
+}
+
+.nd-costs-budget-fields {
+  align-items: flex-end;
+}
+
+.nd-costs-budget-fields .nd-input {
+  width: 140px;
+}
+
+[data-size="narrow"] .nd-cost-bar {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+[data-size="narrow"] .nd-cost-bar-track {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+.nd-costs-unpriced {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  font-size: var(--fs-label);
+  color: var(--pill-amber-ink);
+}
+
+/* Ritmo do provedor: ícone e texto na mesma linha (o reset deixa o SVG como bloco). */
+.nd-costs-pacing {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-costs-pacing > svg {
+  flex-shrink: 0;
+}
+
+.nd-costs-pacing > span {
+  min-width: 0;
+}

@@ -1,0 +1,417 @@
+/*
+ * Janela Quadro (spec 093, T07). Só variáveis dos tokens; nenhuma cor literal. O tamanho vem do
+ * `data-size` da janela: estreita, as colunas viram uma lista com a rolagem dentro da janela.
+ */
+.nd-board-root {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-board-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+}
+
+/* A área de rolagem do Quadro (`nd-app-scroll`) só rola na lista estreita: larga, rolam as colunas. */
+.nd-board-main.nd-app-scroll {
+  overflow: hidden;
+}
+
+.nd-board-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.nd-board-columns-menu {
+  position: relative;
+}
+
+.nd-board-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 5;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-radius: var(--r-lg);
+  box-shadow: var(--bevel), var(--elev-3);
+}
+
+/* O foco fica no próprio campo (anel duplo único do `.nd-root :focus-visible`); o rótulo não ganha outro. */
+.nd-board-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 28px;
+  padding: var(--sp-1) var(--sp-2);
+  /* Concêntrico com o popover: `--r-lg` − `--sp-2` = `--r-xs`. */
+  border-radius: var(--r-xs);
+  font-size: var(--fs-label);
+  color: var(--ink2);
+  cursor: pointer;
+}
+
+.nd-board-check input {
+  accent-color: var(--accent);
+}
+
+/* Colunas lado a lado: cada uma com a rolagem própria. */
+.nd-board {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  gap: var(--sp-2);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/*
+ * Raia (095/T05, decisão 7): fundo `--lane`, raio 12, sem contorno. O cabeçalho em caixa-alta
+ * (caption) traz o rótulo e a contagem, separado dos cartões por `--divider`.
+ */
+.nd-board-column {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+}
+
+/*
+ * Bloqueada: a mesma raia, com o rótulo em rosa (o tom fica no texto, nunca numa borda). Sem
+ * estado definido: sem o fundo da raia.
+ */
+.nd-board-column[data-kind="undefined"] {
+  background: transparent;
+}
+
+.nd-board-column-head {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--divider);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nd-board-column-count {
+  color: var(--muted);
+}
+
+.nd-board-column-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.nd-board-column-label[data-tone="cyan"] {
+  color: var(--pill-cyan-ink);
+}
+.nd-board-column-label[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+.nd-board-column-label[data-tone="green"] {
+  color: var(--pill-green-ink);
+}
+.nd-board-column-label[data-tone="rose"] {
+  color: var(--pill-rose-ink);
+}
+
+.nd-board-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  border-radius: var(--r-md);
+}
+
+/* Coluna vazia (094/T08, A-03): um rótulo discreto centralizado, nunca uma caixa tracejada vazia. */
+.nd-board-empty {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-2);
+  text-align: center;
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-board-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/*
+ * O item é a moldura do cartão (094/T08, A-02; 095/T05): `--card` com o relevo `--card-edge`,
+ * sem contorno. A borda transparente só existe para a seleção (`data-selected`, bloco comum de
+ * estados) pintar `--selected-edge`. A tarefa ativa ganha o fundo ciano suave, como no mockup.
+ */
+.nd-board-item {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: var(--card);
+  box-shadow: var(--card-edge);
+}
+
+.nd-board-item[data-active="true"]:not([data-selected="true"]) {
+  background: var(--pill-cyan-bg);
+}
+
+.nd-board-card {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fs-control)/1.4 var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Rodapé do cartão: o link fica alinhado ao texto do cartão (padding do rodapé + o do link = `--sp-2`). */
+.nd-board-card-foot {
+  display: flex;
+  padding: 0 var(--sp-2) var(--sp-1);
+}
+
+.nd-board-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+/* Id em mono (C-08), legenda e `--muted`; em andamento, ciano (como no mockup). */
+.nd-board-card-id {
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-medium);
+  color: var(--muted);
+}
+
+.nd-board-card[data-tone="cyan"] .nd-board-card-id {
+  color: var(--pill-cyan-ink);
+}
+.nd-board-card[data-tone="rose"] .nd-board-card-id {
+  color: var(--pill-rose-ink);
+}
+
+.nd-board-card-title {
+  font-size: var(--fs-control);
+  font-weight: var(--fw-medium);
+  color: var(--ink);
+}
+
+/*
+ * Selos do cartão (veredito, estado real, recuperação): pequenos e com raio moderado (decisão 9),
+ * nunca a pílula de raio cheio.
+ */
+.nd-board-card .nd-pill {
+  border-radius: var(--r-sm);
+}
+
+.nd-board-reason {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: var(--fs-caption);
+  color: var(--danger-ink);
+}
+
+.nd-section-label[data-tone="rose"] {
+  color: var(--pill-rose-ink);
+}
+
+/*
+ * Troca de coluna: o cartão inteiro (o item, que é a moldura) chega deslizando (transform), sem
+ * animação com movimento reduzido.
+ */
+.nd-board-item[data-enter="true"] {
+  animation: nd-board-enter 220ms ease-out;
+}
+
+@keyframes nd-board-enter {
+  from {
+    opacity: 0.4;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-board-item[data-enter="true"] {
+    animation: none;
+  }
+}
+
+/*
+ * Última revisão (spec 094, T05): recolhida, UMA linha; aberta, no máximo 40% da altura do
+ * Quadro (o conteúdo da janela), com a rolagem dentro do corpo. As colunas (`.nd-board`, flex 1)
+ * ficam com o resto.
+ */
+.nd-board-review {
+  flex-shrink: 0;
+  max-height: 40%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+.nd-board-review-toggle {
+  flex-shrink: 0;
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.nd-board-review-line {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--fw-semibold);
+}
+
+.nd-board-review-line[data-tone="green"] {
+  color: var(--pill-green-ink);
+}
+
+.nd-board-review-line[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-board-review-body {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3) var(--sp-2);
+}
+
+/* Estreita: as colunas viram uma lista; rola a área do Quadro (a janela não rola). */
+[data-size="narrow"] .nd-board-main.nd-app-scroll {
+  overflow-y: auto;
+}
+
+.nd-board[data-board-layout="list"] {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  overflow: visible;
+}
+
+.nd-board[data-board-layout="list"] .nd-board-scroll {
+  flex: none;
+  overflow: visible;
+}
+
+
+/* --- Folha dentro da janela (Ações da tarefa) --- */
+.nd-actions-sheet {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface);
+  border-top: 1px solid var(--divider);
+}
+
+.nd-actions-sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.nd-actions-sheet-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-actions-sheet-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+
+.nd-trail {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-trail-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-1) 0;
+  border-bottom: 1px solid var(--divider);
+  font-size: var(--fs-label);
+}
+
+.nd-trail-item:last-child {
+  border-bottom: 0;
+}
+
+.nd-trail-text {
+  flex: 1 1 200px;
+  min-width: 0;
+  white-space: pre-wrap;
+  color: var(--ink2);
+}

@@ -1,0 +1,31 @@
+# This repository is a published mirror and does not accept pull requests (see CONTRIBUTING.md).
+# New pull requests get a polite notice and are closed. Security: this workflow never checks out
+# or runs code from the pull request; it only calls the GitHub CLI with the pull request number.
+name: close-pull-requests
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    name: Close with a notice
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr close "$PR_NUMBER" --comment "Thank you for your interest in Nants.
+
+          Nants is developed through an internal process that we are still consolidating. For now, we welcome issues (bug reports and suggestions), but we don't accept pull requests. This repository is a published mirror of the product; changes are made upstream and published here with each release. We will revisit this as the process matures.
+
+          Please open an issue describing the problem and the change you suggest: https://github.com/${GH_REPO}/issues/new/choose
+
+          See CONTRIBUTING.md: https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md"

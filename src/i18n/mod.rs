@@ -1,0 +1,405 @@
+//! Idiomas do servidor e do terminal (spec 102): pt-BR e en.
+//!
+//! - [`Lang`]: o idioma ativo. A interface manda o dela a cada turno (cabeçalho `X-Nants-Lang`,
+//!   ver `server::lang`); o terminal decide pela ordem POSIX `LC_ALL` > `LC_MESSAGES` > `LANG`
+//!   ([`Lang::from_locale_vars`]). Sem informação, pt-BR (compatível com o que já existia).
+//! - Dicionários próprios ([`pt_br::MESSAGES`] e [`en::MESSAGES`]), com as mesmas chaves e os
+//!   mesmos parâmetros nomeados (`{name}`); há teste de paridade.
+//! - [`Msg`]: mensagem por chave e parâmetros, renderizada no idioma pedido só na hora de exibir.
+
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
+pub mod en;
+pub mod pt_br;
+
+/// Idioma suportado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum Lang {
+    /// Português do Brasil (padrão: sem idioma informado).
+    #[default]
+    PtBr,
+    En,
+}
+
+impl Lang {
+    /// Etiqueta usada pela interface e pela API: `pt-BR` ou `en`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Lang::PtBr => "pt-BR",
+            Lang::En => "en",
+        }
+    }
+
+    /// Idioma de uma etiqueta da interface (`pt-BR`, `en`); qualquer outro valor é `None`.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag.trim() {
+            "pt-BR" => Some(Lang::PtBr),
+            "en" => Some(Lang::En),
+            _ => None,
+        }
+    }
+
+    /// Idioma de um valor de locale POSIX (`pt_BR.UTF-8`, `en_US`, `C`, `POSIX`): `pt` vira
+    /// pt-BR; `C`, `POSIX` e o resto, en.
+    pub fn from_locale(value: &str) -> Self {
+        let primary = value
+            .trim()
+            .split(['_', '-', '.', '@'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if primary == "pt" {
+            Lang::PtBr
+        } else {
+            Lang::En
+        }
+    }
+
+    /// Ordem POSIX: o primeiro não vazio entre `LC_ALL`, `LC_MESSAGES` e `LANG` decide. Nenhum
+    /// definido: en (como o locale `C`).
+    pub fn from_locale_vars(lc_all: Option<&str>, lc_messages: Option<&str>, lang: Option<&str>) -> Self {
+        [lc_all, lc_messages, lang]
+            .into_iter()
+            .flatten()
+            .find(|v| !v.trim().is_empty())
+            .map_or(Lang::En, Lang::from_locale)
+    }
+
+    /// Idioma do terminal pelo ambiente do processo.
+    pub fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok();
+        Lang::from_locale_vars(var("LC_ALL").as_deref(), var("LC_MESSAGES").as_deref(), var("LANG").as_deref())
+    }
+
+    fn index(self) -> u8 {
+        match self {
+            Lang::PtBr => 0,
+            Lang::En => 1,
+        }
+    }
+
+    fn from_index(i: u8) -> Self {
+        if i == 1 {
+            Lang::En
+        } else {
+            Lang::PtBr
+        }
+    }
+
+    fn dictionary(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Lang::PtBr => pt_br::MESSAGES,
+            Lang::En => en::MESSAGES,
+        }
+    }
+}
+
+/// Idioma compartilhado e mutável: os agentes leem o valor atual a cada mensagem, então a troca
+/// de idioma no meio de um projeto vale para as próximas mensagens. Clones compartilham o valor.
+#[derive(Debug, Clone, Default)]
+pub struct SharedLang(Arc<AtomicU8>);
+
+impl SharedLang {
+    pub fn new(lang: Lang) -> Self {
+        Self(Arc::new(AtomicU8::new(lang.index())))
+    }
+
+    pub fn get(&self) -> Lang {
+        Lang::from_index(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, lang: Lang) {
+        self.0.store(lang.index(), Ordering::Relaxed);
+    }
+}
+
+/// Texto da chave no idioma, ou `None` se a chave não existe.
+pub fn lookup(lang: Lang, key: &str) -> Option<&'static str> {
+    lang.dictionary().iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+/// Texto da chave no idioma; chave ausente devolve a própria chave (a paridade é testada).
+pub fn text(lang: Lang, key: &str) -> String {
+    lookup(lang, key).map_or_else(|| key.to_string(), str::to_string)
+}
+
+/// Texto da chave com os parâmetros `{name}` preenchidos.
+pub fn tr(lang: Lang, key: &str, params: &[(&str, &str)]) -> String {
+    let template = lookup(lang, key).unwrap_or(key);
+    interpolate(template, |name| params.iter().find(|(n, _)| *n == name).map(|(_, v)| (*v).to_string()))
+}
+
+/// Substitui `{name}` pelo valor de `value(name)`; nome desconhecido fica como está.
+fn interpolate(template: &str, value: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let name_len = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+        let closed = name_len > 0 && after[name_len..].starts_with('}');
+        match closed.then(|| value(&after[..name_len])).flatten() {
+            Some(v) => {
+                out.push_str(&v);
+                rest = &after[name_len + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Valor de um parâmetro de [`Msg`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arg {
+    /// Texto igual nos dois idiomas (número, caminho, versão).
+    Text(String),
+    /// Texto diferente por idioma (ex.: número com vírgula ou ponto decimal).
+    PerLang { pt_br: String, en: String },
+    /// Outra mensagem, renderizada no mesmo idioma.
+    Msg(Box<Msg>),
+    /// Lista de mensagens unidas por um separador.
+    Join(Vec<Msg>, &'static str),
+    /// Tamanho em bytes, exibido em GB com uma casa decimal ("1,5 GB" em pt-BR, "1.5 GB" em en).
+    /// Na forma neutra ([`Msg::neutral`]) vai como o número de bytes, em `<nome>_bytes`.
+    Gb(u64),
+}
+
+/// "12,3 GB" em pt-BR e "12.3 GB" em en (uma casa decimal, base 1024, sem arredondar para cima).
+pub fn format_gb(lang: Lang, bytes: u64) -> String {
+    let tenths = bytes.saturating_mul(10) / (1024 * 1024 * 1024);
+    let sep = match lang {
+        Lang::PtBr => ',',
+        Lang::En => '.',
+    };
+    format!("{}{sep}{} GB", tenths / 10, tenths % 10)
+}
+
+/// Mensagem na forma neutra de idioma (spec 102 T05), para a interface montar o texto pelo próprio
+/// dicionário: o `code` (a chave sem o prefixo), os `params` iguais nos dois idiomas e, se houver
+/// uma lista ([`Arg::Join`]), os itens dela na mesma forma.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neutral {
+    pub code: String,
+    /// Textos iguais nos dois idiomas e números ([`Arg::Gb`] em `<nome>_bytes`). Texto por idioma
+    /// e sub-mensagem não têm forma neutra: ficam de fora, e a interface usa o texto de reserva.
+    pub params: serde_json::Map<String, serde_json::Value>,
+    /// Itens da primeira lista da mensagem, unidos pela interface.
+    pub parts: Vec<Neutral>,
+}
+
+/// Mensagem por chave e parâmetros, renderizada no idioma na hora de exibir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Msg {
+    pub key: &'static str,
+    pub args: Vec<(&'static str, Arg)>,
+}
+
+impl Msg {
+    pub fn new(key: &'static str) -> Self {
+        Self { key, args: Vec::new() }
+    }
+
+    /// Parâmetro de texto igual nos dois idiomas.
+    pub fn arg(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.args.push((name, Arg::Text(value.into())));
+        self
+    }
+
+    /// Parâmetro com outra mensagem.
+    pub fn arg_msg(mut self, name: &'static str, value: Msg) -> Self {
+        self.args.push((name, Arg::Msg(Box::new(value))));
+        self
+    }
+
+    /// Parâmetro com um texto por idioma.
+    pub fn arg_per_lang(mut self, name: &'static str, pt_br: impl Into<String>, en: impl Into<String>) -> Self {
+        self.args.push((name, Arg::PerLang { pt_br: pt_br.into(), en: en.into() }));
+        self
+    }
+
+    /// Parâmetro com uma lista de mensagens unidas por `sep`.
+    pub fn arg_join(mut self, name: &'static str, items: Vec<Msg>, sep: &'static str) -> Self {
+        self.args.push((name, Arg::Join(items, sep)));
+        self
+    }
+
+    /// Texto no idioma.
+    pub fn render(&self, lang: Lang) -> String {
+        let template = lookup(lang, self.key).unwrap_or(self.key);
+        interpolate(template, |name| {
+            self.args.iter().find(|(n, _)| *n == name).map(|(_, arg)| match arg {
+                Arg::Text(t) => t.clone(),
+                Arg::PerLang { pt_br, en } => match lang {
+                    Lang::PtBr => pt_br.clone(),
+                    Lang::En => en.clone(),
+                },
+                Arg::Msg(m) => m.render(lang),
+                Arg::Join(items, sep) => items.iter().map(|m| m.render(lang)).collect::<Vec<_>>().join(sep),
+                Arg::Gb(bytes) => format_gb(lang, *bytes),
+            })
+        })
+    }
+
+    /// Parâmetro de tamanho em bytes (ver [`Arg::Gb`]).
+    pub fn arg_gb(mut self, name: &'static str, bytes: u64) -> Self {
+        self.args.push((name, Arg::Gb(bytes)));
+        self
+    }
+
+    /// Forma neutra de idioma, com o `code` = a chave sem `prefix` (ver [`Neutral`]).
+    pub fn neutral(&self, prefix: &str) -> Neutral {
+        let code = self.key.strip_prefix(prefix).unwrap_or(self.key).to_string();
+        let mut params = serde_json::Map::new();
+        let mut parts = Vec::new();
+        for (name, arg) in &self.args {
+            match arg {
+                Arg::Text(t) => {
+                    params.insert((*name).to_string(), serde_json::Value::from(t.as_str()));
+                }
+                Arg::Gb(bytes) => {
+                    params.insert(format!("{name}_bytes"), serde_json::Value::from(*bytes));
+                }
+                Arg::Join(items, _) if parts.is_empty() => parts = items.iter().map(|m| m.neutral(prefix)).collect(),
+                _ => {}
+            }
+        }
+        Neutral { code, params, parts }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(open) = rest.find('{') {
+            let after = &rest[open + 1..];
+            match after.find('}') {
+                Some(close) if after[..close].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && close > 0 => {
+                    out.push(after[..close].to_string());
+                    rest = &after[close + 1..];
+                }
+                _ => rest = after,
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dictionaries_have_the_same_keys_and_params() {
+        let pt: Vec<&str> = pt_br::MESSAGES.iter().map(|(k, _)| *k).collect();
+        let en: Vec<&str> = en::MESSAGES.iter().map(|(k, _)| *k).collect();
+        let mut sorted_pt = pt.clone();
+        sorted_pt.sort_unstable();
+        sorted_pt.dedup();
+        assert_eq!(sorted_pt.len(), pt.len(), "chave repetida no pt-BR");
+        let mut sorted_en = en.clone();
+        sorted_en.sort_unstable();
+        sorted_en.dedup();
+        assert_eq!(sorted_en.len(), en.len(), "chave repetida no en");
+        assert_eq!(sorted_pt, sorted_en, "pt-BR e en com chaves diferentes");
+        for (key, value) in pt_br::MESSAGES {
+            let other = lookup(Lang::En, key).unwrap_or_default();
+            assert_eq!(params(value), params(other), "parâmetros diferentes em {key}");
+            assert!(!value.trim().is_empty() && !other.trim().is_empty(), "texto vazio em {key}");
+        }
+    }
+
+    #[test]
+    fn locale_order_is_lc_all_then_lc_messages_then_lang() {
+        assert_eq!(Lang::from_locale_vars(Some("pt_BR.UTF-8"), Some("en_US"), Some("en_US")), Lang::PtBr);
+        assert_eq!(Lang::from_locale_vars(Some("C"), Some("pt_BR"), Some("pt_BR")), Lang::En);
+        assert_eq!(Lang::from_locale_vars(None, Some("pt_PT.UTF-8"), Some("en_US")), Lang::PtBr);
+        assert_eq!(Lang::from_locale_vars(Some(""), Some(" "), Some("pt_BR.UTF-8")), Lang::PtBr);
+        assert_eq!(Lang::from_locale_vars(None, None, Some("en_GB.UTF-8")), Lang::En);
+        assert_eq!(Lang::from_locale_vars(None, None, None), Lang::En);
+    }
+
+    #[test]
+    fn locale_values_map_pt_to_pt_br_and_the_rest_to_en() {
+        for pt in ["pt", "pt_BR", "pt_BR.UTF-8", "PT_br", "pt-BR", "pt@euro"] {
+            assert_eq!(Lang::from_locale(pt), Lang::PtBr, "{pt}");
+        }
+        for other in ["C", "POSIX", "C.UTF-8", "en_US.UTF-8", "es_ES", "fr", "portuguese", ""] {
+            assert_eq!(Lang::from_locale(other), Lang::En, "{other}");
+        }
+    }
+
+    #[test]
+    fn ui_tags_round_trip_and_reject_others() {
+        for lang in [Lang::PtBr, Lang::En] {
+            assert_eq!(Lang::from_tag(lang.tag()), Some(lang));
+        }
+        for bad in ["pt", "pt-PT", "EN", "fr", "", "en-US"] {
+            assert_eq!(Lang::from_tag(bad), None, "{bad}");
+        }
+        assert_eq!(Lang::default(), Lang::PtBr);
+    }
+
+    #[test]
+    fn shared_lang_is_seen_by_every_clone() {
+        let a = SharedLang::default();
+        let b = a.clone();
+        assert_eq!(b.get(), Lang::PtBr);
+        a.set(Lang::En);
+        assert_eq!(b.get(), Lang::En);
+        assert_eq!(SharedLang::new(Lang::En).get(), Lang::En);
+    }
+
+    #[test]
+    fn tr_and_msg_fill_params_in_each_language() {
+        assert_eq!(tr(Lang::PtBr, "cli.unknown_command", &[("command", "x")]), "comando desconhecido: x");
+        assert_eq!(tr(Lang::En, "cli.unknown_command", &[("command", "x")]), "unknown command: x");
+        assert_eq!(tr(Lang::En, "chave.inexistente", &[]), "chave.inexistente");
+        let msg = Msg::new("doctor.detail.disk")
+            .arg_join(
+                "list",
+                vec![
+                    Msg::new("doctor.detail.disk_free").arg_per_lang("size", "1,5 GB", "1.5 GB").arg("path", "/a"),
+                    Msg::new("doctor.detail.disk_free").arg_per_lang("size", "2,0 GB", "2.0 GB").arg("path", "/b"),
+                ],
+                "; ",
+            );
+        assert_eq!(msg.render(Lang::PtBr), "1,5 GB livres em /a; 2,0 GB livres em /b");
+        assert_eq!(msg.render(Lang::En), "1.5 GB free in /a; 2.0 GB free in /b");
+        // Chaves literais que não são parâmetros (JSON, `{{.Tag}}`) ficam como estão.
+        assert_eq!(interpolate("a {x} {{.Tag}} {y", |n| (n == "x").then(|| "1".to_string())), "a 1 {{.Tag}} {y");
+    }
+
+    #[test]
+    fn gb_renders_per_language_and_neutral_keeps_only_language_free_values() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        assert_eq!(format_gb(Lang::PtBr, gib * 3 / 2), "1,5 GB");
+        assert_eq!(format_gb(Lang::En, gib * 3 / 2), "1.5 GB");
+        assert_eq!(format_gb(Lang::En, 0), "0.0 GB");
+        let item = |bytes: u64, path: &str| Msg::new("doctor.detail.disk_free").arg_gb("size", bytes).arg("path", path);
+        let msg = Msg::new("doctor.detail.disk").arg_join("list", vec![item(gib, "/a"), item(gib * 12, "/b")], "; ");
+        assert_eq!(msg.render(Lang::PtBr), "1,0 GB livres em /a; 12,0 GB livres em /b");
+        assert_eq!(msg.render(Lang::En), "1.0 GB free in /a; 12.0 GB free in /b");
+        let neutral = msg.neutral("doctor.detail.");
+        assert_eq!(neutral.code, "disk");
+        assert!(neutral.params.is_empty());
+        assert_eq!(neutral.parts.len(), 2);
+        assert_eq!(neutral.parts[0].code, "disk_free");
+        assert_eq!(neutral.parts[0].params["size_bytes"], serde_json::json!(gib));
+        assert_eq!(neutral.parts[0].params["path"], "/a");
+        assert!(neutral.parts[0].parts.is_empty());
+        // Texto por idioma e sub-mensagem ficam de fora; sem o prefixo pedido, a chave fica inteira.
+        let mixed = Msg::new("doctor.detail.version_unknown").arg("local", "0.1.0").arg_msg("why", Msg::new("doctor.why.invalid"));
+        let neutral = mixed.neutral("doctor.detail.");
+        assert_eq!(neutral.code, "version_unknown");
+        assert_eq!(serde_json::Value::Object(neutral.params), serde_json::json!({"local": "0.1.0"}));
+        let per_lang = Msg::new("x.y").arg_per_lang("a", "1", "2").neutral("doctor.");
+        assert_eq!(per_lang.code, "x.y");
+        assert!(per_lang.params.is_empty());
+    }
+}

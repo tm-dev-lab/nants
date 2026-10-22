@@ -1,0 +1,30 @@
+{
+  "about": "Paridade da etapa do plano (spec 094, decisão 3): planStage (web/src/phase.ts) x plan_awaiting_approval do GET /api/attention (src/server/attention.rs). A spec ativa está sempre em AWAITING_APPROVAL (rascunho gravado durante o turno). plan_review null = sem revisão. stage === \"awaiting\" se e somente se plan_awaiting_approval.",
+  "spec_status": "AWAITING_APPROVAL",
+  "cases": [
+    { "running": false, "turn_open": true, "plan_review": "pending", "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": true, "plan_review": "running", "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": true, "plan_review": "ok", "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": true, "plan_review": "stale", "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": true, "plan_review": "unavailable", "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": true, "plan_review": null, "stage": "planning", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": false, "plan_review": "pending", "stage": "reviewing", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": false, "plan_review": "running", "stage": "reviewing", "plan_awaiting_approval": false },
+    { "running": false, "turn_open": false, "plan_review": "ok", "stage": "awaiting", "plan_awaiting_approval": true },
+    { "running": false, "turn_open": false, "plan_review": "stale", "stage": "awaiting", "plan_awaiting_approval": true },
+    { "running": false, "turn_open": false, "plan_review": "unavailable", "stage": "awaiting", "plan_awaiting_approval": true },
+    { "running": false, "turn_open": false, "plan_review": null, "stage": "awaiting", "plan_awaiting_approval": true },
+    { "running": true, "turn_open": true, "plan_review": "pending", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": true, "plan_review": "running", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": true, "plan_review": "ok", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": true, "plan_review": "stale", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": true, "plan_review": "unavailable", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": true, "plan_review": null, "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": "pending", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": "running", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": "ok", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": "stale", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": "unavailable", "stage": null, "plan_awaiting_approval": false },
+    { "running": true, "turn_open": false, "plan_review": null, "stage": null, "plan_awaiting_approval": false }
+  ]
+}

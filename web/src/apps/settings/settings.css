@@ -1,0 +1,328 @@
+/* Janela Configurações (spec 093, T08; enxuta na 095/T06): só tokens (variáveis do tema). */
+/*
+ * 095/T06 (`reference/Janelas.dc.html`): as abas ficam no slot da barra de título (sem coluna
+ * lateral) e o conteúdo é uma página só, com listas separadas por `--divider` (sem caixa dentro de
+ * caixa). Estreita (`data-size="narrow"`), cada aba mostra só o ícone.
+ */
+.nd-settings {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-settings-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.nd-settings-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--muted);
+  font: var(--fw-medium) var(--fs-control) var(--font-sans);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.nd-settings-tabs[data-compact="true"] .nd-settings-tab {
+  padding: 0 var(--sp-2);
+}
+
+.nd-root .nd-settings-tab:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 4px var(--focus-inner);
+}
+
+.nd-settings-tab-label {
+  white-space: nowrap;
+}
+
+.nd-settings-tab-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-pill);
+  background: var(--badge-bg);
+  color: var(--badge-ink);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+
+.nd-settings-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-5) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-settings[data-size="narrow"] .nd-settings-panel {
+  padding: var(--sp-2) var(--sp-3) var(--sp-4);
+}
+
+.nd-settings-panel:focus {
+  outline: none;
+}
+
+.nd-settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+/* O que falta na aba: faixa âmbar sem contorno (como a do Plano). */
+.nd-settings-missing {
+  margin: 0;
+  border: 0;
+  background: var(--pill-amber-bg);
+}
+
+/* Formulário de nova conexão ou edição: abaixo da lista, separado por divisória, sem caixa. */
+.nd-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--divider);
+}
+
+/* --- Conexões: lista (ponto, nome, detalhe `--muted`, "usada por" e o menu "…") --- */
+.nd-conn-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.nd-conn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-conn-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--sp-3);
+  min-height: 44px;
+  min-width: 0;
+}
+
+.nd-conn-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-conn-name {
+  font-weight: var(--fw-medium);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.nd-conn-detail {
+  font-size: var(--fs-label);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-conn-usage {
+  font-size: var(--fs-label);
+  color: var(--ink3);
+  white-space: nowrap;
+}
+
+/* Estreita: "usada por" desce para baixo do detalhe (nada rola na horizontal). */
+.nd-settings[data-size="narrow"] .nd-conn-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.nd-settings[data-size="narrow"] .nd-conn-usage {
+  grid-column: 2;
+  grid-row: 2;
+  white-space: normal;
+}
+
+.nd-conn-note {
+  margin: 0;
+  padding-left: calc(var(--sp-2) + var(--sp-3));
+}
+
+.nd-self-start {
+  align-self: flex-start;
+}
+
+.nd-grow {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+/* --- Preços --- */
+.nd-price-list,
+.nd-prereq-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Um modelo (ou pré-requisito) por linha, com divisória entre eles: sem cartão contornado. */
+.nd-price-card,
+.nd-prereq {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-price-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+  gap: var(--sp-2);
+}
+
+.nd-price-add {
+  align-items: flex-end;
+}
+
+/* Pílula de estado (095/T02, decisão 9): fundo neutro; o tom só no rótulo. */
+.nd-chip-static {
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--pill-muted-ink);
+  font-size: var(--fs-caption);
+}
+
+.nd-chip-static[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-chip-static[data-tone="violet"] {
+  color: var(--pill-violet-ink);
+}
+
+/* Campo com unidade: um anel só, no contêiner (`:focus-within`); o campo dentro não tem contorno. */
+.nd-affix {
+  display: flex;
+  align-items: center;
+  height: 34px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--control-edge);
+  background: var(--card);
+}
+
+.nd-affix input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--sp-1) 0 var(--sp-2);
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fs-body) var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+
+.nd-root .nd-affix input:focus,
+.nd-root .nd-affix input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.nd-root .nd-affix:focus-within {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.nd-affix-unit {
+  padding: 0 var(--sp-2) 0 var(--sp-1);
+  font-size: var(--fs-caption);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* --- Máquina --- */
+.nd-prereq-mark {
+  display: inline-flex;
+  color: var(--danger-ink);
+}
+
+.nd-prereq-mark[data-ok="true"] {
+  color: var(--pill-green-ink);
+}
+
+.nd-settings-appearance {
+  max-width: 520px;
+}
+
+/*
+ * Acesso pela rede (spec 097), abaixo da Máquina: separada por divisória, sem caixa. O script do
+ * WSL fica num bloco recolhido, em fundo `--lane` (como os comandos), rolando na horizontal.
+ */
+.nd-settings-network {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-settings-network > p {
+  margin: 0;
+}
+
+.nd-settings-wsl-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-settings-wsl-body > p {
+  margin: 0;
+}
+
+.nd-settings-script {
+  margin: 0;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}

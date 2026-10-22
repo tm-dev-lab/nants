@@ -1,0 +1,1036 @@
+/*
+ * Estilos do shell (spec 093, T05): barra superior (marca, espaços, Layout, pílula, chips, sino),
+ * camada de sobreposição (menus, lançador, diálogos, avisos), formulários dos Primeiros passos e
+ * boas-vindas. Só variáveis de `tokens.ts`: nenhuma cor literal (checagem em `checks.test.ts`).
+ */
+
+/* --- Camada de sobreposição --- */
+.nd-overlay-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 960;
+}
+
+.nd-overlay-layer > * {
+  pointer-events: auto;
+}
+
+/* --- Barra superior --- */
+.nd-topbar-content {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+  min-width: 0;
+}
+
+.nd-topbar-center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+/* Marca (095/T02, `reference/Main.dc.html`): o símbolo real do Nants, o nome (14/600) e o slogan. */
+.nd-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) 0 0;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+/* Duas linhas no total: o nome em cima e o slogan inteiro embaixo, centradas na barra (44 px). */
+.nd-brand-text {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-self: center;
+  gap: 0;
+  min-width: 0;
+}
+
+.nd-brand-name {
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-body);
+  line-height: 16px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.nd-brand-slogan {
+  font-size: var(--fs-caption);
+  line-height: 13px;
+  color: var(--muted);
+  /* Uma linha só: nunca quebra; onde não cabe, some (regra abaixo). */
+  white-space: nowrap;
+}
+
+/* Estreita: o slogan some primeiro (nenhum controle da barra some antes dele). */
+@media (max-width: 1365px) {
+  .nd-brand-slogan {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+}
+
+/*
+ * Interruptores da barra (YOLO e Internet): botões neutros do conjunto único. Ligado, a cor
+ * aparece SÓ no indicador pequeno (o pino do `.nd-switch`), nunca no botão inteiro (decisão 9).
+ */
+.nd-toggle {
+  flex-shrink: 0;
+  font-weight: var(--fw-medium);
+}
+
+.nd-bar-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.nd-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  flex-shrink: 0;
+  background: var(--icon-muted);
+}
+
+.nd-dot[data-tone="violet"] {
+  background: var(--icon-violet);
+}
+.nd-dot[data-tone="cyan"] {
+  background: var(--icon-cyan);
+}
+.nd-dot[data-tone="amber"] {
+  background: var(--icon-amber);
+}
+.nd-dot[data-tone="green"] {
+  background: var(--icon-green);
+}
+.nd-dot[data-tone="rose"] {
+  background: var(--icon-rose);
+}
+
+/* Ponto pequeno da pílula e dos seletores (como o do mockup, 7 px). */
+.nd-dot-sm {
+  width: 7px;
+  height: 7px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nd-dot[data-pulse="true"] {
+    animation: nd-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes nd-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.nd-menu-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-menu-hint {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/*
+ * Pílula de execução (095/T02, decisão 9): fundo NEUTRO de controle sobre o titânio da barra; a
+ * cor da fase fica só no ponto e no rótulo curto (`.nd-run-phase`). Sem borda nem material próprio.
+ */
+.nd-run-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 30px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0 var(--sp-1) 0 var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--control);
+  color: var(--ink);
+  font-size: var(--fs-control);
+}
+
+.nd-run-pill[data-tone="violet"] .nd-run-phase {
+  color: var(--pill-violet-ink);
+}
+.nd-run-pill[data-tone="cyan"] .nd-run-phase {
+  color: var(--pill-cyan-ink);
+}
+.nd-run-pill[data-tone="amber"] .nd-run-phase {
+  color: var(--pill-amber-ink);
+}
+.nd-run-pill[data-tone="green"] .nd-run-phase {
+  color: var(--pill-green-ink);
+}
+.nd-run-pill[data-tone="rose"] .nd-run-phase {
+  color: var(--pill-rose-ink);
+}
+
+/*
+ * Destaque ao integrar: por alguns segundos, um halo na cor da fase em volta do PONTO (095/T07,
+ * A-01). A pílula em si nunca ganha contorno: a cor fica só no ponto e no rótulo da fase.
+ */
+.nd-run-pill[data-flash="true"] .nd-dot {
+  box-shadow: var(--ring-flash);
+}
+
+.nd-run-phase {
+  font-weight: var(--fw-semibold);
+  white-space: nowrap;
+}
+
+/*
+ * Encaixe do título (095/T07, A-01): uma linha só (`height` de uma linha e `overflow: hidden`) que
+ * quebra. O `::before` de largura zero ocupa a primeira linha; o título tem base e mínimo de 12
+ * caracteres, então, quando não cabem 12, ele desce para a segunda linha, que fica escondida.
+ * Assim nunca aparece uma letra só com reticências; o título continua no DOM, na dica e no rótulo.
+ */
+.nd-run-title-slot {
+  display: flex;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 20px;
+  line-height: 20px;
+  overflow: hidden;
+}
+
+.nd-run-title-slot::before {
+  content: "";
+  width: 0;
+  height: 20px;
+}
+
+.nd-run-title {
+  flex: 1 1 12ch;
+  min-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+.nd-run-details {
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/*
+ * Ação principal desabilitada: tokens de controle desabilitado (texto `--muted` sobre
+ * `--surface2`, ≥ 3:1 nos dois temas, conferido no teste de contraste), sem opacidade por cima.
+ * O roxo-escuro sobre roxo esmaecido era quase ilegível. Especificidade 0,4,0: vence o
+ * desabilitado comum (`--o-disabled`, em desktop.css).
+ */
+.nd-root .nd-btn[data-variant="primary"]:disabled {
+  background: var(--control);
+  color: var(--muted);
+  opacity: 1;
+}
+
+/*
+ * Trilho do interruptor: neutro (borda `--control-edge`, pino `--muted`). Ligado, só o pino ganha
+ * o tom do interruptor (`data-tone` no botão: âmbar no YOLO, violeta na Internet).
+ */
+.nd-switch {
+  position: relative;
+  width: 24px;
+  height: 14px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--control-edge);
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.nd-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--muted);
+}
+
+.nd-switch[data-on="true"]::after {
+  left: 12px;
+  background: var(--ink);
+}
+
+.nd-toggle[data-tone="amber"] .nd-switch[data-on="true"]::after {
+  background: var(--icon-amber);
+}
+
+.nd-toggle[data-tone="violet"] .nd-switch[data-on="true"]::after {
+  background: var(--icon-violet);
+}
+
+/* Selo "Setup incompleto": botão neutro; o âmbar fica só no ícone de alerta. */
+.nd-setup-badge .nd-icon-warn {
+  color: var(--icon-amber);
+}
+
+.nd-bell {
+  position: relative;
+}
+
+/* --- Avisos sob a barra e aviso flutuante --- */
+.nd-bar-alert,
+.nd-bar-note {
+  position: absolute;
+  left: 50%;
+  top: 52px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: min(640px, calc(100% - 32px));
+  /* Os botões encostam no padding: `--r-lg` − `--sp-1` = `--r-md`, o raio deles. */
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-3);
+  border-radius: var(--r-lg);
+  font-size: var(--fs-body);
+  color: var(--ink);
+  box-shadow: var(--bevel), var(--elev-3);
+  z-index: 970;
+}
+
+.nd-bar-note {
+  top: 96px;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+/* Botão encostado no padding do aviso: `--r-lg` − `--sp-1` = `--r-md` (concêntrico, decisão 9). */
+.nd-toast .nd-btn {
+  border-radius: var(--r-md);
+}
+
+.nd-bar-alert-icon {
+  color: var(--danger-ink);
+  flex-shrink: 0;
+}
+
+.nd-bar-alert-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.nd-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 104px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-4);
+  border-radius: var(--r-lg);
+  font-size: var(--fs-body);
+  color: var(--ink);
+  box-shadow: var(--bevel), var(--elev-3);
+  z-index: 990;
+}
+
+/*
+ * Aviso com título (095/T03, "App no ar", `App.dc.html`): cartão com ícone de confirmação,
+ * título em 600 e a frase em `--muted`. A entrada sobe e aparece; sob `prefers-reduced-motion`,
+ * só aparece (fade, C-15).
+ */
+.nd-toast[data-titled="true"] {
+  align-items: flex-start;
+  gap: var(--sp-3);
+  width: min(360px, calc(100% - 32px));
+  box-sizing: border-box;
+  padding: var(--sp-3) var(--sp-2) var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  font-size: var(--fs-control);
+}
+
+.nd-toast-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--icon-green);
+}
+
+.nd-toast-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-toast-title {
+  font-weight: var(--fw-semibold);
+}
+
+.nd-toast-body {
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nd-toast[data-titled="true"] {
+    animation: nd-toast-rise 220ms ease-out;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-toast[data-titled="true"] {
+    animation: nd-toast-fade 160ms linear;
+  }
+}
+
+@keyframes nd-toast-rise {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes nd-toast-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+/* --- Diálogos --- */
+/* Véu das sobreposições modais (094/T08, V-01): `--scrim` por tema. */
+.nd-dialog-backdrop,
+.nd-launcher-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--scrim);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: calc(var(--sp-12) + var(--sp-12));
+  z-index: 980;
+}
+
+.nd-dialog {
+  max-height: calc(100% - 140px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-5);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--elev-4);
+  color: var(--ink);
+}
+
+.nd-dialog-text {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.55;
+  color: var(--ink2);
+}
+
+.nd-dialog-text p {
+  margin: 0 0 8px;
+}
+
+.nd-dialog-text ul {
+  margin: 0 0 8px;
+  padding-left: var(--sp-5);
+}
+
+.nd-dialog-warning,
+.nd-field-warn {
+  color: var(--pill-amber-ink);
+  font-size: var(--fs-label);
+  margin: 0;
+}
+
+.nd-dialog-error,
+.nd-field-error {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--danger-ink);
+}
+
+.nd-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/*
+ * --- Lançador ---
+ * Sobreposição sólida (`.nd-overlay`) e sem borda (C-16), sobre o véu `--scrim`: nada da janela de
+ * trás aparece. Como a busca do mockup (`reference/Janelas.dc.html`, 095/T02): raio 16 (`--r-xl`),
+ * campo de 56 px sem borda com texto de 17 px (`--fs-heading`) e uma divisória embaixo, resultados
+ * em linhas de 44 px (nome à esquerda, contexto à direita) numa lista com padding de 8 px.
+ */
+.nd-launcher {
+  width: min(640px, calc(100% - 32px));
+  max-height: min(480px, calc(100% - 140px));
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-xl);
+  box-shadow: var(--bevel), var(--elev-4);
+}
+
+.nd-launcher-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 56px;
+  flex-shrink: 0;
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-xl) var(--r-xl) 0 0;
+  border-bottom: 1px solid var(--divider);
+  color: var(--muted);
+}
+
+.nd-launcher-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fw-regular) var(--fs-heading) var(--font-sans);
+  letter-spacing: var(--ls-tight);
+  outline: none;
+}
+
+/*
+ * Campo do lançador sem contorno nenhum (095/T07, A-02; pedido do usuário: sem borda roxa): o
+ * lançador é modal e só tem esse campo de texto; o cursor piscando e o próprio painel já mostram
+ * onde está o foco. Vence `.nd-root :focus-visible` (especificidade 0,3,1).
+ */
+.nd-root .nd-launcher-search input:focus,
+.nd-root .nd-launcher-search input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.nd-launcher-list {
+  overflow: auto;
+  min-height: 0;
+  padding: var(--sp-2);
+}
+
+.nd-launcher-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 44px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-md);
+  font-size: var(--fs-body);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+/* Contexto à direita da linha ("Abrir janela", "Configurações", o atalho). */
+.nd-launcher-item .nd-menu-hint {
+  font-size: var(--fs-label);
+}
+
+.nd-launcher-empty {
+  margin: 8px 12px;
+  font-size: var(--fs-body);
+  color: var(--muted);
+}
+
+/* --- Formulários --- */
+.nd-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.nd-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-field-label {
+  font-size: var(--fs-label);
+  color: var(--ink3);
+}
+
+.nd-field-hint {
+  margin: 0;
+  font-size: var(--fs-label);
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.nd-input {
+  height: 34px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  border: 1px solid var(--control-edge);
+  background: var(--card);
+  color: var(--ink);
+  font: var(--fs-body) var(--font-sans);
+  min-width: 0;
+}
+
+.nd-input.nd-mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+}
+
+.nd-input:disabled {
+  opacity: var(--o-disabled);
+}
+
+.nd-fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-radio-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: var(--sp-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nd-radio-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line2);
+  cursor: pointer;
+}
+
+.nd-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.nd-row-between {
+  justify-content: space-between;
+}
+
+.nd-strong {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-body);
+  color: var(--ink);
+}
+
+.nd-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-link {
+  border: 0;
+  background: transparent;
+  color: var(--ink2);
+  font: var(--fw-medium) var(--fs-control) var(--font-sans);
+  cursor: pointer;
+  padding: var(--sp-1) var(--sp-1);
+  border-radius: var(--r-sm);
+  min-height: 24px;
+}
+
+.nd-disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  align-self: flex-start;
+}
+
+.nd-advanced,
+.nd-folder-browser {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-folder-browser {
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line2);
+}
+
+.nd-callout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  border: 1px solid var(--pill-amber-edge);
+  background: var(--pill-amber-bg);
+  color: var(--ink);
+  font-size: var(--fs-body);
+}
+
+.nd-callout p {
+  margin: 0;
+}
+
+.nd-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-label);
+}
+
+.nd-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--muted);
+}
+
+.nd-folder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.nd-folder-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 30px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink2);
+  font-size: var(--fs-label);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-tag {
+  margin-left: auto;
+  font-size: var(--fs-caption);
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--pill-green-ink);
+}
+
+.nd-muted {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+/*
+ * Agentes (Configurações e Primeiros passos) e o que falta na máquina: uma linha por item com
+ * `--divider` entre elas, sem cartão contornado (095/T06, sem caixa dentro de caixa). Cada papel
+ * põe os campos lado a lado quando cabe e empilha na janela estreita.
+ */
+.nd-role-grid {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.nd-role-card {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  align-items: start;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-role-card > .nd-role-title,
+.nd-role-card > [role="alert"] {
+  grid-column: 1 / -1;
+}
+
+.nd-missing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--ink3);
+}
+
+.nd-facts dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-test-result,
+.nd-ok {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+.nd-ok,
+.nd-test-result[data-ok="true"] {
+  color: var(--pill-green-ink);
+}
+
+.nd-test-result[data-ok="false"] {
+  color: var(--danger-ink);
+}
+
+.nd-role-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-role-title[data-tone="violet"] {
+  color: var(--pill-violet-ink);
+}
+.nd-role-title[data-tone="cyan"] {
+  color: var(--pill-cyan-ink);
+}
+.nd-role-title[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-segment {
+  display: inline-flex;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border-radius: var(--r-md);
+  align-self: flex-start;
+}
+
+.nd-segment-item {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-xs);
+  font-size: var(--fs-label);
+  color: var(--ink3);
+  cursor: pointer;
+}
+
+.nd-segment-item:focus-within {
+  outline: 2px solid var(--focus-outer);
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.nd-combo {
+  position: relative;
+}
+
+.nd-combo .nd-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.nd-combo-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 10;
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding: var(--sp-1);
+  list-style: none;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--elev-3);
+}
+
+.nd-combo-list li {
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-xs);
+  font: var(--fs-control) var(--font-sans);
+  color: var(--ink2);
+  cursor: pointer;
+}
+
+/* --- Primeiros passos --- */
+.nd-setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4);
+  min-height: 100%;
+  box-sizing: border-box;
+}
+
+.nd-steps ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nd-step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 30px;
+  padding: 0 var(--sp-3) 0 var(--sp-2);
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink3);
+  font: var(--fw-medium) var(--fs-label) var(--font-sans);
+  cursor: pointer;
+}
+
+.nd-step-mark {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--r-pill);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--control-edge);
+  font-size: var(--fs-caption);
+}
+
+.nd-step[data-done="true"] .nd-step-mark {
+  border-color: var(--pill-green-edge);
+  background: var(--pill-green-bg);
+  color: var(--pill-green-ink);
+}
+
+.nd-setup-body,
+.nd-setup-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-setup-title {
+  margin: 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-setup-loading {
+  margin: 0;
+  padding: var(--sp-6);
+  font-size: var(--fs-body);
+  color: var(--muted);
+}
+
+.nd-missing-list {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Comando ou caminho em linha: fundo `--lane`, sem contorno (095/T06). */
+.nd-code {
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--lane);
+  color: var(--ink);
+  font-size: var(--fs-label);
+  overflow-wrap: anywhere;
+}
+
+/* --- Boas-vindas --- */
+.nd-welcome {
+  width: min(520px, calc(100% - 32px));
+}
+
+.nd-welcome-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.nd-welcome-slogan {
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-medium);
+  color: var(--ink2);
+}
+
+.nd-welcome-product {
+  color: var(--muted);
+}
+
+.nd-welcome-projects ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 200px;
+  overflow: auto;
+}
+
+/* --- Foco duplo nos controles novos (especificidade 0,3,0, como em desktop.css) --- */
+.nd-root .nd-pill-btn:focus-visible,
+.nd-root .nd-step:focus-visible,
+.nd-root .nd-link:focus-visible,
+.nd-root .nd-folder-item:focus-visible,
+.nd-root .nd-input:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}

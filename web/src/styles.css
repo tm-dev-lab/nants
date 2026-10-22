@@ -1,0 +1,40 @@
+/*
+ * Base da página: o Tailwind (reset e utilitários como `sr-only`) e as famílias das fontes locais
+ * (@fontsource, importadas em main.tsx; nada vem de CDN). Cores, superfícies, material e
+ * papéis de parede ficam nos tokens (`desktop/theme/tokens.ts`) e nos estilos do desktop
+ * (`desktop/theme/*.css`) e das janelas (`apps/**`).
+ */
+@import "tailwindcss";
+/* A saída de build (web/dist) não é fonte de classes: excluí-la torna o CSS independente do dist anterior. */
+@source not "../dist";
+
+@theme {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* A página inteira é o desktop: `html`, `body` e `#root` ocupam a viewport, e o `.nd-root`
+   (altura 100%; no celular, `--app-height`) herda essa altura. Sem isso tudo fica com 0 px. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+html,
+body {
+  /* Cores do sistema (o `color-scheme` do index.html) até o desktop pintar o papel de parede. */
+  background-color: Canvas;
+  color: CanvasText;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  min-height: 100%;
+}
+
+/* Aba oculta (classe posta por pageVisibility.ts): nada anima em segundo plano. */
+html.page-hidden *,
+html.page-hidden *::before,
+html.page-hidden *::after {
+  animation-play-state: paused !important;
+}

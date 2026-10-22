@@ -1,0 +1,371 @@
+/* Janela Arquivos (spec 093, T08; enxuta na 095/T06): só tokens (variáveis do tema). */
+.nd-files {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-label);
+  color: var(--ink2);
+}
+
+/*
+ * Ferramentas (095/T06): a fonte e "Atualizar" no slot da barra de título, numa linha que nunca
+ * quebra (o texto longo da fonte encurta com reticências). Fora de uma janela (montada sozinha),
+ * a mesma linha fica no topo, separada por `--divider`.
+ */
+.nd-files-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-files > .nd-files-toolbar {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.nd-files-segment {
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.nd-files-reason {
+  font-size: var(--fs-label);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.nd-segment-btn {
+  min-height: 24px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--ink3);
+  font: var(--fs-label) var(--font-sans);
+  cursor: pointer;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-root .nd-segment-btn:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.nd-files .nd-strip[data-tone="amber"],
+.nd-file-viewer .nd-strip[data-tone="amber"] {
+  border-color: var(--pill-amber-edge);
+  background: var(--pill-amber-bg);
+}
+
+.nd-files-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-files-body[data-arrangement="split"] {
+  flex-direction: row;
+}
+
+.nd-files-tree {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-files-tree[data-split="true"] {
+  flex-grow: 0;
+  flex-shrink: 0;
+}
+
+.nd-files-tools {
+  padding: var(--sp-2) var(--sp-3);
+  flex-shrink: 0;
+}
+
+.nd-files-tree-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Divisória: 10 px de área útil, com a linha no meio. */
+.nd-files-handle {
+  flex: 0 0 10px;
+  cursor: col-resize;
+  touch-action: none;
+  position: relative;
+  background: transparent;
+}
+
+.nd-files-handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: var(--divider);
+}
+
+.nd-files-handle:hover::before {
+  width: 2px;
+  background: var(--accent);
+}
+
+.nd-root .nd-files-handle:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--focus-inner);
+}
+
+.nd-files-view {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-files-back {
+  padding: var(--sp-2) var(--sp-3);
+  flex-shrink: 0;
+}
+
+/* --- Árvore --- */
+.nd-tree {
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.nd-tree-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 26px;
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) calc(var(--sp-2) + var(--nd-level, 0) * var(--sp-4));
+  border-radius: var(--r-sm);
+  color: var(--ink2);
+  cursor: pointer;
+}
+
+.nd-tree-item[aria-disabled="true"] {
+  cursor: default;
+}
+
+.nd-root .nd-tree-item:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 4px var(--focus-inner);
+}
+
+.nd-tree-chevron {
+  flex-shrink: 0;
+  transition: transform 120ms ease;
+}
+
+.nd-tree-item[aria-expanded="true"] .nd-tree-chevron {
+  transform: rotate(90deg);
+}
+
+.nd-tree-spacer {
+  display: inline-block;
+  width: 12px;
+  flex-shrink: 0;
+}
+
+.nd-tree-icon {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.nd-tree-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-tree-tag {
+  flex-shrink: 0;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface2);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+}
+
+.nd-tree-changed {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.nd-tree-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--icon-amber);
+}
+
+.nd-tree-note {
+  margin: 0;
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) calc(var(--sp-2) + var(--sp-5) + var(--nd-level, 0) * var(--sp-4));
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-file-note {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+/* --- Visualizador --- */
+.nd-file-viewer {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-file-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.nd-file-path-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-file-path {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+  font-size: var(--fs-caption);
+  color: var(--ink);
+}
+
+.nd-file-dir {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink3);
+}
+
+.nd-file-name {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.nd-file-actions {
+  gap: var(--sp-2);
+}
+
+.nd-file-masked {
+  margin: var(--sp-2) var(--sp-3) 0;
+}
+
+.nd-file-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.nd-code-host {
+  position: absolute;
+  inset: 0;
+}
+
+.nd-file-code,
+.nd-file-diff {
+  margin: 0;
+  padding: var(--sp-2) 0;
+  font-size: var(--fs-caption);
+  line-height: 1.25rem;
+  color: var(--ink);
+}
+
+.nd-code-line {
+  display: flex;
+}
+
+.nd-code-gutter {
+  width: 48px;
+  flex-shrink: 0;
+  padding-right: var(--sp-3);
+  text-align: right;
+  color: var(--muted);
+  user-select: none;
+  box-sizing: border-box;
+}
+
+.nd-code-text {
+  flex: 1;
+  min-width: 0;
+  padding-right: var(--sp-3);
+  white-space: pre;
+}
+
+.nd-file-code[data-wrap="true"] .nd-code-text,
+.nd-file-diff[data-wrap="true"] .nd-diff-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-diff-line {
+  display: block;
+  padding: 0 var(--sp-3);
+  white-space: pre;
+}
+
+.nd-diff-line[data-diff="head"] {
+  color: var(--muted);
+}
+
+.nd-diff-line[data-diff="hunk"] {
+  color: var(--pill-cyan-ink);
+}
+
+.nd-diff-line[data-diff="add"] {
+  background: var(--pill-green-bg);
+  color: var(--pill-green-ink);
+}
+
+.nd-diff-line[data-diff="del"] {
+  background: var(--danger-soft);
+  color: var(--danger-ink);
+}
+
+/*
+ * Sem arquivo aberto (094/T08, A-07): o lado do visualizador mostra uma orientação discreta,
+ * separada da árvore por um hairline.
+ */
+.nd-files-placeholder {
+  border-left: 1px solid var(--divider);
+}

@@ -1,0 +1,1102 @@
+/*
+ * Estilos do desktop (spec 093, decisões 4, 9 e 13). Só variáveis de `tokens.ts` (aplicadas na
+ * raiz `.nd-root` pelo CSSOM): nenhuma cor literal aqui (checagem em `checks.test.ts`).
+ *
+ * Material "titânio com reflexo" (spec 095, T01): `.nd-chrome` pinta `--chrome` (base opaca com
+ * faixa de luz, ponto de brilho e faixa diagonal, só gradientes) com o bisel `--bevel` (borda de
+ * luz no topo `--hi` e linha da base `--lo`). Vai na barra superior, nas barras de título, no
+ * dock e nos controles segmentados; menus, popovers e avisos são `.nd-overlay`. Sem vidro nem `backdrop-filter`:
+ * tudo é opaco. Janelas, barras e dock não têm `border`: a sombra e o contraste da superfície
+ * separam; no contraste alto entra um `outline` com `--edge-strong`.
+ *
+ * Escala de acabamento (spec 094, T06): raios `--r-*`, espaços `--sp-*`, fontes `--fs-*`/`--fw-*`
+ * e elevação `--elev-1..4`, todos de `tokens.ts`. Nada de valor solto (checagem em
+ * `checks.test.ts`). Os estados dos controles ficam num bloco único perto do fim do arquivo.
+ */
+
+.nd-root {
+  /* Medidas fixas (as mesmas de `metrics.ts`): a área de trabalho desconta a barra e o dock. */
+  --topbar-h: 44px;
+  --titlebar-h: 44px;
+  --dock-h: 60px;
+  --dock-gap: 12px;
+  position: relative;
+  width: 100%;
+  /* Altura real da viewport: o dock nunca fica abaixo da borda visível. */
+  height: 100%;
+  height: 100dvh;
+  height: var(--app-height, 100dvh);
+  overflow: hidden;
+  /* `clip` não deixa o foco ou um `scrollIntoView` rolar a raiz (o dock sairia do lugar). */
+  overflow: clip;
+  font-family: var(--font-sans);
+  /* Escala da 095/T02 (C-09): corpo de 14 px, entrelinha 1.55 e o espaçamento levemente negativo do mockup. */
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  letter-spacing: var(--ls-tight);
+  color: var(--ink);
+  background-color: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+.nd-root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+.nd-root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/*
+ * Monoespaçada SÓ nas categorias da C-08 (095/T02): id de tarefa, código (em linha e bloco),
+ * console e registro, caminhos de arquivo e hashes de commit. `<kbd>`, endereço, custos, horas e
+ * metadados são sem serifa. Lista fechada de seletores e de arquivos com `nd-mono` em
+ * `typography.test.ts`.
+ */
+.nd-mono {
+  font-family: var(--font-mono);
+}
+
+/*
+ * O 700 saiu do uso (C-15): o negrito padrão do navegador (`<strong>`, `<b>`, títulos, cabeçalho de
+ * tabela) vira o 600 da escala, o mais forte da Inter importada (sem negrito sintético). Especificidade
+ * 0,0,1: qualquer regra de componente com classe ainda decide o próprio peso.
+ */
+:where(.nd-root) b,
+:where(.nd-root) strong,
+:where(.nd-root) th,
+:where(.nd-root) h1,
+:where(.nd-root) h2,
+:where(.nd-root) h3,
+:where(.nd-root) h4,
+:where(.nd-root) h5,
+:where(.nd-root) h6 {
+  font-weight: var(--fw-semibold);
+}
+
+/* Números alinhados (custos, tokens, contagens) sem trocar de família (C-08). */
+.nd-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Barras de rolagem finas, com a cor da linha dos tokens (acompanham o tema). */
+.nd-root,
+.nd-root * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line2) transparent;
+}
+
+.nd-wallpaper {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.nd-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- Foco duplo (claro + escuro), sempre visível --- */
+.nd-root :focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+/*
+ * --- Material: titânio com reflexo (095/T01) ---
+ * Só na barra superior, nas barras de título, no dock (e nas abas do celular) e nos segmentados.
+ * Opaco: nada da janela de trás aparece através dele.
+ * Sobre o titânio o conteúdo usa as cores do cromo (C-01): texto `--chrome-ink`, secundário e borda
+ * de controle `--chrome-muted`, ícones `--chrome-icon-*` e seleção no tom violeta do cromo. O reflexo
+ * fica como no mockup; quem se ajusta ao contraste é o conteúdo. Essas cores têm mais contraste que
+ * as das janelas também nas superfícies das janelas, então valem para todo filho.
+ */
+.nd-chrome {
+  --control: var(--chrome-control);
+  --ink: var(--chrome-ink);
+  --ink2: var(--chrome-ink);
+  --ink3: var(--chrome-ink);
+  --muted: var(--chrome-muted);
+  --control-edge: var(--chrome-muted);
+  --icon-violet: var(--chrome-icon-violet);
+  --icon-cyan: var(--chrome-icon-cyan);
+  --icon-amber: var(--chrome-icon-amber);
+  --icon-green: var(--chrome-icon-green);
+  --icon-rose: var(--chrome-icon-rose);
+  --icon-muted: var(--chrome-icon-muted);
+  --selected-edge: var(--chrome-ink);
+  --pill-violet-ink: var(--chrome-pill-violet-ink);
+  --pill-cyan-ink: var(--chrome-pill-cyan-ink);
+  --pill-amber-ink: var(--chrome-pill-amber-ink);
+  --pill-green-ink: var(--chrome-pill-green-ink);
+  --pill-rose-ink: var(--chrome-pill-rose-ink);
+  --pill-muted-ink: var(--chrome-pill-muted-ink);
+  /* Um só tom de perigo também sobre o cromo (A-15): o da pílula rosa. */
+  --danger-ink: var(--chrome-pill-rose-ink);
+  background: var(--chrome);
+  box-shadow: var(--bevel);
+}
+
+/*
+ * --- Sobreposições (095/T01, decisão do Arquiteto na revisão 1) ---
+ * Menus, popovers, sino, folha de atalhos, Personalizar, lançador, avisos, toasts e dicas: superfície
+ * sólida elevada (`--overlay`, como a busca e o aviso do mockup), sem titânio. A borda de luz no topo
+ * é o `--overlay-edge`, que dentro delas vale como `--bevel` (as regras dos componentes já declaram
+ * `var(--bevel), var(--elev-3)`). Valem os tokens normais (`--ink`, `--muted`, `--icon-*`, estados).
+ */
+.nd-overlay {
+  --bevel: var(--overlay-edge);
+  background: var(--overlay);
+}
+
+/* --- Barra superior --- */
+.nd-topbar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+  z-index: 900;
+}
+
+.nd-topbar-slot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+  min-width: 0;
+}
+
+/* --- Área de trabalho e janelas --- */
+.nd-workarea {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: var(--topbar-h);
+  /* O dock inteiro e as duas folgas ficam fora da área de trabalho. */
+  bottom: calc(var(--dock-h) + 2 * var(--dock-gap));
+  /* Contexto de empilhamento próprio: o `z` das janelas nunca passa da barra, do dock e dos popovers. */
+  z-index: 1;
+  isolation: isolate;
+}
+
+.nd-root[data-gesture="true"] iframe {
+  pointer-events: none;
+}
+
+.nd-window {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  box-shadow: var(--elev-2);
+  transform-origin: 0 0;
+}
+
+/*
+ * Moldura (095/T01, decisão 2): SEM borda. A janela se separa do fundo pela sombra de dois níveis
+ * (atrás `--elev-2`, em foco `--elev-4`) e pelo contraste da superfície (`--surface` sobre o papel
+ * de parede); o realce `--hi` vem do bisel da barra de título, colado no topo. Nunca a cor de
+ * destaque: o contorno da janela não é indicador de foco (o foco do teclado é o anel duplo).
+ */
+.nd-window[data-active="true"] {
+  box-shadow: var(--elev-4);
+}
+
+/* A barra de título é titânio; o `--lo` do bisel é a linha que a separa do conteúdo. */
+.nd-titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--titlebar-h);
+  padding: 0 var(--sp-2) 0 var(--sp-4);
+  cursor: grab;
+  user-select: none;
+  flex-shrink: 0;
+  touch-action: none;
+}
+
+.nd-window[data-mode="maximized"] .nd-titlebar {
+  cursor: default;
+}
+
+/* O tom por aplicativo fica SÓ aqui, no ícone pequeno da barra de título (o dock é neutro). */
+.nd-titlebar-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.nd-title {
+  font-size: var(--fs-control);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.nd-subtitle {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Controles da janela: só o ícone (`--muted`); o fundo aparece no hover (camada de estado). */
+.nd-wbtn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: var(--r-md);
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.nd-wbtn:hover {
+  color: var(--ink);
+}
+
+/*
+ * Ferramentas da janela na barra de título (095/T02, C-07): abas (Configurações) e controles do
+ * navegador (App), entre o subtítulo e os controles. O arrasto não começa nelas
+ * (`[data-window-tools]` no seletor sem arrasto) e os atalhos da barra não valem lá dentro. No
+ * celular viram uma linha abaixo da barra, rolável na horizontal (regra em `mobile.css`).
+ */
+.nd-window-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  flex: 0 1 auto;
+  cursor: default;
+}
+
+.nd-window-tools:empty {
+  display: none;
+}
+
+.nd-wbtn[data-variant="close"]:hover {
+  background-color: var(--danger-soft);
+  color: var(--danger-ink);
+}
+
+.nd-content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Regra única: o app que rola sozinho (`scroll: "app"` no registro) tem a barra; a janela, não. */
+.nd-content[data-scroll="app"] {
+  overflow: hidden;
+}
+
+.nd-handle {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+
+.nd-handle[data-handle="e"] {
+  top: var(--titlebar-h);
+  right: 0;
+  cursor: ew-resize;
+}
+
+.nd-handle[data-handle="s"] {
+  left: 0;
+  bottom: 0;
+  cursor: ns-resize;
+}
+
+.nd-handle[data-handle="se"] {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  color: var(--muted);
+}
+
+/* Acima de qualquer janela (os `z` das janelas são compactados abaixo de 10 000). */
+.nd-snap-preview {
+  position: absolute;
+  border-radius: var(--r-lg);
+  background: var(--snap-fill);
+  border: 1px solid var(--snap-edge);
+  pointer-events: none;
+  z-index: 19000;
+}
+
+.nd-menu-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 20000;
+}
+
+.nd-menu-layer > * {
+  pointer-events: auto;
+}
+
+/* --- Estado vazio e cartões --- */
+.nd-empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
+  text-align: center;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: 1.55;
+}
+
+.nd-empty-icon {
+  color: var(--muted);
+}
+
+.nd-card {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: var(--r-lg);
+}
+
+.nd-desktop-empty {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(420px, calc(100% - 32px));
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  background: var(--surface);
+  box-shadow: var(--elev-2);
+}
+
+.nd-desktop-empty h2 {
+  margin: 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-desktop-empty p {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.55;
+  color: var(--ink3);
+}
+
+.nd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/*
+ * --- Botões: conjunto único (095/T02, decisão 9) ---
+ * Toda janela, a barra e as sobreposições usam só estas variantes de `.nd-btn` (`data-variant`):
+ * - secundária (sem `data-variant`): fundo neutro de controle (`--control`), texto `--ink`;
+ * - `primary`: violeta sólido, no máximo UMA visível por janela ou vista (a ação principal);
+ * - `ghost`: sem fundo, com fundo só no hover (camada de estado); com `.nd-iconbtn`, só o ícone;
+ * - `danger`: rosa suave, só para Parar e Remover.
+ * Modificadores de tamanho: `.nd-btn-sm`, `.nd-bar-btn` (barra superior) e `.nd-pill-btn` (dentro
+ * da pílula de execução). Teste do conjunto em `buttons.test.tsx`.
+ */
+.nd-btn {
+  height: 32px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-md);
+  border: 0;
+  background: var(--control);
+  color: var(--ink);
+  font: var(--fw-medium) var(--fs-control) var(--font-sans);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nd-btn[data-variant="primary"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-btn[data-variant="ghost"] {
+  background: transparent;
+  color: var(--ink2);
+}
+
+.nd-btn[data-variant="danger"] {
+  background: var(--danger-soft);
+  color: var(--danger-ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-iconbtn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  justify-content: center;
+}
+
+/* Modificadores de tamanho do conjunto único (no mesmo arquivo do `.nd-btn`: a ordem decide). */
+.nd-btn-sm {
+  height: 26px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-label);
+  gap: var(--sp-2);
+}
+
+/* Botões da barra superior (variante secundária ou fantasma do conjunto único), na altura do mockup. */
+.nd-bar-btn {
+  height: 30px;
+  padding: 0 var(--sp-3);
+  min-width: 0;
+}
+
+/*
+ * Busca larga (095/T02, `reference/Main.dc.html`): "Buscar ou pedir" em `--muted` e o atalho em
+ * `<kbd>` sem serifa à direita. No celular (C-16) e onde a barra aperta, só o ícone.
+ */
+.nd-search-btn {
+  flex: 0 1 220px;
+  width: 220px;
+  padding: 0 var(--sp-2) 0 var(--sp-3);
+  color: var(--muted);
+  font-weight: var(--fw-regular);
+}
+
+.nd-search-btn .nd-search-text {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-search-btn[data-compact="true"] {
+  flex: 0 0 auto;
+  width: 30px;
+  padding: 0;
+  justify-content: center;
+}
+
+/*
+ * Botão dentro da pílula (Parar, Retomar): `.nd-btn` do conjunto único, menor. Concêntrico com a
+ * pílula (decisão 9): `--r-lg` − `--sp-1` = `--r-md`.
+ */
+.nd-pill-btn {
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-label);
+  flex-shrink: 0;
+}
+
+/* Atalho de teclado: sem serifa (C-08), legenda em `--muted` sobre o fundo neutro de controle. */
+.nd-root kbd {
+  display: inline-block;
+  font-family: var(--font-sans);
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-medium);
+  line-height: 1.6;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-sm);
+  background: var(--control);
+  color: var(--muted);
+}
+
+/* --- Menus e popovers (sobreposição sólida, `.nd-overlay`) --- */
+.nd-menu,
+.nd-popover {
+  position: absolute;
+  z-index: 950;
+  border-radius: var(--r-lg);
+  padding: var(--sp-1);
+  box-shadow: var(--bevel), var(--elev-3);
+}
+
+.nd-menu {
+  min-width: 240px;
+  max-height: calc(100% - 16px);
+  overflow: auto;
+}
+
+.nd-menu-label {
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  font-size: var(--fs-caption);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-menu-sep {
+  height: 1px;
+  background: var(--line2);
+  margin: 4px 8px;
+}
+
+.nd-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 32px;
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink2);
+  font: var(--fw-medium) var(--fs-control) var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-popover {
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.nd-popover-title {
+  margin: 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-label {
+  font-size: var(--fs-caption);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-2);
+}
+
+.nd-choice-grid[data-columns="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.nd-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--divider);
+  background: var(--card);
+  color: var(--ink2);
+  font: var(--fw-medium) var(--fs-label) var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+}
+
+/* Selecionada: a borda vem do estado comum (`--selected-edge`); o anel fino reforça na miniatura. */
+.nd-choice[aria-pressed="true"] {
+  box-shadow: var(--ring-selected);
+}
+
+.nd-choice-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+}
+
+.nd-choice-check {
+  margin-left: auto;
+  color: var(--icon-violet);
+}
+
+.nd-thumb {
+  display: block;
+  width: 100%;
+  height: 54px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--divider);
+}
+
+/* --- Folha de atalhos --- */
+.nd-sheet {
+  position: absolute;
+  left: 50%;
+  top: 72px;
+  transform: translateX(-50%);
+  width: min(520px, calc(100% - 32px));
+  max-height: calc(100% - 180px);
+  overflow: auto;
+  z-index: 970;
+}
+
+.nd-shortcuts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-2) var(--sp-4);
+  align-items: center;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-shortcuts dt {
+  display: flex;
+  gap: var(--sp-1);
+}
+
+.nd-shortcuts dd {
+  margin: 0;
+}
+
+/* --- Dicas contextuais --- */
+.nd-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 104px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-4);
+  border-radius: var(--r-lg);
+  font-size: var(--fs-body);
+  color: var(--ink);
+  box-shadow: var(--bevel), var(--elev-3);
+  z-index: 990;
+}
+
+/* O botão de dispensar encosta no padding da dica: `--r-lg` − `--sp-1` = `--r-md` (concêntrico). */
+.nd-hint .nd-wbtn {
+  border-radius: var(--r-md);
+}
+
+.nd-hint-icon {
+  color: var(--icon-amber);
+}
+
+/* --- Dock --- */
+.nd-dock {
+  position: absolute;
+  left: 50%;
+  bottom: var(--dock-gap);
+  transform: translateX(-50%);
+  height: var(--dock-h);
+  max-width: calc(100% - 24px);
+  border-radius: var(--r-2xl);
+  padding: 0 var(--sp-2);
+  display: flex;
+  align-items: center;
+  box-shadow: var(--bevel), var(--elev-1);
+  z-index: 960;
+  box-sizing: border-box;
+}
+
+.nd-dock-list {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-dock-item {
+  position: relative;
+}
+
+/*
+ * Ícones do dock NEUTROS (095/T02, decisão 9; `reference/Main.dc.html`): `--ink` com a janela
+ * aberta, `--muted` fechada, sem tom por aplicativo (o tom fica só no ícone da barra de título).
+ * Botão de 44 px (`--dock-h` − 2 × `--sp-2`), ícone de 20 px e o ponto da janela aberta.
+ */
+.nd-dock-btn {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r-lg);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.nd-dock-btn:hover {
+  transform: translateY(-4px);
+}
+
+/* Janela em foco: a "tecla" acesa do mockup (`active`), a camada de pressionado sobre o titânio. */
+.nd-dock-btn[data-state="focused"] {
+  background-color: var(--state-press);
+}
+
+.nd-dock-btn[data-state="open"],
+.nd-dock-btn[data-state="minimized"],
+.nd-dock-btn[data-state="focused"] {
+  color: var(--ink);
+}
+
+.nd-dock-indicator {
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 4px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--ink);
+  box-sizing: border-box;
+}
+
+.nd-dock-indicator[data-indicator="minimized"] {
+  background: transparent;
+  border: 1px solid var(--muted);
+}
+
+.nd-dock-indicator[data-indicator="focused"] {
+  width: 12px;
+}
+
+.nd-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-pill);
+  background: var(--badge-bg);
+  color: var(--badge-ink);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+
+.nd-tip {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-label);
+  color: var(--ink);
+  box-shadow: var(--bevel), var(--elev-3);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+}
+
+.nd-tip-sub {
+  color: var(--muted);
+}
+
+.nd-dock-item:hover .nd-tip,
+.nd-dock-btn:focus-visible + .nd-tip {
+  opacity: 1;
+  visibility: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-dock-btn,
+  .nd-tip {
+    transition: none;
+  }
+
+  .nd-dock-btn:hover {
+    transform: none;
+  }
+}
+
+/*
+ * --- Contraste alto (no fim e com especificidade 0,2,0) ---
+ * O titânio vira sólido (`--surface2`) e janelas, barras, dock e pílula ganham um `outline` com
+ * `--edge-strong` (nunca `border`: a moldura continua sem borda). O anel de foco (0,3,0) vence.
+ */
+@media (prefers-contrast: more) {
+  .nd-root .nd-chrome {
+    background: var(--surface2);
+    box-shadow: none;
+    outline: 1px solid var(--edge-strong);
+    outline-offset: -1px;
+  }
+
+  .nd-root .nd-window,
+  .nd-root .nd-overlay,
+  .nd-root .nd-run-pill {
+    outline: 1px solid var(--edge-strong);
+    outline-offset: -1px;
+  }
+
+  /*
+   * Controles de preenchimento neutro sem borda (095/T02, decisão 9): no contraste alto ganham o
+   * contorno `--edge-strong` (a secundária, a de perigo, as pílulas de estado e o `<kbd>`). A
+   * fantasma (sem fundo) e a primária (violeta sólido) ficam de fora; com foco, vale o anel duplo.
+   */
+  .nd-root .nd-btn:not([data-variant="ghost"]):not([data-variant="primary"]):not(:focus-visible),
+  .nd-root .nd-pill,
+  .nd-root .nd-chip-static,
+  .nd-root kbd {
+    outline: 1px solid var(--edge-strong);
+    outline-offset: -1px;
+  }
+}
+
+/*
+ * --- Estados dos controles (spec 094, T06): o mesmo tratamento em todos ---
+ * - hover: a camada `--state-hover` por cima do fundo do controle (qualquer variante);
+ * - pressionado (`:active`): a camada `--state-press`;
+ * - ativo/selecionado (`aria-pressed`, `aria-selected`, `aria-current`, `data-checked`,
+ *   `data-active`, `data-selected`, `data-open`): fundo `--accent-soft` e texto `--ink`; os
+ *   controles com borda trocam a cor dela por `--selected-edge` (≥ 3:1); os segmentos sobem com o
+ *   bisel do material;
+ * - desabilitado: opacidade `--o-disabled`, sem camada de hover;
+ * - foco: o anel duplo (bloco seguinte).
+ * A camada vai em `background-image`: a cor de fundo de cada variante (perigo, destaque) fica.
+ * Especificidade 0,4,0 (hover/pressionado) e 0,3,0 (selecionado/desabilitado): vence as regras
+ * de componente, que não declaram mais estados próprios.
+ */
+.nd-root .nd-btn:hover:not(:disabled),
+.nd-root .nd-wbtn:hover:not(:disabled),
+.nd-root .nd-menu-item:hover:not(:disabled),
+.nd-root .nd-pill-btn:hover:not(:disabled),
+.nd-root .nd-choice:hover:not(:disabled),
+.nd-root .nd-mobile-tab:hover:not(:disabled),
+.nd-root .nd-switcher-item:hover:not(:disabled),
+.nd-root .nd-launcher-item:hover:not(:disabled),
+.nd-root .nd-radio-card:hover:not(:disabled),
+.nd-root .nd-link:hover:not(:disabled),
+.nd-root .nd-link-btn:hover:not(:disabled),
+.nd-root .nd-disclosure-btn:hover:not(:disabled),
+.nd-root .nd-folder-item:hover:not(:disabled),
+.nd-root .nd-segment-item:hover:not(:disabled),
+.nd-root .nd-combo-list li:hover:not(:disabled),
+.nd-root .nd-step:hover:not(:disabled),
+.nd-root .nd-tab:hover:not(:disabled),
+.nd-root .nd-segment-btn:hover:not(:disabled),
+.nd-root .nd-tree-item:hover:not(:disabled),
+.nd-root .nd-settings-tab:hover:not(:disabled),
+.nd-root .nd-option:hover:not(:disabled),
+.nd-root .nd-board-check:hover:not(:disabled),
+.nd-root .nd-board-card:hover:not(:disabled),
+.nd-root .nd-remove-volumes:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.nd-root .nd-btn:active:not(:disabled),
+.nd-root .nd-wbtn:active:not(:disabled),
+.nd-root .nd-menu-item:active:not(:disabled),
+.nd-root .nd-pill-btn:active:not(:disabled),
+.nd-root .nd-choice:active:not(:disabled),
+.nd-root .nd-mobile-tab:active:not(:disabled),
+.nd-root .nd-switcher-item:active:not(:disabled),
+.nd-root .nd-launcher-item:active:not(:disabled),
+.nd-root .nd-radio-card:active:not(:disabled),
+.nd-root .nd-link:active:not(:disabled),
+.nd-root .nd-link-btn:active:not(:disabled),
+.nd-root .nd-disclosure-btn:active:not(:disabled),
+.nd-root .nd-folder-item:active:not(:disabled),
+.nd-root .nd-segment-item:active:not(:disabled),
+.nd-root .nd-combo-list li:active:not(:disabled),
+.nd-root .nd-step:active:not(:disabled),
+.nd-root .nd-tab:active:not(:disabled),
+.nd-root .nd-segment-btn:active:not(:disabled),
+.nd-root .nd-tree-item:active:not(:disabled),
+.nd-root .nd-settings-tab:active:not(:disabled),
+.nd-root .nd-option:active:not(:disabled),
+.nd-root .nd-board-check:active:not(:disabled),
+.nd-root .nd-board-card:active:not(:disabled),
+.nd-root .nd-remove-volumes:active:not(:disabled) {
+  background-image: linear-gradient(var(--state-press), var(--state-press));
+}
+
+.nd-root .nd-btn[aria-pressed="true"],
+.nd-root .nd-choice[aria-pressed="true"],
+.nd-root .nd-board-item[data-selected="true"],
+.nd-root .nd-segment-btn[aria-pressed="true"],
+.nd-root .nd-tab[aria-selected="true"],
+.nd-root .nd-settings-tab[aria-selected="true"],
+.nd-root .nd-segment-item[data-checked="true"],
+.nd-root .nd-option[data-checked="true"],
+.nd-root .nd-radio-card[data-checked="true"],
+.nd-root .nd-step[aria-current="step"],
+.nd-root .nd-launcher-item[data-active="true"],
+.nd-root .nd-combo-list li[data-active="true"],
+.nd-root .nd-tree-item[data-selected="true"] {
+  background-color: var(--accent-soft);
+  color: var(--ink);
+}
+
+/*
+ * Celular (095/T07, A-09 e pedido do usuário): a aba atual e o item atual do Alternador se marcam
+ * só pelo fundo neutro (pressionado no titânio das abas, `--lane` na lista) e pelo peso do texto;
+ * nada violeta, nem fundo, nem borda.
+ */
+.nd-root .nd-mobile-tab[aria-current="page"] {
+  background-color: var(--state-press);
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-root .nd-switcher-item[aria-current="true"] {
+  background-color: var(--lane);
+  color: var(--ink);
+}
+
+/*
+ * Contraste alto (095/T09, herdado da revisão da T07): o fundo neutro da aba atual e do item atual
+ * do Alternador pode sumir; eles ganham o contorno neutro `--edge-strong` (nunca violeta). Com
+ * foco de teclado, vale o anel de foco.
+ */
+@media (prefers-contrast: more) {
+  .nd-root .nd-mobile-tab[aria-current="page"]:not(:focus-visible),
+  .nd-root .nd-switcher-item[aria-current="true"]:not(:focus-visible) {
+    outline: 1px solid var(--edge-strong);
+    outline-offset: -1px;
+  }
+}
+
+/* Botões-alternância com borda (Diff, Quebra de linha, Ocultos...): a borda marca o ligado (≥ 3:1). */
+.nd-root .nd-btn[aria-pressed="true"]:not([data-variant="ghost"]),
+.nd-root .nd-choice[aria-pressed="true"],
+.nd-root .nd-board-item[data-selected="true"],
+.nd-root .nd-option[data-checked="true"],
+.nd-root .nd-radio-card[data-checked="true"],
+.nd-root .nd-step[aria-current="step"] {
+  border-color: var(--selected-edge);
+}
+
+/* Fora do foco: com foco, o anel duplo (que também é `box-shadow`) fica. */
+.nd-root .nd-segment-item[data-checked="true"]:not(:focus-within),
+.nd-root .nd-segment-btn[aria-pressed="true"]:not(:focus-visible) {
+  box-shadow: var(--bevel);
+}
+
+.nd-root .nd-btn:disabled,
+.nd-root .nd-wbtn:disabled,
+.nd-root .nd-menu-item:disabled,
+.nd-root .nd-pill-btn:disabled,
+.nd-root .nd-mobile-tab:disabled,
+.nd-root .nd-switcher-item:disabled,
+.nd-root .nd-launcher-item:disabled,
+.nd-root .nd-link:disabled,
+.nd-root .nd-link-btn:disabled,
+.nd-root .nd-disclosure-btn:disabled,
+.nd-root .nd-folder-item:disabled,
+.nd-root .nd-step:disabled,
+.nd-root .nd-tab:disabled,
+.nd-root .nd-segment-btn:disabled,
+.nd-root .nd-settings-tab:disabled,
+.nd-root .nd-option:disabled,
+.nd-root .nd-board-card:disabled {
+  opacity: var(--o-disabled);
+  cursor: default;
+  background-image: none;
+}
+
+/* Os ícones do dock ficam sobre o titânio: a camada de estado é o único fundo do botão. */
+.nd-root .nd-dock-btn:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.nd-root .nd-dock-btn:active {
+  background-image: linear-gradient(var(--state-press), var(--state-press));
+}
+
+/*
+ * O botão da janela em foco já tem o fundo `--state-press`: hover e pressionado não empilham outra
+ * camada (o hover dele é a subida do ícone), para o ícone seguir ≥ 3:1 sobre o titânio.
+ */
+.nd-root .nd-dock-btn[data-state="focused"]:hover,
+.nd-root .nd-dock-btn[data-state="focused"]:active {
+  background-image: none;
+}
+
+/*
+ * --- Foco duplo nos componentes com sombra própria (especificidade 0,3,0) ---
+ * `.nd-root :focus-visible` (0,2,0) perderia o anel interno para regras como
+ * `.nd-dock-btn[data-state="focused"]` e `.nd-choice[aria-pressed="true"]` (0,2,0, depois no
+ * arquivo) ou para o material. Aqui o anel duplo volta em todos eles.
+ */
+.nd-root .nd-dock-btn:focus-visible,
+.nd-root .nd-choice:focus-visible,
+.nd-root .nd-chrome:focus-visible,
+.nd-root .nd-btn:focus-visible,
+.nd-root .nd-wbtn:focus-visible,
+.nd-root .nd-menu-item:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+/*
+ * Barra de título (spec 095, decisão 2; pedido do usuário): nenhum contorno colorido na moldura
+ * nem na barra. Com navegação real por teclado, um anel NEUTRO e discreto, só o `--focus-outer`
+ * (neutro, ≥ 3:1 no titânio), DENTRO da barra (ela fica colada no topo de uma janela com
+ * `overflow: hidden`); o bisel do titânio continua. Foco programático (abrir pelo dock ou pelo
+ * lançador, restaurar): `data-quiet-focus` (focus.ts) e nenhum anel.
+ */
+.nd-root .nd-titlebar:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: var(--bevel);
+}
+
+.nd-root .nd-titlebar[data-quiet-focus="true"]:focus-visible {
+  outline: none;
+  box-shadow: var(--bevel);
+}

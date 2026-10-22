@@ -1,0 +1,391 @@
+/*
+ * Modo celular (spec 093, T10; decisão 17). Só variáveis de `tokens.ts`: nenhuma cor literal
+ * (checagem em `checks.test.ts`).
+ *
+ * - Barra compacta, área de trabalho e abas empilhadas (flex): a área ocupa o resto da altura,
+ *   que acompanha a viewport visual (`--app-height`) quando o teclado virtual abre;
+ * - uma janela por vez em tela cheia, sem cantos nem sombra; o Alternador é uma lista vertical
+ *   sobre uma superfície sólida (texto nunca direto sobre o papel de parede);
+ * - alvos de toque com ≥ 44 px (botões da barra de título inclusive);
+ * - com o teclado aberto (`<html data-keyboard="open">`), a barra e as abas somem;
+ * - janela estreita (`data-size="narrow"`, 390 px): nada rola na horizontal.
+ */
+
+/* --- Estrutura --- */
+.nd-root[data-mobile="true"] {
+  display: flex;
+  flex-direction: column;
+  height: var(--app-height, 100%);
+  overflow-x: hidden;
+}
+
+.nd-root[data-mobile="true"] .nd-topbar {
+  position: relative;
+  inset: auto;
+  height: auto;
+  min-height: 56px;
+  flex-shrink: 0;
+  padding: max(var(--sp-2), env(safe-area-inset-top)) var(--sp-3) var(--sp-2);
+}
+
+.nd-root[data-mobile="true"] .nd-workarea {
+  position: relative;
+  inset: auto;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* --- Barra compacta: espaço, selo de setup e sino; a pílula na segunda linha --- */
+.nd-topbar-content[data-compact="true"] {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+}
+
+.nd-topbar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-topbar-row > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+/*
+ * Pílula do celular (spec 094, T05): cantos concêntricos. O raio interno do "Parar" é o raio da
+ * pílula menos o padding (uniforme, `--sp-1` = 4 px; `--r-lg` − `--sp-1` = `--r-md`, da escala
+ * da T06), e a altura visível do botão é a da pílula menos o padding: nunca uma pílula inteira
+ * dentro da outra, nem encostada na borda.
+ */
+.nd-topbar-content[data-compact="true"] .nd-run-pill {
+  --pill-radius: var(--r-lg);
+  --pill-pad: var(--sp-1);
+  flex: 1;
+  height: auto;
+  min-height: 44px;
+  border-radius: var(--pill-radius);
+  padding: var(--pill-pad) var(--pill-pad) var(--pill-pad) var(--sp-3);
+}
+
+/*
+ * O botão não cresce até 44 px: a regra geral de alvo de toque (0,2,0) é vencida aqui (0,3,0).
+ * O alvo de 44 px vem da área expandida invisível (`::before`), centrada no botão.
+ */
+.nd-topbar-content[data-compact="true"] .nd-pill-btn {
+  position: relative;
+  align-self: stretch;
+  height: auto;
+  min-height: 0;
+  border-radius: calc(var(--pill-radius) - var(--pill-pad));
+}
+
+.nd-topbar-content[data-compact="true"] .nd-pill-btn::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: calc(-1 * var(--pill-pad));
+  right: calc(-1 * var(--pill-pad));
+  height: 44px;
+  transform: translateY(-50%);
+}
+
+.nd-topbar-content[data-compact="true"] .nd-run-details {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- Janela em tela cheia --- */
+.nd-root[data-mobile="true"] .nd-window {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.nd-root[data-mobile="true"] .nd-titlebar {
+  height: 52px;
+  padding: 0 var(--sp-1) 0 var(--sp-4);
+  cursor: default;
+  touch-action: auto;
+}
+
+/* --- Alvos de toque (≥ 44 px; os botões da barra de título também) --- */
+.nd-root[data-mobile="true"] :where(button, select, summary, a.nd-btn, [role="tab"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], [role="treeitem"]) {
+  min-height: 44px;
+}
+
+.nd-root[data-mobile="true"] :where(.nd-iconbtn, .nd-wbtn) {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+/*
+ * --- Campos com 16 px ---
+ * Abaixo de 16 px o Safari do iPhone amplia a página ao focar o campo. A especificidade (0,2,1)
+ * vence as regras de fonte dos campos (`.nd-input.nd-mono`, `.nd-composer-input`, `.nd-affix input`).
+ */
+.nd-root[data-mobile="true"] :is(input, textarea, select) {
+  font-size: var(--fs-touch);
+}
+
+/* --- Abas --- */
+.nd-mobile-tabs {
+  position: relative;
+  flex-shrink: 0;
+  padding: var(--sp-2) var(--sp-2) max(var(--sp-2), env(safe-area-inset-bottom));
+  z-index: 960;
+}
+
+.nd-mobile-tab-list {
+  display: flex;
+  justify-content: space-around;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-mobile-tab-item {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.nd-mobile-tab {
+  width: 100%;
+  min-width: 56px;
+  min-height: 52px;
+  padding: var(--sp-1) var(--sp-1);
+  border: 0;
+  border-radius: var(--r-lg);
+  background: transparent;
+  color: var(--ink3);
+  font: var(--fw-medium) var(--fs-caption) var(--font-sans);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  cursor: pointer;
+}
+
+/* Caixa do ícone igual em todas as abas (a do Alternador só ganha o fundo): os rótulos ficam
+   na mesma linha. */
+.nd-mobile-tab-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.nd-mobile-tab-icon .nd-badge {
+  top: -6px;
+  right: -12px;
+}
+
+/*
+ * A aba do Alternador é neutra como as outras (095/T07, A-09): sem quadrado violeta. A aba atual,
+ * qualquer que seja, se marca só pelo fundo de pressionado (bloco comum, em desktop.css).
+ */
+.nd-mobile-tab[data-variant="switcher"] .nd-mobile-tab-icon {
+  border-radius: var(--r-md);
+}
+
+.nd-mobile-tab-label {
+  line-height: 14px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Alternador: lista vertical, sem sobreposição --- */
+.nd-switcher {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  background: var(--surface);
+}
+
+.nd-switcher-title {
+  margin: 0 4px 10px;
+  font-size: var(--fs-label);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nd-switcher-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/*
+ * Item do Alternador (095/T07, A-09): uma LINHA separada pela `--divider`, sem cartão nem contorno;
+ * ícone neutro como no dock. Aberta não é selecionada: só o item da vista atual (`aria-current`)
+ * ganha o fundo `--lane` (bloco comum de estados, em desktop.css), nunca uma borda colorida.
+ */
+.nd-switcher-item {
+  width: 100%;
+  min-height: 60px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 0;
+  border-bottom: 1px solid var(--divider);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  cursor: pointer;
+}
+
+.nd-switcher-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  color: var(--ink2);
+}
+
+.nd-switcher-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-switcher-name {
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-switcher-sub {
+  font-size: var(--fs-label);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-switcher-badge {
+  position: static;
+  flex-shrink: 0;
+}
+
+.nd-switcher-go {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+/* --- Avisos e sino continuam visíveis, dentro da tela estreita --- */
+.nd-root[data-mobile="true"] .nd-attention {
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  width: auto;
+  max-height: calc(100% - 16px);
+}
+
+.nd-root[data-mobile="true"] .nd-permission-toasts {
+  left: 8px;
+  right: 8px;
+  width: auto;
+  bottom: 88px;
+}
+
+.nd-root[data-mobile="true"] .nd-toast {
+  bottom: 88px;
+  max-width: calc(100% - 16px);
+}
+
+.nd-root[data-mobile="true"] .nd-bar-alert,
+.nd-root[data-mobile="true"] .nd-bar-note {
+  top: 120px;
+  max-width: calc(100% - 16px);
+}
+
+/*
+ * --- Composer no celular (094/T08, A-11) ---
+ * O botão de anexo tem 44 px de alvo com o ícone no meio: sem o gap e com o padding mínimo da
+ * escala, o texto do campo começa logo depois do ícone, e não longe dele.
+ */
+.nd-root[data-mobile="true"] .nd-composer {
+  gap: 0;
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-1);
+}
+
+/* --- Teclado virtual aberto: a barra e as abas somem; o campo fica visível --- */
+:root[data-keyboard="open"] .nd-root[data-mobile="true"] .nd-keyboard-hide {
+  display: none !important;
+}
+
+/*
+ * --- Janela estreita (data-size="narrow", ex.: 390 px): nada rola na horizontal ---
+ * O iframe do App fica de fora: os tamanhos fixos dele já cabem por `transform: scale`.
+ */
+.nd-content[data-size="narrow"] {
+  overflow-x: hidden;
+}
+
+.nd-content[data-size="narrow"] :where(img, video, canvas, table) {
+  max-width: 100%;
+}
+
+.nd-content[data-size="narrow"] :where(pre) {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-content[data-size="narrow"] :where(p, li, dd, dt, td, th, h1, h2, h3, h4, label, summary, a, code) {
+  overflow-wrap: anywhere;
+}
+
+.nd-content[data-size="narrow"] :where(.nd-actions, .nd-dialog-actions) {
+  flex-wrap: wrap;
+}
+
+/*
+ * --- Ferramentas da janela (095/T02, C-07) ---
+ * No celular o slot `[data-window-tools]` é uma linha de titânio logo abaixo da barra de título
+ * (o `Window` o desenha fora dela), rolável na horizontal: a janela em si nunca rola de lado.
+ */
+.nd-root[data-mobile="true"] .nd-window-tools {
+  flex-shrink: 0;
+  min-height: 44px;
+  padding: 0 var(--sp-3);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
+/*
+ * Linha compacta de 44 px (095/T07, A-08): o slot nunca cresce na vertical. A janela do celular é
+ * uma coluna flexível, e regras de janela (ex.: `.nd-window[data-window="app"] .nd-window-tools`,
+ * `flex: 1 1 auto`, feita para a barra de título do desktop) faziam a linha virar um bloco de
+ * ~320 px. Especificidade 0,4,0: vence qualquer regra de janela; o conteúdo vem logo abaixo.
+ */
+.nd-root[data-mobile="true"] .nd-window .nd-window-tools {
+  flex: 0 0 44px;
+  height: 44px;
+  max-height: 44px;
+  box-sizing: border-box;
+  align-items: center;
+}

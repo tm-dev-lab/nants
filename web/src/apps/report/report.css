@@ -1,0 +1,57 @@
+/*
+ * Janela Relatório (spec 093, T07; enxuta na 095/T06). Só variáveis dos tokens. Sem caixas
+ * contornadas: "Projeto concluído" é uma faixa `--lane`, o relatório segue em seções separadas por
+ * `--divider` e "Como executar" fica em destaque numa faixa, sem contorno.
+ */
+.nd-report {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  font-size: var(--fs-body);
+  line-height: 1.55;
+  color: var(--ink2);
+  min-width: 0;
+}
+
+.nd-completed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+}
+
+.nd-completed-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--pill-green-ink);
+}
+
+.nd-report-body {
+  border-radius: var(--r-md);
+  min-width: 0;
+}
+
+.nd-report .nd-howto {
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--lane);
+}
+
+/* Blocos de código do relatório ("Como executar" inclusive): só o fundo, sem contorno (095/T07, A-05). */
+.nd-report .nd-md-pre {
+  border: 0;
+}
+
+.nd-report .nd-details {
+  padding: var(--sp-2) 0 0;
+  border: 0;
+  border-radius: 0;
+  border-top: 1px solid var(--divider);
+}

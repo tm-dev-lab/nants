@@ -1,0 +1,228 @@
+/* Janela Execução (spec 095, T03; `reference/App.dc.html`): só variáveis dos tokens. */
+/*
+ * A raiz é a única área de rolagem do app (`nd-app-scroll`); numa janela alta, o console ocupa o
+ * resto e rola sozinho. Numa janela baixa, o console fica com a altura mínima e a raiz rola.
+ */
+.nd-exec {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+/* Cartão da execução: spec, comando e porta, pílula de estado e a ação. */
+.nd-exec-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+  flex-shrink: 0;
+}
+
+.nd-exec-card-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-exec-spec {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.nd-exec-line {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-exec-pill {
+  gap: var(--sp-2);
+  height: 26px;
+  padding: 0 var(--sp-3);
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+
+.nd-exec-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: currentColor;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nd-exec-dot[data-pulse="true"] {
+    animation: nd-exec-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes nd-exec-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/*
+ * Portas publicadas (095/T07, decisão 6): uma linha por porta, separadas por `--divider`. O
+ * endereço é texto (não mais um link solto para o navegador do sistema); "Abrir no App" é a ação, e
+ * a nova aba fica na linha discreta de baixo.
+ */
+.nd-exec-ports {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.nd-exec-port-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-exec-port-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.nd-exec-port {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-control);
+  color: var(--ink);
+}
+
+.nd-exec-port-alt {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+/* "Abrir em nova aba": link discreto dentro da frase, sublinhado (não é a ação principal). */
+.nd-exec-port-alt .nd-link {
+  padding: 0;
+  min-height: 0;
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.nd-exec .nd-strip[data-tone="amber"] {
+  border-color: var(--pill-amber-edge);
+  background: var(--pill-amber-bg);
+}
+
+.nd-exec .nd-readiness,
+.nd-exec .nd-problem,
+.nd-exec .nd-strip,
+.nd-exec-detail {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.nd-exec-detail pre {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--sp-1) 0 0;
+  padding: var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--surface2);
+  font-size: var(--fs-caption);
+}
+
+.nd-exec-command {
+  display: block;
+  margin: var(--sp-2) 0;
+}
+
+/* Console: o resto da janela, com rolagem própria. */
+.nd-exec-console {
+  flex: 1;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-exec-console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
+.nd-exec-console-title {
+  font-size: var(--fs-label);
+  font-weight: var(--fw-semibold);
+  color: var(--muted);
+}
+
+.nd-exec-console-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-exec-console-body .nd-scroll-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.nd-app-log {
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--surface2);
+  color: var(--ink);
+  font-size: var(--fs-mono);
+  line-height: 1.65;
+}
+
+.nd-exec-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-control);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+/* Página do Nants aberta pela rede (095/T09): ajuda curta na linha da porta, discreta. */
+.nd-exec-port-hint {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}

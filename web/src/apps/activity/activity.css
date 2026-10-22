@@ -1,0 +1,238 @@
+/* Janela Atividade (spec 093, T07). Só variáveis dos tokens. */
+.nd-activity-root {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-tabs {
+  display: flex;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3) 0;
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.nd-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 28px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  background: transparent;
+  color: var(--ink3);
+  font: var(--fw-medium) var(--fs-label) var(--font-sans);
+  cursor: pointer;
+}
+
+/* Selecionada: fundo e texto do estado comum; o sublinhado neutro (`--ink`) marca a aba (095/T07). */
+.nd-tab[aria-selected="true"] {
+  border-bottom-color: var(--ink);
+}
+
+.nd-activity-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.nd-activity-live,
+.nd-history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-4);
+}
+
+.nd-activity-live > .nd-strip {
+  margin: 0;
+}
+
+.nd-history-list,
+.nd-recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/*
+ * Uma linha por agente (095/T05, decisão 7, como no mockup): ponto de estado, nome em 600 numa
+ * coluna fixa e a ação atual em `--muted`, com `--divider` entre as linhas. Sem cartão nem contorno.
+ */
+.nd-agent-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-agent-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--divider);
+  font-size: var(--fs-control);
+  min-width: 0;
+}
+
+.nd-agent-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--icon-muted);
+  opacity: 0.6;
+  align-self: center;
+}
+
+.nd-agent-dot[data-dot="violet"],
+.nd-agent-dot[data-dot="cyan"],
+.nd-agent-dot[data-dot="amber"],
+.nd-agent-dot[data-dot="green"],
+.nd-agent-dot[data-dot="rose"] {
+  opacity: 1;
+}
+
+.nd-agent-dot[data-dot="violet"] {
+  background: var(--icon-violet);
+}
+.nd-agent-dot[data-dot="cyan"] {
+  background: var(--icon-cyan);
+}
+.nd-agent-dot[data-dot="amber"] {
+  background: var(--icon-amber);
+}
+.nd-agent-dot[data-dot="green"] {
+  background: var(--icon-green);
+}
+.nd-agent-dot[data-dot="rose"] {
+  background: var(--icon-rose);
+}
+
+.nd-agent-row-name {
+  flex: 0 0 104px;
+  min-width: 0;
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-agent-row-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+/* A ação atual: sem serifa e `--muted` (C-08); o mono fica só para a tarefa e para comando/ferramenta. */
+.nd-agent-row-action {
+  margin: 0;
+  font: var(--fs-control)/1.45 var(--font-sans);
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* O estado curto ("gerando imagem", "ajustando o ritmo"): cor só no rótulo, nunca num fundo. */
+.nd-agent-row-state {
+  font-weight: var(--fw-medium);
+  color: var(--ink2);
+}
+
+.nd-agent-row-state[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-agent-card-detail {
+  color: var(--muted);
+}
+
+.nd-agent-row-task {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-agent-row-stage {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+/* Texto secundário do agente parado (094/T08, A-05): sem serifa e `--muted`; o mono fica para comando e ferramenta. */
+.nd-agent-card-idle {
+  font-family: var(--font-sans);
+  font-size: var(--fs-control);
+  color: var(--muted);
+}
+
+.nd-recent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-1);
+}
+
+.nd-recent-item,
+.nd-history-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-label);
+  color: var(--ink2);
+  min-width: 0;
+}
+
+.nd-recent-item > span {
+  min-width: 0;
+}
+
+/* Histórico em linhas com `--divider` (095/T05), sem caixa por item. */
+.nd-history-list {
+  gap: 0;
+}
+
+.nd-history-item {
+  align-items: flex-start;
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.nd-history-item > .nd-stack-xs {
+  flex: 1;
+}
+
+.nd-history-item[data-history-kind="reviewer_approved"] .nd-history-icon {
+  color: var(--pill-green-ink);
+}
+
+.nd-history-item[data-history-kind="image_generated"] .nd-history-icon {
+  color: var(--pill-violet-ink);
+}
+
+.nd-history-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+[data-size="narrow"] .nd-recent-item,
+[data-size="narrow"] .nd-history-item {
+  flex-wrap: wrap;
+}
+
+/* Estreita: o nome encolhe para a ação ter espaço. */
+[data-size="narrow"] .nd-agent-row-name {
+  flex-basis: 88px;
+}

@@ -1,0 +1,803 @@
+//! Atividade ao vivo dos agentes: eventos efêmeros (nunca persistidos) sobre o que o agente
+//! está fazendo. O módulo não conhece o servidor: o consumidor implementa [`ActivitySink`].
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use super::llm_client::StreamDelta;
+
+/// Intervalo mínimo entre envios de deltas de uma atividade (~4 eventos/s).
+pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// Tamanho máximo do texto de um evento de atividade.
+pub const MAX_EVENT_TEXT_BYTES: usize = 2 * 1024;
+/// Tamanho máximo do rótulo de ferramenta.
+const MAX_LABEL_BYTES: usize = 160;
+/// Tamanho máximo do comando exibido na atividade.
+const MAX_COMMAND_BYTES: usize = 200;
+/// Intervalo padrão do heartbeat de comando em curso (<= 30 s).
+pub const COMMAND_HEARTBEAT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    Start,
+    Reasoning,
+    Text,
+    Tool,
+    /// Início de um comando longo (texto = comando redigido).
+    Command,
+    /// Sinal periódico de que o comando em curso segue rodando.
+    Heartbeat,
+    /// Fim do comando em curso.
+    CommandEnd,
+    End,
+}
+
+impl ActivityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Reasoning => "reasoning",
+            Self::Text => "text",
+            Self::Tool => "tool",
+            Self::Command => "command",
+            Self::Heartbeat => "heartbeat",
+            Self::CommandEnd => "command_end",
+            Self::End => "end",
+        }
+    }
+}
+
+/// `code` estável e `params` neutros de idioma do texto de um evento (spec 102): a interface
+/// mostra o rótulo do dicionário no idioma ativo; `text` continua como a reserva em pt-BR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityCode {
+    pub code: String,
+    pub params: serde_json::Map<String, Value>,
+}
+
+impl ActivityCode {
+    fn new(code: impl Into<String>, pairs: &[(&str, String)]) -> Self {
+        Self {
+            code: code.into(),
+            params: pairs.iter().map(|(k, v)| ((*k).to_string(), Value::from(v.clone()))).collect(),
+        }
+    }
+}
+
+/// Evento de atividade, ainda sem redação (o sink do consumidor redige).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEvent {
+    pub agent: String,
+    pub spec_id: Option<String>,
+    pub task_id: Option<String>,
+    pub activity_id: String,
+    pub kind: ActivityKind,
+    pub text: Option<String>,
+    /// `code`/`params` do texto (rótulo de ferramenta, aviso do limitador), quando há.
+    pub code: Option<ActivityCode>,
+}
+
+/// Destino dos eventos de atividade.
+pub trait ActivitySink: Send + Sync {
+    fn emit(&self, event: ActivityEvent);
+
+    /// Redige segredos de um texto inteiro (antes de qualquer corte). Padrão: identidade.
+    fn sanitize(&self, text: &str) -> String {
+        text.to_string()
+    }
+}
+
+/// Sink que descarta tudo (padrão).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSink;
+
+impl ActivitySink for NullSink {
+    fn emit(&self, _event: ActivityEvent) {}
+}
+
+/// Identidade de quem emite: sink + agente + spec/tarefa.
+#[derive(Clone)]
+pub struct ActivityScope {
+    sink: Arc<dyn ActivitySink>,
+    agent: String,
+    spec_id: Option<String>,
+    task_id: Option<String>,
+    heartbeat: Duration,
+}
+
+impl ActivityScope {
+    pub fn new(
+        sink: Arc<dyn ActivitySink>,
+        agent: impl Into<String>,
+        spec_id: Option<String>,
+        task_id: Option<String>,
+    ) -> Self {
+        Self {
+            sink,
+            agent: agent.into(),
+            spec_id,
+            task_id,
+            heartbeat: COMMAND_HEARTBEAT,
+        }
+    }
+
+    /// Intervalo do heartbeat de comando (injetável em testes).
+    pub fn with_heartbeat(mut self, interval: Duration) -> Self {
+        self.heartbeat = interval;
+        self
+    }
+
+    pub fn null(agent: impl Into<String>) -> Self {
+        Self::new(Arc::new(NullSink), agent, None, None)
+    }
+
+    /// Inicia uma atividade (emite `start`). O `end` sai em [`ActivityRun::end`] ou no `drop`.
+    pub fn begin(&self) -> ActivityRun {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let run = ActivityRun {
+            scope: self.clone(),
+            id: format!("act-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            state: Mutex::new(State::new()),
+        };
+        run.send(ActivityKind::Start, None);
+        run
+    }
+}
+
+/// Acumulado máximo por tipo (mantém o fim).
+const MAX_ACC_BYTES: usize = 64 * 1024;
+/// Cauda sem espaço retida no meio do stream (o segredo pode ainda estar chegando).
+const MAX_HELD_TAIL_BYTES: usize = 256;
+const MASK: &str = "***";
+
+struct State {
+    /// Texto acumulado: [reasoning, text].
+    acc: [String; 2],
+    /// Último snapshot emitido por tipo (evita repetição).
+    emitted: [String; 2],
+    last_kind: Option<usize>,
+    last_flush: Instant,
+    ended: bool,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            acc: [String::new(), String::new()],
+            emitted: [String::new(), String::new()],
+            last_kind: None,
+            last_flush: Instant::now(),
+            ended: false,
+        }
+    }
+}
+
+const KINDS: [ActivityKind; 2] = [ActivityKind::Reasoning, ActivityKind::Text];
+
+/// Uma atividade em andamento (um passo do agente).
+///
+/// Eventos `reasoning` e `text` são SNAPSHOTS: o acumulado do tipo, redigido inteiro
+/// ([`ActivitySink::sanitize`]) e só depois cortado mantendo o fim (<= 2 KiB). Quem consome
+/// substitui, não concatena.
+pub struct ActivityRun {
+    scope: ActivityScope,
+    id: String,
+    state: Mutex<State>,
+}
+
+impl ActivityRun {
+    fn send(&self, kind: ActivityKind, text: Option<String>) {
+        self.send_coded(kind, text, None);
+    }
+
+    fn send_coded(&self, kind: ActivityKind, text: Option<String>, code: Option<ActivityCode>) {
+        // Os `params` passam pela mesma redação do texto (o servidor ainda os saneia de novo).
+        let code = code.map(|mut c| {
+            for value in c.params.values_mut() {
+                if let Value::String(text) = value {
+                    *text = self.scope.sink.sanitize(text);
+                }
+            }
+            c
+        });
+        self.scope.sink.emit(ActivityEvent {
+            agent: self.scope.agent.clone(),
+            spec_id: self.scope.spec_id.clone(),
+            task_id: self.scope.task_id.clone(),
+            activity_id: self.id.clone(),
+            kind,
+            text,
+            code,
+        });
+    }
+
+    /// Acumula o delta e, no máximo ~4 vezes por segundo, emite o snapshot do tipo.
+    pub fn delta(&self, delta: StreamDelta) {
+        let (i, text) = match delta {
+            StreamDelta::Reasoning(t) => (0, t),
+            StreamDelta::Text(t) => (1, t),
+            StreamDelta::Retry(notice) => return self.retry(&notice),
+        };
+        if text.is_empty() {
+            return;
+        }
+        let mut out = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended {
+                return;
+            }
+            if let Some(prev) = st.last_kind.filter(|k| *k != i) {
+                self.snapshot(&mut st, prev, true, &mut out);
+            }
+            st.last_kind = Some(i);
+            st.acc[i].push_str(&text);
+            if st.acc[i].len() > MAX_ACC_BYTES {
+                let cut = st.acc[i].len() - MAX_ACC_BYTES;
+                let mut at = cut;
+                while !st.acc[i].is_char_boundary(at) {
+                    at += 1;
+                }
+                st.acc[i].drain(..at);
+            }
+            if st.last_flush.elapsed() >= FLUSH_INTERVAL {
+                self.snapshot(&mut st, i, false, &mut out);
+                st.last_flush = Instant::now();
+            }
+        }
+        self.send_all(out);
+    }
+
+    /// Nova tentativa da resposta (spec 088): descarta o acumulado da tentativa anterior e mostra
+    /// o aviso fixo como texto do passo; os deltas da nova tentativa o substituem.
+    fn retry(&self, notice: &str) {
+        let shown = cut_head(&self.scope.sink.sanitize(notice).replace(['\n', '\r'], " "), MAX_EVENT_TEXT_BYTES);
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended || shown.is_empty() {
+                return;
+            }
+            st.acc = [String::new(), String::new()];
+            st.emitted = [String::new(), shown.clone()];
+            st.last_kind = None;
+        }
+        self.send_coded(ActivityKind::Text, Some(shown), notice_code(notice));
+    }
+
+    /// Aviso fixo durante uma ferramenta que chama o provedor (spec 090 T02: espera de ritmo ou nova
+    /// tentativa da geração de imagem), exibido como o texto do passo, como na nova tentativa.
+    pub fn notice(&self, text: &str) {
+        self.retry(text);
+    }
+
+    /// Snapshot do tipo `i`. No meio do stream retém a última sequência sem espaço.
+    fn snapshot(&self, st: &mut State, i: usize, fin: bool, out: &mut Vec<(ActivityKind, String)>) {
+        let acc = &st.acc[i];
+        if acc.is_empty() {
+            return;
+        }
+        let sink = &self.scope.sink;
+        let shown = if fin {
+            sink.sanitize(acc)
+        } else {
+            let split = acc
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map_or(0, |(idx, c)| idx + c.len_utf8());
+            let (visible, tail) = acc.split_at(split);
+            let mut shown = sink.sanitize(visible);
+            if tail.len() > MAX_HELD_TAIL_BYTES {
+                shown.push_str(MASK);
+            }
+            shown
+        };
+        let shown = cut_tail(&shown, MAX_EVENT_TEXT_BYTES);
+        if shown.is_empty() || st.emitted[i] == shown {
+            return;
+        }
+        st.emitted[i] = shown.clone();
+        out.push((KINDS[i], shown));
+    }
+
+    /// Rótulo curto de uma chamada de ferramenta (redigido por inteiro antes do corte).
+    pub fn tool(&self, name: &str, arguments: &str) {
+        let mut out = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended {
+                return;
+            }
+            for i in 0..2 {
+                self.snapshot(&mut st, i, true, &mut out);
+            }
+        }
+        let label = self.scope.sink.sanitize(&tool_label_full(name, arguments));
+        let label = cut_head(&label.replace(['\n', '\r'], " "), MAX_LABEL_BYTES);
+        self.send_all(out);
+        self.send_coded(ActivityKind::Tool, Some(label), Some(tool_code(name, arguments)));
+    }
+
+    /// Executa `fut` (um comando longo) emitindo `command` ao iniciar, `heartbeat` a cada
+    /// intervalo do escopo e `command_end` ao terminar (também se o futuro for descartado).
+    pub async fn track_command<F: std::future::Future>(&self, command: &str, fut: F) -> F::Output {
+        let shown = cut_head(&self.scope.sink.sanitize(command).replace(['\n', '\r'], " "), MAX_COMMAND_BYTES);
+        self.send(ActivityKind::Command, Some(shown));
+        struct EndGuard<'a>(&'a ActivityRun);
+        impl Drop for EndGuard<'_> {
+            fn drop(&mut self) {
+                self.0.send(ActivityKind::CommandEnd, None);
+            }
+        }
+        let _guard = EndGuard(self);
+        let mut ticker = tokio::time::interval(self.scope.heartbeat.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                _ = ticker.tick() => self.send(ActivityKind::Heartbeat, None),
+            }
+        }
+    }
+
+    /// Encerra a atividade (idempotente) depois do snapshot final de cada tipo.
+    pub fn end(&self) {
+        let mut out = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended {
+                return;
+            }
+            for i in 0..2 {
+                self.snapshot(&mut st, i, true, &mut out);
+            }
+            st.ended = true;
+        }
+        self.send_all(out);
+        self.send(ActivityKind::End, None);
+    }
+
+    fn send_all(&self, items: Vec<(ActivityKind, String)>) {
+        for (kind, text) in items {
+            self.send(kind, Some(text));
+        }
+    }
+}
+
+impl Drop for ActivityRun {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Primeiros `max` bytes, em fronteira de caractere.
+fn cut_head(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// Últimos `max` bytes, em fronteira de caractere.
+fn cut_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+/// Rótulo curto: "lendo src/x.rs", "escrevendo …", "rodando `cmd`". O consumidor redige segredos.
+pub fn tool_label(name: &str, arguments: &str) -> String {
+    cut_head(&tool_label_full(name, arguments).replace(['\n', '\r'], " "), MAX_LABEL_BYTES)
+}
+
+/// Rótulo sem corte (para redigir por inteiro antes de truncar).
+fn tool_label_full(name: &str, arguments: &str) -> String {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let arg = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let label = match name {
+        "read_file" => format!("lendo {}", arg("path")),
+        "list_dir" => format!("listando {}", arg_or(arg("path"), ".")),
+        "search_code" => format!("buscando `{}`", arg("pattern")),
+        "write_file" | "apply_patch" => format!("escrevendo {}", arg("path")),
+        "write_sdd_artifacts" => "escrevendo artefatos SDD".to_string(),
+        "run_command" => format!("rodando `{}`", arg("command")),
+        "fetch_url" => format!("lendo página {}", arg("url")),
+        "package_versions" => format!("consultando versões de {} ({})", arg("name"), arg("ecosystem")),
+        "web_source" => format!("fonte consultada: {} ({})", arg("title"), arg("url")),
+        "web_search_unavailable" => "busca na web indisponível neste provedor (seguindo sem ela)".to_string(),
+        // Spec 084 T02: `referencia/<arquivo>` é imagem de referência do usuário, não captura.
+        "view_screenshot" => match arg("name").strip_prefix(crate::sdd::references::VIEW_PREFIX) {
+            Some(file) => format!("vendo a referência {file}"),
+            None => format!("vendo a captura {}", arg("name")),
+        },
+        "images_refused" => "o modelo não aceitou imagens; seguindo sem capturas".to_string(),
+        // Spec 090 T02: só o caminho; o prompt não vai para a atividade nem para a trilha.
+        "generate_image" => format!("gerando imagem {}", arg("path")),
+        // Spec 091: falha final da geração, só com o motivo fixo (sem texto remoto).
+        "image_failed" => format!("geração de imagem falhou ({})", arg("reason")),
+        other => format!("usando {other}"),
+    };
+    label
+}
+
+/// `code` e `params` de um aviso fixo (spec 102): a espera do limitador e do limite do provedor
+/// (089), a espera da geração de imagem e a conferência do plano. Os textos vêm das funções e
+/// constantes que os montam. A nova tentativa (088) segue só com o texto de reserva.
+pub fn notice_code(notice: &str) -> Option<ActivityCode> {
+    use super::llm_client::{pace_notice_secs, throttle_notice_parts};
+    if let Some(secs) = pace_notice_secs(notice) {
+        return Some(ActivityCode::new("pace.waiting", &[("seconds", secs.to_string())]));
+    }
+    if let Some((label, secs, attempt, total)) = throttle_notice_parts(notice) {
+        let mut code = ActivityCode::new("pace.throttled", &[("label", label)]);
+        for (k, v) in [("seconds", secs), ("attempt", attempt), ("total", total)] {
+            code.params.insert(k.into(), Value::from(v));
+        }
+        return Some(code);
+    }
+    if notice == crate::harness::tools::IMAGE_PACE_NOTICE {
+        return Some(ActivityCode::new("pace.queued", &[]));
+    }
+    if notice == super::architect::PLAN_CHECK_ACTIVITY {
+        return Some(ActivityCode::new("plan.checking", &[]));
+    }
+    None
+}
+
+/// `code` e `params` do rótulo de uma ferramenta (spec 102): os mesmos valores de
+/// [`tool_label_full`], sem o texto em pt-BR. O sink do consumidor redige e corta os `params`.
+pub fn tool_code(name: &str, arguments: &str) -> ActivityCode {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let arg = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .replace(['\n', '\r'], " ")
+    };
+    let c = ActivityCode::new;
+    match name {
+        "read_file" => c("tool.read_file", &[("path", arg("path"))]),
+        "list_dir" => c("tool.list_dir", &[("path", arg_or(arg("path"), "."))]),
+        "search_code" => c("tool.search_code", &[("pattern", arg("pattern"))]),
+        "write_file" | "apply_patch" => c("tool.write_file", &[("path", arg("path"))]),
+        "write_sdd_artifacts" => c("tool.write_sdd_artifacts", &[]),
+        "run_command" => c("tool.run_command", &[("command", arg("command"))]),
+        "fetch_url" => c("tool.fetch_url", &[("url", arg("url"))]),
+        "package_versions" => c("tool.package_versions", &[("name", arg("name")), ("ecosystem", arg("ecosystem"))]),
+        "web_source" => c("tool.web_source", &[("title", arg("title")), ("url", arg("url"))]),
+        "web_search_unavailable" => c("tool.web_search_unavailable", &[]),
+        "view_screenshot" => match arg("name").strip_prefix(crate::sdd::references::VIEW_PREFIX) {
+            Some(file) => c("tool.view_reference", &[("file", file.to_string())]),
+            None => c("tool.view_screenshot", &[("name", arg("name"))]),
+        },
+        "images_refused" => c("tool.images_refused", &[]),
+        "generate_image" => c("tool.generate_image", &[("path", arg("path"))]),
+        "image_failed" => c("tool.image_failed", &[("reason", arg("reason"))]),
+        other => c("tool.other", &[("name", other.to_string())]),
+    }
+}
+
+fn arg_or(value: String, default: &str) -> String {
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Sink que guarda os eventos em memória.
+    #[derive(Default)]
+    pub struct Recorder(pub Mutex<Vec<ActivityEvent>>);
+
+    impl ActivitySink for Recorder {
+        fn emit(&self, event: ActivityEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    impl Recorder {
+        pub fn events(&self) -> Vec<ActivityEvent> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::Recorder;
+    use super::*;
+
+    fn scope(rec: &Arc<Recorder>) -> ActivityScope {
+        ActivityScope::new(rec.clone(), "developer", Some("s".into()), Some("T01".into()))
+    }
+
+    /// Sink de teste que redige um segredo literal, como o do servidor.
+    struct Redacting(Recorder, &'static str);
+
+    impl ActivitySink for Redacting {
+        fn emit(&self, event: ActivityEvent) {
+            self.0.emit(event);
+        }
+        fn sanitize(&self, text: &str) -> String {
+            text.replace(self.1, "***")
+        }
+    }
+
+    const SECRET: &str = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+
+    fn leaks(events: &[ActivityEvent]) -> bool {
+        // Qualquer fragmento do segredo com >= 6 caracteres, no texto ou nos `params`.
+        let params = events
+            .iter()
+            .filter_map(|e| e.code.as_ref())
+            .flat_map(|c| c.params.values())
+            .filter_map(Value::as_str);
+        events.iter().filter_map(|e| e.text.as_deref()).chain(params).any(|t| {
+            SECRET
+                .as_bytes()
+                .windows(6)
+                .any(|w| t.contains(std::str::from_utf8(w).unwrap_or("\u{0}")))
+        })
+    }
+
+    fn redacting() -> (Arc<Redacting>, ActivityScope) {
+        let sink = Arc::new(Redacting(Recorder::default(), SECRET));
+        let scope = ActivityScope::new(sink.clone(), "developer", None, None);
+        (sink, scope)
+    }
+
+    #[test]
+    fn snapshots_are_coalesced_and_replace() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        for i in 0..200 {
+            run.delta(StreamDelta::Reasoning(format!("p{i} ")));
+        }
+        run.end();
+        let ev = rec.events();
+        assert!(ev.len() < 20, "coalescência: {} eventos", ev.len());
+        assert_eq!(ev.last().map(|e| e.kind), Some(ActivityKind::End));
+        let last = ev.iter().rev().find(|e| e.kind == ActivityKind::Reasoning).expect("snapshot");
+        assert!(last.text.as_deref().is_some_and(|t| t.starts_with("p0 p1 ") && t.ends_with("p199 ")));
+        assert!(ev.iter().all(|e| e.text.as_ref().is_none_or(|t| t.len() <= MAX_EVENT_TEXT_BYTES)));
+    }
+
+    #[test]
+    fn secret_crossing_2048_without_spaces_is_masked() {
+        let (sink, scope) = redacting();
+        let run = scope.begin();
+        run.delta(StreamDelta::Reasoning(format!("{}{SECRET}{}", "a".repeat(2040), "b".repeat(100))));
+        run.end();
+        assert!(!leaks(&sink.0.events()));
+    }
+
+    #[test]
+    fn secret_inside_single_big_delta_is_masked() {
+        let (sink, scope) = redacting();
+        let run = scope.begin();
+        run.delta(StreamDelta::Text(format!("{} {SECRET} {}", "x ".repeat(3000), "y ".repeat(10))));
+        run.end();
+        assert!(!leaks(&sink.0.events()));
+    }
+
+    #[test]
+    fn secret_split_across_deltas_with_flush_between_is_masked() {
+        let (sink, scope) = redacting();
+        let run = scope.begin();
+        std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(20));
+        run.delta(StreamDelta::Reasoning("usar sk-abcde".into()));
+        std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(20));
+        run.delta(StreamDelta::Reasoning("fghijklmnopqrstuvwxyz0123456789 ok".into()));
+        run.end();
+        let ev = sink.0.events();
+        assert!(!leaks(&ev));
+        assert!(ev.iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("usar"))));
+    }
+
+    #[test]
+    fn retry_notice_replaces_partial_text_and_next_attempt_starts_clean() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        run.delta(StreamDelta::Text("parcial ".into()));
+        let notice = "resposta do provedor falhou (incompleta: content_filter); repetindo (1/2)";
+        run.delta(StreamDelta::Retry(notice.into()));
+        run.delta(StreamDelta::Text("nova".into()));
+        run.end();
+        let texts: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == ActivityKind::Text)
+            .filter_map(|e| e.text)
+            .collect();
+        assert!(texts.iter().any(|t| t == notice), "{texts:?}");
+        assert_eq!(texts.last().map(String::as_str), Some("nova"), "{texts:?}");
+    }
+
+    #[test]
+    fn throttle_notices_are_shown_and_renewed() {
+        // Spec 089: cada aviso da espera de limite substitui o anterior no texto do passo.
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        let first = crate::agents::llm_client::throttle_notice("no_capacity", Duration::from_secs(30), 3, 6);
+        let renewed = crate::agents::llm_client::throttle_notice("no_capacity", Duration::from_secs(15), 3, 6);
+        run.delta(StreamDelta::Retry(first.clone()));
+        run.delta(StreamDelta::Retry(renewed.clone()));
+        run.end();
+        let texts: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == ActivityKind::Text)
+            .filter_map(|e| e.text)
+            .collect();
+        assert_eq!(texts, vec![first, renewed]);
+        assert_eq!(texts[0], "provedor no limite (no_capacity); aguardando 30 s (tentativa 3/6)");
+    }
+
+    #[test]
+    fn secret_in_command_beyond_160_bytes_is_masked() {
+        let (sink, scope) = redacting();
+        let run = scope.begin();
+        let cmd = format!(r#"{{"command":"echo {} {SECRET}"}}"#, "z".repeat(140));
+        run.tool("run_command", &cmd);
+        run.end();
+        assert!(!leaks(&sink.0.events()));
+    }
+
+    /// Spec 102: o rótulo da ferramenta sai com `code` e `params` (sem o texto pt-BR), e os avisos
+    /// fixos do limitador, da imagem e do plano também; o texto continua como reserva.
+    #[test]
+    fn tool_and_notices_carry_codes() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        run.tool("generate_image", r#"{"path":"web/img/gato.webp","prompt":"um gato"}"#);
+        run.tool("read_file", r#"{"path":"src/a.rs"}"#);
+        run.tool("misterio", "{}");
+        run.notice(&crate::agents::llm_client::pace_notice(Duration::from_millis(14_200)));
+        run.notice(crate::harness::tools::IMAGE_PACE_NOTICE);
+        run.notice(crate::agents::architect::PLAN_CHECK_ACTIVITY);
+        run.delta(StreamDelta::Retry(crate::agents::llm_client::throttle_notice("HTTP 429", Duration::from_secs(5), 2, 6)));
+        run.delta(StreamDelta::Retry("resposta do provedor falhou (x); repetindo (1/2)".into()));
+        run.end();
+        let coded: Vec<(Option<String>, Option<String>, serde_json::Map<String, Value>)> = rec
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e.kind, ActivityKind::Tool | ActivityKind::Text))
+            .map(|e| {
+                let (code, params) = e.code.map_or((None, serde_json::Map::new()), |c| (Some(c.code), c.params));
+                (e.text, code, params)
+            })
+            .collect();
+        let code_of = |i: usize| coded[i].1.as_deref();
+        assert_eq!(coded[0].0.as_deref(), Some("gerando imagem web/img/gato.webp"));
+        assert_eq!(code_of(0), Some("tool.generate_image"));
+        assert_eq!(coded[0].2.get("path"), Some(&Value::from("web/img/gato.webp")));
+        assert!(!coded[0].2.contains_key("prompt"), "o prompt não vai para a atividade");
+        assert_eq!(code_of(1), Some("tool.read_file"));
+        assert_eq!(code_of(2), Some("tool.other"));
+        assert_eq!(coded[2].2.get("name"), Some(&Value::from("misterio")));
+        assert_eq!(code_of(3), Some("pace.waiting"));
+        assert_eq!(coded[3].2.get("seconds"), Some(&Value::from("15")));
+        assert_eq!(code_of(4), Some("pace.queued"));
+        assert_eq!(code_of(5), Some("plan.checking"));
+        assert_eq!(code_of(6), Some("pace.throttled"));
+        assert_eq!(coded[6].2.get("attempt"), Some(&Value::from(2)));
+        assert_eq!(code_of(7), None, "a nova tentativa segue só com o texto");
+    }
+
+    #[test]
+    fn tool_params_are_redacted() {
+        let (sink, scope) = redacting();
+        let run = scope.begin();
+        run.tool("run_command", &format!(r#"{{"command":"curl -H {SECRET} x"}}"#));
+        run.end();
+        let events = sink.0.events();
+        assert!(events.iter().any(|e| e.code.as_ref().is_some_and(|c| c.code == "tool.run_command")));
+        assert!(!leaks(&events));
+    }
+
+    #[test]
+    fn keeps_order_between_kinds() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        run.delta(StreamDelta::Reasoning("pensando".into()));
+        run.delta(StreamDelta::Text("resposta".into()));
+        run.tool("run_command", r#"{"command":"cargo test"}"#);
+        drop(run);
+        let kinds: Vec<_> = rec.events().iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ActivityKind::Start,
+                ActivityKind::Reasoning,
+                ActivityKind::Text,
+                ActivityKind::Tool,
+                ActivityKind::End
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn long_command_emits_start_heartbeats_and_end_with_redaction() {
+        let (sink, scope) = redacting();
+        let scope = scope.with_heartbeat(Duration::from_millis(20));
+        let run = scope.begin();
+        let cmd = format!("echo {} {SECRET}", "z".repeat(400));
+        let out = run
+            .track_command(&cmd, async {
+                tokio::time::sleep(Duration::from_millis(110)).await;
+                7
+            })
+            .await;
+        assert_eq!(out, 7);
+        let ev = sink.0.events();
+        let kinds: Vec<_> = ev.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds[1], ActivityKind::Command);
+        assert!(kinds.iter().filter(|k| **k == ActivityKind::Heartbeat).count() >= 2);
+        assert_eq!(*kinds.last().unwrap_or(&ActivityKind::Start), ActivityKind::CommandEnd);
+        assert!(!leaks(&ev));
+        let shown = ev[1].text.as_deref().unwrap_or_default();
+        assert!(shown.len() <= MAX_COMMAND_BYTES);
+    }
+
+    #[test]
+    fn view_screenshot_label_names_the_capture() {
+        assert_eq!(tool_label("view_screenshot", r#"{"name":"shots/home.png"}"#), "vendo a captura shots/home.png");
+        assert_eq!(tool_label("view_screenshot", r#"{"name":"referencia/ab.png"}"#), "vendo a referência ab.png");
+        assert_eq!(
+            tool_label("generate_image", r#"{"path":"web/img/gato.webp","prompt":"segredo do prompt"}"#),
+            "gerando imagem web/img/gato.webp"
+        );
+    }
+
+    #[test]
+    fn image_failed_label_shows_the_fixed_reason() {
+        assert_eq!(
+            tool_label("image_failed", r#"{"reason":"provider_http_400 (código: invalid_value)"}"#),
+            "geração de imagem falhou (provider_http_400 (código: invalid_value))"
+        );
+    }
+
+    #[test]
+    fn images_refused_label_is_readable() {
+        let label = tool_label("images_refused", "{}");
+        assert_eq!(label, "o modelo não aceitou imagens; seguindo sem capturas");
+        assert!(!label.contains("usando"));
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(tool_label("read_file", r#"{"path":"src/x.rs"}"#), "lendo src/x.rs");
+        assert_eq!(tool_label("list_dir", "{}"), "listando .");
+        assert_eq!(tool_label("run_command", r#"{"command":"ls"}"#), "rodando `ls`");
+        let long = format!(r#"{{"path":"{}"}}"#, "x".repeat(500));
+        assert!(tool_label("write_file", &long).len() <= MAX_LABEL_BYTES);
+    }
+}

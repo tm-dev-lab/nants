@@ -1,0 +1,63 @@
+# Nants tests on every push and pull request. It publishes nothing and uses no credentials.
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (cargo test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - name: Git identity for the tests
+        run: |
+          git config --global user.name "nants-ci"
+          git config --global user.email "nants-ci@users.noreply.github.com"
+      - name: cargo test (through scripts/test.sh)
+        run: scripts/test.sh cargo test
+
+  web:
+    name: Interface (web)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: vitest (through scripts/test.sh)
+        run: ../scripts/test.sh npx vitest run
+      - name: build (tsc and vite)
+        run: npm run build

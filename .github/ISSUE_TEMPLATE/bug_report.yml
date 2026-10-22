@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in Nants does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Please search the existing issues first.
+        Never paste API keys or other secrets. To report a vulnerability, use the Security tab instead.
+  - type: input
+    id: version
+    attributes:
+      label: Nants version
+      description: The output of `nants --version`.
+      placeholder: nants 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows with WSL2 (x86_64)
+        - Windows with WSL2 (aarch64)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: distribution
+    attributes:
+      label: Distribution
+      placeholder: Ubuntu 24.04
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of nants doctor
+      render: text
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and models
+      description: If the problem involves the agents, the provider and the model of each role. Never the key.
+      placeholder: "OpenAI; Architect: model A, Developer: model B, Reviewer: model C"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Logs and screenshots help; remove any secret first.
+    validations:
+      required: true

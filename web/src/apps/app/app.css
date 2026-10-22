@@ -1,0 +1,249 @@
+/* Janela App, só o navegador (spec 095, T03; `reference/App.dc.html`): só variáveis dos tokens. */
+/*
+ * O App rola sozinho (`scroll: "app"` no registro; spec 094, T05): a raiz é a única área de
+ * rolagem (`nd-app-scroll`). Sem barra de ação acima do conteúdo (decisão 10): as ferramentas do
+ * navegador ficam na barra de título e o resto é o palco (iframe ou estado vazio).
+ */
+.nd-app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-app .nd-strip[data-tone="amber"] {
+  border-color: var(--pill-amber-edge);
+  background: var(--pill-amber-bg);
+}
+
+.nd-app-browser {
+  /* Sem `min-height: 0`: o navegador nunca encolhe abaixo do palco mínimo (a raiz rola). */
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * Ferramentas do navegador na barra de título (slot `[data-window-tools]`, C-07): voltar,
+ * recarregar, endereço centralizado, tamanho e nova aba. O slot do App ocupa o meio da barra; o
+ * subtítulo encolhe primeiro.
+ */
+.nd-window[data-window="app"] .nd-window-tools {
+  flex: 1 1 auto;
+}
+
+.nd-window[data-window="app"] .nd-subtitle {
+  flex: 0 1 auto;
+}
+
+.nd-app-bar {
+  --app-control-h: 28px;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* Altura única dos controles do navegador na barra de título (094/T08, A-13; 28 px no mockup). */
+.nd-app-bar .nd-btn,
+.nd-app-bar .nd-app-address {
+  height: var(--app-control-h);
+  box-sizing: border-box;
+}
+
+.nd-app-bar .nd-iconbtn {
+  width: var(--app-control-h);
+}
+
+/* Barra compacta (janela estreita, celular): o endereço numa linha e o menu ao lado. */
+.nd-app-bar[data-compact="true"] {
+  flex-wrap: nowrap;
+}
+
+.nd-app-bar[data-compact="true"] .nd-app-address {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.nd-app-address-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+/* Endereço em sem serifa (095/T02, C-08), centralizado, como no mockup. */
+.nd-app-address {
+  width: 100%;
+  max-width: 380px;
+  min-width: 0;
+  text-align: center;
+  font-size: var(--fs-control);
+  color: var(--muted);
+}
+
+/*
+ * Campo rebaixado do mockup (095/T07, A-03): sem borda, só o fundo de controle (no titânio,
+ * `--control` é o `--chrome-control`, rebaixado nos dois temas). Vence o `.nd-input` (0,2,0).
+ */
+.nd-app-bar .nd-app-address {
+  border: 0;
+  border-radius: var(--r-md);
+  padding: 0 var(--sp-3);
+  background: var(--control);
+}
+
+.nd-app-size-btn {
+  gap: var(--sp-1);
+  font-size: var(--fs-label);
+}
+
+.nd-app-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-2);
+  margin: var(--sp-2) var(--sp-3) 0;
+  flex-shrink: 0;
+}
+
+.nd-app-stage {
+  position: relative;
+  flex: 1;
+  min-height: 160px;
+  overflow: hidden;
+  background: var(--surface2);
+}
+
+/*
+ * O iframe é posicionado no palco (fora do fluxo): o tamanho dele (viewport fixo, escalado) não
+ * conta no mínimo do palco, e a altura em % resolve sempre contra o palco, sem depender da cadeia
+ * de alturas percentuais dos contêineres flexíveis (no Safari do iPhone, ela podia não resolver).
+ * Com largura fixa menor que o palco, `inset: 0` + `margin: 0 auto` centraliza.
+ */
+.nd-app-frame {
+  position: absolute;
+  inset: 0;
+  display: block;
+  margin: 0 auto;
+  border: 0;
+  background: var(--surface);
+}
+
+.nd-app-stage[data-scale]:not([data-scale="1"]) .nd-app-frame {
+  margin: 0;
+}
+
+/* --- Estados vazios (C-10): ícone, título 17/600, uma frase e as ações, no centro --- */
+.nd-app-empty {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
+  text-align: center;
+}
+
+.nd-app-empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--r-xl);
+  background: var(--control);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nd-app-empty-title {
+  margin: 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-app-empty-text {
+  margin: 0;
+  max-width: 360px;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+.nd-app-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+/* Progresso indeterminado da subida (sem console): uma faixa que corre; parada sob movimento reduzido. */
+.nd-app-progress {
+  position: relative;
+  width: 200px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  background: var(--control);
+}
+
+.nd-app-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nd-app-progress::after {
+    animation: nd-app-progress 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes nd-app-progress {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(250%);
+  }
+}
+
+/*
+ * --- Porta talvez não liberada na rede (095/T09) ---
+ * Linha discreta abaixo do palco, em `--muted`, com Recarregar ao lado.
+ */
+.nd-app-reach-hint {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-top: 1px solid var(--divider);
+  font-size: var(--fs-label);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+.nd-app-reach-hint > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.nd-app-reach-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+}
