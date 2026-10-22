@@ -206,7 +206,8 @@ resolve_package() {
     SHA=$latest_sha
     return 0
   fi
-  # Versão específica: mesma conta e contêiner do pacote atual, em vX.Y.Z/, com o .sha256 ao lado.
+  # Versão específica: mesma base de endereço do pacote atual (o que vem antes de /vA.B.C/arquivo,
+  # ex.: https://github.com/tm-dev-lab/nants/releases/download), em vX.Y.Z/, com o .sha256 ao lado.
   base=$(printf '%s\n' "$latest_url" | sed 's#/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/[^/]*$##')
   [ -n "$base" ] && [ "$base" != "$latest_url" ] || die no_base "$WANTED"
   VERSION=$WANTED

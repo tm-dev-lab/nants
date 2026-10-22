@@ -6,7 +6,8 @@
 #   target/release/nants; imagem ubuntu:24.04.
 #
 # O que faz:
-#   1. empacota o executável como o release.sh (nants-X.Y.Z-x86_64-linux.tar.gz, com o SHA-256) e
+#   1. empacota o executável como o scripts/package.sh e a Release do GitHub
+#      (nants-X.Y.Z-x86_64-linux.tar.gz, com o SHA-256) e
 #      gera o latest.json com as URLs locais;
 #   2. serve o install.sh, o latest.json e o pacote por HTTP local (python3, porta
 #      NANTS_CHECK_PORT, padrão 18765; nunca 3000 a 3010);
@@ -59,7 +60,7 @@ main() {
   trap cleanup EXIT
   trap 'exit 130' INT TERM
 
-  # 1. Pacote e manifesto, como o release.sh.
+  # 1. Pacote e manifesto, como o scripts/package.sh.
   www=$work/www
   mkdir -p "$www/v$version" "$work/stage"
   cp "$bin" "$work/stage/nants"

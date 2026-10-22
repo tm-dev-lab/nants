@@ -30,7 +30,8 @@ pub const PLAYWRIGHT_REPO: &str = "mcr.microsoft.com/playwright";
 /// Variável que troca o endereço base das versões publicadas (onde fica o `latest.json`).
 pub const RELEASES_URL_ENV: &str = "NANTS_RELEASES_URL";
 /// Endereço base padrão das versões publicadas: o `latest.json` é publicado junto com o site
-/// (spec 103 T03), em `https://nants.tmdevlab.com/latest.json`, com as URLs dos pacotes no Blob.
+/// (spec 103 T03), em `https://nants.tmdevlab.com/latest.json`, com as URLs dos pacotes na
+/// Release do GitHub de `tm-dev-lab/nants` (spec 110).
 pub const DEFAULT_RELEASES_URL: &str = "https://nants.tmdevlab.com";
 /// Comando de instalação e atualização (reinstalar = atualizar).
 pub const INSTALL_COMMAND: &str = "curl -fsSL https://nants.tmdevlab.com/install.sh | sh";

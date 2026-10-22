@@ -73,7 +73,8 @@ curl -fsSL https://nants.tmdevlab.com/install.sh | sh
 ```
 
 The installer verifies the SHA-256 of the package and installs the executable to
-`~/.local/bin/nants`, without `sudo`. Then:
+`~/.local/bin/nants`, without `sudo`. You can also download the packages from the
+[Releases](https://github.com/tm-dev-lab/nants/releases) page. Then:
 
 ```sh
 nants                     # start Nants and open it in your browser
@@ -84,6 +85,16 @@ nants --help              # all commands and options
 - **Update:** run the install command again. `nants doctor` tells you when a new version is out.
 - **Uninstall:** `nants uninstall` removes the executable; `nants uninstall --purge` also removes
   the settings and data. Your projects in `~/NantsProjects` are never deleted.
+
+### Verify a download
+
+Each release is built from this repository by GitHub Actions, with a SHA-256 file and a build
+provenance attestation for every package:
+
+```sh
+sha256sum -c nants-X.Y.Z-x86_64-linux.tar.gz.sha256
+gh attestation verify nants-X.Y.Z-x86_64-linux.tar.gz --repo tm-dev-lab/nants
+```
 
 ## Quick start
 

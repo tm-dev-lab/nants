@@ -1,0 +1,225 @@
+# Builds Nants from this repository and publishes it as a GitHub Release.
+#
+# - Pushing a tag vX.Y.Z (final release) or vX.Y.Z-rc.N (test pre-release): checks the tag
+#   against Cargo.toml and CHANGELOG.md, runs the tests, builds the portable packages with
+#   scripts/package.sh, attests their build provenance and creates the Release with the notes
+#   from CHANGELOG.md. A final release is marked as latest; an rc is a pre-release and never
+#   the latest. X.Y.Z is always the Cargo.toml version.
+# - Run workflow (manual): a rehearsal. It builds and packages and keeps the result as a workflow
+#   artifact, without a Release and without attestations.
+#
+# It uses only the GITHUB_TOKEN of this repository, with no other secret.
+# Verify a download with: gh attestation verify <file> --repo tm-dev-lab/nants
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: "0.13.0"
+  CARGO_ZIGBUILD_VERSION: "0.24.0"
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag, Cargo.toml and CHANGELOG.md
+        if: github.event_name == 'push'
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(awk '/^\[/ { p = ($0 == "[package]"); next } p && /^version[ \t]*=/ { sub(/^version[ \t]*=[ \t]*"/, ""); sub(/".*$/, ""); print; exit }' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no version in the [package] section of Cargo.toml"; exit 1; }
+          if [ "$REF_TYPE" != "tag" ] || ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::invalid tag $TAG (use vX.Y.Z or vX.Y.Z-rc.N)"
+            exit 1
+          fi
+          base=${TAG#v}
+          base=${base%%-*}
+          if [ "$base" != "$version" ]; then
+            echo "::error::the tag $TAG does not match the Cargo.toml version (expected v$version or v$version-rc.N)"
+            exit 1
+          fi
+          if ! grep -Eq "^## \[$(printf '%s' "$version" | sed 's/\./\\./g')\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no ## [$version] section"
+            exit 1
+          fi
+          echo "tag $TAG, version $version"
+
+      - name: Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - name: Git identity for the tests
+        run: |
+          git config --global user.name "nants-ci"
+          git config --global user.email "nants-ci@users.noreply.github.com"
+      - name: cargo test (through scripts/test.sh)
+        run: scripts/test.sh cargo test
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci (web)
+        working-directory: web
+        run: npm ci
+      - name: vitest (through scripts/test.sh)
+        working-directory: web
+        run: ../scripts/test.sh npx vitest run
+      - name: build (tsc and vite)
+        working-directory: web
+        run: npm run build
+      # The interface build is embedded in the executable: web/dist must match what is committed.
+      - name: web/dist matches the commit
+        run: |
+          pending=$(git status --porcelain --untracked-files=normal -- web)
+          if [ -n "$pending" ]; then
+            printf '%s\n' "$pending"
+            echo "::error::the interface build differs from the committed web/dist"
+            exit 1
+          fi
+
+  release:
+    name: ${{ github.event_name == 'push' && 'Release' || 'Package (rehearsal)' }}
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: release
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cache cargo-zigbuild
+        id: zigbuild-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo-zigbuild
+        if: steps.zigbuild-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
+
+      # This repository has no .gitignore: build outputs and caches are ignored only in this
+      # checkout, so the clean tree check of package.sh looks at the committed files.
+      - name: Ignore build outputs in this checkout
+        run: printf '%s\n' /target/ /dist-release/ /.zig-cache/ >>.git/info/exclude
+
+      # The tag (vX.Y.Z or vX.Y.Z-rc.N; package.sh checks it again) or, in the rehearsal,
+      # v + the Cargo.toml version. label is the tag without the v; prerelease marks an rc.
+      - name: Version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(awk '/^\[/ { p = ($0 == "[package]"); next } p && /^version[ \t]*=/ { sub(/^version[ \t]*=[ \t]*"/, ""); sub(/".*$/, ""); print; exit }' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no version in the [package] section of Cargo.toml"; exit 1; }
+          if [ "$EVENT" = "push" ]; then tag=$REF_NAME; else tag="v$version"; fi
+          label=${tag#v}
+          case "$label" in *-rc.*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "label=$label"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: The Release does not exist yet
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::the Release $TAG already exists; it is never overwritten"
+            exit 1
+          fi
+
+      - name: scripts/package.sh
+        env:
+          NOTES: ${{ runner.temp }}/release-notes.md
+          TAG: ${{ steps.version.outputs.tag }}
+        run: scripts/package.sh --skip-tests --tag "$TAG" --notes "$NOTES"
+
+      - name: Keep the packages (rehearsal)
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nants-${{ steps.version.outputs.label }}-rehearsal
+          path: dist-release/${{ steps.version.outputs.tag }}/
+          if-no-files-found: error
+
+      - name: Attest the build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist-release/${{ steps.version.outputs.tag }}/nants-${{ steps.version.outputs.label }}-x86_64-linux.tar.gz
+            dist-release/${{ steps.version.outputs.tag }}/nants-${{ steps.version.outputs.label }}-aarch64-linux.tar.gz
+
+      - name: Create the Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          LABEL: ${{ steps.version.outputs.label }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          NOTES: ${{ runner.temp }}/release-notes.md
+        run: |
+          dir="dist-release/$TAG"
+          if [ "$PRERELEASE" = "true" ]; then
+            set -- --prerelease --latest=false
+          else
+            set -- --latest
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Nants $LABEL" \
+            --notes-file "$NOTES" \
+            "$@" \
+            "$dir/nants-$LABEL-x86_64-linux.tar.gz" \
+            "$dir/nants-$LABEL-x86_64-linux.tar.gz.sha256" \
+            "$dir/nants-$LABEL-aarch64-linux.tar.gz" \
+            "$dir/nants-$LABEL-aarch64-linux.tar.gz.sha256" \
+            "$dir/latest.json"

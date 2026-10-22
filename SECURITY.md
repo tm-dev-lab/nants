@@ -37,3 +37,10 @@ Nants runs locally. Examples of what is in scope:
 - leaks of API keys or other secrets through the interface, logs, events or generated files;
 - ways for agent commands to escape the permission checks or the project folder;
 - problems in the installer or in the verification of release packages.
+
+## Release packages
+
+Releases are built from this repository by GitHub Actions and published on the
+[Releases](https://github.com/tm-dev-lab/nants/releases) page. Every package has a SHA-256 file
+and a build provenance attestation, which you can check with
+`gh attestation verify <file> --repo tm-dev-lab/nants`.

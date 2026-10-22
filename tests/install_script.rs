@@ -108,12 +108,17 @@ fn sha256(path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
 }
 
-/// Gera `vX/nants-X-<arch>-linux.tar.gz` e o `.sha256` em `root`; devolve o SHA.
+/// Gera `files/vX/nants-X-<arch>-linux.tar.gz` e o `.sha256` em `root`; devolve o SHA.
 fn package(root: &Path, version: &str, arch: &str) -> String {
+    package_at(root, "files", version, arch)
+}
+
+/// Como `package`, com a pasta base `prefix` (ex.: o caminho das Releases do GitHub).
+fn package_at(root: &Path, prefix: &str, version: &str, arch: &str) -> String {
     let stage = root.join(format!("stage-{version}-{arch}"));
     write_exec(&stage.join("nants"), &fake_nants(version, arch));
     let file = format!("nants-{version}-{arch}-linux.tar.gz");
-    let dir = root.join(format!("files/v{version}"));
+    let dir = root.join(format!("{prefix}/v{version}"));
     std::fs::create_dir_all(&dir).expect("pasta");
     let st = Command::new("tar").arg("-czf").arg(dir.join(&file)).arg("-C").arg(&stage).arg("nants").status().expect("tar");
     assert!(st.success());
@@ -130,15 +135,20 @@ struct Fixture {
     log: PathBuf,
 }
 
-/// O manifesto no formato do `release.sh` (multilinha) ou compacto numa linha só.
+/// O manifesto no formato do `scripts/package.sh` (multilinha) ou compacto numa linha só.
 fn manifest(f_url: &str, version: &str, sums: &[(&str, String)], compact: bool) -> String {
+    manifest_at(f_url, "files", version, sums, compact)
+}
+
+/// Como `manifest`, com os pacotes sob a pasta base `prefix`.
+fn manifest_at(f_url: &str, prefix: &str, version: &str, sums: &[(&str, String)], compact: bool) -> String {
     let assets: serde_json::Map<String, serde_json::Value> = sums
         .iter()
         .map(|(arch, sum)| {
             (
                 format!("{arch}-linux"),
                 serde_json::json!({
-                    "url": format!("{f_url}/files/v{version}/nants-{version}-{arch}-linux.tar.gz"),
+                    "url": format!("{f_url}/{prefix}/v{version}/nants-{version}-{arch}-linux.tar.gz"),
                     "sha256": sum,
                 }),
             )
@@ -387,6 +397,40 @@ fn nants_version_installs_that_version_from_the_same_base_and_reinstall_updates(
     assert!(installed(&f).is_some_and(|b| b.contains("nants 0.4.2")), "{all}");
     assert!(all.contains("antes: 0.3.0, agora: 0.4.2"), "{all}");
     assert_eq!(home_files(&f), [".local/bin/nants"]);
+}
+
+/// Spec 110: o latest.json aponta para as Releases do GitHub
+/// (`.../releases/download/vA.B.C/arquivo`); o NANTS_VERSION tira a base de lá e acha a outra
+/// versão e o `.sha256` ao lado, no mesmo formato.
+#[test]
+fn nants_version_works_with_github_release_urls() {
+    const GH: &str = "tm-dev-lab/nants/releases/download";
+    let f = fixture("github", false, &[]);
+    let root = f.base.0.join("www");
+    let sum_x = package_at(&root, GH, "0.4.2", "x86_64");
+    let sum_a = package_at(&root, GH, "0.4.2", "aarch64");
+    package_at(&root, GH, "0.3.0", "x86_64");
+    let json = manifest_at(&f.server.url, GH, "0.4.2", &[("x86_64", sum_x), ("aarch64", sum_a)], false);
+    write(&root.join("latest.json"), json.as_bytes());
+
+    let out = run(&f, LINUX, &[("NANTS_VERSION", "v0.3.0")]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(installed(&f).is_some_and(|b| b.contains("nants 0.3.0")), "{all}");
+    let hits = f.server.hits.lock().map(|h| h.clone()).unwrap_or_default();
+    assert_eq!(
+        hits,
+        [
+            "/latest.json".to_string(),
+            format!("/{GH}/v0.3.0/nants-0.3.0-x86_64-linux.tar.gz.sha256"),
+            format!("/{GH}/v0.3.0/nants-0.3.0-x86_64-linux.tar.gz"),
+        ]
+    );
+    // Sem NANTS_VERSION, a última, pela URL do manifesto.
+    let out = run(&f, LINUX, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(installed(&f).is_some_and(|b| b.contains("nants 0.4.2")), "{}", text(&out));
+    assert_eq!(tmp_left(&f), 0);
 }
 
 #[test]
