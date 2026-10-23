@@ -18,7 +18,7 @@ describe("getSpecReport", () => {
   });
 
   it("404 é falha de HTTP (sem relatório), não resposta válida", async () => {
-    installFetch(() => ({ status: 404, body: { error: "relatório não encontrado" } }));
+    installFetch(() => ({ status: 404, body: { error: "relatório não encontrado", code: "report_not_found" } }));
     const result = await getSpecReport("p1", "001-x");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.status).toBe(404);

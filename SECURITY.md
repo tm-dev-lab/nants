@@ -34,7 +34,8 @@ Nants runs locally. Examples of what is in scope:
 
 - a way for another website, device or user to reach or control the local server without the
   user's consent;
-- leaks of API keys or other secrets through the interface, logs, events or generated files;
+- leaks of API keys, ChatGPT plan tokens or other secrets through the interface, logs, events or
+  generated files;
 - ways for agent commands to escape the permission checks or the project folder;
 - problems in the installer or in the verification of release packages.
 
@@ -62,6 +63,31 @@ Known limits:
   not reliable. An attacker on the network who keeps trying can block the add window while they
   insist. Devices already authorized keep working, and this computer can still sign in with the
   terminal link (restart Nants for a new one).
+
+## ChatGPT plan connection
+
+A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and has no API key:
+
+- **Sign-in:** authorization code with PKCE (S256), as a public client, with no client secret.
+  Each attempt has a new `state`, `nonce` and PKCE verifier. The `state` is single use, expires in
+  10 minutes and is bound to the device that started the attempt. The redirect is the loopback
+  address `http://127.0.0.1:<port>/auth/callback`, so the sign-in happens in the browser of the
+  computer running Nants.
+- **Identity:** the ID token is checked before anything is stored: the RS256 signature against the
+  OpenAI keys (JWKS), the exact issuer, the audience, the expiry and the `nonce`. The account must
+  have granted the scope that allows using the plan. A later sign-in that returns a different
+  client id is rejected.
+- **Storage:** the tokens, the client id issued at the first sign-in, the e-mail and the account id
+  are kept in `chatgpt-conn-<id>.json`, and the installation identifier in `chatgpt-host-id.json`,
+  both in the Nants data folder (`~/.local/share/nants`). The files have mode 0600, are written
+  atomically and are never read through a symbolic link. Tokens never go to logs, events or the
+  browser.
+- **Renewal:** the access token is short lived and is renewed a few minutes before it expires, one
+  renewal at a time per connection. The refresh token rotates: each renewal stores the new one. If
+  OpenAI rejects the refresh token, Nants deletes the tokens and asks you to sign in again.
+- **Sign out:** revokes the refresh token at OpenAI and deletes the local sign-in. If OpenAI does
+  not confirm the revocation, the local sign-in is still deleted and Nants says so, pointing to your
+  ChatGPT account settings.
 
 ## Release packages
 

@@ -8,7 +8,7 @@ import { memo, useMemo } from "react";
 import { Icon } from "../../desktop/Icon";
 import { useShell } from "../../desktop/shellContext";
 import { useT } from "../../i18n/react";
-import { useAppStore, type AppState, type PendingPermission } from "../../store";
+import { permissionArrival, useAppStore, type AppState, type PendingPermission } from "../../store";
 import { agentLabel } from "../shared/agents";
 import "../shared/apps.css";
 import { PermissionDecisions } from "../shared/PermissionDecisions";
@@ -18,14 +18,18 @@ import { permissionTitle } from "../conversation/PermissionMessage";
 export const MAX_PERMISSION_TOASTS = 3;
 const PREVIEW_CHARS = 120;
 
-/** Pedidos pendentes de todos os projetos, do mais antigo ao mais novo. */
+/**
+ * Pedidos pendentes de todos os projetos, do mais antigo ao mais novo. Na mesma hora (o relógio
+ * da linha do tempo não recua e repete a hora durante um recuo do relógio de parede), vale a ordem
+ * de chegada ao vivo; sem ela, os pedidos sairiam agrupados por projeto.
+ */
 function pendingAcrossProjects(state: Pick<AppState, "permissions" | "removedProjectIds">): PendingPermission[] {
   const out: PendingPermission[] = [];
   for (const [projectId, list] of Object.entries(state.permissions)) {
     if (state.removedProjectIds[projectId] === true) continue;
     out.push(...list);
   }
-  return out.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  return out.sort((a, b) => (a.at ?? 0) - (b.at ?? 0) || permissionArrival(a.projectId, a.requestId) - permissionArrival(b.projectId, b.requestId));
 }
 
 /** Os avisos visíveis (até 3, os mais recentes) e quantos ficaram de fora. */

@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { refreshActivities } from "../activityRehydrate";
 import type { ProjectEntry, ProjectState, SpecView } from "../api/types";
 import { loadChatHistory } from "../chatHistory";
+import type { ApiFailure } from "../api/client";
 import { t } from "../i18n";
 import { activeSpecIdOf, loadDialog } from "../dialogHistory";
 import { isExecutionMode, isStalledRun, phaseForProject, pickActiveSpec, planStage, reviewWaiting, type PlanStage } from "../phase";
@@ -69,7 +70,7 @@ function isPausedRun(state: ProjectState, spec: SpecView | null): boolean {
  * O espaço está pronto para as janelas (estado carregado e config ou erro de config resolvidos).
  * Fora disso, as permissões pendentes são "órfãs" (ver `orphanPermissions`).
  */
-function spaceReadyFor(config: unknown, configError: string | null, state: ProjectState | null): boolean {
+function spaceReadyFor(config: unknown, configError: ApiFailure | null, state: ProjectState | null): boolean {
   return state !== null && (config !== null || configError !== null);
 }
 
@@ -104,9 +105,9 @@ export interface SpaceData {
   permissions: readonly PendingPermission[];
   /** Permissões pendentes enquanto o espaço não está pronto (decidíveis no "Precisa de você"). */
   orphanPermissions: readonly PendingPermission[];
-  configError: string | null;
+  configError: ApiFailure | null;
   /** Falha do GET de estado (texto fixo do cliente), com `reload` como "Tentar de novo". */
-  loadError: string | null;
+  loadError: ApiFailure | null;
   /** Falha da carga do diálogo da spec ativa, com `retryDialog`. */
   dialogError: boolean;
   /** Acompanhando um turno do Arquiteto depois da queda do POST. */
@@ -161,14 +162,14 @@ export function useSpaceData(projectId: string): SpaceData {
   const permissions = useAppStore((s) => s.permissions[projectId] ?? EMPTY_PERMISSIONS);
   const revision = useAppStore((s) => s.revisions[projectId] ?? 0);
   const liveRevision = useAppStore((s) => s.liveRevisions[projectId] ?? 0);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<ApiFailure | null>(null);
   const [dialogError, setDialogError] = useState(false);
   const [tracking, setTracking] = useState<TurnTracking | null>(null);
 
   const reload = useCallback(async (): Promise<void> => {
     const result = await refreshProjectState(projectId);
     if (result === null) return; // resposta superada por um GET mais novo
-    setLoadError(result.ok ? null : result.error.message);
+    setLoadError(result.ok ? null : result.error);
   }, [projectId]);
 
   useEffect(() => {

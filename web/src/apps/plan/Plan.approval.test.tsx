@@ -147,7 +147,7 @@ describe("Plano: spec sem comando (409 test_command_missing)", () => {
 
   it("turno de chat em andamento (409) mostra a mensagem fixa do chat e libera o botão", async () => {
     const shell = await legacy();
-    chatWith(shell, async () => json({ error: "já existe um turno de chat em andamento para este projeto" }, 409));
+    chatWith(shell, async () => json({ error: "já existe um turno de chat em andamento para este projeto", code: "chat_active" }, 409));
     await approve();
     expect(within(plan()).getByRole("alert").textContent).toContain("já existe um turno de chat em andamento para este projeto");
     expect((within(plan()).getByRole("button", { name: "Aprovar e iniciar" }) as HTMLButtonElement).disabled).toBe(false);
@@ -178,7 +178,7 @@ describe("Plano: falhas da aprovação", () => {
 
   it("422 de agente não configurado oferece Configurar na aba Agentes", async () => {
     const shell = await open(planState(""));
-    shell.server.reply("POST", APPROVE, () => ({ status: 422, body: { error: "agente developer não configurado" } }));
+    shell.server.reply("POST", APPROVE, () => ({ status: 422, body: { error: "agente developer não configurado", code: "developer_not_configured" } }));
     await approve();
     const alert = within(plan()).getByRole("alert");
     expect(within(alert).getByRole("button", { name: "Configurar: Agentes" }).getAttribute("data-settings-tab")).toBe("agents");

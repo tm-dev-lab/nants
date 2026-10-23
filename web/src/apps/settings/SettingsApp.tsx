@@ -24,7 +24,7 @@ import { loadConfig } from "../../configLoader";
 import { AppearanceChoices } from "../../desktop/AppearanceChoices";
 import { LANGS } from "../../i18n/lang";
 import { useT } from "../../i18n/react";
-import { messageText } from "../../i18n/serverCodes";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { readinessItemLabel } from "../shared/readiness";
 import { SETTINGS_WINDOW_TABS, type SettingsWindowTab } from "../../desktop/api";
 import { Icon } from "../../desktop/Icon";
@@ -39,6 +39,9 @@ import "../shared/apps.css";
 import { AgentsForm } from "./AgentsForm";
 import { ConnectionRow } from "./ConnectionRow";
 import { ConnectionForm } from "./ConnectionForm";
+import { dismissChatgptReturn, isPlanConnection, loginErrorText, useChatgptReturn } from "./chatgptPlan";
+import { NewConnection } from "./NewConnection";
+import { PlanConnectionPanel } from "./PlanConnection";
 import { MachineTab } from "./MachineTab";
 import { PricingEditor } from "./PricingEditor";
 import { ProjectsRootTab } from "./ProjectsRootTab";
@@ -73,10 +76,26 @@ function ConfigGate() {
   }
   return (
     <div role="alert" className="nd-stack-sm">
-      <p className="nd-field-error">{messageText(configError)}</p>
+      <p className="nd-field-error">{apiFailureText(configError)}</p>
       <button type="button" className="nd-btn nd-btn-sm nd-self-start" onClick={() => void loadConfig()}>
         <Icon name="refresh" size={14} />
         {t("common.tryAgain")}
+      </button>
+    </div>
+  );
+}
+
+/** Resultado do login pelo plano que voltou para esta página (erro traduzido, com "Dispensar"). */
+function ChatgptLoginError({ reason }: { reason: string }) {
+  const { t } = useT();
+  return (
+    <div role="alert" className="nd-strip nd-settings-missing" data-tone="rose" data-chatgpt-error={reason}>
+      <Icon name="alert" size={14} />
+      <span>
+        {t("chatgpt.loginError.title")} {loginErrorText(reason)}
+      </span>
+      <button type="button" className="nd-btn nd-btn-sm" onClick={dismissChatgptReturn}>
+        {t("common.dismiss")}
       </button>
     </div>
   );
@@ -86,13 +105,22 @@ function ConnectionsTab() {
   const { t } = useT();
   const shell = useShell();
   const config = useAppStore((s) => s.config);
+  const back = useChatgptReturn().result;
   // `null` = só a lista; `"new"` = criação; conexão = edição.
   const [editing, setEditing] = useState<ConnectionView | "new" | null>(null);
   if (config === null) return <ConfigGate />;
   const connections = config.connections;
-  const showForm = editing !== null || connections.length === 0;
+  // Volta de um login concluído: a conexão pronta, com o nome editável e os modelos da conta.
+  const ready = back?.kind === "connected" ? (connections.find((c) => c.id === back.connectionId) ?? null) : null;
+  const editingView = editing !== null && editing !== "new" ? editing : null;
+  const showForm = ready === null && (editing !== null || connections.length === 0);
+  const closeEditor = (): void => {
+    setEditing(null);
+    void shell.reloadReadiness();
+  };
   return (
     <div className="nd-settings-section" data-connections-tab="">
+      {back?.kind === "error" ? <ChatgptLoginError reason={back.reason} /> : null}
       {connections.length > 0 ? (
         <ul className="nd-conn-list" aria-label={t("settings.savedConnections")}>
           {connections.map((c) => (
@@ -100,7 +128,10 @@ function ConnectionsTab() {
               key={c.id}
               connection={c}
               users={connectionUsers(config.agents, c.id)}
-              onEdit={(conn) => setEditing(conn)}
+              onEdit={(conn) => {
+                dismissChatgptReturn();
+                setEditing(conn);
+              }}
               onTested={() => void shell.reloadReadiness()}
             />
           ))}
@@ -108,19 +139,30 @@ function ConnectionsTab() {
       ) : (
         <p className="nd-muted">{t("settings.noConnections")}</p>
       )}
-      {showForm ? (
-        <section className="nd-settings-form" aria-label={editing !== null && editing !== "new" ? t("settings.editConnectionLabel", { name: editing.name }) : t("settings.newConnection")}>
-          <h3 className="nd-strong">{editing !== null && editing !== "new" ? t("settings.editConnectionTitle", { name: editing.name }) : t("settings.newConnection")}</h3>
-          <ConnectionForm
-            key={editing !== null && editing !== "new" ? editing.id : "new"}
-            existingIds={connections.map((c) => c.id)}
-            {...(editing !== null && editing !== "new" ? { initial: editing } : {})}
-            onSaved={() => {
-              setEditing(null);
-              void shell.reloadReadiness();
-            }}
-            {...(connections.length > 0 ? { onCancel: () => setEditing(null) } : {})}
-          />
+      {ready !== null ? (
+        <PlanConnectionPanel
+          key={`ready:${ready.id}`}
+          connection={ready}
+          title={t("chatgpt.ready.title")}
+          onDone={() => {
+            dismissChatgptReturn();
+            void shell.reloadReadiness();
+          }}
+        />
+      ) : editingView !== null && isPlanConnection(editingView) ? (
+        <PlanConnectionPanel key={`edit:${editingView.id}`} connection={editingView} title={t("settings.editConnectionTitle", { name: editingView.name })} onDone={closeEditor} />
+      ) : showForm ? (
+        <section className="nd-settings-form" aria-label={editingView !== null ? t("settings.editConnectionLabel", { name: editingView.name }) : t("settings.newConnection")}>
+          <h3 className="nd-strong">{editingView !== null ? t("settings.editConnectionTitle", { name: editingView.name }) : t("settings.newConnection")}</h3>
+          {editingView !== null ? (
+            <ConnectionForm key={editingView.id} existingIds={connections.map((c) => c.id)} initial={editingView} onSaved={closeEditor} onCancel={() => setEditing(null)} />
+          ) : (
+            <NewConnection
+              existingIds={connections.map((c) => c.id)}
+              onSaved={closeEditor}
+              {...(connections.length > 0 ? { onCancel: () => setEditing(null) } : {})}
+            />
+          )}
         </section>
       ) : (
         <button type="button" className="nd-btn nd-self-start" onClick={() => setEditing("new")}>

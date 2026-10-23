@@ -1777,3 +1777,14 @@
     border-width: 2px;
   }
 }
+
+/* Indicador do plano ChatGPT perto do campo da Conversa (spec 116 T03): uma linha discreta. */
+.nd-plan-indicator {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}

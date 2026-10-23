@@ -199,15 +199,81 @@ pub struct LanViewPortsConfig {
 /// Não há tipos de provedor: toda conexão é OpenAI-compatível e o provedor é
 /// definido pela `base_url`. Campos legados (`provider_type`, `api_version`) no
 /// TOML são ignorados ao carregar e não são mais gravados.
+///
+/// Spec 116: `kind` diz como a conexão se autentica. Ausente (configuração antiga) é a conexão por
+/// chave de hoje. A conexão pelo plano ChatGPT (`chatgpt_plan`) não tem `api_key`, tem a
+/// `base_url` e o `wire_api` fixos ([`Connection::normalize`]) e guarda as credenciais num
+/// arquivo próprio da pasta de dados (`server::chatgpt`).
 pub struct Connection {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    /// Valor literal ou referência no formato `env:NOME_VARIAVEL`.
+    /// Valor literal ou referência no formato `env:NOME_VARIAVEL`. Vazio (e fora do TOML) na
+    /// conexão pelo plano ChatGPT.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
     /// Protocolo de chat usado com esta conexão (padrão `chat`).
     #[serde(default)]
     pub wire_api: WireApi,
+    /// Como a conexão se autentica (spec 116); a por chave não é gravada.
+    #[serde(default, skip_serializing_if = "ConnectionKind::is_api_key")]
+    pub kind: ConnectionKind,
+}
+
+/// Endereço fixo da conexão pelo plano ChatGPT (spec 116).
+pub const CHATGPT_PLAN_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Como a conexão se autentica (spec 116).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionKind {
+    /// Chave de API (literal ou `env:NOME`): a conexão de sempre.
+    #[default]
+    ApiKey,
+    /// Plano ChatGPT (Plus ou Pro), pelo login OAuth; sem chave.
+    ChatgptPlan,
+}
+
+impl ConnectionKind {
+    pub fn is_api_key(&self) -> bool {
+        *self == ConnectionKind::ApiKey
+    }
+
+    /// Forma textual usada na API (`"api_key"` ou `"chatgpt_plan"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectionKind::ApiKey => "api_key",
+            ConnectionKind::ChatgptPlan => "chatgpt_plan",
+        }
+    }
+}
+
+impl Connection {
+    /// Conexão pelo plano ChatGPT com a `base_url` e o `wire_api` fixos e sem chave.
+    pub fn chatgpt_plan(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            base_url: CHATGPT_PLAN_BASE_URL.to_string(),
+            api_key: String::new(),
+            wire_api: WireApi::Responses,
+            kind: ConnectionKind::ChatgptPlan,
+        }
+    }
+
+    pub fn is_chatgpt_plan(&self) -> bool {
+        self.kind == ConnectionKind::ChatgptPlan
+    }
+
+    /// Fixa os campos da conexão pelo plano ChatGPT (config editada à mão): `base_url`,
+    /// `wire_api` e nenhuma chave. A conexão por chave não muda.
+    pub fn normalize(&mut self) {
+        if self.is_chatgpt_plan() {
+            self.base_url = CHATGPT_PLAN_BASE_URL.to_string();
+            self.wire_api = WireApi::Responses;
+            self.api_key.clear();
+        }
+    }
 }
 
 /// Protocolo HTTP de uma conexão: Chat Completions ou Responses (`/v1/responses`).
@@ -240,6 +306,7 @@ impl std::fmt::Debug for Connection {
             .field("base_url", &self.base_url)
             .field("api_key", &"***")
             .field("wire_api", &self.wire_api)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -389,6 +456,7 @@ mod tests {
             base_url: "https://x".into(),
             api_key: "sk-segredo-123".into(),
             wire_api: WireApi::Responses,
+            kind: Default::default(),
         };
         let dbg = format!("{conn:?}");
         assert!(!dbg.contains("sk-segredo-123"), "vazou segredo: {dbg}");
@@ -430,6 +498,7 @@ api_key = "k"
                 base_url: "https://x".into(),
                 api_key: "k".into(),
                 wire_api: wire,
+                kind: Default::default(),
             })
             .expect("toml");
             assert!(text.contains(&format!("wire_api = \"{}\"", wire.as_str())), "{text}");

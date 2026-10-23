@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
 use super::error::ApiError;
@@ -77,10 +77,6 @@ pub const STOPPED_REASON: &str = "execução parada";
 /// Teto de pedidos pendentes por projeto; excedente é negado sem registro nem evento.
 pub const MAX_PENDING_PER_PROJECT: usize = 64;
 
-/// Mensagem uniforme para pedido desconhecido, de outro projeto ou já resolvido.
-const PENDING_NOT_FOUND: &str = "pedido de permissão não encontrado";
-/// Mensagem para projeto inexistente.
-const PROJECT_NOT_FOUND: &str = "projeto não encontrado";
 
 /// Serializa a leitura-modificação-escrita de `.sdd/settings.yaml` (todos os projetos).
 /// Nunca é segurado em `.await`: só dentro de `persist_always`, em thread bloqueante.
@@ -102,6 +98,18 @@ pub const ALWAYS_REASON_SECRET: &str =
 /// Motivo fixo: em modo docker, "sempre" para comando que invoca docker/podman é inútil.
 pub const ALWAYS_REASON_DOCKER: &str =
     "em modo docker, comandos que invocam docker/podman não são liberados permanentemente";
+
+/// Código estável do motivo de não haver "sempre" (spec 115 T03): a interface mostra
+/// `permission.always.<código>` no idioma ativo; o motivo em texto segue só como reserva.
+pub fn always_denied_code(reason: &str) -> &'static str {
+    match reason {
+        crate::harness::allowlist::ALWAYS_REASON_ARBITRARY => "arbitrary",
+        crate::harness::allowlist::ALWAYS_REASON_CHARS => "operators",
+        ALWAYS_REASON_SECRET => "secret",
+        ALWAYS_REASON_DOCKER => "docker",
+        _ => "generic",
+    }
+}
 
 /// Pedido aguardando decisão humana.
 struct Pending {
@@ -137,6 +145,9 @@ struct Pending {
 struct EnvPayload {
     reason: String,
     diff: String,
+    /// Tipo estável do pedido ([`ENV_KIND`], [`CONFIG_KIND`] ou [`FINAL_FIX_KIND`]): é por ele, e
+    /// não pelo texto exibido (no idioma do projeto), que o pedido é reconhecido (spec 114 T02).
+    change_kind: &'static str,
 }
 
 /// Dados de um pedido novo, já calculados a partir do comando completo.
@@ -166,6 +177,8 @@ pub struct PendingView {
     pub always_allowed: bool,
     /// Motivo fixo para `always_allowed == false`; `None` quando é permitido.
     pub always_denied_reason: Option<&'static str>,
+    /// Código do motivo ([`always_denied_code`]), traduzido pela interface; `None` quando é permitido.
+    pub always_denied_code: Option<&'static str>,
     /// `"environment"` para mudança de ambiente; ausente nos pedidos de comando.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
@@ -175,6 +188,10 @@ pub struct PendingView {
     /// Diff unificado, texto puro (só `environment`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Tipo estável do pedido de alteração (`environment`, `config` ou `final_fix`); interno, o
+    /// `/api/attention` reconhece a correção final por ele (spec 114 T02).
+    #[serde(skip)]
+    pub change_kind: Option<&'static str>,
 }
 
 /// Concessões em memória de um run: `run` do humano e `test_command` exato.
@@ -400,9 +417,11 @@ impl ApprovalRegistry {
                         task_id: p.task_id.clone(),
                         always_allowed: p.always_allowed,
                         always_denied_reason: p.always_denied_reason,
+                        always_denied_code: p.always_denied_reason.map(always_denied_code),
                         kind: p.environment.as_ref().map(|_| ENV_KIND),
                         reason: p.environment.as_ref().map(|e| e.reason.clone()),
                         diff: p.environment.as_ref().map(|e| e.diff.clone()),
+                        change_kind: p.environment.as_ref().map(|e| e.change_kind),
                     };
                     (p.seq, view)
                 })
@@ -506,6 +525,8 @@ pub struct ProjectApprover {
     /// Parada pedida pelo usuário na execução deste aprovador (spec 087 T06): vira `true` e libera
     /// os pedidos pendentes como negados. `None` fora de uma execução (chat, relatório...).
     stop: Option<watch::Receiver<bool>>,
+    /// Idioma do projeto dos textos dos pedidos e das aprovações automáticas (spec 114 T02).
+    lang: crate::i18n::SharedLang,
 }
 
 /// Pedido genérico de alteração (ambiente ou configuração de testes) para [`ProjectApprover::decide_change`].
@@ -523,12 +544,10 @@ struct ChangeRequest<'a> {
 
 /// `kind` da linha de aprovação automática (YOLO) da correção de configuração de testes.
 pub const CONFIG_KIND: &str = "config";
-const CONFIG_COMMAND: &str = "Alterar o comando de testes do projeto (test_command/checks)";
 
-/// `kind` da aprovação automática (YOLO) da tarefa de correção da verificação final.
+/// `kind` da aprovação automática (YOLO) da tarefa de correção da verificação final; é também o
+/// tipo estável do pedido, pelo qual o `/api/attention` o reconhece (o texto sai no idioma do projeto).
 pub const FINAL_FIX_KIND: &str = "final_fix";
-/// Texto fixo do pedido da correção final (o `/api/attention` o reconhece por ele).
-pub const FINAL_FIX_COMMAND: &str = "Criar tarefa de correção dos critérios globais não atendidos";
 
 impl crate::agents::runner::FinalGate for ProjectApprover {
     fn approve_fix<'a>(&'a self, _spec_id: &'a str, reason: &'a str) -> crate::agents::runner::Fut<'a, bool> {
@@ -538,11 +557,10 @@ impl crate::agents::runner::FinalGate for ProjectApprover {
 
 /// Prefixo fixo da mensagem de aprovação automática (evento e linha de diálogo).
 pub const YOLO_AUTO_PREFIX: &str = "aprovada automaticamente";
-/// Código (spec 102) do aviso de aprovação automática ignorada; a interface o traduz.
+/// Código (spec 102) do aviso de aprovação automática ignorada (uma linha de sistema por run,
+/// quando `.sdd/settings.yaml` está inválido); a interface o traduz, e o texto de reserva é
+/// `system.run.yolo_ignored` no idioma do projeto (spec 115 T03).
 pub const CODE_YOLO_IGNORED: &str = "run.yolo_ignored";
-/// Linha de sistema (uma por run) quando a aprovação automática foi ignorada por `.sdd/settings.yaml` inválido.
-pub const YOLO_IGNORED_TEXT: &str =
-    "Aprovação automática ignorada: .sdd/settings.yaml está inválido e não pôde ser lido; os pedidos de permissão vão para você até corrigir o arquivo.";
 
 impl ProjectApprover {
     pub fn new(
@@ -564,7 +582,20 @@ impl ProjectApprover {
             judge: None,
             judge_cache: Arc::new(Mutex::new(HashMap::new())),
             stop: None,
+            lang: crate::i18n::SharedLang::default(),
         }
+    }
+
+    /// Idioma do projeto dos pedidos e das aprovações automáticas (spec 114 T02); lido a cada
+    /// pedido, então a troca de idioma vale para os próximos.
+    pub fn with_lang(mut self, lang: crate::i18n::SharedLang) -> Self {
+        self.lang = lang;
+        self
+    }
+
+    /// Texto da chave no idioma atual do projeto.
+    fn tr(&self, key: &str, params: &[(&str, &str)]) -> String {
+        crate::i18n::tr(self.lang.get(), key, params)
     }
 
     /// Liga a parada da execução (spec 087 T06): com ela pedida, cada pedido pendente deste
@@ -660,7 +691,7 @@ impl ProjectApprover {
                 Some(self.project_id.clone()),
                 json!({
                     "agent": "system",
-                    "text": YOLO_IGNORED_TEXT,
+                    "text": self.tr(&format!("system.{CODE_YOLO_IGNORED}"), &[]),
                     "code": CODE_YOLO_IGNORED,
                     "params": {},
                     "task_id": Value::Null,
@@ -710,7 +741,7 @@ impl ProjectApprover {
     fn announce_judge_refusal(&self, role: Role, task_id: Option<&str>, command: &str, reason: &str) {
         let text = truncate_command(&scrub_text(
             &self.secrets,
-            &format!("A aprovação automática não liberou sozinha ({reason}); aguardando você: {command}"),
+            &self.tr("approvals.judge_refusal", &[("reason", reason), ("command", command)]),
         ));
         deliver(
             &self.events,
@@ -750,8 +781,8 @@ impl ProjectApprover {
             role: req.role,
             task_id: req.task_id.as_deref(),
             reason: &req.reason,
-            command: format!("Alterar o ambiente Docker: {}", paths.join(", ")),
-            auto_detail: format!("alterar o ambiente Docker ({}). Motivo: {}", paths.join(", "), req.reason),
+            command: self.tr("approvals.env.command", &[("paths", &paths.join(", "))]),
+            auto_detail: self.tr("approvals.env.auto", &[("paths", &paths.join(", ")), ("reason", &req.reason)]),
             auto_kind: ENV_KIND,
             diff,
             auto_allowed: true,
@@ -780,12 +811,14 @@ impl ProjectApprover {
                 yolo_host_verdict(seg, &self.project_root) == YoloHostVerdict::Auto
             }
         });
+        let command = self.tr("approvals.config.command", &[]);
+        let auto_detail = self.tr("approvals.auto_with_reason", &[("command", &command), ("reason", reason)]);
         let change = ChangeRequest {
             role: Role::Architect,
             task_id,
             reason,
-            command: CONFIG_COMMAND.to_string(),
-            auto_detail: format!("{CONFIG_COMMAND}. Motivo: {reason}"),
+            command,
+            auto_detail,
             auto_kind: CONFIG_KIND,
             diff: diff.to_string(),
             auto_allowed,
@@ -796,12 +829,14 @@ impl ProjectApprover {
     /// Pedido HITL da tarefa de correção da verificação final (spec 059/T02): reaproveita o
     /// pedido `environment` da UI; YOLO aprova sozinho (`kind: "final_fix"`). `true` = criar.
     pub async fn approve_final_fix(&self, reason: &str) -> bool {
+        let command = self.tr("approvals.final_fix.command", &[]);
+        let auto_detail = self.tr("approvals.auto_with_reason", &[("command", &command), ("reason", reason)]);
         let change = ChangeRequest {
             role: Role::Architect,
             task_id: None,
             reason,
-            command: FINAL_FIX_COMMAND.to_string(),
-            auto_detail: format!("{FINAL_FIX_COMMAND}. Motivo: {reason}"),
+            command,
+            auto_detail,
             auto_kind: FINAL_FIX_KIND,
             diff: String::new(),
             auto_allowed: true,
@@ -830,7 +865,11 @@ impl ProjectApprover {
             format!("{}{TRUNCATED_SUFFIX}", &t[..end])
         };
         let command = clip(&req.command, MAX_EVENT_COMMAND_BYTES);
-        let payload = EnvPayload { reason: clip(req.reason, MAX_ENV_REASON_BYTES), diff: clip(&req.diff, MAX_ENV_DIFF_BYTES) };
+        let payload = EnvPayload {
+            reason: clip(req.reason, MAX_ENV_REASON_BYTES),
+            diff: clip(&req.diff, MAX_ENV_DIFF_BYTES),
+            change_kind: req.auto_kind,
+        };
         let task_id = req.task_id.map(|t| scrub_text(&self.secrets, t));
         let agent = role_name(req.role);
         let Ok((request_id, rx)) = self.registry.register_draft(PendingDraft {
@@ -862,6 +901,7 @@ impl ProjectApprover {
                 "diff": payload.diff,
                 "always_allowed": false,
                 "always_denied_reason": null,
+                "always_denied_code": null,
             }),
         ));
         self.await_decision(&request_id, rx).await
@@ -907,14 +947,16 @@ impl ProjectApprover {
                         }
                         YoloHostVerdict::NeedsJudge(why) => {
                             // Seguro ⇒ aprova com o motivo; inseguro/erro ⇒ humano.
-                            match self.judge_verdict(&req.command, &why).await {
+                            // O juiz lê a dúvida em pt-BR (o prompt dele); sem juiz, a pessoa a
+                            // lê no idioma do projeto (spec 115 T03).
+                            match self.judge_verdict(&req.command, &why.text(crate::i18n::Lang::PtBr)).await {
                                 Some(v) if v.safe => {
-                                    let detail = format!("{} (juiz: {})", req.command, v.reason);
+                                    let detail = self.tr("approvals.judge_auto", &[("command", &req.command), ("reason", &v.reason)]);
                                     self.announce_auto(req.role, req.task_id.as_deref(), "command", &detail);
                                     return ApprovalDecision::Once;
                                 }
                                 Some(v) => self.announce_judge_refusal(req.role, req.task_id.as_deref(), &req.command, &v.reason),
-                                None => self.announce_judge_refusal(req.role, req.task_id.as_deref(), &req.command, &why),
+                                None => self.announce_judge_refusal(req.role, req.task_id.as_deref(), &req.command, &why.text(self.lang.get())),
                             }
                         }
                         YoloHostVerdict::Excluded(_) => {}
@@ -973,6 +1015,7 @@ impl ProjectApprover {
                 "command": truncate_command(&command),
                 "always_allowed": always_allowed,
                 "always_denied_reason": denied_reason,
+                "always_denied_code": denied_reason.map(always_denied_code),
             }),
         ));
         self.await_decision(&request_id, rx).await
@@ -1034,23 +1077,19 @@ pub fn validate_request_id(id: &str) -> Result<(), ApiError> {
     if valid {
         Ok(())
     } else {
-        Err(ApiError::unprocessable(
-            "request_id deve ter 32 caracteres hexadecimais minúsculos",
-        ))
+        Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "request_id_invalid", Map::new()))
     }
 }
 
 fn parse_decision(body: &[u8]) -> Result<ApprovalDecision, ApiError> {
     let value: Value = serde_json::from_slice(body)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado"))?;
+        .map_err(|_| ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new()))?;
     match value.get("decision").and_then(Value::as_str) {
         Some("once") => Ok(ApprovalDecision::Once),
         Some("run") => Ok(ApprovalDecision::Run),
         Some("always") => Ok(ApprovalDecision::Always),
         Some("deny") => Ok(ApprovalDecision::Deny),
-        _ => Err(ApiError::unprocessable(
-            "decision deve ser \"once\", \"run\", \"always\" ou \"deny\"",
-        )),
+        _ => Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "decision_invalid", Map::new())),
     }
 }
 
@@ -1103,7 +1142,7 @@ pub(super) async fn wait_stop(stop: Option<watch::Receiver<bool>>) {
 }
 
 fn pending_not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, PENDING_NOT_FOUND)
+    ApiError::coded(StatusCode::NOT_FOUND, "permission_not_found", Map::new())
 }
 
 /// Persiste `command` em `allowed_commands` do projeto. `false` se não for seguro ou falhar.
@@ -1188,7 +1227,7 @@ pub async fn resolve_permission(
     // ou publicado. Ordem de locks: config → approvals (a mesma de `remove_project`).
     let config = state.config().read().await;
     if !config.projects.iter().any(|p| p.id == id) {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND));
+        return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()));
     }
     state.pause(PAUSE_AFTER_PERMISSION_LOOKUP).await;
     let decision = parse_decision(&body)?;
@@ -1717,7 +1756,7 @@ mod tests {
         assert_eq!(join(handle).await, ApprovalDecision::Deny);
         let (second, body) = send(&h.state, decide_req("proj", &id, "deny")).await;
         assert_eq!(second, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], PENDING_NOT_FOUND);
+        assert_eq!(body["code"], "permission_not_found");
     }
 
     #[tokio::test]
@@ -1726,7 +1765,7 @@ mod tests {
         let (id, handle) = start_approval(&h, "echo hi").await;
         let (status, body) = send(&h.state, decide_req("outro", &id, "once")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], PENDING_NOT_FOUND);
+        assert_eq!(body["code"], "permission_not_found");
         assert_eq!(h.registry.len(), 1, "pedido alheio não é removido");
 
         let (status, body) = send(&h.state, decide_req("proj", &id, "once")).await;
@@ -1740,10 +1779,10 @@ mod tests {
         let unknown = "0".repeat(32);
         let (status, body) = send(&h.state, decide_req("proj", &unknown, "once")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], PENDING_NOT_FOUND);
+        assert_eq!(body["code"], "permission_not_found");
         let (status, body) = send(&h.state, decide_req("ghost", &unknown, "once")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], PROJECT_NOT_FOUND);
+        assert_eq!(body["code"], "project_not_found");
     }
 
     #[tokio::test]
@@ -2263,6 +2302,8 @@ mod tests {
         assert_eq!(list[1].always_denied_reason, None);
         assert!(!list[2].always_allowed);
         assert_eq!(list[2].always_denied_reason, Some(ALWAYS_REASON_CHARS));
+        // Spec 115 T03: o código do motivo, que a interface traduz.
+        assert_eq!(list.iter().map(|v| v.always_denied_code).collect::<Vec<_>>(), [Some("arbitrary"), None, Some("operators")]);
 
         let approver = h.approver(Some(Duration::from_millis(20)));
         let mut rx = h.state.events().subscribe();
@@ -2270,6 +2311,7 @@ mod tests {
         let payload = next_permission(&mut rx).await;
         assert_eq!(payload["always_allowed"], json!(false));
         assert_eq!(payload["always_denied_reason"], json!(ALWAYS_REASON_ARBITRARY));
+        assert_eq!(payload["always_denied_code"], json!("arbitrary"));
     }
 
     #[tokio::test]
@@ -2395,6 +2437,7 @@ mod tests {
         let payload = next_permission(&mut rx).await;
         assert_eq!(payload["always_allowed"], json!(false));
         assert_eq!(payload["always_denied_reason"], json!(ALWAYS_REASON_SECRET));
+        assert_eq!(payload["always_denied_code"], json!("secret"));
         assert_eq!(h.registry.list_pending("proj").len(), 0);
 
         let (id, handle) = start_request(&h, h.approver(None).with_run(run.clone()), Role::Developer, &command).await;
@@ -2432,6 +2475,7 @@ mod tests {
         let payload = next_permission(&mut rx).await;
         assert_eq!(payload["always_allowed"], json!(false));
         assert_eq!(payload["always_denied_reason"], json!(ALWAYS_REASON_DOCKER));
+        assert_eq!(payload["always_denied_code"], json!("docker"));
     }
 
     // ----- Modo YOLO (spec 037/T01) -----
@@ -2541,6 +2585,100 @@ mod tests {
         assert_eq!(approver.approve_config_change(None, "r", "d", &bad).await, ApprovalDecision::Deny);
     }
 
+    /// Spec 114 T02 (achado 11): a aprovação automática da correção final sai no idioma do
+    /// projeto; o prefixo (marcador lido pela web) e o `kind` não mudam.
+    #[tokio::test]
+    async fn yolo_final_fix_line_follows_project_language() {
+        use crate::i18n::{Lang, SharedLang};
+        for (lang, tag, expected) in [
+            (
+                Lang::En,
+                "yolo-final-en",
+                "aprovada automaticamente: Create a fix task for the unmet global criteria. Reason: Final verification: 1 of 2 criteria met. Create a fix task?",
+            ),
+            (
+                Lang::PtBr,
+                "yolo-final-pt",
+                "aprovada automaticamente: Criar tarefa de correção dos critérios globais não atendidos. Motivo: Verificação final: 1 de 2 critérios atendidos. Criar tarefa de correção?",
+            ),
+        ] {
+            let h = harness(tag);
+            set_yolo(&h, true, &[]);
+            let mut rx = h.state.events().subscribe();
+            let approver = h.approver(Some(Duration::from_millis(80))).with_lang(SharedLang::new(lang));
+            let question = crate::i18n::tr(lang, "runner.final_fix.reason", &[("met", "1"), ("total", "2")]);
+            assert!(approver.approve_final_fix(&question).await);
+            let lines = drain_agent_messages(&mut rx);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["text"], expected);
+            assert_eq!(lines[0]["kind"], FINAL_FIX_KIND);
+            assert_eq!(lines[0]["yolo_auto"], true);
+        }
+    }
+
+    /// Spec 114 T02: sem YOLO, o pedido da correção final vai ao humano com o texto no idioma do
+    /// projeto e o tipo estável `final_fix`, pelo qual o `/api/attention` o reconhece.
+    #[tokio::test]
+    async fn final_fix_request_has_project_language_text_and_stable_kind() {
+        use crate::i18n::{Lang, SharedLang};
+        let h = harness("final-fix-en");
+        let mut rx = h.state.events().subscribe();
+        let approver = h.approver(None).with_lang(SharedLang::new(Lang::En));
+        let handle = tokio::spawn(async move { approver.approve_final_fix("Final verification: 1 of 2 criteria met. Create a fix task?").await });
+        let payload = next_permission(&mut rx).await;
+        assert_eq!(payload["command"], "Create a fix task for the unmet global criteria");
+        assert_eq!(payload["kind"], ENV_KIND, "a interface segue com o cartão de alteração");
+        let pending = h.registry.list_pending("proj");
+        assert_eq!(pending[0].change_kind, Some(FINAL_FIX_KIND));
+        let id = payload["request_id"].as_str().expect("id").to_string();
+        let (status, body) = send(&h.state, decide_req("proj", &id, "deny")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!handle.await.expect("join"));
+    }
+
+    /// Spec 114 T02 (sentinela): perguntas e aprovações automáticas de ambiente e de configuração
+    /// de testes em en não têm texto fixo em pt; o pt-BR continua como era.
+    #[tokio::test]
+    async fn change_requests_follow_project_language() {
+        use crate::harness::tools::{EnvChangeRequest, EnvFileChange};
+        use crate::i18n::{Lang, SharedLang};
+        let h = harness("yolo-change-en");
+        set_yolo(&h, true, &[]);
+        let mut rx = h.state.events().subscribe();
+        let approver = h.approver(Some(Duration::from_millis(80))).with_lang(SharedLang::new(Lang::En));
+        let req = EnvChangeRequest {
+            role: Role::Developer,
+            task_id: None,
+            reason: "need curl".into(),
+            files: vec![EnvFileChange { path: ".nants/Dockerfile".into(), diff: "-a\n+b\n".into() }],
+        };
+        assert_eq!(approver.approve_environment(&req).await, ApprovalDecision::Once);
+        assert_eq!(approver.approve_config_change(None, "tests need deps", "d", &["npm test".to_string()]).await, ApprovalDecision::Once);
+        let texts: Vec<String> = drain_agent_messages(&mut rx).iter().map(|m| m["text"].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "aprovada automaticamente: change the Docker environment (.nants/Dockerfile). Reason: need curl".to_string(),
+                "aprovada automaticamente: Change the project test command (test_command/checks). Reason: tests need deps".to_string(),
+            ]
+        );
+        for t in &texts {
+            let rest = t.trim_start_matches(YOLO_AUTO_PREFIX);
+            for word in ["alterar", "motivo", "ambiente", "comando", "não"] {
+                assert!(!rest.to_lowercase().contains(word), "pt no caminho en ({word}): {t}");
+            }
+        }
+        let h = harness("yolo-change-pt");
+        set_yolo(&h, true, &[]);
+        let mut rx = h.state.events().subscribe();
+        let approver = h.approver(Some(Duration::from_millis(80)));
+        assert_eq!(approver.approve_config_change(None, "r", "d", &["npm test".to_string()]).await, ApprovalDecision::Once);
+        assert_eq!(
+            drain_agent_messages(&mut rx)[0]["text"],
+            "aprovada automaticamente: Alterar o comando de testes do projeto (test_command/checks). Motivo: r"
+        );
+    }
+
     #[tokio::test]
     async fn yolo_container_commands_use_hard_exclusions_only() {
         let h = harness("yolo-ctr");
@@ -2564,6 +2702,22 @@ mod tests {
         assert_eq!(approver.approve(&ctr("mix deps.get")).await, ApprovalDecision::Deny);
     }
 
+    /// Spec 115 T03: cada motivo fixo de "sempre" recusado tem o seu código; o resto é genérico.
+    #[test]
+    fn always_denied_reasons_map_to_stable_codes() {
+        use crate::harness::allowlist::ALWAYS_REASON_GENERIC;
+        for (reason, code) in [
+            (ALWAYS_REASON_ARBITRARY, "arbitrary"),
+            (ALWAYS_REASON_CHARS, "operators"),
+            (ALWAYS_REASON_SECRET, "secret"),
+            (ALWAYS_REASON_DOCKER, "docker"),
+            (ALWAYS_REASON_GENERIC, "generic"),
+            ("outro motivo", "generic"),
+        ] {
+            assert_eq!(always_denied_code(reason), code, "{reason}");
+        }
+    }
+
     /// C-08: settings inválido com `yolo: true` manda o pedido ao humano e avisa UMA vez por run.
     #[tokio::test]
     async fn invalid_settings_with_yolo_warns_once_per_run() {
@@ -2578,17 +2732,25 @@ mod tests {
         assert_eq!(approver.approve(&req_of(Role::Developer, "npm install y")).await, ApprovalDecision::Deny);
         let warnings: Vec<Value> = drain_agent_messages(&mut rx)
             .into_iter()
-            .filter(|m| m["text"] == YOLO_IGNORED_TEXT)
+            .filter(|m| m["code"] == CODE_YOLO_IGNORED)
             .collect();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0]["agent"], "system");
         assert_eq!(warnings[0]["code"], CODE_YOLO_IGNORED, "spec 102: aviso com code");
-        // Outro run avisa de novo.
+        // Spec 115 T03: o texto de reserva vem do dicionário, no idioma do projeto.
+        assert_eq!(warnings[0]["text"], crate::i18n::text(crate::i18n::Lang::PtBr, "system.run.yolo_ignored"));
+        assert!(warnings[0]["text"].as_str().unwrap_or("").starts_with("Aprovação automática ignorada"));
+        // Outro run avisa de novo, agora em inglês.
         let run2 = h.registry.begin_run("proj", None);
-        let approver2 = h.approver(Some(Duration::from_millis(60))).with_run(run2);
+        let approver2 = h
+            .approver(Some(Duration::from_millis(60)))
+            .with_lang(crate::i18n::SharedLang::new(crate::i18n::Lang::En))
+            .with_run(run2);
         let mut rx = h.state.events().subscribe();
         assert_eq!(approver2.approve(&req_of(Role::Developer, "npm install z")).await, ApprovalDecision::Deny);
-        assert_eq!(drain_agent_messages(&mut rx).iter().filter(|m| m["text"] == YOLO_IGNORED_TEXT).count(), 1);
+        let again: Vec<Value> = drain_agent_messages(&mut rx).into_iter().filter(|m| m["code"] == CODE_YOLO_IGNORED).collect();
+        assert_eq!(again.len(), 1);
+        assert!(again[0]["text"].as_str().unwrap_or("").starts_with("Automatic approval ignored"), "{again:?}");
     }
 
     #[tokio::test]
@@ -2599,7 +2761,7 @@ mod tests {
         let approver = h.approver(Some(Duration::from_millis(60))).with_run(run);
         let mut rx = h.state.events().subscribe();
         assert_eq!(approver.approve(&req_of(Role::Developer, "npm install x")).await, ApprovalDecision::Deny);
-        assert!(drain_agent_messages(&mut rx).iter().all(|m| m["text"] != YOLO_IGNORED_TEXT));
+        assert!(drain_agent_messages(&mut rx).iter().all(|m| m["code"] != CODE_YOLO_IGNORED));
     }
 
     #[tokio::test]
@@ -2704,9 +2866,17 @@ mod tests {
     async fn yolo_judge_unsafe_error_or_missing_goes_to_the_human_with_reason() {
         let h = harness("yolo-judge-unsafe");
         set_yolo(&h, true, &[]);
-        for (reply, expected) in [(verdict(false, "apaga fora da raiz"), "apaga fora da raiz"), (Err("falha".to_string()), "expansão dinâmica")] {
+        // Spec 115 T03: sem resposta do juiz, a dúvida chega no idioma do projeto.
+        for (reply, lang, expected) in [
+            (verdict(false, "apaga fora da raiz"), crate::i18n::Lang::PtBr, "apaga fora da raiz"),
+            (Err("falha".to_string()), crate::i18n::Lang::PtBr, "expansão dinâmica em: $(pwd)/.."),
+            (Err("falha".to_string()), crate::i18n::Lang::En, "dynamic expansion in: $(pwd)/.."),
+        ] {
             let judge = FakeJudge::new(reply);
-            let approver = h.approver(Some(Duration::from_millis(80))).with_judge(judge.clone());
+            let approver = h
+                .approver(Some(Duration::from_millis(80)))
+                .with_judge(judge.clone())
+                .with_lang(crate::i18n::SharedLang::new(lang));
             let mut rx = h.state.events().subscribe();
             let decision = approver.approve(&req_of(Role::Developer, "rm -rf $(pwd)/..")).await;
             assert_eq!(decision, ApprovalDecision::Deny, "sem humano o timeout nega");

@@ -594,6 +594,7 @@ async fn get_redacts_secret_written_in_clear_after_the_fact() {
         base_url: "https://api.example.com/v1".into(),
         api_key: SECRET.into(),
         wire_api: crate::config::WireApi::default(),
+        kind: Default::default(),
     });
     let state = AppState::new(root.join("config.toml"), cfg, 3000);
     let (_, body) = get(&state, &uri(PROJECT, SPEC, ""), HOST).await;

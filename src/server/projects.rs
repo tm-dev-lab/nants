@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::approvals::{replace_atomic, PendingView, PERSIST_LOCK};
 use super::config_api::{redact_urls, sanitize_for_view, save_atomic, validate_text_field, INVALID_VIEW};
@@ -27,7 +27,7 @@ use super::error::ApiError;
 use super::events::{validate_project_id, ApiEvent, EventType, SecretSet};
 use super::runs::RunView;
 use super::safe_fs::{self, SafeFsError, MAX_READ_BYTES};
-use super::state::{AppState, ReserveError, REMOVE_RESERVATION, REPORT_BUSY_MSG, SETTINGS_RESERVATION};
+use super::state::{AppState, ReserveError, REMOVE_RESERVATION, REPORT_BUSY_CODE, SETTINGS_RESERVATION};
 use super::dialog::{self, DIALOG_EXCLUDE_LINE, DIALOG_TMP_EXCLUDE_LINE};
 use super::report::{REPORT_EXCLUDE_LINE, REPORT_TMP_EXCLUDE_LINE};
 use crate::config::{Config, Project};
@@ -58,12 +58,6 @@ const EXCLUDE_REL: &str = ".git/info/exclude";
 const DEFAULT_BASE_BRANCH: &str = "main";
 /// Tamanho máximo do trecho com slug do id do projeto.
 const SLUG_MAX_CHARS: usize = 40;
-/// Mensagem estática para falhas de inicialização do `.sdd`.
-const INIT_ERROR: &str = "falha ao inicializar .sdd do projeto";
-/// Mensagem estática (409) para destinos da inicialização com tipo inválido.
-const INIT_TARGET_INVALID: &str = "estrutura do projeto inválida para inicialização";
-/// Mensagem estática (409) para `settings.yaml` que não é arquivo regular.
-const CONFIG_INVALID: &str = "arquivo de configuração do projeto inválido";
 /// Limite de leitura de `.git/HEAD`.
 const HEAD_MAX_BYTES: u64 = 4096;
 /// Prefixo de `HEAD` simbólico apontando para uma branch local.
@@ -76,10 +70,6 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDACTED_ID: &str = "[redigido]";
 /// Mensagem exibida quando um arquivo do `.sdd` não pode ser lido ou interpretado.
 pub const INVALID_FILE: &str = "arquivo inválido";
-/// Mensagem (409) quando o projeto já tem execução em andamento.
-const RUN_ACTIVE_MSG: &str = "já existe uma execução em andamento neste projeto";
-/// Mensagem (500) quando o comando de testes não pode ser gravado.
-const SETTINGS_SAVE_ERROR: &str = "falha ao salvar o comando de testes";
 
 /// Serializa a inicialização em disco (sem segurar o lock da configuração).
 static INIT_GUARD: Mutex<()> = Mutex::new(());
@@ -255,19 +245,16 @@ pub fn is_system_dir(path: &Path) -> bool {
 /// Mensagens são estáticas e não ecoam a entrada.
 pub fn validate_path_shape(raw: &str) -> Result<(), ApiError> {
     if raw.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "path é obrigatório"));
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "path_required", Map::new()));
     }
     if raw.len() > MAX_PATH_BYTES || raw.chars().any(char::is_control) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "path inválido: máximo de 4096 bytes, sem caracteres de controle",
-        ));
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "path_too_long", Map::new()));
     }
     if !raw.starts_with('/') {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "path deve ser absoluto"));
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "path_not_absolute", Map::new()));
     }
     if raw.split('/').any(|c| c == "..") {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "path não pode conter '..'"));
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "path_dot_dot", Map::new()));
     }
     Ok(())
 }
@@ -377,9 +364,9 @@ pub(crate) fn format_utc(secs: u64) -> String {
 pub(super) fn safe_error(e: SafeFsError) -> ApiError {
     match e {
         SafeFsError::Unsafe | SafeFsError::NotRegular | SafeFsError::TooLarge | SafeFsError::Invalid => {
-            ApiError::new(StatusCode::CONFLICT, e.static_message())
+            ApiError::coded(StatusCode::CONFLICT, e.code(), Map::new())
         }
-        SafeFsError::Missing | SafeFsError::Io => ApiError::internal(INIT_ERROR),
+        SafeFsError::Missing | SafeFsError::Io => ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "sdd_init_failed", Map::new()),
     }
 }
 
@@ -441,7 +428,7 @@ fn optional_meta(path: &Path) -> Result<Option<fs::Metadata>, ApiError> {
     match fs::symlink_metadata(path) {
         Ok(m) => Ok(Some(m)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(ApiError::internal(INIT_ERROR)),
+        Err(_) => Err(ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "sdd_init_failed", Map::new())),
     }
 }
 
@@ -456,7 +443,7 @@ fn precheck_init_targets(root: &Path, git_dir: bool) -> Result<(), ApiError> {
     check_dir_slot(&root.join(SPECS_REL))?;
     safe_fs::check_chain(root, SETTINGS_REL).map_err(safe_error)?;
     if optional_meta(&root.join(SETTINGS_REL))?.is_some_and(|m| !m.file_type().is_file()) {
-        return Err(ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID));
+        return Err(ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()));
     }
     Ok(())
 }
@@ -467,7 +454,7 @@ fn precheck_exclude(root: &Path) -> Result<(), ApiError> {
     safe_fs::check_chain(root, EXCLUDE_REL).map_err(safe_error)?;
     if let Some(meta) = optional_meta(&root.join(EXCLUDE_REL))? {
         if !meta.file_type().is_file() || meta.len() > MAX_READ_BYTES {
-            return Err(ApiError::new(StatusCode::CONFLICT, INIT_TARGET_INVALID));
+            return Err(ApiError::coded(StatusCode::CONFLICT, "project_structure_invalid", Map::new()));
         }
     }
     Ok(())
@@ -512,6 +499,8 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         super::plan_changes::PLAN_CHANGES_TMP_EXCLUDE_LINE,
         USAGE_EXCLUDE_LINE,
         USAGE_CHAT_EXCLUDE_LINE,
+        super::usage::CUTS_EXCLUDE_LINE,
+        super::usage::CUTS_CHAT_EXCLUDE_LINE,
         CAPTURES_EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
@@ -532,7 +521,7 @@ fn check_dir_slot(path: &Path) -> Result<(), ApiError> {
         None => Ok(()),
         Some(m) if m.file_type().is_symlink() => Err(safe_error(SafeFsError::Unsafe)),
         Some(m) if m.file_type().is_dir() => Ok(()),
-        Some(_) => Err(ApiError::new(StatusCode::CONFLICT, INIT_TARGET_INVALID)),
+        Some(_) => Err(ApiError::coded(StatusCode::CONFLICT, "project_structure_invalid", Map::new())),
     }
 }
 
@@ -540,7 +529,7 @@ fn check_dir_slot(path: &Path) -> Result<(), ApiError> {
 /// Pré-valida todos os destinos antes de qualquer escrita: violação → 409 e nada é criado.
 /// Só a escrita fica sob `INIT_GUARD`; a branch base é lida antes, fora do guard.
 /// Nunca executa `git init`.
-fn init_sdd(root: &Path, yolo: bool) -> Result<DiskState, ApiError> {
+fn init_sdd(root: &Path, yolo: bool, lang: crate::i18n::Lang) -> Result<DiskState, ApiError> {
     let _guard = INIT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let git_meta = optional_meta(&root.join(".git"))?;
     if git_meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
@@ -549,7 +538,7 @@ fn init_sdd(root: &Path, yolo: bool) -> Result<DiskState, ApiError> {
     let git_dir = git_meta.as_ref().is_some_and(|m| m.file_type().is_dir());
 
     precheck_init_targets(root, git_dir)?;
-    let git_initialized = ensure_git_repo(root, git_meta.is_some())?;
+    let git_initialized = ensure_git_repo(root, git_meta.is_some(), lang)?;
     let is_git = true;
     let base = read_head_branch(root);
     safe_fs::ensure_dirs(root, SPECS_REL).map_err(safe_error)?;
@@ -577,7 +566,7 @@ fn init_sdd(root: &Path, yolo: bool) -> Result<DiskState, ApiError> {
     };
     let yaml = settings
         .render()
-        .map_err(|_| ApiError::internal(INIT_ERROR))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "sdd_init_failed", Map::new()))?;
     safe_fs::write_new(root, SETTINGS_REL, &yaml).map_err(safe_error)?;
     ensure_local_excludes(root)?;
     Ok(DiskState {
@@ -587,12 +576,13 @@ fn init_sdd(root: &Path, yolo: bool) -> Result<DiskState, ApiError> {
     })
 }
 
-const GIT_INIT_ERROR: &str = "falha ao inicializar o repositório Git da pasta";
-const INITIAL_COMMIT_MSG: &str = "chore: inicializa repositório (Nants)";
+/// Prefixo do commit inicial do repositório criado pelo Nants; o texto depois dele sai no idioma
+/// do projeto (`commit.init_repo`, spec 115 T04).
+const INITIAL_COMMIT_PREFIX: &str = "chore: ";
 
 /// Garante repositório com ao menos um commit. Devolve `true` se o Nants fez init e/ou commit.
 /// Pasta sem `.git` dentro de outro repositório → 409 sem criar nada.
-fn ensure_git_repo(root: &Path, has_git: bool) -> Result<bool, ApiError> {
+fn ensure_git_repo(root: &Path, has_git: bool, lang: crate::i18n::Lang) -> Result<bool, ApiError> {
     let git = Git::new(root).with_env("GIT_TERMINAL_PROMPT", "0");
     if !has_git {
         let ancestor = root
@@ -601,15 +591,9 @@ fn ensure_git_repo(root: &Path, has_git: bool) -> Result<bool, ApiError> {
             .find(|a| a.join(".git").exists())
             .map(|a| a.display().to_string());
         if let Some(top) = git.toplevel().or(ancestor) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!(
-                    "a pasta está dentro do repositório Git {top}; escolha a raiz do repositório ou outra pasta"
-                ),
-            )
-            .with_code("project_nested_repo", super::error::params([("path", json!(top))])));
+            return Err(ApiError::coded(StatusCode::CONFLICT, "project_nested_repo", super::error::params([("path", json!(top))])));
         }
-        git.init_main().map_err(|_| ApiError::internal(GIT_INIT_ERROR))?;
+        git.init_main().map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "git_init_failed", Map::new()))?;
     } else if !git.is_unborn() {
         return Ok(false);
     }
@@ -618,21 +602,18 @@ fn ensure_git_repo(root: &Path, has_git: bool) -> Result<bool, ApiError> {
         .into_iter()
         .map(|k| (k, if k == "user.name" { "Nants" } else { "nants@localhost" }))
         .collect();
-    git.commit_empty(INITIAL_COMMIT_MSG, &fallback)
-        .map_err(|_| ApiError::internal(GIT_INIT_ERROR))?;
+    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.init_repo"), &fallback)
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "git_init_failed", Map::new()))?;
     Ok(true)
 }
 
 /// Executa `init_sdd` fora do runtime assíncrono, com tempo total limitado.
-async fn init_with_timeout(root: PathBuf, yolo: bool) -> Result<DiskState, ApiError> {
-    let job = tokio::task::spawn_blocking(move || init_sdd(&root, yolo));
+async fn init_with_timeout(root: PathBuf, yolo: bool, lang: crate::i18n::Lang) -> Result<DiskState, ApiError> {
+    let job = tokio::task::spawn_blocking(move || init_sdd(&root, yolo, lang));
     match tokio::time::timeout(INIT_TIMEOUT, job).await {
-        Err(_) => Err(ApiError::new(
-            StatusCode::GATEWAY_TIMEOUT,
-            "tempo esgotado ao inicializar o projeto",
-        )),
+        Err(_) => Err(ApiError::coded(StatusCode::GATEWAY_TIMEOUT, "project_init_timeout", Map::new())),
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ApiError::internal(INIT_ERROR)),
+        Ok(Err(_)) => Err(ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "sdd_init_failed", Map::new())),
     }
 }
 
@@ -640,19 +621,19 @@ async fn init_with_timeout(root: PathBuf, yolo: bool) -> Result<DiskState, ApiEr
 fn parse_input(body: &[u8]) -> Result<CreateProjectInput, ApiError> {
     serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })
 }
 
 fn map_create_problem(problem: DirProblem) -> ApiError {
     match problem {
-        DirProblem::Missing => ApiError::new(StatusCode::BAD_REQUEST, "path inexistente"),
-        DirProblem::Denied => ApiError::new(StatusCode::FORBIDDEN, "sem permissão para o path"),
-        DirProblem::NotDir => ApiError::new(StatusCode::BAD_REQUEST, "path não é um diretório"),
-        DirProblem::Invalid => ApiError::new(StatusCode::BAD_REQUEST, "path inválido"),
+        DirProblem::Missing => ApiError::coded(StatusCode::BAD_REQUEST, "path_missing", Map::new()),
+        DirProblem::Denied => ApiError::coded(StatusCode::FORBIDDEN, "path_no_permission", Map::new()),
+        DirProblem::NotDir => ApiError::coded(StatusCode::BAD_REQUEST, "path_not_dir", Map::new()),
+        DirProblem::Invalid => ApiError::coded(StatusCode::BAD_REQUEST, "field_path_invalid", Map::new()),
     }
 }
 
@@ -663,7 +644,7 @@ where
 {
     tokio::task::spawn_blocking(job)
         .await
-        .map_err(|_| ApiError::internal("falha interna"))?
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?
 }
 
 fn project_response(secrets: &SecretSet, project: &Project, disk: DiskState) -> ProjectResponse {
@@ -713,7 +694,7 @@ pub async fn create_project(State(state): State<AppState>, body: Bytes) -> Resul
         return create_by_name(&state, &name).await;
     };
     if name.is_empty() {
-        return Err(ApiError::unprocessable("name é obrigatório"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "name_required", Map::new()));
     }
     validate_text_field("name", &name)?;
     validate_path_shape(&raw_path)?;
@@ -735,7 +716,7 @@ async fn create_by_name(state: &AppState, name: &str) -> Result<Response, ApiErr
     let root = validate_root(cfg.projects_root_raw(), &cfg, std::env::var_os("HOME"))?;
     let created = tokio::task::spawn_blocking(move || create_project_dir(&root, &slug, &cfg))
         .await
-        .map_err(|_| ApiError::internal("falha interna"))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     let canonical = match created {
         Ok(dir) => dir,
         Err(e) => return Ok(e.into_response()),
@@ -749,14 +730,14 @@ async fn register_project(state: &AppState, name: &str, canonical: PathBuf) -> R
     let state = state.clone();
     let name = name.to_string();
     if canonical.parent().is_none() {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "diretório raiz não é permitido"));
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "root_dir_forbidden", Map::new()));
     }
     if is_system_dir(&canonical) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "diretório de sistema não é permitido"));
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "system_dir_forbidden", Map::new()));
     }
     let canonical_str = canonical
         .to_str()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "path inválido"))?
+        .ok_or_else(|| ApiError::coded(StatusCode::BAD_REQUEST, "field_path_invalid", Map::new()))?
         .to_string();
 
     let secrets = state.secret_set().await;
@@ -786,7 +767,7 @@ async fn register_project(state: &AppState, name: &str, canonical: PathBuf) -> R
     }
 
     let inherited_yolo = state.config().read().await.last_yolo;
-    let disk = init_with_timeout(canonical.clone(), inherited_yolo).await?;
+    let disk = init_with_timeout(canonical.clone(), inherited_yolo, state.project_lang(&id).get()).await?;
     let project = Project {
         id,
         name: display_name,
@@ -822,10 +803,7 @@ async fn register_project(state: &AppState, name: &str, canonical: PathBuf) -> R
 }
 
 fn id_conflict() -> ApiError {
-    ApiError::new(
-        StatusCode::CONFLICT,
-        "identificador de projeto já existe para outro caminho",
-    )
+    ApiError::coded(StatusCode::CONFLICT, "project_id_taken", Map::new())
 }
 
 async fn persist(state: &AppState, cfg: &Config) -> Result<(), ApiError> {
@@ -833,8 +811,8 @@ async fn persist(state: &AppState, cfg: &Config) -> Result<(), ApiError> {
     let snapshot = cfg.clone();
     tokio::task::spawn_blocking(move || save_atomic(&path, &snapshot))
         .await
-        .map_err(|_| ApiError::internal("falha ao salvar a configuração"))?
-        .map_err(|_| ApiError::internal("falha ao salvar a configuração"))
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed", Map::new()))?
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed", Map::new()))
 }
 
 /// `GET /api/projects/:id/state`
@@ -852,7 +830,7 @@ pub async fn get_state(
 pub(super) async fn find_project(state: &AppState, id: &str) -> Result<Project, ApiError> {
     let cfg = state.config().read().await;
     let found = cfg.projects.iter().find(|p| p.id == id).cloned();
-    found.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "projeto não encontrado"))
+    found.ok_or_else(|| ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()))
 }
 
 /// Estado do projeto como exibido à API (disco + execução + pedidos pendentes).
@@ -880,8 +858,6 @@ mod remove_project_tests;
 #[path = "reserve_race_tests.rs"]
 mod reserve_race_tests;
 
-/// Mensagem (409) quando o projeto tem um turno de chat em andamento.
-const CHAT_ACTIVE_MSG: &str = "já existe um turno de chat em andamento para este projeto";
 
 /// `DELETE /api/projects/:id`: remove o projeto **só do Nants**. O corpo é ignorado.
 ///
@@ -910,17 +886,17 @@ pub async fn remove_project(
         .projects
         .iter()
         .position(|p| p.id == id)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "projeto não encontrado"))?;
+        .ok_or_else(|| ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()))?;
     let _run = state
         .runs()
         .try_start(&id, REMOVE_RESERVATION)
         .map_err(|_| {
-            let msg = if state.runs().is_report(&id) { REPORT_BUSY_MSG } else { RUN_ACTIVE_MSG };
-            ApiError::new(StatusCode::CONFLICT, msg)
+            let code = if state.runs().is_report(&id) { REPORT_BUSY_CODE } else { "run_active" };
+            ApiError::coded(StatusCode::CONFLICT, code, Map::new())
         })?;
     let _chat = state
         .try_begin_chat(&id)
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, CHAT_ACTIVE_MSG))?;
+        .ok_or_else(|| ApiError::coded(StatusCode::CONFLICT, "chat_active", Map::new()))?;
 
     let project_root = PathBuf::from(&guard.projects[index].path);
     let mut next = guard.clone();
@@ -980,24 +956,24 @@ pub async fn put_settings(
         .reserve_run(&id, SETTINGS_RESERVATION)
         .await
         .map_err(|e| match e {
-            ReserveError::NotFound => ApiError::new(StatusCode::NOT_FOUND, "projeto não encontrado"),
-            ReserveError::Busy => ApiError::new(StatusCode::CONFLICT, RUN_ACTIVE_MSG),
-            ReserveError::ReportInProgress => ApiError::new(StatusCode::CONFLICT, REPORT_BUSY_MSG),
+            ReserveError::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()),
+            ReserveError::Busy => ApiError::coded(StatusCode::CONFLICT, "run_active", Map::new()),
+            ReserveError::ReportInProgress => ApiError::coded(StatusCode::CONFLICT, REPORT_BUSY_CODE, Map::new()),
         })?;
     let input = parse_settings_input(&body)?;
     if input.test_command.is_none() && input.max_attempts.is_none() && input.max_test_cycles.is_none() {
-        return Err(ApiError::unprocessable("test_command é obrigatório"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_required", Map::new()));
     }
     for limit in [input.max_attempts, input.max_test_cycles].into_iter().flatten() {
         if !sdd::LIMIT_RANGE.contains(&limit) {
-            return Err(ApiError::unprocessable("limites devem estar entre 1 e 10"));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "limits_range", Map::new()));
         }
     }
     let command = match &input.test_command {
         Some(raw) => {
             let command = check_test_command_shape(raw)?;
             if command == INVALID_VIEW {
-                return Err(ApiError::unprocessable(TEST_COMMAND_ECHO_MSG));
+                return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_redacted", Map::new()));
             }
             Some(command)
         }
@@ -1032,9 +1008,9 @@ pub async fn put_yolo(
     let project = find_project(&state, &id).await?;
     let input: YoloInput = serde_json::from_slice(&body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })?;
     let root = PathBuf::from(&project.path);
@@ -1072,9 +1048,9 @@ pub async fn put_internet(
     let project = find_project(&state, &id).await?;
     let input: InternetInput = serde_json::from_slice(&body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })?;
     let root = PathBuf::from(&project.path);
@@ -1088,29 +1064,29 @@ pub async fn put_internet(
 pub(super) fn write_internet(root: &Path, enabled: bool) -> Result<(), ApiError> {
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let text = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES).map_err(settings_error)?;
-    let mut settings = Settings::parse(&text).map_err(|_| ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID))?;
+    let mut settings = Settings::parse(&text).map_err(|_| ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()))?;
     settings.architect_internet = enabled;
-    let rendered = settings.render().map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))
+    let rendered = settings.render().map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))
 }
 
 /// Grava `yolo` em `settings.yaml` (leitura-modificação-escrita atômica sob o `PERSIST_LOCK`).
 pub(super) fn write_yolo(root: &Path, enabled: bool) -> Result<(), ApiError> {
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let text = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES).map_err(settings_error)?;
-    let mut settings = Settings::parse(&text).map_err(|_| ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID))?;
+    let mut settings = Settings::parse(&text).map_err(|_| ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()))?;
     settings.yolo = enabled;
-    let rendered = settings.render().map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))
+    let rendered = settings.render().map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))
 }
 
 /// Decodifica o corpo: malformado → 400; campo ausente ou tipo errado → 422 sem eco.
 fn parse_settings_input(body: &[u8]) -> Result<SettingsInput, ApiError> {
     serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })
 }
@@ -1119,15 +1095,11 @@ fn parse_settings_input(body: &[u8]) -> Result<SettingsInput, ApiError> {
 /// É o mesmo limite usado na leitura, então todo valor exibido é aceito de volta na gravação.
 fn check_test_command_shape(raw: &str) -> Result<String, ApiError> {
     sdd::check_test_command_shape(raw).map_err(|e| match e {
-        TestCommandError::Empty => ApiError::unprocessable("test_command é obrigatório"),
-        TestCommandError::Invalid => ApiError::unprocessable(
-            "test_command inválido: uma linha, até 200 caracteres, sem caracteres de controle",
-        ),
+        TestCommandError::Empty => ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_required", Map::new()),
+        TestCommandError::Invalid => ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_invalid", Map::new()),
     })
 }
 
-/// Mensagem (422) para eco de valor exibido que foi redigido ou marcado como inválido.
-const TEST_COMMAND_ECHO_MSG: &str = "test_command contém valor redigido; digite o comando completo";
 
 /// `test_command` na leitura: redigido por `SecretSet`; valor que a gravação não aceitaria
 /// (forma inválida) vira `[inválido]`. Vazio continua vazio (comando ainda não configurado).
@@ -1174,18 +1146,18 @@ fn write_settings_inner(
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let text = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES).map_err(settings_error)?;
     let mut settings = Settings::parse(&text)
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID))?;
+        .map_err(|_| ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()))?;
     if let Some(command) = command {
         if only_if_empty && !settings.test_command.trim().is_empty() {
             return Ok(false);
         }
         let shown = test_command_view(secrets, &settings.test_command);
         if shown != settings.test_command && command == shown {
-            return Err(ApiError::unprocessable(TEST_COMMAND_ECHO_MSG));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_redacted", Map::new()));
         }
         settings.test_command = if settings.environment == sdd::Environment::Docker {
             sdd::docker_command::normalize(command)
-                .map_err(|m| ApiError::unprocessable(m))?
+                .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_docker", Map::new()))?
         } else {
             command.to_string()
         };
@@ -1198,9 +1170,9 @@ fn write_settings_inner(
     }
     let rendered = settings
         .render()
-        .map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
     replace_atomic(root, SETTINGS_REL, rendered.as_bytes())
-        .map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
     Ok(true)
 }
 
@@ -1224,22 +1196,22 @@ pub(super) fn write_checks_if_empty(
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let text = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES).map_err(settings_error)?;
     let mut settings = Settings::parse(&text)
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID))?;
+        .map_err(|_| ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()))?;
     if !settings.checks.is_empty() {
         return Ok(false);
     }
     settings.checks = if settings.environment == sdd::Environment::Docker {
         sdd::docker_command::normalize_all("", &valid)
-            .map_err(|m| ApiError::unprocessable(m))?
+            .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "test_command_docker", Map::new()))?
             .1
     } else {
         valid
     };
     let rendered = settings
         .render()
-        .map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
     replace_atomic(root, SETTINGS_REL, rendered.as_bytes())
-        .map_err(|_| ApiError::internal(SETTINGS_SAVE_ERROR))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()))?;
     Ok(true)
 }
 
@@ -1248,8 +1220,8 @@ pub(super) fn write_checks_if_empty(
 fn settings_error(e: SafeFsError) -> ApiError {
     match e {
         SafeFsError::Unsafe => safe_error(e),
-        SafeFsError::Io => ApiError::internal(SETTINGS_SAVE_ERROR),
-        _ => ApiError::new(StatusCode::CONFLICT, CONFIG_INVALID),
+        SafeFsError::Io => ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "test_command_save_failed", Map::new()),
+        _ => ApiError::coded(StatusCode::CONFLICT, "project_config_invalid", Map::new()),
     }
 }
 
@@ -1759,6 +1731,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "literal".into(),
@@ -2002,6 +1975,15 @@ Texto.
         assert_eq!(git_out(&proj, &["rev-list", "--count", "HEAD"]), "1");
         assert_eq!(git_out(&proj, &["log", "-1", "--format=%s"]), "chore: inicializa repositório (Nants)");
         assert!(git_out(&proj, &["status", "--porcelain"]).is_empty(), ".sdd não aparece como alteração");
+        // Spec 115 T04 (C-09): em projeto en, o mesmo prefixo e o texto em inglês.
+        let en_dir = temp_dir("nongit-en");
+        let en_proj = en_dir.join("p");
+        fs::create_dir_all(&en_proj).expect("mkdir");
+        let en_state = state_in(&en_dir, Config::default());
+        en_state.set_lang(None, crate::i18n::Lang::En);
+        let (status, body) = call(&en_state, post_project("P", en_proj.to_str().expect("u"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(git_out(&en_proj, &["log", "-1", "--format=%s"]), "chore: initialize repository (Nants)");
         assert!(!proj.join(".gitignore").exists());
         // Recadastrar não cria outro commit.
         let (status, body) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2072,7 +2054,7 @@ Texto.
             .map(|k| (k, if k == "user.name" { "Nants" } else { "nants@localhost" }))
             .collect();
         assert_eq!(fallback.len(), 2);
-        repo.commit_empty(INITIAL_COMMIT_MSG, &fallback).expect("commit");
+        repo.commit_empty("chore: x", &fallback).expect("commit");
         assert_eq!(git_out(&proj, &["log", "-1", "--format=%an <%ae>"]), "Nants <nants@localhost>");
     }
 
@@ -2340,6 +2322,7 @@ Texto.
             base_url: "https://api.example.com/v1".into(),
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2372,6 +2355,7 @@ Texto.
             base_url: "https://api.example.com/v1".into(),
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2416,6 +2400,7 @@ Texto.
             base_url: "https://api.example.com/v1".into(),
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2596,6 +2581,7 @@ Texto.
             base_url: "https://api.example.com/v1".into(),
             api_key: LONG.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("Demo", proj.to_str().expect("u"))).await;
@@ -2925,7 +2911,7 @@ Texto.
         write(&p1.join(".sdd"), "nao sou diretorio");
         let (status, body) = call(&state, post_project("P", p1.to_str().expect("u"))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains(INIT_TARGET_INVALID), "{body}");
+        assert!(body.contains("\"code\":\"project_structure_invalid\""), "{body}");
         assert_eq!(fs::read_to_string(p1.join(".sdd")).expect("r"), "nao sou diretorio");
         assert!(!p1.join(".sdd/settings.yaml").exists());
 
@@ -2934,7 +2920,7 @@ Texto.
         write(&p2.join(".git/info"), "arquivo");
         let (status, body) = call(&state, post_project("P", p2.to_str().expect("u"))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains(INIT_TARGET_INVALID), "{body}");
+        assert!(body.contains("\"code\":\"project_structure_invalid\""), "{body}");
         assert!(!p2.join(".sdd").exists(), "nada criado");
 
         // `.sdd/specs` é arquivo regular.
@@ -2942,7 +2928,7 @@ Texto.
         write(&p3.join(".sdd/specs"), "arquivo");
         let (status, body) = call(&state, post_project("P", p3.to_str().expect("u"))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains(INIT_TARGET_INVALID), "{body}");
+        assert!(body.contains("\"code\":\"project_structure_invalid\""), "{body}");
         assert!(!p3.join(".sdd/settings.yaml").exists(), "nada criado");
 
         assert!(state.config().read().await.projects.is_empty());
@@ -3005,6 +2991,7 @@ mod pending_tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "literal".into(),
@@ -3449,6 +3436,7 @@ mod settings_tests {
                 base_url: "https://api.example.com/v1".into(),
                 api_key: "k".into(),
                 wire_api: crate::config::WireApi::Responses,
+                kind: Default::default(),
             });
             cfg.connections.push(Connection {
                 id: "c-chat".into(),
@@ -3456,6 +3444,7 @@ mod settings_tests {
                 base_url: "https://api.example.com/v1".into(),
                 api_key: "k".into(),
                 wire_api: crate::config::WireApi::Chat,
+                kind: Default::default(),
             });
             cfg.agents.architect.connection_id = "c-chat".into();
         }
@@ -3482,6 +3471,7 @@ mod settings_tests {
                     base_url: "https://api.example.com/v1".into(),
                     api_key: "k".into(),
                     wire_api: wire,
+                    kind: Default::default(),
                 });
             }
             cfg.agents.developer.connection_id = "c-chat".into();
@@ -3735,6 +3725,7 @@ mod settings_tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "test".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = AppState::new(dir.join("config.toml"), crate::server::readiness::chat_ready(cfg), 3000);
         let body = json!({ "name": "P", "path": proj.to_str().expect("u") }).to_string();

@@ -14,13 +14,14 @@
  */
 import { memo, useId, useState, type FormEvent } from "react";
 import { putBudget } from "../../api/client";
-import type { NamedUsage, SpecBudget, UsageTotals } from "../../api/types";
+import type { NamedUsage, PlanUsageTotals, SpecBudget, UsageTotals } from "../../api/types";
 import { imagesCostHint, imagesCostLine, webSearchCostLine } from "../../copy";
 import { EmptyState } from "../../desktop/EmptyState";
 import { Icon } from "../../desktop/Icon";
 import { useShell, useSpace } from "../../desktop/shellContext";
 import { useWindowVisibility } from "../../desktop/useWindowVisibility";
 import type { MessageKey } from "../../i18n";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
 import { useAppStore } from "../../store";
 import { formatTokens, formatUsd } from "../../usageFormat";
@@ -29,10 +30,12 @@ import { agentLabel } from "../shared/agents";
 import { useUsageView } from "../shared/useUsage";
 import "../shared/apps.css";
 import "./costs.css";
+import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
 import {
   budgetProgress,
   costBars,
   costText,
+  hasApiConsumption,
   hasConsumption,
   pacingNotice,
   pacingText,
@@ -66,6 +69,8 @@ function CostsContentView({ size }: AppContentProps) {
   if (!hasConsumption(totals)) {
     return <EmptyState icon="costs" message={t("costs.noConsumption")} />;
   }
+  // Só pelo plano ChatGPT: sem total em dólar (nada foi cobrado por chave), só a seção do plano.
+  const apiUsage = hasApiConsumption(totals);
   const unpriced = totals.cost_usd === null;
   const imageCount = totals.images ?? 0;
   const imageEstimated = totals.images_estimated === true;
@@ -84,36 +89,40 @@ function CostsContentView({ size }: AppContentProps) {
   const openPricing = (): void => shell.openSettings("pricing");
   return (
     <div className="nd-app-scroll nd-app-page nd-costs" data-costs="" data-costs-layout={narrow ? "stacked" : "table"}>
-      <section className="nd-costs-total" aria-label={t("costs.projectCost")}>
-        {unpriced ? (
-          <>
-            {/* Sem preço, o valor não existe: o total diz isso em texto, sem traço no lugar do número (095/T08). */}
-            <p className="nd-costs-amount" data-testid="usage-cost" data-unpriced="">
-              {t("costs.unpricedTotal")}
+      {apiUsage ? (
+        <section className="nd-costs-total" aria-label={t("costs.projectCost")}>
+          {unpriced ? (
+            <>
+              {/* Sem preço, o valor não existe: o total diz isso em texto, sem traço no lugar do número (095/T08). */}
+              <p className="nd-costs-amount" data-testid="usage-cost" data-unpriced="">
+                {t("costs.unpricedTotal")}
+              </p>
+              <p className="nd-costs-unpriced" role="note" data-unpriced-note="">
+                <span>{t("costs.unpricedNote")}</span>
+                <button type="button" className="nd-btn nd-btn-sm" onClick={openPricing}>
+                  <Icon name="settings" size={14} />
+                  {t("readiness.configure")}
+                </button>
+              </p>
+            </>
+          ) : (
+            <p className="nd-costs-amount" data-testid="usage-cost">
+              {totalCostText(totals)}
+              {totals.cost_estimated === true ? <span className="nd-costs-amount-note">{` ${t("costs.estimated")}`}</span> : null}
             </p>
-            <p className="nd-costs-unpriced" role="note" data-unpriced-note="">
-              <span>{t("costs.unpricedNote")}</span>
-              <button type="button" className="nd-btn nd-btn-sm" onClick={openPricing}>
-                <Icon name="settings" size={14} />
-                {t("readiness.configure")}
-              </button>
+          )}
+          {imageCount > 0 ? (
+            <p className="nd-muted" data-testid="images-hint">
+              {imagesCostHint(imageCount, imageEstimated)}
             </p>
-          </>
-        ) : (
-          <p className="nd-costs-amount" data-testid="usage-cost">
-            {totalCostText(totals)}
-            {totals.cost_estimated === true ? <span className="nd-costs-amount-note">{` ${t("costs.estimated")}`}</span> : null}
-          </p>
-        )}
-        {imageCount > 0 ? (
-          <p className="nd-muted" data-testid="images-hint">
-            {imagesCostHint(imageCount, imageEstimated)}
-          </p>
-        ) : null}
-        {progress !== null && spec !== null ? <BudgetBar specId={spec.id} progress={progress} /> : null}
-      </section>
+          ) : null}
+          {progress !== null && spec !== null ? <BudgetBar specId={spec.id} progress={progress} /> : null}
+        </section>
+      ) : null}
 
-      {top.length > 0 ? (
+      {totals.chatgpt_plan !== undefined && totals.chatgpt_plan.calls > 0 ? <PlanUsage plan={totals.chatgpt_plan} /> : null}
+
+      {apiUsage && top.length > 0 ? (
         <section className="nd-costs-top" aria-label={t("costs.top")} data-costs-top="">
           <ul className="nd-costs-top-list">
             {top.map((item) => (
@@ -126,45 +135,47 @@ function CostsContentView({ size }: AppContentProps) {
         </section>
       ) : null}
 
-      <details className="nd-costs-more" data-costs-details="">
-        <summary className="nd-costs-more-summary">
-          <Icon name="chevron-right" size={14} className="nd-details-chevron" />
-          {t("costs.details")}
-        </summary>
-        <div className="nd-costs-more-body">
-          <p className="nd-muted nd-num" data-costs-tokens="">{`${tokensText(totals)} · ${tp("costs.calls", totals.calls)}`}</p>
-          <Bars title={t("costs.byRole")} bars={costBars(project.by_agent ?? [], agentLabel)} />
-          {specUsage !== undefined && specUsage.tasks.length > 0 ? (
-            <Bars title={t("costs.byTask", { spec: spec?.id ?? "" })} bars={costBars(specUsage.tasks, taskTitle)} />
-          ) : null}
-          <p className="nd-costs-pacing" data-pacing={pacing === null ? "idle" : "waiting"}>
-            <Icon name={pacing === null ? "zap" : "refresh"} size={14} />
-            <span>{pacingText(pacing)}</span>
-          </p>
-          <UsageTable title={t("costs.byCategory")} firstCol={t("costs.category")} rows={project.by_spec ?? []} total={totals} label={categoryLabel} narrow={narrow} />
-          {totals.unpriced_calls > 0 ? (
-            <p role="note" className="nd-costs-note" data-unpriced-calls="">
-              <span>{tp("costs.unpricedCalls", totals.unpriced_calls)}</span>
-              <button type="button" className="nd-btn nd-btn-sm" onClick={openPricing}>
-                <Icon name="settings" size={14} />
-                {t("readiness.configure")}
-              </button>
+      {apiUsage ? (
+        <details className="nd-costs-more" data-costs-details="">
+          <summary className="nd-costs-more-summary">
+            <Icon name="chevron-right" size={14} className="nd-details-chevron" />
+            {t("costs.details")}
+          </summary>
+          <div className="nd-costs-more-body">
+            <p className="nd-muted nd-num" data-costs-tokens="">{`${tokensText(totals)} · ${tp("costs.calls", totals.calls)}`}</p>
+            <Bars title={t("costs.byRole")} bars={costBars(project.by_agent ?? [], agentLabel)} />
+            {specUsage !== undefined && specUsage.tasks.length > 0 ? (
+              <Bars title={t("costs.byTask", { spec: spec?.id ?? "" })} bars={costBars(specUsage.tasks, taskTitle)} />
+            ) : null}
+            <p className="nd-costs-pacing" data-pacing={pacing === null ? "idle" : "waiting"}>
+              <Icon name={pacing === null ? "zap" : "refresh"} size={14} />
+              <span>{pacingText(pacing)}</span>
             </p>
-          ) : null}
-          {(totals.web_search_calls ?? 0) > 0 ? (
-            <p data-testid="web-search-cost" className="nd-muted nd-num">
-              {webSearchCostLine(totals.web_search_calls ?? 0, formatUsd(totals.web_search_usd ?? 0))}
-            </p>
-          ) : null}
-          {imageCount > 0 ? (
-            <p data-testid="images-cost" className="nd-muted nd-num">
-              {imagesCostLine(imageCount, formatUsd(totals.images_usd ?? 0), imageEstimated)}
-            </p>
-          ) : null}
-          <UsageTable title={t("costs.byAgent")} firstCol={t("costs.agent")} rows={project.by_agent ?? []} label={agentLabel} narrow={narrow} />
-          <UsageTable title={t("costs.byModel")} firstCol={t("costs.model")} rows={project.by_model ?? []} narrow={narrow} note={t("costs.modelNote")} />
-        </div>
-      </details>
+            <UsageTable title={t("costs.byCategory")} firstCol={t("costs.category")} rows={project.by_spec ?? []} total={totals} label={categoryLabel} narrow={narrow} />
+            {totals.unpriced_calls > 0 ? (
+              <p role="note" className="nd-costs-note" data-unpriced-calls="">
+                <span>{tp("costs.unpricedCalls", totals.unpriced_calls)}</span>
+                <button type="button" className="nd-btn nd-btn-sm" onClick={openPricing}>
+                  <Icon name="settings" size={14} />
+                  {t("readiness.configure")}
+                </button>
+              </p>
+            ) : null}
+            {(totals.web_search_calls ?? 0) > 0 ? (
+              <p data-testid="web-search-cost" className="nd-muted nd-num">
+                {webSearchCostLine(totals.web_search_calls ?? 0, formatUsd(totals.web_search_usd ?? 0))}
+              </p>
+            ) : null}
+            {imageCount > 0 ? (
+              <p data-testid="images-cost" className="nd-muted nd-num">
+                {imagesCostLine(imageCount, formatUsd(totals.images_usd ?? 0), imageEstimated)}
+              </p>
+            ) : null}
+            <UsageTable title={t("costs.byAgent")} firstCol={t("costs.agent")} rows={project.by_agent ?? []} label={agentLabel} narrow={narrow} />
+            <UsageTable title={t("costs.byModel")} firstCol={t("costs.model")} rows={project.by_model ?? []} narrow={narrow} note={t("costs.modelNote")} />
+          </div>
+        </details>
+      ) : null}
 
       {spec !== null && specView !== null ? (
         <details className="nd-costs-more" data-costs-budget="">
@@ -209,6 +220,28 @@ function BudgetBar({ specId, progress }: { specId: string; progress: BudgetProgr
 }
 
 export const CostsContent = memo(CostsContentView);
+
+/**
+ * Uso pelo plano ChatGPT (spec 116 T03): os tokens e as chamadas, sem US$ (o uso sai do limite do
+ * plano), com o link "Gerenciar uso".
+ */
+function PlanUsage({ plan }: { plan: PlanUsageTotals }) {
+  const { t, tp } = useT();
+  const headingId = useId();
+  return (
+    <section aria-labelledby={headingId} className="nd-costs-plan nd-stack-xs" data-costs-plan="">
+      <h3 id={headingId} className="nd-section-label">
+        {t("costs.plan.title")}
+      </h3>
+      <p className="nd-costs-plan-tokens nd-num" data-plan-tokens="">{`${tokensText(plan)} · ${tp("costs.calls", plan.calls)}`}</p>
+      <p className="nd-muted">{t("costs.plan.note")}</p>
+      <a className="nd-btn nd-btn-sm nd-self-start" data-variant="ghost" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="">
+        <Icon name="external" size={14} />
+        {t("chatgpt.manageUsage")}
+      </a>
+    </section>
+  );
+}
 
 function Bars({ title, bars }: { title: string; bars: readonly CostBar[] }) {
   const headingId = useId();
@@ -345,7 +378,7 @@ function BudgetForm({ projectId, specId, budget, onSaved }: { projectId: string;
       body.max_usd = v;
     }
     const r = await putBudget(projectId, specId, body);
-    if (!r.ok) return setMessage({ text: r.error.message });
+    if (!r.ok) return setMessage({ text: apiFailureText(r.error) });
     setSaved(body);
     onSaved(body);
     setMessage({ key: Object.keys(body).length === 0 ? "costs.budget.removed" : "costs.budget.saved" });

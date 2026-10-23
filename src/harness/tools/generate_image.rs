@@ -424,6 +424,9 @@ fn record_usage(link: &ImageGenLink, usage: Option<Usage>, quality: &str) {
             web_search_calls: 0,
             images: 1,
             image_quality: Some(quality.to_string()),
+            estimated: false,
+            cut: None,
+            billing: Default::default(),
         });
     }
 }

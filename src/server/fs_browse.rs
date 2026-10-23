@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use serde_json::Map;
 use super::error::ApiError;
 use super::events::SecretSet;
 use super::projects::{
@@ -60,22 +61,22 @@ fn home_path() -> String {
 
 fn map_browse_problem(problem: DirProblem) -> ApiError {
     match problem {
-        DirProblem::Missing => ApiError::new(StatusCode::NOT_FOUND, "diretório não encontrado"),
+        DirProblem::Missing => ApiError::coded(StatusCode::NOT_FOUND, "dir_not_found", Map::new()),
         DirProblem::Denied => {
-            ApiError::new(StatusCode::FORBIDDEN, "sem permissão para listar o diretório")
+            ApiError::coded(StatusCode::FORBIDDEN, "list_no_permission", Map::new())
         }
-        DirProblem::NotDir => ApiError::new(StatusCode::BAD_REQUEST, "caminho não é um diretório"),
-        DirProblem::Invalid => ApiError::new(StatusCode::BAD_REQUEST, "caminho inválido"),
+        DirProblem::NotDir => ApiError::coded(StatusCode::BAD_REQUEST, "not_a_directory", Map::new()),
+        DirProblem::Invalid => ApiError::coded(StatusCode::BAD_REQUEST, "path_invalid", Map::new()),
     }
 }
 
 fn map_read_error(e: io::Error) -> ApiError {
     match e.kind() {
-        io::ErrorKind::NotFound => ApiError::new(StatusCode::NOT_FOUND, "diretório não encontrado"),
+        io::ErrorKind::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "dir_not_found", Map::new()),
         io::ErrorKind::PermissionDenied => {
-            ApiError::new(StatusCode::FORBIDDEN, "sem permissão para listar o diretório")
+            ApiError::coded(StatusCode::FORBIDDEN, "list_no_permission", Map::new())
         }
-        _ => ApiError::new(StatusCode::BAD_REQUEST, "não foi possível listar o diretório"),
+        _ => ApiError::coded(StatusCode::BAD_REQUEST, "list_failed", Map::new()),
     }
 }
 
@@ -83,7 +84,7 @@ fn map_read_error(e: io::Error) -> ApiError {
 fn list_dir(raw: &Path, hidden: bool, secrets: &SecretSet) -> Result<BrowseView, ApiError> {
     let canonical = resolve_dir(raw).map_err(map_browse_problem)?;
     if is_system_dir(&canonical) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "diretório de sistema não é permitido"));
+        return Err(ApiError::coded(StatusCode::FORBIDDEN, "system_dir_forbidden", Map::new()));
     }
     let read = fs::read_dir(&canonical).map_err(map_read_error)?;
 
@@ -125,7 +126,7 @@ fn list_dir(raw: &Path, hidden: bool, secrets: &SecretSet) -> Result<BrowseView,
 
     let path = canonical
         .to_str()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "caminho inválido"))?;
+        .ok_or_else(|| ApiError::coded(StatusCode::BAD_REQUEST, "path_invalid", Map::new()))?;
     let parent = canonical
         .parent()
         .and_then(Path::to_str)
@@ -154,7 +155,7 @@ pub async fn browse(
     let secrets = state.secret_set().await;
     let view = tokio::task::spawn_blocking(move || list_dir(Path::new(&raw), hidden, &secrets))
         .await
-        .map_err(|_| ApiError::internal("falha interna"))??;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))??;
     Ok((StatusCode::OK, Json(view)).into_response())
 }
 
@@ -365,6 +366,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&root, cfg);
         let (status, body) = call(&state, get_req(&browse_uri(&root, ""))).await;

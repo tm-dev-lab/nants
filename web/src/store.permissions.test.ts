@@ -18,6 +18,7 @@ function requested(requestId: string, extra: Record<string, unknown> = {}): ApiE
       command: "node --test",
       always_allowed: false,
       always_denied_reason: "este comando executa código arbitrário",
+      always_denied_code: "arbitrary",
       ...extra,
     },
   } as unknown as ApiEvent;

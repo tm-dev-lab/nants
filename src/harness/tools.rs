@@ -75,7 +75,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::agents::llm_client::{ImageInput, ToolSpec};
-use crate::agents::runner::{validate_scope, ACCEPTANCE, OBJECTIVE, REVISED_NEXT_ACTION};
+use crate::agents::runner::{validate_scope, BlockReason, ACCEPTANCE, BLOCK_REVISED, OBJECTIVE};
 use crate::harness::allowlist::{evaluate, Decision, Policy};
 use crate::harness::browser::BrowserTests;
 use crate::harness::compose::{ComposeEnv, HeadTail};
@@ -838,6 +838,9 @@ pub struct ToolHost {
     /// Negações de permissão nesta sessão (spec 087 T03): comando ou mudança de ambiente negados
     /// pelo humano, pela política ou pela recusa de elevação de privilégio.
     permission_denials: AtomicUsize,
+    /// Idioma do projeto dos textos que o host grava para a pessoa (ex.: o motivo de uma tarefa
+    /// BLOQUEADA com a definição revisada, spec 114 T02). Padrão pt-BR.
+    lang: crate::i18n::Lang,
 }
 
 /// Marca de um arquivo na sessão: data de modificação (quando o sistema informa) e tamanho.
@@ -964,7 +967,14 @@ impl ToolHost {
             generated: None,
             seen: Mutex::new(HashMap::new()),
             permission_denials: AtomicUsize::new(0),
+            lang: crate::i18n::Lang::default(),
         }
+    }
+
+    /// Idioma do projeto dos textos gravados para a pessoa (spec 114 T02).
+    pub fn with_lang(mut self, lang: crate::i18n::Lang) -> Self {
+        self.lang = lang;
+        self
     }
 
     /// Negações de permissão acumuladas nesta sessão (spec 087 T03). O laço do agente compara o
@@ -1940,7 +1950,9 @@ impl ToolHost {
         merged.frontmatter.allowed_scope = new.frontmatter.allowed_scope.clone();
         merged.frontmatter.covers = new.frontmatter.covers.clone();
         if blocked {
-            merged.frontmatter.next_action = Some(REVISED_NEXT_ACTION.to_string());
+            let reason = BlockReason::new(self.lang, BLOCK_REVISED, &[]);
+            merged.frontmatter.next_action = Some(reason.text);
+            merged.frontmatter.next_action_code = Some(reason.code.to_string());
         }
         // Do modelo só Objetivo e Critérios; todas as demais seções (histórico, findings,
         // marcadores) vêm do disco, intactas e na ordem original.
@@ -2254,11 +2266,8 @@ impl ToolHost {
             .map_err(|e| io::Error::other(e.to_string()))?
             .map_err(|e| ToolError::Io(io::Error::other(e)))?;
         if out.timed_out {
-            // O runner real anexa o próprio marcador de tempo esgotado; a linha `exit:` já o diz.
-            let marker = format!("[tempo limite de {}s excedido]", timeout.as_secs());
-            let output = out.output.trim_end();
-            let output = output.strip_suffix(marker.as_str()).unwrap_or(output);
-            return Ok(timeout_output(output, timeout));
+            // O executor do Compose devolve a saída crua; a orientação de tempo esgotado é daqui.
+            return Ok(timeout_output(out.output.trim_end(), timeout));
         }
         let code = out.code.map_or_else(|| "sinal".to_string(), |c| c.to_string());
         let mut text = format!("exit: {code}\n{}", out.output);
@@ -3682,7 +3691,7 @@ mod tests {
         fs::create_dir_all(root.join(".nants")).expect("mkdir");
         fs::write(root.join(".nants/compose.yaml"), "services:\n  workspace:\n    image: alpine:3\n").expect("w");
         let fake = Arc::new(FakeRunner::default());
-        fake.reply_timeout("run", "compilando\nservidor ouvindo na 3000\n\n[tempo limite de 2s excedido]\n");
+        fake.reply_timeout("run", "compilando\nservidor ouvindo na 3000\n");
         let h = host(Role::Developer, &root, &[], &["npm*"], &[], ApprovalDecision::Deny)
             .with_compose(Arc::new(crate::harness::compose::fake::test_env("timeout", fake.clone())))
             .with_command_timeout(Duration::from_secs(2));
@@ -6244,7 +6253,24 @@ mod tests {
         assert_eq!(t3.frontmatter.status, TaskStatus::Blocked);
         assert_eq!(t3.frontmatter.attempts, 3);
         assert_eq!(t3.frontmatter.next_action.as_deref(), Some("definição revisada; retomar"));
+        assert_eq!(t3.frontmatter.next_action_code.as_deref(), Some(BLOCK_REVISED));
         assert!(t3.body.contains("## Análise de recuperação #1") && t3.body.contains("- novo"));
+    }
+
+    /// Spec 114 T02: com o projeto em en, o motivo da tarefa BLOQUEADA revisada sai em en e leva o
+    /// código estável que a retomada lê.
+    #[tokio::test]
+    async fn blocked_task_revision_reason_follows_project_language() {
+        let root = sdd_root("ip-edit-en");
+        put_spec(&root, "IN_PROGRESS");
+        put_task_as(&root, "T03", "BLOCKED", 3, "");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny).with_lang(crate::i18n::Lang::En);
+        write_art(&h, &format!("{T}/T03.md"), &revised("T03", "TODO", 0, "[]", "src/**")).await.expect("T03");
+        let t3 = Task::parse(&fs::read_to_string(root.join(format!("{T}/T03.md"))).expect("r")).expect("p");
+        assert_eq!(t3.frontmatter.status, TaskStatus::Blocked);
+        assert_eq!(t3.frontmatter.next_action.as_deref(), Some("definition revised; resume"));
+        assert_eq!(t3.frontmatter.next_action_code.as_deref(), Some(BLOCK_REVISED));
+        assert!(crate::agents::runner::is_revised_block(&t3.frontmatter));
     }
 
     #[tokio::test]

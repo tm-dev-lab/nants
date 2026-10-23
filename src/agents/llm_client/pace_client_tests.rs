@@ -77,7 +77,7 @@ async fn without_quota_headers_or_limits_nothing_waits() {
     }
     let deltas = Mutex::new(Vec::new());
     for _ in 0..2 {
-        c.chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d)).await.expect("ok");
+        c.chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d))).await.expect("ok");
     }
     assert_eq!(*count.lock().expect("lock"), 5);
     assert!(waits.lock().expect("lock").is_empty());
@@ -97,7 +97,7 @@ async fn exhausted_remaining_on_a_stream_waits_for_the_reset_with_notices() {
     let (pacer, sleep, waits) = paced_parts();
     let c = client(base, &pacer, sleep);
     let deltas = Mutex::new(Vec::new());
-    let on = |d| deltas.lock().expect("lock").push(d);
+    let on = |d| deltas.lock().expect("lock").extend(super::not_size(d));
     c.chat_stream(&req(), &on).await.expect("1º");
     assert!(notices(&deltas).is_empty());
     c.chat_stream(&req(), &on).await.expect("2º");
@@ -132,7 +132,7 @@ async fn a_limit_teaches_the_pace_and_the_retry_follows_it() {
     let (pacer, sleep, waits) = paced_parts();
     let c = client(base, &pacer, sleep).with_throttle_delays(secs(&[5]));
     let deltas = Mutex::new(Vec::new());
-    let on = |d| deltas.lock().expect("lock").push(d);
+    let on = |d| deltas.lock().expect("lock").extend(super::not_size(d));
     c.chat_stream(&req(), &on).await.expect("1º");
     c.chat_stream(&req(), &on).await.expect("2º");
     c.chat_stream(&req(), &on).await.expect("3º, depois do limite");
@@ -169,7 +169,7 @@ async fn short_waits_have_no_notice() {
     let (pacer, sleep, waits) = paced_parts();
     let c = client(base, &pacer, sleep);
     let deltas = Mutex::new(Vec::new());
-    let on = |d| deltas.lock().expect("lock").push(d);
+    let on = |d| deltas.lock().expect("lock").extend(super::not_size(d));
     c.chat_stream(&req(), &on).await.expect("1º");
     c.chat_stream(&req(), &on).await.expect("2º");
     assert_eq!(*waits.lock().expect("lock"), vec![Duration::from_millis(800)]);
@@ -207,6 +207,7 @@ fn only_connection_clients_are_paced() {
         base_url: "http://127.0.0.1:9/v1".into(),
         api_key: "sk-literal".into(),
         wire_api: WireApi::Chat,
+        kind: Default::default(),
     };
     let from_conn = LlmClient::from_connection(&conn).expect("cliente");
     assert!(from_conn.is_paced());
@@ -224,6 +225,7 @@ async fn connection_clients_share_the_process_registry() {
         base_url: base,
         api_key: "sk-literal".into(),
         wire_api: WireApi::Chat,
+        kind: Default::default(),
     };
     LlmClient::from_connection(&conn).expect("cliente").chat(&req()).await.expect("ok");
     // Outro cliente da mesma conexão (outro papel, outro turno) vê o mesmo par.

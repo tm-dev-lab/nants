@@ -110,7 +110,8 @@ async fn run(
         state.approvals().clone(),
         state.events().clone(),
         Arc::clone(&secrets),
-    ));
+    )
+    .with_lang(state.project_lang(project_id)));
     let activity = Arc::new(BusActivitySink::new(
         state.events().clone(),
         project_id,
@@ -119,7 +120,7 @@ async fn run(
     let architect = LlmArchitect::new(backend, model, Some(effort), policy, approver)
         .with_lang(state.project_lang(project_id))
         .with_activity(activity, Some(spec_id.to_string()), None)
-        .with_usage(super::usage::FileUsageSink::new(root.to_path_buf(), project_id));
+        .with_usage(super::usage::FileUsageSink::redacting(root.to_path_buf(), project_id, Arc::clone(&secrets)));
     let turn = architect.update_architecture(root, &facts);
     let answer = tokio::select! {
         biased;
@@ -132,11 +133,12 @@ async fn run(
     };
     let sid = spec_id.to_string();
     let apply_root = root.to_path_buf();
+    let lang = state.project_lang(project_id).get();
     tokio::task::spawn_blocking(move || {
         let (arch_answer, lessons) = split_lessons(&answer);
-        let outcome = apply(&apply_root, &sid, &arch_answer, &secrets);
+        let outcome = apply(lang, &apply_root, &sid, &arch_answer, &secrets);
         // Lições dos perfis (spec 063): independentes do ARCHITECTURE.md; falha só vira aviso.
-        if let Err(Skip(code)) = apply_lessons(&apply_root, &sid, &lessons, &secrets) {
+        if let Err(Skip(code)) = apply_lessons(lang, &apply_root, &sid, &lessons, &secrets) {
             eprintln!("aviso: lições dos perfis não atualizadas ({sid}): {code}");
         }
         outcome
@@ -184,6 +186,7 @@ fn current_lessons_block(root: &Path, secrets: &SecretSet) -> String {
 /// cada um com origem Txx); o resto do perfil, inclusive as notas do usuário, fica intacto.
 /// Commita só os perfis alterados; falha de gravação/commit restaura os originais.
 pub(super) fn apply_lessons(
+    lang: crate::i18n::Lang,
     root: &Path,
     spec_id: &str,
     blocks: &[(String, Vec<String>)],
@@ -228,7 +231,7 @@ pub(super) fn apply_lessons(
         written += 1;
     }
     let paths: Vec<String> = changed.iter().map(|(rel, _, _)| rel.clone()).collect();
-    let msg = format!("docs({spec_id}): lições dos perfis de especialista");
+    let msg = crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), "commit.lessons");
     if Git::new(root).commit_paths(&paths, &msg).is_err() {
         restore(root, &changed);
         return Err(Skip("falha_no_commit"));
@@ -243,8 +246,9 @@ fn restore(root: &Path, files: &[(String, String, String)]) {
 }
 
 /// Valida `answer`, grava atomicamente e commita só o `ARCHITECTURE.md`. Síncrono (testável).
-pub fn apply(root: &Path, spec_id: &str, answer: &str, secrets: &SecretSet) -> Result<Outcome, Skip> {
-    let msg = format!("docs({spec_id}): atualiza ARCHITECTURE.md");
+/// O assunto do commit mantém o prefixo `docs(<spec>): ` e leva o texto no idioma do projeto.
+pub fn apply(lang: crate::i18n::Lang, root: &Path, spec_id: &str, answer: &str, secrets: &SecretSet) -> Result<Outcome, Skip> {
+    let msg = crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), "commit.architecture_file");
     apply_with_message(root, &msg, answer, secrets)
 }
 
@@ -344,6 +348,7 @@ pub(super) fn write_atomic(root: &Path, content: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) -> String {
@@ -383,13 +388,21 @@ mod tests {
     #[test]
     fn writes_and_commits_only_the_architecture_file() {
         let r = repo("ok");
-        let out = apply(&r, "028-x", &valid(), &none()).expect("apply");
+        let out = apply(Lang::PtBr, &r, "028-x", &valid(), &none()).expect("apply");
         assert_eq!(out, Outcome::Committed);
         assert!(fs::read_to_string(r.join(ARCH_FILE)).expect("r").contains("## Stack"));
         assert!(git(&r, &["log", "-1", "--format=%s"]).contains("docs(028-x): atualiza ARCHITECTURE.md"));
         assert!(git(&r, &["status", "--porcelain"]).is_empty());
         // Segunda chamada com o mesmo conteúdo: sem alteração.
-        assert_eq!(apply(&r, "028-x", &valid(), &none()), Ok(Outcome::Unchanged));
+        assert_eq!(apply(Lang::PtBr, &r, "028-x", &valid(), &none()), Ok(Outcome::Unchanged));
+    }
+
+    /// Spec 115 T04 (C-09): em projeto en, o mesmo prefixo `docs(<spec>): ` e o texto em inglês.
+    #[test]
+    fn architecture_commit_keeps_the_prefix_in_english() {
+        let r = repo("ok-en");
+        assert_eq!(apply(Lang::En, &r, "028-x", &valid(), &none()), Ok(Outcome::Committed));
+        assert_eq!(git(&r, &["log", "-1", "--format=%s"]).trim(), "docs(028-x): update ARCHITECTURE.md");
     }
 
     const PROFILE: &str = "---\nrole: developer\nstack: [clojure]\nupdated_at: 2026-10-16\nsource_spec: 063-x\n---\n## Papel\n- Clojure com deps.edn.\n## Notas do usuário\n- usar cljfmt\n";
@@ -417,7 +430,7 @@ mod tests {
             ("developer".to_string(), vec!["- usar `clojure -M:test` (T03/F-02)".to_string(), "- sem origem".to_string()]),
             ("reviewer".to_string(), vec!["- x (T01)".to_string()]), // sem arquivo: ignorado
         ];
-        assert_eq!(apply_lessons(&r, "064-y", &blocks, &none()).expect("ok"), 1);
+        assert_eq!(apply_lessons(Lang::PtBr, &r, "064-y", &blocks, &none()).expect("ok"), 1);
         let text = fs::read_to_string(r.join(".sdd/skills/developer.md")).expect("r");
         assert!(text.contains("## Lições do projeto\n- usar `clojure -M:test` (T03/F-02)"), "{text}");
         assert!(!text.contains("sem origem") && text.contains("## Notas do usuário\n- usar cljfmt"), "{text}");
@@ -426,24 +439,24 @@ mod tests {
         assert!(!r.join(".sdd/skills/reviewer.md").exists());
         // 2ª rodada, spec diferente: lições novas geram novo commit (e preservam as notas).
         let round2 = vec![("developer".to_string(), vec!["- outra (T04/F-01)".to_string()])];
-        assert_eq!(apply_lessons(&r, "065-z", &round2, &none()).expect("ok"), 1);
+        assert_eq!(apply_lessons(Lang::PtBr, &r, "065-z", &round2, &none()).expect("ok"), 1);
         let t2 = fs::read_to_string(r.join(".sdd/skills/developer.md")).expect("r");
         assert!(t2.contains("- outra (T04/F-01)") && !t2.contains("T03/F-02") && t2.contains("- usar cljfmt"), "{t2}");
         // mesma spec de novo, lições diferentes: também aplica (reason repetido não bloqueia).
         let round3 = vec![("developer".to_string(), vec!["- terceira (T05)".to_string()])];
-        assert_eq!(apply_lessons(&r, "065-z", &round3, &none()).expect("ok"), 1);
+        assert_eq!(apply_lessons(Lang::PtBr, &r, "065-z", &round3, &none()).expect("ok"), 1);
         assert!(fs::read_to_string(r.join(".sdd/skills/developer.md")).expect("r").contains("- terceira (T05)"));
         assert_eq!(git(&r, &["log", "--format=%s"]).matches("lições dos perfis").count(), 3);
         // sem lições válidas: nada muda.
         let none_valid = vec![("developer".to_string(), vec!["- sem origem".to_string()])];
-        assert_eq!(apply_lessons(&r, "065-z", &none_valid, &none()).expect("ok"), 0);
+        assert_eq!(apply_lessons(Lang::PtBr, &r, "065-z", &none_valid, &none()).expect("ok"), 0);
     }
 
     #[test]
     fn dirty_base_does_not_commit() {
         let r = repo("dirty");
         fs::write(r.join("sujo.txt"), "x").expect("w");
-        assert_eq!(apply(&r, "s", &valid(), &none()), Err(Skip("base_suja")));
+        assert_eq!(apply(Lang::PtBr, &r, "s", &valid(), &none()), Err(Skip("base_suja")));
         assert!(!r.join(ARCH_FILE).exists());
         assert_eq!(git(&r, &["log", "--format=%s"]).trim(), "init");
     }
@@ -453,7 +466,7 @@ mod tests {
         let r = repo("sdd");
         fs::create_dir_all(r.join(".sdd/specs")).expect("mkdir");
         fs::write(r.join(".sdd/specs/x.md"), "x").expect("w");
-        assert_eq!(apply(&r, "s", &valid(), &none()), Ok(Outcome::Committed));
+        assert_eq!(apply(Lang::PtBr, &r, "s", &valid(), &none()), Ok(Outcome::Committed));
         let files = git(&r, &["show", "--name-only", "--format=", "HEAD"]);
         assert_eq!(files.trim(), ARCH_FILE);
         assert!(git(&r, &["status", "--porcelain"]).contains(".sdd/"));
@@ -465,16 +478,16 @@ mod tests {
         fs::create_dir_all(r.join(".sdd")).expect("mkdir");
         fs::write(r.join(".sdd/s.yaml"), "x").expect("w");
         fs::write(r.join("a.txt"), "mudou\n").expect("w");
-        assert_eq!(apply(&r, "s", &valid(), &none()), Err(Skip("base_suja")));
+        assert_eq!(apply(Lang::PtBr, &r, "s", &valid(), &none()), Err(Skip("base_suja")));
     }
 
     #[test]
     fn invalid_content_writes_nothing() {
         let r = repo("invalid");
-        assert!(apply(&r, "s", "sem título\n## Stack\n", &none()).is_err());
-        assert!(apply(&r, "s", "# T\n## Visão geral\nso isso\n", &none()).is_err());
+        assert!(apply(Lang::PtBr, &r, "s", "sem título\n## Stack\n", &none()).is_err());
+        assert!(apply(Lang::PtBr, &r, "s", "# T\n## Visão geral\nso isso\n", &none()).is_err());
         let huge = format!("{}\n{}", valid(), "x".repeat(70 * 1024));
-        assert_eq!(apply(&r, "s", &huge, &none()), Err(Skip("grande_demais")));
+        assert_eq!(apply(Lang::PtBr, &r, "s", &huge, &none()), Err(Skip("grande_demais")));
         assert!(!r.join(ARCH_FILE).exists());
         assert!(git(&r, &["status", "--porcelain"]).is_empty());
     }
@@ -484,7 +497,7 @@ mod tests {
         let r = repo("fence");
         let body = valid().replace("texto", "chave sk-supersecret-123456");
         let secrets = SecretSet::new(vec!["sk-supersecret-123456".to_string()]);
-        apply(&r, "s", &format!("```markdown\n{body}```"), &secrets).expect("apply");
+        apply(Lang::PtBr, &r, "s", &format!("```markdown\n{body}```"), &secrets).expect("apply");
         let saved = fs::read_to_string(r.join(ARCH_FILE)).expect("r");
         assert!(saved.starts_with("# Proj"));
         assert!(!saved.contains("sk-supersecret-123456"));
@@ -498,7 +511,7 @@ mod tests {
         fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("hook");
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(apply(&r, "s", &valid(), &none()), Err(Skip("falha_no_commit")));
+        assert_eq!(apply(Lang::PtBr, &r, "s", &valid(), &none()), Err(Skip("falha_no_commit")));
         assert!(!r.join(ARCH_FILE).exists());
         assert!(git(&r, &["status", "--porcelain"]).is_empty());
     }

@@ -49,12 +49,6 @@ pub const PAUSE_UI_BEFORE_LOOKUP: &str = "ui_state_before_lookup";
 /// Ponto de pausa de teste no PUT por projeto, com o projeto encontrado e o read lock seguro.
 pub const PAUSE_UI_AFTER_LOOKUP: &str = "ui_state_after_lookup";
 
-const MSG_NO_DATA_DIR: &str = "diretório de dados do Nants indisponível";
-const MSG_UNSAFE: &str = "estado da interface inacessível (symlink ou arquivo especial)";
-const MSG_IO: &str = "falha ao gravar o estado da interface";
-const MSG_TOO_LARGE: &str = "o estado da interface passaria de 64 KiB";
-const MSG_SECTION: &str = "section deve ter de 1 a 64 caracteres [a-z0-9_.-], sem partes vazias";
-const MSG_NOT_FOUND: &str = "projeto não encontrado";
 
 /// Envelope devolvido pelo GET/PUT (e pelo 409).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,8 +99,8 @@ enum StoreError {
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         match e {
-            StoreError::Unsafe => ApiError::internal(MSG_UNSAFE),
-            StoreError::Io => ApiError::internal(MSG_IO),
+            StoreError::Unsafe => ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "ui_state_unsafe", Map::new()),
+            StoreError::Io => ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "ui_state_write_failed", Map::new()),
         }
     }
 }
@@ -247,19 +241,19 @@ fn set_section(data: &mut Map<String, Value>, section: &str, value: Value) {
 fn parse_put(body: &Bytes) -> Result<PutInput, ApiError> {
     let input: PutInput = serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo deve ter base_rev, section e value")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "ui_state_body_invalid", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })?;
     if !valid_section(&input.section) {
-        return Err(ApiError::unprocessable(MSG_SECTION));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "ui_section_invalid", Map::new()));
     }
     Ok(input)
 }
 
 fn data_dir_of(state: &AppState) -> Result<PathBuf, ApiError> {
-    state.data_dir().map(Path::to_path_buf).ok_or_else(|| ApiError::internal(MSG_NO_DATA_DIR))
+    state.data_dir().map(Path::to_path_buf).ok_or_else(|| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "data_dir_unavailable", Map::new()))
 }
 
 /// Lê e grava sob o lock do estado da UI. Devolve 200 com o envelope novo ou 409 com o atual.
@@ -274,14 +268,14 @@ async fn apply_put(state: &AppState, data_dir: PathBuf, doc: Doc, input: PutInpu
         set_section(&mut next.data, &input.section, input.value);
         next.rev = next.rev.saturating_add(1);
         next.version = UI_STATE_VERSION;
-        let bytes = serde_json::to_vec(&next).map_err(|_| ApiError::internal(MSG_IO))?;
+        let bytes = serde_json::to_vec(&next).map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "ui_state_write_failed", Map::new()))?;
         if bytes.len() > UI_STATE_MAX_BYTES {
-            return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, MSG_TOO_LARGE));
+            return Err(ApiError::coded(StatusCode::PAYLOAD_TOO_LARGE, "ui_state_too_large", Map::new()));
         }
         write_doc(&data_dir, &doc, &bytes)?;
         Ok(Ok(next))
     };
-    let outcome = tokio::task::spawn_blocking(job).await.map_err(|_| ApiError::internal("falha interna"))??;
+    let outcome = tokio::task::spawn_blocking(job).await.map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))??;
     Ok(match outcome {
         Ok(envelope) => Json(envelope).into_response(),
         Err(current) => conflict(current),
@@ -300,7 +294,7 @@ fn conflict(current: UiEnvelope) -> Response {
 async fn read_blocking(data_dir: PathBuf, doc: Doc) -> Result<UiEnvelope, ApiError> {
     tokio::task::spawn_blocking(move || read_doc(&data_dir, &doc).map_err(ApiError::from))
         .await
-        .map_err(|_| ApiError::internal("falha interna"))?
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?
 }
 
 /// `GET /api/ui-state`
@@ -322,7 +316,7 @@ pub async fn get_project(State(state): State<AppState>, AxPath(id): AxPath<Strin
     let data_dir = data_dir_of(&state)?;
     let cfg = state.config().read().await;
     if !cfg.projects.iter().any(|p| p.id == id) {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, MSG_NOT_FOUND));
+        return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()));
     }
     let envelope = read_blocking(data_dir, Doc::Project(id.clone())).await;
     drop(cfg);
@@ -343,7 +337,7 @@ pub async fn put_project(
     state.pause(PAUSE_UI_BEFORE_LOOKUP).await;
     let cfg = state.config().read().await;
     if !cfg.projects.iter().any(|p| p.id == id) {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, MSG_NOT_FOUND));
+        return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()));
     }
     state.pause(PAUSE_UI_AFTER_LOOKUP).await;
     let result = apply_put(&state, data_dir, Doc::Project(id.clone()), input).await;

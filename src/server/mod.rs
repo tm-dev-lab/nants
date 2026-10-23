@@ -13,6 +13,7 @@ pub mod captures;
 pub mod survey;
 pub mod tools_trail;
 pub mod chat;
+pub mod chatgpt;
 pub mod chat_attachments;
 pub mod choices;
 pub mod config_api;
@@ -83,6 +84,11 @@ pub fn router(state: AppState) -> Router {
             "/api/config/connections/:id/models",
             get(models_api::list_models),
         )
+        // Conexão pelo plano ChatGPT (spec 116): início do login, retorno, estado e sair.
+        .route(chatgpt::START_PATH, post(chatgpt::post_start))
+        .route(chatgpt::CALLBACK_PATH, get(chatgpt::get_callback))
+        .route("/api/connections/:id/chatgpt", get(chatgpt::get_status))
+        .route("/api/connections/:id/chatgpt/logout", post(chatgpt::post_logout))
         .route("/api/projects", post(projects::create_project))
         .route("/api/projects/:id", delete(projects::remove_project))
         .route("/api/projects/:id/state", get(projects::get_state))
@@ -286,6 +292,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         }
     }
 
@@ -845,6 +852,7 @@ mod tests {
             base_url: base,
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         };
         let result = config_api::run_handshake_with(&conn, "m".into(), Duration::from_millis(200)).await;
         assert!(!result.ok);
@@ -864,6 +872,7 @@ mod tests {
             base_url: base,
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         };
         let result = config_api::run_handshake_with(&conn, "m".into(), Duration::from_secs(5)).await;
         assert_eq!(result.status, Some(429));
@@ -918,6 +927,7 @@ mod tests {
             base_url: base,
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("test-id"), cfg);
         let req = request(
@@ -978,6 +988,7 @@ mod tests {
             base_url: "https://user:SEGREDO@host.example/v1".into(),
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("userinfo-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -997,6 +1008,7 @@ mod tests {
             base_url: format!("https://user:SEGREDO@127.0.0.1:{port}/v1"),
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("legacy-test"), cfg);
         let req = request(
@@ -1124,6 +1136,7 @@ mod tests {
             base_url: base,
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "salva".into(),
@@ -1151,6 +1164,7 @@ mod tests {
             base_url: base.clone(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("probe-cache"), cfg);
         let key = super::models_api::CacheKey::new("salva", &base);
@@ -1225,6 +1239,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("probe-f03"), cfg);
         let (status, resp) = call(
@@ -1254,6 +1269,7 @@ mod tests {
             base_url: base,
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         };
         let result =
             config_api::run_models_probe_with(&conn, Duration::from_millis(200)).await;
@@ -1351,6 +1367,7 @@ mod tests {
             base_url: "https://h/v1?key=SEGREDO".into(),
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("query-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -1412,6 +1429,7 @@ mod tests {
             base_url: "https://h/v1".into(),
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "bad id".into(),
@@ -1511,6 +1529,7 @@ mod tests {
             base_url: "https://h/v1".into(),
             api_key: "env:sk-abc123segredo".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("env-f11-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -1551,6 +1570,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         let state = state_in(&temp_dir("f03"), cfg);
         let body = json!({
@@ -1646,7 +1666,7 @@ mod static_ui_routes_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
-        assert_eq!(text(resp).await, r#"{"error":"não encontrado"}"#);
+        assert_eq!(text(resp).await, r#"{"code":"not_found","error":"não encontrado"}"#);
     }
 
     #[tokio::test]

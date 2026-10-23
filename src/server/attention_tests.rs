@@ -275,6 +275,7 @@ fn state_with_reviewer(dir: &Path, ids: &[&str]) -> AppState {
         base_url: "https://api.example.com/v1".into(),
         api_key: "sk-teste-atencao-0123456789".into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     cfg.agents.reviewer = AgentConfig { connection_id: "c".into(), model: "rev".into(), effort: Effort::Medium, max_steps: None };
     AppState::new(dir.join("config.toml"), cfg, 3000).with_data_dir(dir.join("data"))
@@ -329,20 +330,34 @@ async fn without_reviewer_fresh_plan_counts() {
 
 #[test]
 fn final_fix_kind_requires_an_environment_request() {
-    use crate::server::approvals::{PendingView, FINAL_FIX_COMMAND};
-    let view = |kind: Option<&'static str>| PendingView {
+    use crate::server::approvals::{PendingView, CONFIG_KIND, FINAL_FIX_KIND};
+    // Spec 114 T02: reconhecida pelo tipo estável, nunca pelo texto (que sai no idioma do projeto).
+    let view = |kind: Option<&'static str>, change_kind: Option<&'static str>, command: &str| PendingView {
         request_id: "a".repeat(32),
         agent: "architect",
-        command: FINAL_FIX_COMMAND.to_string(),
+        command: command.to_string(),
         task_id: None,
         always_allowed: false,
         always_denied_reason: None,
+        always_denied_code: None,
         kind,
         reason: None,
         diff: None,
+        change_kind,
     };
-    assert_eq!(super::permission_item(view(Some("environment"))).kind, "final_fix");
-    assert_eq!(super::permission_item(view(None)).kind, "command", "comando com o mesmo texto não é a correção final");
+    for command in ["Create a fix task for the unmet global criteria", "Criar tarefa de correção dos critérios globais não atendidos"] {
+        assert_eq!(super::permission_item(view(Some("environment"), Some(FINAL_FIX_KIND), command)).kind, "final_fix", "{command}");
+    }
+    assert_eq!(
+        super::permission_item(view(None, None, "Criar tarefa de correção dos critérios globais não atendidos")).kind,
+        "command",
+        "comando com o mesmo texto não é a correção final"
+    );
+    assert_eq!(
+        super::permission_item(view(Some("environment"), Some(CONFIG_KIND), "Create a fix task for the unmet global criteria")).kind,
+        "environment",
+        "o texto não decide: outro tipo de pedido de alteração segue `environment`"
+    );
 }
 
 #[tokio::test]

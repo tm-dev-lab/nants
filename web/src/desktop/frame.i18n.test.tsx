@@ -193,8 +193,8 @@ describe("moldura em inglês: erros dos interruptores", () => {
       fireEvent.click(within(confirm).getByRole("button", { name: "Turn on auto-approve" }));
     });
     await settle();
-    // A frase é do dicionário; o motivo é o texto fixo do cliente da API por status (traduzido na 102).
-    expect(within(confirm).getByRole("alert").textContent).toBe("Couldn't change auto-approve: dados inválidos");
+    // A frase é do dicionário; o motivo é a reserva do cliente por status, no idioma ativo (115 T02).
+    expect(within(confirm).getByRole("alert").textContent).toBe("Couldn't change auto-approve: invalid data");
   });
 
   it("falha ao desligar a Internet: o alerta da barra traz a frase inteira com a mensagem do servidor", async () => {
@@ -211,7 +211,7 @@ describe("moldura em inglês: erros dos interruptores", () => {
     });
     await settle();
     expect(document.querySelector("[data-bar-alert='internet'] .nd-bar-alert-text")?.textContent).toBe(
-      "Couldn't change the Architect's internet access: falha interna do servidor",
+      "Couldn't change the Architect's internet access: internal server error",
     );
   });
 });

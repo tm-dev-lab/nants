@@ -122,20 +122,20 @@ export const PERMISSION_ALWAYS_FALLBACK_NOTICE: Readonly<Record<"once" | "run", 
 });
 
 /**
- * Motivos fixos do servidor para `always_allowed: false` (allowlist.rs, sempre em pt-BR) e a chave
- * do texto exibido para cada um. O motivo genérico do servidor mapeia para o genérico do cliente;
- * qualquer outro motivo também.
+ * Códigos do servidor para `always_allowed: false` (`approvals::always_denied_code`, spec 115 T03)
+ * e a chave do texto exibido para cada um. Código ausente ou desconhecido vira o genérico.
  */
 const PERMISSION_ALWAYS_REASON_KEYS: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
-  ["este comando executa código arbitrário", "permission.always.arbitrary"],
-  ["este comando contém operadores ou aspas", "permission.always.operators"],
-  ["este comando contém um segredo e não pode ser liberado permanentemente", "permission.always.secret"],
-  ["não pode ser liberado permanentemente", "permission.always.generic"],
+  ["arbitrary", "permission.always.arbitrary"],
+  ["operators", "permission.always.operators"],
+  ["secret", "permission.always.secret"],
+  ["docker", "permission.always.docker"],
+  ["generic", "permission.always.generic"],
 ]);
 
-/** Explicação de não haver "Sempre" para o motivo do servidor (ausente ou desconhecido: genérico). */
-export function permissionAlwaysReason(reason: string | null | undefined): string {
-  const key = reason === null || reason === undefined ? undefined : PERMISSION_ALWAYS_REASON_KEYS.get(reason);
+/** Explicação de não haver "Sempre" pelo código do motivo (ausente ou desconhecido: genérico). */
+export function permissionAlwaysReason(code: string | null | undefined): string {
+  const key = code === null || code === undefined ? undefined : PERMISSION_ALWAYS_REASON_KEYS.get(code);
   return t(key ?? "permission.always.generic");
 }
 
@@ -149,6 +149,9 @@ const PROVIDER_FIXED_CODES: ReadonlySet<string> = new Set([
   "provider_connect_failed",
   "provider_bad_response",
   "provider_invalid_config",
+  "provider_plan_limit",
+  "provider_plan_not_eligible",
+  "provider_plan_needs_login",
 ]);
 
 /** Dica de limite (spec 089) para `provider_bad_response` com detalhe "provedor no limite…" (reserva pt-BR). */
@@ -228,6 +231,13 @@ export function providerFailureMessage(
     }
     case "provider_invalid_config":
       return withDetail(t("providerMsg.invalidConfig"), detail);
+    // Plano ChatGPT (spec 116 T02): limite de uso, conta não elegível ou entrar de novo.
+    case "provider_plan_limit":
+      return t("providerMsg.planLimit");
+    case "provider_plan_not_eligible":
+      return t("providerMsg.planNotEligible");
+    case "provider_plan_needs_login":
+      return t("providerMsg.planNeedsLogin");
     default:
       return null;
   }

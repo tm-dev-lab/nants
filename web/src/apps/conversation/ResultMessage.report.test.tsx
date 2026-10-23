@@ -93,9 +93,9 @@ function routes({ state = () => stateOf("COMPLETED"), report, result = () => ({ 
     if (method === "GET" && url.endsWith("/result")) return result();
     if (method === "GET" && url.endsWith("/report")) {
       reportCalls += 1;
-      return report ? report(reportCalls) : { status: 404, body: { error: "relatório não encontrado" } };
+      return report ? report(reportCalls) : { status: 404, body: { error: "relatório não encontrado", code: "report_not_found" } };
     }
-    return { status: 404, body: { error: "não encontrado" } };
+    return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
   return { fetchMock, reportCalls: () => reportCalls, reportUrls: () => fetchMock.mock.calls.map((c) => String(c[0])).filter((u) => u.endsWith("/report")) };
 }

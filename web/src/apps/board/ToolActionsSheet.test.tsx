@@ -51,7 +51,7 @@ describe("ToolActionsSheet", () => {
     let calls = 0;
     installFetch(() => {
       calls += 1;
-      return calls === 1 ? { status: 500, body: { error: "falha interna" } } : { body: { items: [], total: 0, has_more: false } };
+      return calls === 1 ? { status: 500, body: { error: "falha interna", code: "internal" } } : { body: { items: [], total: 0, has_more: false } };
     });
     render(<ToolActionsSheet projectId="p1" specId="s1" task="FINAL" title="Ações da verificação final" onClose={() => undefined} />);
     const alert = await screen.findByRole("alert");

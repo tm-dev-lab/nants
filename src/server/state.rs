@@ -51,8 +51,8 @@ pub enum ReserveError {
     ReportInProgress,
 }
 
-/// Mensagem (409) enquanto o relatório final é gerado. Distinta de execução em andamento.
-pub const REPORT_BUSY_MSG: &str = "Gerando o relatório final do Arquiteto; tente de novo em instantes.";
+/// Código (spec 115 T02) do 409 enquanto o relatório final da spec anterior é gerado.
+pub const REPORT_BUSY_CODE: &str = "report_in_progress";
 
 /// Pausa de teste: ao atingir `point`, sinaliza `reached` e espera `release`.
 #[cfg(test)]
@@ -200,6 +200,8 @@ pub struct AppState {
     devices: Arc<super::devices::DeviceStore>,
     /// O endereço de escuta não é loopback (spec 112): exige dispositivo como o modo rede.
     exposed: bool,
+    /// Login pelo plano ChatGPT (spec 116): tentativas pendentes, JWKS e renovações.
+    chatgpt: Arc<super::chatgpt::ChatgptAuth>,
     /// IPv4 de rede do Windows conferidos há pouco (spec 112), com o instante da conferência.
     windows_ips: Arc<tokio::sync::Mutex<Option<(Instant, Option<Vec<std::net::Ipv4Addr>>)>>>,
     /// Pausas de teste (vazio em produção).
@@ -271,6 +273,7 @@ impl AppState {
             network_run: super::lan::NetworkRun { lan: false, source: super::lan::ModeSource::Default, requested_port: port },
             devices,
             exposed: false,
+            chatgpt: Arc::new(super::chatgpt::ChatgptAuth::default()),
             windows_ips: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             gates: Arc::new(Mutex::new(Vec::new())),
@@ -333,6 +336,17 @@ impl AppState {
         .flatten();
         *cache = Some((Instant::now(), ips.clone()));
         ips
+    }
+
+    /// Login pelo plano ChatGPT (spec 116).
+    pub fn chatgpt(&self) -> &Arc<super::chatgpt::ChatgptAuth> {
+        &self.chatgpt
+    }
+
+    /// Substitui o login pelo plano ChatGPT (testes: servidor de autenticação simulado e relógio).
+    pub fn with_chatgpt(mut self, auth: super::chatgpt::ChatgptAuth) -> Self {
+        self.chatgpt = Arc::new(auth);
+        self
     }
 
     /// Dispositivos autorizados (spec 112).
@@ -426,12 +440,17 @@ impl AppState {
     }
 
     /// O par do papel Desenvolvedor gera imagens ([`Self::image_generation_available`]); conexão
-    /// inexistente = não.
+    /// inexistente = não. Pelo plano ChatGPT, também não (spec 116 T02: a ferramenta hospedada de
+    /// imagem não funciona por ali).
     pub async fn developer_image_generation_available(&self) -> bool {
         let pair = {
             let cfg = self.config.read().await;
             let agent = &cfg.agents.developer;
-            let wire = cfg.connections.iter().find(|c| c.id == agent.connection_id).map(|c| c.wire_api);
+            let wire = cfg
+                .connections
+                .iter()
+                .find(|c| c.id == agent.connection_id && !c.is_chatgpt_plan())
+                .map(|c| c.wire_api);
             wire.map(|w| (agent.connection_id.clone(), agent.model.clone(), w))
         };
         pair.is_some_and(|(conn, model, wire)| self.image_generation_available(&conn, &model, wire))

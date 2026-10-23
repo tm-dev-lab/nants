@@ -14,11 +14,15 @@ import { localized } from "../../i18n";
 import { useT } from "../../i18n/react";
 import { useShell } from "../../desktop/shellContext";
 import { parseEscalation, type EscalationContext } from "../../escalation";
+import { localizeAttempted, localizeRecoveryAnalysis, localizeRecoveryCause } from "../../recoveryAnalysis";
 import { recoveryKey, useAppStore, type ChatMessage } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
 import { approveProblem, recoveryProblem, type RunProblem } from "../shared/runProblems";
 import { ChatCard, ChatCardHead } from "./ChatCard";
+import { runStopCode } from "../board/boardModel";
+import { PLAN_USAGE_URL, planConnectionToReconnect } from "../settings/chatgptPlan";
+import { useChatgptStart } from "../settings/PlanConnection";
 
 /** Rótulo de cada tipo de opção de escalada, no idioma ativo. */
 export const ESCALATION_KIND_LABELS: Readonly<Record<string, string>> = localized({
@@ -55,8 +59,9 @@ function Block({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function EscalationDetails({ ctx }: { ctx: EscalationContext }) {
-  const { t } = useT();
-  const cause = ctx.rootCause ?? ctx.summary;
+  const { t, lang } = useT();
+  // As marcas e as causas fixas do servidor vêm em pt-BR: viram o idioma ativo (spec 115 T04).
+  const cause = ctx.rootCause !== null ? localizeRecoveryCause(ctx.rootCause, lang) : localizeRecoveryAnalysis(ctx.summary, lang);
   return (
     <div className="nd-stack-sm nd-muted">
       {cause !== "" ? (
@@ -81,12 +86,12 @@ function EscalationDetails({ ctx }: { ctx: EscalationContext }) {
       ) : null}
       {ctx.attempted !== null ? (
         <Block title={t("escalation.attempted")}>
-          <p className="nd-break">{ctx.attempted}</p>
+          <p className="nd-break">{localizeAttempted(ctx.attempted, lang)}</p>
         </Block>
       ) : null}
       {ctx.whyStopped !== null ? (
         <Block title={t("escalation.whyStopped")}>
-          <p className="nd-prewrap">{ctx.whyStopped}</p>
+          <p className="nd-prewrap">{localizeRecoveryCause(ctx.whyStopped, lang)}</p>
         </Block>
       ) : null}
       {ctx.options.length > 0 ? (
@@ -198,6 +203,11 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
   const guidanceShown = !hasOptions || otherOpen;
   const guidanceTooLong = guidanceBytes > RECOVERY_GUIDANCE_MAX_BYTES;
   const blockedByReadiness = gateBlocked(shell.readiness, "execute");
+  // Pausa pelo plano ChatGPT (spec 116 T03): limite de uso ou novo login, com o cartão próprio.
+  const stopCode = useAppStore((s) => (stalled ? runStopCode(s.messages[projectId], spec.id, s.runStarts[projectId]) : null));
+  const planPause = stopCode === "run.plan_limit" ? "limit" : stopCode === "run.plan_needs_login" ? "sign_in" : null;
+  const reconnectTarget = useAppStore((s) => (planPause === "sign_in" ? (planConnectionToReconnect(s.config?.agents, s.config?.connections)?.id ?? null) : null));
+  const reconnect = useChatgptStart(reconnectTarget ?? undefined);
   const locked = busy || blockedByReadiness;
 
   function fail(next: RunProblem): void {
@@ -262,8 +272,22 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
         ))}
       />
       <div className="nd-chat-card-body nd-stack">
-        <h3 className="nd-callout-title">{stalled ? t("paused.stalledTitle") : environmental ? t("envBlock.title") : t("paused.title")}</h3>
-        {stalled ? (
+        <h3 className="nd-callout-title" data-plan-pause={planPause ?? undefined}>
+          {planPause === "limit"
+            ? t("paused.planLimitTitle")
+            : planPause === "sign_in"
+              ? t("paused.planLoginTitle")
+              : stalled
+                ? t("paused.stalledTitle")
+                : environmental
+                  ? t("envBlock.title")
+                  : t("paused.title")}
+        </h3>
+        {planPause === "limit" ? (
+          <p className="nd-muted">{t("paused.planLimitHint")}</p>
+        ) : planPause === "sign_in" ? (
+          <p className="nd-muted">{t("paused.planLoginHint")}</p>
+        ) : stalled ? (
           <p className="nd-muted">{t("paused.stalledHint")}</p>
         ) : environmental ? (
           <p className="nd-muted">{t("envBlock.hint")}</p>
@@ -389,11 +413,32 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
       </div>
       <div className="nd-chat-card-foot nd-stack-sm">
         <div className="nd-actions">
+          {planPause === "limit" ? (
+            <a className="nd-btn" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="">
+              <Icon name="external" size={14} />
+              {t("chatgpt.manageUsage")}
+            </a>
+          ) : null}
+          {planPause === "sign_in" ? (
+            <button
+              type="button"
+              className="nd-btn"
+              data-variant="primary"
+              data-plan-reconnect=""
+              disabled={reconnect.busy}
+              aria-busy={reconnect.busy}
+              onClick={() => (reconnectTarget !== null ? reconnect.start() : shell.openSettings("connections"))}
+            >
+              <Icon name="refresh" size={14} />
+              {reconnect.busy ? t("chatgpt.opening") : t("chatgpt.reconnect")}
+            </button>
+          ) : null}
           <button type="button" className="nd-btn" onClick={() => void resume()} disabled={locked} aria-busy={busy} data-resume="">
             <Icon name="play" size={14} />
             {resumeLabel}
           </button>
         </div>
+        {reconnect.notice}
         {problem !== null ? <ProblemNotice message={problem.message} missing={problem.missing} prereq={problem.prereq} /> : null}
       </div>
     </ChatCard>

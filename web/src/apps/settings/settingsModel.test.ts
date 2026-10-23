@@ -3,6 +3,7 @@
  * da janela e as regras do editor de preços.
  */
 import { describe, expect, it } from "vitest";
+import { setLanguage } from "../../i18n";
 import type { Readiness } from "../../desktop/api";
 import { notReady, READY } from "../../desktop/shell-test-utils";
 import {
@@ -60,10 +61,26 @@ describe("preços", () => {
   it("formata e lê números em pt-BR", () => {
     expect(formatPrice(1.25)).toBe("1,25");
     expect(formatPrice(0.1 + 0.2)).toBe("0,3");
+    // Spec 115 T04 (C-14): pelo Intl, sem separador de milhar (o campo lê de volta).
+    expect(formatPrice(1234.5)).toBe("1234,5");
+    expect(parsePrice(formatPrice(1234.5))).toBe(1234.5);
+    expect(formatPrice(15)).toBe("15");
     expect(parsePrice("1,5")).toBe(1.5);
     expect(parsePrice("")).toBeNull();
     expect(parsePrice("-1")).toBeNull();
     expect(parsePrice("abc")).toBeNull();
+  });
+
+  it("formata com ponto em en (Intl), sem separador de milhar", () => {
+    setLanguage("en", { persist: false });
+    try {
+      expect(formatPrice(1.25)).toBe("1.25");
+      expect(formatPrice(0.1 + 0.2)).toBe("0.3");
+      expect(formatPrice(1234.5)).toBe("1234.5");
+      expect(parsePrice(formatPrice(0.000125))).toBe(0.000125);
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 
   it("selo: sem preço, estimado (com a data) e manual", () => {

@@ -64,6 +64,7 @@ fn ready_config() -> Config {
         base_url: "https://api.example.com/v1".into(),
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     cfg.agents.architect = agent("m-arq");
     cfg.agents.developer = agent("m-dev");
@@ -357,7 +358,7 @@ const ABSENT_VAR: &str = "NANTS_TEST_T12_READY_KEY_NEVER_SET";
 const LEAK_URL: &str = "https://segredo-host-t12.example.com/v1";
 
 fn conn(id: &str, name: &str, api_key: &str) -> Connection {
-    Connection { id: id.into(), name: name.into(), base_url: LEAK_URL.into(), api_key: api_key.into(), wire_api: WireApi::default() }
+    Connection { id: id.into(), name: name.into(), base_url: LEAK_URL.into(), api_key: api_key.into(), wire_api: WireApi::default(), kind: Default::default() }
 }
 
 /// Três papéis prontos; o Arquiteto em `c1` e Developer/Revisor em `c2`, com as chaves dadas.
@@ -547,4 +548,23 @@ async fn protected_routes_412_with_the_key_item() {
         assert_eq!(missing_of(&resp), ["connection_key:c2"], "{uri}");
         assert!(!resp.to_string().contains(ABSENT_VAR));
     }
+}
+
+/// Spec 116 T02: a conexão pelo plano ChatGPT não pede chave; pede o login utilizável. Os modelos
+/// dela não entram na recomendação de preço (lá não há US$).
+#[test]
+fn plan_connection_needs_login_not_key_nor_price() {
+    let mut cfg = ready_config();
+    cfg.connections[0] = Connection::chatgpt_plan("c1", "ChatGPT (p)");
+    let r = evaluate_with(&cfg, &items(true, true), &secrets(&cfg), &|_| false);
+    assert_eq!(ids(&r.chat), ["connection_plan:c1"]);
+    assert_eq!(r.chat.missing[0].code, "connection_plan");
+    assert_eq!(r.chat.missing[0].settings_tab, "connections");
+    assert!(ids(&r.execute).contains(&"connection_plan:c1"));
+    assert!(!ids(&r.execute).iter().any(|id| id.starts_with("connection_key")));
+    assert!(ids(&r.recommended).is_empty(), "sem preço para os modelos do plano");
+    // Com o login utilizável, nada pendente; `evaluate` sem a consulta conta como sem login.
+    let r = evaluate_with(&cfg, &items(true, true), &secrets(&cfg), &|id| id == "c1");
+    assert!(r.chat.ok && r.execute.ok, "{:?} {:?}", r.chat, r.execute);
+    assert!(!evaluate(&cfg, &items(true, true), &secrets(&cfg)).chat.ok);
 }

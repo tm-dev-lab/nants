@@ -61,6 +61,7 @@ const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-settings-tab", "aba de Configurações"],
   ["nd-segment-btn", "segmento de controle segmentado (Arquivos)"],
   ["nd-choice", "opção visual em grade (Aparência)"],
+  ["nd-conn-method", "cartão de como conectar (chave de API ou plano ChatGPT, spec 116)"],
   ["nd-link", "link em linha (trilha de pastas)"],
   ["nd-link-btn", "link em linha dentro do texto"],
   ["nd-disclosure-btn", "abre e fecha uma seção (mostrar mais)"],

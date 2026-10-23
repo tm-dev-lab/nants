@@ -11,7 +11,7 @@
  * no máximo um render por quadro, e só desta janela. A trilha não é buscada com a janela fora de
  * vista.
  */
-import { memo, useId, useMemo, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { ToolActionItem } from "../../api/types";
 import { Icon, type IconName } from "../../desktop/Icon";
 import { useSpace } from "../../desktop/shellContext";
@@ -36,6 +36,20 @@ const NO_ACTIVITIES: readonly ActivityEntry[] = [];
 const NO_MESSAGES: readonly ChatMessage[] = [];
 /** Últimas ações da tarefa ativa mostradas. */
 const RECENT_ACTIONS = 8;
+/** Passo do relógio da chamada ao modelo (o texto mostra segundos e minutos). */
+const MODEL_TICK_MS = 5_000;
+
+/** Instante atual, renovado a cada `ms` só enquanto `active` (sem relógio parado na tela). */
+function useNowWhile(active: boolean, ms: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), ms);
+    return () => clearInterval(timer);
+  }, [active, ms]);
+  return active ? now : Date.now();
+}
 
 type Tab = "live" | "history";
 
@@ -141,7 +155,9 @@ function dotTone(agent: string, live: { kind: LiveKind } | null): string {
  * `--muted` ("gerando imagem web/img/gato.webp"), com a tarefa em mono e a etapa abaixo, quando há.
  */
 function AgentRow({ agent, activity, running }: { agent: string; activity: ActivityEntry | undefined; running: boolean }) {
-  const live = activity === undefined ? null : liveActionOf(activity);
+  // Spec 114 T04: durante a chamada ao modelo, o tempo segue andando entre os sinais do servidor.
+  const now = useNowWhile(activity?.modelStartedAt !== undefined, MODEL_TICK_MS);
+  const live = activity === undefined ? null : liveActionOf(activity, now);
   const tone = dotTone(agent, live);
   return (
     <li className="nd-agent-row" data-agent-card={agent} data-live={live?.kind} data-tone={agentTone(agent)}>
@@ -173,6 +189,11 @@ function AgentRow({ agent, activity, running }: { agent: string; activity: Activ
         {live !== null && live.stage !== null ? (
           <span className="nd-agent-row-stage" data-live-stage="">
             {live.stage}
+          </span>
+        ) : null}
+        {live !== null && live.model !== null ? (
+          <span className="nd-agent-row-stage" data-live-model="">
+            {live.model}
           </span>
         ) : null}
       </span>

@@ -137,8 +137,19 @@ export function pacingText(notice: string | null): string {
 
 
 /** Houve consumo (alguma chamada, token, busca ou imagem). */
-export function hasConsumption(t: UsageTotals): boolean {
+/** Houve consumo cobrado em dólar (chave de API): chamadas, tokens, imagens ou buscas. */
+export function hasApiConsumption(t: UsageTotals): boolean {
   return t.calls > 0 || t.input > 0 || t.output > 0 || (t.images ?? 0) > 0 || (t.web_search_calls ?? 0) > 0;
+}
+
+/** Chamadas pelo plano ChatGPT (spec 116), que ficam fora das contagens em dólar. */
+function planCalls(t: UsageTotals): number {
+  return t.chatgpt_plan?.calls ?? 0;
+}
+
+/** Houve algum consumo: em dólar ou pelo plano ChatGPT. */
+export function hasConsumption(t: UsageTotals): boolean {
+  return hasApiConsumption(t) || planCalls(t) > 0;
 }
 
 export function costsSummary({ space }: AppSummaryInput): AppSummary {

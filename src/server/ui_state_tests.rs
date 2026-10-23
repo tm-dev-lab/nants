@@ -164,7 +164,7 @@ async fn invalid_section_and_body_are_rejected() {
     for section in ["", "Appearance", "a..b", ".a", "a.", "a/b", "a b", "ação", long.as_str()] {
         let (status, text) = put(&state, "/api/ui-state", 0, section, json!(1)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{section}: {text}");
-        assert_eq!(json_of(&text)["error"], MSG_SECTION, "mensagem fixa, sem ecoar a seção");
+        assert_eq!(json_of(&text)["code"], "ui_section_invalid", "mensagem fixa, sem ecoar a seção");
     }
     let ok = "a".repeat(64);
     let (status, _) = put(&state, "/api/ui-state", 0, &ok, json!(1)).await;

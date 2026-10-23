@@ -42,6 +42,7 @@ describe("upload de imagem do chat (spec 082 T05)", () => {
     [507, ATTACHMENT_NO_SPACE, "api.attachmentNoSpace"],
   ])("HTTP %s vira mensagem clara (com a chave do idioma ativo, spec 102 T06)", async (status, message, messageKey) => {
     stubFetch(async () => jsonResponse(status, { error: "qualquer" }));
+    // Sem `code` (limite do corpo antes da rota, por exemplo): a reserva do próprio cliente.
     const result = await uploadChatAttachment("p1", new Blob(["x"]), "image/png");
     expect(result).toEqual({ ok: false, error: { kind: "http", status, message, messageKey } });
   });

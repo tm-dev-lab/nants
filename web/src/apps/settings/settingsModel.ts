@@ -2,7 +2,7 @@
  * Regras puras da janela Configurações (spec 093, T08): abas, o que falta por aba (prontidão), o
  * resumo da janela e as regras do editor de preços (com o "US$ por imagem" da 092).
  */
-import { getLanguage, localized, t, tp } from "../../i18n";
+import { formatNumber, localized, t, tp } from "../../i18n";
 import type { Agents, ConnectionView, ModelPricing } from "../../api/types";
 import { ROLE_INFO, ROLE_ORDER, wireApiCardLabel, wireApiOf } from "../../settings/rules";
 import type { IconName } from "../../desktop/Icon";
@@ -123,12 +123,12 @@ export type PriceRows = Record<string, PriceRow>;
 export const EMPTY_PRICE_ROW: PriceRow = { input: "", output: "", cached: "", image: "", source: "manual" };
 
 /**
- * Número com o separador decimal do idioma ativo (vírgula em pt-BR, ponto em en), até 6 algarismos
- * significativos, sem cauda de float. O campo aceita os dois separadores (`parsePrice`).
+ * Número com o separador decimal do idioma ativo (vírgula em pt-BR, ponto em en) pelo
+ * `Intl.NumberFormat` (`formatNumber`, spec 115 T04), até 6 algarismos significativos, sem cauda de
+ * float e sem separador de milhar (o campo aceita os dois separadores decimais, `parsePrice`).
  */
 export function formatPrice(v: number): string {
-  const text = String(Number(v.toPrecision(6)));
-  return getLanguage() === "pt-BR" ? text.replace(".", ",") : text;
+  return formatNumber(v, { maximumSignificantDigits: 6, useGrouping: false });
 }
 
 export function priceRowOf(p: ModelPricing): PriceRow {

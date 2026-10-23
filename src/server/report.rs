@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use crate::agents::runner::{final_base_prefix, manual_criteria, section_text, ACCEPTANCE, FINAL_BASE_PREFIX};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
 use super::approvals::ProjectApprover;
@@ -60,8 +60,6 @@ const SPEC_FILE: &str = "spec.md";
 const TASKS_DIR: &str = "tasks";
 const SETTINGS_REL: &str = ".sdd/settings.yaml";
 const SOURCE: &str = "architect";
-const REPORT_NOT_FOUND: &str = "relatório não encontrado";
-const INTERNAL_MSG: &str = "falha interna";
 const NO_EVIDENCE: &str = "sem registro de execução dos testes";
 const NO_TEST_COMMAND: &str = "(não definido)";
 
@@ -237,7 +235,7 @@ async fn generate(
     let architect = LlmArchitect::new(backend, model, Some(effort), policy, approver)
         .with_lang(lang)
         .with_activity(activity, Some(spec_id.to_string()), None)
-        .with_usage(super::usage::FileUsageSink::new(root.clone(), project_id))
+        .with_usage(super::usage::FileUsageSink::redacting(root.clone(), project_id, Arc::clone(&secrets)))
         .with_memory(Arc::clone(&secrets));
 
     let turn = architect.report(&root, &facts);
@@ -735,10 +733,10 @@ pub async fn get_report(
     let root = PathBuf::from(&project.path);
     let view = tokio::task::spawn_blocking(move || read_report(&root, &spec_id, &secrets))
         .await
-        .map_err(|_| ApiError::internal(INTERNAL_MSG))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     match view {
         Some(view) => Ok(Json(view).into_response()),
-        None => Err(ApiError::new(StatusCode::NOT_FOUND, REPORT_NOT_FOUND)),
+        None => Err(ApiError::coded(StatusCode::NOT_FOUND, "report_not_found", Map::new())),
     }
 }
 

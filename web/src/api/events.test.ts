@@ -280,7 +280,7 @@ describe("permission_requested e permission_resolved: escopos", () => {
   const base = { request_id: "r1", project_id: "p1", task_id: null, agent: "developer", command: "node --test" };
 
   it("aceita always_allowed false com motivo e true com motivo null", () => {
-    const denied = { ...base, always_allowed: false, always_denied_reason: "este comando executa código arbitrário" };
+    const denied = { ...base, always_allowed: false, always_denied_reason: "este comando executa código arbitrário", always_denied_code: "arbitrary" };
     const allowed = { ...base, command: "git status", always_allowed: true, always_denied_reason: null };
     expect(parseApiEvent({ event_type: "permission_requested", project_id: "p1", payload: denied })).not.toBeNull();
     expect(parseApiEvent({ event_type: "permission_requested", project_id: "p1", payload: allowed })).not.toBeNull();
@@ -293,6 +293,12 @@ describe("permission_requested e permission_resolved: escopos", () => {
   it("rejeita always_allowed de tipo errado", () => {
     expect(
       parseApiEvent({ event_type: "permission_requested", project_id: "p1", payload: { ...base, always_allowed: "sim" } }),
+    ).toBeNull();
+  });
+
+  it("rejeita always_denied_code de tipo errado (spec 115 T03)", () => {
+    expect(
+      parseApiEvent({ event_type: "permission_requested", project_id: "p1", payload: { ...base, always_allowed: false, always_denied_code: 3 } }),
     ).toBeNull();
   });
 

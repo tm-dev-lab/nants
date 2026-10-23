@@ -95,7 +95,10 @@ async fn existing_folder_is_409_project_dir_exists_with_the_path() {
     fs::write(root.join("meu-app/arquivo.txt"), "dados").expect("arquivo");
     let (status, body) = create(&state, json!({"name": "Meu App"})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body, json!({"error": "project_dir_exists", "path": canonical(&root.join("meu-app"))}));
+    assert_eq!(
+        body,
+        json!({"error": "a pasta do projeto já existe", "code": "project_dir_exists", "path": canonical(&root.join("meu-app"))})
+    );
     assert!(state.config().read().await.projects.is_empty());
     assert!(!root.join("meu-app/.git").exists(), "nada inicializado");
     // Segunda criação do mesmo nome depois de uma criação bem-sucedida também é 409.
@@ -103,7 +106,7 @@ async fn existing_folder_is_409_project_dir_exists_with_the_path() {
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = create(&state, json!({"name": "outro"})).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "project_dir_exists");
+    assert_eq!(body["code"], "project_dir_exists");
 }
 
 #[tokio::test]
@@ -163,7 +166,7 @@ async fn symlink_in_place_of_the_folder_is_never_followed() {
     let state = state_with_root(&dir, root.to_str().expect("utf8"));
     let (status, body) = create(&state, json!({"name": "Meu App"})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "project_dir_exists");
+    assert_eq!(body["code"], "project_dir_exists");
     let (status, _) = create(&state, json!({"name": "Quebrado"})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(fs::read_dir(&outside).expect("ler").next().is_none(), "destino do link intocado");

@@ -288,7 +288,7 @@ describe("Shell: barra superior", () => {
       projects: [P1],
       states: { p1: makeProjectState({ id: "p1", name: "Loja", running: true, run: { spec_id: "s1", status: "running" }, specs: [spec] }) },
     });
-    server.reply("POST", /\/stop$/, () => ({ status: 409, body: { error: "não há execução em andamento desta spec" } }));
+    server.reply("POST", /\/stop$/, () => ({ status: 409, body: { error: "não há execução em andamento desta spec", code: "no_run_for_spec" } }));
     const pill = document.querySelector<HTMLElement>("[data-run-pill]");
     if (pill === null) throw new Error("pílula ausente");
     fireEvent.click(within(pill).getByRole("button", { name: "Parar" }));
@@ -709,9 +709,9 @@ describe("Shell: useSpaceData e eventos", () => {
     const afterReconnect = attention();
     expect(afterReconnect).toBe(before + 1);
     // Retomada da aba: oculta por mais de 2 s e de volta.
-    const realNow = Date.now;
-    let fake = realNow();
-    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => fake);
+    // O tempo oculta é medido pelo relógio monotônico (114/T01), não pelo de parede.
+    let fake = performance.now();
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => fake);
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("hidden");
     document.dispatchEvent(new Event("visibilitychange"));

@@ -40,6 +40,9 @@ struct Entry {
     tool: Option<String>,
     command: Option<String>,
     command_started_at: Option<u64>,
+    /// Chamada ao modelo em curso (spec 114 T04): início (ms, época Unix) e bytes recebidos.
+    model_started_at: Option<u64>,
+    received_bytes: Option<u64>,
     stage: Option<String>,
     stage_code: Option<String>,
     /// `code`/`params` do último rótulo de ferramenta e do último texto (spec 102).
@@ -67,6 +70,8 @@ pub struct Observed<'a> {
     pub stage_code: Option<&'a str>,
     /// `code` e `params` (já saneados) do texto do evento (spec 102).
     pub code: Option<(&'a str, &'a serde_json::Map<String, serde_json::Value>)>,
+    /// Bytes recebidos da resposta do modelo em curso (heartbeat da chamada, spec 114 T04).
+    pub received_bytes: Option<u64>,
 }
 
 /// Atividade ao vivo de um (agente, tarefa), como exposta pela API.
@@ -82,6 +87,11 @@ pub struct LiveActivity {
     pub command: Option<String>,
     /// Início do comando em curso (ms desde a época Unix).
     pub command_started_at: Option<u64>,
+    /// Chamada ao modelo em curso (spec 114 T04): início (ms desde a época Unix) e bytes recebidos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub received_bytes: Option<u64>,
     pub stage: Option<String>,
     /// `code`/`params` neutros de idioma (spec 102): a interface traduz; o texto é a reserva.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +153,8 @@ impl LiveActivityRegistry {
             tool: None,
             command: None,
             command_started_at: None,
+            model_started_at: None,
+            received_bytes: None,
             stage: ev.stage.map(String::from),
             stage_code: ev.stage_code.map(String::from),
             tool_code: None,
@@ -171,9 +183,22 @@ impl LiveActivityRegistry {
                 entry.command_started_at = Some(epoch_ms());
             }
             ActivityKind::Heartbeat => {}
+            ActivityKind::ModelBeat => {
+                if entry.model_started_at.is_some() && ev.received_bytes.is_some() {
+                    entry.received_bytes = ev.received_bytes;
+                }
+            }
             ActivityKind::CommandEnd => {
                 entry.command = None;
                 entry.command_started_at = None;
+            }
+            ActivityKind::Model => {
+                entry.model_started_at = Some(epoch_ms());
+                entry.received_bytes = None;
+            }
+            ActivityKind::ModelEnd => {
+                entry.model_started_at = None;
+                entry.received_bytes = None;
             }
             ActivityKind::Start | ActivityKind::End => {}
         }
@@ -213,6 +238,8 @@ impl LiveActivityRegistry {
                 tool: e.tool.clone(),
                 command: e.command.clone(),
                 command_started_at: e.command_started_at,
+                model_started_at: e.model_started_at,
+                received_bytes: e.received_bytes,
                 stage: e.stage.clone(),
                 stage_code: e.stage_code.clone(),
                 tool_code: e.tool_code.as_ref().map(|(c, _)| c.clone()),
@@ -264,6 +291,7 @@ mod tests {
             stage: None,
             stage_code: None,
             code: None,
+            received_bytes: None,
         };
         r.record_at(now, "p", ev);
     }
@@ -285,6 +313,45 @@ mod tests {
         assert!(snap[0].command.is_none() && snap[0].command_started_at.is_none());
     }
 
+    /// Spec 114 T04: a chamada ao modelo entra no instantâneo (início e bytes do heartbeat) e o
+    /// heartbeat mantém a entrada viva além do TTL; `model_end` limpa.
+    #[test]
+    fn model_call_is_in_snapshot_with_received_bytes() {
+        let r = LiveActivityRegistry::with_ttl(Duration::from_secs(120));
+        let t = Instant::now();
+        let ev = |kind, received_bytes| Observed {
+            agent: "developer",
+            task_id: Some("T02"),
+            spec_id: Some("003"),
+            activity_id: "a1",
+            kind,
+            text: None,
+            stage: None,
+            stage_code: None,
+            code: None,
+            received_bytes,
+        };
+        r.record_at(t, "p", ev(ActivityKind::Start, None));
+        r.record_at(t, "p", ev(ActivityKind::Model, None));
+        let s = r.snapshot_at(t, "p");
+        assert!(s[0].model_started_at.is_some() && s[0].received_bytes.is_none());
+        let mut at = t;
+        for i in 1..=5u64 {
+            at += Duration::from_secs(100);
+            r.record_at(at, "p", ev(ActivityKind::ModelBeat, Some(i * 1000)));
+        }
+        let s = r.snapshot_at(at + Duration::from_secs(60), "p");
+        assert_eq!(s.len(), 1, "o heartbeat da chamada mantém a entrada viva");
+        assert_eq!(s[0].received_bytes, Some(5000));
+        let json = serde_json::to_value(&s[0]).expect("json");
+        assert_eq!(json["received_bytes"], 5000);
+        r.record_at(at, "p", ev(ActivityKind::ModelEnd, None));
+        let s = r.snapshot_at(at, "p");
+        assert!(s[0].model_started_at.is_none() && s[0].received_bytes.is_none());
+        let json = serde_json::to_value(&s[0]).expect("json");
+        assert!(json.get("model_started_at").is_none());
+    }
+
     #[test]
     fn final_verification_stage_survives_ttl_until_end() {
         let r = LiveActivityRegistry::with_ttl(Duration::from_secs(120));
@@ -299,6 +366,7 @@ mod tests {
             stage: Some(FINAL_VERIFICATION_STAGE),
             stage_code: Some(FINAL_VERIFICATION_STAGE),
             code: None,
+            received_bytes: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start));
         let late = t + Duration::from_secs(600);
@@ -350,6 +418,7 @@ mod tests {
                 stage: None,
                 stage_code: None,
                 code: None,
+                received_bytes: None,
             };
             r.record_at(t, "p", ev);
         }
@@ -377,6 +446,7 @@ mod tests {
             stage: Some("Escrevendo relatório final"),
             stage_code: Some("report"),
             code,
+            received_bytes: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None, None));
         r.record_at(t, "p", ev(ActivityKind::Tool, Some("gerando imagem web/a.png"), Some(("tool.generate_image", &params))));

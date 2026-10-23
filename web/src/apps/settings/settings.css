@@ -574,3 +574,67 @@
 .nd-device-revoke-all {
   justify-content: flex-end;
 }
+
+/*
+ * Como conectar (spec 116 T03): dois cartões lado a lado (empilhados quando estreito), sem borda,
+ * no fundo da raia. "Chave de API" é o próprio botão; o cartão do plano tem o botão do ChatGPT.
+ */
+.nd-conn-methods {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: var(--sp-2);
+}
+
+.nd-conn-methods > li {
+  display: flex;
+  min-width: 0;
+}
+
+.nd-conn-method {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  width: 100%;
+  min-width: 0;
+  padding: var(--sp-3);
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  color: var(--ink2);
+  font: inherit;
+  text-align: left;
+}
+
+button.nd-conn-method {
+  cursor: pointer;
+}
+
+button.nd-conn-method:hover {
+  background: var(--state-hover);
+}
+
+.nd-conn-method-arrow {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+/* Conexão pelo plano: selo e estado na linha; modelos da conta em pílulas. */
+.nd-conn-badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.nd-plan-models {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}

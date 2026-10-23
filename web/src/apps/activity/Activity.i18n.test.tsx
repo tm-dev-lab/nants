@@ -100,6 +100,20 @@ describe("Atividade em en", () => {
     expect(portugueseLeftovers(win)).toEqual([]);
   });
 
+  it("chamada longa ao modelo em en, sem português (spec 114 T04)", async () => {
+    const { stream, scheduler } = await mount("en");
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "model", model_started_at: Date.now() - 510_000 }));
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "heartbeat", received_bytes: 1_258_291 }));
+      scheduler.runFrames();
+    });
+    const win = panel("en");
+    const dev = win.querySelector('[data-agent-card="developer"]') as HTMLElement;
+    expect(dev.querySelector("[data-live-state]")?.textContent).toBe("receiving the response");
+    expect(dev.querySelector("[data-live-detail]")?.textContent).toBe("for 8 min · 1.2 MB received");
+    expect(portugueseLeftovers(win)).toEqual([]);
+  });
+
   it("aba Histórico: informativos e textos fixos sem português; o caminho aparece como veio", async () => {
     await mount("en");
     await act(async () => {

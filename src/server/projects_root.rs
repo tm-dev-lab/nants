@@ -15,8 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::error::ApiError;
 use super::projects::{is_system_dir, MAX_PATH_BYTES};
@@ -27,13 +26,9 @@ pub const FOLDER_SLUG_MAX: usize = 64;
 /// Código do 409 de pasta existente.
 pub const PROJECT_DIR_EXISTS: &str = "project_dir_exists";
 
-const ROOT_INVALID: &str = "pasta de projetos inválida: use um caminho absoluto (aceita ~), sem '..'";
-const ROOT_SYSTEM: &str = "pasta de projetos inválida: diretório de sistema não é permitido";
-const ROOT_IN_PROJECT: &str = "pasta de projetos inválida: não pode ficar dentro de um projeto registrado";
-const ROOT_CREATE: &str = "não foi possível criar a pasta de projetos";
-const NAME_INVALID: &str = "nome inválido: use letras ou números";
-const DIR_CREATE: &str = "não foi possível criar a pasta do projeto";
-const DIR_OUTSIDE: &str = "a pasta do projeto ficaria fora da pasta de projetos";
+const ROOT_CREATE: &str = "projects_root_create_failed";
+const DIR_CREATE: &str = "project_dir_create_failed";
+const DIR_OUTSIDE: &str = "project_dir_outside_root";
 
 /// Letra latina acentuada → base ASCII (o resto passa como está).
 fn fold(ch: char) -> char {
@@ -72,17 +67,17 @@ pub fn folder_slug(name: &str) -> Option<String> {
 pub fn validate_root(raw: &str, cfg: &Config, home: Option<std::ffi::OsString>) -> Result<PathBuf, ApiError> {
     let raw = raw.trim();
     if raw.is_empty() || raw.len() > MAX_PATH_BYTES || raw.chars().any(char::is_control) {
-        return Err(ApiError::unprocessable(ROOT_INVALID));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_absolute", Map::new()));
     }
-    let path = crate::config::expand_home_from(raw, home).ok_or_else(|| ApiError::unprocessable(ROOT_INVALID))?;
+    let path = crate::config::expand_home_from(raw, home).ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_absolute", Map::new()))?;
     if path.components().any(|c| c == Component::ParentDir) || path.parent().is_none() {
-        return Err(ApiError::unprocessable(ROOT_INVALID));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_absolute", Map::new()));
     }
     check_placement(&path, cfg)?;
     // Raiz já existente: a forma canônica (symlinks resolvidos) também passa pelas regras.
     if let Ok(canonical) = fs::canonicalize(&path) {
         if canonical.parent().is_none() {
-            return Err(ApiError::unprocessable(ROOT_INVALID));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_absolute", Map::new()));
         }
         check_placement(&canonical, cfg)?;
     }
@@ -91,10 +86,10 @@ pub fn validate_root(raw: &str, cfg: &Config, home: Option<std::ffi::OsString>) 
 
 fn check_placement(path: &Path, cfg: &Config) -> Result<(), ApiError> {
     if is_system_dir(path) {
-        return Err(ApiError::unprocessable(ROOT_SYSTEM));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_system", Map::new()));
     }
     if cfg.projects.iter().any(|p| path.starts_with(&p.path)) {
-        return Err(ApiError::unprocessable(ROOT_IN_PROJECT));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "projects_root_inside_project", Map::new()));
     }
     Ok(())
 }
@@ -111,10 +106,8 @@ pub enum CreateDirError {
 impl IntoResponse for CreateDirError {
     fn into_response(self) -> Response {
         match self {
-            Self::Exists(path) => (
-                StatusCode::CONFLICT,
-                Json(json!({"error": PROJECT_DIR_EXISTS, "path": path.display().to_string()})),
-            )
+            Self::Exists(path) => ApiError::coded(StatusCode::CONFLICT, PROJECT_DIR_EXISTS, Map::new())
+                .with_field("path", json!(path.display().to_string()))
                 .into_response(),
             Self::Api(e) => e.into_response(),
         }
@@ -123,12 +116,12 @@ impl IntoResponse for CreateDirError {
 
 /// Erro 400 de nome sem slug.
 pub fn name_invalid() -> ApiError {
-    ApiError::new(StatusCode::BAD_REQUEST, NAME_INVALID)
+    ApiError::coded(StatusCode::BAD_REQUEST, "project_name_invalid", Map::new())
 }
 
 /// Cria a raiz se faltar e `<raiz>/<slug>` (bloqueante). Devolve o caminho canônico da pasta nova.
 pub fn create_project_dir(root: &Path, slug: &str, cfg: &Config) -> Result<PathBuf, CreateDirError> {
-    let api = |m: &'static str| CreateDirError::Api(ApiError::unprocessable(m));
+    let api = |code: &'static str| CreateDirError::Api(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, code, Map::new()));
     fs::create_dir_all(root).map_err(|_| api(ROOT_CREATE))?;
     let canonical_root = fs::canonicalize(root).map_err(|_| api(ROOT_CREATE))?;
     if !canonical_root.is_dir() {

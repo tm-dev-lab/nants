@@ -5,8 +5,10 @@
  * - Status do projeto é derivado dos eventos (ver `reduceEvent`).
  */
 import { useSyncExternalStore } from "react";
+import type { ApiFailure } from "./api/client";
 import { parseCoded, type CodeParams, type Coded } from "./api/codes";
 import { providerFailureText } from "./copy";
+import { liveNow } from "./liveClock";
 import type {
   ActivitySnapshot,
   AgentActivityPayload,
@@ -125,8 +127,8 @@ export interface PendingPermission {
   command: string;
   /** Ausente = não permitido: a UI não oferece "Sempre permitir". */
   alwaysAllowed?: boolean;
-  /** Motivo fixo quando `alwaysAllowed` é falso. */
-  alwaysDeniedReason?: string | null;
+  /** Código do motivo quando `alwaysAllowed` é falso (`permission.always.<código>`; spec 115 T03). */
+  alwaysDeniedCode?: string | null;
   /** `"environment"`: mudança do ambiente Docker, com `reason` e `diff` (texto puro). */
   kind?: string | null;
   reason?: string | null;
@@ -154,8 +156,8 @@ interface ActiveArchitectTurn {
 
 export interface AppState {
   config: ConfigView | null;
-  /** Mensagem fixa quando `GET /api/config` falha; `null` sem erro. */
-  configError: string | null;
+  /** Falha de `GET /api/config` (mostrada com `apiFailureText`, no idioma ativo); `null` sem erro. */
+  configError: ApiFailure | null;
   projects: ProjectEntry[];
   activeProjectId: string | null;
   projectStates: Record<string, ProjectState>;
@@ -203,6 +205,12 @@ export interface AppState {
   blockKinds: Record<string, { taskId: string; kind: BlockKind }>;
   /** Projeto bloqueado por `task_updated` com o run ainda ativo (recuperação pode retomar). */
   liveBlocked: Record<string, true>;
+  /**
+   * Início ou retomada mais recente da execução por projeto (spec 114 T04): `project_status`
+   * executando ou a transição do estado para "executando". Uma mensagem de parada anterior não
+   * explica a parada atual.
+   */
+  runStarts: Record<string, RunStart>;
   /** Atividade ao vivo dos agentes por projeto (efêmera, spec 024). */
   activities: Record<string, ActivityEntry[]>;
 }
@@ -236,6 +244,13 @@ export interface ActivityEntry {
   commandActivityId?: string;
   /** Último sinal do comando (command/heartbeat, ms locais); sem sinal por COMMAND_STALE_MS ele some. */
   commandLastBeat?: number;
+  /**
+   * Chamada ao modelo em curso (spec 114 T04): início (ms, época Unix) e os bytes da resposta já
+   * recebidos (ausente = nenhum ainda). O heartbeat da chamada mantém a entrada viva; sem sinal por
+   * COMMAND_STALE_MS, a chamada some da tela.
+   */
+  modelStartedAt?: number;
+  modelBytes?: number;
   /** Rótulo da etapa (relatório final, ARCHITECTURE.md), exibido no cabeçalho da bolha. */
   stage?: string;
   /**
@@ -249,6 +264,16 @@ export interface ActivityEntry {
   lastAt: number;
   /** Instante do `end` do passo atual; ausente = passo aberto. */
   endedAt?: number;
+}
+
+/**
+ * Marco de início da execução: `seq` na ordem de chegada ao vivo (a mesma das mensagens) e `at`,
+ * a hora da linha do tempo, para as linhas do histórico, que não têm `seq`. A ordem vem do `seq`:
+ * a hora pode empatar no mesmo milissegundo ou durante um recuo do relógio de parede.
+ */
+export interface RunStart {
+  seq: number;
+  at: number;
 }
 
 function activityKey(agent: string, taskId?: string | null): string {
@@ -280,6 +305,16 @@ export const COMMAND_STALE_MS = 60_000;
 function withoutCommand(a: ActivityEntry): ActivityEntry {
   const { command: _c, commandStartedAt: _s, commandActivityId: _i, commandLastBeat: _b, ...rest } = a;
   return rest;
+}
+
+function withoutModel(a: ActivityEntry): ActivityEntry {
+  const { modelStartedAt: _s, modelBytes: _b, ...rest } = a;
+  return rest;
+}
+
+/** Bytes válidos de `received_bytes` (inteiro não negativo), ou `undefined`. */
+function receivedBytes(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function keepTail(text: string, max: number): string {
@@ -337,6 +372,12 @@ export function mergeServerActivities(
             commandStartedAt: Math.min(it.command_started_at ?? lastAt, now),
             commandActivityId: it.activity_id,
             commandLastBeat: lastAt,
+          }
+        : {}),
+      ...(typeof it.model_started_at === "number"
+        ? {
+            modelStartedAt: Math.min(it.model_started_at, now),
+            ...(receivedBytes(it.received_bytes) !== undefined ? { modelBytes: receivedBytes(it.received_bytes) } : {}),
           }
         : {}),
       ...(typeof it.stage === "string" && it.stage !== "" ? { stage: it.stage } : {}),
@@ -402,7 +443,22 @@ function reduceActivity(
       delete next.commandStartedAt;
       delete next.commandActivityId;
       delete next.commandLastBeat;
+      delete next.modelStartedAt;
+      delete next.modelBytes;
       delete next.endedAt;
+      break;
+    case "model": {
+      // Spec 114 T04: começou a chamada ao modelo (o relógio da Atividade parte daqui).
+      const at = typeof payload.model_started_at === "number" ? Math.min(payload.model_started_at, now) : now;
+      next = { ...base, activityId: payload.activity_id, modelStartedAt: at, lastAt: now };
+      delete next.modelBytes;
+      delete next.endedAt;
+      break;
+    }
+    case "model_end":
+      next = { ...base, lastAt: now };
+      delete next.modelStartedAt;
+      delete next.modelBytes;
       break;
     case "reasoning":
       next = { ...base, activityId: payload.activity_id, reasoning: keepTail(text, MAX_ACTIVITY_REASONING), lastAt: now };
@@ -432,10 +488,18 @@ function reduceActivity(
       delete next.endedAt;
       break;
     }
-    case "heartbeat":
-      // Só mantém a bolha viva (não expira por inatividade enquanto o comando roda).
-      next = { ...base, lastAt: now, ...(base.command !== undefined ? { commandLastBeat: now } : {}) };
+    case "heartbeat": {
+      // Mantém a bolha viva (não expira por inatividade enquanto o comando ou a chamada rodam) e,
+      // na chamada ao modelo, atualiza os bytes recebidos.
+      const bytes = receivedBytes(payload.received_bytes);
+      next = {
+        ...base,
+        lastAt: now,
+        ...(base.command !== undefined ? { commandLastBeat: now } : {}),
+        ...(base.modelStartedAt !== undefined && bytes !== undefined ? { modelBytes: bytes } : {}),
+      };
       break;
+    }
     case "command_end":
       next = { ...base, lastAt: now };
       delete next.command;
@@ -448,11 +512,13 @@ function reduceActivity(
       // `end` de um passo antigo (outro activity_id) não encerra o passo atual.
       if (existing !== undefined && existing.activityId !== payload.activity_id) return list.slice();
       next = { ...base, endedAt: now, lastAt: now };
-      // O passo acabou: nenhum comando dele segue rodando.
+      // O passo acabou: nenhum comando nem chamada ao modelo dele segue rodando.
       delete next.command;
       delete next.commandStartedAt;
       delete next.commandActivityId;
       delete next.commandLastBeat;
+      delete next.modelStartedAt;
+      delete next.modelBytes;
   }
   if (typeof payload.stage === "string" && payload.stage !== "") {
     next.stage = payload.stage;
@@ -469,7 +535,8 @@ function reduceActivity(
 export function pruneActivities(list: readonly ActivityEntry[], now: number): ActivityEntry[] {
   return list
     .filter((a) => (isTestsRun(a) || (a.stage === FINAL_VERIFICATION_STAGE && a.endedAt === undefined) || now - a.lastAt < ACTIVITY_IDLE_MS) && (a.endedAt === undefined || now - a.endedAt < ACTIVITY_END_GRACE_MS))
-    .map((a) => (a.command !== undefined && !isTestsRun(a) && now - (a.commandLastBeat ?? a.lastAt) > COMMAND_STALE_MS ? withoutCommand(a) : a));
+    .map((a) => (a.command !== undefined && !isTestsRun(a) && now - (a.commandLastBeat ?? a.lastAt) > COMMAND_STALE_MS ? withoutCommand(a) : a))
+    .map((a) => (a.modelStartedAt !== undefined && now - a.lastAt > COMMAND_STALE_MS ? withoutModel(a) : a));
 }
 
 /** Estado de recuperação de uma tarefa: analisando, retry aplicado ou escalada ao humano. */
@@ -548,6 +615,7 @@ const initialState: AppState = {
   recoveries: {},
   blockKinds: {},
   liveBlocked: {},
+  runStarts: {},
   activities: {},
 };
 
@@ -588,9 +656,10 @@ interface AppStore {
   /**
    * Acrescenta o histórico carregado do servidor antes das mensagens já presentes, na ordem do
    * arquivo. Turno cujo `turn_id` já foi exibido (POST/SSE) é omitido; os demais entram inteiros
-   * e seus ids passam a contar como exibidos. Turnos sem id nunca são omitidos.
-   * Duplicata aparente possível: uma mensagem otimista do usuário enviada durante a carga pode
-   * reaparecer junto do turno persistido com o mesmo texto. Preferível a perder mensagem.
+   * e os ids dos turnos já respondidos (com a linha do Arquiteto) passam a contar como exibidos; o
+   * turno em andamento continua aceitando a resposta por SSE ou POST. Turnos sem id nunca são omitidos.
+   * O eco do composer cuja linha já foi persistida (pelo `turn_id` ou, sem ele, pelo texto e anexos
+   * de um turno ainda não respondido) sai: a mensagem do usuário aparece uma vez só (114/T03).
    */
   hydrateHistory(projectId: string, turns: readonly ChatHistoryTurn[]): void;
   /**
@@ -621,6 +690,8 @@ interface AppStore {
    * `arrivalClockNow`).
    */
   hydratePermissions(projectId: string, server: readonly PendingPermissionView[], startedAt: number): void;
+  /** Marca o início ou a retomada da execução do projeto agora (estado lido com run ativo). */
+  markRunStarted(projectId: string): void;
   /**
    * Remove o projeto do estado do cliente: lista, config, mensagens, shownTurns, pendentes, fase,
    * contador e estado. Marca o id como removido na sessão. Idempotente.
@@ -661,6 +732,15 @@ function clearArrivals(projectId: string): void {
   for (const key of [...arrivals.keys()]) {
     if (key.startsWith(prefix)) arrivals.delete(key);
   }
+}
+
+/**
+ * Ordem de chegada ao vivo de um pedido de permissão (0 = sem registro, como o hidratado do GET).
+ * Desempata pedidos com a mesma hora: com o relógio de parede recuando, `liveNow()` repete a última
+ * hora, e a ordem por projeto deixaria de ser a de chegada (114/T04).
+ */
+export function permissionArrival(projectId: string, requestId: string): number {
+  return arrivals.get(arrivalKey(projectId, requestId)) ?? 0;
 }
 
 /** Valor atual do relógio de chegada: tire antes de um GET para saber o que chegou depois. */
@@ -792,6 +872,37 @@ function toResolved(
   return { ...pending, applied, ...(requested === undefined ? {} : { requested }), resolvedAt };
 }
 
+/** Folga entre a hora do eco (relógio da aba) e a do servidor ao casar o eco com a linha persistida. */
+const ECHO_MATCH_SLACK_MS = 5 * 60_000;
+
+/**
+ * Eco do composer (em voo e ainda sem `turn_id`, porque o `chat_turn_started` se perdeu numa queda
+ * do stream) cuja linha já está no histórico: mesmo texto, mesmos anexos, turno ainda não
+ * respondido nesta aba e gravado depois do envio (com folga de relógio). Devolve o id do eco, ou
+ * `null`. Só há um turno por projeto: no máximo um eco em voo.
+ */
+function persistedEcho(current: readonly ChatMessage[], turns: readonly ChatHistoryTurn[], shown: readonly string[]): number | null {
+  const echo = current.find((m) => m.role === "user" && m.origin !== "history" && m.inFlight === true && m.turnId === undefined);
+  if (echo === undefined) return null;
+  const claimed = new Set<string>(shown);
+  for (const m of current) if (m.origin !== "history" && m.turnId !== undefined) claimed.add(m.turnId);
+  const same = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean => {
+    const x = a ?? [];
+    const y = b ?? [];
+    return x.length === y.length && x.every((v, i) => v === y[i]);
+  };
+  const match = turns.some(
+    (t) =>
+      t.role === "user" &&
+      t.turn_id !== undefined &&
+      !claimed.has(t.turn_id) &&
+      t.text === echo.text &&
+      same(t.attachments, echo.attachments) &&
+      t.ts * 1000 >= echo.at - ECHO_MATCH_SLACK_MS,
+  );
+  return match ? echo.id : null;
+}
+
 /** Limita a lista de `turn_id` exibidos (FIFO). */
 function capTurns(list: string[]): string[] {
   return list.length > MAX_SHOWN_TURNS ? list.slice(list.length - MAX_SHOWN_TURNS) : list;
@@ -888,8 +999,14 @@ const SUSTAINED_PHASES: ReadonlySet<ProjectPhase> = new Set<ProjectPhase>(["bloc
  *   só quando estava aguardando permissão.
  * Eventos globais (`project_id` nulo) não alteram estado de projeto.
  */
-export function reduceEvent(state: AppState, event: ApiEvent, nextId: number, seq?: number): Partial<AppState> {
-  const patch = reduceEventBody(state, event, nextId, seq);
+export function reduceEvent(
+  state: AppState,
+  event: ApiEvent,
+  nextId: number,
+  seq?: number,
+  at: number = liveNow(),
+): Partial<AppState> {
+  const patch = reduceEventBody(state, event, nextId, seq, at);
   const projectId = event.project_id;
   if (
     projectId !== null &&
@@ -915,7 +1032,7 @@ function agentMessageText(agent: string, text: string): string {
   return providerFailureText(text, null) ?? text;
 }
 
-function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: number | undefined): Partial<AppState> {
+function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: number | undefined, at: number): Partial<AppState> {
   const projectId = event.project_id;
   if (projectId === null) return {};
   const phase = state.phases[projectId] ?? "idle";
@@ -927,6 +1044,8 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
         return {};
       }
       const patch: Partial<AppState> = { phases: { ...state.phases, [projectId]: status } };
+      // Spec 114 T04: marca o início ou a retomada da execução (o motivo da parada vem depois dele).
+      if (status === "executing") patch.runStarts = { ...state.runStarts, [projectId]: { seq: seq ?? 0, at } };
       if (state.liveBlocked[projectId]) {
         const liveBlocked = { ...state.liveBlocked };
         delete liveBlocked[projectId];
@@ -950,7 +1069,7 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
         // Pendentes encerrados ficam na conversa como resolvidos, sem decisão registrada.
         const pendingNow = state.permissions[projectId] ?? [];
         if (pendingNow.length > 0) {
-          const now = Date.now();
+          const now = liveNow();
           patch.resolvedPermissions = withResolved(
             state.resolvedPermissions,
             projectId,
@@ -978,12 +1097,12 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
         agent: payload.agent,
         command: payload.command,
         alwaysAllowed: payload.always_allowed,
-        alwaysDeniedReason: payload.always_denied_reason,
+        alwaysDeniedCode: payload.always_denied_code,
         kind: payload.kind,
         reason: payload.reason,
         diff: payload.diff,
         // Mantém o instante da primeira chegada quando o mesmo pedido chega de novo.
-        at: index === -1 ? Date.now() : (list[index]?.at ?? Date.now()),
+        at: index === -1 ? liveNow() : (list[index]?.at ?? liveNow()),
       };
       const deduped = index === -1 ? [...list, req] : list.map((p, i) => (i === index ? req : p));
       const patch: Partial<AppState> = {
@@ -1002,7 +1121,7 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
       const patch: Partial<AppState> = {
         permissions: withQueue(state.permissions, projectId, rest),
         resolvedPermissions: withResolved(state.resolvedPermissions, projectId, [
-          toResolved(hit, event.payload.applied, undefined, Date.now()),
+          toResolved(hit, event.payload.applied, undefined, liveNow()),
         ]),
       };
       if (rest.length === 0 && phase === "waiting_approval") {
@@ -1082,7 +1201,7 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
         role: "agent",
         agent: payload.agent,
         text: agentMessageText(payload.agent, payload.text),
-        at: Date.now(),
+        at,
         ...(seq === undefined ? {} : { seq }),
         ...(dialogSeq === undefined ? {} : { dialogSeq }),
         ...(payloadSpec === undefined
@@ -1269,7 +1388,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
         return;
       }
       liveSeq += 1;
-      const patch = reduceEvent(state, event, counter, liveSeq);
+      const patch = reduceEvent(state, event, counter, liveSeq, liveNow());
       if (Object.keys(patch).length > 0) setState(patch);
     },
     appendMessage(projectId, message) {
@@ -1278,7 +1397,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
       if (isProjectRemoved(state, projectId)) return id;
       const current = state.messages[projectId] ?? [];
       liveSeq += 1;
-      const next = capMessages([...current, { origin: "live", ...message, id, at: Date.now(), seq: liveSeq }]);
+      const next = capMessages([...current, { origin: "live", ...message, id, at: liveNow(), seq: liveSeq }]);
       setState({ messages: { ...state.messages, [projectId]: next } });
       return id;
     },
@@ -1329,7 +1448,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
           liveSeq += 1;
           messages = capMessages([
             ...current,
-            { id: counter, role: "user", text, at: Date.now(), origin: "live", confirmed: true, turnId: turn.turnId, seq: liveSeq },
+            { id: counter, role: "user", text, at: liveNow(), origin: "live", confirmed: true, turnId: turn.turnId, seq: liveSeq },
           ]);
         }
       }
@@ -1391,7 +1510,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
         role: "architect",
         agent: "architect",
         text,
-        at: Date.now(),
+        at: liveNow(),
         origin: "live",
         seq: liveSeq,
         ...(turnId === undefined ? {} : { turnId }),
@@ -1415,17 +1534,28 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
       for (const turn of turns) {
         if (turn.turn_id !== undefined) persisted.add(turn.turn_id);
       }
+      // Turnos com a resposta do Arquiteto já gravada. O turno em andamento (só a linha do usuário)
+      // não entra: a resposta dele ainda chega por SSE ou pelo POST e precisa aparecer (114/T03).
+      const answered = new Set<string>();
+      for (const turn of turns) {
+        if (turn.role === "architect" && turn.turn_id !== undefined) answered.add(turn.turn_id);
+      }
       const current = state.messages[projectId] ?? [];
+      const echo = persistedEcho(current, turns, state.shownTurns[projectId] ?? []);
       // O diálogo dos agentes (role agent) tem carga própria (`hydrateDialog`): não é tocado aqui.
       const live = current.filter((m) => {
         if (m.role === "agent") return true;
         if (m.origin === "history") return false;
         if (m.role === "user") {
-          // Em voo (sem confirmação) ou confirmada cujo turno ainda não está no histórico: mantém.
-          return m.confirmed !== true || m.turnId === undefined || !persisted.has(m.turnId);
+          // O servidor grava a mensagem do usuário no início do turno: com a linha persistida, o eco
+          // do composer sai (a linha do histórico a substitui), mesmo com o POST ainda em andamento.
+          if (m.id === echo) return false;
+          if (m.turnId !== undefined && persisted.has(m.turnId)) return false;
+          // Em voo cujo turno ainda não está no histórico, ou sem turn_id: mantém.
+          return true;
         }
         if (m.role === "architect") {
-          return m.turnId === undefined || !persisted.has(m.turnId);
+          return m.turnId === undefined || !answered.has(m.turnId);
         }
         return true;
       });
@@ -1447,10 +1577,10 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
       const dialog = live.filter((m) => m.role === "agent");
       const room = Math.max(0, MAX_MESSAGES_PER_PROJECT - rows.length);
       const keptLive = chatLive.slice(Math.max(0, chatLive.length - room));
-      // Dedupe por id exato: ids do histórico + ids ao vivo que foram mantidos.
-      const ids = new Set<string>(persisted);
+      // Exibidos: turnos respondidos no histórico + respostas ao vivo mantidas.
+      const ids = new Set<string>(answered);
       for (const m of keptLive) {
-        if (m.turnId !== undefined) ids.add(m.turnId);
+        if (m.role === "architect" && m.turnId !== undefined) ids.add(m.turnId);
       }
       setState({
         messages: { ...state.messages, [projectId]: [...rows, ...keptLive, ...dialog] },
@@ -1540,9 +1670,13 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
           list.filter((p) => p.requestId !== requestId),
         ),
         resolvedPermissions: withResolved(state.resolvedPermissions, projectId, [
-          toResolved(hit, applied, requested, Date.now()),
+          toResolved(hit, applied, requested, liveNow()),
         ]),
       });
+    },
+    markRunStarted(projectId) {
+      liveSeq += 1;
+      setState({ runStarts: { ...state.runStarts, [projectId]: { seq: liveSeq, at: liveNow() } } });
     },
     hydratePermissions(projectId, server, startedAt) {
       if (isProjectRemoved(state, projectId)) return;
@@ -1551,7 +1685,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
       // Snapshot que ainda lista um pedido já resolvido aqui: a resolução local vale (não duplica).
       const liveServer = server.filter((p) => !resolvedIds.has(p.request_id));
       const serverIds = new Set(liveServer.map((p) => p.request_id));
-      const now = Date.now();
+      const now = liveNow();
       const fromServer: PendingPermission[] = liveServer.map(
         (p) =>
           local.find((l) => l.requestId === p.request_id) ?? {
@@ -1561,7 +1695,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
             agent: p.agent,
             command: p.command,
             alwaysAllowed: p.always_allowed,
-            alwaysDeniedReason: p.always_denied_reason,
+            alwaysDeniedCode: p.always_denied_code,
             kind: p.kind,
             reason: p.reason,
             diff: p.diff,
@@ -1633,6 +1767,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
         ),
         blockKinds: without(s.blockKinds),
         liveBlocked: without(s.liveBlocked),
+        runStarts: without(s.runStarts),
         activities: without(s.activities),
         removedProjectIds: { ...s.removedProjectIds, [projectId]: true },
       });

@@ -106,6 +106,44 @@ describe("Atividade: cartões por agente e ação ao vivo", () => {
     expect(win.querySelector('[data-agent-card="reviewer"] [data-live-state]')?.textContent).toBe("repetindo");
   });
 
+  it("chamada longa ao modelo: o papel aparece ativo com o tempo e o tamanho recebido (spec 114 T04)", async () => {
+    const { stream, scheduler } = await mount();
+    const started = Date.now() - 125_000;
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "start" }));
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "model", model_started_at: started }));
+      scheduler.runFrames();
+    });
+    const win = panel();
+    const dev = win.querySelector('[data-agent-card="developer"]') as HTMLElement;
+    expect(dev.getAttribute("data-live")).toBe("model");
+    expect(dev.querySelector("[data-live-state]")?.textContent).toBe("aguardando o modelo");
+    expect(dev.querySelector("[data-live-detail]")?.textContent).toBe("há 2 min");
+    expect(dev.querySelector("[data-agent-idle]")).toBeNull();
+    // O Revisor, que não chamou o modelo, segue aguardando a vez.
+    expect(win.querySelector('[data-agent-card="reviewer"]')?.textContent).toContain("aguardando a vez");
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "heartbeat", received_bytes: 49_152 }));
+      scheduler.runFrames();
+    });
+    expect(dev.querySelector("[data-live-state]")?.textContent).toBe("recebendo a resposta");
+    expect(dev.querySelector("[data-live-detail]")?.textContent).toBe("há 2 min · 48 KB recebidos");
+    expect(within(win).getByTestId("activity-summary").textContent).toBe("Desenvolvedor em atividade");
+    // O raciocínio que chega passa à frente; a chamada fica numa linha à parte.
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "reasoning", text: "conferindo o carrinho" }));
+      scheduler.runFrames();
+    });
+    expect(dev.getAttribute("data-live")).toBe("thinking");
+    expect(dev.querySelector("[data-live-model]")?.textContent).toBe("recebendo a resposta há 2 min · 48 KB recebidos");
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "model_end" }));
+      scheduler.runFrames();
+    });
+    expect(dev.querySelector("[data-live-model]")).toBeNull();
+    expect(findForbiddenGlyphs(win)).toEqual([]);
+  });
+
   it("rajada de eventos: um render por quadro, com o valor mais recente", async () => {
     const { stream, scheduler } = await mount();
     await act(async () => {

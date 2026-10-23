@@ -118,6 +118,7 @@ fn smoke_config() -> Config {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: SECRET_KEY.to_string(),
             wire_api: nants::config::WireApi::default(),
+            kind: Default::default(),
         }],
         agents: Agents {
             architect: agent.clone(),

@@ -129,28 +129,40 @@ const TEST_READY_CONN: &str = "nants-test-ready";
 /// existente nos testes dispararia o levantamento inicial do Arquiteto, que grava na conversa do
 /// projeto (`.sdd/specs/.chat.jsonl`) e ocupa as reservas por até ~40 s de novas tentativas, mudando
 /// o comportamento de testes existentes. Fora dos testes este desvio não existe.
-fn connection_problems(conn: &Connection) -> Vec<ConnectionProblem> {
+fn connection_problems(conn: &Connection, plan_ready: &dyn Fn(&str) -> bool) -> Vec<ConnectionProblem> {
     #[cfg(test)]
     if conn.id == TEST_READY_CONN {
         return Vec::new();
     }
-    conn.usable_problems()
+    let mut out = conn.usable_problems();
+    // Spec 116 T02: a conexão pelo plano ChatGPT precisa do login utilizável.
+    if conn.is_chatgpt_plan() && !plan_ready(&conn.id) {
+        out.push(ConnectionProblem::PlanLogin);
+    }
+    out
 }
 
 /// Acrescenta as pendências `connection_url:<id>` e `connection_key:<id>` de cada agente pronto
 /// cuja conexão não monta cliente ([`Connection::usable_problems`], as mesmas recusas de
 /// `LlmClient::new`/`from_connection`), sem repetir a mesma conexão. O rótulo usa o nome da
 /// conexão (filtrado pelos segredos); nunca o valor da chave, o nome da variável ou a URL.
-fn push_connection_items(out: &mut Vec<Missing>, cfg: &Config, agents: &[&AgentConfig], secrets: &SecretSet) {
+fn push_connection_items(
+    out: &mut Vec<Missing>,
+    cfg: &Config,
+    agents: &[&AgentConfig],
+    secrets: &SecretSet,
+    plan_ready: &dyn Fn(&str) -> bool,
+) {
     for agent in agents {
         if !agent_ready(cfg, agent) {
             continue;
         }
         let Some(conn) = connection_of(cfg, agent) else { continue };
-        for problem in connection_problems(conn) {
+        for problem in connection_problems(conn, plan_ready) {
             let (prefix, what) = match problem {
                 ConnectionProblem::BaseUrl => ("connection_url", "Endereço"),
                 ConnectionProblem::ApiKey => ("connection_key", "Chave"),
+                ConnectionProblem::PlanLogin => ("connection_plan", "Acesso ao plano ChatGPT"),
             };
             let id = format!("{prefix}:{}", scrub_text(secrets, &conn.id));
             if out.iter().any(|m| m.id == id) {
@@ -197,10 +209,14 @@ fn machine_missing(items: &[PrereqItem], id: &'static str) -> Option<Missing> {
     }
 }
 
-/// Modelos em uso pelos três papéis (sem repetição, sem vazios).
+/// Modelos em uso pelos três papéis (sem repetição, sem vazios). Os papéis pela conexão do plano
+/// ChatGPT ficam de fora: lá não há US$ (spec 116 T02).
 fn models_in_use(cfg: &Config) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for agent in [&cfg.agents.architect, &cfg.agents.developer, &cfg.agents.reviewer] {
+        if connection_of(cfg, agent).is_some_and(Connection::is_chatgpt_plan) {
+            continue;
+        }
         let model = agent.model.trim();
         if !model.is_empty() && !out.iter().any(|m| m == model) {
             out.push(model.to_string());
@@ -209,8 +225,15 @@ fn models_in_use(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// Avalia os quatro níveis a partir da configuração e do diagnóstico da máquina (função pura).
+/// Avalia os quatro níveis a partir da configuração e do diagnóstico da máquina (função pura). As
+/// conexões pelo plano ChatGPT contam como sem login ([`evaluate_with`]).
 pub fn evaluate(cfg: &Config, machine: &[PrereqItem], secrets: &SecretSet) -> Readiness {
+    evaluate_with(cfg, machine, secrets, &|_| false)
+}
+
+/// Como [`evaluate`], com `plan_ready(id)` dizendo se a conexão pelo plano ChatGPT `id` tem login
+/// utilizável (spec 116 T02).
+pub fn evaluate_with(cfg: &Config, machine: &[PrereqItem], secrets: &SecretSet, plan_ready: &dyn Fn(&str) -> bool) -> Readiness {
     let mut chat = Vec::new();
     if cfg.connections.is_empty() {
         chat.push(config_item("connection", "Conexão com um provedor de modelos", TAB_CONNECTIONS));
@@ -218,7 +241,7 @@ pub fn evaluate(cfg: &Config, machine: &[PrereqItem], secrets: &SecretSet) -> Re
     if !agent_ready(cfg, &cfg.agents.architect) {
         chat.push(config_item("agent_architect", "Arquiteto: conexão e modelo", TAB_AGENTS));
     }
-    push_connection_items(&mut chat, cfg, &[&cfg.agents.architect], secrets);
+    push_connection_items(&mut chat, cfg, &[&cfg.agents.architect], secrets, plan_ready);
     let git = machine_missing(machine, "git");
     let mut create_project = chat.clone();
     create_project.extend(git.clone());
@@ -230,7 +253,7 @@ pub fn evaluate(cfg: &Config, machine: &[PrereqItem], secrets: &SecretSet) -> Re
     if !agent_ready(cfg, &cfg.agents.reviewer) {
         execute.push(config_item("agent_reviewer", "Revisor: conexão e modelo", TAB_AGENTS));
     }
-    push_connection_items(&mut execute, cfg, &[&cfg.agents.developer, &cfg.agents.reviewer], secrets);
+    push_connection_items(&mut execute, cfg, &[&cfg.agents.developer, &cfg.agents.reviewer], secrets, plan_ready);
     execute.extend(git);
     execute.extend(DOCKER_IDS.iter().filter_map(|id| machine_missing(machine, id)));
 
@@ -309,7 +332,11 @@ pub async fn current(state: &AppState) -> Readiness {
 async fn build(state: &AppState, machine: &[PrereqItem]) -> Readiness {
     let secrets: Arc<SecretSet> = state.secret_set().await;
     let cfg = state.config().read().await;
-    evaluate(&cfg, machine, &secrets)
+    let auth = state.chatgpt();
+    let plan_ready = |id: &str| {
+        matches!(auth.status(state.data_dir(), id), super::chatgpt::PlanStatus::Connected { .. })
+    };
+    evaluate_with(&cfg, machine, &secrets, &plan_ready)
 }
 
 /// Resposta 412 `{error: "prereq_missing", missing: [ids], code: "prereq_missing", params: {count}}`
@@ -370,6 +397,7 @@ pub(crate) fn chat_ready(mut cfg: Config) -> Config {
                 base_url: "http://127.0.0.1:9/v1".into(),
                 api_key: "env:NANTS_TEST_READY_KEY_NEVER_SET".into(),
                 wire_api: crate::config::WireApi::default(),
+                kind: Default::default(),
             });
         }
         cfg.agents.architect.connection_id = CONN.into();

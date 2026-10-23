@@ -29,6 +29,11 @@ const SCENARIO_PREFIX = "Cenário de falha:";
  * anterior (`runner::UNCHANGED_FILE_LABEL`, spec 092 T04): `[MEDIUM, observação (arquivo não mudou nesta rodada)]`.
  */
 const UNCHANGED_FILE_LABEL = "observação (arquivo não mudou nesta rodada)";
+/**
+ * Rótulo, junto da severidade, do finding de baixa confiança (`runner::LOW_CONFIDENCE_LABEL`, spec
+ * 087 T05): `[HIGH, baixa confiança]`. A tela mostra `review.lowConfidence` no idioma ativo (spec 115 T03).
+ */
+const LOW_CONFIDENCE_LABEL = "baixa confiança";
 /** Linha das capturas vistas pelo Revisor (`runner::CAPTURES_HEADER`), última antes dos critérios. */
 const CAPTURES_HEADER = "Capturas avaliadas:";
 /** Nome de captura servido por `/captures/:name` (`sdd::screenshots::copy_name`). */
@@ -84,6 +89,8 @@ export interface ReviewFinding {
   scenario?: string;
   /** Spec 092 T04: observação rebaixada porque o arquivo não mudou nesta rodada. */
   unchangedFile?: boolean;
+  /** Spec 087 T05: finding de baixa confiança (vira observação). */
+  lowConfidence?: boolean;
 }
 
 export interface ReviewMessage {
@@ -138,16 +145,19 @@ function parseFindingLine(line: string): ReviewFinding {
   const arrow = tail.indexOf(" → ");
   const rawSeverity = head[2] ?? "";
   const unchangedMark = `, ${UNCHANGED_FILE_LABEL}`;
-  // O rótulo pode vir seguido de outro (`, baixa confiança`): tira só ele, onde estiver.
+  const lowMark = `, ${LOW_CONFIDENCE_LABEL}`;
+  // Os rótulos podem vir juntos (`, observação (...), baixa confiança`): tira cada um, onde estiver.
   const unchangedFile = rawSeverity.includes(unchangedMark);
+  const lowConfidence = rawSeverity.includes(lowMark);
   const finding: ReviewFinding = {
     id: head[1] ?? "",
-    severity: unchangedFile ? rawSeverity.replace(unchangedMark, "") : rawSeverity,
+    severity: rawSeverity.replace(unchangedMark, "").replace(lowMark, ""),
     location,
     description: arrow < 0 ? tail : tail.slice(0, arrow),
     recommendation: arrow < 0 ? "" : tail.slice(arrow + 3),
   };
   if (unchangedFile) finding.unchangedFile = true;
+  if (lowConfidence) finding.lowConfidence = true;
   return finding;
 }
 

@@ -18,6 +18,8 @@ import { useT } from "../../i18n/react";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { describeTestResult } from "../../settings/rules";
 import { connectionDetail, connectionUsageText } from "./settingsModel";
+import { isPlanConnection, PLAN_USAGE_URL, planEmail, planState, planStateText } from "./chatgptPlan";
+import { ChatgptButton, SignOutDialog, useChatgptStart } from "./PlanConnection";
 
 interface TestState {
   /** Texto do resultado, montado na hora de exibir (no idioma ativo). */
@@ -35,15 +37,20 @@ interface ConnectionRowProps {
   onTested?: (ok: boolean) => void;
 }
 
-/** Tom do ponto: o último teste manda; sem teste, em uso (verde) ou sem uso (neutro). */
-export function connectionDotTone(result: { ok: boolean } | null, users: readonly string[] | undefined): Tone | null {
+/**
+ * Tom do ponto: o último teste manda; sem teste, em uso (verde) ou sem uso (neutro). A conexão pelo
+ * plano sem login válido fica âmbar (precisa entrar de novo).
+ */
+export function connectionDotTone(result: { ok: boolean } | null, users: readonly string[] | undefined, planLoggedOut = false): Tone | null {
   if (result !== null) return result.ok ? "green" : "rose";
+  if (planLoggedOut) return "amber";
   if (users !== undefined && users.length > 0) return "green";
   return null;
 }
 
-function dotLabel(result: { ok: boolean } | null, users: readonly string[] | undefined): string {
+function dotLabel(result: { ok: boolean } | null, users: readonly string[] | undefined, planLoggedOut: boolean): string {
   if (result !== null) return result.ok ? t("settings.connection.testOk") : t("settings.connection.testFailed");
+  if (planLoggedOut) return t("chatgpt.state.needsLogin");
   if (users === undefined) return t("settings.connection.untested");
   return users.length > 0 ? t("settings.connection.inUse") : t("settings.connection.unused");
 }
@@ -54,6 +61,8 @@ export function ConnectionRow({ connection, users, onEdit, onTested }: Connectio
   const [result, setResult] = useState<TestState | null>(null);
   const [testModel, setTestModel] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const reconnect = useChatgptStart(connection.id);
   const menuButton = useRef<HTMLButtonElement | null>(null);
   const modelFieldId = useId();
   const mounted = useRef(true);
@@ -93,17 +102,38 @@ export function ConnectionRow({ connection, users, onEdit, onTested }: Connectio
     if (returnFocus) menuButton.current?.focus({ preventScroll: true });
   };
 
-  const tone = connectionDotTone(result, users);
+  const plan = isPlanConnection(connection);
+  const state = plan ? planState(connection) : null;
+  const loggedOut = state !== null && state !== "connected";
+  const email = plan ? planEmail(connection) : "";
+  const tone = connectionDotTone(result, users, loggedOut);
+  const stateText = state === null ? "" : planStateText(state);
   return (
     <li className="nd-conn" data-connection={connection.id} data-conn-tone={tone ?? "muted"}>
       <div className="nd-conn-row">
         <span className="nd-dot" data-tone={tone ?? undefined} aria-hidden="true" />
-        <span className="nd-sr-only">{dotLabel(result, users)}</span>
+        <span className="nd-sr-only">{dotLabel(result, users, loggedOut)}</span>
         <span className="nd-conn-text">
           <span className="nd-conn-name">{connection.name}</span>
-          <span className="nd-conn-detail" title={connection.base_url} data-conn-detail="">
-            {connectionDetail(connection)}
-          </span>
+          {plan ? (
+            <span className="nd-conn-badges" data-conn-plan={state ?? undefined}>
+              <span className="nd-pill nd-pill-sm" data-tone="violet">
+                {t("chatgpt.badge")}
+              </span>
+              {email !== "" ? (
+                <span className="nd-conn-detail" data-conn-detail="">
+                  {email}
+                </span>
+              ) : null}
+              <span className="nd-conn-detail" data-tone={loggedOut ? "amber" : undefined} data-conn-state="">
+                {stateText}
+              </span>
+            </span>
+          ) : (
+            <span className="nd-conn-detail" title={connection.base_url} data-conn-detail="">
+              {connectionDetail(connection)}
+            </span>
+          )}
         </span>
         {users !== undefined ? (
           <span className="nd-conn-usage" data-conn-usage="">
@@ -154,6 +184,42 @@ export function ConnectionRow({ connection, users, onEdit, onTested }: Connectio
                   <Icon name="pencil" size={16} />
                   <span className="nd-menu-text">{t("settings.connection.edit")}</span>
                 </button>
+                {plan ? (
+                  <>
+                    <a role="menuitem" className="nd-menu-item" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="" onClick={() => closeMenu(false)}>
+                      <Icon name="external" size={16} />
+                      <span className="nd-menu-text">{t("chatgpt.manageUsage")}</span>
+                    </a>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="nd-menu-item"
+                      data-chatgpt-reconnect=""
+                      disabled={reconnect.busy}
+                      onClick={() => {
+                        closeMenu(true);
+                        reconnect.start();
+                      }}
+                    >
+                      <Icon name="refresh" size={16} />
+                      <span className="nd-menu-text">{t("chatgpt.reconnect")}</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="nd-menu-item"
+                      data-chatgpt-signout=""
+                      disabled={state === "disconnected"}
+                      onClick={() => {
+                        closeMenu(false);
+                        setSigningOut(true);
+                      }}
+                    >
+                      <Icon name="close" size={16} />
+                      <span className="nd-menu-text">{t("chatgpt.signOut")}</span>
+                    </button>
+                  </>
+                ) : null}
               </PopupMenu>
             ) : null}
           </>
@@ -172,6 +238,21 @@ export function ConnectionRow({ connection, users, onEdit, onTested }: Connectio
           </button>
         )}
       </div>
+      {plan && (loggedOut || onEdit === undefined) ? (
+        <div className="nd-row nd-conn-note" data-conn-plan-actions="">
+          {loggedOut ? (
+            <ChatgptButton connectionId={connection.id} label={t("chatgpt.reconnect")} ariaLabel={t("chatgpt.reconnectNamed", { name: connection.name })} small />
+          ) : null}
+          {onEdit === undefined ? (
+            <a className="nd-btn nd-btn-sm nd-self-start" data-variant="ghost" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="">
+              <Icon name="external" size={14} />
+              {t("chatgpt.manageUsage")}
+            </a>
+          ) : null}
+        </div>
+      ) : null}
+      {reconnect.notice !== null ? <div className="nd-conn-note">{reconnect.notice}</div> : null}
+      {signingOut ? <SignOutDialog connection={connection} onClose={() => setSigningOut(false)} /> : null}
       {busy && onEdit !== undefined ? (
         <p role="status" className="nd-conn-note nd-muted">
           {t("settings.connection.testing")}

@@ -44,7 +44,6 @@ use super::spec_result::validate_spec_id;
 use super::state::AppState;
 use crate::agents::architect::truncate_bytes;
 use crate::agents::chat::ChatBackend;
-use crate::agents::llm_client::LlmClient;
 use crate::agents::plan_review::PlanReviewer;
 use crate::config::Effort;
 use crate::sdd::environment::sha256_hex;
@@ -173,7 +172,7 @@ async fn reviewer_setup(state: &AppState) -> Option<ReviewerSetup> {
     if agent.model.trim().is_empty() {
         return None;
     }
-    let client = LlmClient::from_connection(&connection).ok()?;
+    let client = super::chatgpt::plan_client::llm_client(state, &connection).ok()?;
     let backend: Arc<dyn ChatBackend> = match state.report_backend() {
         Some(backend) => backend,
         None => Arc::new(client),
@@ -280,13 +279,14 @@ async fn review_once(state: &AppState, project_id: &str, root: &Path, spec_id: &
         state.approvals().clone(),
         state.events().clone(),
         Arc::clone(&secrets),
-    ));
+    )
+    .with_lang(state.project_lang(project_id)));
     let activity = Arc::new(
         BusActivitySink::new(state.events().clone(), project_id, Arc::clone(&secrets)).with_stage("plan_review", PLAN_REVIEW_STAGE),
     );
     let reviewer = PlanReviewer::new(Arc::clone(&setup.backend), setup.model.clone(), Some(setup.effort), policy, approver)
         .with_activity(activity, Some(spec_id.to_string()))
-        .with_usage(super::usage::FileUsageSink::new(root.to_path_buf(), project_id))
+        .with_usage(super::usage::FileUsageSink::redacting(root.to_path_buf(), project_id, Arc::clone(&secrets)))
         .with_lang(state.project_lang(project_id));
     let mut shutdown = state.shutdown_signal();
     let turn = reviewer.review(root, &plan);

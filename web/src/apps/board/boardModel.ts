@@ -15,7 +15,7 @@ import { TASK_STATUS_LABEL } from "../../copy";
 import type { Tone } from "../../desktop/theme/tokens";
 import { localized, t, tp, type MessageKey } from "../../i18n";
 import { parseReviewMessage, type ReviewMessage } from "../../reviewMessage";
-import { belongsToSpec, type ChatMessage, type RecoveryEntry } from "../../store";
+import { belongsToSpec, type ChatMessage, type RecoveryEntry, type RunStart } from "../../store";
 import type { AppSummary, AppSummaryInput } from "../registry";
 
 const FLOW: readonly TaskStatus[] = ["TODO", "IN_PROGRESS", "IN_REVIEW", "CHANGES_REQUESTED", "APPROVED", "INTEGRATING", "DONE"];
@@ -154,6 +154,91 @@ const IN_FLIGHT: ReadonlySet<string> = new Set(["IN_PROGRESS", "IN_REVIEW", "CHA
 /** Tarefa ativa: a em andamento; senão a primeira ainda não concluída. */
 export function pickActiveTask(tasks: readonly TaskView[]): TaskView | null {
   return tasks.find((t) => t.status !== null && IN_FLIGHT.has(t.status)) ?? tasks.find((t) => t.status !== "DONE") ?? null;
+}
+
+// --- Tarefa de execução pausada (spec 114 T04) ---
+
+/**
+ * Motivo curto da pausa: o provedor falhou, a pessoa parou, erro interno, interrupção sem aviso
+ * (servidor reiniciado) ou, com a execução viva, um pedido esperando a decisão da pessoa.
+ */
+export type PauseReason = "provider" | "plan_limit" | "plan_not_eligible" | "plan_sign_in" | "stopped" | "failed" | "interrupted" | "decision";
+
+/** Estados em que a tarefa está com um agente: parada a execução, ela fica pausada (não "em andamento"). */
+const HALTABLE: ReadonlySet<string> = new Set(["IN_PROGRESS", "IN_REVIEW", "CHANGES_REQUESTED", "APPROVED", "INTEGRATING"]);
+
+/** `code` das mensagens do sistema que encerram o run (`src/server/runs.rs`) e o motivo de cada um. */
+const STOP_CODES: Readonly<Record<string, PauseReason>> = {
+  "run.stopped": "stopped",
+  "run.provider_failed": "provider",
+  "run.provider_failed_detail": "provider",
+  // Plano ChatGPT (spec 116 T03): cada pausa com o motivo próprio.
+  "run.plan_limit": "plan_limit",
+  "run.plan_not_eligible": "plan_not_eligible",
+  "run.plan_needs_login": "plan_sign_in",
+  "run.failed": "failed",
+  "run.failed_cause": "failed",
+};
+
+/**
+ * Motivo da parada ATUAL do run da spec (spec 114 T04): a última mensagem do sistema com `code` de
+ * parada, desde que venha depois do início ou da retomada mais recente da execução. Esse marco é o
+ * `since` (`runStarts` do store, de `project_status` executando ou da transição do estado para
+ * "executando"), comparado pelo `seq` de chegada ao vivo (a hora pode empatar) e, nas linhas do
+ * histórico, pela hora. Sem marco (página recarregada), vale qualquer mensagem de agente posterior
+ * à parada, que só existe se a execução voltou. Sem parada depois do marco, "execução interrompida".
+ */
+export function runStopReason(messages: readonly ChatMessage[] | undefined, specId: string, since?: RunStart): PauseReason {
+  const code = runStopCode(messages, specId, since);
+  return code === null ? "interrupted" : (STOP_CODES[code] ?? "interrupted");
+}
+
+/**
+ * `code` da parada ATUAL do run da spec (a mesma regra de `runStopReason`), ou `null` (execução
+ * interrompida). A Conversa usa para o cartão próprio das pausas do plano ChatGPT (spec 116 T03).
+ */
+export function runStopCode(messages: readonly ChatMessage[] | undefined, specId: string, since?: RunStart): string | null {
+  if (messages === undefined) return null;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m === undefined || m.role !== "agent" || !belongsToSpec(m, specId)) continue;
+    if (since !== undefined && (m.seq !== undefined ? m.seq <= since.seq : m.at < since.at)) return null;
+    // Um agente falou depois: a execução foi retomada depois de qualquer parada mais antiga.
+    if (m.agent !== "system") return null;
+    if (m.code !== undefined && STOP_CODES[m.code] !== undefined) return m.code;
+  }
+  return null;
+}
+
+/**
+ * Tarefas pausadas, sem status novo no disco: o estado vem da execução (`halted`: spec em
+ * andamento sem run, a mesma regra da Conversa) e dos pedidos pendentes (`waiting`: tarefas com
+ * permissão aguardando a pessoa). Só as que estão com um agente; BLOCKED tem a própria coluna.
+ */
+export function taskPauses(tasks: readonly TaskView[], halted: boolean, stopReason: PauseReason, waiting: ReadonlySet<string>): Map<string, PauseReason> {
+  const out = new Map<string, PauseReason>();
+  for (const task of tasks) {
+    if (task.status === null || !HALTABLE.has(task.status)) continue;
+    if (halted) out.set(task.id, stopReason);
+    else if (waiting.has(task.id)) out.set(task.id, "decision");
+  }
+  return out;
+}
+
+/** Rótulo curto do motivo da pausa, no idioma ativo. */
+const PAUSE_REASON_KEY: Readonly<Record<PauseReason, MessageKey>> = {
+  provider: "board.pause.provider",
+  plan_limit: "board.pause.planLimit",
+  plan_not_eligible: "board.pause.planNotEligible",
+  plan_sign_in: "board.pause.planNeedsLogin",
+  stopped: "board.pause.stopped",
+  failed: "board.pause.failed",
+  interrupted: "board.pause.interrupted",
+  decision: "board.pause.decision",
+};
+
+export function pauseReasonText(reason: PauseReason): string {
+  return t(PAUSE_REASON_KEY[reason]);
 }
 
 /** Selo de recuperação do Arquiteto (sem caractere no lugar de ícone). */

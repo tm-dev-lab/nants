@@ -15,7 +15,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use axum::http::StatusCode;
+use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::watch;
 
@@ -199,9 +200,7 @@ pub fn validate_project_id(id: &str) -> Result<(), ApiError> {
     if valid {
         Ok(())
     } else {
-        Err(ApiError::unprocessable(
-            "project_id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres",
-        ))
+        Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "project_id_invalid", Map::new()))
     }
 }
 
@@ -779,6 +778,13 @@ impl ActivitySink for BusActivitySink {
         if ev.kind == crate::agents::activity::ActivityKind::Command {
             payload["command_started_at"] = json!(super::live_activity::epoch_ms());
         }
+        // Spec 114 T04: início da chamada ao modelo e o tamanho já recebido da resposta.
+        if ev.kind == crate::agents::activity::ActivityKind::Model {
+            payload["model_started_at"] = json!(super::live_activity::epoch_ms());
+        }
+        if let Some(bytes) = ev.received_bytes {
+            payload["received_bytes"] = json!(bytes);
+        }
         if matches!(
             ev.kind,
             crate::agents::activity::ActivityKind::Tool | crate::agents::activity::ActivityKind::Command
@@ -797,6 +803,7 @@ impl ActivitySink for BusActivitySink {
                 stage: self.stage.as_ref().map(|(_, s)| s.as_str()),
                 stage_code: self.stage.as_ref().map(|(c, _)| *c),
                 code: coded.as_ref().map(|(c, p)| (c.as_str(), p)),
+                received_bytes: ev.received_bytes,
             },
         );
         self.bus.publish(ApiEvent::new(
@@ -951,6 +958,7 @@ mod tests {
             base_url: base_url.into(),
             api_key: api_key.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         }
     }
 
@@ -1344,6 +1352,7 @@ mod tests {
             kind: ActivityKind::Text,
             text: Some("y".repeat(10_000)),
             code: None,
+            received_bytes: None,
         });
         let ev = rx.try_recv().expect("evento");
         assert_eq!(ev.event_type(), "agent_activity");
@@ -1367,10 +1376,40 @@ mod tests {
             kind: ActivityKind::Start,
             text: None,
             code: None,
+            received_bytes: None,
         });
         let entries = std::fs::read_dir(&dir).expect("ler").count();
         assert_eq!(entries, 0, "nada pode ser gravado em disco");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spec 114 T04: `model` leva o início da chamada e o heartbeat dela, os bytes recebidos.
+    #[test]
+    fn model_call_payload_has_start_and_received_bytes() {
+        use crate::agents::activity::{ActivityEvent, ActivityKind, ActivitySink as _};
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let sink = BusActivitySink::new(bus, "p", Arc::new(SecretSet::default()));
+        let ev = |kind, received_bytes| ActivityEvent {
+            agent: "developer".into(),
+            spec_id: Some("003".into()),
+            task_id: Some("T02".into()),
+            activity_id: "a1".into(),
+            kind,
+            text: None,
+            code: None,
+            received_bytes,
+        };
+        sink.emit(ev(ActivityKind::Model, None));
+        sink.emit(ev(ActivityKind::ModelBeat, Some(48_000)));
+        sink.emit(ev(ActivityKind::ModelEnd, None));
+        let model = rx.try_recv().expect("model");
+        assert_eq!(model.payload["kind"], "model");
+        assert!(model.payload["model_started_at"].as_u64().is_some_and(|ms| ms > 0));
+        assert!(model.payload.get("received_bytes").is_none());
+        let beat = rx.try_recv().expect("heartbeat");
+        assert_eq!((beat.payload["kind"].as_str(), beat.payload["received_bytes"].as_u64()), (Some("heartbeat"), Some(48_000)));
+        assert_eq!(rx.try_recv().expect("fim").payload["kind"], "model_end");
     }
 
     #[test]
@@ -1613,6 +1652,7 @@ mod tests {
             kind,
             text: Some(text.into()),
             code: None,
+            received_bytes: None,
         }
     }
 

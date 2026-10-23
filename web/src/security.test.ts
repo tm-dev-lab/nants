@@ -40,8 +40,17 @@ const STORAGE_ALLOWED: ReadonlySet<string> = new Set([
   "staleStorage.test.ts",
 ]);
 
-/** Só a limpeza na carga toca o `sessionStorage` (para apagar, nunca para gravar). */
-const SESSION_ALLOWED: ReadonlySet<string> = new Set(["staleStorage.ts", "staleStorage.test.ts"]);
+/**
+ * `sessionStorage`: a limpeza na carga (só apaga) e a volta do login pelo plano ChatGPT (spec 116
+ * T03), que guarda só o id do espaço aberto (nada sensível, em try/catch) e o apaga na volta.
+ */
+const SESSION_ALLOWED: ReadonlySet<string> = new Set([
+  "staleStorage.ts",
+  "staleStorage.test.ts",
+  "apps/settings/chatgptPlan.ts",
+  "apps/settings/chatgptPlan.test.ts",
+  "apps/settings/PlanConnection.test.tsx",
+]);
 
 describe("segurança do código da SPA", () => {
   const files = sourceFiles(SRC_DIR);

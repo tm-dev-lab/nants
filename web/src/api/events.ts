@@ -114,7 +114,7 @@ const TASK_STATUSES: readonly string[] = [
   "BLOCKED",
 ];
 
-const ACTIVITY_KINDS: readonly string[] = ["start", "reasoning", "text", "tool", "command", "heartbeat", "command_end", "end"];
+const ACTIVITY_KINDS: readonly string[] = ["start", "reasoning", "text", "tool", "command", "heartbeat", "command_end", "model", "model_end", "end"];
 
 function isStr(value: unknown): value is string {
   return typeof value === "string";
@@ -237,7 +237,8 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
         p.command !== "" &&
         // Campos de escopo são opcionais (servidor antigo); quando presentes, têm o tipo certo.
         (p.always_allowed === undefined || typeof p.always_allowed === "boolean") &&
-        (p.always_denied_reason === undefined || p.always_denied_reason === null || isStr(p.always_denied_reason))
+        (p.always_denied_reason === undefined || p.always_denied_reason === null || isStr(p.always_denied_reason)) &&
+        (p.always_denied_code === undefined || p.always_denied_code === null || isStr(p.always_denied_code))
       );
     case "permission_resolved":
       return isStr(p.request_id) && isStr(p.project_id) && isStr(p.applied) && p.request_id !== "";

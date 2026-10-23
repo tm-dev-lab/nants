@@ -2,6 +2,30 @@
 //! Os fluxos completos (RETRY, ESCALATE, limite, ambiental) estão em `runs.rs`.
 
 use super::*;
+use crate::i18n::Lang;
+
+/// Spec 114 T02: os FATOS da recuperação trazem o motivo como foi gravado (no idioma do projeto
+/// ou, nas tarefas antigas, em pt-BR) e, quando houver, o código estável do motivo.
+#[test]
+fn facts_carry_block_reason_text_and_stable_code() {
+    let root = choice_root("facts-code", "BLOCKED", "");
+    let path = root.join(".sdd/specs/s1/tasks/T01.md");
+    let legacy = load(&root, "s1", "T01", &SecretSet::default()).expect("legado");
+    assert!(legacy.facts.contains("Motivo do bloqueio: bloqueada\n"), "{}", legacy.facts);
+    let raw = std::fs::read_to_string(&path).expect("ler").replace(
+        "next_action: \"bloqueada\"",
+        "next_action: \"impasse: the Developer did not change the branch since the previous rejection (2 rejections)\"\nnext_action_code: \"stalled\"",
+    );
+    std::fs::write(&path, raw).expect("gravar");
+    let coded = load(&root, "s1", "T01", &SecretSet::default()).expect("com código");
+    assert!(
+        coded.facts.contains(
+            "Motivo do bloqueio: impasse: the Developer did not change the branch since the previous rejection (2 rejections) (código: stalled)\n"
+        ),
+        "{}",
+        coded.facts
+    );
+}
 
 #[test]
 fn parse_accepts_valid_retry_and_escalate() {
@@ -479,13 +503,20 @@ fn premise_retry_uses_strategy_and_proposal_or_default() {
     let mut esc = Decision::escalate("causa");
     esc.strategy = Some("estratégia".into());
     esc.proposal = Some("proposta".into());
-    let retry = premise_retry(esc);
+    let retry = premise_retry(Lang::PtBr, esc.clone());
     assert!(retry.retry && retry.config.is_none() && retry.revise.is_none());
     assert_eq!(retry.strategy.as_deref(), Some("estratégia; proposta"));
     assert!(retry.root_cause.starts_with("causa") && retry.root_cause.contains("premissa registrada"));
-    let bare = premise_retry(Decision::escalate("c"));
-    assert_eq!(bare.strategy.as_deref(), Some(DEFAULT_YOLO_STRATEGY));
+    let bare = premise_retry(Lang::PtBr, Decision::escalate("c"));
+    assert_eq!(bare.strategy.as_deref(), Some(crate::i18n::text(Lang::PtBr, "recovery.default_strategy").as_str()));
+    assert!(bare.strategy.as_deref().is_some_and(|s| s.starts_with("adotar a abordagem mais simples")));
     assert!(!section_body(&SecretSet::default(), &bare).contains("escalar ao humano"));
+    // Spec 115 T04: em projeto en, a premissa e a estratégia padrão saem em inglês.
+    let en = premise_retry(Lang::En, esc);
+    assert!(en.root_cause.starts_with("causa (premise recorded: automatic approval is on"), "{}", en.root_cause);
+    assert_eq!(en.strategy.as_deref(), Some("estratégia; proposta"));
+    let bare = premise_retry(Lang::En, Decision::escalate("c"));
+    assert!(bare.strategy.as_deref().is_some_and(|s| s.starts_with("take the simplest, most direct approach")), "{:?}", bare.strategy);
 }
 
 #[test]
@@ -693,7 +724,7 @@ fn apply_choice_applies_each_kind_and_rejects_stale_or_unblocked() {
     let (valid, _) = validate_options(&config_root("choice-val", OPT_SETTINGS), &secrets, vec![cfg, guide, env, rev], false, &|| true);
     assert_eq!(valid.len(), 4);
     let root = choice_root("choice", "BLOCKED", &analysis_with(&valid));
-    let apply = |c: Choice| apply_choice(&root, "s1", "T01", &c, &secrets, &|| true, false);
+    let apply = |c: Choice| apply_choice(&root, "s1", "T01", &c, &secrets, &|| true, false, Lang::PtBr);
     // config: grava settings (o cliente nunca envia o conteúdo).
     assert_eq!(apply(Choice::Option("cfg".into(), 1)), Ok("config"));
     let settings = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings");
@@ -735,8 +766,8 @@ fn apply_choice_applies_each_kind_and_rejects_stale_or_unblocked() {
     assert_eq!(apply(Choice::Option("gui".into(), 1)), Err(ChoiceError::Stale));
     // Tarefa não bloqueada e inexistente.
     let todo = choice_root("choice-todo", "TODO", "");
-    assert_eq!(apply_choice(&todo, "s1", "T01", &Choice::Guidance("x".into()), &secrets, &|| true, false), Err(ChoiceError::NotBlocked));
-    assert_eq!(apply_choice(&todo, "s1", "T09", &Choice::Guidance("x".into()), &secrets, &|| true, false), Err(ChoiceError::NotFound));
+    assert_eq!(apply_choice(&todo, "s1", "T01", &Choice::Guidance("x".into()), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::NotBlocked));
+    assert_eq!(apply_choice(&todo, "s1", "T09", &Choice::Guidance("x".into()), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::NotFound));
 }
 
 #[test]
@@ -745,7 +776,7 @@ fn apply_choice_revalidates_config_against_the_guard_at_choice_time() {
     // Opção forjada direto no corpo (ex.: arquivo editado): a guarda roda de novo ao escolher.
     let forged = RecoveryOption { test_command: Some("echo ok".into()), ..raw(OptionKind::Config, "forjada") };
     let root = choice_root("choice-forged", "BLOCKED", &analysis_with(&[forged]));
-    assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option("forjada".into(), 1), &secrets, &|| true, false), Err(ChoiceError::Stale));
+    assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option("forjada".into(), 1), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::Stale));
     let settings = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings");
     assert!(!settings.contains("echo ok"), "{settings}");
 }
@@ -792,7 +823,7 @@ fn apply_choice_revalidates_text_and_environmental_rules_like_generation() {
     };
     let root = choice_root("choice-regen", "BLOCKED", &analysis_with(&[big, sudo, rev.clone()]));
     for id in ["grande", "priv"] {
-        assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option(id.into(), 1), &secrets, &|| true, false), Err(ChoiceError::Stale), "{id}");
+        assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option(id.into(), 1), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::Stale), "{id}");
     }
     // revise_task em falha ambiental (evidência com código 127) é recusada na escolha.
     let env_root = choice_root("choice-regen-env", "BLOCKED", &analysis_with(&[rev]));
@@ -802,9 +833,9 @@ fn apply_choice_revalidates_text_and_environmental_rules_like_generation() {
         "next_action: \"bloqueada\"\ntest_evidence: \"[falha dos testes: código 127]\\nsh: tsc: not found\"",
     );
     std::fs::write(&path, text).expect("T01");
-    assert_eq!(apply_choice(&env_root, "s1", "T01", &Choice::Option("rev".into(), 1), &secrets, &|| true, false), Err(ChoiceError::Stale));
+    assert_eq!(apply_choice(&env_root, "s1", "T01", &Choice::Option("rev".into(), 1), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::Stale));
     // O número da análise precisa ser o da última.
-    assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option("grande".into(), 2), &secrets, &|| true, false), Err(ChoiceError::Stale));
+    assert_eq!(apply_choice(&root, "s1", "T01", &Choice::Option("grande".into(), 2), &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::Stale));
 }
 
 /// Spec 079: `scope_add` aceito em RETRY/REVISE_TASK/REVISE_CONFIG, validado ao registrar e mostrado
@@ -1022,6 +1053,7 @@ mod internet {
             base_url: "https://api.example.com/v1".into(),
             api_key: "k".into(),
             wire_api: wire,
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig { connection_id: "c1".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
         cfg.architect_internet.recovery_searches = 2;
@@ -1117,7 +1149,45 @@ fn autonomous_and_env_fix_lines_count_old_and_new_prefixes() {
     );
     assert_eq!(count_marked_lines(&body, AUTONOMOUS_ROUND_PREFIX, LEGACY_AUTONOMOUS_ROUND_PREFIX), 2);
     assert_eq!(count_marked_lines(&body, ENV_FIX_PREFIX, LEGACY_ENV_FIX_PREFIX), 2);
-    for note in [AUTONOMOUS_NOTE, YOLO_NOTE, YOLO_REINFORCED_NOTE, PREMISE_NOTE] {
+    let premise = crate::i18n::text(Lang::PtBr, "recovery.premise_note");
+    for note in [AUTONOMOUS_NOTE, YOLO_NOTE, YOLO_REINFORCED_NOTE, premise.as_str()] {
         assert!(!note.contains("YOLO") && note.to_lowercase().contains("aprovação automática"), "{note}");
     }
+}
+
+/// Spec 115 T03: a opção aplicada pela aprovação automática vai junto da causa, no idioma do projeto.
+#[test]
+fn auto_applied_option_follows_the_project_language() {
+    assert_eq!(auto_applied(Lang::PtBr, "faltou o curl", "instalar"), "faltou o curl (a aprovação automática aplicou a opção «instalar»)");
+    assert_eq!(auto_applied(Lang::En, "curl is missing", "install"), "curl is missing (automatic approval applied the option \"install\")");
+}
+
+/// Spec 115 T04 (C-08): as entradas da orientação saem no idioma do projeto; o cabeçalho da seção,
+/// lido pelo runner, fica fixo.
+#[test]
+fn apply_choice_writes_entries_in_the_project_language() {
+    let secrets = SecretSet::default();
+    let guide = RecoveryOption { text: Some("mock the clock".into()), ..raw(OptionKind::Guidance, "gui") };
+    let rev = RecoveryOption {
+        objective: Some("new objective".into()),
+        acceptance: Some("- new criterion".into()),
+        ..raw(OptionKind::ReviseTask, "rev")
+    };
+    let (valid, _) = validate_options(&config_root("choice-en-val", OPT_SETTINGS), &secrets, vec![guide, rev], false, &|| true);
+    assert_eq!(valid.len(), 2);
+    let root = choice_root("choice-en", "BLOCKED", &analysis_with(&valid));
+    let apply = |c: Choice| apply_choice(&root, "s1", "T01", &c, &secrets, &|| true, false, Lang::En);
+    assert_eq!(apply(Choice::Option("gui".into(), 1)), Ok("guidance"));
+    assert_eq!(apply(Choice::Guidance("use port 0".into())), Ok("guidance"));
+    let (_, body) = read_task_body(&root);
+    let guidance = crate::agents::runner::section_text(&body, crate::agents::runner::GUIDANCE_SECTION).expect("orientação");
+    assert!(guidance.contains("I chose the option \"rótulo gui\": mock the clock"), "{guidance}");
+    assert!(guidance.contains("Human guidance: use port 0"), "{guidance}");
+    assert!(!guidance.contains("Escolhi") && !guidance.contains("Orientação do humano:"), "{guidance}");
+    assert!(body.contains("\n## Orientação do humano\n"), "cabeçalho estrutural fixo: {body}");
+    assert_eq!(apply(Choice::Option("rev".into(), 1)), Ok("revise_task"));
+    let (_, body) = read_task_body(&root);
+    assert!(body.contains("I chose the option \"rótulo rev\": the task definition was revised."), "{body}");
+    // Em pt-BR, o texto de sempre.
+    assert_eq!(crate::i18n::tr(Lang::PtBr, "recovery.choice.option", &[("label", "a"), ("text", "b")]), "Escolhi a opção «a»: b");
 }

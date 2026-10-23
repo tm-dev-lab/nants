@@ -25,7 +25,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::approvals::random_hex_id;
 use super::error::ApiError;
@@ -50,12 +50,6 @@ pub const ORPHAN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Anexos por mensagem.
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 4;
 
-const NOT_FOUND: &str = "imagem não encontrada";
-const INTERNAL_MSG: &str = "falha interna";
-const UNSUPPORTED: &str = "tipo de imagem não suportado: envie PNG, JPEG ou WebP";
-const TOO_LARGE: &str = "imagem maior que 5 MiB";
-const QUOTA_FULL: &str =
-    "sem espaço para imagens neste projeto (limite de 200 MiB); as imagens da conversa recente ocupam todo o espaço";
 const CACHE_CONTROL: &str = "private, max-age=3600";
 
 /// Serializa a gravação (cota e limpeza) entre uploads simultâneos.
@@ -100,11 +94,11 @@ pub fn attachment_exists(root: &Path, name: &str) -> bool {
 }
 
 fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, NOT_FOUND)
+    ApiError::coded(StatusCode::NOT_FOUND, "image_not_found", Map::new())
 }
 
 fn unsupported() -> ApiError {
-    ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, UNSUPPORTED)
+    ApiError::coded(StatusCode::UNSUPPORTED_MEDIA_TYPE, "image_type_unsupported", Map::new())
 }
 
 /// MIME declarado no `Content-Type` (parâmetros ignorados), se for um dos aceitos.
@@ -245,7 +239,7 @@ pub async fn post_attachment(
     validate_project_id(&id)?;
     let declared = declared_mime(&headers).ok_or_else(unsupported)?;
     if body.len() > MAX_ATTACHMENT_BYTES {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE));
+        return Err(ApiError::coded(StatusCode::PAYLOAD_TOO_LARGE, "image_too_large", Map::new()));
     }
     if sniff(&body) != Some(declared) {
         return Err(unsupported());
@@ -259,17 +253,17 @@ pub async fn post_attachment(
         store(&root, &body, ext, MAX_PROJECT_BYTES)
     })
     .await
-    .map_err(|_| ApiError::internal(INTERNAL_MSG))?;
+    .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     match stored {
         Ok(name) => {
             let id = name.split_once('.').map_or(name.as_str(), |(id, _)| id).to_string();
             Ok((StatusCode::CREATED, Json(json!({ "id": id, "name": name }))).into_response())
         }
-        Err(StoreError::Full) => Err(ApiError::new(StatusCode::INSUFFICIENT_STORAGE, QUOTA_FULL)),
+        Err(StoreError::Full) => Err(ApiError::coded(StatusCode::INSUFFICIENT_STORAGE, "attachment_no_space", Map::new())),
         Err(StoreError::Fs(SafeFsError::Unsafe | SafeFsError::NotRegular)) => {
-            Err(ApiError::new(StatusCode::CONFLICT, SafeFsError::Unsafe.static_message()))
+            Err(ApiError::coded(StatusCode::CONFLICT, SafeFsError::Unsafe.code(), Map::new()))
         }
-        Err(StoreError::Fs(_)) => Err(ApiError::internal(INTERNAL_MSG)),
+        Err(StoreError::Fs(_)) => Err(ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new())),
     }
 }
 
@@ -285,7 +279,7 @@ pub async fn get_attachment(
     let rel = rel_of(&name);
     let read = tokio::task::spawn_blocking(move || safe_fs::read_bounded(&root, &rel, MAX_ATTACHMENT_BYTES as u64))
         .await
-        .map_err(|_| ApiError::internal(INTERNAL_MSG))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     let data = match read {
         Ok(safe_fs::BoundedRead { data: Some(data), .. }) => data,
         _ => return Err(not_found()),

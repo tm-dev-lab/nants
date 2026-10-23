@@ -25,7 +25,7 @@ const TASKS: TaskView[] = [
 const SPEC: SpecView = { id: "s1", title: "Plano", status: "IN_PROGRESS", tasks: TASKS };
 
 function pending(requestId: string, taskId: string | null, agent: string, command: string, at = T0): PendingPermission {
-  return { requestId, projectId: PID, taskId, agent, command, alwaysAllowed: false, alwaysDeniedReason: "este comando executa código arbitrário", at };
+  return { requestId, projectId: PID, taskId, agent, command, alwaysAllowed: false, alwaysDeniedCode: "arbitrary", at };
 }
 
 function resolvedEntry(requestId: string, taskId: string | null, command: string, applied: "once" | "run" | "deny"): ResolvedPermission {

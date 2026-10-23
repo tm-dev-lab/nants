@@ -48,6 +48,24 @@ describe("perguntas do Arquiteto (nants-choices)", () => {
     expect(screen.getAllByText("Login: Sim").length).toBeGreaterThan(0);
   });
 
+  it("relógio de parede que recua não põe a resposta antes da pergunta (114/T01)", async () => {
+    // Causa da instabilidade: o WSL ajusta a hora para trás com frequência; a resposta ganhava uma
+    // hora anterior à da pergunta, ia para antes dela na conversa e a pergunta seguia interativa.
+    const id = "choices-clock";
+    postChatMock.mockResolvedValue({ ok: true, data: { reply: "ok", turn_id: "t-clock", draft_updated: false } } as never);
+    act(() => {
+      appStore.appendMessage(id, { role: "architect", text: BLOCK });
+    });
+    render(<Harness id={id} />);
+    const wall = Date.now() - 2_000;
+    vi.spyOn(Date, "now").mockImplementation(() => wall);
+    fireEvent.click(screen.getByRole("radio", { name: "Sim" }));
+    fireEvent.click(screen.getByRole("button", { name: "Enviar respostas" }));
+    await screen.findByText("ok");
+    expect(screen.queryByRole("button", { name: "Enviar respostas" })).toBeNull();
+    expect(screen.getByText("Suas escolhas")).toBeTruthy();
+  });
+
   it("só a última mensagem do Arquiteto é interativa", () => {
     const id = "choices-2";
     act(() => {

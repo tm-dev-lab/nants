@@ -30,6 +30,7 @@ import { Icon } from "../../desktop/Icon";
 import { useShell, useSpace } from "../../desktop/shellContext";
 import type { ContainerSize } from "../../desktop/useContainerSize";
 import { useWindowVisibility } from "../../desktop/useWindowVisibility";
+import type { SpaceData } from "../../desktop/useSpaceData";
 import { useWindowHost } from "../../desktop/windowHost";
 import { useT } from "../../i18n/react";
 import { recoveryKey, useAppStore, type RecoveryEntry } from "../../store";
@@ -55,13 +56,17 @@ import {
   OPTIONAL_COLUMNS,
   parseBoardColumns,
   parsedReview,
+  pauseReasonText,
   pickActiveTask,
   recoveryLabel,
+  runStopReason,
   statusLabel,
   STATUS_TONE,
   toggleBoardColumn,
+  taskPauses,
   toolActionsLabel,
   type BoardColumn,
+  type PauseReason,
 } from "./boardModel";
 import { ToolActionsSheet } from "./ToolActionsSheet";
 
@@ -92,6 +97,8 @@ function BoardContentView({ size }: AppContentProps) {
     <Board
       projectId={space.data.projectId}
       spec={spec}
+      halted={space.data.paused || space.data.stalled}
+      permissions={space.data.permissions}
       size={size}
       selectedTask={space.selection.taskId}
       boardColumns={space.selection.boardColumns}
@@ -105,14 +112,19 @@ export const BoardContent = memo(BoardContentView);
 interface BoardProps {
   projectId: string;
   spec: SpecView;
+  /** Execução da spec parada (pausada ou interrompida): a mesma regra do cartão da Conversa. */
+  halted: boolean;
+  /** Pedidos de permissão pendentes do espaço (a tarefa aguarda a decisão da pessoa). */
+  permissions: SpaceData["permissions"];
   size: ContainerSize;
   selectedTask: string | null;
   boardColumns: readonly string[] | undefined;
   setSelection: NonNullable<ReturnType<typeof useSpace>>["setSelection"];
 }
 
-function Board({ projectId, spec, size, selectedTask, boardColumns, setSelection }: BoardProps) {
+function Board({ projectId, spec, halted, permissions, size, selectedTask, boardColumns, setSelection }: BoardProps) {
   const host = useWindowHost();
+  const shell = useShell();
   const { t, lang } = useT();
   const reduced = host.reducedMotion();
   const visible = useWindowVisibility("board");
@@ -140,6 +152,14 @@ function Board({ projectId, spec, size, selectedTask, boardColumns, setSelection
   useEffect(() => {
     prevPlacement.current = placement;
   }, [placement]);
+
+  // Spec 114 T04: tarefa com agente e execução parada aparece pausada, com o motivo curto (da
+  // mensagem de parada posterior ao início ou à retomada mais recente) e o acesso à ação na Conversa. O seletor devolve um texto
+  // estável: a rajada de mensagens não re-renderiza o Quadro.
+  const stopReason = useAppStore((s) => (halted ? runStopReason(s.messages[projectId], spec.id, s.runStarts[projectId]) : "interrupted"));
+  const waiting = useMemo(() => new Set(permissions.flatMap((p) => (p.taskId === null ? [] : [p.taskId]))), [permissions]);
+  const pauses = useMemo(() => taskPauses(spec.tasks, halted, stopReason, waiting), [spec.tasks, halted, stopReason, waiting]);
+  const openConversation = useCallback(() => shell.openWindow("conversation"), [shell]);
 
   const recoveryOf = useCallback(
     (taskId: string): Recovery | undefined => {
@@ -269,6 +289,9 @@ function Board({ projectId, spec, size, selectedTask, boardColumns, setSelection
                   onSelect={() => select(task.id)}
                   onKeyDown={(event) => onCardKeyDown(event, col, row)}
                   recovery={recoveryOf(task.id)}
+                  pause={pauses.get(task.id)}
+                  decide={halted && task.status === "BLOCKED"}
+                  onOpenConversation={openConversation}
                   realStatus={column.kind === "flow" && task.status !== null && task.status !== column.key ? task.status : null}
                   actions={toolCounts?.[task.id] ?? 0}
                   onOpenActions={(from) => openActions(task.id, from)}
@@ -342,6 +365,11 @@ interface CardProps {
   onSelect: () => void;
   onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
   recovery: Recovery | undefined;
+  /** Tarefa pausada (spec 114 T04): motivo curto; o cartão ganha o acesso à ação na Conversa. */
+  pause: PauseReason | undefined;
+  /** Tarefa bloqueada com a execução parada: a decisão fica na Conversa. */
+  decide: boolean;
+  onOpenConversation: () => void;
   /** Estado real quando o cartão aparece na coluna de outro estado (coluna oculta). */
   realStatus: TaskStatus | null;
   actions: number;
@@ -349,13 +377,14 @@ interface CardProps {
   usage: TaskUsageMap;
 }
 
-function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, realStatus, actions, onOpenActions, usage }: CardProps) {
+function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, pause, decide, onOpenConversation, realStatus, actions, onOpenActions, usage }: CardProps) {
   const { t } = useT();
   const verdict =
     task.last_review_verdict === "APPROVED" || task.last_review_verdict === "CHANGES_REQUESTED" ? task.last_review_verdict : null;
   const owner = task.status === null ? undefined : CARD_OWNER[task.status];
   const usageLine = taskUsageLine(usage[task.id]);
   const tone = task.status !== null && task.status in STATUS_TONE ? STATUS_TONE[task.status] : "muted";
+  const pauseAction = pause !== undefined ? t(pause === "decision" ? "board.pause.decide" : "board.pause.continue") : decide ? t("board.pause.decide") : null;
   // Metadados numa linha só, separados por "·" (094/T08, A-02): tentativa, tempo/custo e dependências.
   const meta: { key: string; node: ReactNode }[] = [];
   if (task.attempts > 0) meta.push({ key: "attempts", node: <span>{t("board.attempt", { attempt: task.attempts, max: task.max_attempts })}</span> });
@@ -381,7 +410,9 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
       >
         <span className="nd-board-card-top">
           <span className="nd-mono nd-board-card-id nd-break">{task.id}</span>
-          {owner !== undefined ? <AgentAvatar kind={owner} size="sm" decorative state={task.status !== null && WORKING.has(task.status) ? "thinking" : undefined} /> : null}
+          {owner !== undefined ? (
+            <AgentAvatar kind={owner} size="sm" decorative state={pause === undefined && task.status !== null && WORKING.has(task.status) ? "thinking" : undefined} />
+          ) : null}
         </span>
         <span className="nd-board-card-title nd-break">{task.title}</span>
         {meta.length > 0 ? (
@@ -424,20 +455,41 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
             <span className="nd-prewrap nd-break">{task.next_action}</span>
           </span>
         ) : null}
+        {pause !== undefined ? (
+          <span className="nd-board-reason nd-board-pause" data-paused={pause}>
+            <span className="nd-section-label" data-tone="amber">
+              {t(pause === "decision" ? "board.waiting" : "board.paused")}
+            </span>
+            <span className="nd-break">{pauseReasonText(pause)}</span>
+          </span>
+        ) : null}
         {task.error !== undefined ? <span className="nd-prewrap nd-muted nd-break">{task.error}</span> : null}
       </button>
-      {actions > 0 ? (
+      {actions > 0 || pauseAction !== null ? (
         <span className="nd-board-card-foot" data-card-foot="">
-          <button
-            type="button"
-            className="nd-link-btn"
-            data-tool-actions={task.id}
-            aria-haspopup="dialog"
-            aria-label={t("board.taskActionsLabel", { actions: toolActionsLabel(actions), task: task.id })}
-            onClick={(event) => onOpenActions(event.currentTarget)}
-          >
-            {toolActionsLabel(actions)}
-          </button>
+          {pauseAction !== null ? (
+            <button
+              type="button"
+              className="nd-link-btn"
+              data-pause-action={task.id}
+              aria-label={t("board.pause.actionLabel", { action: pauseAction, task: task.id })}
+              onClick={onOpenConversation}
+            >
+              {pauseAction}
+            </button>
+          ) : null}
+          {actions > 0 ? (
+            <button
+              type="button"
+              className="nd-link-btn"
+              data-tool-actions={task.id}
+              aria-haspopup="dialog"
+              aria-label={t("board.taskActionsLabel", { actions: toolActionsLabel(actions), task: task.id })}
+              onClick={(event) => onOpenActions(event.currentTarget)}
+            >
+              {toolActionsLabel(actions)}
+            </button>
+          ) : null}
         </span>
       ) : null}
     </li>

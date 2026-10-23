@@ -287,7 +287,7 @@ describe("store: permission_resolved", () => {
     expect(store.getState().permissions).toBe(before.permissions);
   });
 
-  it("guarda always_allowed e always_denied_reason do pedido", () => {
+  it("guarda always_allowed e always_denied_code do pedido", () => {
     const store = createAppStore();
     store.applyEvent({
       event_type: "permission_requested",
@@ -300,12 +300,13 @@ describe("store: permission_resolved", () => {
         command: "node --test",
         always_allowed: false,
         always_denied_reason: "este comando executa código arbitrário",
+        always_denied_code: "arbitrary",
       },
     });
 
     expect(store.getState().permissions[PID]?.[0]).toMatchObject({
       alwaysAllowed: false,
-      alwaysDeniedReason: "este comando executa código arbitrário",
+      alwaysDeniedCode: "arbitrary",
     });
   });
 });

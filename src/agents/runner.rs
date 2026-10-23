@@ -117,8 +117,69 @@ pub const NOT_COUNTED_LINE: &str = "- Contagem: não conta como ciclo (escalada 
 /// Causa raiz do limite de ciclos; seções antigas (sem [`NOT_COUNTED_LINE`]) com esta causa também
 /// não contam, desde que a seção seja uma escalada (`- Decisão: escalar ao humano`).
 const LEGACY_LIMIT_CAUSE: &str = "- Causa raiz: limite de ciclos de recuperação atingido";
-/// `next_action` de uma tarefa BLOQUEADA cuja definição foi editada pelo Arquiteto no chat.
+/// `next_action` (pt-BR) gravado antes da spec 114 numa tarefa BLOQUEADA cuja definição foi
+/// editada pelo Arquiteto no chat. Só serve para ler o que já existe em disco: hoje o motivo leva o
+/// código [`BLOCK_REVISED`] e o texto no idioma do projeto.
 pub const REVISED_NEXT_ACTION: &str = "definição revisada; retomar";
+/// Código do motivo de uma tarefa BLOQUEADA com a definição revisada pelo Arquiteto no chat.
+pub const BLOCK_REVISED: &str = "revised";
+
+/// Códigos estáveis dos motivos de bloqueio gravados em `next_action_code` (spec 114 T02). Cada um
+/// tem o texto `runner.block.<código>` nos dois dicionários, menos o orçamento (`runner.budget.*`,
+/// montado pelo [`BudgetGuard`]).
+pub const BLOCK_CODES: [&str; 22] = [
+    "budget",
+    "docker",
+    "external_edit",
+    "tests_failed",
+    "stalled",
+    "rejections",
+    "not_on_base",
+    "staged_index",
+    "sdd_dirty",
+    "base_dirty",
+    "worktree_dirty",
+    "local_settings",
+    "squash_failed",
+    "base_tests_failed",
+    "base_tests_not_run",
+    "base_check_failed",
+    "base_check_not_run",
+    "commit_failed",
+    "rollback_failed",
+    "finalize_dirty",
+    BLOCK_REVISED,
+    "blocked",
+];
+
+/// Motivo de bloqueio (spec 114 T02): o código estável, lido pelas máquinas, e o texto para a
+/// pessoa no idioma do projeto. Vai para `next_action_code` e `next_action`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockReason {
+    pub code: &'static str,
+    pub text: String,
+}
+
+impl BlockReason {
+    /// Motivo com o texto `runner.block.<code>` no idioma, com os parâmetros preenchidos.
+    pub fn new(lang: Lang, code: &'static str, params: &[(&str, &str)]) -> Self {
+        Self { code, text: i18n::tr(lang, &format!("runner.block.{code}"), params) }
+    }
+
+    /// Motivo com contagem (spec 115 T01): `runner.block.<code>.one`/`.other`, com `{count}`.
+    pub fn counted(lang: Lang, code: &'static str, count: u64) -> Self {
+        Self { code, text: i18n::tr_plural(lang, &format!("runner.block.{code}"), count, &[]) }
+    }
+}
+
+/// Tarefa BLOQUEADA com a definição revisada: pelo código ou, nas tarefas gravadas antes da spec
+/// 114 (sem código), pelo texto pt-BR fixo.
+pub fn is_revised_block(meta: &crate::sdd::TaskMeta) -> bool {
+    match meta.next_action_code.as_deref() {
+        Some(code) => code == BLOCK_REVISED,
+        None => meta.next_action.as_deref() == Some(REVISED_NEXT_ACTION),
+    }
+}
 /// Prefixo da evidência de testes quando o `test_command` falhou (a evidência normal é de sucesso).
 pub const TEST_FAILURE_MARK: &str = "[falha dos testes";
 
@@ -832,7 +893,8 @@ pub fn mark_manual_criteria(acceptance: &str) -> String {
 }
 
 /// APPROVED com algum critério `not_met` (exceto `(manual)`, que não bloqueia) vira CHANGES_REQUESTED, com um finding gerado por critério.
-pub fn enforce_criteria(mut result: ReviewResult) -> ReviewResult {
+/// Os findings gerados saem no idioma do projeto (`lang`): o Desenvolvedor os lê no corpo da tarefa.
+pub fn enforce_criteria(lang: Lang, mut result: ReviewResult) -> ReviewResult {
     if result.verdict != Verdict::Approved {
         return result;
     }
@@ -844,12 +906,13 @@ pub fn enforce_criteria(mut result: ReviewResult) -> ReviewResult {
     let mut generated = Vec::new();
     for c in unmet {
         n += 1;
+        let evidence = if c.evidence.trim().is_empty() { i18n::text(lang, "runner.review.no_evidence") } else { c.evidence.trim().to_string() };
         generated.push(Finding {
             id: format!("F-{n:02}"),
             severity: "HIGH".into(),
-            location: "critérios de aceitação".into(),
-            description: format!("Critério não atendido: {}. Evidência: {}", c.criterion, if c.evidence.trim().is_empty() { "(nenhuma)" } else { c.evidence.trim() }),
-            recommendation: "Atender o critério com código e teste que o exercitem".into(),
+            location: i18n::text(lang, "runner.review.unmet_location"),
+            description: i18n::tr(lang, "runner.review.unmet_description", &[("criterion", &c.criterion), ("evidence", &evidence)]),
+            recommendation: i18n::text(lang, "runner.review.unmet_recommendation"),
             ..Finding::default()
         });
     }
@@ -968,9 +1031,9 @@ fn changed_hunks(repo: &Git, since: &str, branch: &str) -> Result<Vec<ChangedHun
 /// ou critério não manual `not_met`, nada é rebaixado e todos os findings (na ordem original) bloqueiam.
 /// Se nada bloqueante sobra, o veredito vira APPROVED. Em APPROVED, todos os findings devolvidos são
 /// observações. Na 1ª revisão nada é rebaixado.
-pub fn converge(result: ReviewResult, previous: &[Finding], hunks: &[ChangedHunk]) -> Converged {
-    let (result, low) = demote_low_confidence(result);
-    let Converged { result, mut observations } = converge_findings(result, previous, hunks);
+pub fn converge(lang: Lang, result: ReviewResult, previous: &[Finding], hunks: &[ChangedHunk]) -> Converged {
+    let (result, low) = demote_low_confidence(lang, result);
+    let Converged { result, mut observations } = converge_findings(lang, result, previous, hunks);
     observations.extend(low);
     Converged { result, observations }
 }
@@ -978,7 +1041,7 @@ pub fn converge(result: ReviewResult, previous: &[Finding], hunks: &[ChangedHunk
 /// Spec 087 T05: finding com `confidence: low` nunca reprova e vira observação (inclusive na 1ª
 /// revisão). Em CHANGES_REQUESTED, sem outro finding: critério não manual `not_met` vira finding
 /// bloqueante (como em [`enforce_criteria`]); sem nada mais que bloqueie, o veredito vira APPROVED.
-fn demote_low_confidence(mut result: ReviewResult) -> (ReviewResult, Vec<Finding>) {
+fn demote_low_confidence(lang: Lang, mut result: ReviewResult) -> (ReviewResult, Vec<Finding>) {
     if !result.findings.iter().any(|f| f.confidence == Confidence::Low) {
         return (result, Vec::new());
     }
@@ -987,9 +1050,9 @@ fn demote_low_confidence(mut result: ReviewResult) -> (ReviewResult, Vec<Finding
     result.findings = kept;
     if result.verdict == Verdict::ChangesRequested && result.findings.is_empty() {
         result.verdict = Verdict::Approved;
-        result.summary = format!("{} (findings de baixa confiança viraram observações.)", result.summary.trim_end());
+        result.summary = i18n::tr(lang, "runner.review.low_confidence_demoted", &[("summary", result.summary.trim_end())]);
         // Critério não atendido continua bloqueando: volta a CHANGES_REQUESTED com findings gerados.
-        result = enforce_criteria(result);
+        result = enforce_criteria(lang, result);
     }
     (result, low)
 }
@@ -1011,6 +1074,7 @@ pub const CHANGED_FILES_MAX: usize = 50;
 /// APPROVED (critério não manual `not_met` continua bloqueando), como em [`demote_low_confidence`].
 /// O que sobra segue em [`converge`].
 pub fn converge_with_files(
+    lang: Lang,
     result: ReviewResult,
     previous: &[Finding],
     hunks: &[ChangedHunk],
@@ -1018,15 +1082,16 @@ pub fn converge_with_files(
     exists: &dyn Fn(&str) -> bool,
 ) -> Converged {
     let (result, unchanged) = match changed_files {
-        Some(changed) => demote_unchanged_files(result, previous, changed, exists),
+        Some(changed) => demote_unchanged_files(lang, result, previous, changed, exists),
         None => (result, Vec::new()),
     };
-    let Converged { result, mut observations } = converge(result, previous, hunks);
+    let Converged { result, mut observations } = converge(lang, result, previous, hunks);
     observations.extend(unchanged);
     Converged { result, observations }
 }
 
 fn demote_unchanged_files(
+    lang: Lang,
     mut result: ReviewResult,
     previous: &[Finding],
     changed: &[String],
@@ -1054,12 +1119,9 @@ fn demote_unchanged_files(
     result.findings = kept;
     if result.findings.is_empty() {
         result.verdict = Verdict::Approved;
-        result.summary = format!(
-            "{} (findings novos em arquivos que não mudaram desde a revisão anterior viraram observações.)",
-            result.summary.trim_end()
-        );
+        result.summary = i18n::tr(lang, "runner.review.unchanged_files_demoted", &[("summary", result.summary.trim_end())]);
         // Critério não atendido continua bloqueando: volta a CHANGES_REQUESTED com findings gerados.
-        result = enforce_criteria(result);
+        result = enforce_criteria(lang, result);
     }
     let labeled = demoted
         .into_iter()
@@ -1140,7 +1202,7 @@ pub fn changed_files_facts(changed: &[String]) -> String {
     out
 }
 
-fn converge_findings(mut result: ReviewResult, previous: &[Finding], hunks: &[ChangedHunk]) -> Converged {
+fn converge_findings(lang: Lang, mut result: ReviewResult, previous: &[Finding], hunks: &[ChangedHunk]) -> Converged {
     if result.verdict == Verdict::Approved {
         let observations = std::mem::take(&mut result.findings);
         return Converged { result, observations };
@@ -1170,10 +1232,7 @@ fn converge_findings(mut result: ReviewResult, previous: &[Finding], hunks: &[Ch
     }
     let observations = std::mem::take(&mut result.findings);
     result.verdict = Verdict::Approved;
-    result.summary = format!(
-        "{} (findings MEDIUM sobre código não alterado desde a última reprovação viraram observações.)",
-        result.summary.trim_end()
-    );
+    result.summary = i18n::tr(lang, "runner.review.untouched_code_demoted", &[("summary", result.summary.trim_end())]);
     Converged { result, observations }
 }
 
@@ -1350,23 +1409,21 @@ enum TaskWarning {
 }
 
 impl TaskWarning {
-    /// Texto de reserva em pt-BR, `code` e `params`.
-    fn notice(&self) -> (String, &'static str, serde_json::Map<String, serde_json::Value>) {
-        match self {
-            Self::Ownership { path, error } => (
-                format!("Aviso: não consegui devolver a posse dos arquivos de {path}: {error}"),
-                "task.ownership_failed",
-                notice_params(&[("path", path), ("error", error)]),
-            ),
-            Self::Cleanup { path, error } => (
-                format!(
-                    "Aviso: não consegui apagar a worktree {path}: {error}. A tarefa está integrada; remova a pasta manualmente (git worktree remove --force) quando possível"
-                ),
-                "task.cleanup_failed",
-                notice_params(&[("path", path), ("error", error)]),
-            ),
-        }
+    /// Texto de reserva no idioma do projeto (`system.<code>`), `code` e `params`.
+    fn notice(&self, lang: Lang) -> (String, &'static str, serde_json::Map<String, serde_json::Value>) {
+        let (code, path, error) = match self {
+            Self::Ownership { path, error } => ("task.ownership_failed", path, error),
+            Self::Cleanup { path, error } => ("task.cleanup_failed", path, error),
+        };
+        let pairs = [("path", path.as_str()), ("error", error.as_str())];
+        (system_text(lang, code, &pairs), code, notice_params(&pairs))
     }
+}
+
+/// Texto de reserva de uma mensagem do sistema com `code` (spec 115 T03): `system.<code>` do
+/// dicionário no idioma do projeto, o mesmo texto que a web monta pelo código.
+fn system_text(lang: Lang, code: &str, params: &[(&str, &str)]) -> String {
+    i18n::tr(lang, &format!("system.{code}"), params)
 }
 
 /// Evento emitido nas transições e mensagens dos agentes.
@@ -1470,22 +1527,29 @@ impl EventSink for NullSink {
 /// Executa `test_command` real com `sh -c`, cwd = diretório pedido, timeout e saída limitada.
 ///
 /// O comando vem do `settings.yaml` configurado pelo humano, nunca de um agente.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShellTestExecutor {
     timeout: Duration,
+    /// Idioma das marcas que o executor acrescenta à saída (corte e tempo limite), lido a cada
+    /// execução: é o idioma do projeto (spec 115 T04).
+    lang: i18n::SharedLang,
 }
 
 impl ShellTestExecutor {
     /// Executor com o timeout padrão de [`TEST_TIMEOUT`].
     pub fn new() -> Self {
-        Self {
-            timeout: TEST_TIMEOUT,
-        }
+        Self::with_timeout(TEST_TIMEOUT)
     }
 
     /// Executor com timeout customizado (usado em testes).
     pub fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+        Self { timeout, lang: i18n::SharedLang::default() }
+    }
+
+    /// Marcas da saída no idioma do projeto.
+    pub fn with_lang(mut self, lang: i18n::SharedLang) -> Self {
+        self.lang = lang;
+        self
     }
 }
 
@@ -1504,8 +1568,9 @@ impl TestExecutor for ShellTestExecutor {
         let dir = dir.to_path_buf();
         let command = command.to_string();
         let timeout = self.timeout;
+        let lang = self.lang.get();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || run_shell(&dir, &command, timeout))
+            tokio::task::spawn_blocking(move || run_shell(&dir, &command, timeout, lang))
                 .await
                 .map_err(|e| RunnerError::Tests(format!("execução interrompida: {e}")))?
         })
@@ -1546,8 +1611,15 @@ fn pump(mut reader: impl Read, tx: Sender<Vec<u8>>) {
     }
 }
 
+/// Marca de tempo limite acrescentada à saída dos testes (no host e no Docker), no idioma do
+/// projeto (spec 115 T04): a pessoa a vê na saída dos testes.
+fn timed_out_mark(lang: Lang, timeout: Duration) -> String {
+    let secs = timeout.as_secs().to_string();
+    format!("\n[{}]\n", i18n::tr(lang, "runner.output.timed_out", &[("secs", &secs)]))
+}
+
 /// Executa `command` com `sh -c` em `dir`. Após o timeout, mata o processo e não espera os pipes.
-fn run_shell(dir: &Path, command: &str, timeout: Duration) -> Result<TestResult, RunnerError> {
+fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang) -> Result<TestResult, RunnerError> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -1610,13 +1682,10 @@ fn run_shell(dir: &Path, command: &str, timeout: Duration) -> Result<TestResult,
 
     let mut output = String::from_utf8_lossy(&capture.buf).into_owned();
     if capture.truncated {
-        output.push_str("\n[saída truncada em 64 KiB]\n");
+        output.push_str(&format!("\n[{}]\n", i18n::text(lang, "runner.output.truncated")));
     }
     if timed_out {
-        output.push_str(&format!(
-            "\n[tempo limite de {}s excedido]\n",
-            timeout.as_secs()
-        ));
+        output.push_str(&timed_out_mark(lang, timeout));
     }
     Ok(TestResult {
         passed: !timed_out && exit_ok,
@@ -1819,7 +1888,10 @@ impl TaskRunner {
         })
         .await
         .map_err(|e| RunnerError::Tests(format!("execução interrompida: {e}")))?;
-        let out = joined.map_err(RunnerError::Docker)?;
+        let mut out = joined.map_err(RunnerError::Docker)?;
+        if out.timed_out {
+            out.output.push_str(&timed_out_mark(self.lang.get(), TEST_TIMEOUT));
+        }
         Ok(TestResult { passed: out.success(), output: out.output, exit_code: out.code, timed_out: out.timed_out })
     }
 
@@ -1993,18 +2065,13 @@ impl TaskRunner {
                 }
             }
         }
-        let message = format!(
-            "style({}): {} - formatação automática",
-            task.frontmatter.spec_id, task.frontmatter.id
-        );
+        let prefix = format!("style({}): {} - ", task.frontmatter.spec_id, task.frontmatter.id);
+        let message = i18n::commit_subject(lang, &prefix, "commit.formatting");
         match formatting::finalize(wt, &task.frontmatter.allowed_scope, &message) {
             Ok(files) if files.is_empty() => {}
             Ok(files) => {
-                let text = i18n::tr(
-                    lang,
-                    "runner.format.applied",
-                    &[("count", &files.len().to_string()), ("names", &applied.join(", "))],
-                );
+                let count = u64::try_from(files.len()).unwrap_or(u64::MAX);
+                let text = i18n::tr_plural(lang, "runner.format.applied", count, &[("names", &applied.join(", "))]);
                 self.tests_message(task, attempt, text);
             }
             Err(why) => {
@@ -2026,8 +2093,8 @@ impl TaskRunner {
         let Some(guard) = &self.budget else {
             return Ok(None);
         };
-        match guard.exceeded(&task.frontmatter.spec_id) {
-            Some(reason) => Ok(Some(self.block(task, reason, BlockKind::Budget)?)),
+        match guard.exceeded(&task.frontmatter.spec_id, self.lang.get()) {
+            Some(text) => Ok(Some(self.block(task, BlockReason { code: "budget", text }, BlockKind::Budget)?)),
             None => Ok(None),
         }
     }
@@ -2070,12 +2137,12 @@ impl TaskRunner {
         }
         match self.drive(&settings, &mut task).await {
             Err(RunnerError::Docker(reason)) => Ok(Outcome::Blocked {
-                reason: format!("ambiente docker: {reason}"),
+                reason: self.block_reason("docker", &[("reason", &reason)]).text,
                 kind: BlockKind::Environmental,
                 open_findings: vec![],
             }),
             Err(RunnerError::ExternalEdit { path }) => Ok(Outcome::Blocked {
-                reason: format!("{path} modificado externamente"),
+                reason: self.block_reason("external_edit", &[("path", &path.to_string())]).text,
                 kind: BlockKind::Environmental,
                 open_findings: vec![],
             }),
@@ -2118,7 +2185,7 @@ impl TaskRunner {
                 TaskStatus::Blocked => {
                     let open_findings = read_findings(&task.body)?;
                     return Ok(Outcome::Blocked {
-                        reason: reason_of(task),
+                        reason: reason_of(task, self.lang.get()),
                         kind: BlockKind::infer(&open_findings),
                         open_findings,
                     });
@@ -2188,7 +2255,7 @@ impl TaskRunner {
                 let open_findings = read_findings(&next.body)?;
                 return Ok(SpecOutcome::Blocked {
                     task_id,
-                    reason: reason_of(next),
+                    reason: reason_of(next, self.lang.get()),
                     kind: BlockKind::infer(&open_findings),
                     open_findings,
                 });
@@ -2252,6 +2319,7 @@ impl TaskRunner {
                 &task.frontmatter.spec_id,
                 &task.frontmatter.id,
                 &task.frontmatter.branch,
+                self.lang.get(),
             )?;
             // Formatação automática (spec 078): vira commit próprio, antes do HEAD testado e revisado.
             self.format_delivery(settings, task, &wt, attempt).await?;
@@ -2266,7 +2334,7 @@ impl TaskRunner {
             let mut test = match self.run_tracked(settings, &wt, &settings.test_command, true, None, "", &task.frontmatter.id, attempt).await {
                 Ok(t) => t,
                 Err(RunnerError::Docker(reason)) => {
-                    return self.block(task, format!("ambiente docker: {reason}"), BlockKind::Environmental);
+                    return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
                 }
                 Err(e) => return Err(e),
             };
@@ -2278,7 +2346,7 @@ impl TaskRunner {
                     let r = match self.run_tracked(settings, &wt, &check.command, false, Some(&check.name), "", &task.frontmatter.id, attempt).await {
                         Ok(r) => r,
                         Err(RunnerError::Docker(reason)) => {
-                            return self.block(task, format!("ambiente docker: {reason}"), BlockKind::Environmental);
+                            return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
                         }
                         Err(e) => return Err(e),
                     };
@@ -2381,7 +2449,7 @@ impl TaskRunner {
                 task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(test.exit_code, test.timed_out), test.output));
                 return self.block(
                     task,
-                    format!("test_command falhou {failed_runs} vezes na mesma tentativa"),
+                    self.block_reason_counted("tests_failed", u64::from(failed_runs)),
                     BlockKind::Quality,
                 );
             }
@@ -2506,13 +2574,13 @@ impl TaskRunner {
         // Sem base do diff (`rejected_sha` ausente, p.ex. após recuperação, revisão ou retomada humana, que
         // limpam o sha sem apagar os findings) ou com falha ao ler os hunks, nada é rebaixado, como na 1ª revisão.
         let hunks = task.frontmatter.rejected_sha.as_deref().and_then(|sha| changed_hunks(&root, sha, &branch).ok());
-        let enforced = enforce_criteria(reviewed);
+        let enforced = enforce_criteria(self.lang.get(), reviewed);
         // Spec 092 T04: na re-revisão, finding novo MEDIUM/LOW em arquivo que não mudou (e que existe na
         // worktree da branch revisada) vira observação.
         let exists = |path: &str| file_in_worktree(&input.worktree, path);
         let Converged { result, observations } = match &hunks {
-            Some(h) => converge_with_files(enforced, &previous, h, changed_files.as_deref(), &exists),
-            None => converge_with_files(enforced, &previous, &[], changed_files.as_deref(), &exists),
+            Some(h) => converge_with_files(self.lang.get(), enforced, &previous, h, changed_files.as_deref(), &exists),
+            None => converge_with_files(self.lang.get(), enforced, &previous, &[], changed_files.as_deref(), &exists),
         };
         let text = render_review_message(
             result.verdict,
@@ -2558,17 +2626,14 @@ impl TaskRunner {
                 if stalled {
                     return self.block(
                         task,
-                        format!(
-                            "impasse: o Desenvolvedor não alterou a branch desde a reprovação anterior ({} reprovações)",
-                            task.frontmatter.attempts
-                        ),
+                        self.block_reason_counted("stalled", u64::from(task.frontmatter.attempts)),
                         BlockKind::Quality,
                     );
                 }
                 if task.frontmatter.attempts >= task.frontmatter.max_attempts {
                     return self.block(
                         task,
-                        format!("{} reprovações do revisor", task.frontmatter.attempts),
+                        self.block_reason_counted("rejections", u64::from(task.frontmatter.attempts)),
                         BlockKind::Quality,
                     );
                 }
@@ -2592,7 +2657,7 @@ impl TaskRunner {
         if root.current_branch()? != base {
             return self.block(
                 task,
-                format!("raiz do repositório não está na base '{base}'"),
+                self.block_reason("not_on_base", &[("base", base)]),
                 BlockKind::Environmental,
             );
         }
@@ -2606,7 +2671,7 @@ impl TaskRunner {
         if root.has_staged_changes()? {
             return self.block(
                 task,
-                "índice da base com alterações staged; resolva manualmente: git restore --staged --worktree <paths> ou git commit; depois reexecute".into(),
+                self.block_reason("staged_index", &[]),
                 BlockKind::Environmental,
             );
         }
@@ -2617,7 +2682,7 @@ impl TaskRunner {
         if wt.is_dir() && !Git::new(wt.clone()).is_clean_ignoring_sdd()? {
             return self.block(
                 task,
-                "worktree com alterações não commitadas".into(),
+                self.block_reason("worktree_dirty", &[]),
                 BlockKind::Environmental,
             );
         }
@@ -2637,7 +2702,7 @@ impl TaskRunner {
         if root.changed_paths(base, &branch)?.iter().any(|p| p == LOCAL_SETTINGS) {
             return self.block(
                 task,
-                format!("a branch altera {LOCAL_SETTINGS}; integração recusada"),
+                self.block_reason("local_settings", &[("path", LOCAL_SETTINGS)]),
                 BlockKind::Environmental,
             );
         }
@@ -2652,7 +2717,7 @@ impl TaskRunner {
             return self.rollback_then_block(
                 &root,
                 task,
-                format!("squash merge falhou: {e}"),
+                self.block_reason("squash_failed", &[("error", &e)]),
                 BlockKind::Environmental,
                 &captured,
             );
@@ -2693,7 +2758,7 @@ impl TaskRunner {
                     return self.rollback_then_block(
                         &root,
                         task,
-                        "testes na base falharam após o squash".into(),
+                        self.block_reason("base_tests_failed", &[]),
                         BlockKind::Quality,
                         &captured,
                     );
@@ -2702,7 +2767,7 @@ impl TaskRunner {
                     return self.rollback_then_block(
                         &root,
                         task,
-                        format!("testes na base não executaram: {e}"),
+                        self.block_reason("base_tests_not_run", &[("error", &e.to_string())]),
                         BlockKind::Environmental,
                         &captured,
                     );
@@ -2729,7 +2794,7 @@ impl TaskRunner {
                     return self.rollback_then_block(
                         &root,
                         task,
-                        format!("checagem {} na base falhou após o squash", check.name),
+                        self.block_reason("base_check_failed", &[("name", &check.name)]),
                         BlockKind::Quality,
                         &captured,
                     );
@@ -2738,7 +2803,7 @@ impl TaskRunner {
                     return self.rollback_then_block(
                         &root,
                         task,
-                        format!("checagem {} na base não executou: {e}", check.name),
+                        self.block_reason("base_check_not_run", &[("name", &check.name), ("error", &e.to_string())]),
                         BlockKind::Environmental,
                         &captured,
                     );
@@ -2768,7 +2833,7 @@ impl TaskRunner {
                 return self.rollback_then_block(
                     &root,
                     task,
-                    format!("commit de integração falhou: {e}"),
+                    self.block_reason("commit_failed", &[("error", &e.to_string())]),
                     BlockKind::Environmental,
                     &captured,
                 );
@@ -2783,7 +2848,7 @@ impl TaskRunner {
             return self.rollback_then_block(
                 &root,
                 task,
-                format!("commit de integração falhou: {e}"),
+                self.block_reason("commit_failed", &[("error", &e.to_string())]),
                 BlockKind::Environmental,
                 &captured,
             );
@@ -2824,7 +2889,7 @@ impl TaskRunner {
         &self,
         root: &Git,
         task: &mut Task,
-        cause: String,
+        cause: BlockReason,
         kind: BlockKind,
         captured: &Result<Vec<(String, String)>, String>,
     ) -> Result<Step, RunnerError> {
@@ -2834,13 +2899,10 @@ impl TaskRunner {
         };
         match undone {
             Ok(()) => self.block(task, cause, kind),
-            Err(e) => self.block(
-                task,
-                format!(
-                    "{cause}; rollback do squash não concluído, conferir git status (índice pode conter alterações do squash): {e}"
-                ),
-                BlockKind::Environmental,
-            ),
+            Err(e) => {
+                let reason = self.block_reason("rollback_failed", &[("cause", &cause.text), ("error", &e)]);
+                self.block(task, reason, BlockKind::Environmental)
+            }
         }
     }
 
@@ -2873,15 +2935,13 @@ impl TaskRunner {
             let id = task.frontmatter.id.clone();
             let path = wt.display().to_string();
             self.events.emit(RunnerEvent::SystemNotice {
-                text: format!(
-                    "Tarefa {id} bloqueada: a worktree {path} tem alterações não commitadas. Commite ou descarte-as e clique em Continuar."
-                ),
+                text: system_text(self.lang.get(), "task.worktree_dirty", &[("task", &id), ("path", &path)]),
                 code: "task.worktree_dirty".into(),
                 params: notice_params(&[("task", &id), ("path", &path)]),
                 task_id: Some(id),
             });
             return Ok(Step::Finish(Outcome::Blocked {
-                reason: "worktree com alterações não commitadas; limpe e reexecute".into(),
+                reason: self.block_reason("finalize_dirty", &[]).text,
                 kind: BlockKind::Environmental,
                 open_findings: read_findings(&task.body)?,
             }));
@@ -2897,7 +2957,7 @@ impl TaskRunner {
         }
         // Um aviso por problema, cada um com o seu `code` (spec 102).
         for warning in warnings {
-            let (text, code, params) = warning.notice();
+            let (text, code, params) = warning.notice(self.lang.get());
             self.events.emit(RunnerEvent::SystemNotice {
                 text,
                 code: code.into(),
@@ -2966,32 +3026,44 @@ impl TaskRunner {
     /// `.sdd/settings.yaml` (configuração local, versionada ou não) não bloqueiam. Qualquer outro
     /// caminho não commitado (arquivos de `.sdd` fora dessas duas entradas, arquivos fora de `.sdd`)
     /// bloqueia. Alterações staged são tratadas antes, em `integrate`.
-    fn dirty_reason(&self) -> Result<Option<String>, RunnerError> {
+    fn dirty_reason(&self) -> Result<Option<BlockReason>, RunnerError> {
         for path in self.git().porcelain_paths(&[WORKTREES_EXCLUDE])? {
             // `.sdd/skills/` (perfis de especialista, spec 063) é do humano/Arquiteto, como `.sdd/specs/`.
             if path.starts_with(".sdd/specs/") || path.starts_with(".sdd/skills/") || path == LOCAL_SETTINGS {
                 continue;
             }
             if path.starts_with(".sdd/") {
-                return Ok(Some(format!("alterações não commitadas em .sdd: {path}")));
+                return Ok(Some(self.block_reason("sdd_dirty", &[("path", &path)])));
             }
-            return Ok(Some(format!("base com alterações não commitadas: {path}")));
+            return Ok(Some(self.block_reason("base_dirty", &[("path", &path)])));
         }
         Ok(None)
     }
 
-    /// Marca `BLOCKED` com o motivo em `next_action` e devolve o encerramento do laço.
+    /// Motivo de bloqueio `code` no idioma do projeto (spec 114 T02).
+    fn block_reason(&self, code: &'static str, params: &[(&str, &str)]) -> BlockReason {
+        BlockReason::new(self.lang.get(), code, params)
+    }
+
+    /// Motivo de bloqueio `code` com contagem, no plural do idioma (spec 115 T01).
+    fn block_reason_counted(&self, code: &'static str, count: u64) -> BlockReason {
+        BlockReason::counted(self.lang.get(), code, count)
+    }
+
+    /// Marca `BLOCKED` com o motivo (texto em `next_action`, código em `next_action_code`) e
+    /// devolve o encerramento do laço.
     fn block(
         &self,
         task: &mut Task,
-        reason: String,
+        reason: BlockReason,
         kind: BlockKind,
     ) -> Result<Step, RunnerError> {
         task.frontmatter.status = TaskStatus::Blocked;
-        task.frontmatter.next_action = Some(reason.clone());
+        task.frontmatter.next_action = Some(reason.text.clone());
+        task.frontmatter.next_action_code = Some(reason.code.to_string());
         self.persist(task)?;
         Ok(Step::Finish(Outcome::Blocked {
-            reason,
+            reason: reason.text,
             kind,
             open_findings: read_findings(&task.body)?,
         }))
@@ -3157,12 +3229,18 @@ impl TaskRunner {
     }
 
     /// Aviso fixo da verificação final (spec 102): mensagem do sistema com `code` e `params`
-    /// (já sem segredos); `text` é a reserva em pt-BR. Listas e erros longos não vão em `params`
-    /// (cortados em 512 bytes): ficam no `text`, depois da primeira quebra de linha, e a interface
-    /// os mostra como vieram, abaixo da frase fixa traduzida.
-    fn final_notice(&self, text: String, code: &str, params: &[(&str, &str)]) {
+    /// (já sem segredos); o texto de reserva é `system.<code>` no idioma do projeto (spec 115 T03).
+    /// Listas e erros longos (`tail`) não vão em `params` (cortados em 512 bytes): ficam no `text`,
+    /// depois da primeira quebra de linha, e a interface os mostra como vieram, abaixo da frase
+    /// fixa traduzida.
+    fn final_notice(&self, code: &str, params: &[(&str, &str)], tail: Option<&str>) {
         let scrubbed: Vec<(&str, String)> = params.iter().map(|(k, v)| (*k, self.scrub(v))).collect();
         let pairs: Vec<(&str, &str)> = scrubbed.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let fixed = system_text(self.lang.get(), code, &pairs);
+        let text = match tail {
+            Some(tail) => format!("{fixed}\n{tail}"),
+            None => fixed,
+        };
         self.events.emit(RunnerEvent::SystemNotice {
             text: self.scrub(&text),
             code: code.into(),
@@ -3202,12 +3280,8 @@ impl TaskRunner {
             return Ok(FinalStep::Complete);
         }
         let total_listed = criteria.lines().filter(|l| !l.trim().is_empty()).count();
-        if let Some(reason) = self.budget.as_ref().and_then(|g| g.exceeded(spec_id)) {
-            self.final_notice(
-                format!("AVISO: verificação final não executada: {reason}; a spec será concluída sem ela."),
-                "final.skipped",
-                &[("reason", &reason.to_string())],
-            );
+        if let Some(reason) = self.budget.as_ref().and_then(|g| g.exceeded(spec_id, self.lang.get())) {
+            self.final_notice("final.skipped", &[("reason", &reason.to_string())], None);
             return Ok(FinalStep::Complete);
         }
         // O indicador cobre os testes da base e a conferência do Revisor; o `drop` limpa em qualquer saída.
@@ -3217,19 +3291,25 @@ impl TaskRunner {
         let (base_text, checks_text, fail_tail) = self.final_base_evidence(settings).await?;
         let screenshots = crate::sdd::screenshots::list(&self.repo_root, &settings.screenshots, base_started);
         let mut test_output = base_text;
+        let lang = self.lang.get();
         for t in tasks {
             let f = &t.frontmatter;
-            match &f.test_run {
-                Some(r) => test_output.push_str(&format!(
-                    "{} `{}` exit={} em {}: {}\n",
-                    f.id,
-                    r.command,
-                    r.exit_code.map_or("?".to_string(), |c| c.to_string()),
-                    r.at,
-                    r.summary
-                )),
-                None => test_output.push_str(&format!("{}: sem test_run registrado\n", f.id)),
-            }
+            let line = match &f.test_run {
+                Some(r) => i18n::tr(
+                    lang,
+                    "runner.final_base.task_test_run",
+                    &[
+                        ("task", &f.id),
+                        ("command", &r.command),
+                        ("code", &r.exit_code.map_or("?".to_string(), |c| c.to_string())),
+                        ("at", &r.at),
+                        ("summary", &r.summary),
+                    ],
+                ),
+                None => i18n::tr(lang, "runner.final_base.task_no_test_run", &[("task", &f.id)]),
+            };
+            test_output.push_str(&line);
+            test_output.push('\n');
         }
         let input = ReviewInput {
             spec_id: spec_id.to_string(),
@@ -3270,16 +3350,12 @@ impl TaskRunner {
                 // sobrescrever as cópias da 1ª.
                 let round = if tasks.iter().any(is_final_fix) { 2 } else { 1 };
                 let captures = self.copy_captures(&input, "FINAL", round, &r.screenshots_viewed);
-                (converge(enforce_criteria(r), &[], &[]), captures)
+                (converge(self.lang.get(), enforce_criteria(self.lang.get(), r), &[], &[]), captures)
             }
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
             Err(e) => {
                 // O erro pode passar do teto de um param: vai inteiro no texto, depois da frase fixa.
-                self.final_notice(
-                    format!("Verificação final indisponível; concluindo sem ela.\n{e}"),
-                    "final.unavailable",
-                    &[],
-                );
+                self.final_notice("final.unavailable", &[], Some(&e.to_string()));
                 return Ok(FinalStep::Complete);
             }
         };
@@ -3312,23 +3388,15 @@ impl TaskRunner {
             .collect();
         let detail = if unmet.is_empty() { result.summary.clone() } else { unmet.join("\n") };
         if tasks.iter().any(is_final_fix) {
-            self.final_notice(
-                format!(
-                    "AVISO: a verificação final ainda aponta critérios não atendidos após a rodada de correção; a spec será concluída assim mesmo.\n{detail}"
-                ),
-                "final.still_unmet",
-                &[],
-            );
+            self.final_notice("final.still_unmet", &[], Some(&detail));
             return Ok(FinalStep::Complete);
         }
         if let Some(gate) = &self.final_gate {
-            let reason = format!("Verificação final: {met} de {total} critérios atendidos. Criar tarefa de correção?\n{detail}");
+            let (met, total) = (met.to_string(), total.to_string());
+            let question = i18n::tr(self.lang.get(), "runner.final_fix.reason", &[("met", &met), ("total", &total)]);
+            let reason = format!("{question}\n{detail}");
             if !gate.approve_fix(spec_id, &reason).await {
-                self.final_notice(
-                    format!("AVISO: tarefa de correção recusada; a spec será concluída com critérios não atendidos.\n{detail}"),
-                    "final.fix_refused",
-                    &[],
-                );
+                self.final_notice("final.fix_refused", &[], Some(&detail));
                 return Ok(FinalStep::Complete);
             }
         }
@@ -3345,7 +3413,12 @@ impl TaskRunner {
                 scope.push(g.clone());
             }
         }
-        let title = final_fix_title(self.lang.get());
+        let lang = self.lang.get();
+        let title = final_fix_title(lang);
+        // Os cabeçalhos `## Objetivo` e `## Critérios de Aceitação` são lidos pelo parser da tarefa
+        // (`section_text`) e ficam fixos; o texto livre sai no idioma do projeto (spec 115 T04).
+        let goal = i18n::text(lang, "runner.final_fix.objective");
+        let reference = i18n::text(lang, "runner.final_fix.reference_heading");
         let fix = Task {
             frontmatter: crate::sdd::TaskMeta {
                 id: id.clone(),
@@ -3367,19 +3440,16 @@ impl TaskRunner {
                 test_evidence: None,
                 test_run: None,
                 next_action: Some("aguardando developer".into()),
+                next_action_code: None,
                 diff_lines: Vec::new(),
                 kind: Some(crate::sdd::TASK_KIND_FINAL_FIX.into()),
             },
             body: format!(
-                "## Objetivo\nCorrigir os critérios globais não atendidos apontados pela verificação final.\n\n## Critérios de Aceitação\n{detail}\n\n## Critérios globais (referência)\n{criteria}\n{fail_tail}"
+                "## {OBJECTIVE}\n{goal}\n\n## {ACCEPTANCE}\n{detail}\n\n## {reference}\n{criteria}\n{fail_tail}"
             ),
         };
         self.write_guarded(&self.task_path(spec_id, &id), &fix.render()?)?;
-        self.final_notice(
-            format!("Verificação final: criada a tarefa {id} ({title}) para os critérios não atendidos."),
-            "final.fix_created",
-            &[("task", &id), ("title", &title)],
-        );
+        self.final_notice("final.fix_created", &[("task", &id), ("title", &title)], None);
         self.events.emit(RunnerEvent::TaskUpdated {
             spec_id: spec_id.to_string(),
             task_id: id,
@@ -3458,16 +3528,17 @@ impl TaskRunner {
         let test_text = match self.run_tracked(settings, root, &settings.test_command, true, None, WHERE, "FINAL", 1).await {
             Ok(t) => {
                 test_mark = if t.passed { "✓" } else { "✗" }.to_string();
-                let status = if t.passed { "passou" } else { "FALHOU" };
+                let key = if t.passed { "runner.final_base.tests_passed" } else { "runner.final_base.tests_failed" };
                 let code = t.exit_code.map_or("?".to_string(), |c| c.to_string());
                 let tail = self.scrub(tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES));
                 if !t.passed {
-                    fail_tail.push_str(&format!("\n## Saída dos testes na base\n```\n{tail}\n```\n"));
+                    let heading = i18n::text(lang, "runner.final_base.tests_output_heading");
+                    fail_tail.push_str(&format!("\n## {heading}\n```\n{tail}\n```\n"));
                 }
-                format!("$ {command}\nTestes na base exit={code} {status}:\n{tail}\n")
+                format!("$ {command}\n{}:\n{tail}\n", i18n::tr(lang, key, &[("code", &code)]))
             }
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
-            Err(e) => format!("$ {command}\nTestes na base: não executado: {e}\n"),
+            Err(e) => format!("$ {command}\n{}\n", i18n::tr(lang, "runner.final_base.tests_not_run", &[("error", &e.to_string())])),
         };
         let mut outcomes = Vec::with_capacity(settings.checks.len());
         let mut not_run = Vec::new();
@@ -3487,7 +3558,8 @@ impl TaskRunner {
                 Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
                 Err(e) => {
                     not_run_names.push(i18n::tr(lang, "runner.checks.not_run", &[("name", &check.name)]));
-                    not_run.push(format!("### {} - não executado: {e}\n$ {}", check.name, self.scrub(&check.command)));
+                    let line = i18n::tr(lang, "runner.final_base.check_not_run", &[("name", &check.name), ("error", &e.to_string())]);
+                    not_run.push(format!("### {line}\n$ {}", self.scrub(&check.command)));
                 }
             }
         }
@@ -3515,7 +3587,8 @@ impl TaskRunner {
         });
         for o in outcomes.iter().filter(|o| !o.passed) {
             let tail = self.scrub(tail_bytes(o.output.trim_end(), CHECK_TAIL_BYTES));
-            fail_tail.push_str(&format!("\n## Saída da checagem {} na base\n```\n{tail}\n```\n", o.name));
+            let heading = i18n::tr(lang, "runner.final_base.check_output_heading", &[("name", &o.name)]);
+            fail_tail.push_str(&format!("\n## {heading}\n```\n{tail}\n```\n"));
         }
         let mut sections = Vec::new();
         if !outcomes.is_empty() {
@@ -3580,6 +3653,7 @@ impl TaskRunner {
             task.frontmatter.attempts = 0;
             task.frontmatter.rejected_sha = None;
             task.frontmatter.next_action = None;
+            task.frontmatter.next_action_code = None;
         }
         self.persist(&task)?;
         Ok(n)
@@ -3630,6 +3704,7 @@ impl TaskRunner {
         task.frontmatter.attempts = 0;
         task.frontmatter.rejected_sha = None;
         task.frontmatter.next_action = None;
+        task.frontmatter.next_action_code = None;
         self.persist(&task)?;
         Ok(n)
     }
@@ -3643,6 +3718,7 @@ impl TaskRunner {
     ) -> Result<(), RunnerError> {
         task.frontmatter.status = status;
         task.frontmatter.next_action = Some(next_action.to_string());
+        task.frontmatter.next_action_code = None;
         self.persist(task)
     }
 
@@ -3775,12 +3851,14 @@ fn raw_read(path: &Path) -> Result<String, RunnerError> {
     })
 }
 
-/// Motivo registrado para uma tarefa BLOCKED.
-fn reason_of(task: &Task) -> String {
+/// Motivo registrado para uma tarefa BLOCKED: o texto gravado, no idioma em que foi gravado
+/// (inclusive o pt-BR das tarefas antigas), ou, sem ele, o motivo genérico no idioma do projeto.
+fn reason_of(task: &Task, lang: Lang) -> String {
     task.frontmatter
         .next_action
         .clone()
-        .unwrap_or_else(|| "tarefa BLOCKED".to_string())
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| BlockReason::new(lang, "blocked", &[]).text)
 }
 
 /// Instante em RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`, segundos truncados).
@@ -3829,6 +3907,7 @@ fn commit_pending(
     spec_id: &str,
     task_id: &str,
     branch: &str,
+    lang: Lang,
 ) -> Result<(), RunnerError> {
     if same_path(wt, root) || !wt.join(".git").exists() {
         return Err(RunnerError::Invalid(format!(
@@ -3845,7 +3924,7 @@ fn commit_pending(
     }
     if !wt_git.is_clean()? {
         wt_git.add_all()?;
-        wt_git.commit(&format!("chore({spec_id}): {task_id} - alterações do desenvolvedor"))?;
+        wt_git.commit(&i18n::commit_subject(lang, &format!("chore({spec_id}): {task_id} - "), "commit.developer_changes"))?;
     }
     Ok(())
 }
@@ -4649,6 +4728,7 @@ mod tests {
                 test_evidence: None,
                 test_run: None,
                 next_action: None,
+                next_action_code: None,
                 diff_lines: Vec::new(),
                 kind: None,
             },
@@ -5278,12 +5358,12 @@ mod tests {
             CriterionCheck { criterion: "a".into(), met: true, evidence: "t1".into() },
             CriterionCheck { criterion: "b".into(), met: false, evidence: String::new() },
         ];
-        let out = enforce_criteria(r.clone());
+        let out = enforce_criteria(Lang::PtBr, r.clone());
         assert_eq!(out.verdict, Verdict::ChangesRequested);
         assert_eq!(out.findings.len(), 1);
         assert!(out.findings[0].description.contains("b"));
         r.criteria.pop();
-        assert_eq!(enforce_criteria(r).verdict, Verdict::Approved);
+        assert_eq!(enforce_criteria(Lang::PtBr, r).verdict, Verdict::Approved);
         assert_eq!(render_criteria(&out.criteria), "✓ a: t1\n✗ b");
     }
 
@@ -5294,7 +5374,7 @@ mod tests {
         assert!(!is_manual_criterion("1. node --test verde (manual não)"));
         let mut r = approved(vec![]);
         r.criteria = vec![CriterionCheck { criterion: "(manual) olhar no navegador".into(), met: false, evidence: String::new() }];
-        assert_eq!(enforce_criteria(r).verdict, Verdict::Approved);
+        assert_eq!(enforce_criteria(Lang::PtBr, r).verdict, Verdict::Approved);
         let marked = mark_manual_criteria("1. teste verde\n- [ ] (manual) ver no navegador");
         assert!(marked.contains(&format!("(manual) ver no navegador [{HUMAN_CHECK_MARK}]")), "{marked}");
         assert!(!marked.lines().next().unwrap_or("").contains(HUMAN_CHECK_MARK));
@@ -5434,12 +5514,12 @@ mod tests {
     #[test]
     fn converge_medium_inside_changed_hunk_blocks() {
         let r = rejected(vec![medium("F-02", "src/a.rs:12")]);
-        let out = converge(r, &[finding("F-01")], &[hunk("src/a.rs", 10, 15)]);
+        let out = converge(Lang::PtBr, r, &[finding("F-01")], &[hunk("src/a.rs", 10, 15)]);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         assert_eq!(out.result.findings.len(), 1);
         assert!(out.observations.is_empty());
         // faixa a-b que cruza o hunk
-        let out = converge(rejected(vec![medium("F-02", "src/a.rs:1-10")]), &[finding("F-01")], &[hunk("src/a.rs", 10, 15)]);
+        let out = converge(Lang::PtBr, rejected(vec![medium("F-02", "src/a.rs:1-10")]), &[finding("F-01")], &[hunk("src/a.rs", 10, 15)]);
         assert_eq!(out.result.findings.len(), 1);
     }
 
@@ -5447,20 +5527,20 @@ mod tests {
     fn converge_medium_in_same_file_as_previous_finding_blocks() {
         let mut prev = finding("F-01");
         prev.location = "src/a.rs:99".into();
-        let out = converge(rejected(vec![medium("F-02", "src/a.rs:3")]), &[prev], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, rejected(vec![medium("F-02", "src/a.rs:3")]), &[prev], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         assert_eq!(out.result.findings.len(), 1);
     }
 
     #[test]
     fn converge_medium_on_untouched_file_becomes_observation_and_promotes() {
-        let out = converge(rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::Approved);
         assert!(out.result.findings.is_empty());
         assert_eq!(out.observations, vec![medium("F-02", "src/b.rs:3")]);
         assert!(out.result.summary.contains("viraram observações"), "{}", out.result.summary);
         // mesmo arquivo, mas fora das linhas alteradas e sem finding anterior nele
-        let out = converge(rejected(vec![medium("F-02", "src/z.rs:500")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, rejected(vec![medium("F-02", "src/z.rs:500")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::Approved);
     }
 
@@ -5468,13 +5548,13 @@ mod tests {
     fn converge_high_and_unlocated_findings_always_block() {
         let mut high = finding("F-02");
         high.location = "src/untouched.rs:1".into();
-        let out = converge(rejected(vec![high, medium("F-03", "src/b.rs:3")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, rejected(vec![high, medium("F-03", "src/b.rs:3")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         // Spec 082: com um bloqueante sobrando, nada é rebaixado (o caso da T04 do Test 04).
         let ids: Vec<&str> = out.result.findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["F-02", "F-03"], "os dois bloqueiam, na ordem original");
         assert!(out.observations.is_empty());
-        let out = converge(rejected(vec![medium("F-04", "estrutura geral do módulo")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, rejected(vec![medium("F-04", "estrutura geral do módulo")]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         assert_eq!(out.result.findings.len(), 1);
     }
@@ -5483,21 +5563,21 @@ mod tests {
     fn converge_unmet_criterion_prevents_promotion() {
         let mut r = rejected(vec![medium("F-02", "src/b.rs:3")]);
         r.criteria = vec![met("c1", false)];
-        let out = converge(r, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, r, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         // Spec 082: critério `not_met` mantém o MEDIUM bloqueante (o caso da T02 do Test 04).
         assert_eq!(out.result.findings, vec![medium("F-02", "src/b.rs:3")]);
         assert!(out.observations.is_empty());
         let mut manual = rejected(vec![medium("F-02", "src/b.rs:3")]);
         manual.criteria = vec![met("(manual) olhar no navegador", false)];
-        assert_eq!(converge(manual, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]).result.verdict, Verdict::Approved);
+        assert_eq!(converge(Lang::PtBr, manual, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]).result.verdict, Verdict::Approved);
     }
 
     #[test]
     fn converge_medium_outside_hunks_with_unmet_criterion_keeps_blocking() {
         let mut r = rejected(vec![medium("F-02", "src/b.rs:3"), medium("F-03", "src/c.rs:9")]);
         r.criteria = vec![met("c1", true), met("c2", false)];
-        let out = converge(r.clone(), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, r.clone(), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result, r, "nada é rebaixado quando não leva à aprovação");
         assert!(out.observations.is_empty());
     }
@@ -5506,7 +5586,7 @@ mod tests {
     fn converge_high_plus_medium_outside_hunks_both_block() {
         let high = Finding { location: "src/z.rs:1".into(), ..finding("F-05") };
         let r = rejected(vec![medium("F-06", "src/b.rs:3"), high]);
-        let out = converge(r.clone(), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, r.clone(), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
     }
@@ -5515,7 +5595,7 @@ mod tests {
     fn converge_only_medium_outside_hunks_without_unmet_approves_with_observations() {
         let mut r = rejected(vec![medium("F-02", "src/b.rs:3"), medium("F-03", "src/c.rs:9")]);
         r.criteria = vec![met("c1", true)];
-        let out = converge(r, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+        let out = converge(Lang::PtBr, r, &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
         assert_eq!(out.result.verdict, Verdict::Approved);
         assert!(out.result.findings.is_empty());
         assert_eq!(out.observations, vec![medium("F-02", "src/b.rs:3"), medium("F-03", "src/c.rs:9")]);
@@ -5525,7 +5605,7 @@ mod tests {
     #[test]
     fn converge_without_hunks_never_demotes_even_with_previous_findings() {
         let r = rejected(vec![medium("F-02", "src/b.rs:3")]);
-        let out = converge(r.clone(), &[finding("F-01")], &[]);
+        let out = converge(Lang::PtBr, r.clone(), &[finding("F-01")], &[]);
         assert_eq!(out.result, r, "veredito e findings inalterados");
         assert!(out.observations.is_empty());
     }
@@ -5534,7 +5614,7 @@ mod tests {
     fn locations_without_slash_need_a_line_suffix_to_count_as_path() {
         for loc in ["critério 2.1", "v1.2", "obj.metodo", "Foo.bar", "Foo.bar e v1.2"] {
             assert!(parse_locations(loc).is_empty(), "{loc}");
-            let out = converge(rejected(vec![medium("F-02", loc)]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
+            let out = converge(Lang::PtBr, rejected(vec![medium("F-02", loc)]), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]);
             assert_eq!(out.result.verdict, Verdict::ChangesRequested, "{loc}");
             assert_eq!(out.result.findings.len(), 1, "{loc}");
             assert!(out.observations.is_empty(), "{loc}");
@@ -5577,18 +5657,18 @@ mod tests {
     #[test]
     fn rereview_new_medium_on_unchanged_file_is_observation_and_approves() {
         let changed = files(&["src/z.rs"]);
-        let out = converge_with_files(rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[], Some(&changed), &yes);
         assert_eq!(out.result.verdict, Verdict::Approved);
         assert!(out.result.findings.is_empty());
         assert_eq!(out.observations, vec![labeled(medium("F-02", "src/b.rs:3"))]);
         assert!(out.result.summary.contains("não mudaram desde a revisão anterior"), "{}", out.result.summary);
         let low = Finding { severity: "LOW".into(), ..medium("F-03", "src/c.rs") };
-        let out = converge_with_files(rejected(vec![low.clone()]), &[finding("F-01")], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, rejected(vec![low.clone()]), &[finding("F-01")], &[], Some(&changed), &yes);
         assert_eq!(out.result.verdict, Verdict::Approved);
         assert_eq!(out.observations, vec![labeled(low)]);
         // Com um HIGH que continua bloqueando, o MEDIUM novo vira observação mesmo assim.
         let high = Finding { location: "src/z.rs:1".into(), ..finding("F-04") };
-        let out = converge_with_files(
+        let out = converge_with_files(Lang::PtBr, 
             rejected(vec![high.clone(), medium("F-05", "src/b.rs:3")]),
             &[finding("F-01")],
             &[hunk("src/z.rs", 1, 2)],
@@ -5601,7 +5681,7 @@ mod tests {
         // Critério não manual `not_met` continua bloqueando (como na 087/T05).
         let mut unmet = rejected(vec![medium("F-02", "src/b.rs:3")]);
         unmet.criteria = vec![met("c1", false)];
-        let out = converge_with_files(unmet, &[finding("F-01")], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, unmet, &[finding("F-01")], &[], Some(&changed), &yes);
         assert_eq!(out.result.verdict, Verdict::ChangesRequested);
         assert_eq!(out.result.findings[0].location, "critérios de aceitação");
         assert_eq!(out.observations.len(), 1);
@@ -5610,7 +5690,7 @@ mod tests {
     #[test]
     fn rereview_high_on_unchanged_file_blocks() {
         let r = rejected(vec![Finding { location: "src/b.rs:3".into(), ..finding("F-02") }]);
-        let out = converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&files(&["src/z.rs"])), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&files(&["src/z.rs"])), &yes);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
     }
@@ -5618,12 +5698,12 @@ mod tests {
     #[test]
     fn rereview_new_medium_on_changed_file_blocks() {
         let r = rejected(vec![medium("F-02", "./src/b.rs:3")]);
-        let out = converge_with_files(r.clone(), &[finding("F-01")], &[hunk("src/b.rs", 3, 3)], Some(&files(&["src/b.rs"])), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[hunk("src/b.rs", 3, 3)], Some(&files(&["src/b.rs"])), &yes);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
         // Vários caminhos: basta um alterado para bloquear.
         let r = rejected(vec![medium("F-02", "src/a.rs:1, src/b.rs:3")]);
-        let out = converge_with_files(r.clone(), &[finding("F-01")], &[hunk("src/b.rs", 3, 3)], Some(&files(&["src/b.rs"])), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[hunk("src/b.rs", 3, 3)], Some(&files(&["src/b.rs"])), &yes);
         assert_eq!(out.result, r);
     }
 
@@ -5632,20 +5712,20 @@ mod tests {
         let changed = files(&["src/z.rs"]);
         // Mesmo id.
         let r = rejected(vec![medium("F-01", "src/b.rs:3")]);
-        let out = converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
         assert_eq!(out.result, r);
         // Mesmo arquivo com descrição parecida (id renumerado).
         let prev = Finding { description: "Falta validar o campo email vazio".into(), ..medium("F-01", "src/b.rs:9") };
         let again = Finding { description: "Ainda falta validar o campo email quando vazio".into(), ..medium("F-03", "src/b.rs:12") };
         let r = rejected(vec![again]);
-        let out = converge_with_files(r.clone(), &[prev.clone()], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[prev.clone()], &[], Some(&changed), &yes);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
         // Arquivo do finding anterior que não mudou, com outra redação: o apontamento continua aberto
         // (F-01 da revisão): bloqueia, sem depender da similaridade do texto.
         let other = Finding { description: "Nome de variável enganoso no laço".into(), ..medium("F-03", "./src/b.rs:12") };
         let r = rejected(vec![other]);
-        let out = converge_with_files(r.clone(), &[prev], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[prev], &[], Some(&changed), &yes);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
     }
@@ -5666,17 +5746,17 @@ mod tests {
                 ..medium("F-02", "src/b.rs:3")
             };
             let r = rejected(vec![f]);
-            let out = converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
+            let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
             assert_eq!(out.result, r, "{desc} {rec} {scenario}");
             assert!(out.observations.is_empty());
         }
         // Nome ambíguo (dois alterados com o mesmo nome) ou só parecido não conta.
         let ambiguous = files(&["src/x/mod.rs", "src/y/mod.rs"]);
         let f = Finding { description: "Veja mod.rs e data.rs".into(), ..medium("F-02", "src/b.rs:3") };
-        let out = converge_with_files(rejected(vec![f]), &[finding("F-01")], &[], Some(&ambiguous), &yes);
+        let out = converge_with_files(Lang::PtBr, rejected(vec![f]), &[finding("F-01")], &[], Some(&ambiguous), &yes);
         assert_eq!(out.result.verdict, Verdict::Approved);
         let f = Finding { description: "Veja data.rs".into(), ..medium("F-02", "src/b.rs:3") };
-        let out = converge_with_files(rejected(vec![f]), &[finding("F-01")], &[], Some(&changed), &yes);
+        let out = converge_with_files(Lang::PtBr, rejected(vec![f]), &[finding("F-01")], &[], Some(&changed), &yes);
         assert_eq!(out.result.verdict, Verdict::Approved);
     }
 
@@ -5686,7 +5766,7 @@ mod tests {
         let changed = files(&["src/a.rs"]);
         let r = rejected(vec![medium("F-02", "tests/faltando_test.rs:1")]);
         let exists = |p: &str| p != "tests/faltando_test.rs";
-        let out = converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&changed), &exists);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&changed), &exists);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
         // Checagem real na worktree: existente rebaixa; ausente, `..` ou worktree inexistente não.
@@ -5698,10 +5778,10 @@ mod tests {
         assert!(!file_in_worktree(&dir, "../src/b.rs") && !file_in_worktree(&dir, "/etc/passwd"));
         assert!(!file_in_worktree(&dir.join("sumiu"), "src/b.rs"));
         let real = |p: &str| file_in_worktree(&dir, p);
-        let out = converge_with_files(rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[], Some(&changed), &real);
+        let out = converge_with_files(Lang::PtBr, rejected(vec![medium("F-02", "src/b.rs:3")]), &[finding("F-01")], &[], Some(&changed), &real);
         assert_eq!(out.result.verdict, Verdict::Approved);
         let r = rejected(vec![medium("F-02", "src/nao.rs:3")]);
-        assert_eq!(converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&changed), &real).result, r);
+        assert_eq!(converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&changed), &real).result, r);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5710,7 +5790,7 @@ mod tests {
         let changed = files(&["src/z.rs"]);
         for loc in ["estrutura geral do módulo", "captura t01-1-home.png", "public/img/hero.webp", "referência a.png × captura b.png"] {
             let r = rejected(vec![medium("F-02", loc)]);
-            let out = converge_with_files(r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
+            let out = converge_with_files(Lang::PtBr, r.clone(), &[finding("F-01")], &[], Some(&changed), &yes);
             assert_eq!(out.result, r, "{loc}");
             assert!(out.observations.is_empty(), "{loc}");
         }
@@ -5720,7 +5800,7 @@ mod tests {
     fn first_review_never_demotes_by_unchanged_file() {
         // 1ª revisão: sem `rejected_sha` não há lista de arquivos alterados.
         let r = rejected(vec![medium("F-01", "src/b.rs:3")]);
-        let out = converge_with_files(r.clone(), &[], &[], None, &yes);
+        let out = converge_with_files(Lang::PtBr, r.clone(), &[], &[], None, &yes);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
     }
@@ -5737,10 +5817,10 @@ mod tests {
     #[test]
     fn converge_first_review_is_unchanged_and_approved_findings_become_observations() {
         let r = rejected(vec![medium("F-01", "src/b.rs:3"), finding("F-02")]);
-        let out = converge(r.clone(), &[], &[]);
+        let out = converge(Lang::PtBr, r.clone(), &[], &[]);
         assert_eq!(out.result, r);
         assert!(out.observations.is_empty());
-        let out = converge(approved(vec![medium("F-01", "src/b.rs:3")]), &[], &[]);
+        let out = converge(Lang::PtBr, approved(vec![medium("F-01", "src/b.rs:3")]), &[], &[]);
         assert_eq!(out.result.verdict, Verdict::Approved);
         assert!(out.result.findings.is_empty());
         assert_eq!(out.observations, vec![medium("F-01", "src/b.rs:3")]);
@@ -6049,17 +6129,86 @@ mod tests {
         assert_eq!(list.last(), Some(&(MAX_DIFF_LINES_ENTRIES as u64 + 4)));
     }
 
+    /// Spec 115 T03: avisos da tarefa com o texto de reserva `system.<code>` do idioma do projeto.
+    #[test]
+    fn task_notices_use_the_system_text_of_each_language() {
+        let cleanup = TaskWarning::Cleanup { path: "/w".into(), error: "e".into() };
+        let ownership = TaskWarning::Ownership { path: "/w".into(), error: "e".into() };
+        let (pt, code, params) = cleanup.notice(Lang::PtBr);
+        assert_eq!(code, "task.cleanup_failed");
+        assert_eq!(params, notice_params(&[("path", "/w"), ("error", "e")]));
+        assert!(pt.starts_with("Aviso: não consegui apagar a worktree /w: e. A tarefa está integrada"), "{pt}");
+        let (en, _, _) = cleanup.notice(Lang::En);
+        assert!(en.starts_with("Warning: could not delete the worktree /w: e. The task is integrated"), "{en}");
+        let (pt, code, _) = ownership.notice(Lang::PtBr);
+        assert_eq!((pt.as_str(), code), ("Aviso: não consegui devolver a posse dos arquivos de /w: e", "task.ownership_failed"));
+        let (en, _, _) = ownership.notice(Lang::En);
+        assert_eq!(en, "Warning: could not give back ownership of the files in /w: e");
+        let dirty = |lang| system_text(lang, "task.worktree_dirty", &[("task", "T01"), ("path", "/w")]);
+        assert!(dirty(Lang::PtBr).starts_with("Tarefa T01 bloqueada: a worktree /w tem alterações"));
+        assert!(dirty(Lang::En).starts_with("Task T01 blocked: the worktree /w has uncommitted changes"));
+        assert_no_pt(&[dirty(Lang::En), en]);
+    }
+
+    /// Spec 115 T03: findings gerados e notas da convergência no idioma do projeto; o local gerado
+    /// nunca parece um caminho, nos dois idiomas.
+    #[test]
+    fn generated_findings_and_convergence_notes_follow_the_project_language() {
+        let unmet = |evidence: &str| ReviewResult {
+            criteria: vec![CriterionCheck { criterion: "c1".into(), met: false, evidence: evidence.into() }],
+            ..approved(vec![])
+        };
+        for (lang, evidence, location, description, recommendation) in [
+            (Lang::PtBr, "", "critérios de aceitação", "Critério não atendido: c1. Evidência: (nenhuma)", "Atender o critério com código e teste que o exercitem"),
+            (Lang::En, "seen", "acceptance criteria", "Criterion not met: c1. Evidence: seen", "Meet the criterion with code and a test that exercises it"),
+        ] {
+            let out = enforce_criteria(lang, unmet(evidence));
+            assert_eq!(out.verdict, Verdict::ChangesRequested);
+            let f = &out.findings[0];
+            assert_eq!((f.location.as_str(), f.description.as_str(), f.recommendation.as_str()), (location, description, recommendation));
+            assert!(parse_locations(&f.location).is_empty(), "{lang:?}");
+        }
+        let low = || Finding { confidence: Confidence::Low, ..finding("F-01") };
+        let untouched = || rejected(vec![medium("F-02", "src/b.rs:3")]);
+        let changed = vec!["src/z.rs".to_string()];
+        let yes = |_: &str| true;
+        for (lang, low_note, untouched_note, unchanged_note) in [
+            (
+                Lang::PtBr,
+                "(findings de baixa confiança viraram observações.)",
+                "(findings MEDIUM sobre código não alterado desde a última reprovação viraram observações.)",
+                "(findings novos em arquivos que não mudaram desde a revisão anterior viraram observações.)",
+            ),
+            (
+                Lang::En,
+                "(low confidence findings became observations.)",
+                "(MEDIUM findings on code unchanged since the last rejection became observations.)",
+                "(new findings in files that did not change since the previous review became observations.)",
+            ),
+        ] {
+            let summary = converge(lang, rejected(vec![low()]), &[], &[]).result.summary;
+            assert!(summary.ends_with(low_note), "{summary}");
+            let summary = converge(lang, untouched(), &[finding("F-01")], &[hunk("src/z.rs", 1, 2)]).result.summary;
+            assert!(summary.ends_with(untouched_note), "{summary}");
+            let summary = converge_with_files(lang, untouched(), &[finding("F-01")], &[], Some(&changed), &yes).result.summary;
+            assert!(summary.ends_with(unchanged_note), "{summary}");
+            if lang == Lang::En {
+                assert_no_pt(&[summary]);
+            }
+        }
+    }
+
     #[test]
     fn low_confidence_findings_do_not_block_even_in_first_review() {
         let low = Finding { confidence: Confidence::Low, ..finding("F-01") };
-        let Converged { result, observations } = converge(rejected(vec![low.clone()]), &[], &[]);
+        let Converged { result, observations } = converge(Lang::PtBr, rejected(vec![low.clone()]), &[], &[]);
         assert_eq!(result.verdict, Verdict::Approved);
         assert!(result.findings.is_empty());
         assert!(result.summary.contains("baixa confiança"), "{}", result.summary);
         assert_eq!(observations, vec![low.clone()]);
 
         // Com outro finding bloqueante, a reprovação segue só com ele; o low vira observação.
-        let Converged { result, observations } = converge(rejected(vec![low.clone(), finding("F-02")]), &[], &[]);
+        let Converged { result, observations } = converge(Lang::PtBr, rejected(vec![low.clone(), finding("F-02")]), &[], &[]);
         assert_eq!(result.verdict, Verdict::ChangesRequested);
         assert_eq!(result.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02"]);
         assert_eq!(observations, vec![low.clone()]);
@@ -6067,7 +6216,7 @@ mod tests {
         // Critério not_met continua bloqueando, com finding gerado.
         let mut with_unmet = rejected(vec![low.clone()]);
         with_unmet.criteria = vec![met("c1", false)];
-        let Converged { result, observations } = converge(with_unmet, &[], &[]);
+        let Converged { result, observations } = converge(Lang::PtBr, with_unmet, &[], &[]);
         assert_eq!(result.verdict, Verdict::ChangesRequested);
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].location, "critérios de aceitação");
@@ -6467,10 +6616,36 @@ mod tests {
         assert!(rev.inputs().is_empty());
     }
 
+    /// Spec 115 T04: no modo Docker, a marca de tempo limite da saída dos testes sai no idioma do
+    /// projeto (o executor do Compose devolve a saída crua e o `timed_out`).
+    #[tokio::test]
+    async fn docker_timeout_mark_follows_the_project_language() {
+        use crate::harness::compose::fake::FakeRunner;
+        let secs = TEST_TIMEOUT.as_secs();
+        for (lang, name, mark) in [
+            (Lang::En, "docker-timeout-en", format!("[time limit of {secs}s exceeded]")),
+            (Lang::PtBr, "docker-timeout-pt", format!("[tempo limite de {secs}s excedido]")),
+        ] {
+            let fx = Fixture::new(name, "make test");
+            enable_docker(&fx);
+            let fake = Arc::new(FakeRunner::default());
+            fake.reply_timeout("run", "compilando\n");
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let runner = fx
+                .runner(&dev, &rev, ScriptedTests::default(), &rec)
+                .with_compose(Arc::new(crate::harness::compose::fake::test_env(name, fake)))
+                .with_lang(i18n::SharedLang::new(lang));
+            let settings = read_settings(&fx.settings_path()).unwrap();
+            let out = runner.exec_cmd(&settings, &fx.repo, "make test", false).await.unwrap();
+            assert!(out.timed_out && !out.passed);
+            assert_eq!(out.output, format!("compilando\n\n{mark}\n"));
+        }
+    }
+
     struct Over;
 
     impl BudgetGuard for Over {
-        fn exceeded(&self, _spec: &str) -> Option<String> {
+        fn exceeded(&self, _spec: &str, _lang: crate::i18n::Lang) -> Option<String> {
             Some("orçamento da spec atingido: 10 de 5 tokens".into())
         }
     }
@@ -6491,7 +6666,7 @@ mod tests {
             .unwrap();
         assert_eq!(out, SpecOutcome::Completed);
         assert!(rev.inputs().iter().all(|i| i.task_id != "FINAL"));
-        assert!(rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { text, code, .. } if code == "final.skipped" && text.contains("verificação final não executada: orçamento"))));
+        assert!(rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { text, code, params, .. } if code == "final.skipped" && text.starts_with("AVISO: verificação final não executada porque o orçamento") && params.contains_key("reason"))));
     }
 
     #[tokio::test]
@@ -6665,6 +6840,45 @@ mod tests {
         }
     }
 
+    /// Spec 115 T04 (C-09): o commit do Nants na branch da tarefa mantém o prefixo convencional e
+    /// leva o texto no idioma do projeto; só o `feat(<spec>): Txx - ` marca o DONE.
+    #[test]
+    fn developer_commit_keeps_the_prefix_and_follows_the_project_language() {
+        for (lang, name, text) in [
+            (crate::i18n::Lang::En, "dev-commit-en", "developer changes"),
+            (crate::i18n::Lang::PtBr, "dev-commit-pt", "alterações do desenvolvedor"),
+        ] {
+            let fx = Fixture::new(name, "true");
+            let wt = fx.repo.with_file_name("wt");
+            git_in(&fx.repo, &["worktree", "add", "-q", "-b", "sdd/s1/T01", wt.to_str().unwrap()]);
+            fs::write(wt.join("novo.txt"), "x\n").unwrap();
+            commit_pending(&wt, &fx.repo, SPEC, "T01", "sdd/s1/T01", lang).unwrap();
+            let subject = git_in(&wt, &["log", "-1", "--format=%s"]);
+            assert_eq!(subject, format!("chore(s1): T01 - {text}"));
+            assert!(!is_task_commit(&subject, SPEC, "T01"), "commit da branch não marca DONE");
+        }
+    }
+
+    /// Spec 115 T04 (C-09): em projeto en, a tarefa termina DONE pelo commit `feat(<spec>): Txx - `.
+    #[tokio::test]
+    async fn done_is_detected_by_the_feat_prefix_in_an_english_project() {
+        let en = formatter_texts_in(crate::i18n::Lang::En, "done-prefix-en").await;
+        assert!(!en.is_empty());
+        let root = env::temp_dir().join(format!("nants-runner-{}-done-prefix-en", process::id())).join("repo");
+        let subject = git_in(&root, &["log", "-1", "--format=%s", "main"]);
+        assert!(subject.starts_with("feat(s1): T01 - "), "{subject}");
+        assert!(is_integrated(&Git::new(root.clone()), "main", SPEC, "T01").unwrap());
+        // A branch da tarefa (já apagada) levou os commits com o prefixo e o texto em inglês.
+        let lost = git_in(&root, &["fsck", "--unreachable", "--no-reflogs"]);
+        let subjects: Vec<String> = lost
+            .lines()
+            .filter_map(|l| l.strip_prefix("unreachable commit "))
+            .map(|sha| git_in(&root, &["log", "-1", "--format=%s", sha.trim()]))
+            .collect();
+        assert!(subjects.iter().any(|l| l == "style(s1): T01 - automatic formatting"), "{subjects:?}");
+        assert!(subjects.iter().any(|l| l == "chore(s1): T01 - developer changes"), "{subjects:?}");
+    }
+
     /// Formatador que aplica, um que sai 3 e um que estoura o tempo, no idioma pedido; devolve as
     /// mensagens `tests`.
     async fn formatter_texts_in(lang: crate::i18n::Lang, name: &str) -> Vec<String> {
@@ -6696,12 +6910,12 @@ mod tests {
         let pt = formatter_texts_in(crate::i18n::Lang::PtBr, "fmt-idioma-pt").await;
         assert!(pt.iter().any(|t| t.starts_with("formatação automática (boom) falhou (não bloqueia): saída 3: ") && t.contains("oops-text")), "{pt:?}");
         assert!(pt.contains(&"formatação automática (slow) falhou (não bloqueia): tempo esgotado".to_string()), "{pt:?}");
-        assert!(pt.contains(&"formatação automática: 1 arquivos (web)".to_string()), "{pt:?}");
+        assert!(pt.contains(&"formatação automática: 1 arquivo (web)".to_string()), "{pt:?}");
 
         let en = formatter_texts_in(crate::i18n::Lang::En, "fmt-idioma-en").await;
         assert!(en.iter().any(|t| t.starts_with("automatic formatting (boom) failed (does not block): exit 3: ") && t.contains("oops-text")), "{en:?}");
         assert!(en.contains(&"automatic formatting (slow) failed (does not block): timed out".to_string()), "{en:?}");
-        assert!(en.contains(&"automatic formatting: 1 files (web)".to_string()), "{en:?}");
+        assert!(en.contains(&"automatic formatting: 1 file (web)".to_string()), "{en:?}");
         assert_no_pt(&en);
         assert_eq!(i18n::tr(crate::i18n::Lang::En, "runner.format.failed", &[("why", "x")]), "automatic formatting failed (does not block): x");
         assert_eq!(i18n::tr(crate::i18n::Lang::PtBr, "runner.format.failed", &[("why", "x")]), "formatação automática falhou (não bloqueia): x");
@@ -6787,7 +7001,7 @@ mod tests {
         let _ = fs::remove_file(&marker);
         assert_eq!(fs::read_to_string(fx.repo.join("web/a.txt")).unwrap(), "ABC\n", "mudança da 1ª execução fica");
         assert!(texts.iter().all(|t| !t.contains("falhou")), "{texts:?}");
-        assert!(texts.contains(&"formatação automática: 1 arquivos (flaky)".to_string()), "{texts:?}");
+        assert!(texts.contains(&"formatação automática: 1 arquivo (flaky)".to_string()), "{texts:?}");
         assert_eq!(subjects[0], "style(s1): T01 - formatação automática");
     }
 
@@ -8006,7 +8220,7 @@ mod tests {
         if met {
             ReviewResult { criteria: c, ..approved(vec![]) }
         } else {
-            enforce_criteria(ReviewResult { criteria: c, ..approved(vec![]) })
+            enforce_criteria(Lang::PtBr, ReviewResult { criteria: c, ..approved(vec![]) })
         }
     }
 
@@ -8349,7 +8563,7 @@ mod tests {
                 return approved(vec![]);
             }
             let c = vec![CriterionCheck { criterion: "tudo funciona".into(), met: false, evidence: evidence.clone() }];
-            enforce_criteria(ReviewResult { criteria: c, ..approved(vec![]) })
+            enforce_criteria(Lang::PtBr, ReviewResult { criteria: c, ..approved(vec![]) })
         });
         let gate = Arc::new(Gate(false, Default::default()));
         let out = fx
@@ -8556,14 +8770,43 @@ mod tests {
         assert_eq!(fix.frontmatter.kind.as_deref(), Some(crate::sdd::TASK_KIND_FINAL_FIX));
         let raw = std::fs::read_to_string(fx.task_path("T02")).unwrap();
         assert!(raw.contains("kind:") && raw.contains("final_fix"), "{raw}");
+        // Spec 115 T04 (C-07): os cabeçalhos lidos pelo parser ficam fixos; o texto livre segue o
+        // idioma do projeto.
+        let goal = i18n::text(lang, "runner.final_fix.objective");
+        let reference = i18n::text(lang, "runner.final_fix.reference_heading");
+        assert!(section_text(&fix.body, OBJECTIVE).is_some_and(|s| s.trim() == goal), "{}", fix.body);
+        assert!(section_text(&fix.body, ACCEPTANCE).is_some(), "{}", fix.body);
+        assert!(fix.body.contains(&format!("\n## {reference}\n")), "{}", fix.body);
+        // O que vai ao Revisor na verificação final: a linha de cada tarefa no idioma do projeto.
+        let final_input = rev.inputs().into_iter().find(|i| i.task_id == "FINAL").expect("FINAL");
+        let at = if lang == crate::i18n::Lang::En { "` exit=0 at " } else { "` exit=0 em " };
+        assert!(final_input.test_output.contains(at), "{}", final_input.test_output);
+        if lang == crate::i18n::Lang::En {
+            assert_no_pt(&[goal, reference]);
+        }
+        // Spec 115 T03: o texto de reserva é o `system.<code>` do idioma do projeto.
+        let created = i18n::tr(lang, "system.final.fix_created", &[("task", "T02"), ("title", expected)]);
         assert!(rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { text, code, params, .. }
             if code == "final.fix_created"
                 && params.get("title") == Some(&serde_json::Value::from(expected))
-                && text.contains(&format!("({expected})")))));
+                && text == created)));
         // 2ª rodada reconhecida pela marca: nenhuma nova tarefa, e a falha vira aviso.
         assert!(!fx.task_path("T03").exists(), "no máximo uma rodada de correção");
         assert_eq!(rev.inputs().iter().filter(|i| i.task_id == "FINAL").count(), 2);
-        assert!(rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { code, .. } if code == "final.still_unmet")));
+        let still = format!("{}\n", i18n::text(lang, "system.final.still_unmet"));
+        let unmet: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RunnerEvent::SystemNotice { text, code, .. } if code == "final.still_unmet" => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unmet.len(), 1);
+        assert!(unmet[0].starts_with(&still) && unmet[0].contains("tudo funciona"), "{}", unmet[0]);
+        if lang == crate::i18n::Lang::En {
+            assert_no_pt(&[created, still]);
+        }
     }
 
     #[tokio::test]
@@ -8574,6 +8817,137 @@ mod tests {
     #[tokio::test]
     async fn final_fix_task_title_follows_project_language_pt_br() {
         final_fix_created_in(crate::i18n::Lang::PtBr, "final-fix-pt", "Correção da verificação final").await;
+    }
+
+    /// Portão que registra a pergunta recebida (spec 114 T02).
+    #[derive(Default)]
+    struct AskedGate(Mutex<Vec<String>>);
+    impl FinalGate for AskedGate {
+        fn approve_fix<'a>(&'a self, _spec_id: &'a str, reason: &'a str) -> Fut<'a, bool> {
+            self.0.lock().unwrap().push(reason.to_string());
+            Box::pin(async { false })
+        }
+    }
+
+    async fn final_fix_question_in(lang: crate::i18n::Lang, name: &str) -> String {
+        let fx = Fixture::new(name, "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = FakeReviewer::new(|_, i| if i.task_id == "FINAL" { matrix(false) } else { approved(vec![]) });
+        let gate = Arc::new(AskedGate::default());
+        let out = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_lang(crate::i18n::SharedLang::new(lang))
+            .with_final_gate(gate.clone())
+            .run_spec(SPEC)
+            .await
+            .unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        let asked = gate.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        asked[0].clone()
+    }
+
+    /// Spec 114 T02 (achado 11): a pergunta da verificação final sai no idioma do projeto; o
+    /// detalhe (critério e evidência do Revisor) é conteúdo e vem como está.
+    #[tokio::test]
+    async fn final_fix_question_follows_project_language() {
+        let en = final_fix_question_in(crate::i18n::Lang::En, "final-ask-en").await;
+        let first = en.lines().next().unwrap_or_default().to_string();
+        assert_eq!(first, "Final verification: 0 of 1 criteria met. Create a fix task?", "{en}");
+        assert_no_pt(&[first]);
+        assert!(en.contains("- tudo funciona"), "{en}");
+        let pt = final_fix_question_in(crate::i18n::Lang::PtBr, "final-ask-pt").await;
+        assert!(pt.starts_with("Verificação final: 0 de 1 critérios atendidos. Criar tarefa de correção?\n"), "{pt}");
+    }
+
+    /// Spec 114 T02 (achado 8): o motivo do bloqueio grava o código estável e o texto no idioma
+    /// do projeto, nos dois idiomas.
+    #[tokio::test]
+    async fn block_reason_has_stable_code_and_project_language_text() {
+        for (lang, name, expected) in [
+            (crate::i18n::Lang::En, "bloqueio-en", "3 reviewer rejections"),
+            (crate::i18n::Lang::PtBr, "bloqueio-pt", "3 reprovações do revisor"),
+        ] {
+            let fx = Fixture::new(name, "true");
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let (dev, rec) = (FakeDev::default(), Recorder::default());
+            let rev = FakeReviewer::new(|_, _| rejected(vec![finding("F-01")]));
+            let out = fx
+                .runner(&dev, &rev, ScriptedTests::default(), &rec)
+                .with_lang(crate::i18n::SharedLang::new(lang))
+                .run_task(SPEC, "T01")
+                .await
+                .unwrap();
+            assert!(matches!(&out, Outcome::Blocked { reason, .. } if reason == expected), "{out:?}");
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.next_action.as_deref(), Some(expected));
+            assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"));
+            let raw = std::fs::read_to_string(fx.task_path("T01")).unwrap();
+            assert!(raw.contains("next_action_code:") && raw.contains("rejections"), "{raw}");
+            if lang == crate::i18n::Lang::En {
+                assert_no_pt(&[expected.to_string()]);
+            }
+        }
+    }
+
+    /// Spec 114 T02: tarefa BLOCKED antiga (motivo em pt-BR, sem código) continua lida e exibida
+    /// como está, mesmo com o projeto em en; sem motivo, o genérico sai no idioma do projeto.
+    #[tokio::test]
+    async fn legacy_pt_block_reason_is_still_read() {
+        let fx = Fixture::new("bloqueio-legado", "true");
+        let mut old = task("T01", TaskStatus::Blocked, &[]);
+        old.frontmatter.next_action =
+            Some("impasse: o Desenvolvedor não alterou a branch desde a reprovação anterior (2 reprovações)".into());
+        fx.add_task(&old);
+        let mut bare = task("T02", TaskStatus::Blocked, &[]);
+        bare.frontmatter.next_action = None;
+        fx.add_task(&bare);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_lang(en());
+        let out = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(&out, Outcome::Blocked { reason, .. } if reason.starts_with("impasse: o Desenvolvedor")), "{out:?}");
+        assert_eq!(fx.read_task("T01").frontmatter.next_action_code, None, "o legado não ganha código inventado");
+        let out = runner.run_task(SPEC, "T02").await.unwrap();
+        assert!(matches!(&out, Outcome::Blocked { reason, .. } if reason == "task BLOCKED"), "{out:?}");
+    }
+
+    /// Spec 114 T02 (sentinela): todo código de bloqueio tem texto nos dois dicionários, o en sem
+    /// português e o pt-BR diferente do en; o revisado é reconhecido pelo código e pelo legado.
+    #[test]
+    fn every_block_code_has_both_languages_without_portuguese_in_english() {
+        use crate::i18n::lookup;
+        for code in BLOCK_CODES.iter().filter(|c| **c != "budget") {
+            let base = format!("runner.block.{code}");
+            // Com contagem, o texto vem no plural (spec 115 T01): as duas formas.
+            let keys: Vec<String> = if lookup(Lang::En, &format!("{base}.one")).is_some() {
+                vec![format!("{base}.one"), format!("{base}.other")]
+            } else {
+                vec![base]
+            };
+            for key in keys {
+                let en = lookup(Lang::En, &key).unwrap_or_else(|| panic!("sem en: {key}"));
+                let pt = lookup(Lang::PtBr, &key).unwrap_or_else(|| panic!("sem pt-BR: {key}"));
+                assert_ne!(en, pt, "{key}");
+                assert_no_pt(&[en.to_string()]);
+                assert!(!en.chars().any(|c| "ãõçáéíóúâêôà".contains(c)), "{key}: {en}");
+            }
+        }
+        assert_eq!(BlockReason::counted(Lang::En, "rejections", 1).text, "1 reviewer rejection");
+        assert_eq!(BlockReason::counted(Lang::PtBr, "tests_failed", 3).text, "test_command falhou 3 vezes na mesma tentativa");
+        for key in ["runner.budget.tokens", "runner.budget.usd", "runner.final_fix.reason"] {
+            assert_no_pt(&[lookup(Lang::En, key).unwrap_or_default().to_string()]);
+        }
+        let mut meta = task("T01", TaskStatus::Blocked, &[]).frontmatter;
+        meta.next_action = Some(REVISED_NEXT_ACTION.into());
+        assert!(is_revised_block(&meta), "legado pt-BR sem código");
+        meta.next_action = Some(BlockReason::new(Lang::En, BLOCK_REVISED, &[]).text);
+        meta.next_action_code = Some(BLOCK_REVISED.into());
+        assert!(is_revised_block(&meta), "código atual, texto em en");
+        meta.next_action = Some(REVISED_NEXT_ACTION.into());
+        meta.next_action_code = Some("rejections".into());
+        assert!(!is_revised_block(&meta), "o código vence o texto");
     }
 
     /// Spec 107 T01: tarefa gravada antes da marca (só o título, em pt-BR ou en) ainda marca a 2ª rodada.
@@ -8729,7 +9103,7 @@ mod tests {
 
     #[test]
     fn shell_missing_command_exits_127_and_header_is_structured() {
-        let r = run_shell(&env::temp_dir(), "comando_que_nao_existe_xyz", Duration::from_secs(10)).unwrap();
+        let r = run_shell(&env::temp_dir(), "comando_que_nao_existe_xyz", Duration::from_secs(10), Lang::PtBr).unwrap();
         assert!(!r.passed);
         assert_eq!(r.exit_code, Some(127));
         assert_eq!(failure_header(r.exit_code, r.timed_out), "[falha dos testes: código 127]\n");
@@ -8746,6 +9120,23 @@ mod tests {
         assert!(!r.passed);
         assert!(r.output.contains("tempo limite"));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// Spec 115 T04: as marcas do executor (corte e tempo limite) saem no idioma do projeto.
+    #[tokio::test]
+    async fn shell_executor_marks_follow_the_project_language() {
+        let dir = env::temp_dir();
+        let lang = i18n::SharedLang::new(Lang::En);
+        let ex = ShellTestExecutor::with_timeout(Duration::from_millis(300)).with_lang(lang.clone());
+        let r = ex.run(&dir, "sleep 5").await.unwrap();
+        assert!(r.output.contains("[time limit of 0s exceeded]") && !r.output.contains("tempo limite"), "{}", r.output);
+        let big = format!("head -c {} /dev/zero | tr '\\0' a", MAX_TEST_OUTPUT_BYTES + 10);
+        let ex = ShellTestExecutor::new().with_lang(lang.clone());
+        let r = ex.run(&dir, &big).await.unwrap();
+        assert!(r.output.ends_with("[output truncated at 64 KiB]\n"), "{}", &r.output[r.output.len() - 60..]);
+        lang.set(Lang::PtBr);
+        let r = ex.run(&dir, &big).await.unwrap();
+        assert!(r.output.ends_with("[saída truncada em 64 KiB]\n"));
     }
 
     #[tokio::test]

@@ -241,7 +241,9 @@ pub async fn startup_sweep(state: &AppState) {
     match result {
         Ok(Ok(report)) => {
             if !report.cleaned.is_empty() {
-                println!("nants: ambientes Docker órfãos removidos: {}", report.cleaned.join(", "));
+                // Aviso para quem opera o servidor, no idioma do terminal (spec 115 T04).
+                let list = report.cleaned.join(", ");
+                println!("{}", crate::i18n::tr(crate::i18n::Lang::from_env(), "cli.orphan_envs_removed", &[("list", &list)]));
             }
         }
         Ok(Err(e)) => eprintln!("aviso: varredura de ambientes Docker ignorada: {e}"),

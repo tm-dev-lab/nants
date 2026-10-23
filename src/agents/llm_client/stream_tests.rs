@@ -10,7 +10,7 @@ const SSE: &str = "text/event-stream";
 
 /// Servidor que responde, em ordem, (status, content-type, corpo) sem Content-Length
 /// (fim do corpo = fechamento da conexão). Captura as requisições.
-async fn raw_server(
+pub(crate) async fn raw_server(
     responses: Vec<(u16, &'static str, String)>,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -84,10 +84,10 @@ fn collector() -> (
 ) {
     let v = Arc::new(Mutex::new(Vec::new()));
     let v2 = Arc::clone(&v);
-    (v, move |d| v2.lock().expect("lock").push(d))
+    (v, move |d| v2.lock().expect("lock").extend(super::not_size(d)))
 }
 
-fn ev(name: &str, data: &str) -> String {
+pub(crate) fn ev(name: &str, data: &str) -> String {
     format!("event: {name}\r\ndata: {data}\r\n\r\n")
 }
 
@@ -343,4 +343,110 @@ async fn stream_with_web_search_accepted_keeps_tool_and_not_rejected() {
     assert!(!got.web_search_rejected);
     assert_eq!(got.web_search_calls, 2);
     assert_eq!(body_of(&cap.lock().expect("lock")[0])["tools"], json!([{"type":"web_search"}]));
+}
+
+/// Spec 114 T04: o tamanho recebido chega em `Received`, crescente, até o total do corpo SSE.
+#[tokio::test]
+async fn stream_reports_received_bytes_growing_to_body_size() {
+    let body = responses_sse();
+    let total = u64::try_from(body.len()).expect("len");
+    let (base, _) = raw_server(vec![(200, SSE, body)]).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let cb = move |d| {
+        if let StreamDelta::Received(n) = d {
+            sink.lock().expect("lock").push(n);
+        }
+    };
+    client(base, WireApi::Responses)
+        .chat_stream(&req(None), &cb)
+        .await
+        .expect("ok");
+    let sizes = seen.lock().expect("lock").clone();
+    assert!(!sizes.is_empty());
+    assert!(sizes.windows(2).all(|w| w[0] <= w[1]), "{sizes:?}");
+    assert_eq!(sizes.last().copied(), Some(total));
+}
+
+/// Stream da Responses enorme: `INICIO`, muitos deltas com a chave da conexão e `secret` no meio,
+/// e sem evento final (spec 114 T05).
+pub(crate) fn huge_responses_stream(deltas: usize, secret: &str) -> String {
+    let mut s = ev("response.created", r#"{"type":"response.created","response":{"status":"in_progress"}}"#);
+    let piece = |t: &str| {
+        ev("response.output_text.delta", &serde_json::json!({ "type": "response.output_text.delta", "delta": t }).to_string())
+    };
+    s += &piece("INICIO ");
+    for i in 0..deltas {
+        s += &piece(&format!("parte {i} com {KEY} e {secret} "));
+    }
+    s
+}
+
+fn cut_of(deltas: &[StreamDelta]) -> Vec<Arc<StreamCut>> {
+    deltas
+        .iter()
+        .filter_map(|d| if let StreamDelta::Cut(c) = d { Some(Arc::clone(c)) } else { None })
+        .collect()
+}
+
+#[tokio::test]
+async fn too_large_cut_delivers_bounded_redacted_diagnosis() {
+    let (base, _) = raw_server(vec![(200, SSE, huge_responses_stream(2_000, "x"))]).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    let cb = move |d: StreamDelta| seen2.lock().expect("lock").push(d);
+    let e = client(base, WireApi::Responses)
+        .with_max_response_bytes(64 * 1024)
+        .chat_stream(&req(None), &cb)
+        .await
+        .expect_err("cortada");
+    assert!(matches!(e, LlmError::Parse(r) if r.kind == BadKind::TooLarge), "{e:?}");
+    let cuts = cut_of(&seen.lock().expect("lock"));
+    assert_eq!(cuts.len(), 1, "um corte, sem nova tentativa");
+    let cut = &cuts[0];
+    assert_eq!(cut.reason, "too_large");
+    assert!(cut.bytes > 64 * 1024, "{}", cut.bytes);
+    assert!(cut.events > 100);
+    assert_eq!(cut.top_events[0].0, "response.output_text.delta");
+    assert!(cut.head.starts_with("INICIO "));
+    assert!(!format!("{cut:?}").contains(KEY), "a chave da conexão sai redigida");
+    let (head, tail) = cut.snippets(str::to_string);
+    assert!(head.len() <= CUT_SNIPPET_BYTES && tail.len() <= CUT_SNIPPET_BYTES);
+    let (usage, estimated) = cut.usage().expect("custo");
+    assert!(estimated && usage.prompt > 0 && usage.completion > 0, "{usage:?}");
+}
+
+#[tokio::test]
+async fn idle_timeout_after_some_text_is_a_cut() {
+    // Cabeçalhos e um delta, depois silêncio: o prazo de ociosidade corta a leitura.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut tmp = [0u8; 4096];
+        let _ = sock.read(&mut tmp).await;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {SSE}\r\nConnection: close\r\n\r\n");
+        let _ = sock.write_all(head.as_bytes()).await;
+        let body = ev("response.output_text.delta", r#"{"type":"response.output_text.delta","delta":"comecei"}"#);
+        let _ = sock.write_all(body.as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    let cb = move |d: StreamDelta| seen2.lock().expect("lock").push(d);
+    let e = client(format!("http://{addr}/v1"), WireApi::Responses)
+        .with_timeout(Duration::from_millis(300))
+        .expect("timeout")
+        .with_retry_delays(Vec::new())
+        .chat_stream(&req(None), &cb)
+        .await
+        .expect_err("cortada");
+    assert!(matches!(e, LlmError::Timeout), "{e:?}");
+    let cuts = cut_of(&seen.lock().expect("lock"));
+    let cut = cuts.first().expect("corte");
+    assert_eq!(cut.reason, "timeout");
+    assert_eq!(cut.head, "comecei");
+    assert!(cut.usage().is_some_and(|(_, est)| est));
 }

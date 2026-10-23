@@ -29,13 +29,15 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+use super::error::{params, ApiError};
 
 use super::events::{validate_project_id, ApiEvent, EventBus, EventType};
 use super::projects::{find_project, format_utc, scrub_text};
 use super::safe_fs;
 use super::spec_result::validate_spec_id;
-use super::state::{ReserveError, APP_RESERVATION, REPORT_BUSY_MSG};
+use super::state::{ReserveError, APP_RESERVATION, REPORT_BUSY_CODE};
 use super::AppState;
 use crate::harness::compose::{ComposeEnv, ComposeKind, PublishedPort};
 use crate::sdd::{Spec, SpecStatus};
@@ -52,32 +54,31 @@ pub const REASON_RUN_STARTED: &str = "run_started";
 pub const REASON_PROJECT_REMOVED: &str = "project_removed";
 pub const REASON_SHUTDOWN: &str = "shutdown";
 
-const MSG_CONFIRM: &str = "confirmação humana necessária para executar o sistema";
-const MSG_BODY: &str = "corpo JSON inválido";
-const MSG_NOT_FOUND: &str = "projeto não encontrado";
-const MSG_SPEC_NOT_FOUND: &str = "spec não encontrada";
-const MSG_BUSY: &str = "já existe uma execução em andamento neste projeto";
-const MSG_NOT_COMPLETED: &str = "a spec precisa estar COMPLETED para executar o sistema";
-const MSG_NO_COMMAND: &str = "A especificação não declara como executar";
-const MSG_RUNNING: &str = "o sistema já está em execução neste projeto";
-const MSG_INTERNAL: &str = "falha interna";
-const MSG_RUN_DOCKER: &str = "em modo docker, o run_command roda DENTRO do serviço workspace: não invoque docker, \
-docker compose nem podman; use o comando interno que sobe o app ouvindo 0.0.0.0 (por exemplo: npm ci && npm run dev -- --host 0.0.0.0 --port 5173)";
+/// Códigos (spec 115 T02) dos erros do app; os textos ficam nos dicionários (`serverError.<code>`).
+const ERR_CONFIRM: &str = "app_confirm_required";
+const ERR_BODY: &str = "body_invalid";
+const ERR_NOT_FOUND: &str = "project_not_found";
+const ERR_SPEC_NOT_FOUND: &str = "spec_not_found";
+const ERR_BUSY: &str = "run_active";
+const ERR_NOT_COMPLETED: &str = "app_spec_not_completed";
+const ERR_NO_COMMAND: &str = "app_no_run_command";
+const ERR_RUNNING: &str = "app_already_running";
+const ERR_INTERNAL: &str = "internal";
+const ERR_RUN_DOCKER: &str = "app_run_command_docker";
 /// Linhas de log do workspace anexadas ao detalhe de falha do `up`.
 const FAIL_LOG_LINES: u32 = 50;
 /// Janela de observação do `-run` após o `up` (053).
 const RUN_OBSERVE_WINDOW: Duration = Duration::from_secs(8);
 /// Limite (caracteres, contados do FIM) do detalhe de falha devolvido ao front.
 const DETAIL_CHARS: usize = 1600;
-const MSG_DOCKER_PORT: &str = "uma porta publicada pelo ambiente Docker já está em uso no host";
 /// Código (spec 102) da porta publicada já em uso no host.
 pub const CODE_PORT_IN_USE: &str = "app_port_in_use";
 /// Código (spec 102) da faixa de portas de visualização esgotada (`params.start`, `params.end`).
 pub const CODE_VIEW_PORTS_EXHAUSTED: &str = "view_ports_exhausted";
 /// Código (spec 102) do aviso de porta trocada (`params.wanted`, `params.used`).
 pub const CODE_PORT_REMAPPED: &str = "app_port_remapped";
-const MSG_DOCKER_UP: &str = "não foi possível subir o ambiente Docker do projeto";
-const MSG_DOCKER_DOWN: &str = "não foi possível derrubar o ambiente Docker do projeto";
+const ERR_DOCKER_UP: &str = "app_docker_up_failed";
+const ERR_DOCKER_DOWN: &str = "app_docker_down_failed";
 /// Host usado nos links quando o `Host` da requisição não é aceito pela política do servidor.
 pub const FALLBACK_HOST: &str = "127.0.0.1";
 
@@ -335,12 +336,12 @@ impl AppManager {
     }
 }
 
-fn reject(status: StatusCode, message: &str, reason: &'static str) -> Response {
-    (status, Json(json!({"error": message, "reason": reason}))).into_response()
+fn reject(status: StatusCode, code: &'static str, reason: &'static str) -> Response {
+    ApiError::coded(status, code, Map::new()).with_reason(reason).into_response()
 }
 
-fn plain(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"error": message}))).into_response()
+fn plain(status: StatusCode, code: &'static str) -> Response {
+    ApiError::coded(status, code, Map::new()).into_response()
 }
 
 #[derive(Deserialize)]
@@ -361,10 +362,10 @@ pub async fn start_app(
         return e.into_response();
     }
     let Ok(input) = serde_json::from_slice::<StartInput>(&body) else {
-        return plain(StatusCode::BAD_REQUEST, MSG_BODY);
+        return plain(StatusCode::BAD_REQUEST, ERR_BODY);
     };
     if !input.confirm {
-        return plain(StatusCode::BAD_REQUEST, MSG_CONFIRM);
+        return plain(StatusCode::BAD_REQUEST, ERR_CONFIRM);
     }
     if let Err(e) = validate_spec_id(&input.spec_id) {
         return e.into_response();
@@ -376,12 +377,12 @@ pub async fn start_app(
     // Reserva interna do projeto durante toda a partida (exclui run, remoção e outra partida).
     let (project, _guard) = match state.reserve_run(&id, APP_RESERVATION).await {
         Ok(ok) => ok,
-        Err(ReserveError::NotFound) => return plain(StatusCode::NOT_FOUND, MSG_NOT_FOUND),
+        Err(ReserveError::NotFound) => return plain(StatusCode::NOT_FOUND, ERR_NOT_FOUND),
         Err(ReserveError::Busy) => {
-            return reject(StatusCode::CONFLICT, MSG_BUSY, "busy");
+            return reject(StatusCode::CONFLICT, ERR_BUSY, "busy");
         }
         Err(ReserveError::ReportInProgress) => {
-            return reject(StatusCode::CONFLICT, REPORT_BUSY_MSG, "report_in_progress");
+            return reject(StatusCode::CONFLICT, REPORT_BUSY_CODE, "report_in_progress");
         }
     };
     let root = std::path::PathBuf::from(&project.path);
@@ -394,34 +395,34 @@ pub async fn start_app(
     })
     .await;
     let Ok(spec) = read else {
-        return plain(StatusCode::INTERNAL_SERVER_ERROR, MSG_INTERNAL);
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, ERR_INTERNAL);
     };
     let Some(spec) = spec else {
-        return plain(StatusCode::NOT_FOUND, MSG_SPEC_NOT_FOUND);
+        return plain(StatusCode::NOT_FOUND, ERR_SPEC_NOT_FOUND);
     };
     if spec.frontmatter.status != SpecStatus::Completed {
-        return reject(StatusCode::CONFLICT, MSG_NOT_COMPLETED, "spec_not_completed");
+        return reject(StatusCode::CONFLICT, ERR_NOT_COMPLETED, "spec_not_completed");
     }
     if state.apps().is_running(&id) {
-        return reject(StatusCode::CONFLICT, MSG_RUNNING, "already_running");
+        return reject(StatusCode::CONFLICT, ERR_RUNNING, "already_running");
     }
     // Projeto Compose `-run` na raiz do projeto; projeto sem ambiente docker é recusado (spec 074).
     let Some(compose) = state.compose().for_project_lan(&root, &id, ComposeKind::Run, state.lan_view_ports()) else {
         return reject(
             StatusCode::CONFLICT,
-            super::runs::PROJECT_NOT_DOCKER_MSG,
+            super::runs::PROJECT_NOT_DOCKER_CODE,
             super::runs::REASON_ENV_NOT_DOCKER,
         );
     };
     let Some(raw) = spec.frontmatter.run_command.as_deref() else {
-        return reject(StatusCode::UNPROCESSABLE_ENTITY, MSG_NO_COMMAND, "no_run_command");
+        return reject(StatusCode::UNPROCESSABLE_ENTITY, ERR_NO_COMMAND, "no_run_command");
     };
     let Ok(inner) = crate::sdd::docker_command::normalize(raw) else {
-        return reject(StatusCode::UNPROCESSABLE_ENTITY, MSG_RUN_DOCKER, "run_command_docker");
+        return reject(StatusCode::UNPROCESSABLE_ENTITY, ERR_RUN_DOCKER, "run_command_docker");
     };
     match state.apps().launch_docker(&id, &root, &input.spec_id, compose, &inner).await {
         Ok(view) => Json(app_view(&state, view, &headers, true).await).into_response(),
-        Err(LaunchError::AlreadyRunning) => reject(StatusCode::CONFLICT, MSG_RUNNING, "already_running"),
+        Err(LaunchError::AlreadyRunning) => reject(StatusCode::CONFLICT, ERR_RUNNING, "already_running"),
         Err(LaunchError::Docker(detail)) => {
             let secrets = state.secret_set().await;
             let clean = scrub_text(&secrets, &detail);
@@ -431,36 +432,24 @@ pub async fn start_app(
             // mensagem da faixa e os números reais. `code`/`params` (spec 102) para a interface traduzir.
             if let Some(line) = clean.lines().find(|l| l.starts_with(crate::config::VIEW_PORTS_EXHAUSTED_PREFIX)) {
                 let range = state.lan_view_ports();
-                let params = json!({
-                    "start": range.map(|r| r.start),
-                    "end": range.map(|r| r.end),
-                });
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({
-                        "error": line, "reason": "docker_port_in_use", "detail": line,
-                        "code": CODE_VIEW_PORTS_EXHAUSTED, "params": params,
-                    })),
-                )
+                let params = params([("start", json!(range.map(|r| r.start))), ("end", json!(range.map(|r| r.end)))]);
+                return ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, CODE_VIEW_PORTS_EXHAUSTED, params)
+                    .with_reason("docker_port_in_use")
+                    .with_detail(line)
                     .into_response();
             }
             if crate::harness::compose::is_port_conflict(&detail) {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({
-                        "error": MSG_DOCKER_PORT, "reason": "docker_port_in_use", "detail": detail,
-                        "code": CODE_PORT_IN_USE,
-                    })),
-                )
+                return ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, CODE_PORT_IN_USE, Map::new())
+                    .with_reason("docker_port_in_use")
+                    .with_detail(detail)
                     .into_response();
             }
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error": MSG_DOCKER_UP, "reason": "docker_failed", "detail": detail})),
-            )
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, ERR_DOCKER_UP, Map::new())
+                .with_reason("docker_failed")
+                .with_detail(detail)
                 .into_response()
         }
-        Err(LaunchError::Spawn) => plain(StatusCode::INTERNAL_SERVER_ERROR, MSG_INTERNAL),
+        Err(LaunchError::Spawn) => plain(StatusCode::INTERNAL_SERVER_ERROR, ERR_INTERNAL),
     }
 }
 
@@ -474,7 +463,7 @@ pub async fn stop_app(State(state): State<AppState>, AxPath(id): AxPath<String>,
     }
     state.apps().stop(&id, REASON_STOPPED).await;
     if state.apps().is_docker_running(&id) {
-        return plain(StatusCode::INTERNAL_SERVER_ERROR, MSG_DOCKER_DOWN);
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, ERR_DOCKER_DOWN);
     }
     Json(app_view(&state, state.apps().view(&id), &headers, false).await).into_response()
 }

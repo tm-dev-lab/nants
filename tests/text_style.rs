@@ -323,7 +323,8 @@ fn nants_texts_have_no_dashes_emoji_yolo_or_old_button_name() {
     }
     // A varredura chega aos textos que importam (nada de produção ficou de fora por engano).
     for (file, marker) in [
-        ("server/approvals.rs", "Aprovação automática ignorada"),
+        // Spec 115 T03: o aviso saiu de `approvals.rs` para o dicionário (`system.run.yolo_ignored`).
+        ("i18n/pt_br.rs", "Aprovação automática ignorada"),
         ("server/approvals.rs", "aprovada automaticamente"),
         ("server/recovery.rs", "## Aprovação automática: autonomia"),
         ("server/report.rs", "Executar fora do Nants"),

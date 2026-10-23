@@ -205,6 +205,8 @@
 /* Rodapé do cartão: o link fica alinhado ao texto do cartão (padding do rodapé + o do link = `--sp-2`). */
 .nd-board-card-foot {
   display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
   padding: 0 var(--sp-2) var(--sp-1);
 }
 
@@ -253,6 +255,15 @@
 
 .nd-section-label[data-tone="rose"] {
   color: var(--pill-rose-ink);
+}
+
+/* Tarefa pausada (spec 114 T04): o motivo curto em âmbar, como espera, não erro. */
+.nd-board-pause {
+  color: var(--muted);
+}
+
+.nd-section-label[data-tone="amber"] {
+  color: var(--pill-amber-ink);
 }
 
 /*

@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    default_image_price, AgentConfig, DEFAULT_PROJECTS_ROOT, Agents, MAX_STEPS_RANGE, Config, Connection, Effort, PriceSource, Pricing, Project, ServerConfig, WireApi,
+    default_image_price, AgentConfig, DEFAULT_PROJECTS_ROOT, Agents, MAX_STEPS_RANGE, Config, Connection, ConnectionKind, CHATGPT_PLAN_BASE_URL, Effort, PriceSource, Pricing, Project, ServerConfig, WireApi,
     LanViewPortsConfig,
 };
 pub use view_ports::{ViewPorts, DEFAULT_VIEW_PORTS, MAX_VIEW_PORTS, MIN_VIEW_PORT, VIEW_PORTS_EXHAUSTED_PREFIX};
@@ -35,7 +35,12 @@ impl Config {
     /// sem criar nenhum arquivo.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match fs::read_to_string(path) {
-            Ok(content) => Ok(toml::from_str(&content)?),
+            Ok(content) => {
+                let mut cfg: Self = toml::from_str(&content)?;
+                // Spec 116: a conexão pelo plano ChatGPT tem endereço e protocolo fixos.
+                cfg.connections.iter_mut().for_each(Connection::normalize);
+                Ok(cfg)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
@@ -94,12 +99,15 @@ impl Connection {
 
     /// Problemas que impedem montar o cliente desta conexão (prontidão, spec 093 T12), na ordem
     /// endereço e chave. Lista vazia: `LlmClient::from_connection` não falha por configuração.
+    ///
+    /// A conexão pelo plano ChatGPT (spec 116) não tem chave: o login dela é conferido pela
+    /// prontidão do servidor ([`ConnectionProblem::PlanLogin`]).
     pub fn usable_problems(&self) -> Vec<ConnectionProblem> {
         let mut out = Vec::new();
         if !self.has_usable_base_url() {
             out.push(ConnectionProblem::BaseUrl);
         }
-        if !self.has_usable_key() {
+        if !self.is_chatgpt_plan() && !self.has_usable_key() {
             out.push(ConnectionProblem::ApiKey);
         }
         out
@@ -113,6 +121,8 @@ pub enum ConnectionProblem {
     BaseUrl,
     /// Chave vazia ou não resolvível.
     ApiKey,
+    /// Conexão pelo plano ChatGPT sem login utilizável (desconectada ou "precisa entrar de novo").
+    PlanLogin,
 }
 
 /// Caminho padrão: `$XDG_CONFIG_HOME/nants/config.toml` ou `$HOME/.config/nants/config.toml`.
@@ -408,6 +418,7 @@ api_key = "env:OA_KEY"
             base_url: "http://localhost".into(),
             api_key: api_key.into(),
             wire_api: WireApi::default(),
+            kind: Default::default(),
         }
     }
 

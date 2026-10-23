@@ -15,12 +15,13 @@ import { parseReviewMessage } from "../../reviewMessage";
 import { belongsToSpec, type ActivityEntry, type ChatMessage } from "../../store";
 import { isPacing, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
 import type { InfoKind } from "../attention/attentionModel";
+import { formatBytes } from "../files/filesModel";
 import type { AppSummary, AppSummaryInput } from "../registry";
 
 /** Cartões fixos, nesta ordem; outros papéis (como os testes) entram só quando ativos. */
 const ACTIVITY_AGENTS: readonly string[] = ["developer", "reviewer", "architect"];
 
-export type LiveKind = "image" | "pacing" | "retry" | "tests" | "command" | "tool" | "writing" | "thinking";
+export type LiveKind = "image" | "pacing" | "retry" | "tests" | "command" | "tool" | "writing" | "thinking" | "model";
 
 interface LiveAction {
   kind: LiveKind;
@@ -30,6 +31,11 @@ interface LiveAction {
   detail: string;
   /** Etapa (relatório, verificação final), quando há. */
   stage: string | null;
+  /**
+   * Chamada ao modelo em curso exibida à parte (spec 114 T04), quando a linha mostra outra coisa
+   * (o raciocínio ou o texto que já chegou): "recebendo a resposta há 2 min · 48 KB recebidos".
+   */
+  model: string | null;
 }
 
 const DETAIL_MAX = 160;
@@ -41,25 +47,50 @@ export function tailLine(text: string, max = DETAIL_MAX): string {
 }
 
 type LiveSource = Pick<ActivityEntry, "agent" | "reasoning" | "text" | "tool"> &
-  Partial<Pick<ActivityEntry, "command" | "stage" | "stageCode" | "toolCode" | "textCode">>;
+  Partial<Pick<ActivityEntry, "command" | "stage" | "stageCode" | "toolCode" | "textCode" | "modelStartedAt" | "modelBytes">>;
 
-/** Estado e ação ao vivo de uma atividade. */
-export function liveActionOf(activity: LiveSource): LiveAction {
+/** Tempo decorrido curto: "45 s", "2 min", "1 h 5 min" (sem inventar precisão). */
+export function elapsedText(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return t("activity.model.seconds", { seconds });
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return t("activity.model.minutes", { minutes });
+  return t("activity.model.hours", { hours: Math.floor(minutes / 60), minutes: minutes % 60 });
+}
+
+/**
+ * Chamada ao modelo em curso (spec 114 T04): o estado ("aguardando o modelo" antes do primeiro
+ * byte, "recebendo a resposta" depois) e o progresso real que o cliente conhece: o tempo desde o
+ * início e o tamanho já recebido. `null` sem chamada em curso.
+ */
+function modelProgress(activity: Pick<LiveSource, "modelStartedAt" | "modelBytes">, now: number): { state: string; detail: string } | null {
+  if (activity.modelStartedAt === undefined) return null;
+  const receiving = activity.modelBytes !== undefined && activity.modelBytes > 0;
+  const time = t("activity.model.for", { time: elapsedText(now - activity.modelStartedAt) });
+  const detail = receiving ? `${time} · ${t("activity.model.received", { size: formatBytes(activity.modelBytes ?? 0) })}` : time;
+  return { state: t(receiving ? "activity.state.receiving" : "activity.state.waitingModel"), detail };
+}
+
+/** Estado e ação ao vivo de uma atividade (`now`: o relógio do tempo da chamada ao modelo). */
+export function liveActionOf(activity: LiveSource, now: number = Date.now()): LiveAction {
   const stage = stageText(activity);
   const tool = activity.tool.trim();
   const text = activity.text.trim();
-  if (isPacing(activity)) return { kind: "pacing", state: t("activity.state.pacing"), detail: tailLine(stepText(activity)), stage };
+  const call = modelProgress(activity, now);
+  const model = call === null ? null : `${call.state} ${call.detail}`;
+  if (isPacing(activity)) return { kind: "pacing", state: t("activity.state.pacing"), detail: tailLine(stepText(activity)), stage, model: null };
   const retry = [text, tool].find((t) => t.includes(RETRY_MARK));
-  if (retry !== undefined) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(retryDetail(retry)), stage };
+  if (retry !== undefined) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(retryDetail(retry)), stage, model: null };
   if (activity.toolCode?.code === "tool.generate_image") {
     const path = activity.toolCode.params.path;
-    return { kind: "image", state: t("activity.state.image"), detail: typeof path === "string" && path !== "" ? path : toolText(activity), stage };
+    return { kind: "image", state: t("activity.state.image"), detail: typeof path === "string" && path !== "" ? path : toolText(activity), stage, model: null };
   }
-  if (activity.agent === "tests" && activity.command !== undefined) return { kind: "tests", state: t("activity.state.tests"), detail: activity.command, stage };
-  if (activity.command !== undefined) return { kind: "command", state: t("activity.executing"), detail: activity.command, stage };
-  if (tool !== "") return { kind: "tool", state: t("activity.state.working"), detail: toolText(activity), stage };
-  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: tailLine(stepText(activity)), stage };
-  return { kind: "thinking", state: t("activity.thinking"), detail: tailLine(activity.reasoning), stage };
+  if (activity.agent === "tests" && activity.command !== undefined) return { kind: "tests", state: t("activity.state.tests"), detail: activity.command, stage, model: null };
+  if (activity.command !== undefined) return { kind: "command", state: t("activity.executing"), detail: activity.command, stage, model: null };
+  if (tool !== "") return { kind: "tool", state: t("activity.state.working"), detail: toolText(activity), stage, model };
+  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: tailLine(stepText(activity)), stage, model };
+  if (activity.reasoning.trim() !== "" || call === null) return { kind: "thinking", state: t("activity.thinking"), detail: tailLine(activity.reasoning), stage, model };
+  return { kind: "model", state: call.state, detail: call.detail, stage, model: null };
 }
 
 /** A atividade mais recente de cada agente (as de tarefas diferentes do mesmo agente viram uma). */

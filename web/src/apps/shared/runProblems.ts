@@ -3,7 +3,7 @@
  * pausada). O 412 `prereq_missing` vira a lista do que
  * falta, com a aba de cada item (o "Configurar" leva até ela).
  */
-import { isAgentNotConfiguredMessage, type ApiFailure } from "../../api/client";
+import { isAgentNotConfigured, type ApiFailure } from "../../api/client";
 import type { Readiness, ReadinessItem } from "../../desktop/api";
 import { APPROVE_REASON_MESSAGES, RECOVERY_REASON_MESSAGES } from "../../copy";
 import { t } from "../../i18n";
@@ -35,7 +35,7 @@ function failureText(failure: ApiFailure, fallback: string): string {
 export function approveProblem(failure: ApiFailure, readiness: Readiness | null = null): RunProblem {
   const prereq = prereqItems(failure, readiness);
   if (prereq !== null) return { message: prereqMessage(prereq), missing: prereq, prereq: true };
-  if (failure.status === 422 && isAgentNotConfiguredMessage(failure.message)) {
+  if (isAgentNotConfigured(failure)) {
     return { message: t("approve.agents"), missing: agentItems() };
   }
   if (failure.status === 409) {

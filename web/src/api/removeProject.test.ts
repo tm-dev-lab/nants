@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { removeProject } from "./client";
 import { KNOWN_EVENT_TYPES, parseApiEvent } from "./events";
 import { installFetch } from "../test-utils";
+import { apiFailureText } from "../i18n/serverCodes";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -31,7 +32,7 @@ describe("removeProject (cliente)", () => {
   });
 
   it("404 com 'projeto não encontrado' é sucesso idempotente (alreadyRemoved)", async () => {
-    installFetch(() => ({ status: 404, body: { error: "projeto não encontrado" } }));
+    installFetch(() => ({ status: 404, body: { error: "projeto não encontrado", code: "project_not_found" } }));
 
     const result = await removeProject("p1");
 
@@ -39,28 +40,23 @@ describe("removeProject (cliente)", () => {
   });
 
   it("409 de execução devolve a mensagem fixa e não é sucesso", async () => {
-    installFetch(() => ({ status: 409, body: { error: "já existe uma execução em andamento neste projeto" } }));
+    installFetch(() => ({ status: 409, body: { error: "já existe uma execução em andamento neste projeto", code: "run_active" } }));
 
     const result = await removeProject("p1");
 
     expect(result).toEqual({
       ok: false,
-      error: {
-        kind: "http",
-        status: 409,
-        message: "já existe uma execução em andamento neste projeto",
-        messageKey: "serverMessage.runActive",
-      },
+      error: { kind: "http", status: 409, message: "operação não permitida no estado atual", messageKey: "api.status.409", code: "run_active" },
     });
   });
 
   it("409 de turno de chat devolve a mensagem fixa", async () => {
-    installFetch(() => ({ status: 409, body: { error: "já existe um turno de chat em andamento para este projeto" } }));
+    installFetch(() => ({ status: 409, body: { error: "já existe um turno de chat em andamento para este projeto", code: "chat_active" } }));
 
     const result = await removeProject("p1");
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.message).toBe("já existe um turno de chat em andamento para este projeto");
+    if (!result.ok) expect(result.error.code).toBe("chat_active");
   });
 
   it("422 com texto desconhecido vira mensagem do status, sem eco do corpo", async () => {
@@ -73,12 +69,12 @@ describe("removeProject (cliente)", () => {
   });
 
   it("500 com 'falha ao salvar a configuração' repassa a mensagem fixa", async () => {
-    installFetch(() => ({ status: 500, body: { error: "falha ao salvar a configuração" } }));
+    installFetch(() => ({ status: 500, body: { error: "falha ao salvar a configuração", code: "config_save_failed" } }));
 
     const result = await removeProject("p1");
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.message).toBe("falha ao salvar a configuração");
+    if (!result.ok) expect(apiFailureText(result.error, "pt-BR")).toBe("falha ao salvar a configuração");
   });
 
   it("500 sem texto conhecido vira mensagem genérica de servidor", async () => {

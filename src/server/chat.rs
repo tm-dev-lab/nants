@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::approvals::{random_hex_id, ProjectApprover};
 use super::error::ApiError;
@@ -29,9 +29,9 @@ use super::events::{validate_project_id, ApiEvent, EventType, SecretSet, MAX_MES
 use super::projects::scrub_text;
 use super::safe_fs::{self, MAX_READ_BYTES, O_NOFOLLOW, O_NONBLOCK};
 use super::snapshot::project_snapshot;
-use super::state::{AppState, ArchitectTurn, ReserveError};
+use super::state::{AppState, ArchitectTurn, ReserveError, REPORT_BUSY_CODE};
 use crate::server::events::BusActivitySink;
-use crate::agents::activity::{ActivityEvent, ActivitySink};
+use crate::agents::activity::{ActivityEvent, ActivityKind, ActivitySink};
 use crate::agents::llm_client::{ChatRequest, ChatResponse, StreamDelta};
 use crate::agents::LlmError;
 use std::future::Future;
@@ -58,16 +58,11 @@ pub const MAX_CHAT_MESSAGE_CHARS: usize = 8000;
 /// Bytes lidos do fim do histórico (1 MiB).
 const HISTORY_READ_BYTES: u64 = MAX_READ_BYTES;
 
-const NOT_CONFIGURED: &str = "agente Arquiteto não configurado";
-const REPORT_BUSY: &str = "O Arquiteto está terminando o relatório; tente em instantes";
-const BUSY: &str = "já existe um turno de chat em andamento para este projeto";
-const PROJECT_NOT_FOUND: &str = "projeto não encontrado";
-const TIMEOUT_CODE: &str = "timeout";
+const TIMEOUT_CODE: &str = "chat_timeout";
 const TIMEOUT_TURN_TEXT: &str = "O turno foi cortado por inatividade; envie a mensagem novamente.";
 const TIMEOUT_TURN_SAVED: &str =
     "O turno foi cortado por demora, mas o plano foi salvo; veja o cartão do plano.";
 const ARCHITECT_AGENT: &str = "architect";
-const TURN_ID_FAILED: &str = "falha ao gerar o identificador do turno";
 
 #[derive(Deserialize)]
 struct ChatInput {
@@ -89,8 +84,6 @@ struct Incoming {
 
 /// Texto de uma mensagem só com imagem (sem texto).
 const IMAGE_ONLY_TEXT: &str = "(imagem)";
-const ATTACHMENTS_TOO_MANY: &str = "attachments deve ter no máximo 4 imagens";
-const ATTACHMENT_INVALID: &str = "imagem anexada inválida ou inexistente; anexe de novo";
 
 /// Prazos do turno: inatividade (renovado a cada progresso) e teto absoluto.
 #[derive(Clone, Copy)]
@@ -145,8 +138,12 @@ impl ChatBackend for ProgressBackend {
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let progress = &self.progress;
+            // O tamanho recebido (spec 114 T04) só alimenta a Atividade: o prazo do turno segue
+            // renovado pelos mesmos sinais de antes.
             let wrapped = move |delta: StreamDelta| {
-                progress.touch();
+                if !matches!(delta, StreamDelta::Received(_) | StreamDelta::Cut(_)) {
+                    progress.touch();
+                }
                 on_delta(delta);
             };
             let out = self.inner.complete_stream(req, &wrapped).await;
@@ -164,7 +161,12 @@ struct ProgressSink {
 
 impl ActivitySink for ProgressSink {
     fn emit(&self, event: ActivityEvent) {
-        self.progress.touch();
+        // Spec 114 T04: o acompanhamento da chamada ao modelo (início, sinal periódico e fim) só
+        // informa a Atividade. Uma chamada muda não pode renovar o prazo de inatividade do turno;
+        // o fim da chamada já renova pelo `ProgressBackend`.
+        if !matches!(event.kind, ActivityKind::Model | ActivityKind::ModelBeat | ActivityKind::ModelEnd) {
+            self.progress.touch();
+        }
         self.inner.emit(event);
     }
     fn sanitize(&self, text: &str) -> String {
@@ -281,7 +283,7 @@ async fn run_turn(
     });
     match task.await {
         Ok(result) => result,
-        Err(_) => Err(ApiError::internal(TURN_ID_FAILED)),
+        Err(_) => Err(ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "turn_id_failed", Map::new())),
     }
 }
 
@@ -296,14 +298,10 @@ async fn run_turn_detached(
     // Projeto e turno na mesma seção sob o read lock da configuração (ver `AppState::reserve_chat`).
     let (project, reservation) = match state.reserve_chat(id).await {
         Ok(reserved) => reserved,
-        Err(ReserveError::NotFound) => return Err(ApiError::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND)),
-        Err(ReserveError::Busy) => return Err(ApiError::new(StatusCode::CONFLICT, BUSY)),
+        Err(ReserveError::NotFound) => return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new())),
+        Err(ReserveError::Busy) => return Err(ApiError::coded(StatusCode::CONFLICT, "chat_active", Map::new())),
         Err(ReserveError::ReportInProgress) => {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({"error": REPORT_BUSY, "reason": "report_in_progress"})),
-            )
-                .into_response())
+            return Err(ApiError::coded(StatusCode::CONFLICT, REPORT_BUSY_CODE, Map::new()).with_reason("report_in_progress"))
         }
     };
     // Imagens anexadas precisam existir no projeto (sem symlink): senão 422, sem abrir o turno.
@@ -313,10 +311,10 @@ async fn run_turn_detached(
             .await
             .unwrap_or(false);
         if !all_exist {
-            return Err(ApiError::unprocessable(ATTACHMENT_INVALID));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "attachment_invalid", Map::new()));
         }
     }
-    let turn_id = random_hex_id().map_err(|_| ApiError::internal(TURN_ID_FAILED))?;
+    let turn_id = random_hex_id().map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "turn_id_failed", Map::new()))?;
     let secrets = state.secret_set().await;
     let mut scope = state.begin_architect_turn(
         id,
@@ -367,7 +365,8 @@ async fn run_turn_body(
         state.approvals().clone(),
         state.events().clone(),
         Arc::clone(&secrets),
-    ));
+    )
+    .with_lang(state.project_lang(id)));
     let activity = Arc::new(ProgressSink {
         inner: Arc::new(BusActivitySink::new(state.events().clone(), id, Arc::clone(&secrets))),
         progress: Arc::clone(&progress),
@@ -389,7 +388,7 @@ async fn run_turn_body(
     let mut architect = LlmArchitect::new(backend, model, Some(effort), policy, approver)
         .with_lang(state.project_lang(id))
         .with_activity(activity, None, None)
-        .with_usage(super::usage::FileUsageSink::new(root.clone(), id))
+        .with_usage(super::usage::FileUsageSink::redacting(root.clone(), id, Arc::clone(&secrets)))
         .with_memory(Arc::clone(&secrets))
         .with_docker(docker)
         .with_host_facts(host_facts)
@@ -476,12 +475,9 @@ async fn timeout_response(
         attachments: Vec::new(),
     };
     let _saved = tokio::task::spawn_blocking(move || append_turns(&root, &[turn])).await;
-    let mut body = json!({"error": TIMEOUT_CODE});
-    if draft_saved {
-        body["draft_saved"] = json!(true);
-        body["reason"] = json!("draft_saved");
-    }
-    (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+    let err = ApiError::coded(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_CODE, Map::new());
+    let err = if draft_saved { err.with_field("draft_saved", json!(true)).with_reason("draft_saved") } else { err };
+    err.into_response()
 }
 
 /// Redige, publica eventos, persiste o turno e monta a resposta 200.
@@ -551,9 +547,9 @@ fn output_text(secrets: &SecretSet, text: &str) -> String {
 fn parse_message(body: &[u8]) -> Result<Incoming, ApiError> {
     let input: ChatInput = serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })?;
     let attachments = validate_attachments(input.attachments)?;
@@ -574,12 +570,12 @@ fn parse_message(body: &[u8]) -> Result<Incoming, ApiError> {
 /// Até [`MAX_MESSAGE_ATTACHMENTS`] nomes válidos, sem repetição (a ordem é mantida). 422 se não.
 fn validate_attachments(names: Vec<String>) -> Result<Vec<String>, ApiError> {
     if names.len() > MAX_MESSAGE_ATTACHMENTS {
-        return Err(ApiError::unprocessable(ATTACHMENTS_TOO_MANY));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "attachments_max", Map::new()));
     }
     let mut out: Vec<String> = Vec::with_capacity(names.len());
     for name in names {
         if attachment_mime(&name).is_none() {
-            return Err(ApiError::unprocessable(ATTACHMENT_INVALID));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "attachment_invalid", Map::new()));
         }
         if !out.contains(&name) {
             out.push(name);
@@ -592,20 +588,20 @@ fn validate_attachments(names: Vec<String>) -> Result<Vec<String>, ApiError> {
 /// além de `\n` e `\t`. Mensagens de erro são estáticas.
 fn validate_message(message: &str) -> Result<(), ApiError> {
     if message.trim().is_empty() {
-        return Err(ApiError::unprocessable("message é obrigatório"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "message_required", Map::new()));
     }
     if message.chars().count() > MAX_CHAT_MESSAGE_CHARS {
-        return Err(ApiError::unprocessable(format!(
-            "message deve ter no máximo {MAX_CHAT_MESSAGE_CHARS} caracteres"
-        )));
+        return Err(ApiError::coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "message_too_long",
+            super::error::params([("max", json!(MAX_CHAT_MESSAGE_CHARS))]),
+        ));
     }
     if message
         .chars()
         .any(|c| c.is_control() && c != '\n' && c != '\t')
     {
-        return Err(ApiError::unprocessable(
-            "message não pode conter caracteres de controle",
-        ));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "message_control_chars", Map::new()));
     }
     Ok(())
 }
@@ -616,7 +612,7 @@ async fn find_project(state: &AppState, id: &str) -> Result<Project, ApiError> {
         let cfg = state.config().read().await;
         cfg.projects.iter().find(|p| p.id == id).cloned()
     };
-    found.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND))
+    found.ok_or_else(|| ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()))
 }
 
 /// Modelo, esforço e cliente do Arquiteto. Qualquer falha de configuração vira 422 estático.
@@ -631,12 +627,12 @@ pub(super) async fn architect_client(state: &AppState) -> Result<(String, Effort
             .cloned();
         (agent, connection)
     };
-    let not_configured = || ApiError::unprocessable(NOT_CONFIGURED);
+    let not_configured = || ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "architect_not_configured", Map::new());
     let connection = connection.ok_or_else(not_configured)?;
     if agent.model.trim().is_empty() {
         return Err(not_configured());
     }
-    let client = LlmClient::from_connection(&connection).map_err(|_| not_configured())?;
+    let client = super::chatgpt::plan_client::llm_client(state, &connection).map_err(|_| not_configured())?;
     Ok((agent.model, agent.effort, client))
 }
 
@@ -645,7 +641,7 @@ pub(super) async fn architect_client(state: &AppState) -> Result<(String, Effort
 fn architect_error(err: ArchitectError) -> ApiError {
     let ArchitectError::Backend(failure) = err;
     let params = super::error::provider_failure_params(&failure);
-    let api = ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()).with_code(CODE_PROVIDER_FAILED, params);
+    let api = ApiError::coded(StatusCode::BAD_GATEWAY, CODE_PROVIDER_FAILED, params);
     match failure.detail() {
         Some(detail) => api.with_detail(detail),
         None => api,
@@ -912,6 +908,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = if configured {
             AgentConfig {
@@ -1637,6 +1634,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "env:NANTS_CHAT_TEST_UNSET_KEY_5151".into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect.connection_id = "envkey".into();
         let state = state_for(&root, cfg);
@@ -1655,7 +1653,7 @@ mod tests {
         let (status, body) =
             turn(&state, PROJECT_ID, "oi", Some(dynb), Duration::from_millis(50)).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body["error"], TIMEOUT_CODE);
+        assert_eq!(body["code"], TIMEOUT_CODE);
         assert!(body.get("draft_saved").is_none());
         // A mensagem do usuário foi persistida no início; o corte virou um turno curto.
         let lines = chat_lines(&root);
@@ -1713,7 +1711,59 @@ mod tests {
         let (status, body) =
             turn(&state, PROJECT_ID, "oi", slow(600, replies), limits(100, 10_000)).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body["error"], TIMEOUT_CODE);
+        assert_eq!(body["code"], TIMEOUT_CODE);
+    }
+
+    /// O turno como `run_turn_body` o monta: backend com `ProgressBackend` e atividade com
+    /// `ProgressSink`, mas com o heartbeat do escopo injetado (menor que o prazo de inatividade).
+    fn progress_parts(heartbeat_ms: u64) -> (Arc<Progress>, Arc<dyn ChatBackend>, crate::agents::activity::ActivityScope) {
+        let progress = Progress::new();
+        let backend: Arc<dyn ChatBackend> = Arc::new(ProgressBackend { inner: Arc::new(Hang), progress: Arc::clone(&progress) });
+        let sink = Arc::new(ProgressSink {
+            inner: Arc::new(crate::agents::activity::NullSink),
+            progress: Arc::clone(&progress),
+        });
+        let scope = crate::agents::activity::ActivityScope::new(sink, "architect", None, None)
+            .with_heartbeat(Duration::from_millis(heartbeat_ms));
+        (progress, backend, scope)
+    }
+
+    fn silent_request() -> ChatRequest {
+        ChatRequest {
+            model: "m".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            effort: None,
+            response_json: false,
+            web_search: false,
+        }
+    }
+
+    /// Spec 114 T04 (F-01): os sinais da chamada ao modelo (`model`, o heartbeat dela e
+    /// `model_end`) não são progresso do turno. Uma chamada muda é cortada pelo prazo de
+    /// inatividade, não pelo teto absoluto, mesmo com o heartbeat do escopo menor que o prazo.
+    #[tokio::test]
+    async fn silent_model_call_expires_by_idleness_despite_model_heartbeats() {
+        let (progress, backend, scope) = progress_parts(20);
+        let run = scope.begin();
+        let req = silent_request();
+        let on_delta = |d| run.delta(d);
+        let started = std::time::Instant::now();
+        let out = with_idle_deadline(run.track_model(backend.complete_stream(&req, &on_delta)), limits(150, 3_000), &progress).await;
+        assert!(out.is_none());
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1_500), "cortada só pelo teto: {took:?}");
+    }
+
+    /// O heartbeat de comando continua renovando o prazo (só o teto corta o comando longo).
+    #[tokio::test]
+    async fn command_heartbeat_still_renews_idleness() {
+        let (progress, _, scope) = progress_parts(20);
+        let run = scope.begin();
+        let started = std::time::Instant::now();
+        let out = with_idle_deadline(run.track_command("npm test", std::future::pending::<()>()), limits(150, 700), &progress).await;
+        assert!(out.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(650), "{:?}", started.elapsed());
     }
 
     /// Fake que, antes de responder, passa `waits` intervalos de `every` avisando a espera de
@@ -1767,7 +1817,7 @@ mod tests {
             Some(Arc::new(Throttled { every: Duration::from_millis(60), waits: 20, inner }));
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, limits(150, 300)).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body["error"], TIMEOUT_CODE);
+        assert_eq!(body["code"], TIMEOUT_CODE);
     }
 
     #[tokio::test]
@@ -1836,7 +1886,7 @@ mod tests {
         let (_, dynb) = backend(Vec::new());
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error"], "provider_connect_failed");
+        assert_eq!(body["params"]["provider"], "provider_connect_failed");
         assert_eq!(body["code"], CODE_PROVIDER_FAILED);
         assert_eq!(body["params"], json!({"provider": "provider_connect_failed"}));
     }
@@ -1848,7 +1898,7 @@ mod tests {
         let (_, dynb) = backend(vec![text("   ")]);
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error"], "provider_bad_response");
+        assert_eq!(body["params"]["provider"], "provider_bad_response");
         assert_eq!(body["detail"], "sem texto nem ação");
         // Spec 102: `code` estável e `params` com a causa e o motivo.
         assert_eq!(body["code"], CODE_PROVIDER_FAILED);
@@ -1868,7 +1918,7 @@ mod tests {
         })]);
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error"], "provider_http_400");
+        assert_eq!(body["params"]["provider"], "provider_http_400");
         let text = body.to_string();
         assert!(!text.contains(SECRET), "{text}");
         assert!(!text.contains("api.exemplo"), "{text}");
@@ -1900,7 +1950,7 @@ mod tests {
             let (_, dynb) = backend(vec![reply]);
             let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "caso {code}");
-            assert_eq!(body["error"], code);
+            assert_eq!(body["params"]["provider"], code);
             assert!(!body.to_string().contains(SECRET), "caso {code}: {body}");
             // Só a resposta ruim leva `detail` (código com caractere inválido é omitido).
             if code == "provider_bad_response" {
@@ -2101,7 +2151,7 @@ mod tests {
         let state = state_for(&root, config_for(&root, true));
         let (status, body) = get_history(&state, "nao-existe", HOST).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], PROJECT_NOT_FOUND);
+        assert_eq!(body["code"], "project_not_found");
         let (status, _) = get_history(&state, "bad.id", HOST).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -2428,12 +2478,12 @@ mod tests {
             .try_start(PROJECT_ID, crate::server::state::REPORT_RESERVATION)
             .expect("reserva");
         let body = json!({ "message": "oi" }).to_string();
-        let resp = run_turn(&state, PROJECT_ID, body.as_bytes(), CHAT_TIMEOUT, None).await.expect("resp");
+        let resp = run_turn(&state, PROJECT_ID, body.as_bytes(), CHAT_TIMEOUT, None).await.unwrap_or_else(IntoResponse::into_response);
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.expect("corpo");
         let parsed: Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(parsed["reason"], "report_in_progress");
-        assert_eq!(parsed["error"], REPORT_BUSY);
+        assert_eq!(parsed["code"], REPORT_BUSY_CODE);
         assert!(turn_events(&drain_events(&mut rx)).is_empty());
     }
 

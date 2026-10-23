@@ -496,7 +496,8 @@ impl LlmArchitect {
             Vec::new(),
             self.policy.clone(),
             Arc::clone(&self.approver),
-        );
+        )
+        .with_lang(self.lang.get());
         let mut tool_specs = tools::specs(ToolRole::Architect);
         if let Some((access, extra)) = self.net_for(NetPhase::Plan) {
             host = host.with_internet(access);
@@ -1044,6 +1045,7 @@ pub(crate) mod testing {
             web_search_calls: 0,
             citations: Vec::new(),
             web_search_rejected: false,
+            billing: Default::default(),
         })
     }
 
@@ -1071,6 +1073,7 @@ pub(crate) mod testing {
             web_search_calls: 0,
             citations: Vec::new(),
             web_search_rejected: false,
+            billing: Default::default(),
         })
     }
 

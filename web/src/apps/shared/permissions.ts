@@ -25,7 +25,7 @@ export interface DecidableRequest {
   agent: string;
   kind?: string | null;
   alwaysAllowed?: boolean;
-  alwaysDeniedReason?: string | null;
+  alwaysDeniedCode?: string | null;
 }
 
 /**
@@ -61,7 +61,7 @@ export function optionHint(request: DecidableRequest, decision: PermissionDecisi
 /** Por que não há "Sempre" (só motivos conhecidos do servidor; o resto vira o genérico). */
 export function alwaysDeniedExplanation(request: DecidableRequest): string | null {
   if (isEnvironmentRequest(request) || request.alwaysAllowed === true) return null;
-  return permissionAlwaysReason(request.alwaysDeniedReason);
+  return permissionAlwaysReason(request.alwaysDeniedCode);
 }
 
 function isDecision(value: unknown): value is PermissionDecision {

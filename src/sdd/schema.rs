@@ -465,8 +465,14 @@ pub struct TaskMeta {
     /// Última execução dos testes na integração (base, após o squash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_run: Option<TestRun>,
+    /// Motivo gravado para a pessoa, no idioma do projeto (em BLOCKED, o motivo do bloqueio).
+    /// Tarefas antigas o têm em pt-BR: continua sendo exibido como está.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// Código estável, sem idioma, do motivo em `next_action` (spec 114 T02): é o que as máquinas
+    /// leem (retomada, recuperação). Ausente em tarefas antigas e fora de BLOCKED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action_code: Option<String>,
     /// Linhas alteradas de código (sem testes nem docs; `agents::runner::is_test_or_doc`) em `base...branch`,
     /// uma entrada por revisão de tentativa, na ordem (spec 087 T05). Vazio não é gravado.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

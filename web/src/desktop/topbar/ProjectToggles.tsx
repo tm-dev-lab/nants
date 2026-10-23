@@ -8,6 +8,7 @@ import { useId, useState } from "react";
 import { putProjectInternet, putProjectYolo } from "../../api/client";
 import type { ProjectState } from "../../api/types";
 import { t as translateNow } from "../../i18n";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
 import { appStore } from "../../store";
 import { Dialog } from "../Dialog";
@@ -60,7 +61,7 @@ export function YoloToggle({ projectId, state, onChanged }: ToggleProps) {
     const result = await putProjectYolo(projectId, enabled);
     setBusy(false);
     if (!result.ok) {
-      setError(translateNow("autoApprove.error", { message: result.error.message }));
+      setError(translateNow("autoApprove.error", { message: apiFailureText(result.error) }));
       return false;
     }
     await onChanged();
@@ -142,7 +143,7 @@ export function InternetToggle({ projectId, state }: Omit<ToggleProps, "onChange
     const result = await putProjectInternet(projectId, next);
     if (!result.ok) {
       setOptimistic(null);
-      setError(translateNow("internet.error", { message: result.error.message }));
+      setError(translateNow("internet.error", { message: apiFailureText(result.error) }));
       return;
     }
     const data = result.data;

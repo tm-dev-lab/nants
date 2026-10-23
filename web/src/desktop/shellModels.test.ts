@@ -72,8 +72,8 @@ describe("/api/readiness (parser)", () => {
 describe("POST /api/projects {name}", () => {
   it("409 project_dir_exists devolve o caminho; 400 e 412 viram mensagens fixas", async () => {
     const replies = [
-      { status: 409, body: { error: "project_dir_exists", path: "/home/u/NantsProjects/loja" } },
-      { status: 400, body: { error: "nome inválido: use letras ou números" } },
+      { status: 409, body: { error: "a pasta do projeto já existe", code: "project_dir_exists", path: "/home/u/NantsProjects/loja" } },
+      { status: 400, body: { error: "nome inválido: use letras ou números", code: "project_name_invalid" } },
       { status: 412, body: { error: "prereq_missing", missing: ["git"] } },
     ];
     installFetch(() => replies.shift() ?? { status: 500 });

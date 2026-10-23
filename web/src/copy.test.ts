@@ -186,3 +186,15 @@ describe("dica de limite do provedor (spec 089)", () => {
     expect(out).not.toContain(LIMIT);
   });
 });
+
+describe("falhas do plano ChatGPT (spec 116 T02)", () => {
+  it.each([
+    ["provider_plan_limit", "Limite de uso do plano ChatGPT atingido. Confira em Gerenciar uso."],
+    ["provider_plan_not_eligible", "Esta conta ChatGPT não pode usar o plano pelo Nants."],
+    ["provider_plan_needs_login", "A conexão pelo plano ChatGPT pede para entrar de novo. Use Reconectar em Configurações."],
+  ])("%s tem mensagem própria, sem dica de protocolo nem de espera", (code, text) => {
+    expect(isProviderFailureCode(code)).toBe(true);
+    expect(providerFailureMessage(code, "chat")).toBe(text);
+    expect(providerFailureText(code, "responses")).toBe(text);
+  });
+});

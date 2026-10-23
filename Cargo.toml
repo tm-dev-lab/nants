@@ -23,6 +23,10 @@ rust-embed = { version = "8", default-features = false, features = ["debug-embed
 # As duas já estavam no Cargo.lock (dependências de outras crates); nada de openssl.
 getrandom = "0.2"
 sha2 = "0.11"
+# Conexão pelo plano ChatGPT (spec 116): RS256 do ID token pelo `ring` e base64url do JWT. As duas
+# já estavam no Cargo.lock (o `ring` vem do rustls); nenhuma dependência nova de criptografia.
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 http-body-util = "0.1"

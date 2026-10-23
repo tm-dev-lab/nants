@@ -96,7 +96,7 @@ describe("PermissionMessage: decisões", () => {
 
   it("404 (já resolvido em outra janela) vira resolvido sem decisão e sem erro", async () => {
     seed([req("r1", "cargo test")]);
-    installFetch(() => ({ status: 404, body: { error: "pedido de permissão não encontrado" } }));
+    installFetch(() => ({ status: 404, body: { error: "pedido de permissão não encontrado", code: "permission_not_found" } }));
     const user = userEvent.setup();
     render(<Harness />);
 
@@ -109,7 +109,7 @@ describe("PermissionMessage: decisões", () => {
 
   it("erro do servidor mantém o pedido com botões e mostra a mensagem do erro nele", async () => {
     seed([req("r1", "cargo test")]);
-    installFetch(() => ({ status: 500, body: { error: "falha interna" } }));
+    installFetch(() => ({ status: 500, body: { error: "falha interna", code: "internal" } }));
     const user = userEvent.setup();
     render(<Harness />);
 
@@ -195,6 +195,7 @@ describe("PermissionMessage: escopos honestos (JSON literal do servidor)", () =>
     command: "node --test",
     always_allowed: false,
     always_denied_reason: "este comando executa código arbitrário",
+    always_denied_code: "arbitrary",
   };
 
   it("sem always_allowed: não há 'Sempre permitir' e a explicação fixa aparece", () => {
@@ -207,7 +208,7 @@ describe("PermissionMessage: escopos honestos (JSON literal do servidor)", () =>
   });
 
   it("campo always_allowed ausente é tratado como não permitido (sem 'Sempre')", () => {
-    const { always_allowed: _omit, always_denied_reason: _reason, ...legacy } = NOT_ALWAYS;
+    const { always_allowed: _omit, always_denied_reason: _reason, always_denied_code: _code, ...legacy } = NOT_ALWAYS;
     arrive(legacy);
     render(<Harness />);
 
@@ -237,14 +238,14 @@ describe("PermissionMessage: escopos honestos (JSON literal do servidor)", () =>
   });
 
   it("motivo genérico do servidor vira o texto genérico do cliente", () => {
-    arrive({ ...NOT_ALWAYS, always_denied_reason: "não pode ser liberado permanentemente" });
+    arrive({ ...NOT_ALWAYS, always_denied_reason: "não pode ser liberado permanentemente", always_denied_code: "generic" });
     render(<Harness />);
 
     expect(screen.getByText("este comando não pode ser liberado permanentemente")).not.toBeNull();
   });
 
-  it("razão desconhecida vira o texto genérico fixo (sem HTML)", () => {
-    arrive({ ...NOT_ALWAYS, always_denied_reason: "<b>texto livre do agente</b>" });
+  it("código desconhecido vira o texto genérico fixo (sem HTML)", () => {
+    arrive({ ...NOT_ALWAYS, always_denied_reason: "<b>texto livre do agente</b>", always_denied_code: "<b>texto livre do agente</b>" });
     const { container } = render(<Harness />);
 
     expect(screen.getByText("este comando não pode ser liberado permanentemente")).not.toBeNull();
@@ -253,11 +254,18 @@ describe("PermissionMessage: escopos honestos (JSON literal do servidor)", () =>
   });
 
   it("razão de segredo e de operadores mostram o texto fixo correspondente", () => {
-    arrive({ ...NOT_ALWAYS, always_denied_reason: "este comando contém um segredo e não pode ser liberado permanentemente" });
+    arrive({ ...NOT_ALWAYS, always_denied_reason: "este comando contém um segredo e não pode ser liberado permanentemente", always_denied_code: "secret" });
     render(<Harness />);
     expect(
       screen.getByText("este comando contém um segredo e não pode ser liberado permanentemente"),
     ).not.toBeNull();
+  });
+
+  it("o motivo vem pelo código, não pelo texto do servidor (spec 115 T03)", () => {
+    arrive({ ...NOT_ALWAYS, always_denied_reason: "texto de reserva", always_denied_code: "docker" });
+    render(<Harness />);
+    expect(screen.getByText("em modo docker, comandos que invocam docker ou podman não são liberados permanentemente")).not.toBeNull();
+    expect(screen.queryByText("texto de reserva")).toBeNull();
   });
 });
 
@@ -298,7 +306,7 @@ describe("PermissionMessage: conversa, fila e isolamento", () => {
 
   it("erro de POST não aparece na mensagem de outro pedido", async () => {
     seed([req("r1", "node --test"), req("r2", "cargo fmt --check")]);
-    installFetch(() => ({ status: 500, body: { error: "falha interna" } }));
+    installFetch(() => ({ status: 500, body: { error: "falha interna", code: "internal" } }));
     const user = userEvent.setup();
     render(<Harness />);
 
@@ -346,7 +354,7 @@ describe("PermissionMessage: conversa, fila e isolamento", () => {
   it("pedido reidratado do servidor (reload) aparece com as opções", () => {
     appStore.hydratePermissions(
       PID,
-      [{ request_id: "r9", agent: "developer", command: "node --test", task_id: "T01", always_allowed: false, always_denied_reason: "este comando executa código arbitrário" }],
+      [{ request_id: "r9", agent: "developer", command: "node --test", task_id: "T01", always_allowed: false, always_denied_reason: "este comando executa código arbitrário", always_denied_code: "arbitrary" }],
       0,
     );
     render(<Harness />);
@@ -387,7 +395,7 @@ describe("PermissionMessage: foco e acessibilidade", () => {
   });
 
   it("o conjunto de botões tem rótulo acessível e a explicação é ligada ao grupo", () => {
-    arrive({ request_id: "r1", project_id: PID, task_id: "T01", agent: "developer", command: "node --test", always_allowed: false, always_denied_reason: "este comando executa código arbitrário" });
+    arrive({ request_id: "r1", project_id: PID, task_id: "T01", agent: "developer", command: "node --test", always_allowed: false, always_denied_reason: "este comando executa código arbitrário", always_denied_code: "arbitrary" });
     render(<Harness />);
 
     const group = screen.getByRole("group", { name: "Decisão sobre o comando" });

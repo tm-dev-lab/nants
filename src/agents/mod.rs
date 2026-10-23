@@ -29,4 +29,8 @@ pub enum LlmError {
     Parse(llm_client::BadReason),
     #[error("configuração inválida: {0}")]
     Config(String),
+    /// Falha da conexão pelo plano ChatGPT que pausa a execução (spec 116 T02): limite de uso,
+    /// conta não elegível ou precisa entrar de novo. Não se repete.
+    #[error("plano ChatGPT: {}", .0.as_str())]
+    Plan(llm_client::PlanError),
 }

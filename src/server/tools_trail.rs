@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::error::ApiError;
 use super::events::{
@@ -42,11 +42,6 @@ const READ_MAX_BYTES: u64 = MAX_TOOLS_TRAIL_BYTES + 64 * 1024;
 /// Máximo de arquivos lembrados no cache de contagens (ao passar, o cache é esvaziado).
 const CACHE_MAX_ENTRIES: usize = 256;
 const MAX_TASK_LEN: usize = 64;
-const SPEC_NOT_FOUND: &str = "spec não encontrada";
-const BEFORE_MSG: &str = "before deve ser um inteiro positivo";
-const LIMIT_MSG: &str = "limit deve ser um inteiro entre 1 e 500";
-const TASK_MSG: &str = "task inválida";
-const INTERNAL_MSG: &str = "falha interna";
 
 /// Uma linha válida da trilha, com a posição no arquivo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,12 +283,12 @@ pub async fn get_tools(
     let root = PathBuf::from(&project.path);
     let page = tokio::task::spawn_blocking(move || -> Result<TrailPage, ApiError> {
         if !spec_exists(&root, &spec_id) {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, SPEC_NOT_FOUND));
+            return Err(ApiError::coded(StatusCode::NOT_FOUND, "spec_not_found", Map::new()));
         }
         Ok(read_page(&root, &spec_id, task.as_deref(), before, limit))
     })
     .await
-    .map_err(|_| ApiError::internal(INTERNAL_MSG))??;
+    .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))??;
     Ok(Json(page_view(&secrets, page)).into_response())
 }
 
@@ -309,7 +304,7 @@ fn parse_task(raw: Option<&str>) -> Result<Option<String>, ApiError> {
         {
             Ok(Some(text.to_string()))
         }
-        Some(_) => Err(ApiError::unprocessable(TASK_MSG)),
+        Some(_) => Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "task_invalid", Map::new())),
     }
 }
 
@@ -321,7 +316,7 @@ fn parse_before(raw: Option<&str>) -> Result<Option<u64>, ApiError> {
             .ok()
             .filter(|n| *n >= 1)
             .map(Some)
-            .ok_or_else(|| ApiError::unprocessable(BEFORE_MSG)),
+            .ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "before_invalid", Map::new())),
     }
 }
 
@@ -332,7 +327,7 @@ fn parse_limit(raw: Option<&str>) -> Result<usize, ApiError> {
             .parse::<usize>()
             .ok()
             .filter(|n| (1..=MAX_LIMIT).contains(n))
-            .ok_or_else(|| ApiError::unprocessable(LIMIT_MSG)),
+            .ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "limit_invalid", Map::new())),
     }
 }
 

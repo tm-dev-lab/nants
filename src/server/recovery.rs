@@ -69,14 +69,10 @@ const YOLO_REINFORCED_NOTE: &str = "\n## Aprovação automática: ESCALATE NÃO 
 pub const ENV_FIX_PREFIX: &str = "- Correção de ambiente (aprovação automática) #";
 /// Prefixo antigo (antes da 095/T08), ainda contado nas tarefas já gravadas.
 const LEGACY_ENV_FIX_PREFIX: &str = "- Correção de ambiente (YOLO) #";
-/// Premissa registrada quando o YOLO converte um ESCALATE em nova rodada (C-02).
-const PREMISE_NOTE: &str = "premissa registrada: a aprovação automática está ligada e não há decisão do humano; seguir a estratégia sugerida abaixo";
 /// Linhas do corpo da tarefa com o prefixo atual ou o antigo (antes da 095/T08, com "YOLO").
 fn count_marked_lines(body: &str, prefix: &str, legacy: &str) -> usize {
     body.lines().filter(|l| l.starts_with(prefix) || l.starts_with(legacy)).count()
 }
-/// Estratégia padrão quando o modelo escalou sem sugerir nada.
-const DEFAULT_YOLO_STRATEGY: &str = "adotar a abordagem mais simples e direta que satisfaça os critérios, sem depender de decisão do humano";
 /// Cauda da última saída de testes enviada ao modelo.
 pub const MAX_TEST_TAIL_BYTES: usize = 6 * 1024;
 /// Limite do diff da branch contra a base enviado ao modelo.
@@ -90,6 +86,11 @@ const MAX_FACTS_BYTES: usize = 40 * 1024;
 const ARCHITECT_AGENT: &str = "architect";
 
 /// Causas fixas de ESCALATE sem decisão do modelo.
+///
+/// As `CAUSE_*` são marcadores estruturais (spec 115 T04): o servidor as compara (`starts_with`,
+/// contagem de ciclos, escalada determinística) e a web as reconhece pelo texto em pt-BR e as mostra
+/// no idioma ativo (`localizeRecoveryCause` em `web/src/recoveryAnalysis.ts`, na análise da Conversa
+/// e no cartão de recuperação). Por isso ficam fixas, iguais em todos os idiomas.
 pub const CAUSE_UNAVAILABLE: &str = "análise indisponível";
 pub const CAUSE_ENVIRONMENT: &str = "ambiente: o comando de testes não executou";
 /// Falha de ambiente em que o modelo propôs reescrever a tarefa (rebaixaria a verificação).
@@ -356,7 +357,7 @@ pub async fn recover(
                 // enquanto houver rodadas (C-02).
                 if yolo_mode && loaded.rounds < MAX_AUTONOMOUS_ROUNDS && is_escalate(&decision) {
                     forced = true;
-                    premise_retry(decision)
+                    premise_retry(scope.state.project_lang(scope.project_id).get(), decision)
                 } else {
                     decision
                 }
@@ -564,7 +565,8 @@ pub async fn adjust_environment(
         state.events().clone(),
         Arc::clone(secrets),
     )
-    .with_dialog(dialog.clone());
+    .with_dialog(dialog.clone())
+    .with_lang(state.project_lang(project_id));
     let req = EnvChangeRequest {
         role: Role::Architect,
         task_id: Some(task_id.to_string()),
@@ -584,7 +586,8 @@ pub async fn adjust_environment(
     }
     let (job_root, spec) = (root.to_path_buf(), spec_id.to_string());
     let pairs: Vec<(String, String)> = files.into_iter().map(|f| (f.path, f.content)).collect();
-    tokio::task::spawn_blocking(move || super::runs::adopt_environment_files(&job_root, &spec, &pairs))
+    let lang = state.project_lang(project_id).get();
+    tokio::task::spawn_blocking(move || super::runs::adopt_environment_files(&job_root, &spec, &pairs, lang))
         .await
         .map_err(|_| MigrateError::Failed("falha interna na adoção".to_string()))?
         .map(|_| ())
@@ -611,9 +614,10 @@ async fn apply_migration_decision(
     let Some(option) = decision.migrate.clone() else {
         return Ok(decision);
     };
-    let reason = format!(
-        "A tarefa {task_id} precisa de um ajuste no ambiente docker (a imagem não tem um componente): {}",
-        decision.root_cause
+    let reason = crate::i18n::tr(
+        scope.state.project_lang(scope.project_id).get(),
+        "approvals.recovery.env_reason",
+        &[("task", task_id), ("cause", &decision.root_cause)],
     );
     let migrated = adjust_environment(
         scope.state,
@@ -699,8 +703,16 @@ fn env_fix_decision(reason: &str) -> Decision {
     }
 }
 
-/// Converte um ESCALATE em RETRY com a estratégia/proposta sugerida e a premissa registrada.
-fn premise_retry(escalate: Decision) -> Decision {
+/// Causa raiz com a opção que a aprovação automática aplicou, no idioma do projeto (spec 115 T03).
+fn auto_applied(lang: crate::i18n::Lang, cause: &str, label: &str) -> String {
+    crate::i18n::tr(lang, "recovery.auto_applied", &[("cause", cause), ("label", label)])
+}
+
+/// Converte um ESCALATE em RETRY com a estratégia/proposta sugerida e a premissa registrada (C-02).
+/// A premissa (`recovery.premise_note`) e a estratégia padrão quando o modelo escalou sem sugerir
+/// nada (`recovery.default_strategy`) vão para a causa raiz e a estratégia da análise, que a pessoa
+/// lê no Quadro e no cartão de recuperação: saem no idioma do projeto (spec 115 T04).
+fn premise_retry(lang: crate::i18n::Lang, escalate: Decision) -> Decision {
     let mut strategy = escalate.strategy.clone().unwrap_or_default();
     if let Some(proposal) = &escalate.proposal {
         if !strategy.is_empty() {
@@ -709,12 +721,12 @@ fn premise_retry(escalate: Decision) -> Decision {
         strategy.push_str(proposal);
     }
     if strategy.trim().is_empty() {
-        strategy = DEFAULT_YOLO_STRATEGY.to_string();
+        strategy = crate::i18n::text(lang, "recovery.default_strategy");
     }
     Decision {
         retry: true,
         revise: None,
-        root_cause: format!("{} ({PREMISE_NOTE})", escalate.root_cause),
+        root_cause: format!("{} ({})", escalate.root_cause, crate::i18n::text(lang, "recovery.premise_note")),
         strategy: Some(strategy),
         proposal: None,
         config: None,
@@ -733,6 +745,7 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
         return decision;
     }
     let decision = validate_decision_options(scope, loaded, decision).await;
+    let lang = scope.state.project_lang(scope.project_id).get();
     if loaded.yolo && loaded.rounds < MAX_AUTONOMOUS_ROUNDS {
         let config = decision.options.iter().find(|o| o.kind == OptionKind::Config).map(|o| {
             (o.label.clone(), ConfigProposal { test_command: o.test_command.clone(), checks: o.checks.clone() })
@@ -741,7 +754,7 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
             return Decision {
                 retry: true,
                 revise: None,
-                root_cause: format!("{} (a aprovação automática aplicou a opção «{label}»)", decision.root_cause),
+                root_cause: auto_applied(lang, &decision.root_cause, &label),
                 strategy: decision.strategy.or(Some(label)),
                 proposal: None,
                 config: Some(proposal),
@@ -757,7 +770,7 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
             return Decision {
                 retry: true,
                 revise: None,
-                root_cause: format!("{} (a aprovação automática aplicou a opção «{}»)", decision.root_cause, option.label),
+                root_cause: auto_applied(lang, &decision.root_cause, &option.label),
                 strategy: decision.strategy.clone().or_else(|| Some(option.label.clone())),
                 proposal: None,
                 config: None,
@@ -884,8 +897,13 @@ async fn apply_config_decision(
         scope.state.events().clone(),
         Arc::clone(scope.secrets),
     )
-    .with_dialog(scope.dialog.clone());
-    let reason = format!("A tarefa {task_id} falhou por configuração do comando de testes: {}", decision.root_cause);
+    .with_dialog(scope.dialog.clone())
+    .with_lang(scope.state.project_lang(scope.project_id));
+    let reason = crate::i18n::tr(
+        scope.state.project_lang(scope.project_id).get(),
+        "approvals.recovery.config_reason",
+        &[("task", task_id), ("cause", &decision.root_cause)],
+    );
     let approval = tokio::select! {
         biased;
         _ = wait_shutdown(shutdown) => return Err(Stop::Shutdown),
@@ -1311,7 +1329,9 @@ async fn ask_raw(
         state.approvals().clone(),
         state.events().clone(),
         Arc::clone(scope.secrets),
-    ).with_dialog(scope.dialog.clone()));
+    )
+    .with_dialog(scope.dialog.clone())
+    .with_lang(state.project_lang(scope.project_id)));
     let activity = Arc::new(
         BusActivitySink::new(state.events().clone(), scope.project_id, Arc::clone(scope.secrets))
             .with_trail(root.clone(), scope.spec_id),
@@ -1329,7 +1349,7 @@ async fn ask_raw(
         Some(scope.spec_id.to_string()),
         Some(task_id.to_string()),
     )
-    .with_usage(super::usage::FileUsageSink::new(root.clone(), scope.project_id))
+    .with_usage(super::usage::FileUsageSink::redacting(root.clone(), scope.project_id, Arc::clone(scope.secrets)))
     .with_memory(Arc::clone(scope.secrets));
     if let Some(setup) = internet {
         architect = architect.with_internet(setup);
@@ -1671,6 +1691,10 @@ pub fn env_files_option(
 /// - `revise_task`: reescreve objetivo/critérios/escopo.
 ///
 /// Não muda o status nem grava a marca de retomada: quem retoma (`reset_plan`) faz as duas coisas.
+///
+/// O cabeçalho da seção (`## Orientação do humano`) é lido pelo runner e fica fixo; as entradas
+/// são texto livre e saem no idioma do projeto, `lang` (spec 115 T04).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_choice(
     root: &Path,
     spec_id: &str,
@@ -1679,11 +1703,13 @@ pub fn apply_choice(
     secrets: &SecretSet,
     docker: DockerProbe<'_>,
     adopted: bool,
+    lang: crate::i18n::Lang,
 ) -> Result<&'static str, ChoiceError> {
+    let tr = |key: &str, params: &[(&str, &str)]| crate::i18n::tr(lang, key, params);
     let (rel, mut task) = load_blocked(root, spec_id, task_id)?;
     let applied = match choice {
         Choice::Guidance(text) => {
-            let entry = format!("Orientação do humano: {}", scrub_text(secrets, text.trim()));
+            let entry = tr("recovery.choice.guidance", &[("text", &scrub_text(secrets, text.trim()))]);
             task.body = add_human_guidance(&task.body, &entry);
             OptionKind::Guidance.as_str()
         }
@@ -1695,15 +1721,15 @@ pub fn apply_choice(
                         ConfigProposal { test_command: option.test_command.clone(), checks: option.checks.clone() };
                     let change = validate_config(root, &proposal, secrets).map_err(|_| ChoiceError::Stale)?;
                     write_config(root, &change, secrets).map_err(|_| ChoiceError::Io)?;
-                    let entry = format!(
-                        "Escolhi a opção «{}»: a configuração de testes foi alterada pelo servidor ({}). Rode os testes como o `test_command` atual.",
-                        option.label,
-                        change.commands.join(" | ")
+                    let entry = tr(
+                        "recovery.choice.config",
+                        &[("label", &option.label), ("commands", &change.commands.join(" | "))],
                     );
                     task.body = add_human_guidance(&task.body, &scrub_text(secrets, &entry));
                 }
                 OptionKind::Guidance => {
-                    let entry = format!("Escolhi a opção «{}»: {}", option.label, option.text.as_deref().unwrap_or_default());
+                    let entry =
+                        tr("recovery.choice.option", &[("label", &option.label), ("text", option.text.as_deref().unwrap_or_default())]);
                     task.body = add_human_guidance(&task.body, &entry);
                 }
                 OptionKind::Environment => {
@@ -1711,17 +1737,13 @@ pub fn apply_choice(
                     let entry = match &option.files {
                         Some(files) if adopted => {
                             let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-                            format!(
-                                "Escolhi a opção «{}»: o servidor aplicou o ajuste aprovado do ambiente docker ({}); test_command e checks rodam no workspace. {text}",
-                                option.label,
-                                names.join(", ")
+                            tr(
+                                "recovery.choice.environment_adopted",
+                                &[("label", &option.label), ("files", &names.join(", ")), ("text", text)],
                             )
                         }
                         Some(_) => return Err(ChoiceError::Io),
-                        None => format!(
-                            "Escolhi a opção «{}» (orientação sobre o ambiente; sem arquivos propostos, nada foi alterado). Proponha a mudança pelo fluxo de aprovação (`request_environment_change`, arquivos em .nants/): {text}",
-                            option.label
-                        ),
+                        None => tr("recovery.choice.environment_note", &[("label", &option.label), ("text", text)]),
                     };
                     task.body = add_human_guidance(&task.body, &scrub_text(secrets, &entry));
                 }
@@ -1732,7 +1754,7 @@ pub fn apply_choice(
                         allowed_scope: option.allowed_scope.clone(),
                     };
                     apply_revision(&mut task, &revision);
-                    let entry = format!("Escolhi a opção «{}»: a definição da tarefa foi revisada.", option.label);
+                    let entry = tr("recovery.choice.revised", &[("label", &option.label)]);
                     task.body = add_human_guidance(&task.body, &entry);
                 }
             }
@@ -2283,8 +2305,11 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
         meta.id,
         cap(meta.title.clone(), 200)
     ));
+    // O texto está no idioma do projeto (ou em pt-BR, nas tarefas antigas); o código estável
+    // (spec 114 T02), quando houver, identifica o motivo sem depender do idioma.
+    let block_code = meta.next_action_code.as_deref().map(|c| format!(" (código: {})", cap(c.to_string(), 40))).unwrap_or_default();
     out.push_str(&format!(
-        "Motivo do bloqueio: {}\n",
+        "Motivo do bloqueio: {}{block_code}\n",
         cap(meta.next_action.clone().unwrap_or_default(), 500)
     ));
     out.push_str(&format!("allowed_scope: {}\n", cap(meta.allowed_scope.join(", "), 500)));

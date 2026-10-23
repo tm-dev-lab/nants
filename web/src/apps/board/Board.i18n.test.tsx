@@ -219,3 +219,21 @@ describe("Quadro em pt-BR e troca ao vivo", () => {
     expect(portugueseLeftovers(win)).toEqual([]);
   });
 });
+
+describe("Quadro em en: tarefa pausada (spec 114 T04)", () => {
+  it("selo, motivo curto e a ação na conversa sem português", async () => {
+    setLanguage("en", { persist: false });
+    const s = { ...makeSpec("s1", "Online shop", "IN_PROGRESS", [makeTask("T01", "Base", "DONE"), makeTask("T02", "Cart", "IN_PROGRESS")]) };
+    const view = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: makeProjectState({ id: "p1", name: "Shop", specs: [s], running: false, run: null }) } });
+    view.server.reply("GET", /\/api\/projects\/p1\/usage/, () => ({ status: 200, body: USAGE }));
+    await act(async () => {
+      appStore.appendMessage("p1", { role: "agent", agent: "system", specId: "s1", text: "O provedor do modelo falhou (x).", code: "run.provider_failed", params: { provider: "x" } });
+    });
+    await settle();
+    const win = screen.getByRole("region", { name: "Board" });
+    const card = win.querySelector('[data-task-id="T02"]') as HTMLElement;
+    expect(card.querySelector('[data-paused="provider"]')?.textContent).toBe("Pausedthe model provider failed");
+    expect(within(win).getByRole("button", { name: "Continue in the conversation: task T02" })).toBeTruthy();
+    expect(portugueseLeftovers(win)).toEqual([]);
+  });
+});

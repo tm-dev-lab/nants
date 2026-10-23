@@ -17,7 +17,6 @@ import { join, relative, resolve, sep } from "node:path";
 import { parseAst } from "rolldown/parseAst";
 import { describe, expect, it } from "vitest";
 import { looksPortuguese } from "./ptLeftovers";
-import { ptBR } from "./ptBR";
 
 const SRC = resolve(process.cwd(), "src");
 
@@ -39,36 +38,21 @@ interface Exception {
   why: string;
 }
 
-const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-/** Textos fixos do servidor e reservas do cliente que já têm chave (`serverMessage.*` e `api.*`). */
-const KNOWN_SERVER_TEXTS = new RegExp(
-  `^(?:${Object.entries(ptBR)
-    .filter(([key]) => key.startsWith("serverMessage.") || key.startsWith("api."))
-    .map(([, text]) => escapeRe(text))
-    .join("|")})$`,
-);
-
 const SERVER_FORMAT = "marca do formato gravado pelo servidor (sempre em pt-BR): só serve para reconhecer o texto; a tela mostra a chave do dicionário";
 
 const EXCEPTIONS: readonly Exception[] = [
-  {
-    file: "api/client.ts",
-    text: KNOWN_SERVER_TEXTS,
-    why: "mensagens fixas do servidor reconhecidas pelo texto (`KNOWN_SERVER_MESSAGES`); a tela mostra a chave `serverMessage.*`/`api.*` no idioma ativo (`messageKeyForText`)",
-  },
-  { file: "api/client.ts", text: "a pasta está dentro do repositório Git", why: `prefixo da mensagem do 409 de pasta aninhada; ${SERVER_FORMAT} (\`serverError.project_nested_repo\`)` },
+
   { file: "api/client.ts", text: "não modificado", why: "reserva interna do 304 da leitura de arquivo; vira `not_modified` e nunca aparece" },
   { file: "api/types.ts", text: /^(criado|atualizado|reaproveitado)$/, why: "vocabulário fixo do servidor para a situação do perfil de especialista (tipo)" },
+  { file: "api/types.ts", text: "needs_login", why: "estado fixo do login pelo plano ChatGPT (`PlanStatus::NeedsLogin`, spec 116); a palavra `login` vem do dicionário pt, mas o estado não é texto de pessoa (a tela mostra `chatgpt.state.needsLogin`)" },
   { file: "apps/plan/PlanCard.tsx", text: "reaproveitado", why: "vocabulário fixo do servidor (situação do perfil); a tela mostra `plan.skillStatus.*`" },
   { file: "apps/conversation/Bubble.tsx", text: /^(aprovada automaticamente|aprovado automaticamente \(YOLO\)|\[rodada autônoma( YOLO)?\])$/, why: SERVER_FORMAT },
   { file: "apps/conversation/PausedRunCard.tsx", text: "Análise de recuperação", why: SERVER_FORMAT },
   { file: "apps/shared/activityText.ts", text: "repetindo (", why: `aviso de nova tentativa (\`llm_client::retry_notice\`); ${SERVER_FORMAT} (\`activity.retry.detail\`)` },
   { file: "copy.ts", text: "Defina a stack e o comando de testes (test_command) da spec e atualize-a para aprovação.", why: "mensagem interna enviada ao Arquiteto (`internal: true`), nunca exibida; prompts internos ficam em português (decisão 3)" },
-  { file: "copy.ts", text: /^(este comando executa código arbitrário|este comando contém operadores ou aspas|este comando contém um segredo e não pode ser liberado permanentemente|não pode ser liberado permanentemente)$/, why: `motivos de \`always_allowed: false\`; ${SERVER_FORMAT} (\`permission.always.*\`)` },
   { file: "copy.ts", text: "provedor no limite", why: `prefixo do detalhe da falha por limite do provedor; ${SERVER_FORMAT}` },
-  { file: "desktop/api.ts", text: "a pasta já existe", why: "reserva interna do 409 de pasta existente; a tela mostra o caminho (`kind: exists`), nunca esta frase" },
-  { file: "desktop/api.ts", text: /^pasta de projetos inválida: /, why: `mensagens fixas do 422 da pasta de projetos; ${SERVER_FORMAT} (\`api.projectsRoot.*\`)` },
+  { file: "copy.ts", text: "provider_plan_needs_login", why: "código fixo da falha do provedor (`ProviderFailure::Plan`, spec 116); a palavra `login` vem do dicionário pt, mas o código não é texto de pessoa (a tela mostra `providerMsg.planNeedsLogin`)" },
+
   { file: "desktop/theme/contrast.ts", text: /^(cor inválida:|o fundo do contraste precisa ser opaco)$/, why: "erro de programação dos tokens de tema (lançado nos testes de contraste), nunca exibido" },
   { file: "escalation.ts", text: /^(comando|trecho do erro|o que foi tentado|por que nao resolveu|opcoes)$/, why: `campos do bloco "Contexto" da escalada; ${SERVER_FORMAT}` },
   { file: "i18n/en.ts", text: "Português (Brasil)", why: "nome do idioma na própria língua, no seletor de idioma (o mesmo nos dois dicionários)" },
@@ -102,7 +86,7 @@ const EXCEPTIONS: readonly Exception[] = [
   },
   {
     file: "reviewMessage.ts",
-    text: /^(Critérios:|Apontamentos:|Observações \(não bloqueiam\):|Cenário de falha:|observação \(arquivo não mudou nesta rodada\)|Capturas avaliadas:|Aprovado|Pediu ajustes|Verificação final:)$/,
+    text: /^(Critérios:|Apontamentos:|Observações \(não bloqueiam\):|Cenário de falha:|observação \(arquivo não mudou nesta rodada\)|baixa confiança|Capturas avaliadas:|Aprovado|Pediu ajustes|Verificação final:)$/,
     why: `cabeçalhos e vereditos da mensagem do Revisor; ${SERVER_FORMAT} (\`review.*\`)`,
   },
 ];

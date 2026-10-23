@@ -84,6 +84,7 @@ fn config(root: &Path, architect: bool) -> Config {
         base_url: "https://api.example.com/v1".into(),
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     if architect {
         cfg.agents.architect = AgentConfig {
@@ -781,6 +782,7 @@ async fn traceability_redacts_long_secret_before_cutting_the_criterion() {
         base_url: "https://api.example.com/v1".into(),
         api_key: LONG.into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     let state = AppState::new(root.join("config.toml"), cfg, PORT)
         .with_report_backend(Scripted::new(vec![text(GOOD_REPORT)]));

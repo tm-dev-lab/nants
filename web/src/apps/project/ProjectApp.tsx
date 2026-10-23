@@ -16,7 +16,7 @@ import { putProjectLimits } from "../../api/client";
 import type { ProjectState } from "../../api/types";
 import { t as translateNow } from "../../i18n";
 import { useT } from "../../i18n/react";
-import { apiFailureText, messageText } from "../../i18n/serverCodes";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { EmptyState } from "../../desktop/EmptyState";
 import { Icon } from "../../desktop/Icon";
 import { useSpace } from "../../desktop/shellContext";
@@ -151,7 +151,7 @@ function ProjectContentView({ size }: AppContentProps) {
   const { data } = space;
   const state = data.state;
   if (state === null) {
-    return <EmptyState icon="project" message={data.loadError !== null ? messageText(data.loadError) : t("project.loading")} />;
+    return <EmptyState icon="project" message={data.loadError !== null ? apiFailureText(data.loadError) : t("project.loading")} />;
   }
   const path = entry?.path ?? data.project?.path ?? null;
   return (

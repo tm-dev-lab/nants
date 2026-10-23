@@ -11,6 +11,7 @@ import { useAppStore } from "../../store";
 import { formatActive, formatUsd } from "../../usageFormat";
 import { gateBlocked, gateLevel, isPrereqFailure, prereqItems, prereqMessage, readinessItemLabel } from "../../apps/shared/readiness";
 import { t } from "../../i18n";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
 import { Dialog } from "../Dialog";
 import { Icon } from "../Icon";
@@ -42,9 +43,9 @@ function taskProgress(spec: SpecView | null): string | null {
 /** Mensagem fixa de falha ao retomar/continuar (mesmo mapeamento do "Aprovar"). */
 export function resumeProblem(failure: ApiFailure): string {
   if (failure.status === 409 && failure.reason !== undefined) {
-    return APPROVE_REASON_MESSAGES[failure.reason] ?? (failure.message || APPROVE_FALLBACK_MESSAGE);
+    return APPROVE_REASON_MESSAGES[failure.reason] ?? (apiFailureText(failure) || APPROVE_FALLBACK_MESSAGE);
   }
-  return failure.message || APPROVE_FALLBACK_MESSAGE;
+  return apiFailureText(failure) || APPROVE_FALLBACK_MESSAGE;
 }
 
 /** "12 min · US$ 0,04" da spec (tempo ativo somado das tarefas e custo), recarregado com o estado. */
@@ -144,7 +145,7 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
       setStopping(true);
       setConfirming(false);
     } else {
-      setError(result.error.message);
+      setError(apiFailureText(result.error));
     }
   }
 

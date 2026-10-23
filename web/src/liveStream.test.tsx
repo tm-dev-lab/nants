@@ -47,7 +47,7 @@ function mockServer(serverPending: { request_id: string; agent: string; command:
     if (id !== undefined && NAMES[id] !== undefined) {
       return { body: makeProjectState({ id, name: NAMES[id], pending_permissions: serverPending }) };
     }
-    return { status: 404, body: { error: "projeto não encontrado" } };
+    return { status: 404, body: { error: "projeto não encontrado", code: "project_not_found" } };
   });
 }
 

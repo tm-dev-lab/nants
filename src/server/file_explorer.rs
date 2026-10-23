@@ -22,7 +22,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::error::ApiError;
 use super::events::{validate_project_id, SecretSet};
@@ -53,12 +53,6 @@ const LIST_TTL: Duration = Duration::from_secs(2);
 /// Quantidade máxima de raízes no cache da lista.
 const CACHE_MAX_ROOTS: usize = 64;
 
-const MSG_SOURCE: &str = "fonte inválida";
-const MSG_PATH: &str = "caminho inválido";
-const MSG_NOT_FOUND: &str = "não encontrado";
-const MSG_IO: &str = "falha de I/O no diretório do projeto";
-const MSG_NO_GIT: &str = "repositório git indisponível";
-const MSG_INTERNAL: &str = "falha interna";
 
 /// Fonte da árvore: base integrada ou worktree da tarefa ativa (resolvida no servidor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +66,7 @@ impl Source {
         match raw {
             None | Some("base") => Ok(Self::Base),
             Some("task") => Ok(Self::Task),
-            Some(_) => Err(ApiError::new(StatusCode::BAD_REQUEST, MSG_SOURCE)),
+            Some(_) => Err(ApiError::coded(StatusCode::BAD_REQUEST, "source_invalid", Map::new())),
         }
     }
 
@@ -236,17 +230,17 @@ fn cache() -> &'static ListCache {
 
 fn safe_error(e: SafeFsError) -> ApiError {
     match e {
-        SafeFsError::Missing => ApiError::new(StatusCode::NOT_FOUND, MSG_NOT_FOUND),
-        SafeFsError::Io => ApiError::internal(MSG_IO),
+        SafeFsError::Missing => ApiError::coded(StatusCode::NOT_FOUND, "not_found", Map::new()),
+        SafeFsError::Io => ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "project_dir_io", Map::new()),
         SafeFsError::Unsafe
         | SafeFsError::NotRegular
         | SafeFsError::TooLarge
-        | SafeFsError::Invalid => ApiError::new(StatusCode::BAD_REQUEST, MSG_PATH),
+        | SafeFsError::Invalid => ApiError::coded(StatusCode::BAD_REQUEST, "path_invalid", Map::new()),
     }
 }
 
 fn bad_path() -> ApiError {
-    ApiError::new(StatusCode::BAD_REQUEST, MSG_PATH)
+    ApiError::coded(StatusCode::BAD_REQUEST, "path_invalid", Map::new())
 }
 
 /// `.git` em qualquer componente ou `.sdd/worktrees` (e abaixo) nunca são expostos.
@@ -273,7 +267,7 @@ async fn blocking<T: Send + 'static>(
 ) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(job)
         .await
-        .map_err(|_| ApiError::internal(MSG_INTERNAL))?
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?
 }
 
 fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, (String, Instant, Arc<Listing>)>> {
@@ -298,7 +292,7 @@ fn build_listing(root: &Path) -> Result<Listing, ApiError> {
     let git = Git::new(root);
     let paths = git
         .ls_files_visible()
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, MSG_NO_GIT))?;
+        .map_err(|_| ApiError::coded(StatusCode::CONFLICT, "git_unavailable", Map::new()))?;
     let mut entries: Vec<Entry> = Vec::new();
     let mut listed: HashSet<String> = HashSet::new();
     let mut known_dirs: HashSet<String> = HashSet::new();
@@ -396,7 +390,7 @@ fn list_dir(root: &Path, rel: &str) -> Result<Listing, ApiError> {
     if !meta.file_type().is_dir() {
         return Err(bad_path());
     }
-    let read = fs::read_dir(&abs).map_err(|_| ApiError::internal(MSG_IO))?;
+    let read = fs::read_dir(&abs).map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "project_dir_io", Map::new()))?;
     let mut entries: Vec<Entry> = Vec::new();
     let mut scan_cut = false;
     for (i, child) in read.flatten().enumerate() {
@@ -612,7 +606,7 @@ fn read_diff(
     let git = Git::new(root);
     let text = if git.is_tracked(rel) {
         git.diff_file_worktree(&task.base, rel)
-            .map_err(|_| ApiError::new(StatusCode::CONFLICT, MSG_NO_GIT))?
+            .map_err(|_| ApiError::coded(StatusCode::CONFLICT, "git_unavailable", Map::new()))?
     } else if git.is_ignored(rel) {
         String::new()
     } else {
@@ -676,7 +670,7 @@ pub async fn get_file(
     let reveal = matches!(query.reveal.as_deref(), Some("1" | "true"));
     let diff = matches!(query.diff.as_deref(), Some("1" | "true"));
     if diff && source != Source::Task {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, MSG_SOURCE));
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "source_invalid", Map::new()));
     }
     let secrets = state.secret_set().await;
     let inm = headers

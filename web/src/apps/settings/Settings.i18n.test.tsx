@@ -162,6 +162,12 @@ describe("Configurações em en", () => {
     await act(async () => {
       fireEvent.click(within(win()).getByRole("button", { name: "New connection" }));
     });
+    // Spec 116: o primeiro passo pergunta como conectar.
+    expect(within(win()).getByText("How to connect")).toBeTruthy();
+    expect(within(win()).getByText("Use the plan on your ChatGPT account, no key needed.")).toBeTruthy();
+    expect(within(win()).getByRole("button", { name: "Continue with ChatGPT" })).toBeTruthy();
+    expectNoPortuguese();
+    fireEvent.click(within(win()).getByRole("button", { name: /^API key/ }));
     const form = within(win()).getByRole("region", { name: "New connection" });
     for (const label of ["Identifier", "Name", "Base URL", "API key"]) expect(within(form).getByLabelText(label)).toBeTruthy();
     expect(within(form).getByText("Protocol")).toBeTruthy();
@@ -268,7 +274,7 @@ describe("Configurações em en", () => {
     expect(within(win()).getByRole("group", { name: "Idioma / Language" })).toBeTruthy();
     expectNoPortuguese();
 
-    view.server.reply("PUT", /^\/api\/config\/projects-root$/, () => ({ status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido" } }));
+    view.server.reply("PUT", /^\/api\/config\/projects-root$/, () => ({ status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido", code: "projects_root_system" } }));
     await chooseTab(/^Projects/);
     const form = within(win()).getByRole("form", { name: "Projects root" });
     expect(form.textContent).toContain("A new project asks only for the name");

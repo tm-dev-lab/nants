@@ -151,6 +151,9 @@ describe("Primeiros passos", () => {
     fireEvent.click(step(/Conexão/));
     const win = setupWindow();
     expect(within(win).getByRole("heading", { name: "2. Conexão" })).toBeTruthy();
+    // Spec 116: o primeiro passo pergunta como conectar.
+    expect(within(win).getByText("Plano ChatGPT (Plus ou Pro)")).toBeTruthy();
+    fireEvent.click(within(win).getByRole("button", { name: /^Chave de API/ }));
     fireEvent.change(within(win).getByLabelText("Identificador"), { target: { value: "openai" } });
     fireEvent.change(within(win).getByLabelText("Nome"), { target: { value: "OpenAI" } });
     fireEvent.change(within(win).getByLabelText("URL base"), { target: { value: "https://api.openai.com/v1" } });

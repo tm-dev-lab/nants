@@ -191,6 +191,7 @@ fn config_for(root: &Path) -> Config {
         base_url: "https://api.example.com/v1".into(),
         api_key: "sk-e2e".into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     let agent = |model: &str| AgentConfig { connection_id: "c".into(), model: model.into(), effort: Effort::Low, max_steps: None };
     cfg.agents.architect = agent("arq");

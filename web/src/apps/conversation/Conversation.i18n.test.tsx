@@ -98,7 +98,7 @@ const PENDING: PendingPermission[] = [
     agent: "developer",
     command: `npm install ${"x".repeat(200)}`,
     alwaysAllowed: false,
-    alwaysDeniedReason: "este comando executa código arbitrário",
+    alwaysDeniedCode: "arbitrary",
     at: NOW - 30_000,
   },
   { requestId: "r2", projectId: PID, taskId: "T01", agent: "developer", command: "compose.yaml", kind: "environment", reason: "Needs redis", diff: "+ redis", at: NOW - 20_000 },

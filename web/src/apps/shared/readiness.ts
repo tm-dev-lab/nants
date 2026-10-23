@@ -30,7 +30,7 @@ export function gateBlocked(readiness: Readiness | null, gate: ReadinessGate): b
 
 /** Aba das Configurações de uma pendência pelo id (o servidor também manda `settings_tab`). */
 export function settingsTabForPrereq(id: string): SettingsTab {
-  if (id === "connection" || id.startsWith("connection_key:") || id.startsWith("connection_url:")) return "connections";
+  if (id === "connection" || id.startsWith("connection_key:") || id.startsWith("connection_url:") || id.startsWith("connection_plan:")) return "connections";
   if (id.startsWith("agent_")) return "agents";
   if (id.startsWith("pricing:")) return "pricing";
   return "machine";
@@ -63,6 +63,7 @@ function knownPrereqLabel(id: string): string | null {
   const param = at < 0 ? "" : id.slice(at + 1);
   if (kind === "connection_key") return t("prereq.connectionKey", { id: param });
   if (kind === "connection_url") return t("prereq.connectionUrl", { id: param });
+  if (kind === "connection_plan") return t("prereq.connectionPlan", { id: param });
   if (kind === "pricing") return t("prereq.pricing", { id: param });
   return null;
 }
@@ -105,6 +106,7 @@ const READINESS_CODE_KEYS: Readonly<Record<string, MessageKey>> = {
   ...MACHINE_LABEL_KEYS,
   connection_key: "prereq.item.connection_key",
   connection_url: "prereq.item.connection_url",
+  connection_plan: "prereq.item.connection_plan",
   pricing: "prereq.item.pricing",
 };
 

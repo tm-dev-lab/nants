@@ -56,7 +56,7 @@ and you decide at every step.
   and the Reviewer can see.
 - **Cost per task.** Token usage and an estimated cost in dollars for each spec, task and agent.
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
-- **Your provider.** Any OpenAI compatible provider, with one model per role.
+- **Your provider.** Any OpenAI compatible provider, or your ChatGPT plan, with one model per role.
 - **No telemetry.** Your keys and your code stay on your computer.
 
 ## Requirements
@@ -64,7 +64,7 @@ and you decide at every step.
 - Linux, or Windows with WSL2 (x86_64 or aarch64)
 - [Docker](https://docs.docker.com/engine/install/) with Compose v2, usable without `sudo`
 - Git
-- An API key for an OpenAI compatible provider
+- An API key for an OpenAI compatible provider, or a ChatGPT Plus or Pro plan
 
 ## Install
 
@@ -104,6 +104,28 @@ gh attestation verify nants-X.Y.Z-x86_64-linux.tar.gz --repo tm-dev-lab/nants
    the model for each agent.
 2. Create a project: just give it a name. Nants creates a Git repository in `~/NantsProjects`.
 3. Describe your idea in the Conversation, answer the Architect and approve the plan.
+
+## Use your ChatGPT plan
+
+With a ChatGPT Plus or Pro subscription, a connection can use the plan on your account instead of
+an API key. This feature is in preview.
+
+1. In **Settings**, click **New connection** and pick **ChatGPT plan (Plus or Pro)**. The same
+   choice is in **Getting started**.
+2. Click **Continue with ChatGPT** and sign in. The sign-in happens in the browser of the computer
+   running Nants, because OpenAI returns to `127.0.0.1`. On a phone or another device, the screen
+   asks you to do this step on that computer.
+3. Back in Settings, the connection is ready, named after your account e-mail, with the models of
+   your account. Pick them under **Agents**.
+
+Usage counts against your plan, with no cost in dollars; the Costs window shows it as
+**ChatGPT plan**, in tokens. On Plus, the 5-hour usage limit is shared with your other apps that
+use the plan. Check it with **Manage usage** (<https://chatgpt.com/settings/usage>). When the limit
+is reached, the run pauses until you click **Continue**.
+
+The sign-in is stored in the Nants data folder (`~/.local/share/nants`), in files readable only by
+your user. **Sign out**, on the connection row, revokes the access at OpenAI and deletes the
+sign-in from this computer. If Nants asks you to sign in again, use **Reconnect**.
 
 ## Use it from your phone (local network)
 
@@ -189,7 +211,8 @@ executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized
   `nants.tmdevlab.com` to check for a new version and, for cost estimates, downloads a public
   price catalog.
 - **Your keys stay local.** API keys are stored only in your configuration file and are never
-  shown in full, logged or sent to the browser.
+  shown in full, logged or sent to the browser. The ChatGPT plan sign-in stays in the data folder,
+  readable only by your user, and is never logged or sent to the browser.
 - The server listens only on your computer (`127.0.0.1`) by default.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).

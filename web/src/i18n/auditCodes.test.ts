@@ -185,11 +185,11 @@ describe("mensagens fixas do servidor no idioma ativo", () => {
   });
 
   it("'falha interna' e 'projeto não encontrado' dos arquivos e do App saem em en", async () => {
-    stubFetch(500, { error: "falha interna" });
+    stubFetch(500, { error: "falha interna", code: "internal" });
     const internal = await getConfig();
     if (internal.ok) throw new Error("esperava falha");
     expect(apiFailureText(internal.error, "en")).toBe("internal failure");
-    stubFetch(404, { error: "projeto não encontrado" });
+    stubFetch(404, { error: "projeto não encontrado", code: "project_not_found" });
     const missing = await getConfig();
     if (missing.ok) throw new Error("esperava falha");
     expect(apiFailureText(missing.error, "en")).toBe("project not found");

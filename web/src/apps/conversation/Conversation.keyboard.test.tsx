@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { Conversation } from "./Conversation";
 import { useAppStore } from "../../store";
 import type { ChatMessage } from "../../store";
-import { ATTACH_LABEL } from "./ChatAttachments";
+import { ATTACH_LABEL } from "../../test-utils";
 import { KEYBOARD_RESIZE_DEBOUNCE_MS, MOBILE_QUERY } from "../../desktop/viewport";
 
 vi.mock("../../api/client", async (importOriginal) => ({

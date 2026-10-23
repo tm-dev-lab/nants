@@ -388,7 +388,9 @@ impl LlmClient {
         opts: &ImageOptions,
         on_notice: impl Fn(String),
     ) -> Result<GeneratedImage, LlmError> {
-        if self.wire_api != WireApi::Responses {
+        // Spec 116 T02: a ferramenta hospedada de imagem não funciona pelo plano ChatGPT; o Nants
+        // segue com o caminho alternativo (SVG/CSS), sem requisição.
+        if self.wire_api != WireApi::Responses || self.plan.is_some() {
             return Err(LlmError::Parse(IMAGE_UNSUPPORTED));
         }
         let estimate = || {

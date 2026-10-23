@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getConfig, getRequestLanguage, KNOWN_SERVER_MESSAGES, LANG_HEADER, messageKeyForText, postChat } from "../api/client";
+import { getConfig, getRequestLanguage, LANG_HEADER, postChat } from "../api/client";
 import { isMessageCode, parseCodeParams } from "../api/codes";
 import { parseApiEvent } from "../api/events";
 import { setLanguage } from "./index";
-import { apiFailureText, messageText, noticeText, systemMessageText, translateCode } from "./serverCodes";
+import { apiFailureText, noticeText, systemMessageText, translateCode } from "./serverCodes";
 import { en } from "./en";
 import { ptBR } from "./ptBR";
 
@@ -96,25 +96,20 @@ describe("erros da API no idioma ativo (en)", () => {
     expect(apiFailureText(r.error)).toBe("The request is too large.");
   });
 
-  it("sem code: a mensagem fixa conhecida do servidor sai no idioma ativo pelo texto (spec 102 T05)", async () => {
-    stubFetch(404, { error: "projeto não encontrado" });
+  it("o code traduz nos dois idiomas; o texto do servidor nunca é casado (spec 115 T02)", async () => {
+    stubFetch(404, { error: "projeto não encontrado", code: "project_not_found" });
     const r = await getConfig();
     if (r.ok) throw new Error("esperava falha");
-    expect(r.error.message).toBe("projeto não encontrado");
-    expect(r.error.messageKey).toBe("serverMessage.projectNotFound");
+    expect(r.error.code).toBe("project_not_found");
+    expect(r.error.message).toBe("recurso não encontrado");
     expect(apiFailureText(r.error, "en")).toBe("project not found");
     expect(apiFailureText(r.error, "pt-BR")).toBe("projeto não encontrado");
-    // Texto guardado como string (`configError`, `loadError`): o mesmo caminho.
-    expect(messageText("projeto não encontrado", "en")).toBe("project not found");
-    expect(messageText("resposta inesperada do servidor", "en")).toBe("unexpected response from the server");
-    expect(messageText("um texto qualquer", "en")).toBe("um texto qualquer");
-  });
-
-  it("toda mensagem fixa do servidor repassada pelo cliente tem chave no dicionário", () => {
-    for (const message of KNOWN_SERVER_MESSAGES) {
-      if (message === "timeout") continue;
-      expect(messageKeyForText(message), message).toBeDefined();
-    }
+    // Sem code, o texto conhecido do servidor não vale mais: sai a reserva por status.
+    stubFetch(404, { error: "projeto não encontrado" });
+    const bare = await getConfig();
+    if (bare.ok) throw new Error("esperava falha");
+    expect(bare.error.messageKey).toBe("api.status.404");
+    expect(apiFailureText(bare.error, "en")).toBe(en["api.status.404"]);
   });
 
   it("sem code nem mensagem conhecida: texto de reserva por status no idioma ativo", async () => {
@@ -142,7 +137,7 @@ describe("erros da API no idioma ativo (en)", () => {
 
   it("falha do provedor no chat traz code e params", async () => {
     stubFetch(502, {
-      error: "provider_bad_response",
+      error: "o provedor do modelo falhou (provider_bad_response)",
       detail: "incompleta: content_filter",
       code: "provider_failed",
       params: { provider: "provider_bad_response", kind: "incomplete", provider_code: "content_filter" },
@@ -152,7 +147,7 @@ describe("erros da API no idioma ativo (en)", () => {
     expect(r.error.params).toEqual({ provider: "provider_bad_response", kind: "incomplete", provider_code: "content_filter" });
     expect(apiFailureText(r.error, "en")).toBe("The model provider failed (provider_bad_response (incomplete: content_filter)).");
     expect(apiFailureText(r.error, "pt-BR")).toBe("O provedor do modelo falhou (provider_bad_response (incompleta: content_filter)).");
-    stubFetch(502, { error: "provider_connect_failed", code: "provider_failed", params: { provider: "provider_connect_failed" } });
+    stubFetch(502, { error: "o provedor do modelo falhou (provider_connect_failed)", code: "provider_failed", params: { provider: "provider_connect_failed" } });
     const plain = await postChat("p1", "oi");
     if (plain.ok) throw new Error("esperava falha");
     expect(apiFailureText(plain.error, "en")).toBe("The model provider failed (provider_connect_failed).");

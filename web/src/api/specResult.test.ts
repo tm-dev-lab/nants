@@ -9,7 +9,7 @@ const SERVER_RESULT = {
   status: "COMPLETED",
   tasks: [
     { id: "T01", title: "Modelo", status: "DONE" },
-    { id: "T02", title: "Rotas", status: "DONE", error: "arquivo inválido" },
+    { id: "T02", title: "Rotas", status: "DONE", error: "arquivo inválido", code: "file_invalid" },
   ],
   commits: [
     {
@@ -83,7 +83,7 @@ describe("getSpecResult: contrato", () => {
   });
 
   it("404 vira falha estática do cliente, sem expor o corpo", async () => {
-    installFetch(() => ({ status: 404, body: { error: "spec não encontrada", leak: "<b>x</b>" } }));
+    installFetch(() => ({ status: 404, body: { error: "spec não encontrada", code: "spec_not_found", leak: "<b>x</b>" } }));
     const result = await getSpecResult("p1", "001-x");
     expect(result).toMatchObject({ ok: false, error: { kind: "http", status: 404 } });
     expect(JSON.stringify(result)).not.toContain("leak");

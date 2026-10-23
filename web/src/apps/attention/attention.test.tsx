@@ -12,6 +12,7 @@ import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { renderShell, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
+import { liveNow } from "../../liveClock";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 import {
   ACTION_KINDS,
@@ -221,8 +222,12 @@ describe("aviso flutuante de permissão", () => {
     });
     const field = screen.getByRole("textbox", { name: "Mensagem para o Arquiteto" });
     field.focus();
-    // Instantes de chegada distintos (a ordem dos avisos é a de chegada).
-    let clock = 1_000_000;
+    // A ordem dos avisos é a de chegada, mesmo com o relógio de parede recuando no meio (no WSL,
+    // ~2 s a cada ~32 s): o relógio da linha do tempo (114/T01) repete a última hora e o
+    // desempate é a ordem de chegada (114/T04). O recuo é simulado de propósito: a hora de
+    // parede fica 2 s abaixo da última hora já devolvida, e o teste não depende do relógio real.
+    liveNow();
+    let clock = Date.now() - 2_000;
     vi.spyOn(Date, "now").mockImplementation(() => (clock += 10));
     await act(async () => {
       stream().emit("permission_requested", permissionEvent("p1", "r1", "cargo test"));

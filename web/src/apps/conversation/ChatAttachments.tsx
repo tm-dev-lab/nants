@@ -10,24 +10,11 @@ import { useCallback, useRef, useState } from "react";
 import { uploadChatAttachment } from "../../api/client";
 import { chatAttachmentUrl, MAX_CHAT_ATTACHMENTS } from "../../chatImages";
 import { Icon } from "../../desktop/Icon";
-import { t, translate } from "../../i18n";
+import { t } from "../../i18n";
 import { useT } from "../../i18n/react";
-import { ptBR } from "../../i18n/ptBR";
 import { prepareImage } from "../../imageResize";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { ImageLightbox } from "../shared/ImageLightbox";
-
-/*
- * Reservas pt-BR dos textos dos anexos (testes em pt-BR); a tela usa as chaves `attachments.*` no
- * idioma ativo.
- */
-export const ATTACH_LABEL = ptBR["attachments.attach"];
-export const ATTACHMENTS_LIMIT_NOTICE = translate("pt-BR", "attachments.limit", { max: MAX_CHAT_ATTACHMENTS });
-export const ATTACHMENTS_FAILED_NOTICE = ptBR["attachments.failed"];
-export const ATTACHMENTS_PREVIEW_LABEL = ptBR["attachments.previewLabel"];
-export const USER_IMAGES_LABEL = ptBR["attachments.sentLabel"];
-export const THUMB_PLACEHOLDER_TEXT = ptBR["attachments.placeholder"];
-export const ATTACHED_IMAGE_TITLE = ptBR["attachments.attachedTitle"];
 
 type DraftStatus = "uploading" | "ready" | "error";
 

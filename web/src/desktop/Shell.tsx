@@ -25,6 +25,7 @@ import {
 import { approveSpec } from "../api/client";
 import { t, tp } from "../i18n";
 import { useLanguage } from "../i18n/react";
+import { apiFailureText } from "../i18n/serverCodes";
 import type { LanRange, Project, ProjectEntry } from "../api/types";
 import { renderAttentionPanel as renderDefaultAttentionPanel } from "../apps/attention/AttentionPanel";
 import { attentionFor } from "../apps/attention/attentionModel";
@@ -74,6 +75,8 @@ import { DOCK_ORDER, WINDOW_META } from "./windowMeta";
 import { workspaceForViewport } from "./metrics";
 import { canUndo, MIN_WINDOW_H, WINDOW_KINDS, type Layout, type WindowAction, type WindowKind, type Workspace } from "./windows";
 import { SpaceLoading, SpaceNotFound, Welcome } from "./Welcome";
+import { ChatgptWelcome } from "../apps/settings/ChatgptWelcome";
+import { dismissChatgptWelcome, parseChatgptSection, useChatgptReturn } from "../apps/settings/chatgptPlan";
 
 /** Tempo do aviso (com "Desfazer") na tela. */
 const TOAST_MS = 8_000;
@@ -130,6 +133,8 @@ interface Shared {
   toast: Toast | null;
   setToast: (toast: Toast | null | ((t: Toast | null) => Toast | null)) => void;
   setupAutoOpened: MutableRefObject<boolean>;
+  /** A volta do login pelo plano ChatGPT já abriu as Configurações (uma vez por carga). */
+  chatgptOpened: MutableRefObject<boolean>;
   /** Janela a abrir quando o próximo espaço estiver pronto (`goTo` para outro projeto). */
   pendingOpen: MutableRefObject<{ projectId: string; kind: WindowKind } | null>;
   settingsRequest: SettingsRequest | null;
@@ -164,6 +169,7 @@ export function Shell(props: ShellProps) {
   const [bellOpen, setBellOpen] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const setupAutoOpened = useRef(false);
+  const chatgptOpened = useRef(false);
   const pendingOpen = useRef<{ projectId: string; kind: WindowKind } | null>(null);
   const [settingsRequest, setSettingsRequest] = useState<SettingsRequest | null>(null);
   const mobile = useMobileMode();
@@ -215,6 +221,7 @@ export function Shell(props: ShellProps) {
     toast,
     setToast,
     setupAutoOpened,
+    chatgptOpened,
     pendingOpen,
     settingsRequest,
     setSettingsRequest,
@@ -531,6 +538,25 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
     dispatch({ type: "open", kind: "setup" });
   }, [readiness, layoutReady, dispatch, shared.setupAutoOpened]);
 
+  // --- Volta do login pelo plano ChatGPT (spec 116 T03): abre Configurações > Conexões (com a
+  // conexão pronta ou o erro) e, depois do primeiro login, as boas-vindas uma vez só ---
+  const chatgptBack = useChatgptReturn();
+  const chatgptSection = useUiSection(globalState, UI_SECTIONS.chatgpt, parseChatgptSection);
+  useEffect(() => {
+    if (chatgptBack.result === null || !layoutReady || shared.chatgptOpened.current) return;
+    shared.chatgptOpened.current = true;
+    openSettings("connections");
+  }, [chatgptBack.result, layoutReady, openSettings, shared.chatgptOpened]);
+  const welcomeLoaded = globalState.snapshot.ready;
+  useEffect(() => {
+    if (chatgptBack.welcome && welcomeLoaded && chatgptSection.welcomed) dismissChatgptWelcome();
+  }, [chatgptBack.welcome, welcomeLoaded, chatgptSection.welcomed]);
+  const showChatgptWelcome = chatgptBack.welcome && welcomeLoaded && !chatgptSection.welcomed;
+  const closeChatgptWelcome = useCallback(() => {
+    globalState.set(UI_SECTIONS.chatgpt, { welcomed: true });
+    dismissChatgptWelcome();
+  }, [globalState]);
+
   // --- Aviso com "Desfazer": vale enquanto a mudança anunciada for a última ---
   const toast = shared.toast;
   useEffect(() => {
@@ -750,7 +776,7 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
       {space !== null && space.loadError !== null && space.status !== "not_found" ? (
         <div className="nd-bar-alert nd-overlay" role="alert" data-bar-alert="load">
           <Icon name="alert" size={16} className="nd-bar-alert-icon" />
-          <span className="nd-bar-alert-text">{space.loadError}</span>
+          <span className="nd-bar-alert-text">{apiFailureText(space.loadError)}</span>
           <button type="button" className="nd-btn" onClick={() => void space.reload()}>
             {t("common.tryAgain")}
           </button>
@@ -766,6 +792,7 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
       <PermissionToasts />
       {shared.launcherOpen ? <Launcher items={launcherItems} onClose={() => shared.setLauncherOpen(false)} /> : null}
       {shared.newProjectOpen ? <NewProjectDialog onClose={() => shared.setNewProjectOpen(false)} onCreated={onCreated} /> : null}
+      {showChatgptWelcome ? <ChatgptWelcome onClose={closeChatgptWelcome} /> : null}
       {toast !== null ? (
         <div className="nd-toast nd-overlay" role="status" data-toast="" data-titled={toast.title !== undefined ? "true" : undefined}>
           {toast.title !== undefined ? (

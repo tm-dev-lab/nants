@@ -47,6 +47,25 @@ export interface ConnectionView {
   api_key_masked: string;
   /** Ausente em servidores antigos: a UI trata como `chat`. */
   wire_api?: WireApi;
+  /** Como a conexão se autentica (spec 116); ausente = por chave. */
+  kind?: ConnectionKind;
+  /** Estado do login da conexão pelo plano ChatGPT (spec 116), sem segredos. */
+  chatgpt?: ChatgptPlanStatus;
+}
+
+/** Tipo da conexão (spec 116): chave de API ou plano ChatGPT. */
+type ConnectionKind = "api_key" | "chatgpt_plan";
+
+/** Estado do login pelo plano ChatGPT (`GET /api/connections/:id/chatgpt`). */
+export type ChatgptPlanStatus =
+  | { state: "connected"; email: string }
+  | { state: "needs_login"; email: string }
+  | { state: "disconnected" };
+
+/** Resposta de `POST /api/connections/chatgpt/start`: `local` = o pedido veio deste computador. */
+export interface ChatgptStartResult {
+  url: string;
+  local: boolean;
 }
 
 /**
@@ -59,6 +78,8 @@ export interface ConnectionInput {
   base_url: string;
   api_key?: string;
   wire_api?: WireApi;
+  /** Na conexão pelo plano ChatGPT, só o nome muda por aqui (spec 116). */
+  kind?: ConnectionKind;
 }
 
 export interface AgentConfig {
@@ -193,6 +214,21 @@ export interface UsageTotals {
   images_usd?: number;
   /** Alguma imagem usou a estimativa padrão por qualidade (sem preço por imagem). */
   images_estimated?: boolean;
+  /**
+   * Chamadas pelo plano ChatGPT (spec 116 T02): só tokens, sem US$; fora das contagens acima e do
+   * orçamento em dólar. Omitido sem nenhuma.
+   */
+  chatgpt_plan?: PlanUsageTotals;
+}
+
+/** Totais das chamadas pelo plano ChatGPT (spec 116 T02). */
+export interface PlanUsageTotals {
+  calls: number;
+  input: number;
+  output: number;
+  cached: number;
+  reasoning: number;
+  web_search_calls?: number;
 }
 
 export interface NamedUsage extends UsageTotals {
@@ -252,7 +288,10 @@ export interface TestConnectionResult {
 
 /** Um modelo listado por `GET /api/config/connections/:id/models`. */
 interface ModelEntry {
+  /** O que vai no pedido (no plano ChatGPT, o `slug`). */
   id: string;
+  /** Nome mostrado (no plano ChatGPT, o `display_name`; spec 116 T02). */
+  name?: string;
 }
 
 /**
@@ -407,8 +446,10 @@ export interface PendingPermissionView {
   task_id: string | null;
   /** Ausente = não permitido (servidor antigo): a UI não oferece "Sempre permitir". */
   always_allowed?: boolean;
-  /** Motivo fixo quando `always_allowed` é falso; `null`/ausente quando permitido. */
+  /** Motivo fixo (texto de reserva do servidor, não exibido) quando `always_allowed` é falso. */
   always_denied_reason?: string | null;
+  /** Código do motivo (`permission.always.<código>`, spec 115 T03); `null`/ausente quando permitido. */
+  always_denied_code?: string | null;
   /** `"environment"`: mudança do ambiente Docker (motivo e diff abaixo); ausente = comando. */
   kind?: string | null;
   reason?: string | null;
@@ -621,6 +662,7 @@ interface PermissionRequestedPayload {
   /** Ausente = não permitido: não oferecer "Sempre permitir". */
   always_allowed?: boolean;
   always_denied_reason?: string | null;
+  always_denied_code?: string | null;
   kind?: string | null;
   reason?: string | null;
   diff?: string | null;
@@ -701,7 +743,7 @@ interface ArchitectTurnView {
 }
 
 /** `agent_activity`: evento efêmero (nunca persistido). `reasoning`/`text` são snapshots do acumulado. */
-type AgentActivityKind = "start" | "reasoning" | "text" | "tool" | "command" | "heartbeat" | "command_end" | "end";
+type AgentActivityKind = "start" | "reasoning" | "text" | "tool" | "command" | "heartbeat" | "command_end" | "model" | "model_end" | "end";
 
 export interface AgentActivityPayload {
   agent: string;
@@ -712,6 +754,10 @@ export interface AgentActivityPayload {
   text?: string;
   /** Só em `command`: início do comando (ms desde a época Unix). */
   command_started_at?: number;
+  /** Só em `model` (spec 114 T04): início da chamada ao modelo (ms desde a época Unix). */
+  model_started_at?: number;
+  /** No `heartbeat` da chamada ao modelo: bytes já recebidos da resposta (ausente = nenhum ainda). */
+  received_bytes?: number;
   /** Rótulo da etapa (ex.: "Atualizando ARCHITECTURE.md"), reserva em pt-BR. */
   stage?: string;
   /** `code`/`params` da etapa e do texto (rótulo de ferramenta, aviso do limitador), spec 102. */
@@ -735,6 +781,9 @@ export interface ActivitySnapshot {
   tool: string;
   command?: string | null;
   command_started_at?: number | null;
+  /** Chamada ao modelo em curso (spec 114 T04): início (ms, época Unix) e bytes recebidos. */
+  model_started_at?: number | null;
+  received_bytes?: number | null;
   stage?: string | null;
   /** `code`/`params` da etapa, do último rótulo e do último texto (spec 102). */
   stage_code?: string | null;

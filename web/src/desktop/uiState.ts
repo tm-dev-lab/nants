@@ -43,6 +43,8 @@ export const UI_SECTIONS = {
   network: "network",
   /** Idioma da interface (spec 101): `{lang: "pt-BR" | "en"}`, por servidor. */
   language: "language",
+  /** Plano ChatGPT (spec 116 T03): `{welcomed: true}` depois das boas-vindas, que aparecem uma vez só. */
+  chatgpt: "chatgpt",
   selection: "selection",
   mobile: "mobile",
   layout: (category: LayoutCategory, slot: LayoutSlot): string => `layouts.${category}.${slot}`,
@@ -55,7 +57,8 @@ export function isSectionAllowed(scope: UiScope, section: string): boolean {
       section === UI_SECTIONS.appearance ||
       section === UI_SECTIONS.hints ||
       section === UI_SECTIONS.network ||
-      section === UI_SECTIONS.language
+      section === UI_SECTIONS.language ||
+      section === UI_SECTIONS.chatgpt
     );
   }
   if (section === UI_SECTIONS.selection || section === UI_SECTIONS.mobile) return true;

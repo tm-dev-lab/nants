@@ -57,14 +57,14 @@ use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
 use super::approvals::{replace_atomic, ApprovalRegistry, ProjectApprover, RunScopeGuard, PERSIST_LOCK};
-use super::error::{json_response, ApiError};
+use super::error::{params, ApiError};
 use super::dialog::{deliver, DialogTarget};
 use crate::agents::activity::ActivitySink;
 use super::events::{validate_project_id, ApiEvent, BusActivitySink, BusSink, EventBus, EventType, SecretSet};
 use super::projects::{check_local_excludes, ensure_local_excludes, is_git_repo, scrub_text};
 use super::{recovery, report};
 use super::safe_fs::{self, SafeFsError, MAX_READ_BYTES, O_NOFOLLOW};
-use super::state::{AppState, ReserveError, INTERNAL_RESERVATION_PREFIX, REPORT_BUSY_MSG, REPORT_RESERVATION};
+use super::state::{AppState, ReserveError, INTERNAL_RESERVATION_PREFIX, REPORT_BUSY_CODE, REPORT_RESERVATION};
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_agents::{LlmDeveloper, LlmReviewer};
 use crate::agents::llm_client::{LlmClient, ProviderFailure};
@@ -95,18 +95,18 @@ const WORKTREES_EXCLUDE: &str = ".sdd/worktrees";
 /// Status exposto em `run.status` enquanto o runner executa.
 const EXECUTING: &str = "executing";
 
-const SPEC_ID_MSG: &str = "spec_id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres";
-const PROJECT_NOT_FOUND: &str = "projeto não encontrado";
-const SPEC_NOT_FOUND: &str = "spec não encontrada";
-const INVALID_SPEC: &str = "spec inválida";
-const SPEC_DRAFT: &str = "spec ainda em rascunho; finalize com o Arquiteto";
-const SPEC_NOT_AWAITING: &str = "spec não está aguardando aprovação";
-const SPEC_NOT_IN_PROGRESS: &str = "spec não está em andamento";
-const NO_BLOCKED_TASK: &str = "não há tarefa pendente para retomar";
-const SPEC_CHANGED: &str = "spec foi alterada durante a aprovação; tente novamente";
-const TASKS_CHANGED: &str = "tarefas foram alteradas durante a retomada; tente novamente";
-const BUSY: &str = "já existe uma execução em andamento neste projeto";
-const SHUTTING_DOWN_MSG: &str = "servidor encerrando";
+const SPEC_ID_MSG: &str = "spec_id_invalid";
+const PROJECT_NOT_FOUND: &str = "project_not_found";
+const SPEC_NOT_FOUND: &str = "spec_not_found";
+const INVALID_SPEC: &str = "spec_invalid";
+const SPEC_DRAFT: &str = "spec_draft";
+const SPEC_NOT_AWAITING: &str = "spec_not_awaiting";
+const SPEC_NOT_IN_PROGRESS: &str = "spec_not_in_progress";
+const NO_BLOCKED_TASK: &str = "no_blocked_task";
+const SPEC_CHANGED: &str = "spec_changed_approval";
+const TASKS_CHANGED: &str = "tasks_changed_resume";
+const BUSY: &str = "run_active";
+const SHUTTING_DOWN_MSG: &str = "shutting_down";
 /// Motivo do `idle` quando o shutdown interrompe a aprovação antes do runner começar.
 const SHUTDOWN_REASON: &str = "shutdown";
 /// Motivo do `idle` quando o usuário para a execução (spec 086 T04).
@@ -114,27 +114,26 @@ const STOPPED_REASON: &str = "stopped";
 /// Mensagem do sistema no diálogo depois da parada pelo usuário.
 const STOPPED_TEXT: &str = "Execução parada pelo usuário. Use Continuar para retomar.";
 /// 409 da parada sem execução ativa daquela spec.
-const NOT_RUNNING_MSG: &str = "não há execução em andamento desta spec";
-const GIT_TIMEOUT_MSG: &str = "tempo limite na verificação do repositório";
-const WRITE_FAILED: &str = "falha ao gravar o estado da spec";
-const INTERNAL: &str = "falha interna";
-const SETTINGS_MSG: &str = "configuração do projeto inválida";
-const TEST_COMMAND_MSG: &str = "test_command ausente nas configurações do projeto";
-const BASE_BRANCH_MSG: &str = "base_branch ausente nas configurações do projeto";
-const NO_TASKS_MSG: &str = "a spec não tem tarefas";
-const INVALID_TASK_MSG: &str = "tarefa inválida para aprovação";
-const DEP_MISSING_MSG: &str = "tarefa depende de tarefa inexistente";
-const DEP_CYCLE_MSG: &str = "dependências circulares entre tarefas";
-const NOT_GIT_MSG: &str = "o projeto não é um repositório Git válido";
-const BASE_DIRTY_MSG: &str = "a base tem alterações não commitadas fora de .sdd/specs";
+const NOT_RUNNING_MSG: &str = "no_run_for_spec";
+const GIT_TIMEOUT_MSG: &str = "git_timeout";
+const WRITE_FAILED: &str = "spec_write_failed";
+const INTERNAL: &str = "internal";
+const SETTINGS_MSG: &str = "settings_invalid";
+const TEST_COMMAND_MSG: &str = "test_command_missing";
+const BASE_BRANCH_MSG: &str = "base_branch_missing";
+const NO_TASKS_MSG: &str = "no_tasks";
+const INVALID_TASK_MSG: &str = "invalid_task";
+const DEP_MISSING_MSG: &str = "dependency_missing";
+const DEP_CYCLE_MSG: &str = "dependency_cycle";
+const NOT_GIT_MSG: &str = "not_git_repo";
+const BASE_DIRTY_MSG: &str = "base_dirty";
 /// `reason` fixo das respostas 409 de validação.
 const REASON_NO_TASKS: &str = "no_tasks";
 /// Aprovação de plano sem nenhuma tarefa (spec 080 T01). A retomada mantém `no_tasks`.
 const REASON_PLAN_WITHOUT_TASKS: &str = "plan_without_tasks";
 /// Aprovação recusada enquanto o Arquiteto ainda elabora o plano (spec 080 T01).
 const REASON_ARCHITECT_TURN: &str = "architect_turn_active";
-const ARCHITECT_TURN_MSG: &str =
-    "o Arquiteto ainda está elaborando o plano; aguarde o fim do turno para aprovar";
+const ARCHITECT_TURN_MSG: &str = "architect_turn_active";
 const REASON_INVALID_TASK: &str = "invalid_task";
 const REASON_DEP_MISSING: &str = "dependency_missing";
 const REASON_DEP_CYCLE: &str = "dependency_cycle";
@@ -143,28 +142,24 @@ const REASON_BASE_BRANCH: &str = "base_branch_missing";
 const REASON_SETTINGS: &str = "settings_invalid";
 const REASON_ENV_INVALID: &str = "environment_invalid";
 const REASON_ENV_CHANGED: &str = "environment_changed";
-const ENV_CHANGED_MSG: &str =
-    "os arquivos do ambiente (.nants/) mudaram desde a aprovação; peça ao Arquiteto um plano com o ambiente e aprove-o";
-const ARCH_INVALID_MSG: &str = "o ARCHITECTURE.md do plano é inválido (título, seções fixas, até 64 KiB, arquivo regular): corrija-o com o Arquiteto antes de aprovar";
-const ARCH_COMMIT_MSG: &str = "não foi possível commitar o ARCHITECTURE.md na base";
+const ENV_CHANGED_MSG: &str = "environment_changed";
+const ARCH_INVALID_MSG: &str = "architecture_invalid";
+const ARCH_COMMIT_MSG: &str = "architecture_commit_failed";
 const ARCH_FILE: &str = crate::agents::arch_memory::ARCH_FILE;
-const SKILLS_INVALID_MSG: &str = "um perfil de especialista do plano (.sdd/skills) é inválido (formato, até 2 KiB, sem URLs): corrija-o com o Arquiteto antes de aprovar";
-const SKILLS_COMMIT_MSG: &str = "não foi possível commitar os perfis de especialista na base";
+const SKILLS_INVALID_MSG: &str = "skills_invalid";
+const SKILLS_COMMIT_MSG: &str = "skills_commit_failed";
 const RELAUNCH_FAILED: &str = "o relançamento em modo docker foi recusado; use Retomar";
 pub(crate) const REASON_ENV_NOT_DOCKER: &str = "environment_not_docker";
 const REASON_DOCKER_UNAVAILABLE: &str = "docker_unavailable";
-const PLAN_NOT_DOCKER_MSG: &str =
-    "o plano não declara `environment: docker`: todo projeto do Nants roda em docker; peça ao Arquiteto para replanejar com o ambiente docker";
-pub(crate) const PROJECT_NOT_DOCKER_MSG: &str = "este projeto não tem ambiente docker; replaneje a spec";
-const ENV_DENIED_MSG: &str = "a aprovação do ambiente foi negada; nada foi alterado";
-const ENV_COMMIT_MSG: &str = "não foi possível commitar os arquivos do ambiente (.nants/) na base";
-const ENV_TRACKED_MSG: &str =
-    "o ambiente docker precisa ser registrado em .sdd/settings.yaml, mas o arquivo é versionado; defina environment: docker e environment_hash nele";
+const PLAN_NOT_DOCKER_MSG: &str = "plan_not_docker";
+pub(crate) const PROJECT_NOT_DOCKER_CODE: &str = "project_not_docker";
+const ENV_DENIED_MSG: &str = "environment_denied";
+const ENV_COMMIT_MSG: &str = "environment_commit_failed";
+const ENV_TRACKED_MSG: &str = "environment_settings_tracked";
 const REASON_NOT_GIT: &str = "not_git_repo";
 const REASON_BASE_DIRTY: &str = "base_dirty";
 /// Motivo do 409 enquanto o relatório final da spec anterior é gerado.
 const REASON_BUDGET: &str = "budget_exceeded";
-const BUDGET_MSG: &str = "O orçamento da spec está atingido: aumente ou remova o limite antes de retomar.";
 const REASON_REPORT_IN_PROGRESS: &str = "report_in_progress";
 /// `reason` do evento `blocked` (o motivo do runner não é ecoado).
 const BLOCKED_REASON: &str = "task_blocked";
@@ -187,65 +182,28 @@ static SPEC_WRITE_LOCK: Mutex<()> = Mutex::new(());
 #[serde(deny_unknown_fields)]
 struct ApproveInput {}
 
-/// Resposta de rejeição: status, mensagem estática e, opcionalmente, `reason` fixo.
-#[derive(Debug)]
-struct Rejection {
-    status: StatusCode,
-    message: String,
-    reason: Option<&'static str>,
+/// Recusa das rotas de execução: um [`ApiError`] com código (spec 115 T02) e, às vezes, `reason`.
+type Rejection = ApiError;
+
+fn conflict(code: &'static str) -> Rejection {
+    ApiError::coded(StatusCode::CONFLICT, code, Map::new())
 }
 
-impl Rejection {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-            reason: None,
-        }
-    }
-
-    fn with_reason(status: StatusCode, message: &str, reason: &'static str) -> Self {
-        Self {
-            status,
-            message: message.to_string(),
-            reason: Some(reason),
-        }
-    }
-}
-
-impl From<ApiError> for Rejection {
-    fn from(err: ApiError) -> Self {
-        Self::new(err.status(), err.message().to_string())
-    }
-}
-
-impl IntoResponse for Rejection {
-    fn into_response(self) -> Response {
-        match self.reason {
-            None => json_response(self.status, &self.message),
-            Some(reason) => (
-                self.status,
-                Json(json!({"error": self.message, "reason": reason})),
-            )
-                .into_response(),
-        }
-    }
-}
-
-fn conflict(message: &str) -> Rejection {
-    Rejection::new(StatusCode::CONFLICT, message)
-}
-
-fn conflict_reason(message: &str, reason: &'static str) -> Rejection {
-    Rejection::with_reason(StatusCode::CONFLICT, message, reason)
+fn conflict_reason(code: &'static str, reason: &'static str) -> Rejection {
+    conflict(code).with_reason(reason)
 }
 
 fn invalid_spec() -> Rejection {
     conflict(INVALID_SPEC)
 }
 
-fn internal(message: &str) -> Rejection {
-    Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+fn internal(code: &'static str) -> Rejection {
+    ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, code, Map::new())
+}
+
+/// Recusa com o status dado e sem parâmetros.
+fn rejection(status: StatusCode, code: &'static str) -> Rejection {
+    ApiError::coded(status, code, Map::new())
 }
 
 /// Papel de agente da execução: backend pronto, modelo e esforço.
@@ -363,7 +321,7 @@ pub struct ConfiguredRunnerFactory;
 
 impl RunnerFactory for ConfiguredRunnerFactory {
     fn build(&self, job: RunJob) -> Result<Box<dyn SpecRunner>, RunnerError> {
-        let usage = super::usage::FileUsageSink::new(job.root.clone(), job.project_id.clone());
+        let usage = super::usage::FileUsageSink::redacting(job.root.clone(), job.project_id.clone(), Arc::clone(&job.secrets));
         let mut approver = ProjectApprover::new(
             job.project_id.clone(),
             job.root.clone(),
@@ -373,7 +331,8 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         )
         .with_run(job.run)
         .with_dialog(DialogTarget::new(job.root.clone(), job.spec_id.clone()))
-        .with_stop(job.stop.clone());
+        .with_stop(job.stop.clone())
+        .with_lang(job.lang.clone());
         // Juiz do YOLO (spec 062): o modelo do Arquiteto, custo contabilizado como `architect`.
         if let Some(a) = &job.architect {
             approver = approver.with_judge(Arc::new(
@@ -486,7 +445,7 @@ impl RunnerFactory for ConfiguredRunnerFactory {
             job.root,
             Box::new(developer),
             Box::new(reviewer),
-            Box::new(ShellTestExecutor::new()),
+            Box::new(ShellTestExecutor::new().with_lang(job.lang.clone())),
             Box::new(sink),
         )
         .with_cancel(job.cancel)
@@ -723,7 +682,7 @@ async fn stop(state: &AppState, id: &str, spec_id: &str, body: &[u8]) -> Result<
         let cfg = state.config().read().await;
         cfg.projects.iter().find(|p| p.id == id).cloned()
     }
-    .ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND))?;
+    .ok_or_else(|| rejection(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND))?;
     if state.runs().request_stop(id, spec_id) {
         return Ok((StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response());
     }
@@ -734,7 +693,7 @@ async fn stop(state: &AppState, id: &str, spec_id: &str, body: &[u8]) -> Result<
     })
     .await?;
     if missing {
-        return Err(Rejection::new(StatusCode::NOT_FOUND, SPEC_NOT_FOUND));
+        return Err(rejection(StatusCode::NOT_FOUND, SPEC_NOT_FOUND));
     }
     Err(conflict(NOT_RUNNING_MSG))
 }
@@ -763,12 +722,12 @@ struct ChoiceInput {
     guidance: Option<String>,
 }
 
-const TASK_ID_MSG: &str = "task_id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres";
-const TASK_NOT_FOUND: &str = "tarefa não encontrada";
-const TASK_NOT_BLOCKED: &str = "a tarefa não está bloqueada";
-const OPTION_STALE: &str = "a opção não existe mais ou venceu; use a escalada mais recente";
-const CHOICE_INVALID: &str = "informe option_id com analysis (número da análise) ou guidance (texto até 2048 bytes)";
-const CHOICE_FAILED: &str = "falha ao aplicar a escolha";
+const TASK_ID_MSG: &str = "task_id_invalid";
+const TASK_NOT_FOUND: &str = "task_not_found";
+const TASK_NOT_BLOCKED: &str = "task_not_blocked";
+const OPTION_STALE: &str = "option_stale";
+const CHOICE_INVALID: &str = "choice_invalid";
+const CHOICE_FAILED: &str = "choice_failed";
 const MAX_OPTION_ID_LEN: usize = 64;
 
 fn validate_task_id(id: &str) -> Result<(), Rejection> {
@@ -778,17 +737,17 @@ fn validate_task_id(id: &str) -> Result<(), Rejection> {
     if ok {
         Ok(())
     } else {
-        Err(Rejection::new(StatusCode::UNPROCESSABLE_ENTITY, TASK_ID_MSG))
+        Err(rejection(StatusCode::UNPROCESSABLE_ENTITY, TASK_ID_MSG))
     }
 }
 
 fn parse_choice(body: &[u8]) -> Result<recovery::Choice, Rejection> {
-    let invalid = || Rejection::new(StatusCode::UNPROCESSABLE_ENTITY, CHOICE_INVALID);
+    let invalid = || rejection(StatusCode::UNPROCESSABLE_ENTITY, CHOICE_INVALID);
     let input: ChoiceInput = serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
             invalid()
         } else {
-            Rejection::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            rejection(StatusCode::BAD_REQUEST, "json_malformed")
         }
     })?;
     match (input.option_id, input.analysis, input.guidance) {
@@ -839,9 +798,9 @@ async fn choose(
         return Ok(resp);
     }
     let (project, guard) = state.reserve_run(id, spec_id).await.map_err(|e| match e {
-        ReserveError::NotFound => Rejection::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND),
+        ReserveError::NotFound => rejection(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND),
         ReserveError::Busy => conflict(BUSY),
-        ReserveError::ReportInProgress => conflict_reason(REPORT_BUSY_MSG, REASON_REPORT_IN_PROGRESS),
+        ReserveError::ReportInProgress => conflict_reason(REPORT_BUSY_CODE, REASON_REPORT_IN_PROGRESS),
     })?;
     if stopping(state) {
         return Err(shutting_down());
@@ -861,7 +820,7 @@ async fn choose(
         })
         .await?;
         if !is_docker {
-            return Err(conflict_reason(PROJECT_NOT_DOCKER_MSG, REASON_ENV_NOT_DOCKER));
+            return Err(conflict_reason(PROJECT_NOT_DOCKER_CODE, REASON_ENV_NOT_DOCKER));
         }
         let (apply_root, apply_spec, apply_task) = (root.clone(), spec_job.clone(), task_job.clone());
         let snap_root = root.clone();
@@ -873,7 +832,7 @@ async fn choose(
         let (pre_root, pre_spec, pre_task, pre_choice, pre_secrets) =
             (root.clone(), spec_job.clone(), task_job.clone(), choice.clone(), Arc::clone(&secrets));
         let map_choice_error = |e: recovery::ChoiceError| match e {
-            recovery::ChoiceError::NotFound => Rejection::new(StatusCode::NOT_FOUND, TASK_NOT_FOUND),
+            recovery::ChoiceError::NotFound => rejection(StatusCode::NOT_FOUND, TASK_NOT_FOUND),
             recovery::ChoiceError::NotBlocked => conflict(TASK_NOT_BLOCKED),
             recovery::ChoiceError::Stale => conflict(OPTION_STALE),
             recovery::ChoiceError::Io => internal(CHOICE_FAILED),
@@ -888,7 +847,7 @@ async fn choose(
         let mut adopted = false;
         if let Some(option) = env_option {
             let dialog = DialogTarget::new(root.clone(), spec_job.clone());
-            let reason = format!("Ajustar o ambiente docker (opção «{}» escolhida pelo humano)", option.label);
+            let reason = env_choice_reason(state_job.project_lang(&id_job).get(), &option.label);
             recovery::adjust_environment(
                 &state_job, &id_job, &dialog, &root, &secrets, &spec_job, &task_job, &option, &reason,
             )
@@ -896,12 +855,13 @@ async fn choose(
             .map_err(|e| match e {
                 recovery::MigrateError::Denied => conflict(ENV_DENIED_MSG),
                 recovery::MigrateError::Shutdown => shutting_down(),
-                recovery::MigrateError::Failed(m) => conflict_reason(&m, REASON_ENV_INVALID),
+                recovery::MigrateError::Failed(m) => conflict_reason("environment_adjust_failed", REASON_ENV_INVALID).with_detail(m),
             })?;
             adopted = true;
         }
         let probe = state_job.prereqs().clone();
         let apply_secrets = Arc::clone(&secrets);
+        let apply_lang = state_job.project_lang(&id_job).get();
         let applied = blocking(move || {
             recovery::apply_choice(
                 &apply_root,
@@ -911,6 +871,7 @@ async fn choose(
                 &apply_secrets,
                 &|| probe.docker_available(),
                 adopted,
+                apply_lang,
             )
             .map_err(map_choice_error)
         })
@@ -941,6 +902,12 @@ async fn choose(
     }
 }
 
+/// Motivo do pedido de ajuste do ambiente quando a pessoa escolhe a opção (spec 115 T03), no
+/// idioma do projeto: é o texto do pedido de aprovação.
+fn env_choice_reason(lang: crate::i18n::Lang, label: &str) -> String {
+    crate::i18n::tr(lang, "runs.env_choice_reason", &[("label", label)])
+}
+
 /// Validações rápidas e reserva da execução. Todo o restante roda em task própria ([`launch`]):
 /// cancelar este future (desconexão do cliente) não interrompe gravação nem execução.
 async fn start(
@@ -965,10 +932,10 @@ async fn start(
         .reserve_run(id, spec_id)
         .await
         .map_err(|e| match e {
-            ReserveError::NotFound => Rejection::new(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND),
+            ReserveError::NotFound => rejection(StatusCode::NOT_FOUND, PROJECT_NOT_FOUND),
             ReserveError::Busy => conflict(BUSY),
             ReserveError::ReportInProgress => {
-                conflict_reason(REPORT_BUSY_MSG, REASON_REPORT_IN_PROGRESS)
+                conflict_reason(REPORT_BUSY_CODE, REASON_REPORT_IN_PROGRESS)
             }
         })?;
     let task = tokio::spawn(launch(
@@ -1023,33 +990,38 @@ async fn launch(
             return Err(conflict_reason(PLAN_NOT_DOCKER_MSG, REASON_ENV_NOT_DOCKER));
         }
         Mode::Resume if inspected.settings.environment != crate::sdd::Environment::Docker => {
-            return Err(conflict_reason(PROJECT_NOT_DOCKER_MSG, REASON_ENV_NOT_DOCKER));
+            return Err(conflict_reason(PROJECT_NOT_DOCKER_CODE, REASON_ENV_NOT_DOCKER));
         }
         _ => {}
     }
     let prereqs = state.prereqs().clone();
-    if let Some(message) = blocking(move || Ok(docker_prereq_message(&prereqs))).await? {
-        return Err(conflict_reason(&message, REASON_DOCKER_UNAVAILABLE));
+    if let Some(item) = blocking(move || Ok(docker_prereq_missing(&prereqs))).await? {
+        return Err(ApiError::coded(StatusCode::CONFLICT, "docker_unavailable", params([("item", json!(item))]))
+            .with_reason(REASON_DOCKER_UNAVAILABLE));
     }
     let cfg = {
         let current = state.config().read().await;
         current.clone()
     };
-    let developer = agent_setup(&cfg, &cfg.agents.developer, "developer", state.llm_backend())?;
-    let reviewer = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", state.llm_backend())?;
-    let architect = agent_setup(&cfg, &cfg.agents.architect, "architect", state.llm_backend()).ok();
+    let developer = agent_setup(&cfg, &cfg.agents.developer, "developer", state.llm_backend(), Some(&state))?;
+    let reviewer = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", state.llm_backend(), Some(&state))?;
+    let architect = agent_setup(&cfg, &cfg.agents.architect, "architect", state.llm_backend(), Some(&state)).ok();
     // Spec 090 T02: com backend substituto (testes), nenhum gerador real chega à rede.
     let images = match state.llm_backend() {
         Some(_) => None,
         None => super::image_gen::LlmImageGenerator::for_developer(&cfg, &state),
     };
     let secrets = state.secret_set().await;
+    // Idioma dos commits do Nants na base (spec 115 T04, C-09): só o texto depois do prefixo.
+    let commit_lang = state.project_lang(&project_id).get();
     if mode == Mode::Resume {
         // Retomar com o limite ainda atingido só pausaria de novo: exige aumentar ou remover.
         let (budget_root, budget_spec, pricing) = (root.clone(), spec_id.clone(), cfg.pricing.clone());
-        let hit = blocking(move || Ok(super::usage::budget_status(&budget_root, &budget_spec, &pricing))).await?;
+        let lang = state.project_lang(&project_id).get();
+        let hit = blocking(move || Ok(super::usage::budget_status(&budget_root, &budget_spec, &pricing, lang))).await?;
         if let Some(reason) = hit {
-            return Err(conflict_reason(&format!("{BUDGET_MSG} ({reason})"), REASON_BUDGET));
+            return Err(ApiError::coded(StatusCode::CONFLICT, "budget_exceeded", params([("reason", json!(reason))]))
+                .with_reason(REASON_BUDGET));
         }
     }
     let check_root = root.clone();
@@ -1078,7 +1050,7 @@ async fn launch(
     };
     // Modo docker (spec 039): test_command/checks rodam DENTRO do workspace; sem docker/podman.
     let (adopt, spec_checks, spec_formatters) = {
-        let docker_err = |m: &str| conflict_reason(m, REASON_TEST_COMMAND);
+        let docker_err = |_: &str| conflict_reason("test_command_docker", REASON_TEST_COMMAND);
         let mut current = inspected.settings.clone();
         current.environment = crate::sdd::Environment::Docker;
         let would_migrate = crate::sdd::docker_command::migrate_wrapped(&mut current);
@@ -1167,15 +1139,15 @@ async fn launch(
     // (3) commit inicial vazio, só para repositório sem commits.
     if preflight.needs_initial_commit {
         let commit_root = root.clone();
-        git_job(root.clone(), move || initial_commit(&Git::new(commit_root))).await?;
+        git_job(root.clone(), move || initial_commit(&Git::new(commit_root), commit_lang)).await?;
     }
     // (3b) ARCHITECTURE.md inicial/atualizado no planejamento: commitado na base antes das worktrees.
     if approving {
         let (arch_root, sid, arch_secrets) = (root.clone(), spec_id.clone(), Arc::clone(&secrets));
-        git_job(root.clone(), move || adopt_architecture(&arch_root, &sid, &arch_secrets)).await?;
+        git_job(root.clone(), move || adopt_architecture(&arch_root, &sid, &arch_secrets, commit_lang)).await?;
         // Perfis de especialista (spec 063): `.sdd/skills/` commitado junto, antes das worktrees.
         let (skills_root, sid, skills_secrets) = (root.clone(), spec_id.clone(), Arc::clone(&secrets));
-        git_job(root.clone(), move || adopt_skills(&skills_root, &sid, &skills_secrets)).await?;
+        git_job(root.clone(), move || adopt_skills(&skills_root, &sid, &skills_secrets, commit_lang)).await?;
     }
     // (4) comando da spec entra no settings do projeto quando o humano ainda não definiu um.
     let settings = match adopt {
@@ -1228,7 +1200,7 @@ async fn launch(
         Some(hash) => {
             let adopt_root = root.clone();
             let sid = spec_id.clone();
-            git_job(root.clone(), move || adopt_environment(&adopt_root, &hash, &sid)).await?
+            git_job(root.clone(), move || adopt_environment(&adopt_root, &hash, &sid, commit_lang)).await?
         }
         None => settings,
     };
@@ -1311,7 +1283,7 @@ fn stopping(state: &AppState) -> bool {
 }
 
 fn shutting_down() -> Rejection {
-    Rejection::new(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN_MSG)
+    rejection(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN_MSG)
 }
 
 /// `reason` padrão do `idle` de compensação (falha de montagem ou panic).
@@ -1564,20 +1536,15 @@ fn spawn_run(bg: Background) -> bool {
             };
             let relaunched = match (project, guard.take()) {
                 (Some(project), Some(slot)) => {
-                    launch(state.clone(), project_id.clone(), spec_id.clone(), project, slot, Mode::Resume)
-                        .await
-                        .map_err(|r| r.message)
+                    launch(state.clone(), project_id.clone(), spec_id.clone(), project, slot, Mode::Resume).await.map_err(Some)
                 }
-                _ => Err(RELAUNCH_FAILED.to_string()),
+                _ => Err(None),
             };
             match relaunched {
                 // O novo run assumiu a spec e a reserva; este termina sem eventos finais.
                 Ok(()) => return,
-                Err(message) => {
-                    let text = format!("{RELAUNCH_FAILED}: {message}");
-                    let message = scrub_text(&secrets, &message);
-                    let text = scrub_text(&secrets, &text);
-                    let params = Map::from_iter([("message".to_string(), Value::from(message))]);
+                Err(refusal) => {
+                    let (text, params) = relaunch_failure(&secrets, refusal.as_ref());
                     deliver(&events, Some(&dialog), system_message_coded(&project_id, &text, CODE_RELAUNCH_FAILED, params));
                     for ev in terminal_events(&project_id, &secrets, &spec_id, RunEnd::Failed(None)) {
                         deliver(&events, Some(&dialog), ev);
@@ -1603,7 +1570,7 @@ fn spawn_run(bg: Background) -> bool {
         }
         // Orçamento atingido: o Arquiteto avisa uma vez na conversa (sem recuperação nem diagnóstico).
         if let RunEnd::Outcome(SpecOutcome::Blocked { task_id, reason, kind: BlockKind::Budget, .. }) = &end {
-            let text = format!("Execução pausada: {reason}. Aumente ou remova o limite e use Retomar.");
+            let text = crate::i18n::tr(state.project_lang(&project_id).get(), "runs.budget_paused", &[("reason", reason)]);
             deliver(
                 &events,
                 Some(&dialog),
@@ -1826,6 +1793,13 @@ fn terminal_events(
         // Código fixo do provedor (ex.: `provider_http_400`), com o motivo fechado da resposta
         // ruim quando houver (`provider_bad_response (incompleta: content_filter)`, spec 088);
         // nunca texto remoto.
+        // Plano ChatGPT (spec 116 T02): limite de uso, conta não elegível ou precisa entrar de novo
+        // pausam a execução com o código próprio; o "Continuar" retoma. Sem nova tentativa
+        // automática e sem horário de liberação.
+        RunEnd::Provider(ProviderFailure::Plan(plan)) => vec![
+            system_message_coded(project_id, &ProviderFailure::Plan(plan).describe(), plan_pause_code(plan), Map::new()),
+            status_event(project_id, json!({"status": "idle", "reason": "error"})),
+        ],
         RunEnd::Provider(failure) => vec![
             {
                 // Params neutros de idioma (spec 102): a interface monta o motivo pelo dicionário.
@@ -1867,12 +1841,70 @@ pub const CODE_RUN_FAILED_CAUSE: &str = "run.failed_cause";
 pub const CODE_PROVIDER_FAILED: &str = "run.provider_failed";
 /// Falha do provedor com motivo (`params.provider`, `params.kind` e, quando houver, `params.provider_code`).
 pub const CODE_PROVIDER_FAILED_DETAIL: &str = "run.provider_failed_detail";
+/// Execução pausada pelo limite de uso do plano ChatGPT (spec 116 T02).
+pub const CODE_PLAN_LIMIT: &str = "run.plan_limit";
+/// Execução pausada: a conta não é elegível para usar o plano ChatGPT por aqui.
+pub const CODE_PLAN_NOT_ELIGIBLE: &str = "run.plan_not_eligible";
+/// Execução pausada: a conexão pelo plano ChatGPT precisa entrar de novo.
+pub const CODE_PLAN_NEEDS_LOGIN: &str = "run.plan_needs_login";
+
+/// Código da pausa por uma falha do plano ChatGPT.
+fn plan_pause_code(plan: crate::agents::llm_client::PlanError) -> &'static str {
+    use crate::agents::llm_client::PlanError;
+    match plan {
+        PlanError::UsageLimit => CODE_PLAN_LIMIT,
+        PlanError::NotEligible => CODE_PLAN_NOT_ELIGIBLE,
+        PlanError::NeedsLogin => CODE_PLAN_NEEDS_LOGIN,
+    }
+}
 /// Relançamento em modo docker recusado (`params.message`).
 pub const CODE_RELAUNCH_FAILED: &str = "run.relaunch_failed";
 /// Ajuste do test_command/checks para rodar dentro do workspace.
 pub const CODE_DOCKER_MIGRATION: &str = "run.docker_migration";
 
 /// Mensagem do sistema com `code`/`params` (spec 102), além do texto de reserva em pt-BR.
+/// Texto (reserva em pt-BR) e `params` da mensagem `run.relaunch_failed` (spec 115 T02). Com a
+/// recusa do relançamento (um [`ApiError`]), os `params` levam o código dela (`error_code`), os
+/// `params` dela e o `detail` técnico, para a interface traduzir pelo `serverError.<code>`;
+/// `message` (o texto de reserva da recusa) fica só para quem não conhece o código. Tudo redigido
+/// e cortado em [`super::events::MAX_PARAM_BYTES`].
+fn relaunch_failure(secrets: &SecretSet, refusal: Option<&ApiError>) -> (String, Map<String, Value>) {
+    let cut = |s: &str| {
+        let clean = scrub_text(secrets, s);
+        let mut end = clean.len().min(super::events::MAX_PARAM_BYTES);
+        while !clean.is_char_boundary(end) {
+            end -= 1;
+        }
+        clean[..end].to_string()
+    };
+    let Some(err) = refusal else {
+        let message = cut(RELAUNCH_FAILED);
+        return (scrub_text(secrets, RELAUNCH_FAILED), Map::from_iter([("message".to_string(), Value::from(message))]));
+    };
+    let mut params = Map::new();
+    params.insert("message".into(), Value::from(cut(err.message())));
+    if let Some(code) = err.code() {
+        params.insert("error_code".into(), Value::from(code));
+    }
+    for (name, value) in err.params().into_iter().flatten() {
+        if matches!(name.as_str(), "message" | "error_code" | "detail") {
+            continue;
+        }
+        let value = match value {
+            Value::String(s) => Value::from(cut(s)),
+            Value::Number(_) => value.clone(),
+            _ => continue,
+        };
+        params.insert(name.clone(), value);
+    }
+    let mut text = format!("{RELAUNCH_FAILED}: {}", err.message());
+    if let Some(detail) = err.detail() {
+        params.insert("detail".into(), Value::from(cut(detail)));
+        text.push_str(&format!(" ({detail})"));
+    }
+    (scrub_text(secrets, &text), params)
+}
+
 fn system_message_coded(project_id: &str, text: &str, code: &str, params: Map<String, Value>) -> ApiEvent {
     let mut event = system_message(project_id, text);
     if let Some(map) = event.payload.as_object_mut() {
@@ -1907,7 +1939,7 @@ fn validate_spec_id(id: &str) -> Result<(), Rejection> {
     if ok {
         Ok(())
     } else {
-        Err(Rejection::new(StatusCode::UNPROCESSABLE_ENTITY, SPEC_ID_MSG))
+        Err(rejection(StatusCode::UNPROCESSABLE_ENTITY, SPEC_ID_MSG))
     }
 }
 
@@ -1918,12 +1950,9 @@ fn parse_body(body: &[u8]) -> Result<(), Rejection> {
     }
     serde_json::from_slice::<ApproveInput>(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            Rejection::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "corpo JSON com campos inválidos",
-            )
+            rejection(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields")
         } else {
-            Rejection::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            rejection(StatusCode::BAD_REQUEST, "json_malformed")
         }
     })?;
     Ok(())
@@ -1960,7 +1989,7 @@ fn inspect(root: &Path, spec_id: &str, mode: Mode) -> Result<Inspected, Rejectio
     let raw = match safe_fs::read_regular(root, &spec_rel(spec_id), MAX_READ_BYTES) {
         Ok(text) => text,
         Err(SafeFsError::Missing) => {
-            return Err(Rejection::new(StatusCode::NOT_FOUND, SPEC_NOT_FOUND))
+            return Err(rejection(StatusCode::NOT_FOUND, SPEC_NOT_FOUND))
         }
         Err(_) => return Err(invalid_spec()),
     };
@@ -2023,7 +2052,7 @@ fn reset_plan(
             continue;
         }
         let mut reopened = file.task.clone();
-        if meta.next_action.as_deref() == Some(crate::agents::runner::REVISED_NEXT_ACTION) {
+        if crate::agents::runner::is_revised_block(meta) {
             // Definição revisada = nova chance: os ciclos anteriores deixam de contar.
             reopened.body = crate::agents::runner::mark_revised(&reopened.body);
         }
@@ -2036,6 +2065,7 @@ fn reset_plan(
         reopened.frontmatter.tested_signature = None;
         reopened.frontmatter.tested_at = None;
         reopened.frontmatter.next_action = None;
+        reopened.frontmatter.next_action_code = None;
         let marked = reopened.render().map_err(|_| internal(INTERNAL))?;
         entries.push(Entry {
             rel: file.rel.clone(),
@@ -2106,6 +2136,8 @@ fn forced_reset_failure(_root: &Path, _index: usize) -> bool {
 
 /// Mensagem (500) quando o comando de testes da spec não pode ser gravado no projeto.
 const SETTINGS_SAVE_MSG: &str = "falha ao salvar o comando de testes";
+/// Código (spec 115 T02) do 500 ao gravar o `settings.yaml`.
+const SETTINGS_SAVE_CODE: &str = "test_command_save_failed";
 
 /// Grava `command` (da spec) em `settings.yaml` se o `test_command` do projeto estiver vazio.
 /// Relê sob o `PERSIST_LOCK` (o mesmo de PUT e `always`) e preserva os demais campos: se o humano
@@ -2119,9 +2151,9 @@ fn adopt_spec_test_command(root: &Path, command: &str) -> Result<Settings, Rejec
     settings.test_command = command.to_string();
     let rendered = settings
         .render()
-        .map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+        .map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     replace_atomic(root, SETTINGS_REL, rendered.as_bytes())
-        .map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+        .map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok(settings)
 }
 
@@ -2137,8 +2169,8 @@ fn adopt_spec_checks(root: &Path, checks: &[crate::sdd::Check]) -> Result<Settin
         return Ok(settings);
     }
     settings.checks = valid;
-    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_MSG))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok(settings)
 }
 
@@ -2152,8 +2184,8 @@ fn adopt_spec_formatters(root: &Path, formatters: &[crate::sdd::Formatter]) -> R
         return Ok(settings);
     }
     settings.formatters = valid;
-    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_MSG))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok(settings)
 }
 
@@ -2183,8 +2215,8 @@ fn adopt_spec_glob_list(
         return Ok(settings);
     }
     *field(&mut settings) = valid;
-    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_MSG))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok(settings)
 }
 
@@ -2203,8 +2235,8 @@ fn migrate_docker_settings(root: &Path) -> Result<(Option<Settings>, bool), Reje
     if !crate::sdd::docker_command::migrate_wrapped(&mut settings) {
         return Ok((Some(settings), false));
     }
-    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_MSG))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_MSG))?;
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok((Some(settings), true))
 }
 
@@ -2213,21 +2245,13 @@ fn migrate_docker_settings(root: &Path) -> Result<(Option<Settings>, bool), Reje
 /// arquivos atuais precisam bater com o hash aprovado.
 /// Mensagem de pré-requisito quando o Docker não está pronto (CLI, daemon, permissão, Compose v2):
 /// o primeiro item ausente, com o detalhe e a correção do diagnóstico. `None` com o Docker pronto.
-fn docker_prereq_message(prereqs: &super::prereqs::PrereqChecker) -> Option<String> {
+/// Primeiro item do Docker que falta no host (`docker_cli`, `docker_daemon`, `docker_permission` ou
+/// `docker_compose`), ou `None` com o Docker disponível. A interface mostra o item pelo código.
+fn docker_prereq_missing(prereqs: &super::prereqs::PrereqChecker) -> Option<&'static str> {
     let items = prereqs.check();
-    let first = ["docker_cli", "docker_daemon", "docker_permission", "docker_compose"]
-        .iter()
-        .find_map(|id| match items.iter().find(|i| i.id == *id) {
-            Some(i) if i.ok => None,
-            Some(i) => Some(match (&i.detail, &i.fix) {
-                (Some(d), Some(f)) => format!("{} ({d}): {f}", i.label),
-                (Some(d), None) => format!("{} ({d})", i.label),
-                (None, Some(f)) => format!("{}: {f}", i.label),
-                (None, None) => i.label.to_string(),
-            }),
-            None => Some((*id).to_string()),
-        })?;
-    Some(format!("O Docker é pré-requisito do Nants e não está disponível neste host. {first}"))
+    ["docker_cli", "docker_daemon", "docker_permission", "docker_compose"]
+        .into_iter()
+        .find(|id| !items.iter().any(|i| i.id == *id && i.ok))
 }
 
 fn plan_environment(
@@ -2239,7 +2263,7 @@ fn plan_environment(
     use crate::sdd::environment as env;
     if spec_docker {
         let hash = env::validate_and_hash(root)
-            .map_err(|m| conflict_reason(&m, REASON_ENV_INVALID))?;
+            .map_err(|m| conflict_reason("environment_invalid", REASON_ENV_INVALID).with_detail(m))?;
         let same = settings.environment == crate::sdd::Environment::Docker
             && settings.approved_hashes().contains(&hash);
         if same {
@@ -2262,7 +2286,7 @@ fn plan_environment(
 /// Grava `environment: docker` e o hash aprovado no settings, sob o `PERSIST_LOCK`.
 /// Antes, commita na base só os arquivos de ambiente (sem commit se nada mudou); falha no commit
 /// recusa com 409 e nada é adotado.
-fn adopt_environment(root: &Path, hash: &str, spec_id: &str) -> Result<Settings, Rejection> {
+fn adopt_environment(root: &Path, hash: &str, spec_id: &str, lang: crate::i18n::Lang) -> Result<Settings, Rejection> {
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let mut settings = read_settings_checked(root)?;
     // Revalida sob o lock: arquivos diferentes dos validados na fase A não são commitados.
@@ -2274,16 +2298,17 @@ fn adopt_environment(root: &Path, hash: &str, spec_id: &str) -> Result<Settings,
         .into_iter()
         .map(|(rel, _)| rel)
         .collect();
-    commit_environment(root, &paths, spec_id)?;
+    commit_environment(root, &paths, spec_id, lang)?;
     mark_environment_docker(root, &mut settings, hash)?;
     Ok(settings)
 }
 
 /// Commita na base só os `paths` de ambiente (sem commit se nada mudou). Falha: 409 e nada fica
 /// commitado nem preparado (o índice é desfeito por `commit_paths`).
-fn commit_environment(root: &Path, paths: &[String], spec_id: &str) -> Result<(), Rejection> {
+fn commit_environment(root: &Path, paths: &[String], spec_id: &str, lang: crate::i18n::Lang) -> Result<(), Rejection> {
+    let msg = crate::i18n::commit_subject(lang, &format!("chore({spec_id}): "), "commit.environment");
     Git::new(root.to_path_buf())
-        .commit_paths(paths, &format!("chore({spec_id}): ambiente aprovado (Nants)"))
+        .commit_paths(paths, &msg)
         .map(|_| ())
         .map_err(|_| conflict_reason(ENV_COMMIT_MSG, REASON_ENV_INVALID))
 }
@@ -2292,8 +2317,8 @@ fn commit_environment(root: &Path, paths: &[String], spec_id: &str) -> Result<()
 fn mark_environment_docker(root: &Path, settings: &mut Settings, hash: &str) -> Result<(), Rejection> {
     settings.environment = crate::sdd::Environment::Docker;
     settings.approve_environment_hash(hash);
-    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_MSG))?;
-    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_MSG))
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))
 }
 
 /// Adoção de arquivos de ambiente APROVADOS propostos pela recuperação (spec 074): grava `files`
@@ -2305,12 +2330,13 @@ pub(super) fn adopt_environment_files(
     root: &Path,
     spec_id: &str,
     files: &[(String, String)],
+    lang: crate::i18n::Lang,
 ) -> Result<Settings, String> {
     use crate::sdd::environment as env;
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let settings_before = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES)
         .map_err(|_| SETTINGS_SAVE_MSG.to_string())?;
-    let mut settings = read_settings_checked(root).map_err(|r| r.message)?;
+    let mut settings = read_settings_checked(root).map_err(|r| r.message().to_string())?;
     // Estado anterior de cada arquivo (None = não existia); symlink ou especial recusa antes de gravar.
     let mut before: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     for (rel, _) in files {
@@ -2364,19 +2390,19 @@ pub(super) fn adopt_environment_files(
     };
     if let Err(r) = mark_environment_docker(root, &mut settings, &hash) {
         rollback(true);
-        return Err(r.message);
+        return Err(r.message().to_string());
     }
     let paths: Vec<String> = files.iter().map(|(rel, _)| rel.clone()).collect();
-    if let Err(r) = commit_environment(root, &paths, spec_id) {
+    if let Err(r) = commit_environment(root, &paths, spec_id, lang) {
         rollback(true);
-        return Err(r.message);
+        return Err(r.message().to_string());
     }
     Ok(settings)
 }
 
 /// Commita na base o `ARCHITECTURE.md` da raiz quando está novo/alterado (rascunho do plano),
 /// sob o `PERSIST_LOCK` e revalidado. Inválido → 409. Sem mudança, nada a fazer.
-fn adopt_architecture(root: &Path, spec_id: &str, secrets: &super::events::SecretSet) -> Result<(), Rejection> {
+fn adopt_architecture(root: &Path, spec_id: &str, secrets: &super::events::SecretSet, lang: crate::i18n::Lang) -> Result<(), Rejection> {
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let git = Git::new(root.to_path_buf());
     let dirty = git
@@ -2394,11 +2420,8 @@ fn adopt_architecture(root: &Path, spec_id: &str, secrets: &super::events::Secre
                 .ok_or_else(|| conflict_reason(ARCH_COMMIT_MSG, REASON_ENV_INVALID))?;
         }
     }
-    let msg = if git.is_tracked(ARCH_FILE) {
-        format!("docs({spec_id}): atualiza arquitetura")
-    } else {
-        format!("docs({spec_id}): arquitetura inicial")
-    };
+    let key = if git.is_tracked(ARCH_FILE) { "commit.architecture_update" } else { "commit.architecture_initial" };
+    let msg = crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), key);
     git.commit_paths(&[ARCH_FILE.to_string()], &msg)
         .map_err(|_| conflict_reason(ARCH_COMMIT_MSG, REASON_ENV_INVALID))?;
     Ok(())
@@ -2407,7 +2430,7 @@ fn adopt_architecture(root: &Path, spec_id: &str, secrets: &super::events::Secre
 /// Perfis de especialista (`.sdd/skills/{developer,reviewer}.md`) novos/alterados no plano:
 /// validados, redigidos e commitados na base (spec 063). Sem mudança, nada a fazer. Os perfis
 /// ficam fora do squash das tarefas (os agentes nunca escrevem em `.sdd/`).
-fn adopt_skills(root: &Path, spec_id: &str, secrets: &super::events::SecretSet) -> Result<(), Rejection> {
+fn adopt_skills(root: &Path, spec_id: &str, secrets: &super::events::SecretSet, lang: crate::i18n::Lang) -> Result<(), Rejection> {
     let _persist = PERSIST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let git = Git::new(root.to_path_buf());
     let dirty = git
@@ -2435,7 +2458,7 @@ fn adopt_skills(root: &Path, spec_id: &str, secrets: &super::events::SecretSet) 
     if paths.is_empty() {
         return Ok(());
     }
-    git.commit_paths(&paths, &format!("docs({spec_id}): perfis de especialista"))
+    git.commit_paths(&paths, &crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), "commit.skills"))
         .map_err(|_| conflict_reason(SKILLS_COMMIT_MSG, REASON_ENV_INVALID))?;
     Ok(())
 }
@@ -2586,13 +2609,14 @@ fn check_dependencies(tasks: &[Task]) -> Result<(), Rejection> {
 }
 
 /// Mensagem (500) quando o commit inicial da base não pode ser criado. Sem eco da saída do Git.
-const INITIAL_COMMIT_ERROR: &str = "falha ao criar o commit inicial da base";
-/// Mensagem do commit inicial: vazio, sem arquivos, criado só para existir HEAD.
-const INITIAL_COMMIT_TEXT: &str = "chore: commit inicial (Nants)";
+const INITIAL_COMMIT_ERROR: &str = "initial_commit_failed";
+/// Prefixo do commit inicial (vazio, sem arquivos, criado só para existir HEAD); o texto depois
+/// dele sai no idioma do projeto (`commit.initial`).
+const INITIAL_COMMIT_PREFIX: &str = "chore: ";
 
 /// Commit inicial vazio para repositório sem commits (fase B). Só age se HEAD continua sem commits.
 /// Índice com entradas aqui é falha inesperada (a fase A já recusou staged), então vira 500.
-fn initial_commit(git: &Git) -> Result<(), Rejection> {
+fn initial_commit(git: &Git, lang: crate::i18n::Lang) -> Result<(), Rejection> {
     if !git.is_unborn() {
         return Ok(());
     }
@@ -2611,7 +2635,7 @@ fn initial_commit(git: &Git) -> Result<(), Rejection> {
             (key, value)
         })
         .collect();
-    git.commit_empty(INITIAL_COMMIT_TEXT, &fallback)
+    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.initial"), &fallback)
         .map_err(|_| internal(INITIAL_COMMIT_ERROR))
 }
 
@@ -2697,7 +2721,7 @@ where
     let timeout = git_timeout_for(&root);
     let handle = tokio::task::spawn_blocking(job);
     match tokio::time::timeout(timeout, handle).await {
-        Err(_) => Err(Rejection::new(StatusCode::GATEWAY_TIMEOUT, GIT_TIMEOUT_MSG)),
+        Err(_) => Err(rejection(StatusCode::GATEWAY_TIMEOUT, GIT_TIMEOUT_MSG)),
         Ok(Err(_)) => Err(internal(INTERNAL)),
         Ok(Ok(result)) => result,
     }
@@ -2725,18 +2749,19 @@ fn test_git_timeout(root: &Path) -> Option<Duration> {
     overrides.iter().find(|(r, _)| r == root).map(|(_, d)| *d)
 }
 
-/// Monta Desenvolvedor ou Revisor. Qualquer falha de configuração vira 422 estático.
+/// Monta Desenvolvedor ou Revisor. Qualquer falha de configuração vira 422 estático. Com o estado,
+/// a conexão pelo plano ChatGPT usa o token do login (spec 116 T02).
 fn agent_setup(
     cfg: &Config,
     agent: &AgentConfig,
     role: &str,
     injected: Option<Arc<dyn ChatBackend>>,
+    state: Option<&AppState>,
 ) -> Result<AgentSetup, Rejection> {
-    let not_configured = || {
-        Rejection::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("agente {role} não configurado"),
-        )
+    let not_configured = || match role {
+        "developer" => rejection(StatusCode::UNPROCESSABLE_ENTITY, "developer_not_configured"),
+        "reviewer" => rejection(StatusCode::UNPROCESSABLE_ENTITY, "reviewer_not_configured"),
+        _ => rejection(StatusCode::UNPROCESSABLE_ENTITY, "architect_not_configured"),
     };
     let connection = cfg
         .connections
@@ -2746,7 +2771,11 @@ fn agent_setup(
     if agent.model.trim().is_empty() {
         return Err(not_configured());
     }
-    let client = LlmClient::from_connection(connection).map_err(|_| not_configured())?;
+    let client = match state {
+        Some(state) => super::chatgpt::plan_client::llm_client(state, connection),
+        None => LlmClient::from_connection(connection),
+    }
+    .map_err(|_| not_configured())?;
     let backend: Arc<dyn ChatBackend> = injected.unwrap_or_else(|| Arc::new(client));
     Ok(AgentSetup {
         backend,
@@ -2882,6 +2911,14 @@ mod tests {
 
     use super::*;
     use crate::agents::runner::{EventSink, RunnerEvent};
+    use crate::i18n::Lang;
+
+    /// Spec 115 T03: o motivo do ajuste escolhido pela pessoa sai no idioma do projeto.
+    #[test]
+    fn env_choice_reason_follows_the_project_language() {
+        assert_eq!(env_choice_reason(Lang::PtBr, "curl"), "Ajustar o ambiente docker (opção «curl» escolhida por você)");
+        assert_eq!(env_choice_reason(Lang::En, "curl"), "Adjust the docker environment (option \"curl\" chosen by you)");
+    }
     use crate::server::approvals::persist_always;
     use crate::config::Connection;
     use crate::server::{router, AppState};
@@ -3020,6 +3057,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         }
     }
 
@@ -3050,12 +3088,12 @@ mod tests {
     #[test]
     fn agent_setup_carries_configured_max_steps_clamped() {
         let mut cfg = config_for(Path::new("/tmp/x"));
-        let dev = agent_setup(&cfg, &cfg.agents.developer, "developer", None).expect("dev");
+        let dev = agent_setup(&cfg, &cfg.agents.developer, "developer", None, None).expect("dev");
         assert_eq!(dev.max_steps, None, "sem o campo: padrão do papel");
         cfg.agents.developer.max_steps = Some(220);
         cfg.agents.reviewer.max_steps = Some(5);
-        let dev = agent_setup(&cfg, &cfg.agents.developer, "developer", None).expect("dev");
-        let rev = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", None).expect("rev");
+        let dev = agent_setup(&cfg, &cfg.agents.developer, "developer", None, None).expect("dev");
+        let rev = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", None, None).expect("rev");
         assert_eq!(dev.max_steps, Some(220));
         assert_eq!(rev.max_steps, Some(10), "fora da faixa: ajustado no uso");
     }
@@ -3644,7 +3682,7 @@ mod tests {
 
         let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(json_of(&body)["error"], BUSY);
+        assert_eq!(json_of(&body)["code"], BUSY);
 
         let other = root.join(".sdd/specs/s2/tasks");
         fs::create_dir_all(&other).expect("s2");
@@ -3653,7 +3691,7 @@ mod tests {
         fs::write(other.join("T01.md"), task_md("T01", "", "TODO")).expect("task s2");
         let (status, body) = call(&state, approve_req(PROJECT, "s2", "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(json_of(&body)["error"], BUSY);
+        assert_eq!(json_of(&body)["code"], BUSY);
 
         state.trigger_shutdown();
         assert!(wait_idle(&state).await, "shutdown deve liberar a execução");
@@ -3727,7 +3765,7 @@ mod tests {
         assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress, "spec fica em andamento");
         let (status, body) = call(&state, stop_req(PROJECT, SPEC)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(json_of(&body)["error"], NOT_RUNNING_MSG);
+        assert_eq!(json_of(&body)["code"], NOT_RUNNING_MSG);
         state.trigger_shutdown();
     }
 
@@ -3737,7 +3775,7 @@ mod tests {
         let state = state(&root, Script::Hang);
         let (status, body) = call(&state, stop_req(PROJECT, SPEC)).await;
         assert_eq!(status, StatusCode::CONFLICT, "sem execução: {body}");
-        assert_eq!(json_of(&body)["error"], NOT_RUNNING_MSG);
+        assert_eq!(json_of(&body)["code"], NOT_RUNNING_MSG);
         let (status, _) = call(&state, stop_req(PROJECT, "nao-existe")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call(&state, stop_req("outro", SPEC)).await;
@@ -4090,7 +4128,7 @@ mod tests {
             write_sdd(&root, SETTINGS, status, &[("T01", "")]);
             let (code, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
             assert_eq!(code, StatusCode::CONFLICT, "{status}: {body}");
-            assert_eq!(json_of(&body)["error"], expected, "{status}");
+            assert_eq!(json_of(&body)["code"], expected, "{status}");
         }
     }
 
@@ -4264,7 +4302,7 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).to_string()
         };
         let before = log(&root).lines().count();
-        adopt_environment(&root, &hash, "s1").expect("adoção");
+        adopt_environment(&root, &hash, "s1", Lang::PtBr).expect("adoção");
         let after = log(&root);
         assert_eq!(after.lines().count(), before + 1);
         assert!(after.starts_with("chore(s1): ambiente aprovado (Nants)"), "{after}");
@@ -4284,7 +4322,7 @@ mod tests {
             .expect("worktree");
         assert!(wt.join(".nants/compose.yaml").exists());
         // Reaprovar com os mesmos arquivos não cria commit.
-        adopt_environment(&root, &hash, "s1").expect("reaprovação");
+        adopt_environment(&root, &hash, "s1", Lang::PtBr).expect("reaprovação");
         assert_eq!(log(&root).lines().count(), before + 1);
     }
 
@@ -4308,21 +4346,21 @@ mod tests {
         // inválido: 409 já no preflight.
         fs::write(root.join("ARCHITECTURE.md"), "sem titulo").expect("w");
         assert!(check_git_for(&root, false, true).is_err());
-        assert!(adopt_architecture(&root, "s1", &SecretSet::new(Vec::new())).is_err());
+        assert!(adopt_architecture(&root, "s1", &SecretSet::new(Vec::new()), Lang::PtBr).is_err());
         // válido: tolerado só na aprovação e commitado.
         fs::write(root.join("ARCHITECTURE.md"), ARCH_OK).expect("w");
         assert!(check_git_for(&root, false, false).is_err(), "fora da aprovação suja a base");
         assert!(check_git_for(&root, false, true).is_ok());
-        adopt_architecture(&root, "s1", &SecretSet::new(Vec::new())).expect("commit");
+        adopt_architecture(&root, "s1", &SecretSet::new(Vec::new()), Lang::PtBr).expect("commit");
         let git = Git::new(root.clone());
         assert!(git.is_tracked("ARCHITECTURE.md"));
         assert!(git.log_subjects("HEAD", 10).unwrap_or_default().iter().any(|s| s == "docs(s1): arquitetura inicial"));
         // nova versão: atualiza.
         fs::write(root.join("ARCHITECTURE.md"), format!("{ARCH_OK}\nmais\n")).expect("w");
-        adopt_architecture(&root, "s2", &SecretSet::new(Vec::new())).expect("update");
+        adopt_architecture(&root, "s2", &SecretSet::new(Vec::new()), Lang::PtBr).expect("update");
         assert!(git.log_subjects("HEAD", 10).unwrap_or_default().iter().any(|s| s == "docs(s2): atualiza arquitetura"));
         // sem mudança: no-op.
-        adopt_architecture(&root, "s3", &SecretSet::new(Vec::new())).expect("noop");
+        adopt_architecture(&root, "s3", &SecretSet::new(Vec::new()), Lang::PtBr).expect("noop");
     }
 
     const SKILL_OK: &str = "---\nrole: developer\nstack: [clojure]\nupdated_at: 2026-10-16\nsource_spec: s1\n---\n## Papel\n- Clojure com deps.edn.\n";
@@ -4334,13 +4372,13 @@ mod tests {
         // inválido (URL): 409 no preflight e na adoção.
         fs::write(root.join(".sdd/skills/developer.md"), SKILL_OK.replace("deps.edn.", "https://x.dev")).expect("w");
         assert!(check_git_for(&root, false, true).is_err());
-        assert!(adopt_skills(&root, "s1", &SecretSet::new(Vec::new())).is_err());
+        assert!(adopt_skills(&root, "s1", &SecretSet::new(Vec::new()), Lang::PtBr).is_err());
         // válido: tolerado só na aprovação; commitado com segredo redigido.
         let secret = "sk-segredo-12345678";
         fs::write(root.join(".sdd/skills/developer.md"), SKILL_OK.replace("deps.edn.", &format!("chave {secret}"))).expect("w");
         assert!(check_git_for(&root, false, false).is_ok(), "perfil sujo não bloqueia (como .sdd/specs)");
         assert!(check_git_for(&root, false, true).is_ok());
-        adopt_skills(&root, "s1", &SecretSet::new(vec![secret.to_string()])).expect("commit");
+        adopt_skills(&root, "s1", &SecretSet::new(vec![secret.to_string()]), Lang::PtBr).expect("commit");
         let git = Git::new(root.clone());
         assert!(git.is_tracked(".sdd/skills/developer.md"));
         assert!(git.log_subjects("HEAD", 10).unwrap_or_default().iter().any(|s| s == "docs(s1): perfis de especialista"));
@@ -4348,11 +4386,11 @@ mod tests {
         assert!(!String::from_utf8_lossy(&shown.stdout).contains(secret));
         assert!(check_git_for(&root, false, false).is_ok(), "base limpa");
         // sem mudança: no-op.
-        adopt_skills(&root, "s2", &SecretSet::new(Vec::new())).expect("noop");
+        adopt_skills(&root, "s2", &SecretSet::new(Vec::new()), Lang::PtBr).expect("noop");
         // perfil versionado apagado no disco: sem 409.
         fs::remove_file(root.join(".sdd/skills/developer.md")).expect("rm");
         assert!(check_git_for(&root, false, true).is_ok());
-        adopt_skills(&root, "s3", &SecretSet::new(Vec::new())).expect("remoção ignorada");
+        adopt_skills(&root, "s3", &SecretSet::new(Vec::new()), Lang::PtBr).expect("remoção ignorada");
     }
 
     #[test]
@@ -4361,7 +4399,7 @@ mod tests {
         let secret = "sk-segredo-12345678";
         let doc = ARCH_OK.replace("## Stack\nx", &format!("## Stack\nchave {secret}"));
         fs::write(root.join("ARCHITECTURE.md"), doc).expect("w");
-        adopt_architecture(&root, "s1", &SecretSet::new(vec![secret.to_string()])).expect("commit");
+        adopt_architecture(&root, "s1", &SecretSet::new(vec![secret.to_string()]), Lang::PtBr).expect("commit");
         let shown = Command::new("git").args(["show", "HEAD:ARCHITECTURE.md"]).current_dir(&root).output().expect("show");
         let text = String::from_utf8_lossy(&shown.stdout);
         assert!(text.contains("## Stack") && !text.contains(secret), "{text}");
@@ -4380,7 +4418,7 @@ mod tests {
         fs::write(root.join(".nants/compose.yaml"), compose).expect("w");
         let settings = settings_file(&root);
         let h1 = plan_environment(&root, &settings, true, false).expect("plano").expect("hash");
-        adopt_environment(&root, &h1, "s1").expect("adoção");
+        adopt_environment(&root, &h1, "s1", Lang::PtBr).expect("adoção");
         // Aprovação HITL de um ambiente novo (tarefa depois descartada): o hash entra no conjunto.
         persist_environment_hash(&root, "hitl-hash").expect("persist");
         let after = settings_file(&root);
@@ -4421,7 +4459,7 @@ mod tests {
         assert_eq!(plan_environment(&root, &settings, false, false).expect("host"), None);
         // Spec docker: aprova e registra o hash.
         let hash = plan_environment(&root, &settings, true, false).expect("plano").expect("hash");
-        let adopted = adopt_environment(&root, &hash, "s1").expect("adoção");
+        let adopted = adopt_environment(&root, &hash, "s1", Lang::PtBr).expect("adoção");
         assert_eq!(adopted.environment, Environment::Docker);
         assert_eq!(settings_file(&root).environment_hash.as_deref(), Some(hash.as_str()));
         // Execução sem nova aprovação: arquivos iguais passam; alterados são recusados.
@@ -4708,7 +4746,7 @@ mod tests {
         assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
         // Commit inicial vazio + commit do ambiente docker aprovado (só `.nants/`).
         assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]).trim(), "2");
-        assert_eq!(git_out(&root, &["log", "-1", "--format=%s", "HEAD~1"]).trim(), INITIAL_COMMIT_TEXT);
+        assert_eq!(git_out(&root, &["log", "-1", "--format=%s", "HEAD~1"]).trim(), "chore: commit inicial (Nants)");
         assert!(git_out(&root, &["show", "--stat", "--format=", "HEAD~1"]).trim().is_empty());
         assert_eq!(git_out(&root, &["ls-files"]).trim(), ".nants/compose.yaml", "só o ambiente versionado");
         let status_text = git_out(&root, &["status", "--porcelain", "--untracked-files=all"]);
@@ -4735,8 +4773,8 @@ mod tests {
     fn initial_commit_is_idempotent_and_adds_no_files() {
         let root = real_repo("ci-idem", false);
         let git_w = Git::new(&root);
-        assert!(initial_commit(&git_w).is_ok(), "primeiro commit");
-        assert!(initial_commit(&git_w).is_ok(), "segunda chamada não cria outro");
+        assert!(initial_commit(&git_w, Lang::PtBr).is_ok(), "primeiro commit");
+        assert!(initial_commit(&git_w, Lang::PtBr).is_ok(), "segunda chamada não cria outro");
         assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]).trim(), "1");
         assert!(git_out(&root, &["ls-files"]).trim().is_empty());
     }
@@ -4752,7 +4790,7 @@ mod tests {
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_env("GIT_CONFIG_NOSYSTEM", "1");
         assert_eq!(git_w.missing_identity(), vec!["user.name", "user.email"]);
-        assert!(initial_commit(&git_w).is_ok(), "commit com identidade de fallback");
+        assert!(initial_commit(&git_w, Lang::PtBr).is_ok(), "commit com identidade de fallback");
         assert_eq!(git_out(&root, &["log", "-1", "--format=%an <%ae>"]).trim(), "Nants <nants@localhost>");
         let local = git_out(&root, &["config", "--local", "--list"]);
         assert!(!local.contains("user.name") && !local.contains("user.email"), "{local}");
@@ -4808,7 +4846,7 @@ mod tests {
         set_hook(&root, "git", move || fs::write(&hook_path, hook_text).expect("alterar"));
         let (status, body) = call(&state, approve_req(&id, SPEC, "")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(json_of(&body)["error"], SPEC_CHANGED);
+        assert_eq!(json_of(&body)["code"], SPEC_CHANGED);
         assert_eq!(fs::read_to_string(&spec_path).expect("spec"), altered);
         assert_eq!(fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings"), settings_before);
         assert_eq!(fs::read_to_string(root.join(".git/info/exclude")).expect("exclude"), exclude_before);
@@ -4830,7 +4868,7 @@ mod tests {
         set_hook(&root, "git", || std::thread::sleep(Duration::from_millis(400)));
         let (status, body) = call(&state, approve_req(&id, SPEC, "")).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
-        assert_eq!(json_of(&body)["error"], GIT_TIMEOUT_MSG);
+        assert_eq!(json_of(&body)["code"], GIT_TIMEOUT_MSG);
         assert_eq!(spec_status(&root, SPEC), SpecStatus::AwaitingApproval);
         assert_eq!(fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings"), settings_before);
         assert!(Git::new(&root).is_unborn(), "sem commit");
@@ -4848,7 +4886,7 @@ mod tests {
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_env("GIT_CONFIG_NOSYSTEM", "1");
         assert_eq!(git_w.missing_identity(), vec!["user.email"]);
-        assert!(initial_commit(&git_w).is_ok(), "commit inicial");
+        assert!(initial_commit(&git_w, Lang::PtBr).is_ok(), "commit inicial");
         assert_eq!(
             git_out(&root, &["log", "-1", "--format=%an <%ae>"]).trim(),
             "Dev Real <nants@localhost>"
@@ -5133,7 +5171,7 @@ mod tests {
         let state = state(&root, Script::Complete);
         let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(json_of(&body)["error"], INVALID_SPEC);
+        assert_eq!(json_of(&body)["code"], INVALID_SPEC);
     }
 
     /// Tarefa BLOCKED como o runner grava: motivo em `next_action` e tentativas gastas.
@@ -5264,6 +5302,32 @@ mod tests {
         }
     }
 
+    /// Spec 114 T02: a retomada reconhece a definição revisada pelo código estável (texto em
+    /// qualquer idioma) e, nas tarefas antigas sem código, pelo texto pt-BR; outro código não conta,
+    /// mesmo com o texto antigo. O código sai junto com o motivo.
+    #[tokio::test]
+    async fn resume_reads_revised_code_and_legacy_pt_text() {
+        let cases = [
+            ("rev-legado", "next_action: \"definição revisada; retomar\"", true),
+            ("rev-codigo-en", "next_action: \"definition revised; resume\"\nnext_action_code: \"revised\"", true),
+            ("rev-outro-codigo", "next_action: \"definição revisada; retomar\"\nnext_action_code: \"rejections\"", false),
+        ];
+        for (tag, fields, revised) in cases {
+            let root = blocked_project(tag, false).await;
+            let md = blocked_task_md("T01", "x").replace("next_action: \"x\"", fields);
+            fs::write(root.join(TASK_T01), md).expect("T01");
+            let state = state(&root, Script::Hang);
+            let (status, body) = call(&state, resume_req(PROJECT, SPEC, "")).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let t1 = task_of(&root, TASK_T01);
+            let marked = t1.body.contains(&format!("## {}", crate::agents::runner::REVISED_MARK));
+            assert_eq!(marked, revised, "{tag}: {}", t1.body);
+            assert_eq!(t1.frontmatter.next_action_code, None, "{tag}");
+            state.trigger_shutdown();
+            assert!(wait_idle(&state).await);
+        }
+    }
+
     /// Caso real: T01 INTEGRATING (com ou sem commit na base), T02 TODO, nenhuma BLOCKED.
     async fn integrating_project(tag: &str, commit: bool) -> PathBuf {
         let root = blocked_project(tag, true).await;
@@ -5337,7 +5401,7 @@ mod tests {
         let st = state(&root, Script::Hang);
         let (status, body) = call(&st, resume_req(PROJECT, SPEC, "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(error_of(&body), "não há tarefa pendente para retomar");
+        assert_eq!(error_of(&body), "não há tarefa bloqueada para retomar");
         assert_eq!(fs::read_to_string(root.join(TASK_T01)).expect("T01"), before);
         assert!(st.runs().active(PROJECT).is_none());
 
@@ -5367,6 +5431,9 @@ mod tests {
             web_search_calls: 0,
             images: 0,
             image_quality: None,
+            estimated: false,
+            cut: None,
+            billing: Default::default(),
         });
         fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
         let before = fs::read_to_string(root.join(TASK_T01)).expect("T01");
@@ -5431,10 +5498,10 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         let (status, body) = call(&state, resume_req(PROJECT, SPEC, "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(error_of(&body), BUSY);
+        assert_eq!(json_of(&body)["code"], BUSY);
         let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(error_of(&body), BUSY);
+        assert_eq!(json_of(&body)["code"], BUSY);
         state.trigger_shutdown();
         assert!(wait_idle(&state).await);
     }
@@ -5518,11 +5585,37 @@ mod tests {
     }
 
     #[test]
-    fn docker_prereq_message_names_the_first_missing_item_only_when_unavailable() {
-        assert_eq!(docker_prereq_message(&prereqs(true)), None);
-        let message = docker_prereq_message(&prereqs(false)).expect("indisponível");
-        assert!(message.starts_with("O Docker é pré-requisito do Nants"), "{message}");
-        assert!(message.contains("Docker CLI") && message.contains("O Nants não instala o Docker"), "{message}");
+    fn relaunch_refusal_carries_the_code_params_and_detail() {
+        let secret = ["sk", "-RELAUNCH", "-0123456789"].concat();
+        let secrets = SecretSet::new([secret.clone()]);
+        let docker = ApiError::coded(StatusCode::CONFLICT, "docker_unavailable", params([("item", json!("docker_cli"))]))
+            .with_reason(REASON_DOCKER_UNAVAILABLE);
+        let (text, p) = relaunch_failure(&secrets, Some(&docker));
+        assert_eq!(p["error_code"], "docker_unavailable");
+        assert_eq!(p["item"], "docker_cli");
+        assert!(p["message"].as_str().is_some_and(|m| m.starts_with("O Docker é pré-requisito")), "{p:?}");
+        assert!(p.get("detail").is_none());
+        assert!(text.starts_with(RELAUNCH_FAILED), "{text}");
+        let env = conflict_reason("environment_invalid", REASON_ENV_INVALID)
+            .with_detail(format!("compose.yaml não pode expor o docker.sock {secret}"));
+        let (text, p) = relaunch_failure(&secrets, Some(&env));
+        assert_eq!(p["error_code"], "environment_invalid");
+        let detail = p["detail"].as_str().unwrap_or_default();
+        assert!(detail.starts_with("compose.yaml não pode expor o docker.sock"), "{detail}");
+        assert!(!detail.contains(&secret) && !text.contains(&secret), "segredo redigido");
+        assert!(text.contains("docker.sock"), "{text}");
+        let (text, p) = relaunch_failure(&secrets, None);
+        assert_eq!(text, RELAUNCH_FAILED);
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn docker_prereq_missing_names_the_first_missing_item_only_when_unavailable() {
+        assert_eq!(docker_prereq_missing(&prereqs(true)), None);
+        assert_eq!(docker_prereq_missing(&prereqs(false)), Some("docker_cli"));
+        let err = ApiError::coded(StatusCode::CONFLICT, "docker_unavailable", params([("item", json!("docker_cli"))]));
+        assert!(err.message().starts_with("O Docker é pré-requisito do Nants"), "{}", err.message());
+        assert!(err.message().contains("docker_cli"), "{}", err.message());
     }
 
     #[tokio::test]
@@ -5674,6 +5767,28 @@ mod tests {
         // Status sem mensagem do sistema não ganha `code`.
         let integrated = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Outcome(SpecOutcome::Completed));
         assert!(integrated[0].payload.get("code").is_none());
+    }
+
+    /// Spec 116 T02: as falhas do plano ChatGPT pausam a execução com o código próprio, sem
+    /// parâmetros (nem horário de liberação); o "Continuar" retoma.
+    #[test]
+    fn plan_failures_pause_with_their_own_code() {
+        use crate::agents::llm_client::PlanError;
+        let secrets = SecretSet::new(vec![SECRET.to_string()]);
+        for (plan, code, text) in [
+            (PlanError::UsageLimit, CODE_PLAN_LIMIT, "provider_plan_limit"),
+            (PlanError::NotEligible, CODE_PLAN_NOT_ELIGIBLE, "provider_plan_not_eligible"),
+            (PlanError::NeedsLogin, CODE_PLAN_NEEDS_LOGIN, "provider_plan_needs_login"),
+        ] {
+            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Plan(plan)));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].payload["code"], json!(code));
+            assert_eq!(events[0].payload["params"], json!({}));
+            assert_eq!(events[0].payload["text"], json!(text));
+            assert_eq!(events[1].payload["status"], "idle");
+        }
+        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Plan(PlanError::UsageLimit) };
+        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit))));
     }
 
     #[test]
@@ -6257,6 +6372,9 @@ mod tests {
                 web_search_calls: 0,
                 images: 0,
                 image_quality: None,
+                estimated: false,
+                cut: None,
+                billing: Default::default(),
             });
             fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
             let (task_before, settings_before) = (fs::read_to_string(t01_path(&root)).expect("T01"), settings_text(&root));
@@ -6667,7 +6785,7 @@ mod tests {
     #[test]
     fn adopt_environment_files_commits_marks_docker_and_swaps_the_hash() {
         let root = setup_plain("env-adopt", true);
-        let settings = adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1)).expect("adoção");
+        let settings = adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1), Lang::PtBr).expect("adoção");
         assert_eq!(settings.environment, crate::sdd::Environment::Docker);
         let h1 = crate::sdd::environment::env_hash(&root).expect("hash");
         assert!(settings.approved_hashes().contains(&h1));
@@ -6675,7 +6793,7 @@ mod tests {
         assert_eq!(git_out(&root, &["show", "--name-only", "--format=", "HEAD"]).trim(), ".nants/compose.yaml");
         assert!(settings_text(&root).contains("environment: docker"));
         // Projeto já docker: a opção com `files` troca o hash aprovado.
-        let settings = adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V2)).expect("troca");
+        let settings = adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V2), Lang::PtBr).expect("troca");
         let h2 = crate::sdd::environment::env_hash(&root).expect("hash 2");
         assert_ne!(h1, h2);
         assert_eq!(settings.environment_hash.as_deref(), Some(h2.as_str()));
@@ -6689,17 +6807,17 @@ mod tests {
         break_commits(&root);
         let (settings_before, head_before) = (settings_text(&root), git_out(&root, &["rev-parse", "HEAD"]));
         // Sem .nants antes: nada pode sobrar.
-        assert!(adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1)).is_err());
+        assert!(adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1), Lang::PtBr).is_err());
         assert_eq!(settings_text(&root), settings_before);
         assert!(!root.join(".nants").exists(), ".nants criado pela tentativa foi removido");
         assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head_before);
         assert!(git_out(&root, &["status", "--porcelain", "--", ".nants"]).trim().is_empty());
         // Com arquivo anterior commitado: volta ao conteúdo antigo.
         fs::remove_file(root.join(".git/hooks/pre-commit")).expect("sem hook");
-        adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1)).expect("adoção");
+        adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V1), Lang::PtBr).expect("adoção");
         break_commits(&root);
         let (settings_before, head_before) = (settings_text(&root), git_out(&root, &["rev-parse", "HEAD"]));
-        assert!(adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V2)).is_err());
+        assert!(adopt_environment_files(&root, SPEC, &files_of(COMPOSE_V2), Lang::PtBr).is_err());
         assert_eq!(fs::read_to_string(root.join(".nants/compose.yaml")).expect("compose"), COMPOSE_V1);
         assert_eq!(settings_text(&root), settings_before);
         assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head_before);

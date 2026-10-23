@@ -70,8 +70,8 @@ describe("regras", () => {
   });
 
   it("mensagens fixas da falha", () => {
-    expect(removalErrorMessage({ kind: "http", status: 409, message: "já existe uma execução em andamento neste projeto" })).toContain("Aguarde terminar");
-    expect(removalErrorMessage({ kind: "http", status: 409, message: "já existe um turno de chat em andamento para este projeto" })).toContain("Aguarde a resposta");
+    expect(removalErrorMessage({ kind: "http", status: 409, message: "x", code: "run_active" })).toContain("Aguarde terminar");
+    expect(removalErrorMessage({ kind: "http", status: 409, message: "x", code: "chat_active" })).toContain("Aguarde a resposta");
     expect(removalErrorMessage({ kind: "network", status: 0, message: "sem conexão" })).toBe("sem conexão");
   });
 

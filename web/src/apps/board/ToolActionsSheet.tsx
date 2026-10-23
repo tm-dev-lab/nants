@@ -10,6 +10,7 @@ import { getToolActions } from "../../api/client";
 import type { ToolActionItem } from "../../api/types";
 import { Icon } from "../../desktop/Icon";
 import { formatTime } from "../../i18n";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
 import { toolActionText } from "../shared/activityText";
 import { agentLabel, agentTone } from "../shared/agents";
@@ -58,7 +59,7 @@ export function ToolActionsSheet({ projectId, specId, task, title, onClose }: To
     void getToolActions(projectId, specId, { task, limit: TOOL_ACTIONS_PAGE }).then((r) => {
       if (!alive.current) return;
       if (!r.ok) {
-        setLoad({ phase: "error", message: r.error.message });
+        setLoad({ phase: "error", message: apiFailureText(r.error) });
         return;
       }
       setItems(r.data.items);
@@ -80,7 +81,7 @@ export function ToolActionsSheet({ projectId, specId, task, title, onClose }: To
       if (!alive.current) return;
       setOlder(false);
       if (!r.ok) {
-        setLoad({ phase: "error", message: r.error.message });
+        setLoad({ phase: "error", message: apiFailureText(r.error) });
         return;
       }
       setItems((current) => {

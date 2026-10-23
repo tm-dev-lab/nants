@@ -17,7 +17,10 @@
 //!   - `GET /assets/*` e `GET /brand/*` e os ícones da raiz: o JS, o CSS, as fontes e os ícones do
 //!     bundle que a página de entrada carrega (código aberto, sem dado do usuário);
 //!   - `GET /pair?t=...`: o link de entrada de uso único impresso no terminal;
-//!   - `POST /api/devices/pair`: a troca do código de 6 dígitos.
+//!   - `POST /api/devices/pair`: a troca do código de 6 dígitos;
+//!   - `GET /auth/callback`, só com um `state` pendente e válido do login pelo plano ChatGPT
+//!     (spec 116): o retorno chega pelo navegador deste computador, e o handler consome o `state`
+//!     e confere o dispositivo que iniciou a tentativa.
 //! - **Link de entrada:** gerado ao subir em modo rede ([`DeviceStore::issue_entry_link`]), de uso
 //!   único e válido por 10 minutos; cria o dispositivo "Este computador".
 //! - **Código de 6 dígitos:** só com a janela de adicionar aberta (até 10 minutos), troca a cada
@@ -261,6 +264,14 @@ fn new_code() -> Result<String, StoreError> {
     }
 }
 
+
+/// Aviso do terminal para quem opera o servidor (spec 115 T04): autorização, revogação e problemas
+/// da lista de dispositivos, no idioma do terminal (`LC_ALL` > `LC_MESSAGES` > `LANG`, como o resto
+/// do `nants`).
+fn terminal_notice(key: &str, params: &[(&str, &str)]) {
+    eprintln!("{}", crate::i18n::tr(crate::i18n::Lang::from_env(), key, params));
+}
+
 impl DeviceStore {
     /// Dispositivos guardados em `path` (`None`: só em memória, sem pasta de dados).
     pub fn new(path: Option<PathBuf>) -> Self {
@@ -297,12 +308,12 @@ impl DeviceStore {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(_) => {
-                eprintln!("aviso: lista de dispositivos ilegível; nenhum dispositivo autorizado");
+                terminal_notice("devices.log.list_unreadable", &[]);
                 return Vec::new();
             }
         };
         if !meta.file_type().is_file() {
-            eprintln!("aviso: lista de dispositivos não é um arquivo comum; nenhum dispositivo autorizado");
+            terminal_notice("devices.log.list_not_file", &[]);
             return Vec::new();
         }
         let mut raw = String::new();
@@ -312,13 +323,13 @@ impl DeviceStore {
             .open(path)
             .and_then(|f| f.take(MAX_FILE_BYTES).read_to_string(&mut raw));
         if read.is_err() {
-            eprintln!("aviso: lista de dispositivos ilegível; nenhum dispositivo autorizado");
+            terminal_notice("devices.log.list_unreadable", &[]);
             return Vec::new();
         }
         match serde_json::from_str::<DeviceFile>(&raw) {
             Ok(file) => file.devices.into_iter().filter(|d| d.token_hash.len() == 64).collect(),
             Err(_) => {
-                eprintln!("aviso: lista de dispositivos inválida; nenhum dispositivo autorizado");
+                terminal_notice("devices.log.list_invalid", &[]);
                 Vec::new()
             }
         }
@@ -348,7 +359,7 @@ impl DeviceStore {
             .and_then(|()| fs::rename(&tmp, path));
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
-            eprintln!("aviso: não foi possível gravar a lista de dispositivos");
+            terminal_notice("devices.log.save_failed", &[]);
             return Err(StoreError);
         }
         Ok(())
@@ -539,11 +550,11 @@ impl DeviceStore {
         if !ct_eq(window.code.as_bytes(), code.as_bytes()) {
             window.errors += 1;
             let errors = window.errors;
-            eprintln!("aviso: código de dispositivo errado ({errors} de {MAX_CODE_ERRORS})");
+            terminal_notice("devices.log.wrong_code", &[("errors", &errors.to_string()), ("max", &MAX_CODE_ERRORS.to_string())]);
             if errors >= MAX_CODE_ERRORS {
                 inner.window = None;
                 inner.locked = true;
-                eprintln!("aviso: várias tentativas erradas; código de dispositivo invalidado");
+                terminal_notice("devices.log.code_invalidated", &[]);
             }
             return Err(PairError::Invalid { attempts_left: MAX_CODE_ERRORS.saturating_sub(errors) });
         }
@@ -753,11 +764,7 @@ fn redirect(location: &str) -> Response {
 }
 
 fn device_required() -> ApiError {
-    ApiError::new(
-        StatusCode::UNAUTHORIZED,
-        "este aparelho não está autorizado; adicione-o em Configurações > Acesso pela rede",
-    )
-    .with_code(CODE_DEVICE_REQUIRED, Map::new())
+    ApiError::coded(StatusCode::UNAUTHORIZED, CODE_DEVICE_REQUIRED, Map::new())
 }
 
 /// Resposta sem dispositivo: 401 JSON na API e redirecionamento para a entrada nas páginas.
@@ -793,6 +800,15 @@ fn is_event_stream(resp: &Response) -> bool {
         .is_some_and(|v| v.starts_with("text/event-stream"))
 }
 
+/// Retorno do login pelo plano ChatGPT (spec 116) com um `state` pendente e válido: passa sem
+/// dispositivo, e o handler consome o `state` e confere o dispositivo que iniciou a tentativa.
+/// Sem `state` válido, a rota segue a regra de sempre.
+fn chatgpt_callback_pending(state: &AppState, req: &Request) -> bool {
+    req.method() == Method::GET
+        && req.uri().path() == super::chatgpt::CALLBACK_PATH
+        && super::chatgpt::callback_state(req.uri()).is_some_and(|s| state.chatgpt().callback_pending(&s))
+}
+
 /// Camada depois da guarda de `Host`/`Origin`: em modo rede, exige um dispositivo autorizado em
 /// tudo o que não venha de loopback de verdade, fora das rotas abertas.
 pub async fn require_device(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
@@ -806,7 +822,7 @@ pub async fn require_device(State(state): State<AppState>, mut req: Request, nex
         }
     }
     let lan = state.lan_mode();
-    if lan && !loopback && device.is_none() && !is_open(req.method(), req.uri().path()) {
+    if lan && !loopback && device.is_none() && !is_open(req.method(), req.uri().path()) && !chatgpt_callback_pending(&state, &req) {
         return deny(req.method(), req.uri().path());
     }
     req.extensions_mut().insert(Access { device: device.as_ref().map(|(id, _)| id.clone()), loopback });
@@ -842,7 +858,7 @@ fn require_manager(state: &AppState, access: &Access) -> Result<(), ApiError> {
 }
 
 fn store_failed() -> ApiError {
-    ApiError::internal("não foi possível gravar a lista de dispositivos").with_code(CODE_STORE_FAILED, Map::new())
+    ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, CODE_STORE_FAILED, Map::new())
 }
 
 fn publish_changed(state: &AppState, reason: &str) {
@@ -877,7 +893,7 @@ pub async fn get_pair_link(
     }
     match store.redeem_entry_link(&token) {
         Ok(Some((device, token))) => {
-            eprintln!("dispositivo autorizado pelo link de entrada: {} ({})", device.id, device.name);
+            terminal_notice("devices.log.authorized_link", &[("id", &device.id), ("name", &device.name)]);
             publish_changed(&state, "added");
             let mut resp = redirect("/");
             if let Some(cookie) = device_cookie(&token) {
@@ -992,7 +1008,7 @@ pub async fn post_pair(State(state): State<AppState>, headers: HeaderMap, body: 
         .unwrap_or_else(|| suggest_name(headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()), lang));
     match state.devices().pair(&code, name) {
         Ok((device, token)) => {
-            eprintln!("dispositivo autorizado pelo código: {} ({})", device.id, device.name);
+            terminal_notice("devices.log.authorized_code", &[("id", &device.id), ("name", &device.name)]);
             publish_changed(&state, "added");
             let mut resp = Json(json!({"device": device.view(Some(&device.id))})).into_response();
             if let Some(cookie) = device_cookie(&token) {
@@ -1001,22 +1017,13 @@ pub async fn post_pair(State(state): State<AppState>, headers: HeaderMap, body: 
             Ok(resp)
         }
         Err(PairError::RateLimited { retry_after_ms }) => {
-            let err = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "aguarde um segundo e tente de novo")
-                .with_code(CODE_PAIR_RATE_LIMITED, params([("retry_after_ms", json!(retry_after_ms))]));
+            let err = ApiError::coded(StatusCode::TOO_MANY_REQUESTS, CODE_PAIR_RATE_LIMITED, params([("retry_after_ms", json!(retry_after_ms))]));
             let mut resp = err.into_response();
             resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             Ok(resp)
         }
-        Err(PairError::Locked) => Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "várias tentativas erradas; gere outro código no computador",
-        )
-        .with_code(CODE_CODE_LOCKED, Map::new())),
-        Err(PairError::Inactive) => Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "nenhum código ativo; abra Adicionar dispositivo no computador",
-        )
-        .with_code(CODE_CODE_INACTIVE, Map::new())),
+        Err(PairError::Locked) => Err(ApiError::coded(StatusCode::TOO_MANY_REQUESTS, CODE_CODE_LOCKED, Map::new())),
+        Err(PairError::Inactive) => Err(ApiError::coded(StatusCode::BAD_REQUEST, CODE_CODE_INACTIVE, Map::new())),
         Err(PairError::Invalid { attempts_left }) => {
             if attempts_left == 0 {
                 state.events().publish(ApiEvent::new(
@@ -1025,8 +1032,7 @@ pub async fn post_pair(State(state): State<AppState>, headers: HeaderMap, body: 
                     json!({"reason": "too_many_errors"}),
                 ));
             }
-            Err(ApiError::new(StatusCode::BAD_REQUEST, "código errado")
-                .with_code(CODE_CODE_INVALID, params([("attempts_left", json!(attempts_left))])))
+            Err(ApiError::coded(StatusCode::BAD_REQUEST, CODE_CODE_INVALID, params([("attempts_left", json!(attempts_left))])))
         }
         Err(PairError::Store) => Err(store_failed()),
     }
@@ -1047,7 +1053,7 @@ struct RenameInput {
 }
 
 fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "dispositivo não encontrado").with_code(CODE_NOT_FOUND, Map::new())
+    ApiError::coded(StatusCode::NOT_FOUND, CODE_NOT_FOUND, Map::new())
 }
 
 fn valid_id(id: &str) -> bool {
@@ -1067,7 +1073,7 @@ pub async fn patch_device(
     }
     let input: RenameInput = super::config_api::parse_body(&body)?;
     let name = sanitize_name(&input.name).ok_or_else(|| {
-        ApiError::unprocessable("nome inválido").with_code(CODE_NAME_INVALID, params([("max", json!(MAX_NAME_CHARS))]))
+        ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, CODE_NAME_INVALID, params([("max", json!(MAX_NAME_CHARS))]))
     })?;
     match state.devices().rename(&id, name) {
         Ok(Some(device)) => {
@@ -1091,7 +1097,7 @@ pub async fn delete_device(
     }
     let revoked = state.devices().revoke(&id);
     match revoked {
-        Ok(Some(device)) => eprintln!("dispositivo revogado: {} ({})", device.id, device.name),
+        Ok(Some(device)) => terminal_notice("devices.log.revoked", &[("id", &device.id), ("name", &device.name)]),
         Ok(None) => return Err(not_found()),
         Err(_) => {
             publish_changed(&state, "revoked");
@@ -1112,7 +1118,7 @@ pub async fn delete_devices(State(state): State<AppState>, Extension(access): Ex
     let result = state.devices().revoke_all();
     publish_changed(&state, "revoked");
     let n = result.map_err(|_| store_failed())?;
-    eprintln!("todos os dispositivos revogados ({n})");
+    terminal_notice("devices.log.all_revoked", &[("count", &n.to_string())]);
     let mut resp = Json(json!({"revoked": n})).into_response();
     if access.device.is_some() {
         resp.headers_mut().append(header::SET_COOKIE, clear_cookie());

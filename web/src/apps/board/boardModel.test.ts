@@ -5,6 +5,7 @@ import { forbiddenGlyphIn } from "../../desktop/glyphs";
 import type { SpaceData } from "../../desktop/useSpaceData";
 import type { ChatMessage } from "../../store";
 import { makeSpec, makeTask } from "../../test-utils";
+import { translate } from "../../i18n";
 import {
   boardSummary,
   buildColumns,
@@ -15,8 +16,12 @@ import {
   movedCards,
   OPTIONAL_COLUMNS,
   parseBoardColumns,
+  pauseReasonText,
   pickActiveTask,
   recoveryLabel,
+  runStopCode,
+  runStopReason,
+  taskPauses,
   toggleBoardColumn,
 } from "./boardModel";
 
@@ -129,5 +134,69 @@ describe("linha recolhida da última revisão (094/T05)", () => {
     expect(lastReviewLine("T02", "approved")).toBe("Última revisão · T02 · Aprovado");
     expect(lastReviewLine("T02", null)).toBe("Última revisão · T02");
     expect(forbiddenGlyphIn(lastReviewLine("T02", "changes"))).toBeNull();
+  });
+});
+
+describe("tarefa pausada (spec 114 T04)", () => {
+  const sys = (id: number, code: string, specId = "s1"): ChatMessage => ({ id, role: "agent", agent: "system", text: "x", at: id, specId, code }) as ChatMessage;
+
+  it("motivo: a última mensagem de parada do run da spec; sem ela, interrompida", () => {
+    expect(runStopReason(undefined, "s1")).toBe("interrupted");
+    expect(runStopReason([sys(1, "run.stopped")], "s1")).toBe("stopped");
+    expect(runStopReason([sys(1, "run.stopped"), sys(2, "run.provider_failed_detail")], "s1")).toBe("provider");
+    expect(runStopReason([sys(1, "run.failed_cause"), sys(2, "final.unavailable")], "s1")).toBe("failed");
+    // Spec 116 T03: as pausas do plano ChatGPT têm o motivo próprio, pelo código.
+    expect(runStopReason([sys(1, "run.plan_limit")], "s1")).toBe("plan_limit");
+    expect(runStopReason([sys(1, "run.plan_not_eligible")], "s1")).toBe("plan_not_eligible");
+    expect(runStopReason([sys(1, "run.plan_needs_login")], "s1")).toBe("plan_sign_in");
+    expect(pauseReasonText("plan_limit")).toBe("limite de uso do plano atingido");
+    expect(pauseReasonText("plan_not_eligible")).toBe("conta não elegível ao plano");
+    expect(pauseReasonText("plan_sign_in")).toBe("precisa entrar de novo no ChatGPT");
+    expect(translate("en", "board.pause.planLimit")).toBe("plan usage limit reached");
+    expect(translate("en", "board.pause.planNotEligible")).toBe("account not eligible for the plan");
+    expect(translate("en", "board.pause.planNeedsLogin")).toBe("needs you to sign in to ChatGPT again");
+    // Outras mensagens do sistema e a conversa com o Arquiteto não contam como retomada.
+    const chat = { id: 3, role: "architect", text: "ok", at: 3 } as ChatMessage;
+    expect(runStopReason([sys(1, "run.stopped"), chat], "s1")).toBe("stopped");
+    // Mensagem de outra spec não conta.
+    expect(runStopReason([sys(1, "run.stopped", "s2")], "s1")).toBe("interrupted");
+    expect(pauseReasonText("provider")).toBe("o provedor do modelo falhou");
+    // Spec 116 T03: o código da parada (o cartão próprio das pausas do plano).
+    expect(runStopCode([sys(1, "run.plan_limit"), sys(2, "final.unavailable")], "s1")).toBe("run.plan_limit");
+    expect(runStopCode([sys(1, "run.stopped", "s2")], "s1")).toBeNull();
+    expect(runStopCode(undefined, "s1")).toBeNull();
+  });
+
+  it("parada antiga, retomada e queda sem mensagem: o genérico, nunca o motivo antigo", () => {
+    const dev = (id: number): ChatMessage => ({ id, role: "agent", agent: "developer", text: "seguindo", at: id, specId: "s1", taskId: "T02" }) as ChatMessage;
+    const history = [sys(10, "run.provider_failed_detail"), dev(20)];
+    // Pelo marco da retomada (project_status executando ou transição do estado).
+    expect(runStopReason([sys(10, "run.provider_failed_detail")], "s1", { seq: 0, at: 15 })).toBe("interrupted");
+    // Ao vivo, vale a ordem de chegada (`seq`), mesmo com a hora empatada (relógio recuando).
+    const live = (seq: number): ChatMessage => ({ ...sys(15, "run.provider_failed_detail"), seq }) as ChatMessage;
+    expect(runStopReason([live(4)], "s1", { seq: 5, at: 15 })).toBe("interrupted");
+    expect(runStopReason([live(6)], "s1", { seq: 5, at: 15 })).toBe("provider");
+    // Sem marco (página recarregada): o agente que falou depois da parada mostra a retomada.
+    expect(runStopReason(history, "s1")).toBe("interrupted");
+    // A parada da execução atual, depois do marco, vale.
+    expect(runStopReason([...history, sys(30, "run.stopped")], "s1", { seq: 0, at: 15 })).toBe("stopped");
+    expect(runStopReason([sys(10, "run.provider_failed_detail")], "s1", { seq: 0, at: 5 })).toBe("provider");
+  });
+
+  it("só tarefas com um agente; parada vence; com o run vivo, só a que espera decisão", () => {
+    const tasks = [
+      makeTask("T01", "a", "DONE"),
+      makeTask("T02", "b", "IN_PROGRESS"),
+      makeTask("T03", "c", "TODO"),
+      makeTask("T04", "d", "BLOCKED"),
+      makeTask("T05", "e", "INTEGRATING"),
+    ];
+    expect([...taskPauses(tasks, true, "provider", new Set())]).toEqual([
+      ["T02", "provider"],
+      ["T05", "provider"],
+    ]);
+    // Execução viva (ao continuar): nenhuma pausada, salvo a com pedido pendente.
+    expect(taskPauses(tasks, false, "provider", new Set()).size).toBe(0);
+    expect([...taskPauses(tasks, false, "interrupted", new Set(["T02", "T03"]))]).toEqual([["T02", "decision"]]);
   });
 });

@@ -116,7 +116,7 @@ function routes(
       resultCalls += 1;
       return result(resultCalls);
     }
-    return { status: 404, body: { error: "projeto não encontrado" } };
+    return { status: 404, body: { error: "projeto não encontrado", code: "project_not_found" } };
   });
   return { fetchMock, resultCalls: () => resultCalls };
 }
@@ -180,7 +180,7 @@ describe("ResultMessage: conteúdo", () => {
       body: serverResult({
         tasks: [
           { id: "T01", title: "Modelo", status: "DONE" },
-          { id: "T02", title: "Rotas", status: "DONE", error: "arquivo inválido" },
+          { id: "T02", title: "Rotas", status: "DONE", error: "arquivo inválido", code: "file_invalid" },
         ],
       }),
     }));
@@ -241,7 +241,7 @@ describe("ResultMessage: falhas", () => {
   it("falha do GET mostra cartão discreto e 'Tentar de novo' recarrega sem quebrar a tela", async () => {
     const user = userEvent.setup();
     const { fetchMock } = routes(completedState, (call) =>
-      call === 1 ? { status: 500, body: { error: "falha interna" } } : { body: serverResult() },
+      call === 1 ? { status: 500, body: { error: "falha interna", code: "internal" } } : { body: serverResult() },
     );
     render(<Screen />);
 

@@ -63,7 +63,7 @@ function stubRoutes(opts: {
         headers: { "Content-Type": "application/json" },
       });
     }
-    return new Response(JSON.stringify({ error: "projeto não encontrado" }), { status: 404 });
+    return new Response(JSON.stringify({ error: "projeto não encontrado", code: "project_not_found" }), { status: 404 });
   });
   vi.stubGlobal("fetch", mock);
   return { mock, stateCalls: () => stateCalls };
@@ -150,7 +150,7 @@ describe("GET do estado superado (F-08)", () => {
     const a = refreshProjectState(PID);
     const b = refreshProjectState(PID);
 
-    resolvers[1]?.({ status: 500, body: { error: "falha interna" } });
+    resolvers[1]?.({ status: 500, body: { error: "falha interna", code: "internal" } });
     await b;
     resolvers[0]?.({ body: makeProjectState({ name: "velho" }) });
     await a;

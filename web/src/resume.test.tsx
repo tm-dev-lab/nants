@@ -158,7 +158,7 @@ describe("useLiveStream: retomada reabre o stream e ressincroniza", () => {
       if (url === "/api/projects/p1/state") return { body: makeProjectState({ id: "p1", name: "api" }) };
       if (url === "/api/projects/p1/chat") return { body: { turns: [] } };
       if (url === "/api/projects/p1/activity") return { body: [] };
-      return { status: 404, body: { error: "não encontrado" } };
+      return { status: 404, body: { error: "não encontrado", code: "not_found" } };
     });
   }
 
@@ -197,8 +197,9 @@ describe("useLiveStream: retomada reabre o stream e ressincroniza", () => {
     render(<GlobalStream />);
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
 
-    let clock = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    // A retomada mede o tempo oculta pelo relógio monotônico (114/T01), não pelo de parede.
+    let clock = performance.now();
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => clock);
     state = "hidden";
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));

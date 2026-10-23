@@ -31,7 +31,8 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use axum::http::StatusCode;
+use serde_json::{json, Map, Value};
 
 use super::approvals::replace_atomic;
 use super::error::ApiError;
@@ -67,10 +68,6 @@ const DIALOG_FILE: &str = "dialog.jsonl";
 const TMP_PREFIX: &str = ".dialog.jsonl.";
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 500;
-const SPEC_NOT_FOUND: &str = "spec não encontrada";
-const AFTER_MSG: &str = "after deve ser um inteiro não negativo";
-const LIMIT_MSG: &str = "limit deve ser um inteiro entre 1 e 500";
-const INTERNAL_MSG: &str = "falha interna";
 /// Espera de `flush_project` na escrita da fila de cada projeto (só testes e encerramento).
 const SETTLE_STEP: Duration = Duration::from_millis(5);
 
@@ -706,12 +703,12 @@ pub async fn get_dialog(
     let root = PathBuf::from(&project.path);
     let page = tokio::task::spawn_blocking(move || -> Result<Page, ApiError> {
         if !spec_exists(&root, &spec_id) {
-            return Err(ApiError::new(axum::http::StatusCode::NOT_FOUND, SPEC_NOT_FOUND));
+            return Err(ApiError::coded(axum::http::StatusCode::NOT_FOUND, "spec_not_found", Map::new()));
         }
         Ok(read_page(&root, &spec_id, after, limit))
     })
     .await
-    .map_err(|_| ApiError::internal(INTERNAL_MSG))??;
+    .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))??;
     Ok(Json(page_view(&secrets, page)).into_response())
 }
 
@@ -720,7 +717,7 @@ fn parse_after(raw: Option<&str>) -> Result<u64, ApiError> {
         None => Ok(0),
         Some(text) => text
             .parse::<u64>()
-            .map_err(|_| ApiError::unprocessable(AFTER_MSG)),
+            .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "after_invalid", Map::new())),
     }
 }
 
@@ -731,7 +728,7 @@ fn parse_limit(raw: Option<&str>) -> Result<usize, ApiError> {
             .parse::<usize>()
             .ok()
             .filter(|n| (1..=MAX_LIMIT).contains(n))
-            .ok_or_else(|| ApiError::unprocessable(LIMIT_MSG)),
+            .ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "limit_invalid", Map::new())),
     }
 }
 

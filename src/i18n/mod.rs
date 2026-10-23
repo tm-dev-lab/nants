@@ -130,6 +130,57 @@ pub fn tr(lang: Lang, key: &str, params: &[(&str, &str)]) -> String {
     interpolate(template, |name| params.iter().find(|(n, _)| *n == name).map(|(_, v)| (*v).to_string()))
 }
 
+/// Assunto de commit do Nants no repositório da pessoa (spec 115 T04, C-09): o prefixo convencional
+/// (`feat(<spec>): T01 - `, `chore(<spec>): T01 - `, `docs: `...) fica fixo, porque o estado da
+/// tarefa e da spec é lido por ele (`feat(<spec>): Txx - ` marca o DONE); só o texto depois dele
+/// sai no idioma do projeto.
+pub fn commit_subject(lang: Lang, prefix: &str, key: &str) -> String {
+    format!("{prefix}{}", text(lang, key))
+}
+
+/// Forma do plural de `count` (spec 115 T01), a mesma regra da web (`pluralForm` em
+/// `web/src/i18n/index.ts`): `one` só para 1 nos dois idiomas. O zero usa o plural também em pt-BR
+/// ("0 arquivos"), decisão da 101/T01, embora o `Intl.PluralRules` trate 0 como singular em português.
+pub fn plural_form(lang: Lang, count: u64) -> &'static str {
+    match (lang, count) {
+        (_, 1) => "one",
+        (Lang::PtBr | Lang::En, _) => "other",
+    }
+}
+
+/// Número inteiro com o separador de milhar do idioma, como o `Intl.NumberFormat` da web:
+/// "1.234" em pt-BR e "1,234" em en.
+pub fn format_count(lang: Lang, count: u64) -> String {
+    let sep = match lang {
+        Lang::PtBr => '.',
+        Lang::En => ',',
+    };
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (k, c) in digits.chars().enumerate() {
+        if k > 0 && (digits.len() - k) % 3 == 0 {
+            out.push(sep);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Plural simples (spec 115 T01): o texto de `base.one` ou `base.other` (ver [`plural_form`]),
+/// com `{count}` já preenchido no formato do idioma e os demais `params` (que vencem, como na web).
+pub fn tr_plural(lang: Lang, base: &str, count: u64, params: &[(&str, &str)]) -> String {
+    let key = format!("{base}.{}", plural_form(lang, count));
+    let template = lookup(lang, &key).unwrap_or(&key);
+    let formatted = format_count(lang, count);
+    interpolate(template, |name| {
+        params
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| (*v).to_string())
+            .or_else(|| (name == "count").then(|| formatted.clone()))
+    })
+}
+
 /// Substitui `{name}` pelo valor de `value(name)`; nome desconhecido fica como está.
 fn interpolate(template: &str, value: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(template.len());
@@ -317,14 +368,26 @@ mod tests {
     /// Spec 113 T04 (sentinela): as mensagens do sistema que chegam à pessoa pela conversa, pelo
     /// relatório ou citadas ao modelo (runner, conselheiro, levantamento, relatório e rótulos da
     /// interface) não podem ter texto em pt no dicionário en, e o pt-BR precisa diferir do en.
+    /// A spec 114 T02 acrescenta os motivos de bloqueio e de pausa (`runner.block.*`,
+    /// `runner.budget.*`, `runs.*`) e os pedidos e aprovações automáticas (`approvals.*`).
+    /// A spec 115 T01 estende a sentinela a todas as famílias de mensagens de pessoa: os erros da
+    /// API (`serverError.`), as aprovações (`approval.`), as mensagens do sistema (`system.`), o
+    /// terminal (`cli.`, `doctor.`, `uninstall.`) os dispositivos (`devices.`), a recuperação (`recovery.`) e as dúvidas do juiz (`allowlist.`, spec 115 T03); a T04 acrescenta os commits do Nants (`commit.`); a spec 116 T01, o log do login pelo plano ChatGPT (`chatgpt.`). Toda chave do
+    /// dicionário precisa cair numa família, para nenhuma família nova escapar da sentinela.
     #[test]
     fn system_messages_have_no_portuguese_in_english() {
-        const PREFIXES: [&str; 5] = ["runner.", "advisor.", "survey.", "report.", "ui."];
+        const PREFIXES: [&str; 18] = [
+            "runner.", "advisor.", "survey.", "report.", "ui.", "approvals.", "runs.", "serverError.", "approval.", "system.", "cli.",
+            "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.",
+        ];
         const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
         const PT_WORDS: [&str; 19] = [
             "testes", "checagem", "checagens", "não", "esgotado", "arquivos", "coberto", "limite", "nao", "falhou", "reaproveitado", "arvore",
             "verificação", "bloqueante", "executado", "pergunta", "resposta", "levantamento", "iniciar",
         ];
+        for (key, _) in en::MESSAGES {
+            assert!(PREFIXES.iter().any(|p| key.starts_with(p)), "chave fora das famílias da sentinela: {key}");
+        }
         let system: Vec<&(&str, &str)> = en::MESSAGES.iter().filter(|(k, _)| PREFIXES.iter().any(|p| k.starts_with(p))).collect();
         assert!(system.len() >= 20, "chaves do sistema: {}", system.len());
         for (key, value) in system {
@@ -334,9 +397,74 @@ mod tests {
                 assert!(!lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == word), "palavra do pt em en {key}: {value}");
             }
             let pt = lookup(Lang::PtBr, key).unwrap_or_default();
-            let neutral = key.starts_with("report.traceability.commit");
+            let neutral = SAME_IN_BOTH.iter().any(|(k, _)| k == key);
             assert!(neutral || pt != *value, "pt-BR igual ao en em {key}: {value}");
         }
+        for (key, why) in SAME_IN_BOTH {
+            assert!(why.len() > 10, "{key}: motivo curto");
+            assert!(lookup(Lang::En, key).is_some(), "{key} não existe mais: tire da lista");
+            assert_eq!(lookup(Lang::PtBr, key), lookup(Lang::En, key), "{key} não é mais igual nos dois: tire da lista");
+        }
+    }
+
+    /// Chaves com o mesmo texto nos dois idiomas, com o motivo (a sentinela acima exige pt-BR
+    /// diferente do en no resto).
+    const SAME_IN_BOTH: [(&str, &str); 9] = [
+        ("doctor.status.ok", "marca de status do doctor, igual nos dois"),
+        ("doctor.status.info", "marca de status do doctor, igual nos dois"),
+        ("doctor.label.git", "nome de ferramenta"),
+        ("doctor.label.docker_cli", "nome de ferramenta"),
+        ("doctor.label.docker_daemon", "nome de ferramenta"),
+        ("doctor.label.docker_compose", "nome de ferramenta"),
+        ("doctor.label.wsl", "nome de ferramenta"),
+        ("doctor.detail.disk", "só a lista, montada por idioma nos itens"),
+        ("report.traceability.commit", "id e hash do commit, sem texto traduzível"),
+    ];
+
+    /// Spec 115 T01: plural com `.one` e `.other` sempre juntos, nos dois dicionários, sem a chave
+    /// base solta ao lado (quem chama usa [`tr_plural`]).
+    #[test]
+    fn plural_keys_come_in_pairs() {
+        let mut bases = 0;
+        for (name, dict) in [("pt-BR", pt_br::MESSAGES), ("en", en::MESSAGES)] {
+            let has = |key: &str| dict.iter().any(|(k, _)| *k == key);
+            for (key, _) in dict {
+                let (base, other) = match (key.strip_suffix(".one"), key.strip_suffix(".other")) {
+                    (Some(base), _) => (base, format!("{base}.other")),
+                    (_, Some(base)) => (base, format!("{base}.one")),
+                    _ => continue,
+                };
+                bases += 1;
+                assert!(has(&other), "{name}: {key} sem {other}");
+                assert!(!has(base), "{name}: {base} solta ao lado do plural");
+            }
+        }
+        assert!(bases >= 8, "chaves de plural: {bases}");
+    }
+
+    #[test]
+    fn plural_follows_the_web_rule_with_zero_in_the_plural() {
+        for lang in [Lang::PtBr, Lang::En] {
+            assert_eq!(plural_form(lang, 1), "one");
+            for n in [0, 2, 5, 11, 21, 101, 1000] {
+                assert_eq!(plural_form(lang, n), "other", "{lang:?} {n}");
+            }
+        }
+        let applied = |lang, n| tr_plural(lang, "runner.format.applied", n, &[("names", "rustfmt")]);
+        assert_eq!(applied(Lang::PtBr, 1), "formatação automática: 1 arquivo (rustfmt)");
+        assert_eq!(applied(Lang::PtBr, 0), "formatação automática: 0 arquivos (rustfmt)");
+        assert_eq!(applied(Lang::PtBr, 1234), "formatação automática: 1.234 arquivos (rustfmt)");
+        assert_eq!(applied(Lang::En, 1), "automatic formatting: 1 file (rustfmt)");
+        assert_eq!(applied(Lang::En, 3), "automatic formatting: 3 files (rustfmt)");
+        assert_eq!(applied(Lang::En, 1234), "automatic formatting: 1,234 files (rustfmt)");
+        assert_eq!(tr_plural(Lang::En, "runner.block.rejections", 1, &[]), "1 reviewer rejection");
+        assert_eq!(tr_plural(Lang::PtBr, "runner.block.rejections", 3, &[]), "3 reprovações do revisor");
+        // Parâmetro passado vence o `{count}` montado (como na web).
+        assert_eq!(tr_plural(Lang::En, "runner.block.rejections", 2, &[("count", "x")]), "x reviewer rejections");
+        assert_eq!(format_count(Lang::PtBr, 0), "0");
+        assert_eq!(format_count(Lang::PtBr, 999), "999");
+        assert_eq!(format_count(Lang::En, 1_000_000), "1,000,000");
+        assert_eq!(tr_plural(Lang::En, "nao.existe", 2, &[]), "nao.existe.other");
     }
 
     #[test]

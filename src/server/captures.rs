@@ -12,6 +12,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use serde_json::Map;
 use super::error::ApiError;
 use super::events::validate_project_id;
 use super::projects::find_project;
@@ -20,13 +21,11 @@ use super::spec_result::validate_spec_id;
 use super::state::AppState;
 use crate::sdd::screenshots::{media_type_of_name, CAPTURES_DIR, MAX_COPY_NAME_CHARS, MAX_FILE_BYTES};
 
-const NOT_FOUND: &str = "captura não encontrada";
-const INTERNAL_MSG: &str = "falha interna";
 /// Cache privado: o nome da cópia inclui tarefa e tentativa, então o conteúdo raramente muda.
 const CACHE_CONTROL: &str = "private, max-age=3600";
 
 fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, NOT_FOUND)
+    ApiError::coded(StatusCode::NOT_FOUND, "capture_not_found", Map::new())
 }
 
 /// Nome de captura aceito: `[a-z0-9._-]`, até [`MAX_COPY_NAME_CHARS`], sem começar por `.` ou `-`,
@@ -58,7 +57,7 @@ pub async fn get_capture(
     let rel = format!(".sdd/specs/{spec}/{CAPTURES_DIR}/{name}");
     let read = tokio::task::spawn_blocking(move || safe_fs::read_bounded(&root, &rel, MAX_FILE_BYTES))
         .await
-        .map_err(|_| ApiError::internal(INTERNAL_MSG))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     let data = match read {
         Ok(safe_fs::BoundedRead { data: Some(data), .. }) => data,
         _ => return Err(not_found()),

@@ -179,3 +179,11 @@ describe("protocolo da conexão (wire_api)", () => {
     expect(WIRE_API_OPTIONS.map((o) => o.value)).toEqual(["chat", "responses"]);
   });
 });
+
+describe("teste da conexão pelo plano ChatGPT (spec 116 T02)", () => {
+  it("os códigos do plano têm texto próprio", () => {
+    expect(describeTestResult({ ok: false, error: "plan_limit" })).toBe("Limite de uso do plano ChatGPT atingido.");
+    expect(describeTestResult({ ok: false, error: "plan_not_eligible" })).toBe("Esta conta ChatGPT não pode usar o plano pelo Nants.");
+    expect(describeTestResult({ ok: false, error: "plan_needs_login" })).toBe("Entre de novo no plano ChatGPT para usar esta conexão.");
+  });
+});

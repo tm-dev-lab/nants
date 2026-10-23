@@ -7,7 +7,7 @@
  * Tudo passa pelo `request` do cliente (único ponto de `fetch`). As respostas são validadas
  * campo a campo; o que não confere é descartado. Mensagens de erro são fixas.
  */
-import { createProject, request, type ApiFailure, type ApiResult } from "../api/client";
+import { clientReserve, createProject, request, serverErrorCode, type ApiFailure, type ApiResult } from "../api/client";
 import type { Project } from "../api/types";
 import { isMessageCode, parseCodeParams, type CodeParams } from "../api/codes";
 import type { MessageKey } from "../i18n";
@@ -311,11 +311,11 @@ export async function createProjectByName(name: string): Promise<CreateProjectOu
     path: "/api/projects",
     body: JSON.stringify({ name }),
     onHttpError: (status, body) => {
-      if (status !== 409 || !isRecord(body) || body.error !== EXISTS_REASON) return null;
+      if (status !== 409 || !isRecord(body) || serverErrorCode(body) !== EXISTS_REASON) return null;
       const path = str(body.path, 4096);
       if (path === null) return null;
       existsPath = path;
-      return { kind: "http", status, message: "a pasta já existe", reason: EXISTS_REASON };
+      return { kind: "http", status, ...clientReserve("api.status.409"), reason: EXISTS_REASON };
     },
   });
   if (result.ok) {
@@ -346,12 +346,7 @@ interface ProjectsRoot {
 }
 
 /** Mensagens fixas do 422 de `PUT /api/config/projects-root` (as únicas repassadas). */
-const PROJECTS_ROOT_MESSAGES: readonly string[] = [
-  "pasta de projetos inválida: use um caminho absoluto (aceita ~), sem '..'",
-  "pasta de projetos inválida: diretório de sistema não é permitido",
-  "pasta de projetos inválida: não pode ficar dentro de um projeto registrado",
-];
-const PROJECTS_ROOT_INVALID = ptBR["api.projectsRoot.invalid"];
+
 
 /** Lê os dois campos da raiz numa resposta (`/api/config` ou o PUT); ausentes viram `null`. */
 export function parseProjectsRoot(value: unknown): ProjectsRoot {
@@ -366,10 +361,9 @@ export function putProjectsRoot(root: string | null): Promise<ApiResult<Projects
     path: "/api/config/projects-root",
     body: JSON.stringify({ projects_root: root }),
     onHttpError: (status, body) => {
-      if (status !== 422) return null;
-      const error = isRecord(body) && typeof body.error === "string" ? body.error : "";
-      const message = PROJECTS_ROOT_MESSAGES.includes(error) ? `${error.charAt(0).toUpperCase()}${error.slice(1)}.` : PROJECTS_ROOT_INVALID;
-      return { kind: "http", status, message };
+      // Os 422 com `code` (`projects_root_*`) se traduzem pelo código; sem ele, a reserva da pasta.
+      if (status !== 422 || serverErrorCode(body) !== null) return null;
+      return { kind: "http", status, ...clientReserve("api.projectsRoot.invalid") };
     },
   }).then((r) => (r.ok ? { ok: true, data: parseProjectsRoot(r.data) } : r));
 }

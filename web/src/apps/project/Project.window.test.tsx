@@ -66,7 +66,7 @@ describe("Projeto: pasta e limites", () => {
 
   it("valida de 1 a 10 antes de enviar; salva e atualiza o estado; 409 vira mensagem fixa", async () => {
     const { server } = await openProject();
-    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe uma execução em andamento neste projeto" } };
+    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe uma execução em andamento neste projeto", code: "run_active" } };
     server.reply("PUT", /^\/api\/projects\/p1\/settings$/, () => reply);
     const win = project();
     const form = within(win).getByRole("form", { name: "Limites do projeto" });
@@ -215,7 +215,7 @@ describe("Projeto: Remover do Nants", () => {
       if (init?.method === "DELETE" && url === "/api/projects/p1") {
         server.calls.push({ method: "DELETE", url, body: undefined });
         await gate;
-        return new Response(JSON.stringify({ error: "projeto não encontrado" }), { status: 404, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ error: "projeto não encontrado", code: "project_not_found" }), { status: 404, headers: { "Content-Type": "application/json" } });
       }
       if (base === undefined) throw new Error("fetch ausente");
       return base(input, init);
@@ -238,7 +238,7 @@ describe("Projeto: Remover do Nants", () => {
 
   it("409 de execução em andamento: mensagem explicativa e o diálogo continua", async () => {
     const { server } = await openProject();
-    server.reply("DELETE", /^\/api\/projects\/p1$/, () => ({ status: 409, body: { error: "já existe uma execução em andamento neste projeto" } }));
+    server.reply("DELETE", /^\/api\/projects\/p1$/, () => ({ status: 409, body: { error: "já existe uma execução em andamento neste projeto", code: "run_active" } }));
     fireEvent.click(within(project()).getByRole("button", { name: "Remover do Nants" }));
     const dialog = screen.getByRole("alertdialog");
     await act(async () => {

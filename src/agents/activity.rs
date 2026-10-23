@@ -32,6 +32,14 @@ pub enum ActivityKind {
     Heartbeat,
     /// Fim do comando em curso.
     CommandEnd,
+    /// Início de uma chamada ao modelo (spec 114 T04): o servidor anota o instante.
+    Model,
+    /// Sinal periódico da chamada ao modelo em curso (com os bytes recebidos, quando há). Sai como
+    /// `heartbeat`, mas é um tipo próprio: não é progresso do agente e não renova prazo de
+    /// inatividade nenhum (ao contrário do heartbeat de comando).
+    ModelBeat,
+    /// Fim da chamada ao modelo em curso.
+    ModelEnd,
     End,
 }
 
@@ -45,6 +53,9 @@ impl ActivityKind {
             Self::Command => "command",
             Self::Heartbeat => "heartbeat",
             Self::CommandEnd => "command_end",
+            Self::Model => "model",
+            Self::ModelBeat => "heartbeat",
+            Self::ModelEnd => "model_end",
             Self::End => "end",
         }
     }
@@ -78,6 +89,8 @@ pub struct ActivityEvent {
     pub text: Option<String>,
     /// `code`/`params` do texto (rótulo de ferramenta, aviso do limitador), quando há.
     pub code: Option<ActivityCode>,
+    /// Bytes recebidos da resposta do modelo em curso (só no `heartbeat` da chamada, quando há).
+    pub received_bytes: Option<u64>,
 }
 
 /// Destino dos eventos de atividade.
@@ -161,6 +174,8 @@ struct State {
     last_kind: Option<usize>,
     last_flush: Instant,
     ended: bool,
+    /// Bytes recebidos da resposta em curso (`StreamDelta::Received`); exibidos no ritmo do heartbeat.
+    received: u64,
 }
 
 impl State {
@@ -171,6 +186,7 @@ impl State {
             last_kind: None,
             last_flush: Instant::now(),
             ended: false,
+            received: 0,
         }
     }
 }
@@ -194,6 +210,10 @@ impl ActivityRun {
     }
 
     fn send_coded(&self, kind: ActivityKind, text: Option<String>, code: Option<ActivityCode>) {
+        self.send_full(kind, text, code, None);
+    }
+
+    fn send_full(&self, kind: ActivityKind, text: Option<String>, code: Option<ActivityCode>, received_bytes: Option<u64>) {
         // Os `params` passam pela mesma redação do texto (o servidor ainda os saneia de novo).
         let code = code.map(|mut c| {
             for value in c.params.values_mut() {
@@ -211,6 +231,7 @@ impl ActivityRun {
             kind,
             text,
             code,
+            received_bytes,
         });
     }
 
@@ -220,6 +241,13 @@ impl ActivityRun {
             StreamDelta::Reasoning(t) => (0, t),
             StreamDelta::Text(t) => (1, t),
             StreamDelta::Retry(notice) => return self.retry(&notice),
+            // Só guarda o tamanho: quem o mostra é o heartbeat de [`Self::track_model`].
+            StreamDelta::Received(n) => {
+                self.state.lock().unwrap_or_else(PoisonError::into_inner).received = n;
+                return;
+            }
+            // O diagnóstico do corte vai para o registro de uso (spec 114 T05), não para a tela.
+            StreamDelta::Cut(_) => return,
         };
         if text.is_empty() {
             return;
@@ -263,6 +291,7 @@ impl ActivityRun {
             st.acc = [String::new(), String::new()];
             st.emitted = [String::new(), shown.clone()];
             st.last_kind = None;
+            st.received = 0;
         }
         self.send_coded(ActivityKind::Text, Some(shown), notice_code(notice));
     }
@@ -341,6 +370,35 @@ impl ActivityRun {
             tokio::select! {
                 out = &mut fut => return out,
                 _ = ticker.tick() => self.send(ActivityKind::Heartbeat, None),
+            }
+        }
+    }
+
+    /// Executa `fut` (uma chamada ao modelo, spec 114 T04) emitindo `model` ao iniciar, um
+    /// `heartbeat` a cada intervalo do escopo (com os bytes já recebidos, quando há) e `model_end`
+    /// ao terminar (também se o futuro for descartado). Ritmo: um evento por intervalo, nunca por
+    /// pedaço da resposta.
+    pub async fn track_model<F: std::future::Future>(&self, fut: F) -> F::Output {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).received = 0;
+        self.send(ActivityKind::Model, None);
+        struct EndGuard<'a>(&'a ActivityRun);
+        impl Drop for EndGuard<'_> {
+            fn drop(&mut self) {
+                self.0.send(ActivityKind::ModelEnd, None);
+            }
+        }
+        let _guard = EndGuard(self);
+        let mut ticker = tokio::time::interval(self.scope.heartbeat.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                _ = ticker.tick() => {
+                    let received = self.state.lock().unwrap_or_else(PoisonError::into_inner).received;
+                    self.send_full(ActivityKind::ModelBeat, None, None, (received > 0).then_some(received));
+                }
             }
         }
     }
@@ -765,6 +823,47 @@ mod tests {
         assert!(!leaks(&ev));
         let shown = ev[1].text.as_deref().unwrap_or_default();
         assert!(shown.len() <= MAX_COMMAND_BYTES);
+    }
+
+    /// Spec 114 T04: a chamada longa ao modelo emite `model`, heartbeats no ritmo do escopo (nunca
+    /// um por pedaço) com os bytes já recebidos, e `model_end`; o tamanho sozinho não vira texto.
+    #[tokio::test]
+    async fn model_call_emits_start_paced_heartbeats_with_bytes_and_end() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).with_heartbeat(Duration::from_millis(30)).begin();
+        let out = run
+            .track_model(async {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                for n in 1..=500u64 {
+                    run.delta(StreamDelta::Received(n * 100));
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                3
+            })
+            .await;
+        assert_eq!(out, 3);
+        let ev = rec.events();
+        let kinds: Vec<_> = ev.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds[0], ActivityKind::Start);
+        assert_eq!(kinds[1], ActivityKind::Model);
+        assert_eq!(*kinds.last().unwrap_or(&ActivityKind::Start), ActivityKind::ModelEnd);
+        let beats: Vec<_> = ev.iter().filter(|e| e.kind == ActivityKind::ModelBeat).collect();
+        assert_eq!(ActivityKind::ModelBeat.as_str(), "heartbeat");
+        assert!((2..=5).contains(&beats.len()), "{kinds:?}");
+        // Antes dos bytes, o heartbeat não traz tamanho; depois, o último recebido.
+        assert_eq!(beats[0].received_bytes, None);
+        assert_eq!(beats.last().and_then(|b| b.received_bytes), Some(50_000));
+        assert!(ev.iter().all(|e| e.text.is_none()));
+    }
+
+    #[tokio::test]
+    async fn dropped_model_call_still_ends() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).begin();
+        let fut = run.track_model(std::future::pending::<()>());
+        let _ = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        let kinds: Vec<_> = rec.events().iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![ActivityKind::Start, ActivityKind::Model, ActivityKind::ModelEnd]);
     }
 
     #[test]

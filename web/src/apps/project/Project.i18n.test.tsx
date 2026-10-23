@@ -49,7 +49,7 @@ function expectNoPortuguese(): void {
 describe("Projeto em en", () => {
   it("seções, pasta, limites (validação, 409 e sucesso), modos e subtítulo", async () => {
     const { server } = await open("en");
-    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe uma execução em andamento neste projeto" } };
+    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe uma execução em andamento neste projeto", code: "run_active" } };
     server.reply("PUT", /^\/api\/projects\/p1\/settings$/, () => reply);
     const w = win();
     expect([...w.querySelectorAll(".nd-project-section h3")].map((h) => h.textContent)).toEqual(["Project folder", "Limits", "Modes", "Remove from Nants"]);
@@ -88,7 +88,7 @@ describe("Projeto em en", () => {
 
   it("Remover do Nants: diálogo, erro do 409 traduzido e o aviso da remoção", async () => {
     const { server } = await open("en");
-    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe um turno de chat em andamento para este projeto" } };
+    let reply: { status: number; body: unknown } = { status: 409, body: { error: "já existe um turno de chat em andamento para este projeto", code: "chat_active" } };
     server.reply("DELETE", /^\/api\/projects\/p1$/, () => reply);
     fireEvent.click(within(win()).getByRole("button", { name: "Remove from Nants" }));
     const dialog = screen.getByRole("alertdialog", { name: "Remove the workspace from Nants?" });

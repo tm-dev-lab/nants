@@ -308,6 +308,7 @@ mod tests {
                 test_evidence: None,
                 test_run: None,
                 next_action: None,
+                next_action_code: None,
                 diff_lines: vec![],
                 kind: None,
             },

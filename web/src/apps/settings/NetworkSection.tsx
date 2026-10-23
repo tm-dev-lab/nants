@@ -29,6 +29,7 @@ import { rangeLabel, rangeReleased } from "../../desktop/network";
 import { useShell } from "../../desktop/shellContext";
 import { useNetworkView } from "../../desktop/useNetwork";
 import { useT } from "../../i18n/react";
+import { apiFailureText } from "../../i18n/serverCodes";
 import { reachEnvironment } from "../app/runSession";
 import { copyText } from "../conversation/ResultMessage";
 import { journeySteps, stepIsDone, type JourneyStep } from "./devicesModel";
@@ -223,7 +224,7 @@ export function NetworkSection() {
     if (!alive.current) return;
     setSaving(false);
     if (!result.ok) {
-      setSaveError(t("settings.network.saveFailed", { message: result.error.message }));
+      setSaveError(t("settings.network.saveFailed", { message: apiFailureText(result.error) }));
       return;
     }
     const saved = typeof result.data.saved_lan === "boolean" ? result.data.saved_lan : next;

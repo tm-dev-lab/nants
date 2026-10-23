@@ -44,6 +44,7 @@ fn config_for(root: &Path, reviewer: bool) -> Config {
         base_url: "https://api.example.com/v1".into(),
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     if reviewer {
         cfg.agents.reviewer = AgentConfig { connection_id: "c".into(), model: "rev".into(), effort: Effort::Medium, max_steps: None };

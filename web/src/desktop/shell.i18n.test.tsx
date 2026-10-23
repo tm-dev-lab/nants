@@ -74,10 +74,10 @@ describe("Novo projeto em en", () => {
     expect(portugueseLeftovers(dialog)).toEqual([]);
 
     const replies = [
-      { status: 400, body: { error: "nome inválido: use letras ou números" } },
+      { status: 400, body: { error: "nome inválido: use letras ou números", code: "project_name_invalid" } },
       { status: 412, body: { error: "prereq_missing", missing: ["git"] } },
       { status: 422, body: { error: "pasta de projetos inválida" } },
-      { status: 409, body: { error: "identificador de projeto já existe para outro caminho" } },
+      { status: 409, body: { error: "identificador de projeto já existe para outro caminho", code: "project_id_taken" } },
     ];
     const expected = [
       "Invalid name: use letters or numbers.",
@@ -96,7 +96,7 @@ describe("Novo projeto em en", () => {
       expect(portugueseLeftovers(dialog)).toEqual([]);
     }
 
-    server.reply("POST", /^\/api\/projects$/, () => ({ status: 409, body: { error: "project_dir_exists", path: "/home/u/NantsProjects/loja" } }));
+    server.reply("POST", /^\/api\/projects$/, () => ({ status: 409, body: { error: "a pasta do projeto já existe", code: "project_dir_exists", path: "/home/u/NantsProjects/loja" } }));
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("button", { name: "Create project" }));
     });
@@ -112,7 +112,7 @@ describe("Novo projeto em en", () => {
     let fail = false;
     server.reply("GET", /^\/api\/fs\/browse/, () =>
       fail
-        ? { status: 403, body: { error: "sem permissão para listar o diretório" } }
+        ? { status: 403, body: { error: "sem permissão para listar o diretório", code: "list_no_permission" } }
         : { status: 200, body: { path: "/home/u", parent: "/home", truncated: true, entries: [{ name: "app", path: "/home/u/app", is_git_repo: true }] } },
     );
     await act(async () => {
@@ -135,7 +135,7 @@ describe("Novo projeto em en", () => {
       fireEvent.click(within(browser).getByRole("button", { name: "Parent folder" }));
     });
     await settle();
-    expect(within(browser).getByRole("alert").textContent).toBe("no permission to list the directory");
+    expect(within(browser).getByRole("alert").textContent).toBe("no permission to list the folder");
     expect(portugueseLeftovers(dialog)).toEqual([]);
   });
 
@@ -188,7 +188,8 @@ describe("Avisos flutuantes de permissão", () => {
   it("en: '+N', ações e a mudança de ambiente; pt-BR igual a hoje e a troca ao vivo", async () => {
     setLanguage("en", { persist: false });
     const { stream } = await renderShell({ url: "/?space=p1", projects: [P1, P2], states: { p1: makeProjectState({ id: "p1", name: "Loja" }) } });
-    let clock = 1_000_000;
+    // A hora da linha do tempo nunca recua (114/T01): os instantes partem da hora atual.
+    let clock = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => (clock += 10));
     await act(async () => {
       stream().emit("permission_requested", permissionEvent("p1", "r1", "cargo test"));

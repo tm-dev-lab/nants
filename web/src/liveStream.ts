@@ -107,7 +107,8 @@ export function createResumeScheduler(
 export function installResumeSync(options: ResumeOptions): () => void {
   const doc = options.doc ?? document;
   const win = options.win ?? window;
-  const now = options.now ?? ((): number => Date.now());
+  // Mede só quanto tempo a aba ficou oculta: relógio monotônico, imune ao recuo do relógio de parede.
+  const now = options.now ?? ((): number => performance.now());
   const minHidden = options.minHiddenMs ?? RESUME_MIN_HIDDEN_MS;
   const scheduler = options.scheduler;
   let hiddenAt: number | null = doc.visibilityState === "hidden" ? now() : null;

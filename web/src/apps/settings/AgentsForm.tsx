@@ -89,9 +89,15 @@ function validateAgents(draft: Agents, connections: readonly ConnectionView[], s
   return found;
 }
 
+/** Modelo da lista: `id` é o que se grava e envia; `name` (plano ChatGPT, spec 116) é o rótulo. */
+interface ModelOption {
+  id: string;
+  name?: string;
+}
+
 type ModelsEntry =
   | { status: "loading" }
-  | { status: "ready"; models: string[]; truncated: boolean }
+  | { status: "ready"; models: ModelOption[]; truncated: boolean }
   | { status: "error"; message: string };
 
 function endpointKey(connection: ConnectionView): string {
@@ -102,7 +108,10 @@ function toModelsEntry(outcome: ApiResult<ModelsResult>): ModelsEntry {
   if (!outcome.ok) return { status: "error", message: t("settings.models.requestFailed", { message: apiFailureText(outcome.error) }) };
   const data = outcome.data;
   if (typeof data.error === "string") return { status: "error", message: describeModelsError(data.error, data.status) };
-  const models = data.models.flatMap((model) => (typeof model?.id === "string" ? [model.id] : []));
+  const models = data.models.flatMap((model): ModelOption[] => {
+    if (typeof model?.id !== "string") return [];
+    return typeof model.name === "string" && model.name.trim() !== "" ? [{ id: model.id, name: model.name }] : [{ id: model.id }];
+  });
   return { status: "ready", models, truncated: data.truncated === true };
 }
 
@@ -349,7 +358,7 @@ function RoleCard({
   const [switched, setSwitched] = useState(false);
   const loading = modelsEntry?.status === "loading";
   const ready = modelsEntry?.status === "ready" ? modelsEntry : null;
-  const notListed = switched && ready !== null && !ready.truncated && agent.model.trim() !== "" && !ready.models.includes(agent.model);
+  const notListed = switched && ready !== null && !ready.truncated && agent.model.trim() !== "" && !ready.models.some((m) => m.id === agent.model);
 
   let hint: string | null = null;
   let warn = false;
@@ -484,16 +493,17 @@ function ModelCombobox({
 }: {
   id: string;
   value: string;
-  options: readonly string[];
+  options: readonly ModelOption[];
   disabled: boolean;
   onChange: (model: string) => void;
 }) {
+  const labelOf = (option: ModelOption): string => option.name ?? option.id;
   const listId = useId();
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
   const [typed, setTyped] = useState("");
   const query = typed.trim().toLowerCase();
-  const filtered = query === "" ? [...options] : options.filter((m) => m.toLowerCase().includes(query));
+  const filtered = query === "" ? [...options] : options.filter((m) => m.id.toLowerCase().includes(query) || labelOf(m).toLowerCase().includes(query));
   const visible = open && !disabled && filtered.length > 0;
   const current = visible && active < filtered.length ? active : -1;
   const optionId = (index: number): string => `${listId}-opt-${index}`;
@@ -523,7 +533,7 @@ function ModelCombobox({
     } else if (event.key === "Enter") {
       if (visible) {
         event.preventDefault();
-        if (current >= 0) choose(filtered[current] ?? value);
+        if (current >= 0) choose(filtered[current]?.id ?? value);
         else close();
       }
     } else if (event.key === "Escape") {
@@ -567,15 +577,15 @@ function ModelCombobox({
         <ul id={listId} role="listbox" aria-label={t("settings.agents.models")} className="nd-combo-list">
           {filtered.map((model, index) => (
             <li
-              key={model}
+              key={model.id}
               id={optionId(index)}
               role="option"
-              aria-selected={model === value}
+              aria-selected={model.id === value}
               data-active={index === current ? "true" : undefined}
               onMouseDown={(event) => event.preventDefault()}
-              onClick={() => choose(model)}
+              onClick={() => choose(model.id)}
             >
-              {model}
+              {labelOf(model)}
             </li>
           ))}
         </ul>

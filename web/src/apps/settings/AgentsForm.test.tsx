@@ -155,6 +155,31 @@ describe("AgentsForm: lista de modelos", () => {
     expect(JSON.parse(String(put?.[1]?.body)).architect.model).toBe("o3-mini");
   });
 
+  it("spec 116: modelo com nome (plano ChatGPT) mostra o nome e salva o slug", async () => {
+    const fetchMock = installFetch(
+      routes({
+        [modelsUrl("openai-direct")]: {
+          body: {
+            connection_id: "openai-direct",
+            models: [{ id: "gpt-plano-z", name: "GPT Plano Z" }, { id: "gpt-sem-nome" }],
+            truncated: false,
+            fetched_at: 1760000000,
+          },
+        },
+      }),
+    );
+    renderPanel();
+    const region = roleRegion("Arquiteto");
+    const user = await waitForOptions(region, 2);
+    expect(optionsOf(region).map((o) => o.textContent)).toEqual(["GPT Plano Z", "gpt-sem-nome"]);
+    await user.click(within(region).getByRole("option", { name: "GPT Plano Z" }));
+    expect((within(region).getByLabelText("Modelo do Arquiteto") as HTMLInputElement).value).toBe("gpt-plano-z");
+    await user.click(screen.getByRole("button", { name: "Salvar agentes" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(true));
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(put?.[1]?.body)).architect.model).toBe("gpt-plano-z");
+  });
+
   it("digitar um id fora da lista e salvar funciona (entrada manual)", async () => {
     const fetchMock = installFetch(routes());
     renderPanel();

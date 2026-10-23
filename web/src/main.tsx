@@ -15,6 +15,7 @@ import { clearStaleStorage } from "./staleStorage";
 import { UiStateSync } from "./desktop/uiState";
 import { initLanguage } from "./i18n";
 import { bindLanguageToUiState } from "./i18n/uiStateBinding";
+import { captureChatgptReturn } from "./apps/settings/chatgptPlan";
 
 clearStaleStorage();
 
@@ -30,6 +31,13 @@ if (!entry) {
   const languageSource = new UiStateSync({ kind: "global" }, { storage: null });
   bindLanguageToUiState(languageSource);
   void languageSource.start();
+}
+
+// Volta do login pelo plano ChatGPT (spec 116): o resultado fica guardado antes do primeiro render
+// (a rota do desktop normaliza a URL) e a página volta ao espaço em que o login começou.
+if (!entry) {
+  const back = captureChatgptReturn(window.location.search);
+  if (back !== null) window.history.replaceState(window.history.state, "", back);
 }
 
 const container = document.getElementById("root");

@@ -72,8 +72,8 @@ describe("loadChatHistory", () => {
   });
 
   it.each([
-    ["HTTP 500", { status: 500, body: { error: "falha interna" } } as RouteReply],
-    ["HTTP 404", { status: 404, body: { error: "projeto não encontrado" } } as RouteReply],
+    ["HTTP 500", { status: 500, body: { error: "falha interna", code: "internal" } } as RouteReply],
+    ["HTTP 404", { status: 404, body: { error: "projeto não encontrado", code: "project_not_found" } } as RouteReply],
   ])("falha do histórico (%s) não lança e não limpa a conversa já existente", async (_label, reply) => {
     resetStore({ messages: { [PID]: [{ id: 1, role: "user", text: "vivo", at: 0 }] satisfies ChatMessage[] } });
     serveHistory(() => reply);

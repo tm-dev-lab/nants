@@ -3,7 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { SpaceData } from "../../desktop/useSpaceData";
 import type { ActivityEntry, ChatMessage } from "../../store";
 import { countsTowardAttention, INFO_KINDS } from "../attention/attentionModel";
-import { activitySummary, cardAgents, historyItems, imageManifestPath, latestByAgent, liveActionOf, parseImageManifest } from "./activityModel";
+import { setLanguage } from "../../i18n";
+import { activitySummary, cardAgents, elapsedText, historyItems, imageManifestPath, latestByAgent, liveActionOf, parseImageManifest } from "./activityModel";
 
 function entry(extra: Partial<ActivityEntry>): ActivityEntry {
   return { key: "k", agent: "developer", activityId: "a1", reasoning: "", text: "", tool: "", startedAt: 1, lastAt: 1, ...extra };
@@ -47,6 +48,42 @@ describe("ação ao vivo", () => {
     expect(latest.get("tests")?.command).toBe("make test");
     expect(cardAgents(latest)).toEqual(["developer", "reviewer", "architect", "tests"]);
     expect(cardAgents(new Map())).toEqual(["developer", "reviewer", "architect"]);
+  });
+});
+
+describe("chamada ao modelo em curso (spec 114 T04)", () => {
+  const NOW = 10_000_000;
+  it("antes do primeiro byte: 'aguardando o modelo há 2 min'", () => {
+    const live = liveActionOf(entry({ modelStartedAt: NOW - 125_000 }), NOW);
+    expect(live).toMatchObject({ kind: "model", state: "aguardando o modelo", detail: "há 2 min", model: null });
+  });
+
+  it("com bytes chegando e nada de texto: o tempo e o tamanho reais", () => {
+    const live = liveActionOf(entry({ modelStartedAt: NOW - 510_000, modelBytes: 1_258_291 }), NOW);
+    expect(live).toMatchObject({ kind: "model", state: "recebendo a resposta", detail: "há 8 min · 1,2 MB recebidos" });
+  });
+
+  it("com raciocínio ou texto: a linha mostra o que chegou e a chamada vai à parte", () => {
+    const thinking = liveActionOf(entry({ reasoning: "lendo o plano", modelStartedAt: NOW - 30_000, modelBytes: 2048 }), NOW);
+    expect(thinking).toMatchObject({ kind: "thinking", detail: "lendo o plano", model: "recebendo a resposta há 30 s · 2 KB recebidos" });
+    const writing = liveActionOf(entry({ text: "pronto", modelStartedAt: NOW - 4_000 }), NOW);
+    expect(writing).toMatchObject({ kind: "writing", model: "aguardando o modelo há 4 s" });
+    // Sem chamada em curso, nada muda.
+    expect(liveActionOf(entry({ reasoning: "x" }), NOW).model).toBeNull();
+    expect(liveActionOf(entry({}), NOW)).toMatchObject({ kind: "thinking", model: null });
+  });
+
+  it("tempo curto nos dois idiomas", () => {
+    expect(elapsedText(59_999)).toBe("59 s");
+    expect(elapsedText(60_000)).toBe("1 min");
+    expect(elapsedText(3_900_000)).toBe("1 h 5 min");
+    setLanguage("en", { persist: false });
+    try {
+      expect(liveActionOf(entry({ modelStartedAt: NOW - 125_000 }), NOW)).toMatchObject({ state: "waiting for the model", detail: "for 2 min" });
+      expect(liveActionOf(entry({ modelStartedAt: NOW - 510_000, modelBytes: 1_258_291 }), NOW)).toMatchObject({ state: "receiving the response", detail: "for 8 min · 1.2 MB received" });
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 });
 

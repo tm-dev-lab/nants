@@ -5,7 +5,9 @@
 import type { ReactElement } from "react";
 import { render, type RenderOptions, type RenderResult } from "@testing-library/react";
 import { vi } from "vitest";
-import { setLanguage, type Lang } from "./i18n";
+import { setLanguage, translate, type Lang } from "./i18n";
+import { ptBR } from "./i18n/ptBR";
+import { MAX_CHAT_ATTACHMENTS } from "./chatImages";
 import type { AppState } from "./store";
 import { appStore } from "./store";
 import type {
@@ -165,3 +167,15 @@ export function renderWith(ui: ReactElement, { lang = "pt-BR", ...options }: Ren
   setLanguage(lang, { persist: false });
   return render(ui, options);
 }
+
+/*
+ * Textos dos anexos da Conversa em pt-BR, o idioma padrão dos testes (spec 115 T04, C-11): a tela
+ * usa as chaves `attachments.*` no idioma ativo; as constantes ficam só aqui.
+ */
+export const ATTACH_LABEL = ptBR["attachments.attach"];
+export const ATTACHMENTS_LIMIT_NOTICE = translate("pt-BR", "attachments.limit", { max: MAX_CHAT_ATTACHMENTS });
+export const ATTACHMENTS_FAILED_NOTICE = ptBR["attachments.failed"];
+export const ATTACHMENTS_PREVIEW_LABEL = ptBR["attachments.previewLabel"];
+export const USER_IMAGES_LABEL = ptBR["attachments.sentLabel"];
+export const THUMB_PLACEHOLDER_TEXT = ptBR["attachments.placeholder"];
+export const ATTACHED_IMAGE_TITLE = ptBR["attachments.attachedTitle"];

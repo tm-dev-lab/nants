@@ -126,6 +126,108 @@ describe("Quadro: colunas, cartões e resumo", () => {
     expect(findForbiddenGlyphs(win)).toEqual([]);
   });
 
+  it("execução parada pelo provedor: a tarefa aparece pausada, com o motivo e o acesso à conversa; ao continuar, volta a Em desenvolvimento (spec 114 T04)", async () => {
+    const s = spec([makeTask("T01", "Base", "DONE"), makeTask("T02", "Carrinho", "IN_PROGRESS"), makeTask("T03", "Pagamento", "TODO")]);
+    const stopped = makeProjectState({ id: "p1", name: "Loja", specs: [s], running: false, run: null });
+    const view = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: stopped } });
+    view.server.reply("GET", /\/api\/projects\/p1\/usage/, () => ({ status: 200, body: USAGE }));
+    await act(async () => {
+      appStore.appendMessage("p1", {
+        role: "agent",
+        agent: "system",
+        specId: "s1",
+        text: "O provedor do modelo falhou (provider_bad_response: too_large).",
+        code: "run.provider_failed_detail",
+        params: { provider: "provider_bad_response", reason: "too_large" },
+      });
+    });
+    const win = board();
+    const card = win.querySelector('[data-column="IN_PROGRESS"] [data-task-id="T02"]') as HTMLElement;
+    const pause = card.querySelector('[data-paused="provider"]') as HTMLElement;
+    expect(pause.textContent).toBe("Pausadao provedor do modelo falhou");
+    // Sem pulsar "pensando": ninguém está trabalhando na tarefa.
+    expect(card.querySelector('[data-avatar-state="thinking"]')).toBeNull();
+    expect(win.querySelector('[data-task-id="T03"]')?.closest("li")?.querySelector("[data-paused]")).toBeNull();
+    const action = within(win).getByRole("button", { name: "Continuar na conversa: tarefa T02" });
+    expect(action.textContent).toBe("Continuar na conversa");
+    await act(async () => {
+      fireEvent.click(action);
+    });
+    await settle();
+    expect(screen.getByRole("region", { name: "Conversa" })).toBeTruthy();
+    // Continuou: o run voltou e a tarefa volta a "Em desenvolvimento", sem o selo.
+    view.server.model.states.p1 = running(s);
+    await act(async () => {
+      appStore.setState((st) => ({ revisions: { ...st.revisions, p1: (st.revisions.p1 ?? 0) + 1 } }));
+    });
+    await settle();
+    const resumed = board().querySelector('[data-column="IN_PROGRESS"] [data-task-id="T02"]') as HTMLElement;
+    expect(resumed.querySelector("[data-paused]")).toBeNull();
+    expect(board().querySelector("[data-pause-action]")).toBeNull();
+    expect(findForbiddenGlyphs(board())).toEqual([]);
+  });
+
+  it("parada antiga, retomada e queda sem mensagem: mostra 'execução interrompida', não o motivo antigo", async () => {
+    const s = spec([makeTask("T01", "Base", "DONE"), makeTask("T02", "Carrinho", "IN_PROGRESS")]);
+    const stopped = makeProjectState({ id: "p1", name: "Loja", specs: [s], running: false, run: null });
+    const view = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: stopped } });
+    await act(async () => {
+      appStore.appendMessage("p1", { role: "agent", agent: "system", specId: "s1", text: "O provedor do modelo falhou (x).", code: "run.provider_failed", params: { provider: "x" } });
+    });
+    expect(board().querySelector('[data-paused="provider"]')).not.toBeNull();
+    // Retomada: o servidor avisa que voltou a executar.
+    view.server.model.states.p1 = running(s);
+    await act(async () => {
+      view.stream().emit("project_status", { event_type: "project_status", project_id: "p1", payload: { status: "executing", spec_id: "s1" } });
+    });
+    await act(async () => {
+      appStore.setState((st) => ({ revisions: { ...st.revisions, p1: (st.revisions.p1 ?? 0) + 1 } }));
+    });
+    await settle();
+    expect(board().querySelector("[data-paused]")).toBeNull();
+    // Queda sem mensagem de parada (servidor reiniciado): o motivo antigo não volta.
+    view.server.model.states.p1 = stopped;
+    await act(async () => {
+      view.stream().emit("project_status", { event_type: "project_status", project_id: "p1", payload: { status: "idle", reason: "shutdown_forced" } });
+    });
+    await act(async () => {
+      appStore.setState((st) => ({ revisions: { ...st.revisions, p1: (st.revisions.p1 ?? 0) + 1 } }));
+    });
+    await settle();
+    expect(board().querySelector('[data-paused="interrupted"]')?.textContent).toBe("Pausadaexecução interrompida");
+  });
+
+  it("parada pela pessoa: motivo curto próprio", async () => {
+    const s = spec([makeTask("T02", "Carrinho", "IN_REVIEW")]);
+    const stopped = makeProjectState({ id: "p1", name: "Loja", specs: [s], running: false, run: null });
+    await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: stopped } });
+    await act(async () => {
+      appStore.appendMessage("p1", { role: "agent", agent: "system", specId: "s1", text: "Execução parada pelo usuário.", code: "run.stopped" });
+    });
+    expect(board().querySelector('[data-paused="stopped"]')?.textContent).toBe("Pausadaparada por você");
+  });
+
+  it("pedido de permissão aguardando a pessoa: 'Aguardando você' e 'Decidir na conversa'", async () => {
+    const s = spec([makeTask("T02", "Carrinho", "IN_REVIEW")]);
+    const waiting = makeProjectState({
+      id: "p1",
+      name: "Loja",
+      specs: [s],
+      running: true,
+      run: { spec_id: "s1", status: "running" },
+      pending_permissions: [{ request_id: "r1", agent: "reviewer", command: "npm test", task_id: "T02" }],
+    });
+    await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: waiting } });
+    await settle();
+    // Com pedido pendente, o layout abre a Conversa e o Plano: o Quadro vem pelo Dock.
+    await act(async () => {
+      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: /Quadro/ }));
+    });
+    await settle();
+    expect(board().querySelector('[data-paused="decision"]')?.textContent).toBe("Aguardando vocêaguardando sua decisão");
+    expect(within(board()).getByRole("button", { name: "Decidir na conversa: tarefa T02" })).toBeTruthy();
+  });
+
   it("sem tarefas: estado vazio com 'Abrir o Plano'", async () => {
     await renderShell({
       url: "/?space=p1",

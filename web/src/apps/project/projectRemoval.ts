@@ -22,8 +22,6 @@ export function removedNotice(): string {
   return t("project.removed");
 }
 
-const RUN_ACTIVE_MESSAGE = ptBR["serverMessage.runActive"];
-const CHAT_ACTIVE_MESSAGE = ptBR["serverMessage.chatActive"];
 
 /** Aviso da remoção feita nesta aba (a pasta continua no disco), no idioma ativo. */
 export function localRemovalNotice(name: string): string {
@@ -90,7 +88,7 @@ export function nextSpaceAfterRemoval(projects: readonly ProjectEntry[], removed
  * explicativo; os demais seguem o catálogo do cliente (já fixo).
  */
 export function removalErrorMessage(error: ApiFailure): string {
-  if (error.status === 409 && error.message === RUN_ACTIVE_MESSAGE) return t("project.removeRunActive");
-  if (error.status === 409 && error.message === CHAT_ACTIVE_MESSAGE) return t("project.removeChatActive");
+  if (error.status === 409 && error.code === "run_active") return t("project.removeRunActive");
+  if (error.status === 409 && error.code === "chat_active") return t("project.removeChatActive");
   return apiFailureText(error);
 }

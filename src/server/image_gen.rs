@@ -68,7 +68,9 @@ impl LlmImageGenerator {
     pub fn for_developer(cfg: &Config, state: &AppState) -> Option<Self> {
         let agent = &cfg.agents.developer;
         let connection = cfg.connections.iter().find(|c| c.id == agent.connection_id)?;
-        if agent.model.trim().is_empty() {
+        // Spec 116 T02: pelo plano ChatGPT a ferramenta hospedada de imagem não é oferecida; segue o
+        // caminho alternativo (SVG/CSS), sem aviso.
+        if agent.model.trim().is_empty() || connection.is_chatgpt_plan() {
             return None;
         }
         let client = LlmClient::from_connection(connection).ok()?;
@@ -189,6 +191,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "k".into(),
             wire_api: wire,
+            kind: Default::default(),
         });
         cfg.agents.developer.connection_id = "c1".into();
         cfg.agents.developer.model = "m-img".into();

@@ -57,7 +57,7 @@ describe("Novo projeto", () => {
     const { server, dialog } = await openDialog();
     server.reply("POST", /^\/api\/projects$/, (body) => {
       const b = body as { name: string; path?: string };
-      if (b.path === undefined) return { status: 409, body: { error: "project_dir_exists", path: "/home/u/NantsProjects/blog" } };
+      if (b.path === undefined) return { status: 409, body: { error: "a pasta do projeto já existe", code: "project_dir_exists", path: "/home/u/NantsProjects/blog" } };
       return { status: 201, body: created(b.name, b.path) };
     });
     typeName(dialog, "Blog");
@@ -76,9 +76,9 @@ describe("Novo projeto", () => {
   it("erros fixos: nome inválido (400), Git ausente (412) e pasta de projetos inválida (422)", async () => {
     const { server, dialog } = await openDialog();
     const replies = [
-      { status: 400, body: { error: "nome inválido: use letras ou números" } },
+      { status: 400, body: { error: "nome inválido: use letras ou números", code: "project_name_invalid" } },
       { status: 412, body: { error: "prereq_missing", missing: ["git"] } },
-      { status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido" } },
+      { status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido", code: "projects_root_system" } },
     ];
     server.reply("POST", /^\/api\/projects$/, () => replies.shift() ?? { status: 500, body: {} });
     typeName(dialog, "!!!");
@@ -140,7 +140,7 @@ describe("Novo projeto", () => {
     });
     server.reply("GET", /^\/api\/fs\/browse/, (_body, url) => {
       const params = new URL(url, "http://x").searchParams;
-      if (params.get("path") === "/quebra") return { status: 500, body: { error: "falha interna" } };
+      if (params.get("path") === "/quebra") return { status: 500, body: { error: "falha interna", code: "internal" } };
       return { status: 200, body: listing(params.get("path") ?? "/home/u") };
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "Usar uma pasta existente" }));

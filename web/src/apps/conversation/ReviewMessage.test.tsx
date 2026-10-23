@@ -7,6 +7,7 @@ import type { SpecView } from "../../api/types";
 import type { ChatMessage } from "../../store";
 import { makeTask, resetStore } from "../../test-utils";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
+import { setLanguage } from "../../i18n";
 
 afterEach(() => {
   cleanup();
@@ -197,7 +198,8 @@ describe("cenário de falha (spec 087 T05)", () => {
       scenario: "lista vazia → <i>pânico</i>",
     });
     expect(r?.findings[1]?.scenario).toBeUndefined();
-    expect(r?.observations[0]?.severity).toBe("HIGH, baixa confiança");
+    expect(r?.observations[0]?.severity).toBe("HIGH");
+    expect(r?.observations[0]?.lowConfidence).toBe(true);
     expect(r?.observations[0]?.scenario).toBe("x → y");
   });
 
@@ -241,9 +243,32 @@ describe("observação de arquivo inalterado (spec 092 T04)", () => {
       "- F-09 [MEDIUM, observação (arquivo não mudou nesta rodada), baixa confiança] src/d.rs:4 — talvez";
     const r = parseReviewMessage(text);
     expect(r?.observations[0]?.unchangedFile).toBe(true);
-    expect(r?.observations[0]?.severity).toBe("MEDIUM, baixa confiança");
+    expect(r?.observations[0]?.lowConfidence).toBe(true);
+    expect(r?.observations[0]?.severity).toBe("MEDIUM");
     renderMessage(text);
     expect(screen.getByTestId("review-unchanged-file").textContent).toBe("observação (arquivo não mudou nesta rodada)");
+    expect(screen.getByTestId("review-low-confidence").textContent).toBe("baixa confiança");
+  });
+
+  it("baixa confiança sozinha vira selo no idioma ativo (spec 115 T03)", () => {
+    const text = "Aprovado: ok\n\nObservações (não bloqueiam):\n- F-02 [HIGH, baixa confiança] src/lib.rs:1: descrição";
+    const r = parseReviewMessage(text);
+    expect(r?.observations[0]).toEqual({
+      id: "F-02",
+      severity: "HIGH",
+      location: "src/lib.rs:1",
+      description: "descrição",
+      recommendation: "",
+      lowConfidence: true,
+    });
+    setLanguage("en", { persist: false });
+    try {
+      renderMessage(text);
+      expect(screen.getByTestId("review-low-confidence").textContent).toBe("low confidence");
+      expect(screen.queryByText(/baixa confiança/)).toBeNull();
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 
   it("mostra o rótulo só na observação rebaixada", () => {

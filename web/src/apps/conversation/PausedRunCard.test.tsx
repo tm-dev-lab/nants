@@ -95,7 +95,7 @@ describe("Execução pausada na Conversa", () => {
 
   it("422 de agente não configurado oferece Configurar na aba Agentes", async () => {
     const { server } = await open(stateWith(pausedSpec()));
-    server.reply("POST", RESUME, () => ({ status: 422, body: { error: "agente developer não configurado" } }));
+    server.reply("POST", RESUME, () => ({ status: 422, body: { error: "agente developer não configurado", code: "developer_not_configured" } }));
     fireEvent.click(within(card()).getByRole("button", { name: "Retomar" }));
     await settle();
     const alert = within(card()).getByRole("alert");
@@ -328,12 +328,12 @@ describe("Execução pausada: quando aparece", () => {
 
 describe("Execução pausada: falhas da retomada", () => {
   it("409 de cada tipo mostra a mensagem fixa e o cartão continua", async () => {
-    const cases: Array<[string, { error: string; reason?: string }, string]> = [
-      ["spec não está em andamento", { error: "spec não está em andamento" }, "spec não está em andamento"],
-      ["não há tarefa bloqueada", { error: "não há tarefa bloqueada para retomar" }, "não há tarefa bloqueada para retomar"],
-      ["execução em andamento", { error: "já existe uma execução em andamento neste projeto" }, "já existe uma execução em andamento neste projeto"],
-      ["spec alterada", { error: "spec foi alterada durante a aprovação; tente novamente" }, "spec foi alterada durante a aprovação; tente novamente"],
-      ["tarefas alteradas", { error: "tarefas foram alteradas durante a retomada; tente novamente" }, "tarefas foram alteradas durante a retomada; tente novamente"],
+    const cases: Array<[string, { error: string; code?: string; reason?: string }, string]> = [
+      ["spec não está em andamento", { error: "spec não está em andamento", code: "spec_not_in_progress" }, "spec não está em andamento"],
+      ["não há tarefa bloqueada", { error: "não há tarefa bloqueada para retomar", code: "no_blocked_task" }, "não há tarefa bloqueada para retomar"],
+      ["execução em andamento", { error: "já existe uma execução em andamento neste projeto", code: "run_active" }, "já existe uma execução em andamento neste projeto"],
+      ["spec alterada", { error: "spec foi alterada durante a aprovação; tente novamente", code: "spec_changed_approval" }, "spec foi alterada durante a aprovação; tente novamente"],
+      ["tarefas alteradas", { error: "tarefas foram alteradas durante a retomada; tente novamente", code: "tasks_changed_resume" }, "tarefas foram alteradas durante a retomada; tente novamente"],
       ["base suja", { error: "a base tem alterações não commitadas", reason: "base_dirty" }, APPROVE_REASON_MESSAGES.base_dirty ?? ""],
       ["sem ambiente docker", { error: "x", reason: "environment_not_docker" }, APPROVE_REASON_MESSAGES.environment_not_docker ?? ""],
       ["Docker indisponível", { error: "x", reason: "docker_unavailable" }, APPROVE_REASON_MESSAGES.docker_unavailable ?? ""],

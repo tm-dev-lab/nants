@@ -375,6 +375,7 @@ mod tests {
                     web_search_calls: 0,
                     citations: Vec::new(),
                     web_search_rejected: false,
+                    billing: Default::default(),
                     usage: Some(crate::agents::llm_client::Usage { prompt: 10, completion: 5, cached: None, reasoning: None }),
                 })
             })

@@ -52,6 +52,7 @@ import { AttachmentPreview, imageFiles, useChatAttachments } from "./ChatAttachm
 import { setChatSending, takeChatRequest, useChatRequestCount } from "./chatChannel";
 import { dayKey, dayLabel, hasTime } from "./chatTime";
 import { PausedRunCard } from "./PausedRunCard";
+import { PlanIndicator } from "./PlanIndicator";
 import { PermissionMessage } from "./PermissionMessage";
 import { ResultMessage } from "./ResultMessage";
 
@@ -597,6 +598,7 @@ export function Conversation({
             </button>
           </div>
         </form>
+        <PlanIndicator />
       </div>
       {dragging ? (
         <div className="nd-drop-overlay" aria-hidden="true">

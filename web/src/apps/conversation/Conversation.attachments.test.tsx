@@ -17,7 +17,7 @@ import {
   ATTACHMENTS_PREVIEW_LABEL,
   THUMB_PLACEHOLDER_TEXT,
   USER_IMAGES_LABEL,
-} from "./ChatAttachments";
+} from "../../test-utils";
 
 vi.mock("../../api/client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../api/client")>()),

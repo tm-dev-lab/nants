@@ -16,11 +16,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+use serde_json::Map;
 use super::error::ApiError;
 use super::events::{validate_project_id, SecretSet};
 use super::projects::{
     find_project, format_utc, load_tasks, next_action_view, read_head_branch, safe_error,
-    scrub_text, text_field, INVALID_FILE,
+    scrub_text, text_field,
 };
 use super::runs::GIT_TIMEOUT;
 use super::safe_fs::{self, MAX_READ_BYTES};
@@ -32,11 +33,6 @@ use crate::sdd::{
 
 /// Tamanho máximo de `spec_id` (como nas demais rotas de spec).
 const MAX_SPEC_ID_LEN: usize = 64;
-const SPEC_ID_MSG: &str = "spec_id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres";
-const SPEC_NOT_FOUND: &str = "spec não encontrada";
-const TIMEOUT_MSG: &str = "tempo limite na leitura do resultado";
-const GIT_READ_MSG: &str = "falha ao ler o histórico do Git";
-const INTERNAL_MSG: &str = "falha interna";
 
 const SPECS_DIR: &str = ".sdd/specs";
 const SETTINGS_REL: &str = ".sdd/settings.yaml";
@@ -120,8 +116,8 @@ pub async fn get_result(
     let job_root = root.clone();
     let handle = tokio::task::spawn_blocking(move || build_result(&job_root, &spec_id, &secrets));
     match tokio::time::timeout(timeout, handle).await {
-        Err(_) => Err(ApiError::new(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_MSG)),
-        Ok(Err(_)) => Err(ApiError::internal(INTERNAL_MSG)),
+        Err(_) => Err(ApiError::coded(StatusCode::GATEWAY_TIMEOUT, "result_timeout", Map::new())),
+        Ok(Err(_)) => Err(ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new())),
         Ok(Ok(result)) => Ok(Json(result?).into_response()),
     }
 }
@@ -133,7 +129,7 @@ fn build_result(root: &Path, spec_id: &str, secrets: &SecretSet) -> Result<Resul
     let spec_rel = format!("{SPECS_DIR}/{spec_id}");
     let text = safe_fs::read_regular(root, &format!("{spec_rel}/spec.md"), MAX_READ_BYTES)
         .map_err(spec_read_error)?;
-    let spec = Spec::parse(&text).map_err(|_| ApiError::new(StatusCode::CONFLICT, INVALID_FILE))?;
+    let spec = Spec::parse(&text).map_err(|_| ApiError::coded(StatusCode::CONFLICT, "file_invalid", Map::new()))?;
     let title = text_field(secrets, "title", &spec.frontmatter.title);
     let tasks = load_tasks(root, &spec_rel, secrets)
         .into_iter()
@@ -179,7 +175,7 @@ fn build_result(root: &Path, spec_id: &str, secrets: &SecretSet) -> Result<Resul
 /// Spec ausente → 404 estático; symlink, especial ou grande → 409; resto de I/O → 500 estático.
 fn spec_read_error(e: safe_fs::SafeFsError) -> ApiError {
     match e {
-        safe_fs::SafeFsError::Missing => ApiError::new(StatusCode::NOT_FOUND, SPEC_NOT_FOUND),
+        safe_fs::SafeFsError::Missing => ApiError::coded(StatusCode::NOT_FOUND, "spec_not_found", Map::new()),
         other => safe_error(other),
     }
 }
@@ -201,7 +197,7 @@ pub(super) fn git_section(
     let prefix = format!("feat({spec_id}): T");
     let records = git
         .log_grep(base, &prefix)
-        .map_err(|_| ApiError::internal(GIT_READ_MSG))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "git_history_failed", Map::new()))?;
     // `log` vem do mais novo; pega os MAX_COMMITS mais recentes e devolve em ordem cronológica.
     let mut integrations: Vec<(String, CommitView)> = records
         .into_iter()
@@ -223,7 +219,7 @@ pub(super) fn git_section(
     for (hash, _) in &integrations {
         for (letter, path) in git
             .commit_changes(hash)
-            .map_err(|_| ApiError::internal(GIT_READ_MSG))?
+            .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "git_history_failed", Map::new()))?
         {
             let Some(kind) = Change::from_letter(letter) else {
                 continue;
@@ -356,7 +352,7 @@ pub(super) fn validate_spec_id(id: &str) -> Result<(), ApiError> {
     if ok {
         Ok(())
     } else {
-        Err(ApiError::unprocessable(SPEC_ID_MSG))
+        Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "spec_id_invalid", Map::new()))
     }
 }
 

@@ -22,7 +22,7 @@ function rowsUpTo(total: number, after: number, limit: number): DialogMessage[] 
 function serveDialog(total: () => number) {
   return installFetch((_method, url) => {
     if (url.endsWith("/state")) return { body: stateWithSpec() };
-    if (!url.includes("/dialog")) return { status: 404, body: { error: "projeto não encontrado" } };
+    if (!url.includes("/dialog")) return { status: 404, body: { error: "projeto não encontrado", code: "project_not_found" } };
     const query = new URL(url, "http://local").searchParams;
     const after = Number(query.get("after") ?? "0");
     const limit = Number(query.get("limit") ?? "200");
@@ -105,7 +105,7 @@ describe("loadDialog: paginação", () => {
     await loadDialog(PID, SPEC);
     expect(agentTexts()).toEqual(["r1", "r2", "r3"]);
 
-    installFetch(() => ({ status: 500, body: { error: "falha interna" } }));
+    installFetch(() => ({ status: 500, body: { error: "falha interna", code: "internal" } }));
     const outcome = await loadDialog(PID, SPEC);
 
     expect(outcome).toBe("failed");
@@ -203,7 +203,7 @@ describe("cargas por spec: identidade e ordem", () => {
     let failing = true;
     const mock = installFetch((_m, url) => {
       if (url.endsWith("/state")) return { body: stateWithSpec() };
-      if (failing) return { status: 500, body: { error: "falha interna" } };
+      if (failing) return { status: 500, body: { error: "falha interna", code: "internal" } };
       return { body: { messages: rowsUpTo(2, 0, 500), last_seq: BASE + 2, truncated_before: false } };
     });
     expect(await loadDialog(PID, SPEC)).toBe("failed");
@@ -268,7 +268,7 @@ describe("refreshDialogs: recuperação após reconexão ou lagged", () => {
   it("falha na recuperação mantém o diálogo que já estava na tela", async () => {
     serveDialog(() => 2);
     await loadDialog(PID, SPEC);
-    installFetch(() => ({ status: 500, body: { error: "falha interna" } }));
+    installFetch(() => ({ status: 500, body: { error: "falha interna", code: "internal" } }));
 
     await refreshDialogs();
 

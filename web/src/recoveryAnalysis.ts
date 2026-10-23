@@ -59,6 +59,7 @@ const FIXED: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
 const ROUND = /^- Rodada autônoma \((?:aprovação automática|YOLO)\) #(\d+) de (\d+)$/;
 const ENV_FIX = /^- Correção de ambiente \((?:aprovação automática|YOLO)\) #(\d+)$/;
 const ATTEMPTED = /^- o que foi tentado: (\d+) de (\d+) ciclos de recuperação e (\d+) de (\d+) rodadas autônomas$/;
+const ATTEMPTED_VALUE = /^(\d+) de (\d+) ciclos de recuperação e (\d+) de (\d+) rodadas autônomas$/;
 
 /** Causas fixas do servidor (exatas, ou seguidas de ": detalhe"). */
 const CAUSES: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
@@ -81,7 +82,12 @@ const CAUSES: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
 ]);
 const CITED = "(citada pelo modelo) ";
 
-function cause(value: string, lang: Lang): string {
+/**
+ * Causa raiz no idioma ativo (spec 115 T04): as causas fixas do servidor (`CAUSE_*` de
+ * `server/recovery.rs`, gravadas em pt-BR porque o servidor as compara) viram o dicionário, na
+ * análise da Conversa e no cartão de recuperação; o que o modelo escreveu fica como veio.
+ */
+export function localizeRecoveryCause(value: string, lang: Lang): string {
   let rest = value;
   let prefix = "";
   if (rest.startsWith(CITED)) {
@@ -111,10 +117,17 @@ function line(raw: string, lang: Lang): string {
   for (const [pt, key] of LABELS) {
     if (!body.startsWith(pt)) continue;
     const value = body.slice(pt.length);
-    const shown = key === "recoveryText.rootCause" || key === "recoveryText.whyNot" ? cause(value, lang) : value;
+    const shown = key === "recoveryText.rootCause" || key === "recoveryText.whyNot" ? localizeRecoveryCause(value, lang) : value;
     return `${indent}- ${translate(lang, key)}: ${shown}`;
   }
   return raw;
+}
+
+/** Valor de "o que foi tentado" (a contagem do servidor) no idioma ativo; outro texto volta igual. */
+export function localizeAttempted(value: string, lang: Lang): string {
+  const m = ATTEMPTED_VALUE.exec(value.trim());
+  if (m === null) return value;
+  return translate(lang, "recoveryText.attemptedValue", { cycles: m[1] ?? "", maxCycles: m[2] ?? "", rounds: m[3] ?? "", maxRounds: m[4] ?? "" });
 }
 
 /** Análise de recuperação com os textos fixos em `lang`; outro texto (ou pt-BR) volta igual. */

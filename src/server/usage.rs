@@ -15,13 +15,16 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use axum::http::StatusCode;
+use serde_json::Map;
 use super::error::ApiError;
-use super::events::validate_project_id;
-use super::projects::{find_project, format_utc};
+use super::events::{validate_project_id, SecretSet};
+use super::projects::{find_project, format_utc, scrub_text};
 use super::safe_fs::{self, SafeFsError};
 use super::spec_result::validate_spec_id;
 use super::state::AppState;
-use crate::agents::usage::{BudgetGuard, UsageEvent, UsageScope, UsageSink};
+use crate::agents::llm_client::StreamCut;
+use crate::agents::usage::{BudgetGuard, CutEvent, UsageEvent, UsageScope, UsageSink};
 use crate::config::{PriceSource, Pricing};
 
 /// Limite de tamanho de cada `usage.jsonl` (4 MiB).
@@ -60,17 +63,56 @@ pub struct UsageRecord {
     /// Qualidade das imagens geradas (`low|medium|high`, spec 092 T03); ausente = `medium`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_quality: Option<String>,
+    /// Tokens estimados pelo Nants (spec 114 T05: resposta cortada sem o uso do provedor); o custo
+    /// conta como estimado. Ausente = informado pelo provedor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<bool>,
+    /// Motivo do corte da resposta (`too_large`, `timeout`...), quando a chamada foi cortada.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<String>,
+    /// Como a chamada foi cobrada (spec 116 T02): `chatgpt_plan` pelo plano ChatGPT (tokens sem
+    /// US$). Ausente = pela chave de API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
 }
 
+/// Valor de `billing` das chamadas pelo plano ChatGPT.
+pub const BILLING_CHATGPT_PLAN: &str = "chatgpt_plan";
+
+impl UsageRecord {
+    /// Chamada pelo plano ChatGPT: entra só no bloco [`PlanTotals`], sem US$.
+    pub fn is_chatgpt_plan(&self) -> bool {
+        self.billing.as_deref() == Some(BILLING_CHATGPT_PLAN)
+    }
+}
+
+/// Limite de tamanho de cada `cuts.jsonl` (1 MiB): diagnósticos de respostas cortadas.
+pub const MAX_CUTS_BYTES: u64 = 1024 * 1024;
+const CUTS_FILE: &str = "cuts.jsonl";
+/// Arquivo dos diagnósticos sem spec (chat).
+const NO_SPEC_CUTS_FILE: &str = ".sdd/specs/.cuts.jsonl";
+/// Linhas do exclude local para os diagnósticos de corte (por spec e do chat).
+pub const CUTS_EXCLUDE_LINE: &str = ".sdd/specs/**/cuts.jsonl";
+pub const CUTS_CHAT_EXCLUDE_LINE: &str = ".sdd/specs/.cuts.jsonl";
+
 /// Sink que anexa ao `usage.jsonl` do projeto. Falhas de I/O são ignoradas (não derrubam o agente).
+/// Os diagnósticos de resposta cortada vão para `cuts.jsonl`, com a redação de segredos.
 pub struct FileUsageSink {
     root: PathBuf,
     project: String,
+    secrets: Arc<SecretSet>,
 }
 
 impl FileUsageSink {
+    /// Sem segredos da configuração: os trechos de corte só passam pela redação de URLs (e a
+    /// chave da conexão já sai redigida do cliente). Produção usa [`Self::redacting`].
     pub fn new(root: impl Into<PathBuf>, project: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self { root: root.into(), project: project.into() })
+        Self::redacting(root, project, Arc::new(SecretSet::new(Vec::new())))
+    }
+
+    /// Como [`Self::new`], com os segredos da configuração para redigir os trechos de corte.
+    pub fn redacting(root: impl Into<PathBuf>, project: impl Into<String>, secrets: Arc<SecretSet>) -> Arc<Self> {
+        Arc::new(Self { root: root.into(), project: project.into(), secrets })
     }
 
     /// Escopo de registro para um agente do projeto.
@@ -109,11 +151,73 @@ impl UsageSink for FileUsageSink {
             image_quality: event
                 .image_quality
                 .filter(|q| event.images > 0 && IMAGE_QUALITIES.contains(&q.as_str())),
+            estimated: event.estimated.then_some(true),
+            cut: event.cut.filter(|c| valid_cut_reason(c)),
+            billing: event.billing.as_record().map(str::to_string),
         };
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_USAGE_BYTES);
         }
     }
+
+    fn record_cut(&self, event: CutEvent) {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let spec = event.spec.filter(|s| validate_spec_id(s).is_ok());
+        let rel = match &spec {
+            Some(s) => format!("{SPECS_DIR}/{s}/{CUTS_FILE}"),
+            None => NO_SPEC_CUTS_FILE.to_string(),
+        };
+        let line = cut_line(&format_utc(secs), &self.project, spec, event.task, &event.agent, &event.model, &event.cut, &self.secrets);
+        if let Ok(line) = serde_json::to_string(&line) {
+            let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_CUTS_BYTES);
+        }
+    }
+}
+
+/// Motivo de corte aceito no registro: o vocabulário fixo `[a-z_]`, curto.
+fn valid_cut_reason(c: &str) -> bool {
+    !c.is_empty() && c.len() <= 40 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+/// Linha de `cuts.jsonl` (spec 114 T05): números do stream, tokens e os trechos do início e do fim
+/// do texto gerado, redigidos (segredos da configuração e credenciais em URL) e limitados a
+/// `CUT_SNIPPET_BYTES` cada. Nunca a resposta inteira.
+#[allow(clippy::too_many_arguments)]
+fn cut_line(
+    at: &str,
+    project: &str,
+    spec: Option<String>,
+    task: Option<String>,
+    agent: &str,
+    model: &str,
+    cut: &StreamCut,
+    secrets: &SecretSet,
+) -> serde_json::Value {
+    let (head, tail) = cut.snippets(|t| scrub_text(secrets, t));
+    let (usage, estimated) = match cut.usage() {
+        Some((u, e)) => (Some(u), e),
+        None => (None, false),
+    };
+    serde_json::json!({
+        "at": at,
+        "project": project,
+        "spec": spec,
+        "task": task.map(|t| scrub_text(secrets, &t)),
+        "agent": scrub_text(secrets, agent),
+        "model": scrub_text(secrets, model),
+        "reason": cut.reason,
+        "elapsed_ms": cut.elapsed_ms,
+        "bytes": cut.bytes,
+        "events": cut.events,
+        "top_events": cut.top_events.iter().map(|(k, n)| serde_json::json!({ "type": k, "count": n })).collect::<Vec<_>>(),
+        "generated_chars": cut.generated_chars,
+        "input_tokens": usage.map(|u| u.prompt),
+        "output_tokens": usage.map(|u| u.completion),
+        "reasoning_tokens": usage.and_then(|u| u.reasoning),
+        "tokens_estimated": estimated,
+        "head": head,
+        "tail": tail,
+    })
 }
 
 /// Totais de um grupo de chamadas.
@@ -145,6 +249,39 @@ pub struct Totals {
     /// Alguma imagem somada usou a estimativa padrão por qualidade (sem `image_per_unit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub images_estimated: bool,
+    /// Chamadas pelo plano ChatGPT (spec 116 T02): só tokens, sem US$. Ficam fora das contagens
+    /// acima (chamadas, tokens, custo e chamadas sem preço) e do orçamento em dólar; omitido sem
+    /// nenhuma.
+    #[serde(default, skip_serializing_if = "PlanTotals::is_empty")]
+    pub chatgpt_plan: PlanTotals,
+}
+
+/// Totais das chamadas pelo plano ChatGPT (spec 116 T02): tokens, sem US$.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlanTotals {
+    pub calls: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+    pub reasoning: u64,
+    /// Chamadas de busca na web somadas (omitido quando zero).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub web_search_calls: u64,
+}
+
+impl PlanTotals {
+    fn is_empty(&self) -> bool {
+        self.calls == 0
+    }
+
+    fn add(&mut self, r: &UsageRecord) {
+        self.calls += 1;
+        self.input += r.input;
+        self.output += r.output;
+        self.cached += r.cached.unwrap_or(0);
+        self.reasoning += r.reasoning.unwrap_or(0);
+        self.web_search_calls += r.web_search_calls.unwrap_or(0);
+    }
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -157,6 +294,10 @@ fn is_zero_f64(v: &f64) -> bool {
 
 impl Totals {
     fn add(&mut self, r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) {
+        if r.is_chatgpt_plan() {
+            self.chatgpt_plan.add(r);
+            return;
+        }
         self.calls += 1;
         self.input += r.input;
         self.output += r.output;
@@ -178,6 +319,7 @@ impl Totals {
                 self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + c);
                 if pricing.get(&r.model).is_some_and(|p| p.source == PriceSource::Estimated)
                     || image.is_some_and(|(_, estimated)| estimated)
+                    || r.estimated == Some(true)
                 {
                     self.cost_estimated = true;
                 }
@@ -202,8 +344,12 @@ pub fn image_cost(r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) -> Optio
 
 /// Custo em US$ de uma chamada, ou `None` sem preço para o modelo (salvo registro com imagens: aí
 /// conta só a estimativa das imagens). A entrada em cache usa `cached_input_per_mtok` quando houver;
-/// senão, o preço de entrada. As imagens ([`image_cost`]) somam ao custo dos tokens.
+/// senão, o preço de entrada. As imagens ([`image_cost`]) somam ao custo dos tokens. Pelo plano
+/// ChatGPT (spec 116 T02), sem US$: `None`.
 pub fn cost_of(r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) -> Option<f64> {
+    if r.is_chatgpt_plan() {
+        return None;
+    }
     let images = image_cost(r, pricing).map(|(usd, _)| usd);
     let Some(p) = pricing.get(&r.model) else {
         return images;
@@ -483,18 +629,22 @@ fn write_budget(root: &Path, spec: &str, budget: &Budget) -> std::io::Result<()>
 }
 
 /// Motivo de pausa quando o uso da spec atingiu o orçamento; `None` se não há orçamento ou há folga.
-pub fn budget_status(root: &Path, spec: &str, pricing: &BTreeMap<String, Pricing>) -> Option<String> {
+pub fn budget_status(root: &Path, spec: &str, pricing: &BTreeMap<String, Pricing>, lang: crate::i18n::Lang) -> Option<String> {
     let budget = read_budget(root, spec)?;
     let view = aggregate(&load_records(root, Some(spec)), pricing);
-    let tokens = view.total.input + view.total.output;
+    // O limite de tokens conta também os do plano ChatGPT; o de US$ não (spec 116 T02).
+    let plan = &view.total.chatgpt_plan;
+    let tokens = view.total.input + view.total.output + plan.input + plan.output;
     if let Some(max) = budget.max_tokens {
         if tokens >= max {
-            return Some(format!("orçamento da spec atingido: {tokens} de {max} tokens"));
+            let (tokens, max) = (tokens.to_string(), max.to_string());
+            return Some(crate::i18n::tr(lang, "runner.budget.tokens", &[("tokens", &tokens), ("max", &max)]));
         }
     }
     if let (Some(max), Some(cost)) = (budget.max_usd, view.total.cost_usd) {
         if cost >= max {
-            return Some(format!("orçamento da spec atingido: US$ {cost:.2} de US$ {max:.2}"));
+            let (cost, max) = (format!("{cost:.2}"), format!("{max:.2}"));
+            return Some(crate::i18n::tr(lang, "runner.budget.usd", &[("cost", &cost), ("max", &max)]));
         }
     }
     None
@@ -513,8 +663,8 @@ impl FileBudgetGuard {
 }
 
 impl BudgetGuard for FileBudgetGuard {
-    fn exceeded(&self, spec: &str) -> Option<String> {
-        budget_status(&self.root, spec, &self.pricing)
+    fn exceeded(&self, spec: &str, lang: crate::i18n::Lang) -> Option<String> {
+        budget_status(&self.root, spec, &self.pricing, lang)
     }
 }
 
@@ -527,24 +677,24 @@ pub async fn put_budget(
     validate_project_id(&id)?;
     validate_spec_id(&spec)?;
     let budget: Budget = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::unprocessable("corpo JSON com campos inválidos"))?;
+        .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new()))?;
     if !budget.is_valid() {
-        return Err(ApiError::unprocessable("orçamento inválido: use números finitos maiores ou iguais a zero"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "budget_invalid", Map::new()));
     }
     let project = find_project(&state, &id).await?;
     let root = PathBuf::from(&project.path);
     tokio::task::spawn_blocking(move || {
         if budget.is_empty() {
             return safe_fs::remove_regular(&root, &budget_rel(&spec))
-                .map_err(|_| ApiError::internal("falha ao remover o orçamento"));
+                .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "budget_remove_failed", Map::new()));
         }
         if !root.join(SPECS_DIR).join(&spec).is_dir() {
-            return Err(ApiError::new(axum::http::StatusCode::NOT_FOUND, "spec não encontrada"));
+            return Err(ApiError::coded(axum::http::StatusCode::NOT_FOUND, "spec_not_found", Map::new()));
         }
-        write_budget(&root, &spec, &budget).map_err(|_| ApiError::internal("falha ao gravar o orçamento"))
+        write_budget(&root, &spec, &budget).map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "budget_write_failed", Map::new()))
     })
     .await
-    .map_err(|_| ApiError::internal("falha interna"))??;
+    .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))??;
     Ok(Json(budget).into_response())
 }
 
@@ -577,7 +727,7 @@ pub async fn get_usage(
         view
     })
     .await
-    .map_err(|_| ApiError::internal("falha interna"))?;
+    .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     Ok(Json(view).into_response())
 }
 
@@ -585,6 +735,7 @@ pub async fn get_usage(
 mod tests {
     use super::*;
     use crate::agents::llm_client::Usage;
+    use crate::i18n::Lang;
     use std::fs;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -604,6 +755,9 @@ mod tests {
             web_search_calls: 0,
             images: 0,
             image_quality: None,
+            estimated: false,
+            cut: None,
+            billing: Default::default(),
         }
     }
 
@@ -627,6 +781,9 @@ mod tests {
             web_search_calls: w,
             images: None,
             image_quality: None,
+            estimated: None,
+            cut: None,
+            billing: None,
         };
         let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
         let v = aggregate(&[mk(Some(2)), mk(Some(1)), mk(None)], &pr);
@@ -704,7 +861,7 @@ mod tests {
     fn cached_without_cached_price_bills_as_input() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None,
         };
         let c = cost_of(&r, &price(1.0, 1.0, None)).expect("preço");
         assert!((c - 0.001).abs() < 1e-12);
@@ -717,7 +874,7 @@ mod tests {
         let img = |n: u64, q: Option<&str>| UsageRecord {
             at: String::new(), project: String::new(), spec: Some("s1".into()), task: Some("T01".into()),
             agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None,
-            web_search_calls: None, images: Some(n), image_quality: q.map(String::from),
+            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None,
         };
         // Sem image_per_unit: padrão por qualidade, estimado; soma ao custo dos tokens (US$ 1).
         let pr = price(1.0, 1.0, None);
@@ -826,16 +983,26 @@ mod tests {
         fs::create_dir_all(root.join(".sdd/specs/s1")).expect("dir");
         let sink = FileUsageSink::new(&root, "p");
         sink.record(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(1_000_000, 0)));
-        assert!(budget_status(&root, "s1", &BTreeMap::new()).is_none(), "sem orçamento");
+        assert!(budget_status(&root, "s1", &BTreeMap::new(), Lang::PtBr).is_none(), "sem orçamento");
         write_budget(&root, "s1", &Budget { max_tokens: Some(2_000_000), max_usd: Some(2.0) }).expect("w");
-        assert!(budget_status(&root, "s1", &BTreeMap::new()).is_none(), "tokens abaixo; sem preço não há US$");
+        assert!(budget_status(&root, "s1", &BTreeMap::new(), Lang::PtBr).is_none(), "tokens abaixo; sem preço não há US$");
         let p = price(3.0, 0.0, None);
-        let r = budget_status(&root, "s1", &p).expect("US$ atingido");
+        let r = budget_status(&root, "s1", &p, Lang::PtBr).expect("US$ atingido");
         assert_eq!(r, "orçamento da spec atingido: US$ 3.00 de US$ 2.00");
         write_budget(&root, "s1", &Budget { max_tokens: Some(1_000_000), max_usd: None }).expect("w2");
-        let r = budget_status(&root, "s1", &BTreeMap::new()).expect("tokens atingido");
+        let r = budget_status(&root, "s1", &BTreeMap::new(), Lang::PtBr).expect("tokens atingido");
         assert_eq!(r, "orçamento da spec atingido: 1000000 de 1000000 tokens");
-        assert_eq!(FileBudgetGuard::new(&root, BTreeMap::new()).exceeded("s1"), Some(r));
+        assert_eq!(FileBudgetGuard::new(&root, BTreeMap::new()).exceeded("s1", Lang::PtBr), Some(r));
+        // Spec 114 T02: o motivo sai no idioma do projeto.
+        assert_eq!(
+            FileBudgetGuard::new(&root, BTreeMap::new()).exceeded("s1", Lang::En).as_deref(),
+            Some("spec budget reached: 1000000 of 1000000 tokens")
+        );
+        write_budget(&root, "s1", &Budget { max_tokens: None, max_usd: Some(2.0) }).expect("w3");
+        assert_eq!(
+            budget_status(&root, "s1", &p, Lang::En).as_deref(),
+            Some("spec budget reached: US$ 3.00 of US$ 2.00")
+        );
         assert!(!Budget { max_tokens: None, max_usd: Some(-1.0) }.is_valid());
     }
 
@@ -902,6 +1069,9 @@ mod tests {
             web_search_calls: Some(3),
             images: None,
             image_quality: None,
+            estimated: None,
+            cut: None,
+            billing: None,
         };
         let mut pricing = price(1.0, 1.0, None);
         let c = cost_of(&r, &pricing).expect("preço");
@@ -926,9 +1096,49 @@ mod tests {
         let cost = view.total.cost_usd.expect("custo");
         assert!((cost - 1.02).abs() < 1e-9, "{cost}");
         fs::write(root.join(".sdd/specs/s1/budget.json"), r#"{"max_usd":1.01}"#).expect("budget");
-        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None)).is_some());
+        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None), Lang::PtBr).is_some());
         fs::write(root.join(".sdd/specs/s1/budget.json"), r#"{"max_usd":1.03}"#).expect("budget");
-        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None)).is_none());
+        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None), Lang::PtBr).is_none());
+    }
+
+    /// Spec 116 T02: as chamadas pelo plano ChatGPT gravam `billing: chatgpt_plan`, ficam num
+    /// bloco próprio (tokens, sem US$), fora do total, do custo e do orçamento em dólar; o limite
+    /// de tokens ainda as conta.
+    #[test]
+    fn plan_calls_are_recorded_apart_without_usd() {
+        use crate::agents::llm_client::Billing;
+        let root = tmp("plano");
+        let mut plan = ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(1_000_000, 500_000));
+        plan.billing = Billing::ChatgptPlan;
+        plan.web_search_calls = 1;
+        FileUsageSink::new(&root, "p").record(plan);
+        FileUsageSink::new(&root, "p").record(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(1_000_000, 0)));
+        let raw = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("ler");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert!(lines[0].contains(r#""billing":"chatgpt_plan""#), "{raw}");
+        assert!(!lines[1].contains("billing"), "por chave, sem o campo: {raw}");
+        let recs = load_records(&root, Some("s1"));
+        assert!(recs[0].is_chatgpt_plan() && !recs[1].is_chatgpt_plan());
+        assert_eq!(cost_of(&recs[0], &price(1.0, 1.0, None)), None, "sem US$");
+        let view = aggregate(&recs, &price(1.0, 1.0, None));
+        assert_eq!((view.total.calls, view.total.input, view.total.output), (1, 1_000_000, 0));
+        assert_eq!(view.total.unpriced_calls, 0);
+        let cost = view.total.cost_usd.expect("custo da chamada por chave");
+        assert!((cost - 1.0).abs() < 1e-9, "o plano fica fora do US$: {cost}");
+        let p = &view.total.chatgpt_plan;
+        assert_eq!((p.calls, p.input, p.output, p.web_search_calls), (1, 1_000_000, 500_000, 1));
+        assert_eq!(view.by_model[0].totals.chatgpt_plan.calls, 1);
+        let json = serde_json::to_value(&view).expect("json");
+        assert_eq!(json["total"]["chatgpt_plan"]["calls"], 1);
+        assert!(json["by_agent"][0]["chatgpt_plan"].is_object());
+        // Só por chave: o bloco não aparece.
+        let only_key = serde_json::to_value(aggregate(&recs[1..], &price(1.0, 1.0, None))).expect("json");
+        assert!(only_key["total"].get("chatgpt_plan").is_none());
+        // Orçamento em US$ ignora o plano; o de tokens conta.
+        fs::write(root.join(".sdd/specs/s1/budget.json"), r#"{"max_usd":1.5}"#).expect("budget");
+        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None), Lang::PtBr).is_none());
+        fs::write(root.join(".sdd/specs/s1/budget.json"), r#"{"max_tokens":2000000}"#).expect("budget");
+        assert!(budget_status(&root, "s1", &price(1.0, 1.0, None), Lang::PtBr).is_some());
     }
 
     #[test]
@@ -968,6 +1178,9 @@ mod tests {
             web_search_calls: None,
             images: None,
             image_quality: None,
+            estimated: None,
+            cut: None,
+            billing: None,
         }
     }
 
@@ -1086,5 +1299,85 @@ mod tests {
         assert_eq!(t["first_at"], format_utc(t0));
         assert_eq!(t["last_at"], format_utc(t0 + 90));
         assert_eq!(t["calls"], 1, "totais de antes continuam");
+    }
+
+    /// Spec 114 T05: provedor simulado manda um stream enorme e é cortado por tamanho. O
+    /// diagnóstico vai para `cuts.jsonl` sem segredo e com os trechos limitados; o custo estimado
+    /// entra no `usage.jsonl` com `cut: too_large` e aparece nos Custos como estimado.
+    #[tokio::test]
+    async fn too_large_cut_records_diagnosis_and_estimated_cost() {
+        use crate::agents::chat::ChatBackend;
+        use crate::agents::llm_client::stream_tests::{huge_responses_stream, raw_server};
+        use crate::agents::llm_client::tests::KEY;
+        use crate::agents::llm_client::{ChatMessage, ChatRequest, LlmClient, Role, CUT_SNIPPET_BYTES};
+        use crate::agents::usage::UsageBackend;
+        use crate::config::WireApi;
+        const CONFIG_SECRET: &str = "cfg-SEGREDO-da-config-0123456789";
+        let root = tmp("cut-too-large");
+        let (base, _) = raw_server(vec![(200, "text/event-stream", huge_responses_stream(5_000, CONFIG_SECRET))]).await;
+        let client = LlmClient::new(base, KEY.into())
+            .expect("cliente")
+            .with_wire_api(WireApi::Responses)
+            .with_max_response_bytes(256 * 1024);
+        let secrets = Arc::new(SecretSet::new(vec![CONFIG_SECRET.to_string(), KEY.to_string()]));
+        let scope = UsageScope {
+            sink: FileUsageSink::redacting(&root, "p1", secrets),
+            agent: "developer".into(),
+            spec: Some("s1".into()),
+            task: Some("T01".into()),
+        };
+        let metered = UsageBackend::new(&client, Some(scope));
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text(Role::User, "escreva tudo")],
+            tools: Vec::new(),
+            effort: None,
+            response_json: false,
+            web_search: false,
+        };
+        let err = metered.complete_stream(&req, &|_| {}).await.expect_err("cortada");
+        assert!(format!("{err:?}").contains("TooLarge"), "{err:?}");
+
+        let cuts = fs::read_to_string(root.join(".sdd/specs/s1/cuts.jsonl")).expect("diagnóstico");
+        assert_eq!(cuts.lines().count(), 1);
+        assert!(!cuts.contains(CONFIG_SECRET) && !cuts.contains(KEY), "sem segredo");
+        assert!(!cuts.contains("SEGREDO"), "nem pedaço de segredo");
+        assert!(cuts.len() < 8 * 1024, "nunca a resposta inteira: {} bytes", cuts.len());
+        let line: serde_json::Value = serde_json::from_str(cuts.trim()).expect("json");
+        assert_eq!(line["reason"], "too_large");
+        assert_eq!(line["task"], "T01");
+        assert_eq!(line["agent"], "developer");
+        assert!(line["bytes"].as_u64().is_some_and(|b| b > 256 * 1024));
+        assert!(line["events"].as_u64().is_some_and(|n| n > 100));
+        assert!(line["elapsed_ms"].is_u64());
+        assert_eq!(line["top_events"][0]["type"], "response.output_text.delta");
+        assert_eq!(line["tokens_estimated"], true);
+        let head = line["head"].as_str().expect("início");
+        let tail = line["tail"].as_str().expect("fim");
+        assert!(head.starts_with("INICIO ") && head.len() <= CUT_SNIPPET_BYTES, "{}", head.len());
+        assert!(!tail.is_empty() && tail.len() <= CUT_SNIPPET_BYTES, "{}", tail.len());
+
+        let records = load_records(&root, Some("s1"));
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!((r.estimated, r.cut.as_deref()), (Some(true), Some("too_large")));
+        assert!(r.input > 0 && r.output >= 5_000, "{r:?}");
+        let view = aggregate(&records, &price(1.0, 2.0, None));
+        assert!(view.total.cost_usd.is_some_and(|c| c > 0.0));
+        assert!(view.total.cost_estimated, "custo de chamada cortada aparece como estimado");
+        assert_eq!(view.total.calls, 1);
+    }
+
+    #[test]
+    fn usage_record_without_cut_fields_keeps_old_shape() {
+        let root = tmp("cut-shape");
+        FileUsageSink::new(&root, "p").record(ev(Some("s1"), None, "a", "m", Usage::new(1, 1)));
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        assert!(!text.contains("estimated") && !text.contains("\"cut\""), "{text}");
+        let mut e = ev(Some("s1"), None, "a", "m", Usage::new(1, 1));
+        e.cut = Some("../segredo".into());
+        FileUsageSink::new(&root, "p").record(e);
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        assert!(!text.contains("segredo"), "motivo fora do vocabulário é descartado");
     }
 }

@@ -93,14 +93,14 @@ describe("getDialog (cliente)", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("404 vira falha estática com a mensagem fixa do servidor", async () => {
-    installFetch(() => ({ status: 404, body: { error: "spec não encontrada" } }));
+  it("404 vira falha estática com o código do servidor (o texto dele não é repassado)", async () => {
+    installFetch(() => ({ status: 404, body: { error: "spec não encontrada", code: "spec_not_found" } }));
 
     const result = await getDialog("p1", "s1");
 
     expect(result).toEqual({
       ok: false,
-      error: { kind: "http", status: 404, message: "spec não encontrada", messageKey: "serverMessage.specNotFound" },
+      error: { kind: "http", status: 404, message: "recurso não encontrado", messageKey: "api.status.404", code: "spec_not_found" },
     });
   });
 

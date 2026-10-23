@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseApiEvent } from "./api/events";
 import type { ApiEvent } from "./api/types";
-import { ACTIVITY_END_GRACE_MS, ACTIVITY_IDLE_MS, MAX_ACTIVITY_REASONING, createAppStore } from "./store";
+import { ACTIVITY_END_GRACE_MS, ACTIVITY_IDLE_MS, COMMAND_STALE_MS, MAX_ACTIVITY_REASONING, createAppStore, mergeServerActivities } from "./store";
 
 const P = "p1";
 
@@ -142,6 +142,87 @@ describe("comando longo (heartbeat)", () => {
     vi.advanceTimersByTime(ACTIVITY_IDLE_MS + 1);
     store.pruneActivities(P, Date.now());
     expect(store.getState().activities[P] ?? []).toHaveLength(0);
+  });
+});
+
+describe("chamada longa ao modelo (spec 114 T04)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+  });
+  afterEach(() => vi.useRealTimers());
+  const base = { agent: "developer", task_id: "T02", activity_id: "a1" };
+
+  it("model marca o início; heartbeats mantêm a entrada viva e trazem os bytes; model_end limpa", () => {
+    const store = createAppStore();
+    store.applyEvent(activity({ ...base, kind: "start" }));
+    store.applyEvent(activity({ ...base, kind: "model", model_started_at: 999_000 }));
+    expect(store.getState().activities[P]?.[0]).toMatchObject({ modelStartedAt: 999_000 });
+    expect(store.getState().activities[P]?.[0]?.modelBytes).toBeUndefined();
+    // 8,5 min de chamada: nada de "aguardando a vez" no meio.
+    for (let i = 1; i <= 26; i += 1) {
+      vi.advanceTimersByTime(20_000);
+      store.applyEvent(activity({ ...base, kind: "heartbeat", ...(i > 3 ? { received_bytes: i * 1000 } : {}) }));
+      store.pruneActivities(P, Date.now());
+    }
+    expect(store.getState().activities[P]?.[0]).toMatchObject({ modelStartedAt: 999_000, modelBytes: 26_000 });
+    store.applyEvent(activity({ ...base, kind: "model_end" }));
+    const a = store.getState().activities[P]?.[0];
+    expect(a?.modelStartedAt).toBeUndefined();
+    expect(a?.modelBytes).toBeUndefined();
+  });
+
+  it("início no futuro (relógio do servidor) fica no agora; bytes inválidos são ignorados", () => {
+    const store = createAppStore();
+    store.applyEvent(activity({ ...base, kind: "model", model_started_at: 5_000_000 }));
+    store.applyEvent(activity({ ...base, kind: "heartbeat", received_bytes: -4 }));
+    expect(store.getState().activities[P]?.[0]).toMatchObject({ modelStartedAt: 1_000_000 });
+    expect(store.getState().activities[P]?.[0]?.modelBytes).toBeUndefined();
+  });
+
+  it("sem sinal da chamada, o relógio some; start e end também limpam", () => {
+    const store = createAppStore();
+    store.applyEvent(activity({ ...base, kind: "model" }));
+    vi.advanceTimersByTime(COMMAND_STALE_MS + 1);
+    store.pruneActivities(P, Date.now());
+    expect(store.getState().activities[P]?.[0]?.modelStartedAt).toBeUndefined();
+    store.applyEvent(activity({ ...base, kind: "model" }));
+    store.applyEvent(activity({ ...base, kind: "end" }));
+    expect(store.getState().activities[P]?.[0]?.modelStartedAt).toBeUndefined();
+    store.applyEvent(activity({ ...base, activity_id: "a2", kind: "model" }));
+    store.applyEvent(activity({ ...base, activity_id: "a3", kind: "start" }));
+    expect(store.getState().activities[P]?.[0]?.modelStartedAt).toBeUndefined();
+  });
+
+  it("o instantâneo do servidor traz a chamada em curso (reidratação)", () => {
+    const merged = mergeServerActivities(
+      [],
+      [{ agent: "developer", task_id: "T02", spec_id: "s1", activity_id: "a1", reasoning: "", text: "", tool: "", model_started_at: 900_000, received_bytes: 4096, age_ms: 5_000 }],
+      1_000_000,
+    );
+    expect(merged[0]).toMatchObject({ modelStartedAt: 900_000, modelBytes: 4096 });
+  });
+});
+
+describe("marco de início ou retomada da execução (spec 114 T04)", () => {
+  it("project_status executando grava o instante; parada e outro projeto não mexem", () => {
+    const store = createAppStore();
+    const status = (payload: Record<string, unknown>, project = P) => {
+      const ev = parseApiEvent({ event_type: "project_status", project_id: project, payload });
+      if (ev === null) throw new Error("evento inválido");
+      store.applyEvent(ev);
+    };
+    status({ status: "executing", spec_id: "s1" });
+    const first = store.getState().runStarts[P];
+    expect(first?.seq).toBeGreaterThan(0);
+    status({ status: "idle", reason: "stopped" });
+    expect(store.getState().runStarts[P]).toBe(first);
+    status({ status: "executing", spec_id: "s1" });
+    expect(store.getState().runStarts[P]?.seq).toBeGreaterThan(first?.seq ?? 0);
+    // Transição vista no estado lido: o marco fica depois de tudo o que já chegou.
+    store.markRunStarted(P);
+    expect(store.getState().runStarts[P]?.seq).toBeGreaterThan(first?.seq ?? 0);
+    expect(store.getState().runStarts.p2).toBeUndefined();
   });
 });
 

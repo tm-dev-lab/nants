@@ -258,10 +258,10 @@ describe("Configurações: carga da configuração", () => {
     });
     expect(within(settings()).getByRole("status").textContent).toBe("Carregando as configurações.");
     act(() => {
-      appStore.setState({ configError: "Não foi possível carregar a configuração." });
+      appStore.setState({ configError: { kind: "http", status: 500, message: "falha interna do servidor", messageKey: "api.serverError" } });
     });
     const alert = within(settings()).getByRole("alert");
-    expect(alert.textContent).toContain("Não foi possível carregar a configuração.");
+    expect(alert.textContent).toContain("falha interna do servidor");
     const before = server.count("GET", /^\/api\/config$/);
     await act(async () => {
       fireEvent.click(within(alert).getByRole("button", { name: "Tentar de novo" }));
@@ -315,6 +315,8 @@ describe("Configurações: Conexões", () => {
     });
     const win = settings();
     fireEvent.click(within(win).getByRole("button", { name: "Nova conexão" }));
+    // Spec 116: o primeiro passo pergunta como conectar.
+    fireEvent.click(within(win).getByRole("button", { name: /^Chave de API/ }));
     const form = within(win).getByRole("region", { name: "Nova conexão" });
     const key = within(form).getByLabelText("Chave de API") as HTMLInputElement;
     expect(key.type).toBe("password");
@@ -343,9 +345,11 @@ describe("Configurações: Conexões", () => {
 
   it("erro 422: mensagem fixa, formulário mantido e o campo da chave limpo", async () => {
     const { server } = await openSettings();
-    server.reply("PUT", /^\/api\/config\/connections$/, () => ({ status: 422, body: { error: "api_key é obrigatória" } }));
+    server.reply("PUT", /^\/api\/config\/connections$/, () => ({ status: 422, body: { error: "api_key é obrigatória", code: "api_key_required" } }));
     const win = settings();
     fireEvent.click(within(win).getByRole("button", { name: "Nova conexão" }));
+    // Spec 116: o primeiro passo pergunta como conectar.
+    fireEvent.click(within(win).getByRole("button", { name: /^Chave de API/ }));
     const form = within(win).getByRole("region", { name: "Nova conexão" });
     fireEvent.change(within(form).getByLabelText("Identificador"), { target: { value: "novo" } });
     fireEvent.change(within(form).getByLabelText("Nome"), { target: { value: "Novo" } });
@@ -513,7 +517,7 @@ describe("Configurações: Agentes, Preços, Máquina, Aparência e Projetos", (
     act(() => {
       appStore.setState((s) => (s.config === null ? s : { config: { ...s.config, ...{ projects_root: "~/Projetos", projects_root_effective: "/home/dev/Projetos" } } }));
     });
-    let reply = { status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido" } as unknown };
+    let reply = { status: 422, body: { error: "pasta de projetos inválida: diretório de sistema não é permitido", code: "projects_root_system" } as unknown };
     server.reply("PUT", /^\/api\/config\/projects-root$/, () => reply);
     await chooseTab("Projetos");
     const win = settings();

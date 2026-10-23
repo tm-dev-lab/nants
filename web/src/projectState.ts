@@ -34,11 +34,14 @@ export async function refreshProjectState(projectId: string): Promise<ApiResult<
   if (result.ok) {
     const data = result.data;
     if (!superseded) {
+      // Spec 114 T04: a transição para "executando" marca o início ou a retomada da execução.
+      const started = data.run !== null && (appStore.getState().projectStates[projectId]?.run ?? null) === null;
       appStore.setState((s) => ({
         projectStates: { ...s.projectStates, [projectId]: data },
         // Sem run ativo, nenhuma análise está em andamento.
         ...(!data.running && data.run === null ? { recoveries: dropAnalyzing(s.recoveries, projectId) } : {}),
       }));
+      if (started) appStore.markRunStarted(projectId);
       appStore.hydratePermissions(projectId, data.pending_permissions ?? [], startedAt);
       const hadTurn = appStore.getState().architectTurns[projectId] !== undefined;
       appStore.syncArchitectTurn(projectId, data.architect_turn ?? null, turnClock);

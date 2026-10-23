@@ -240,6 +240,9 @@ const TEST_ERROR_MESSAGES: Readonly<Record<string, string>> = localized({
   tls_failed: "settings.test.error.tls_failed",
   bad_response: "settings.test.error.bad_response",
   unsupported: "settings.test.error.unsupported",
+  plan_limit: "settings.test.error.plan_limit",
+  plan_not_eligible: "settings.test.error.plan_not_eligible",
+  plan_needs_login: "settings.test.error.plan_needs_login",
 });
 
 /** Texto do erro HTTP do provedor (com o status quando houver), no idioma ativo. */

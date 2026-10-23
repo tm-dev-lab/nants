@@ -11,6 +11,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::{EmbeddedFile, RustEmbed};
 
+use serde_json::Map;
 use super::error::ApiError;
 
 #[derive(RustEmbed)]
@@ -77,9 +78,9 @@ where
     F: Fn(&str) -> Option<Asset>,
 {
     if *method != Method::GET && *method != Method::HEAD {
-        return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "método não permitido").into_response();
+        return ApiError::coded(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", Map::new()).into_response();
     }
-    let not_found = || ApiError::new(StatusCode::NOT_FOUND, "não encontrado").into_response();
+    let not_found = || ApiError::coded(StatusCode::NOT_FOUND, "not_found", Map::new()).into_response();
 
     // `%2f` no caminho cru é rejeitado antes de decodificar: barra codificada não vira separador.
     if has_encoded_slash(raw_path) {
@@ -358,7 +359,7 @@ mod tests {
                 "application/json",
                 "{path}"
             );
-            assert_eq!(text(resp).await, r#"{"error":"não encontrado"}"#, "{path}");
+            assert_eq!(text(resp).await, r#"{"code":"not_found","error":"não encontrado"}"#, "{path}");
         }
     }
 

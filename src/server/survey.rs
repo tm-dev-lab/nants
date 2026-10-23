@@ -15,7 +15,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Map};
 use tokio::sync::watch;
 
 use super::approvals::{random_hex_id, ProjectApprover};
@@ -27,7 +27,7 @@ use super::projects::{find_project, scrub_text, write_checks_if_empty, write_tes
 use super::report::wait_shutdown;
 use super::safe_fs;
 use super::spec_result::has_real_git_dir;
-use super::state::{AppState, ReserveError, REPORT_BUSY_MSG, SURVEY_RESERVATION};
+use super::state::{AppState, ReserveError, REPORT_BUSY_CODE, SURVEY_RESERVATION};
 use crate::agents::arch_memory::{read_raw, ARCH_FILE};
 use crate::agents::architect::{truncate_bytes, ChatTurn, LlmArchitect, TurnRole};
 use crate::agents::chat::ChatBackend;
@@ -35,15 +35,14 @@ use crate::config::Project;
 use crate::harness::git::Git;
 use crate::sdd::{check_test_command_shape, Check, Settings};
 
-const FIRST_COMMIT_MSG: &str = "docs: levantamento inicial (Nants)";
-const REDO_COMMIT_MSG: &str = "docs: refaz levantamento (Nants)";
+/// Prefixo dos commits do levantamento; o texto depois dele sai no idioma do projeto
+/// (`commit.survey_first` e `commit.survey_redo`, spec 115 T04).
+const SURVEY_COMMIT_PREFIX: &str = "docs: ";
 const TEST_COMMAND_PREFIX: &str = "TEST_COMMAND:";
 const CHECK_PREFIX: &str = "CHECK:";
 const SETTINGS_REL: &str = ".sdd/settings.yaml";
 const SUMMARY_SECTIONS: [&str; 3] = ["## Visão geral", "## Stack", "## Comandos"];
 const SUMMARY_SECTION_BYTES: usize = 900;
-const BUSY_MSG: &str = "já há um turno, execução ou relatório em andamento neste projeto";
-const NOT_CONFIGURED_MSG: &str = "agente Arquiteto não configurado";
 
 /// `GET /api/projects/:id/architecture`.
 pub async fn get_architecture(
@@ -56,7 +55,7 @@ pub async fn get_architecture(
     let root = PathBuf::from(&project.path);
     let content = tokio::task::spawn_blocking(move || read_raw(&root))
         .await
-        .map_err(|_| ApiError::internal("falha interna"))?;
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))?;
     let body = match content {
         Some(text) => json!({"exists": true, "content": scrub_text(&secrets, &text)}),
         None => json!({"exists": false, "content": ""}),
@@ -71,23 +70,23 @@ pub async fn post_survey(
 ) -> Result<Response, ApiError> {
     validate_project_id(&id)?;
     if architect_client(&state).await.is_err() {
-        return Err(ApiError::unprocessable(NOT_CONFIGURED_MSG));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "architect_not_configured", Map::new()));
     }
-    let busy = || ApiError::new(StatusCode::CONFLICT, BUSY_MSG);
+    let busy = || ApiError::coded(StatusCode::CONFLICT, "survey_busy", Map::new());
     let (project, run_guard) = match state.reserve_run(&id, SURVEY_RESERVATION).await {
         Ok(ok) => ok,
         Err(ReserveError::NotFound) => {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "projeto não encontrado"))
+            return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new()))
         }
         Err(ReserveError::Busy) => return Err(busy()),
         Err(ReserveError::ReportInProgress) => {
-            return Err(ApiError::new(StatusCode::CONFLICT, REPORT_BUSY_MSG))
+            return Err(ApiError::coded(StatusCode::CONFLICT, REPORT_BUSY_CODE, Map::new()))
         }
     };
     let chat_guard = state.try_begin_chat(&id).ok_or_else(busy)?;
     let root = PathBuf::from(&project.path);
     if !has_real_git_dir(&root) {
-        return Err(ApiError::new(StatusCode::CONFLICT, "repositório Git não suportado"));
+        return Err(ApiError::coded(StatusCode::CONFLICT, "git_repo_unsupported", Map::new()));
     }
     let task_state = state.clone();
     tokio::spawn(async move {
@@ -224,10 +223,11 @@ async fn survey(
         state.approvals().clone(),
         state.events().clone(),
         Arc::clone(secrets),
-    ));
+    )
+    .with_lang(state.project_lang(project_id)));
     let activity = Arc::new(BusActivitySink::new(state.events().clone(), project_id, Arc::clone(secrets)));
     let architect =
-        LlmArchitect::new(backend, model, Some(effort), policy, approver).with_lang(state.project_lang(project_id)).with_activity(activity, None, None).with_usage(super::usage::FileUsageSink::new(root.to_path_buf(), project_id));
+        LlmArchitect::new(backend, model, Some(effort), policy, approver).with_lang(state.project_lang(project_id)).with_activity(activity, None, None).with_usage(super::usage::FileUsageSink::redacting(root.to_path_buf(), project_id, Arc::clone(secrets)));
     let turn = architect.survey_architecture(root, &facts);
     let answer = tokio::select! {
         biased;
@@ -241,11 +241,12 @@ async fn survey(
 
     let (candidate, markdown) = split_test_command(&answer);
     let (candidate_checks, markdown) = split_checks(markdown);
-    let msg = if had_file { REDO_COMMIT_MSG } else { FIRST_COMMIT_MSG };
+    let key = if had_file { "commit.survey_redo" } else { "commit.survey_first" };
+    let msg = crate::i18n::commit_subject(state.project_lang(project_id).get(), SURVEY_COMMIT_PREFIX, key);
     let apply_root = root.to_path_buf();
     let apply_secrets = Arc::clone(secrets);
     let md = markdown.to_string();
-    let outcome = tokio::task::spawn_blocking(move || apply_with_message(&apply_root, msg, &md, &apply_secrets))
+    let outcome = tokio::task::spawn_blocking(move || apply_with_message(&apply_root, &msg, &md, &apply_secrets))
         .await
         .map_err(|_| "interno")?
         .map_err(|s| s.0)?;
@@ -384,6 +385,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-x".into(),
             wire_api: WireApi::default(),
+            kind: Default::default(),
         });
         cfg.agents.architect = AgentConfig { connection_id: "c".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
         cfg.projects.push(Project {
@@ -456,7 +458,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         let msg = wait_message(&mut rx).await;
         assert!(msg.contains("Levantamento concluído") && msg.contains("cargo test"), "{msg}");
-        assert_eq!(git(&root, &["log", "-1", "--format=%s"]).trim(), FIRST_COMMIT_MSG);
+        assert_eq!(git(&root, &["log", "-1", "--format=%s"]).trim(), "docs: levantamento inicial (Nants)");
         assert!(git(&root, &["status", "--porcelain"]).is_empty());
         let settings = fs::read_to_string(root.join(".sdd/settings.yaml")).expect("s");
         assert!(settings.contains("cargo test"), "{settings}");

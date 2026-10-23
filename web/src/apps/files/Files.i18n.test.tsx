@@ -67,7 +67,7 @@ async function mount(lang: Lang, { taskActive = false, truncated = false, listFa
     if (path === "logo.png") return { status: 200, body: { kind: "binary", size: 2048 } };
     if (path === "dump.sql") return { status: 200, body: { kind: "too_large", size: 3 * 1024 * 1024 } };
     if (path === "config.env") return { status: 200, body: { kind: "text", size: 9, content: "KEY=****\n", masked: true } };
-    return { status: 404, body: { error: "não encontrado" } };
+    return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
   await act(async () => {
     fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: NAME[lang] }));

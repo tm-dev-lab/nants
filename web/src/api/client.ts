@@ -27,6 +27,7 @@ import type {
   DialogView,
   ToolActionItem,
   ToolActionsView,
+  ChatgptStartResult,
   ConnectionInput,
   ConnectionView,
   ModelsResult,
@@ -111,33 +112,23 @@ const STATUS_KEYS: Record<number, MessageKey> = {
 };
 
 /**
- * Textos conhecidos em pt-BR, com a chave do dicionário (spec 102): as reservas do cliente (`api.*`:
- * status HTTP, rede, tempo limite, pasta de projetos) e as mensagens fixas do servidor
- * (`serverMessage.*`, as de `KNOWN_SERVER_MESSAGES`). `message` guarda o texto em pt-BR (registros
- * e compatibilidade); a interface mostra a chave no idioma ativo (`apiFailureText`, `messageText`).
+ * Reservas do cliente (spec 102 e 115): o texto pt-BR em `message` (registros e compatibilidade) e a
+ * chave em `messageKey`, que a interface mostra no idioma ativo (`apiFailureText`) quando o servidor
+ * não manda `code`. O texto do servidor nunca é repassado: os erros dele vão pelo `code` (115 T02).
  */
-const KEY_BY_TEXT: ReadonlyMap<string, MessageKey> = new Map(
-  (Object.keys(ptBR) as MessageKey[]).filter((k) => k.startsWith("api.") || k.startsWith("serverMessage.")).map((k) => [ptBR[k], k]),
-);
+const GENERIC_HTTP_KEY: MessageKey = "api.genericHttp";
+const SERVER_ERROR_KEY: MessageKey = "api.serverError";
+const NETWORK_KEY: MessageKey = "api.network";
+const TIMEOUT_KEY: MessageKey = "api.timeout";
+const INVALID_RESPONSE_KEY: MessageKey = "api.invalidResponse";
+const SERVER_ERROR_MESSAGE = ptBR[SERVER_ERROR_KEY];
 
-/** Chave do dicionário de um texto pt-BR conhecido (reserva do cliente ou mensagem fixa do servidor). */
-export function messageKeyForText(text: string): MessageKey | undefined {
-  return KEY_BY_TEXT.get(text);
+/** Reserva do cliente: o texto pt-BR (`message`) e a chave (`messageKey`) para o idioma ativo. */
+export function clientReserve(key: MessageKey): { message: string; messageKey: MessageKey } {
+  return { message: ptBR[key], messageKey: key };
 }
 
-const STATUS_MESSAGES: Record<number, string> = Object.fromEntries(
-  Object.entries(STATUS_KEYS).map(([status, key]) => [status, ptBR[key]]),
-);
-const GENERIC_HTTP_MESSAGE = ptBR["api.genericHttp"];
-const SERVER_ERROR_MESSAGE = ptBR["api.serverError"];
-const NETWORK_MESSAGE = ptBR["api.network"];
-const TIMEOUT_MESSAGE = ptBR["api.timeout"];
-const INVALID_RESPONSE_MESSAGE = ptBR["api.invalidResponse"];
-
-/**
- * Completa a falha (spec 102): `code`/`params` do corpo (quando no formato fixo) e a chave do texto
- * de reserva quando `message` é um deles.
- */
+/** Completa a falha (spec 102): `code`/`params` do corpo, quando no formato fixo. */
 function withCodes(failure: ApiFailure, body: unknown): ApiFailure {
   const out: ApiFailure = { ...failure };
   if (isRecord(body) && isMessageCode(body.code)) {
@@ -145,76 +136,13 @@ function withCodes(failure: ApiFailure, body: unknown): ApiFailure {
     const params = parseCodeParams(body.params);
     if (params !== null) out.params = params;
   }
-  const key = messageKeyForText(out.message);
-  if (key !== undefined && out.messageKey === undefined) out.messageKey = key;
   return out;
 }
 
-/**
- * Textos fixos que o servidor devolve em `error`. Só estes são repassados ao usuário;
- * qualquer outro texto (que poderia ecoar entrada) é substituído pela mensagem do status.
- */
-export const KNOWN_SERVER_MESSAGES: ReadonlySet<string> = new Set([
-  // Imagens anexadas ao Arquiteto (chat.rs, spec 082 T05).
-  "imagem anexada inválida ou inexistente; anexe de novo",
-  "attachments deve ter no máximo 4 imagens",
-  "corpo JSON malformado",
-  "corpo JSON com campos inválidos",
-  "projeto não encontrado",
-  "spec não encontrada",
-  "spec inválida",
-  "spec ainda em rascunho; finalize com o Arquiteto",
-  "spec não está aguardando aprovação",
-  "spec foi alterada durante a aprovação; tente novamente",
-  // Retomada de execução bloqueada (runs.rs `resume_spec`).
-  "spec não está em andamento",
-  "não há tarefa bloqueada para retomar",
-  "tarefas foram alteradas durante a retomada; tente novamente",
-  // Parada da execução (runs.rs `stop_spec`, spec 086 T04).
-  "não há execução em andamento desta spec",
-  "já existe uma execução em andamento neste projeto",
-  "já existe um turno de chat em andamento para este projeto",
-  "agente Arquiteto não configurado",
-  "agente developer não configurado",
-  "agente reviewer não configurado",
-  "pedido de permissão não encontrado",
-  // Decisão inválida (approvals.rs `parse_decision`, 422).
-  'decision deve ser "once", "run", "always" ou "deny"',
-  "api_key é obrigatória para nova conexão",
-  "api_key é obrigatória",
-  "base_url inválida",
-  "base_url deve usar http ou https",
-  "model é obrigatório",
-  "path é obrigatório",
-  "path deve ser absoluto",
-  "path não pode conter '..'",
-  "path inexistente",
-  "path não é um diretório",
-  "path inválido",
-  "name é obrigatório",
-  "sem permissão para o path",
-  "diretório não encontrado",
-  "falha ao salvar a configuração",
-  "falha interna",
-  "decision deve ser \"once\", \"always\" ou \"deny\"",
-  "servidor encerrando",
-  // Turno do chat que excedeu o tempo (504 de chat.rs).
-  "timeout",
-  // Projetos e navegação de diretórios (projects.rs, fs_browse.rs, safe_fs.rs).
-  "diretório raiz não é permitido",
-  "diretório de sistema não é permitido",
-  "falha ao inicializar .sdd do projeto",
-  "estrutura do projeto inválida para inicialização",
-  "arquivo de configuração do projeto inválido",
-  "identificador de projeto já existe para outro caminho",
-  "diretório do projeto inseguro (symlink)",
-  "diretório do projeto inseguro (arquivo especial ou grande demais)",
-  "falha de I/O no diretório do projeto",
-  "sem permissão para listar o diretório",
-  "caminho não é um diretório",
-  "caminho inválido",
-  "não foi possível listar o diretório",
-]);
+/** Código do erro da API no corpo (`code`, spec 115 T02), ou `null`. */
+export function serverErrorCode(body: unknown): string | null {
+  return isRecord(body) && isMessageCode(body.code) ? body.code : null;
+}
 
 /** Códigos `reason` fixos devolvidos pelo servidor em respostas de erro (runs.rs). */
 const KNOWN_REASONS: ReadonlySet<string> = new Set([
@@ -259,16 +187,16 @@ function serverReason(body: unknown): string | null {
   return typeof reason === "string" && KNOWN_REASONS.has(reason) ? reason : null;
 }
 
-/** Mensagens fixas do servidor para agente sem configuração (422 de runs.rs e chat.rs). */
-const AGENT_NOT_CONFIGURED_MESSAGES: ReadonlySet<string> = new Set([
-  "agente Arquiteto não configurado",
-  "agente developer não configurado",
-  "agente reviewer não configurado",
+/** Códigos do 422 de agente sem configuração (runs.rs e chat.rs). */
+const AGENT_NOT_CONFIGURED_CODES: ReadonlySet<string> = new Set([
+  "architect_not_configured",
+  "developer_not_configured",
+  "reviewer_not_configured",
 ]);
 
 /** `true` só para o 422 de agente não configurado (não para outros 422). */
-export function isAgentNotConfiguredMessage(message: string): boolean {
-  return AGENT_NOT_CONFIGURED_MESSAGES.has(message);
+export function isAgentNotConfigured(failure: ApiFailure): boolean {
+  return failure.status === 422 && failure.code !== undefined && AGENT_NOT_CONFIGURED_CODES.has(failure.code);
 }
 
 interface RequestOptions {
@@ -295,18 +223,12 @@ interface RawRequest {
   keepalive?: boolean;
 }
 
-/** Converte o status HTTP em mensagem fixa. */
-function messageForStatus(status: number): string {
-  if (status >= 500) return SERVER_ERROR_MESSAGE;
-  return STATUS_MESSAGES[status] ?? GENERIC_HTTP_MESSAGE;
+/** Chave da reserva do cliente para o status HTTP. */
+function statusKey(status: number): MessageKey {
+  if (status >= 500) return SERVER_ERROR_KEY;
+  return STATUS_KEYS[status] ?? GENERIC_HTTP_KEY;
 }
 
-/** Extrai `error` do corpo somente se for um texto conhecido; nunca devolve o corpo cru. */
-function serverMessage(body: unknown): string | null {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
-  const error = (body as { error?: unknown }).error;
-  return typeof error === "string" && KNOWN_SERVER_MESSAGES.has(error) ? error : null;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -388,8 +310,8 @@ export async function request<T>(
     clearTimeout(timer);
     const aborted = err instanceof DOMException && err.name === "AbortError";
     return aborted
-      ? fail("timeout", 0, TIMEOUT_MESSAGE)
-      : fail("network", 0, NETWORK_MESSAGE);
+      ? fail("timeout", 0, TIMEOUT_KEY)
+      : fail("network", 0, NETWORK_KEY);
   }
 
   try {
@@ -405,21 +327,21 @@ export async function request<T>(
         return { ok: false, error: withCodes({ kind: "http", status: 412, message, reason: "prereq_missing", missing }, body) };
       }
       const reason = serverReason(body);
-      const message = serverMessage(body) ?? messageForStatus(response.status);
+      const reserve = clientReserve(statusKey(response.status));
       const failure: ApiFailure =
-        reason === null ? { kind: "http", status: response.status, message } : { kind: "http", status: response.status, message, reason };
+        reason === null ? { kind: "http", status: response.status, ...reserve } : { kind: "http", status: response.status, ...reserve, reason };
       return { ok: false, error: withCodes(failure, body) };
     }
     const body = await safeJson(response);
     if (body === PARSE_FAILED) {
-      return fail("invalid_response", response.status, INVALID_RESPONSE_MESSAGE);
+      return fail("invalid_response", response.status, INVALID_RESPONSE_KEY);
     }
     return { ok: true, data: body as T };
   } catch {
     // Corpo interrompido pelo timeout durante a leitura.
     return controller.signal.aborted
-      ? fail("timeout", 0, TIMEOUT_MESSAGE)
-      : fail("network", 0, NETWORK_MESSAGE);
+      ? fail("timeout", 0, TIMEOUT_KEY)
+      : fail("network", 0, NETWORK_KEY);
   } finally {
     clearTimeout(timer);
   }
@@ -438,8 +360,8 @@ async function safeJson(response: Response): Promise<unknown> {
   }
 }
 
-function fail<T>(kind: ApiErrorKind, status: number, message: string): ApiResult<T> {
-  return { ok: false, error: withCodes({ kind, status, message }, null) };
+function fail<T>(kind: ApiErrorKind, status: number, key: MessageKey): ApiResult<T> {
+  return { ok: false, error: { kind, status, ...clientReserve(key) } };
 }
 
 function enc(segment: string): string {
@@ -449,7 +371,7 @@ function enc(segment: string): string {
 /** Dispensa leitura cega: valida só que a resposta é um objeto (ou repassa o tipo). */
 function asObject<T>(result: ApiResult<unknown>): ApiResult<T> {
   if (!result.ok) return result;
-  if (!isRecord(result.data)) return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+  if (!isRecord(result.data)) return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
   return { ok: true, data: result.data as T };
 }
 
@@ -460,7 +382,7 @@ export function getPrereqs(opts?: RequestOptions): Promise<ApiResult<PrereqItem[
   return request<PrereqItem[]>({ method: "GET", path: "/api/system/prereqs", timeoutMs: opts?.timeoutMs }).then(
     (r) => {
       if (!r.ok) return r;
-      if (!Array.isArray(r.data)) return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+      if (!Array.isArray(r.data)) return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
       return r;
     },
   );
@@ -497,6 +419,42 @@ export function putConnection(input: ConnectionInput): Promise<ApiResult<Connect
     path: "/api/config/connections",
     body: JSON.stringify(input),
   }).then((r) => asObject<ConnectionView>(r));
+}
+
+/**
+ * POST /api/connections/chatgpt/start (spec 116): começa o login pelo plano ChatGPT. `connection_id`
+ * reconecta uma conexão salva; sem ele, o login cria uma conexão nova. Devolve a URL de autorização
+ * e se o pedido veio deste computador (`local`).
+ */
+export function startChatgptLogin(input: { name?: string; connection_id?: string }): Promise<ApiResult<ChatgptStartResult>> {
+  return request<ChatgptStartResult>({
+    method: "POST",
+    path: "/api/connections/chatgpt/start",
+    body: JSON.stringify(input),
+  }).then((r) => {
+    const result = asObject<ChatgptStartResult>(r);
+    if (!result.ok) return result;
+    const { url, local } = result.data;
+    return typeof url === "string" && url.startsWith("https://") && typeof local === "boolean"
+      ? { ok: true, data: { url, local } }
+      : fail("invalid_response", 200, INVALID_RESPONSE_KEY);
+  });
+}
+
+/**
+ * POST /api/connections/:id/chatgpt/logout (spec 116): revoga e apaga as credenciais locais. O
+ * servidor responde `{state, revoked}`; `revoked` fora do formato conta como não confirmado (a tela
+ * avisa: melhor um aviso a mais do que dar a revogação por feita).
+ */
+export function logoutChatgpt(id: string): Promise<ApiResult<{ state: "disconnected"; revoked: boolean }>> {
+  return request<unknown>({
+    method: "POST",
+    path: `/api/connections/${enc(id)}/chatgpt/logout`,
+  }).then((r) => {
+    if (!r.ok) return r;
+    const revoked = isRecord(r.data) && r.data.revoked === true;
+    return { ok: true, data: { state: "disconnected", revoked } };
+  });
 }
 
 /** PUT /api/config/agents (substitui os três papéis). */
@@ -583,25 +541,19 @@ export function getConnectionModels(
     if (!result.ok) return result;
     return Array.isArray(result.data.models)
       ? result
-      : fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+      : fail("invalid_response", 200, INVALID_RESPONSE_KEY);
   });
 }
 
-const NESTED_REPO_PREFIX = "a pasta está dentro do repositório Git";
-
-/** POST /api/projects */
+/**
+ * POST /api/projects. O 409 de pasta dentro de outro repositório vem com `code`
+ * `project_nested_repo` e `params.path` (o repositório), traduzido pelo código.
+ */
 export function createProject(input: { name: string; path: string }): Promise<ApiResult<Project>> {
   return request<Project>({
     method: "POST",
     path: "/api/projects",
     body: JSON.stringify({ name: input.name, path: input.path }),
-    onHttpError: (status, body) => {
-      // 409 de pasta dentro de outro repositório: exibe a mensagem do servidor (nomeia o repositório).
-      if (status !== 409 || !isRecord(body)) return null;
-      const text = body.error;
-      if (typeof text !== "string" || !text.startsWith(NESTED_REPO_PREFIX) || text.length > 600) return null;
-      return { kind: "http", status, message: text };
-    },
   }).then((r) => asObject<Project>(r));
 }
 
@@ -652,7 +604,7 @@ export function getProjectActivity(projectId: string): Promise<ApiResult<Activit
     const result = asObject<{ activities?: unknown }>(r);
     if (!result.ok) return result;
     const raw = result.data.activities;
-    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     const items: ActivitySnapshot[] = [];
     for (const it of raw as unknown[]) {
       if (!isRecord(it) || typeof it.agent !== "string" || typeof it.activity_id !== "string") continue;
@@ -670,6 +622,9 @@ export function getProjectActivity(projectId: string): Promise<ApiResult<Activit
         command: nul(it.command),
         command_started_at:
           typeof it.command_started_at === "number" && Number.isFinite(it.command_started_at) ? it.command_started_at : null,
+        // Spec 114 T04: chamada ao modelo em curso (início e bytes recebidos).
+        ...(typeof it.model_started_at === "number" && Number.isFinite(it.model_started_at) ? { model_started_at: it.model_started_at } : {}),
+        ...(typeof it.received_bytes === "number" && Number.isSafeInteger(it.received_bytes) && it.received_bytes >= 0 ? { received_bytes: it.received_bytes } : {}),
         stage: typeof it.stage === "string" && it.stage !== "" ? it.stage : null,
         ...codedFields(it),
         age_ms: age,
@@ -804,7 +759,7 @@ export function getSpecReport(projectId: string, specId: string): Promise<ApiRes
   }).then((r) => {
     if (!r.ok) return r;
     const parsed = toSpecReport(r.data);
-    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE) : { ok: true, data: parsed };
+    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: parsed };
   });
 }
 
@@ -816,7 +771,7 @@ export function getSpecResult(projectId: string, specId: string): Promise<ApiRes
   }).then((r) => {
     if (!r.ok) return r;
     const parsed = toSpecResult(r.data);
-    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE) : { ok: true, data: parsed };
+    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: parsed };
   });
 }
 
@@ -832,7 +787,7 @@ export function getChatHistory(projectId: string): Promise<ApiResult<ChatHistory
     const result = asObject<ChatHistoryView>(r);
     if (!result.ok) return result;
     const raw: unknown = result.data.turns;
-    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     const turns = raw.flatMap((item) => {
       const turn = toChatHistoryTurn(item);
       return turn === null ? [] : [turn];
@@ -883,16 +838,16 @@ export function uploadChatAttachment(
     binary: { body: image, contentType },
     timeoutMs: ATTACHMENT_TIMEOUT_MS,
     onHttpError: (status) => {
-      const message =
-        status === 413 ? ATTACHMENT_TOO_LARGE : status === 415 ? ATTACHMENT_UNSUPPORTED : status === 507 ? ATTACHMENT_NO_SPACE : null;
-      return message === null ? null : { kind: "http", status, message };
+      const key: MessageKey | null =
+        status === 413 ? "api.attachmentTooLarge" : status === 415 ? "api.attachmentUnsupported" : status === 507 ? "api.attachmentNoSpace" : null;
+      return key === null ? null : { kind: "http", status, ...clientReserve(key) };
     },
   }).then((r) => {
     const result = asObject<ChatAttachmentUpload>(r);
     if (!result.ok) return result;
     const { id, name } = result.data;
     if (typeof id !== "string" || typeof name !== "string" || !isAttachmentName(name)) {
-      return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+      return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     }
     return { ok: true, data: { id, name } };
   });
@@ -947,7 +902,7 @@ export function getDialog(projectId: string, specId: string, opts: DialogQuery =
   }).then((r) => {
     if (!r.ok) return r;
     const parsed = toDialogView(r.data);
-    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE) : { ok: true, data: parsed };
+    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: parsed };
   });
 }
 
@@ -1021,7 +976,7 @@ export function getToolActions(projectId: string, specId: string, opts: ToolActi
   }).then((r) => {
     if (!r.ok) return r;
     const parsed = toToolActionsView(r.data);
-    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE) : { ok: true, data: parsed };
+    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: parsed };
   });
 }
 
@@ -1044,12 +999,12 @@ export function postChat(
     body: JSON.stringify(body),
     timeoutMs: CHAT_TIMEOUT_MS,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    // 504 `{"error":"timeout"}`: o servidor cancelou o turno (chat.rs). Kind "timeout" com status 504.
+    // 504 `code: "chat_timeout"`: o servidor cancelou o turno (chat.rs). Kind "timeout" com status 504.
     // 502 com causa fixa do provedor (chat.rs `architect_error`): mensagem específica + código.
     onHttpError: (status, body) => {
-      if (status === 504 && serverMessage(body) === "timeout") {
+      if (status === 504 && serverErrorCode(body) === "chat_timeout") {
         const saved = serverReason(body) === "draft_saved";
-        return { kind: "timeout", status: 504, message: TIMEOUT_MESSAGE, ...(saved ? { reason: "draft_saved" } : {}) };
+        return { kind: "timeout", status: 504, ...clientReserve(TIMEOUT_KEY), ...(saved ? { reason: "draft_saved" } : {}) };
       }
       // 502 do chat é sempre falha do provedor: código desconhecido (ou legado) vira resposta
       // inesperada, nunca "falha interna do servidor".
@@ -1073,11 +1028,11 @@ export function postChat(
   }).then((r) => asObject<ChatReply>(r));
 }
 
-/** Extrai `error` do corpo somente se for uma causa fixa do provedor; nunca devolve o texto cru. */
+/** Causa fixa do provedor (`params.provider` do `provider_failed`); nunca devolve o texto cru. */
 function providerCodeOf(body: unknown): string | null {
-  if (!isRecord(body)) return null;
-  const error = body.error;
-  return typeof error === "string" && isProviderFailureCode(error) ? error : null;
+  if (!isRecord(body) || !isRecord(body.params)) return null;
+  const provider = body.params.provider;
+  return typeof provider === "string" && isProviderFailureCode(provider) ? provider : null;
 }
 
 /** POST /api/projects/:id/specs/:spec_id/approve (202 em sucesso). */
@@ -1141,8 +1096,6 @@ interface RemoveProjectResult {
   alreadyRemoved: boolean;
 }
 
-/** Mensagem fixa do 404 de `DELETE /api/projects/:id` (projects.rs). */
-const PROJECT_NOT_FOUND_MESSAGE = "projeto não encontrado";
 
 /**
  * DELETE /api/projects/:id: tira o projeto só do Nants (arquivos no disco permanecem).
@@ -1159,13 +1112,13 @@ export function removeProject(
     body: opts?.removeVolumes === true ? JSON.stringify({ remove_volumes: true }) : "{}",
   }).then((r): ApiResult<RemoveProjectResult> => {
     if (!r.ok) {
-      if (r.error.status === 404 && r.error.message === PROJECT_NOT_FOUND_MESSAGE) {
+      if (r.error.status === 404 && r.error.code === "project_not_found") {
         return { ok: true, data: { removed: projectId, alreadyRemoved: true } };
       }
       return r;
     }
     const removed = isRecord(r.data) ? r.data.removed : undefined;
-    if (typeof removed !== "string") return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    if (typeof removed !== "string") return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     return { ok: true, data: { removed, alreadyRemoved: false } };
   });
 }
@@ -1274,7 +1227,7 @@ const MAX_APP_DETAIL = 4000;
 function appReasonOnly(status: number, body: unknown): ApiFailure | null {
   // 412 `prereq_missing` (spec 093 T02): segue o caminho comum, que guarda os ids do que falta.
   if (status === 412) return null;
-  const base: ApiFailure = { kind: "http", status, message: messageForStatus(status) };
+  const base: ApiFailure = { kind: "http", status, ...clientReserve(statusKey(status)) };
   if (isRecord(body) && typeof body.reason === "string" && APP_ERROR_REASONS.has(body.reason)) {
     base.reason = body.reason;
     if ((body.reason === "docker_failed" || body.reason === "docker_port_in_use") && typeof body.detail === "string" && body.detail.trim() !== "") {
@@ -1334,7 +1287,7 @@ export function getAppStatus(projectId: string): Promise<ApiResult<AppStatus>> {
   return request<unknown>({ method: "GET", path: `/api/projects/${enc(projectId)}/app` }).then((r) => {
     if (!r.ok) return r;
     const parsed = toAppStatus(r.data);
-    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE) : { ok: true, data: parsed };
+    return parsed === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: parsed };
   });
 }
 
@@ -1370,10 +1323,10 @@ export async function getAppLogs(projectId: string): Promise<ApiResult<string>> 
       credentials: "same-origin",
       signal: controller.signal,
     });
-    if (!response.ok) return fail("http", response.status, messageForStatus(response.status));
+    if (!response.ok) return fail("http", response.status, statusKey(response.status));
     return { ok: true, data: await response.text() };
   } catch {
-    return fail("network", 0, NETWORK_MESSAGE);
+    return fail("network", 0, NETWORK_KEY);
   } finally {
     clearTimeout(timer);
   }
@@ -1431,11 +1384,11 @@ export function getProjectFiles(
     const result = asObject<{ entries?: unknown; truncated?: unknown; task_id?: unknown; changed?: unknown }>(r);
     if (!result.ok) return result;
     const raw = result.data.entries;
-    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    if (!Array.isArray(raw)) return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     const entries: FileEntry[] = [];
     for (const item of raw) {
       if (!isRecord(item) || typeof item.path !== "string" || typeof item.kind !== "string") {
-        return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+        return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
       }
       if (!FILE_ENTRY_KINDS.has(item.kind)) continue; // tipo desconhecido: ignora
       entries.push({ path: item.path, kind: item.kind as FileEntryKind });
@@ -1482,7 +1435,7 @@ export function getProjectFile(
       return r.error.status === 304 ? { ok: true, data: { status: "not_modified" } } : r;
     }
     const body = r.data;
-    if (!isRecord(body) || typeof body.size !== "number") return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    if (!isRecord(body) || typeof body.size !== "number") return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
     if (body.kind === "text" && typeof body.content === "string") {
       return {
         ok: true,
@@ -1499,6 +1452,6 @@ export function getProjectFile(
     if (body.kind === "binary" || body.kind === "too_large") {
       return { ok: true, data: { status: "ok", etag, file: { kind: body.kind, size: body.size } } };
     }
-    return fail("invalid_response", 200, INVALID_RESPONSE_MESSAGE);
+    return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
   });
 }

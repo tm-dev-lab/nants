@@ -21,11 +21,16 @@ use crate::config::{Connection, Effort, WireApi};
 
 mod bad_reason;
 pub use bad_reason::{BadKind, BadReason, ProviderCode, THROTTLE_CODES};
+mod cut;
+use cut::StreamDiag;
+pub use cut::{cut_reason, StreamCut, CUT_SNIPPET_BYTES, CUT_TOP_EVENTS};
 mod image;
 pub use image::{
     is_image_unreadable, is_image_unsupported, GeneratedImage, ImageBackground, ImageFormat, ImageOptions, ImageQuality,
     ImageSize, IMAGE_OUTPUT_TOKENS, IMAGE_UNREADABLE, IMAGE_UNSUPPORTED,
 };
+mod plan;
+pub use plan::{Billing, PlanError, PlanFuture, PlanTokenError, PlanTokens, PLAN_FORBIDDEN_FIELDS, PLAN_UNSUPPORTED_TOOLS, PLAN_USAGE_URL};
 mod pace;
 pub use pace::{pace_notice, pace_notice_secs, parse_reset, PaceClock, Pacer, Quota, PACE_MAX_WAIT, PACE_NOTICE_AFTER, PACE_WINDOW};
 
@@ -273,6 +278,8 @@ pub struct ChatResponse {
     pub citations: Vec<Citation>,
     /// `true` quando a busca na web foi recusada (HTTP 400) e a requisição refeita sem ela.
     pub web_search_rejected: bool,
+    /// Como a chamada é cobrada (spec 116 T02): pelo plano ChatGPT, os tokens vão ao registro sem US$.
+    pub billing: Billing,
 }
 
 /// Causa fixa de uma falha do provedor. Vocabulário estável exibido ao usuário; não carrega
@@ -287,6 +294,8 @@ pub enum ProviderFailure {
     /// Resposta ruim, com o motivo fechado (spec 088); o `Display` continua só o código fixo.
     BadResponse(BadReason),
     InvalidConfig,
+    /// Falha do plano ChatGPT que pausa a execução (spec 116 T02).
+    Plan(PlanError),
 }
 
 impl ProviderFailure {
@@ -378,6 +387,7 @@ impl fmt::Display for ProviderFailure {
             ProviderFailure::ConnectFailed => f.write_str("provider_connect_failed"),
             ProviderFailure::BadResponse(_) => f.write_str("provider_bad_response"),
             ProviderFailure::InvalidConfig => f.write_str("provider_invalid_config"),
+            ProviderFailure::Plan(plan) => write!(f, "provider_{}", plan.as_str()),
         }
     }
 }
@@ -397,6 +407,7 @@ pub fn provider_failure(err: &LlmError) -> ProviderFailure {
         LlmError::Timeout => ProviderFailure::Timeout,
         LlmError::Transport(_) => ProviderFailure::ConnectFailed,
         LlmError::Config(_) => ProviderFailure::InvalidConfig,
+        LlmError::Plan(plan) => ProviderFailure::Plan(*plan),
     }
 }
 
@@ -443,7 +454,7 @@ fn is_transient(err: &LlmError) -> bool {
     match err {
         LlmError::Transport(_) | LlmError::Timeout => true,
         LlmError::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
-        LlmError::Parse(_) | LlmError::Config(_) => false,
+        LlmError::Parse(_) | LlmError::Config(_) | LlmError::Plan(_) => false,
     }
 }
 
@@ -538,6 +549,10 @@ pub struct LlmClient {
     cancel: Option<Arc<AtomicBool>>,
     /// Limitador de ritmo da conexão (spec 089 T02): só nos clientes de [`Self::from_connection`].
     pace: Option<PaceLink>,
+    /// Modo plano ChatGPT (spec 116 T02): a fonte do access token da conexão.
+    plan: Option<Arc<dyn PlanTokens>>,
+    /// Último access token usado no modo plano, para redigir trechos de erro e de corte.
+    plan_secret: Arc<std::sync::Mutex<String>>,
 }
 
 /// Limitador compartilhado e o id da conexão (a chave é completada pelo modelo do pedido).
@@ -597,18 +612,55 @@ impl LlmClient {
             retry_sleep: default_sleep(),
             cancel: None,
             pace: None,
+            plan: None,
+            plan_secret: Arc::new(std::sync::Mutex::new(String::new())),
         })
     }
 
     /// Cria o cliente a partir de uma `Connection`, resolvendo `env:NOME` na chave e usando
     /// o protocolo `wire_api` da conexão. O ritmo segue o limitador do processo para o par
     /// (id da conexão, modelo) ([`Pacer::global`], spec 089 T02).
+    ///
+    /// A conexão pelo plano ChatGPT não tem chave: monta-se por [`Self::from_plan_connection`], com a
+    /// fonte do access token; aqui ela é recusada como configuração inválida.
     pub fn from_connection(conn: &Connection) -> Result<Self, LlmError> {
+        if conn.is_chatgpt_plan() {
+            return Err(LlmError::Config("conexão pelo plano ChatGPT sem fonte de token".into()));
+        }
         let api_key = conn
             .resolve_api_key()
             .map_err(|e| LlmError::Config(e.to_string()))?;
         let client = Self::new(conn.base_url.clone(), api_key)?.with_wire_api(conn.wire_api);
         Ok(Self { pace: Some(PaceLink { pacer: Pacer::global(), conn: conn.id.clone() }), ..client })
+    }
+
+    /// Cliente da conexão pelo plano ChatGPT (spec 116 T02): Responses no modo plano, com o access
+    /// token de `tokens` e o ritmo do processo para o par (id da conexão, modelo).
+    pub fn from_plan_connection(conn: &Connection, tokens: Arc<dyn PlanTokens>) -> Result<Self, LlmError> {
+        let client = Self::new(conn.base_url.clone(), String::new())?.with_plan_tokens(tokens);
+        Ok(Self { pace: Some(PaceLink { pacer: Pacer::global(), conn: conn.id.clone() }), ..client })
+    }
+
+    /// Liga o modo plano ChatGPT (spec 116 T02): Responses, `store:false` e `stream:true` sempre,
+    /// sem os campos proibidos, com o access token de `tokens`.
+    pub fn with_plan_tokens(mut self, tokens: Arc<dyn PlanTokens>) -> Self {
+        self.plan = Some(tokens);
+        self.wire_api = WireApi::Responses;
+        self
+    }
+
+    /// Como as chamadas deste cliente são cobradas.
+    pub fn billing(&self) -> Billing {
+        if self.plan.is_some() {
+            Billing::ChatgptPlan
+        } else {
+            Billing::Metered
+        }
+    }
+
+    /// `true` no modo plano ChatGPT.
+    pub fn is_plan(&self) -> bool {
+        self.plan.is_some()
     }
 
     /// Desliga o limitador: nem espera nem alimenta o ritmo do par (teste de conexão).
@@ -938,7 +990,13 @@ impl LlmClient {
     /// Sem consumidor de deltas, a espera do limitador aqui não é exibida (o reparo do JSON do
     /// Revisor, o advisor e o juiz de comandos usam este caminho): ela tem o teto de
     /// [`PACE_MAX_WAIT`] por requisição, que cabe nos prazos externos desses chamadores.
+    ///
+    /// No modo plano ChatGPT toda chamada é em streaming (spec 116): vai por [`Self::chat_stream`],
+    /// sem consumidor de deltas.
     pub async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        if self.plan.is_some() {
+            return self.chat_stream(req, &|_| {}).await;
+        }
         let quiet = |_: String| {};
         self.with_retry(
             || {
@@ -1020,18 +1078,86 @@ impl LlmClient {
 
     /// `GET {base_url}{path}` com a mesma autenticação, timeout, sem redirects e teto
     /// de resposta do `chat`. Devolve o corpo como JSON.
+    ///
+    /// No modo plano, um 401 sem motivo descarta o access token e tenta uma vez com um renovado.
     pub async fn get_json(&self, path: &str) -> Result<serde_json::Value, LlmError> {
-        let builder = self.http.get(format!("{}{path}", self.base_url));
-        let (status, body) = self.send_capped(builder).await?;
-        if !status.is_success() {
-            return Err(self.http_error(status.as_u16(), &body));
+        let mut renewed = false;
+        loop {
+            let builder = self.http.get(format!("{}{path}", self.base_url));
+            let (status, body) = self.send_capped(builder).await?;
+            if !status.is_success() {
+                if self.renew_after_401(status.as_u16(), &body, &mut renewed).await {
+                    continue;
+                }
+                return Err(self.fail(status.as_u16(), &body).await);
+            }
+            return serde_json::from_str(&body).map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)));
         }
-        serde_json::from_str(&body).map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)))
+    }
+
+    /// Valor do `Authorization: Bearer`: a chave da conexão ou, no modo plano, o access token da
+    /// fonte (renovado por ela). Sem login utilizável, [`PlanError::NeedsLogin`]; autenticação
+    /// indisponível é transitória.
+    async fn bearer(&self) -> Result<String, LlmError> {
+        let Some(tokens) = &self.plan else {
+            return Ok(self.api_key.clone());
+        };
+        match tokens.access_token().await {
+            Ok(token) => {
+                *self.plan_secret.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
+                Ok(token)
+            }
+            Err(PlanTokenError::NeedsLogin) => Err(LlmError::Plan(PlanError::NeedsLogin)),
+            Err(PlanTokenError::Unavailable) => Err(LlmError::Transport("autenticação do plano indisponível".into())),
+            Err(PlanTokenError::Failed) => Err(LlmError::Config("credenciais do plano indisponíveis".into())),
+        }
+    }
+
+    /// Segredo a redigir dos trechos: a chave ou o último access token do plano.
+    fn secret(&self) -> String {
+        if self.plan.is_some() {
+            self.plan_secret.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        } else {
+            self.api_key.clone()
+        }
+    }
+
+    /// Modo plano: um 401 sem código do plano descarta o access token (a próxima chamada renova) e
+    /// pede uma nova tentativa, uma vez por pedido. `true` quando vale repetir.
+    async fn renew_after_401(&self, status: u16, body: &str, renewed: &mut bool) -> bool {
+        let Some(tokens) = &self.plan else {
+            return false;
+        };
+        if status != 401 || *renewed {
+            return false;
+        }
+        let (code, _) = plan::body_error_parts(body);
+        if code.as_deref().and_then(plan::classify).is_some() {
+            return false;
+        }
+        *renewed = true;
+        tokens.expire().await;
+        true
+    }
+
+    /// Erro final de uma resposta HTTP de falha ([`Self::http_error`]); no modo plano, "precisa
+    /// entrar de novo" também marca a conexão.
+    async fn fail(&self, status: u16, body: &str) -> LlmError {
+        let err = self.http_error(status, body);
+        self.note_plan_error(&err).await;
+        err
+    }
+
+    /// Modo plano: [`PlanError::NeedsLogin`] marca a conexão como "precisa entrar de novo".
+    async fn note_plan_error(&self, err: &LlmError) {
+        if let (Some(tokens), LlmError::Plan(PlanError::NeedsLogin)) = (&self.plan, err) {
+            tokens.needs_login().await;
+        }
     }
 
     /// Aplica a autenticação `Authorization: Bearer` em toda requisição.
-    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder.bearer_auth(&self.api_key)
+    fn authorize(&self, builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+        builder.bearer_auth(token)
     }
 
     /// Envia, lê o corpo respeitando `max_response_bytes` e devolve status e texto.
@@ -1050,8 +1176,9 @@ impl LlmClient {
         builder: reqwest::RequestBuilder,
         model: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String, Option<Duration>), LlmError> {
+        let token = self.bearer().await?;
         let mut resp = self
-            .authorize(builder)
+            .authorize(builder, &token)
             .send()
             .await
             .map_err(transport_error)?;
@@ -1097,13 +1224,20 @@ impl LlmClient {
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
     ) -> Result<ChatResponse, LlmError> {
         let delivered = AtomicBool::new(false);
+        // O tamanho recebido (`Received`) não conta como entrega: a nova tentativa de uma falha
+        // transitória continua valendo enquanto nenhum texto chegou.
         let tracked = |d: StreamDelta| {
-            delivered.store(true, Ordering::SeqCst);
+            if !matches!(d, StreamDelta::Received(_) | StreamDelta::Cut(_)) {
+                delivered.store(true, Ordering::SeqCst);
+            }
             on_delta(d);
         };
         let notify = |notice| on_delta(StreamDelta::Retry(notice));
+        // Modo plano (spec 116 T02): o item retirado por `unsupported_capability` continua fora nas
+        // novas tentativas da mesma chamada (ex.: depois de um 503).
+        let removed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         self.with_retry(
-            || self.paced(req, &notify, self.chat_stream_once(req, &tracked)),
+            || self.paced(req, &notify, self.chat_stream_once(req, &tracked, &removed)),
             || delivered.load(Ordering::SeqCst),
             notify,
         )
@@ -1114,8 +1248,10 @@ impl LlmClient {
         &self,
         req: &ChatRequest,
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
+        removed_slot: &std::sync::Mutex<Option<String>>,
     ) -> Result<ChatResponse, Failed> {
-        let responses = matches!(self.wire_api, WireApi::Responses);
+        let plan = self.plan.is_some();
+        let responses = plan || matches!(self.wire_api, WireApi::Responses);
         let path = if responses { "/responses" } else { "/chat/completions" };
         let mut opts = StreamOpts {
             stream: true,
@@ -1123,7 +1259,14 @@ impl LlmClient {
             summary: true,
             effort: req.effort,
             web: responses && req.web_search,
+            plan,
         };
+        let prompt_estimate = self.estimate_tokens(req);
+        // Modo plano (spec 116 T02): item retirado por `unsupported_capability` (uma vez por chamada,
+        // guardado entre as tentativas) e a renovação do token depois de um 401 sem motivo (uma vez
+        // por tentativa).
+        let mut removed: Option<String> = removed_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let mut renewed = false;
         loop {
             let mut body = if responses {
                 build_responses_body(&ChatRequest { web_search: opts.web, ..req.clone() }, opts.effort)?
@@ -1131,6 +1274,13 @@ impl LlmClient {
                 build_body(req, opts.effort)
             };
             opts.apply(&mut body, responses);
+            if plan {
+                plan::plan_body(&mut body);
+                if let Some(param) = &removed {
+                    plan::remove_param(&mut body, param);
+                }
+            }
+            let token = self.bearer().await.map_err(Failed::from)?;
             // Streaming (spec 080 T01): o timeout total do cliente cortaria uma resposta viva no
             // meio (com deltas já entregues, sem nova tentativa). Aqui ele é trocado pelo teto
             // `STREAM_MAX_DURATION`, e `self.timeout` vale como ociosidade: até os cabeçalhos e
@@ -1140,7 +1290,9 @@ impl LlmClient {
                 .post(format!("{}{path}", self.base_url))
                 .timeout(STREAM_MAX_DURATION.max(self.timeout))
                 .json(&body);
-            let mut resp = tokio::time::timeout(self.timeout, self.authorize(builder).send())
+            // Spec 114 T05: o diagnóstico conta o tempo desde o envio do pedido.
+            let mut diag = StreamDiag::new(prompt_estimate);
+            let mut resp = tokio::time::timeout(self.timeout, self.authorize(builder, &token).send())
                 .await
                 .map_err(|_| LlmError::Timeout)?
                 .map_err(transport_error)?;
@@ -1149,11 +1301,25 @@ impl LlmClient {
             if !status.is_success() {
                 let after = retry_after(resp.headers());
                 let text = self.read_capped(&mut resp).await?;
+                // `unsupported_capability`: só a retirada do item de `error.param`, uma vez; nunca
+                // o mesmo corpo de novo nem outro relaxamento.
+                if plan && status.as_u16() == 400 && is_unsupported_capability(&text) {
+                    if let Some(param) = unsupported_param(&body, &text).filter(|_| removed.is_none()) {
+                        *removed_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(param.clone());
+                        removed = Some(param);
+                        self.note_resend(&req.model);
+                        continue;
+                    }
+                    return Err(Failed { err: self.fail(400, &text).await, retry_after: after });
+                }
+                if self.renew_after_401(status.as_u16(), &text, &mut renewed).await {
+                    continue;
+                }
                 if status.as_u16() == 400 && opts.relax(&text, responses) {
                     self.note_resend(&req.model);
                     continue;
                 }
-                return Err(Failed { err: self.http_error(status.as_u16(), &text), retry_after: after });
+                return Err(Failed { err: self.fail(status.as_u16(), &text).await, retry_after: after });
             }
             let fallback_used = req.effort.is_some() && opts.effort.is_none();
             let web_rejected = responses && req.web_search && !opts.web;
@@ -1164,6 +1330,10 @@ impl LlmClient {
                 .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
             if !is_sse {
                 let text = self.read_capped(&mut resp).await?;
+                // Modo plano: só o evento `response.completed` do stream conta como sucesso.
+                if plan {
+                    return Err(LlmError::Parse(NO_FINAL).into());
+                }
                 return if responses {
                     parse_responses(&text, fallback_used).map(|mut r| {
                         r.web_search_rejected = web_rejected;
@@ -1174,11 +1344,20 @@ impl LlmClient {
                 }
                 .map_err(Failed::from);
             }
-            return self
-                .read_sse(resp, responses, fallback_used, on_delta)
-                .await
+            let out = self.read_sse(resp, responses, fallback_used, on_delta, &mut diag).await;
+            // Spec 114 T05: resposta cortada (tamanho, tempo, transmissão ou formato) vira um
+            // diagnóstico com o custo, entregue antes do erro subir. Nunca a resposta inteira.
+            if let Err(e) = &out {
+                if let Some(mut cut) = diag.finish(e, &self.secret()) {
+                    cut.billing = self.billing();
+                    on_delta(StreamDelta::Cut(Arc::new(cut)));
+                }
+                self.note_plan_error(e).await;
+            }
+            return out
                 .map(|mut r| {
                     r.web_search_rejected = web_rejected;
+                    r.billing = self.billing();
                     r
                 })
                 .map_err(Failed::from);
@@ -1191,8 +1370,10 @@ impl LlmClient {
         responses: bool,
         fallback_used: bool,
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
+        diag: &mut StreamDiag,
     ) -> Result<ChatResponse, LlmError> {
         let mut parser = SseParser::default();
+        let plan = self.plan.is_some();
         let mut acc = if responses {
             SseAcc::Responses(None)
         } else {
@@ -1201,10 +1382,19 @@ impl LlmClient {
         let mut total = 0usize;
         'read: while let Some(chunk) = self.next_chunk(&mut resp).await? {
             total = total.saturating_add(chunk.len());
+            diag.received(total);
             if total > self.max_response_bytes {
                 return Err(LlmError::Parse(TOO_LARGE));
             }
+            // Spec 114 T04: o tamanho da resposta em curso, para a Atividade (quem consome limita o ritmo).
+            on_delta(StreamDelta::Received(u64::try_from(total).unwrap_or(u64::MAX)));
             for (event, data) in parser.feed(&chunk) {
+                diag.observe(&event, &data);
+                if plan {
+                    if let Some(err) = plan::stream_failure(&event, &data) {
+                        return Err(err);
+                    }
+                }
                 if acc.event(&event, &data, fallback_used, on_delta)? {
                     break 'read;
                 }
@@ -1212,6 +1402,12 @@ impl LlmClient {
         }
         if !acc.is_done() {
             if let Some((event, data)) = parser.finish() {
+                diag.observe(&event, &data);
+                if plan {
+                    if let Some(err) = plan::stream_failure(&event, &data) {
+                        return Err(err);
+                    }
+                }
                 acc.event(&event, &data, fallback_used, on_delta)?;
             }
         }
@@ -1231,10 +1427,21 @@ impl LlmClient {
             .map_err(transport_error)
     }
 
+    /// Erro de uma resposta HTTP de falha. No modo plano (spec 116 T02), os códigos do plano viram
+    /// o erro próprio ([`plan::class_error`]) e um 401 é sempre "precisa entrar de novo".
     fn http_error(&self, status: u16, body: &str) -> LlmError {
+        if self.plan.is_some() {
+            let (code, _) = plan::body_error_parts(body);
+            if let Some(err) = code.as_deref().and_then(|c| plan::class_error(&plan::classify(c)?, c)) {
+                return err;
+            }
+            if status == 401 {
+                return LlmError::Plan(PlanError::NeedsLogin);
+            }
+        }
         LlmError::Http {
             status,
-            body_snippet: snippet(body, &self.api_key),
+            body_snippet: snippet(body, &self.secret()),
             code: None,
         }
     }
@@ -1249,6 +1456,24 @@ fn transport_error(e: reqwest::Error) -> LlmError {
     } else {
         LlmError::Transport(e.to_string())
     }
+}
+
+/// Modo plano: o corpo de erro traz o código `unsupported_capability`.
+fn is_unsupported_capability(error_body: &str) -> bool {
+    let (code, _) = plan::body_error_parts(error_body);
+    code.as_deref().and_then(plan::classify) == Some(plan::PlanClass::Unsupported)
+}
+
+/// Modo plano: `param` de um 400 `unsupported_capability` cuja retirada muda o corpo `body` (o
+/// mesmo corpo não se repete). `None` para outro erro ou item que não está no corpo.
+fn unsupported_param(body: &Value, error_body: &str) -> Option<String> {
+    if !is_unsupported_capability(error_body) {
+        return None;
+    }
+    let (_, param) = plan::body_error_parts(error_body);
+    let param = param?;
+    let mut probe = body.clone();
+    plan::remove_param(&mut probe, &param).then_some(param)
 }
 
 fn build_http(timeout: Duration) -> Result<reqwest::Client, LlmError> {
@@ -1434,6 +1659,7 @@ fn parse_response(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmEr
         web_search_calls: 0,
         citations: Vec::new(),
         web_search_rejected: false,
+        billing: Default::default(),
     })
 }
 
@@ -1721,6 +1947,7 @@ fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmE
         web_search_calls,
         citations,
         web_search_rejected: false,
+        billing: Default::default(),
     })
 }
 
@@ -1732,6 +1959,12 @@ pub enum StreamDelta {
     /// A resposta em curso falhou e será repetida (spec 088): o que veio antes deve ser
     /// descartado. Texto fixo de [`retry_notice`], sem texto remoto.
     Retry(String),
+    /// Bytes recebidos até agora na resposta em curso (spec 114 T04), a cada pedaço do corpo.
+    /// Não é texto: não marca a resposta como entregue e quem exibe limita o ritmo.
+    Received(u64),
+    /// A resposta em curso foi cortada (spec 114 T05): o diagnóstico e o uso conhecido ou estimado,
+    /// para o registro de uso. Não é texto nem marca a resposta como entregue.
+    Cut(Arc<StreamCut>),
 }
 
 /// Aviso de espera de limite (spec 089):
@@ -1771,6 +2004,8 @@ struct StreamOpts {
     effort: Option<Effort>,
     /// Ferramenta `web_search` ainda incluída no pedido.
     web: bool,
+    /// Modo plano ChatGPT (spec 116): `stream` nunca sai do pedido.
+    plan: bool,
 }
 
 impl StreamOpts {
@@ -1802,7 +2037,7 @@ impl StreamOpts {
             self.summary = false;
         } else if !responses && self.usage && body.contains("stream_options") {
             self.usage = false;
-        } else if self.stream && body.contains("stream") {
+        } else if self.stream && !self.plan && body.contains("stream") {
             self.stream = false;
         } else if effort_rejected {
             self.effort = None;
@@ -1887,6 +2122,7 @@ enum SseAcc {
 fn emit(on: &(dyn Fn(StreamDelta) + Send + Sync), delta: StreamDelta) {
     let empty = match &delta {
         StreamDelta::Reasoning(s) | StreamDelta::Text(s) | StreamDelta::Retry(s) => s.is_empty(),
+        StreamDelta::Received(_) | StreamDelta::Cut(_) => false,
     };
     if !empty {
         on(delta);
@@ -2022,20 +2258,30 @@ impl SseAcc {
                     web_search_calls: 0,
                     citations: Vec::new(),
                     web_search_rejected: false,
+                    billing: Default::default(),
                 })
             }
         }
     }
 }
 
+/// Nos testes: só os deltas de conteúdo (sem o tamanho recebido, spec 114 T04).
 #[cfg(test)]
-mod stream_tests;
+fn not_size(d: StreamDelta) -> Option<StreamDelta> {
+    (!matches!(d, StreamDelta::Received(_) | StreamDelta::Cut(_))).then_some(d)
+}
+
+#[cfg(test)]
+pub(crate) mod stream_tests;
 
 #[cfg(test)]
 mod retry_tests;
 
 #[cfg(test)]
 mod pace_client_tests;
+
+#[cfg(test)]
+mod plan_client_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2525,6 +2771,7 @@ pub(crate) mod tests {
             base_url: "http://localhost/v1".into(),
             api_key: format!("env:{var}"),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         };
         let client = LlmClient::from_connection(&conn).expect("client");
         std::env::remove_var(var);
@@ -2542,6 +2789,7 @@ pub(crate) mod tests {
             base_url: "http://localhost/v1".into(),
             api_key: format!("env:{var}"),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         };
         let err = LlmClient::from_connection(&conn).expect_err("deve falhar");
         assert!(matches!(err, LlmError::Config(_)), "{err:?}");
@@ -2970,6 +3218,7 @@ pub(crate) mod tests {
                 base_url: base,
                 api_key: KEY.into(),
                 wire_api: wire,
+                kind: Default::default(),
             };
             let client = LlmClient::from_connection(&conn).expect("client");
             // Chat não entende o corpo Responses, mas o caminho basta para o teste de seleção.

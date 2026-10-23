@@ -203,7 +203,7 @@ async fn stream_503_before_any_delta_is_retried() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let got = client(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("ok");
     assert_eq!(got.message.content, "olá");
@@ -224,7 +224,7 @@ async fn stream_failure_after_delta_is_not_retried() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let err = client(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect_err("erro sobe");
     assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
@@ -243,6 +243,31 @@ async fn stream_transport_failure_before_delta_is_retried() {
     assert_eq!(got.message.content, "olá");
     assert_eq!(*count.lock().expect("lock"), 2);
     assert_eq!(*waits.lock().expect("lock"), secs(&[2]));
+}
+
+/// Spec 114 T04: bytes recebidos sem texto (só `Received`) não impedem a nova tentativa.
+#[tokio::test]
+async fn stream_failure_after_only_received_bytes_is_retried() {
+    let chunk = ": keep-alive\n\n";
+    let broken = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk}\r\n",
+        chunk.len()
+    );
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"olá\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (base, count) = server(vec![broken, http(200, "", "text/event-stream", sse)]).await;
+    let (sleep, _) = recorder();
+    let sizes = Mutex::new(0usize);
+    let got = client(base, sleep)
+        .chat_stream(&req(), &|d| {
+            if matches!(d, StreamDelta::Received(_)) {
+                *sizes.lock().expect("lock") += 1;
+            }
+        })
+        .await
+        .expect("ok");
+    assert_eq!(got.message.content, "olá");
+    assert_eq!(*count.lock().expect("lock"), 2);
+    assert!(*sizes.lock().expect("lock") >= 2);
 }
 
 #[test]
@@ -353,7 +378,7 @@ async fn stream_idle_body_without_delta_times_out_and_is_retried() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let got = short(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("repetido");
     assert_eq!(got.message.content, "olá");
@@ -508,7 +533,7 @@ async fn stream_bad_response_after_delta_is_retried_with_notice() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let got = responses(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("repetido depois do delta");
     assert_eq!(got.message.content, "olá");
@@ -544,7 +569,7 @@ async fn bad_response_never_carries_remote_text() {
     let (sleep, _) = recorder();
     let deltas = Mutex::new(Vec::new());
     let err = responses(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect_err("falha");
     let failure = provider_failure(&err);
@@ -658,7 +683,7 @@ async fn http_429_and_no_capacity_follow_the_throttle_schedule_with_notices() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let got = client(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("sucesso após os limites");
     assert_eq!(got.message.content, "olá");
@@ -687,7 +712,7 @@ async fn long_throttle_waits_renew_the_notice_every_15_seconds() {
     let deltas = Mutex::new(Vec::new());
     client(base, sleep)
         .with_throttle_delays(secs(&[40]))
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("ok");
     assert_eq!(*waits.lock().expect("lock"), secs(&[15, 15, 10]));
@@ -714,7 +739,7 @@ async fn throttle_retry_after_seconds_cap_and_http_date() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     client(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("ok");
     let got = notices(&deltas);
@@ -765,7 +790,7 @@ async fn stream_throttle_after_delta_is_retried_with_notice() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     let got = responses(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("repetido depois do delta");
     assert_eq!(got.message.content, "olá");
@@ -858,7 +883,7 @@ async fn throttle_notices_and_errors_never_carry_remote_text() {
     let deltas = Mutex::new(Vec::new());
     let err = responses(base, sleep)
         .with_throttle_delays(secs(&[5]))
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect_err("esgotado");
     let failure = provider_failure(&err);
@@ -943,7 +968,7 @@ async fn huge_retry_after_headers_fall_back_to_cap_or_schedule() {
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
     client(base, sleep)
-        .chat_stream(&req(), &|d| deltas.lock().expect("lock").push(d))
+        .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
         .expect("ok");
     let got = notices(&deltas);

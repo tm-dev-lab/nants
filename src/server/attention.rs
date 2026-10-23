@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use super::approvals::{PendingView, FINAL_FIX_COMMAND};
+use super::approvals::{PendingView, FINAL_FIX_KIND};
 use super::chat::read_visible_history;
 use super::choices::parse_choices;
 use super::events::{validate_project_id, SecretSet};
@@ -105,8 +105,9 @@ async fn setup_incomplete(state: &AppState) -> bool {
 }
 
 fn permission_item(view: PendingView) -> PermissionItem {
-    // A correção final é um pedido de ambiente com o texto fixo; só o texto não basta.
-    let kind = if view.kind.is_some() && view.command == FINAL_FIX_COMMAND {
+    // A correção final é um pedido de ambiente com o tipo estável `final_fix` (spec 114 T02): o
+    // texto do pedido sai no idioma do projeto e não serve para reconhecê-la.
+    let kind = if view.kind.is_some() && view.change_kind == Some(FINAL_FIX_KIND) {
         "final_fix"
     } else if view.kind.is_some() {
         "environment"

@@ -660,7 +660,7 @@ pub fn recovery_system_for(lang: Lang) -> String {
      que falha e os findings do Revisor.\n\
      \n\
      Regras:\n\
-     - Motivo \"impasse\" (Desenvolvedor não alterou a branch entre reprovações) indica provável \
+     - Motivo \"impasse\" (código `stalled`: o Desenvolvedor não alterou a branch entre reprovações) indica provável \
        escopo ou definição errada da tarefa: considere REVISE_TASK.\n\
      - Se \"diff de código\" (FATOS) cresceu 3× ou mais da tentativa 1 para a última, a estratégia pode \
        estar errada: considere REVISE_TASK (sugestão, não obrigação).\n\

@@ -202,10 +202,9 @@ impl ComposeRunner for RealComposeRunner {
         }
         let mut bytes = out.and_then(|h| h.join().ok()).unwrap_or_default();
         bytes.extend(err.and_then(|h| h.join().ok()).unwrap_or_default());
-        let mut output = String::from_utf8_lossy(&bytes).into_owned();
-        if timed_out {
-            output.push_str(&format!("\n[tempo limite de {}s excedido]\n", call.timeout.as_secs()));
-        }
+        // Saída crua: quem mostra a saída marca o tempo limite pelo `timed_out`, no idioma de quem lê
+        // (o runner, na saída dos testes, spec 115 T04).
+        let output = String::from_utf8_lossy(&bytes).into_owned();
         Ok(ComposeOutput { code, output, timed_out })
     }
 }

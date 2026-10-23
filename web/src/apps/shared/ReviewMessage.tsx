@@ -51,6 +51,11 @@ export function ReviewFindingList({ findings, kind }: { findings: readonly Revie
                   {t("review.unchangedFile")}
                 </span>
               ) : null}
+              {f.lowConfidence === true ? (
+                <span data-testid="review-low-confidence" className="nd-pill nd-pill-sm" data-tone="muted">
+                  {t("review.lowConfidence")}
+                </span>
+              ) : null}
               {f.location !== "" ? <code className="nd-mono nd-muted nd-break">{f.location}</code> : null}
             </div>
             <p className="nd-finding-text">{f.description}</p>

@@ -85,6 +85,25 @@ describe("Execução pausada em en", () => {
     expect(portugueseLeftovers(article)).toEqual([]);
   });
 
+  it("causas fixas do servidor e a contagem no idioma ativo (spec 115 T04)", async () => {
+    const limit =
+      "Análise de recuperação #3 (ESCALATE)\n- Causa raiz: limite de ciclos de recuperação atingido\n- Decisão: escalar ao humano\n- Contexto:\n  - comando: npm test\n  - código: 127\n  - o que foi tentado: 2 de 2 ciclos de recuperação e 0 de 2 rodadas autônomas\n  - por que não resolveu: limite de ciclos de recuperação atingido";
+    await open("en", stateWith(pausedSpec()));
+    applyEvent("agent_message", { agent: "architect", text: limit, task_id: "T01", spec_id: "s1", seq: 1 });
+    await settle();
+    const article = card();
+    expect(within(article).getAllByText("recovery cycle limit reached")).toHaveLength(2);
+    expect(within(article).getByText("2 of 2 recovery cycles and 0 of 2 autonomous rounds")).toBeTruthy();
+    for (const details of article.querySelectorAll("details")) details.open = true;
+    expect(portugueseLeftovers(article)).toEqual([]);
+    cleanup();
+    await open("pt-BR", stateWith(pausedSpec()));
+    applyEvent("agent_message", { agent: "architect", text: limit, task_id: "T01", spec_id: "s1", seq: 1 });
+    await settle();
+    expect(within(card()).getAllByText("limite de ciclos de recuperação atingido")).toHaveLength(2);
+    expect(within(card()).getByText("2 de 2 ciclos de recuperação e 0 de 2 rodadas autônomas")).toBeTruthy();
+  });
+
   it("sem prontidão: o que falta e Configurar em en", async () => {
     await open("en", stateWith(pausedSpec()), notReady());
     const article = card();

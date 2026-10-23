@@ -64,6 +64,7 @@ fn state(root: &Path) -> AppState {
         base_url: "https://api.example.com/v1".into(),
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
+        kind: Default::default(),
     });
     cfg.projects.push(Project {
         id: PROJECT.into(),
@@ -209,7 +210,7 @@ async fn confinement_rejects_dotdot_absolute_and_symlinks() {
     ] {
         let (s, v) = get(&st, &file(&format!("source=base&{q}"))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{q}");
-        assert_eq!(v["error"], MSG_PATH, "{q}");
+        assert_eq!(v["code"], "path_invalid", "{q}");
     }
     for q in ["dir=..", "dir=/etc", "dir=ponte", "dir=src/main.rs"] {
         let (s, _) = get(&st, &files(PROJECT, &format!("source=base&{q}"))).await;
@@ -228,7 +229,7 @@ async fn unknown_project_missing_file_and_bad_source() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, v) = get(&st, &file("source=base&path=src/nada.rs")).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    assert_eq!(v["error"], MSG_NOT_FOUND);
+    assert_eq!(v["code"], "not_found");
     let (s, _) = get(&st, &file("source=outra&path=src/main.rs")).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (s, _) = get(&st, &files(PROJECT, "source=outra")).await;
@@ -516,7 +517,7 @@ async fn task_diff_returns_unified_diff_scrubbed_and_base_is_rejected() {
     assert!(!body.contains(SECRET) && body.contains("const K"), "{body}");
     let (s, v) = get(&st, &file("source=base&path=src/main.rs&diff=1")).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert_eq!(v["error"], MSG_SOURCE);
+    assert_eq!(v["code"], "source_invalid");
     // Sem tarefa ativa, o diff também é 409.
     let (s, _) = get(&state(&repo("t2-diff-none")), &file("source=task&path=a&diff=1")).await;
     assert_eq!(s, StatusCode::CONFLICT);

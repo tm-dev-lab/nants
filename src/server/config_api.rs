@@ -16,6 +16,7 @@ use axum::Json;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use serde_json::{json, Map};
 use super::error::ApiError;
 use super::models_api;
 use super::price_catalog;
@@ -23,7 +24,7 @@ use super::state::AppState;
 use crate::agents::llm_client::{ChatMessage, ChatRequest, LlmClient, Role};
 use crate::agents::LlmError;
 use crate::config::{
-    AgentConfig, Agents, Config, ConfigError, Connection, Effort, Pricing, WireApi, MAX_STEPS_RANGE,
+    AgentConfig, Agents, Config, ConfigError, Connection, ConnectionKind, Effort, Pricing, WireApi, MAX_STEPS_RANGE,
 };
 
 /// Timeout do teste de conexão.
@@ -88,12 +89,19 @@ struct ConnectionView {
     base_url: String,
     api_key_masked: String,
     wire_api: &'static str,
+    /// Como a conexão se autentica (spec 116): `api_key` ou `chatgpt_plan`.
+    kind: &'static str,
+    /// Estado do login da conexão pelo plano ChatGPT (spec 116), sem segredos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatgpt: Option<super::chatgpt::PlanStatus>,
 }
 
 #[derive(Deserialize)]
 struct ConnectionInput {
     id: String,
     name: String,
+    /// Obrigatória na conexão por chave; ignorada na conexão pelo plano ChatGPT (fixa).
+    #[serde(default)]
     base_url: String,
     /// Vazia em atualização mantém a chave já salva.
     #[serde(default)]
@@ -101,6 +109,10 @@ struct ConnectionInput {
     /// Ausente em atualização mantém o valor salvo (`chat` em conexão nova).
     #[serde(default)]
     wire_api: Option<WireApi>,
+    /// Ausente = por chave. A conexão pelo plano ChatGPT só nasce do login (spec 116); por aqui,
+    /// ela só troca de nome.
+    #[serde(default)]
+    kind: Option<ConnectionKind>,
 }
 
 /// Corpo de `POST /api/config/connections/test`: `{id}` testa uma conexão salva;
@@ -164,7 +176,7 @@ const MAX_PATH_BYTES: usize = 4096;
 
 fn validate_path(value: &str) -> Result<(), ApiError> {
     if value.len() > MAX_PATH_BYTES || value.chars().any(char::is_control) {
-        return Err(ApiError::unprocessable("path inválido"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "field_path_invalid", Map::new()));
     }
     Ok(())
 }
@@ -174,8 +186,10 @@ fn connection_view(conn: &Connection) -> ConnectionView {
         id: sanitize_for_view(&conn.id, validate_connection_id),
         name: sanitize_for_view(&conn.name, |v| validate_text_field("name", v)),
         base_url: display_base_url(&conn.base_url),
-        api_key_masked: mask_api_key(&conn.api_key),
+        api_key_masked: if conn.is_chatgpt_plan() { String::new() } else { mask_api_key(&conn.api_key) },
         wire_api: conn.wire_api.as_str(),
+        kind: conn.kind.as_str(),
+        chatgpt: None,
     }
 }
 
@@ -202,13 +216,20 @@ fn agents_view(agents: &Agents) -> AgentsView {
     }
 }
 
-fn config_view(cfg: &Config) -> ConfigView {
+fn config_view(cfg: &Config, data_dir: Option<&Path>, chatgpt: &super::chatgpt::ChatgptAuth) -> ConfigView {
+    let connection_view_with_status = |conn: &Connection| {
+        let mut view = connection_view(conn);
+        if conn.is_chatgpt_plan() {
+            view.chatgpt = Some(chatgpt.status(data_dir, &conn.id));
+        }
+        view
+    };
     ConfigView {
         server: ServerView {
             host: sanitize_for_view(&cfg.server.host, |v| validate_text_field("host", v)),
             port: cfg.server.port,
         },
-        connections: cfg.connections.iter().map(connection_view).collect(),
+        connections: cfg.connections.iter().map(connection_view_with_status).collect(),
         agents: agents_view(&cfg.agents),
         pricing: cfg.pricing.clone(),
         projects_root: cfg.projects_root.as_ref().map(|r| sanitize_for_view(r, validate_path_like)),
@@ -240,9 +261,7 @@ pub fn validate_connection_id(id: &str) -> Result<(), ApiError> {
     if valid {
         Ok(())
     } else {
-        Err(ApiError::unprocessable(
-            "id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres",
-        ))
+        Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "id_invalid", Map::new()))
     }
 }
 
@@ -250,22 +269,18 @@ pub fn validate_connection_id(id: &str) -> Result<(), ApiError> {
 /// normalizada (esquema e host em minúsculas, sem barra final).
 pub fn validate_base_url(raw: &str) -> Result<String, ApiError> {
     let url = reqwest::Url::parse(raw.trim())
-        .map_err(|_| ApiError::unprocessable("base_url inválida"))?;
+        .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_invalid", Map::new()))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(ApiError::unprocessable("base_url deve usar http ou https"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_scheme", Map::new()));
     }
     if url.host_str().is_none() {
-        return Err(ApiError::unprocessable("base_url sem host"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_no_host", Map::new()));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(ApiError::unprocessable(
-            "base_url não pode conter usuário ou senha; use api_key",
-        ));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_credentials", Map::new()));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(ApiError::unprocessable(
-            "base_url não pode conter query ou fragmento; use api_key",
-        ));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_query", Map::new()));
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
@@ -291,9 +306,11 @@ pub const MAX_TEXT_CHARS: usize = 128;
 /// `name` e `model`: até 128 caracteres, sem caracteres de controle.
 pub fn validate_text_field(field: &str, value: &str) -> Result<(), ApiError> {
     if value.chars().count() > MAX_TEXT_CHARS || value.chars().any(char::is_control) {
-        return Err(ApiError::unprocessable(format!(
-            "{field} inválido: máximo de {MAX_TEXT_CHARS} caracteres, sem caracteres de controle"
-        )));
+        return Err(ApiError::coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "text_field_invalid",
+            super::error::params([("field", json!(field)), ("max", json!(MAX_TEXT_CHARS))]),
+        ));
     }
     Ok(())
 }
@@ -309,9 +326,7 @@ pub fn valid_env_name(name: &str) -> bool {
 /// Chave com prefixo `env:` deve referenciar um nome de variável válido.
 fn validate_api_key(key: &str) -> Result<(), ApiError> {
     match key.strip_prefix(ENV_PREFIX) {
-        Some(name) if !valid_env_name(name) => Err(ApiError::unprocessable(
-            "api_key com prefixo env: deve ser um nome de variável de ambiente válido",
-        )),
+        Some(name) if !valid_env_name(name) => Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_env_invalid", Map::new())),
         _ => Ok(()),
     }
 }
@@ -321,9 +336,9 @@ fn validate_api_key(key: &str) -> Result<(), ApiError> {
 pub(super) fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
-            ApiError::unprocessable("corpo JSON com campos inválidos")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
         } else {
-            ApiError::new(StatusCode::BAD_REQUEST, "corpo JSON malformado")
+            ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new())
         }
     })
 }
@@ -362,14 +377,14 @@ pub(super) async fn persist(state: &AppState, cfg: &Config) -> Result<(), ApiErr
     let snapshot = cfg.clone();
     tokio::task::spawn_blocking(move || save_atomic(&path, &snapshot))
         .await
-        .map_err(|_| ApiError::internal("falha ao salvar a configuração"))?
-        .map_err(|_| ApiError::internal("falha ao salvar a configuração"))
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed", Map::new()))?
+        .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed", Map::new()))
 }
 
 /// `GET /api/config`
 pub async fn get_config(State(state): State<AppState>) -> Response {
     let cfg = state.config().read().await;
-    let mut view = serde_json::to_value(config_view(&cfg)).unwrap_or_else(|_| serde_json::json!({}));
+    let mut view = serde_json::to_value(config_view(&cfg, state.data_dir(), state.chatgpt())).unwrap_or_else(|_| serde_json::json!({}));
     // Acesso pela rede (spec 097): porta do Nants, faixa de visualização e WSL.
     // Versão do Nants (spec 103 T03): vem só do `Cargo.toml`, mostrada em Configurações.
     if let Some(obj) = view.as_object_mut() {
@@ -387,12 +402,35 @@ pub async fn put_connection(
     let input: ConnectionInput = parse_body(&body)?;
     validate_connection_id(&input.id)?;
     validate_text_field("name", &input.name)?;
-    let base_url = validate_base_url(&input.base_url)?;
-    let provided_key = input.api_key.trim();
 
     let mut guard = state.config().write().await;
     let mut next = guard.clone();
     let position = next.connections.iter().position(|c| c.id == input.id);
+    let saved_plan = position.and_then(|i| next.connections.get(i)).is_some_and(Connection::is_chatgpt_plan);
+    // Spec 116: a conexão pelo plano ChatGPT nasce do login e, por aqui, só troca de nome; o tipo
+    // de uma conexão salva não muda.
+    match (input.kind, saved_plan) {
+        (Some(ConnectionKind::ChatgptPlan), false) => {
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "chatgpt_plan_needs_login", Map::new()));
+        }
+        (Some(ConnectionKind::ApiKey), true) => {
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_fixed", Map::new()));
+        }
+        (_, true) => {
+            let Some(conn) = position.and_then(|i| next.connections.get_mut(i)) else {
+                return Err(ApiError::coded(StatusCode::NOT_FOUND, "connection_not_found", Map::new()));
+            };
+            conn.name = input.name;
+            conn.normalize();
+            let view = connection_view(conn);
+            persist(&state, &next).await?;
+            *guard = next;
+            return Ok((StatusCode::OK, Json(view)).into_response());
+        }
+        _ => {}
+    }
+    let base_url = validate_base_url(&input.base_url)?;
+    let provided_key = input.api_key.trim();
     let saved_wire_api = position
         .and_then(|i| next.connections.get(i))
         .map(|c| c.wire_api)
@@ -402,14 +440,12 @@ pub async fn put_connection(
     let api_key = if provided_key.is_empty() {
         // Chave salva só é mantida para o mesmo endpoint (mesma normalização do teste de conexão).
         let saved = position.and_then(|i| next.connections.get(i)).ok_or_else(|| {
-            ApiError::unprocessable("api_key é obrigatória para nova conexão")
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_new", Map::new())
         })?;
         let same_endpoint = validate_base_url(&saved.base_url)
             .is_ok_and(|saved_url| saved_url == base_url);
         if !same_endpoint {
-            return Err(ApiError::unprocessable(
-                "api_key é obrigatória quando base_url muda",
-            ));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_base_url", Map::new()));
         }
         saved.api_key.clone()
     } else {
@@ -424,6 +460,7 @@ pub async fn put_connection(
         base_url,
         api_key,
         wire_api,
+        kind: Default::default(),
     };
     let view = connection_view(&connection);
     match position {
@@ -444,12 +481,10 @@ fn validate_agent(
     connections: &[Connection],
 ) -> Result<(), ApiError> {
     if !connections.iter().any(|c| c.id == agent.connection_id) {
-        return Err(ApiError::unprocessable(format!(
-            "{role}: connection_id não existe"
-        )));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_missing", super::error::params([("role", json!(role))])));
     }
     if agent.model.trim().is_empty() {
-        return Err(ApiError::unprocessable(format!("{role}: model é obrigatório")));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "model_required", super::error::params([("role", json!(role))])));
     }
     validate_text_field("model", &agent.model)?;
     validate_max_steps(role, agent.max_steps)
@@ -461,12 +496,14 @@ fn validate_agent(
 /// editada à mão).
 fn validate_max_steps(role: &str, max_steps: Option<u32>) -> Result<(), ApiError> {
     match max_steps {
-        Some(n) if !MAX_STEPS_RANGE.contains(&n) => Err(ApiError::unprocessable(
-            format!(
-                "{role}: limite de passos deve estar entre {} e {}",
-                MAX_STEPS_RANGE.start(),
-                MAX_STEPS_RANGE.end()
-            ),
+        Some(n) if !MAX_STEPS_RANGE.contains(&n) => Err(ApiError::coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "max_steps_range",
+            super::error::params([
+                ("role", json!(role)),
+                ("min", json!(MAX_STEPS_RANGE.start())),
+                ("max", json!(MAX_STEPS_RANGE.end())),
+            ]),
         )),
         _ => Ok(()),
     }
@@ -475,7 +512,7 @@ fn validate_max_steps(role: &str, max_steps: Option<u32>) -> Result<(), ApiError
 /// Texto de caminho seguro para exibição: até 4096 bytes e sem controle.
 fn validate_path_like(raw: &str) -> Result<(), ApiError> {
     if raw.len() > super::projects::MAX_PATH_BYTES || raw.chars().any(char::is_control) {
-        return Err(ApiError::unprocessable("caminho inválido"));
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "path_invalid", Map::new()));
     }
     Ok(())
 }
@@ -610,9 +647,7 @@ pub async fn put_pricing(State(state): State<AppState>, body: Bytes) -> Result<R
     for (model, price) in &pricing {
         validate_text_field("model", model)?;
         if model.trim().is_empty() || !price.is_valid() {
-            return Err(ApiError::unprocessable(
-                "preço inválido: use números finitos maiores ou iguais a zero",
-            ));
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "price_invalid", Map::new()));
         }
     }
     let mut guard = state.config().write().await;
@@ -694,17 +729,21 @@ async fn resolve_test_target(
         .and_then(|id| guard.connections.iter().find(|c| c.id == id));
 
     let conn = match (&input.base_url, saved) {
+        // Plano ChatGPT (spec 116 T02): endereço fixo e sem chave; testa a conexão salva, com o
+        // token do login.
+        (_, Some(saved)) if saved.is_chatgpt_plan() => {
+            let model = input.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+            return Ok((saved.clone(), model));
+        }
         (None, Some(saved)) => {
             // Conexão salva antes da validação atual (ex.: editada à mão): não usar.
             validate_base_url(&saved.base_url).map_err(|_| {
-                ApiError::unprocessable("base_url salva inválida; recrie a conexão")
+                ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_saved_invalid", Map::new())
             })?;
             saved.clone()
         }
         (None, None) => {
-            return Err(ApiError::unprocessable(
-                "informe base_url ou o id de uma conexão salva",
-            ))
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_or_connection", Map::new()))
         }
         (Some(url), _) => {
             let normalized_url = validate_base_url(url)?;
@@ -720,11 +759,9 @@ async fn resolve_test_target(
                 None => match saved {
                     Some(c) if same_endpoint_as_saved => c.api_key.clone(),
                     Some(_) => {
-                        return Err(ApiError::unprocessable(
-                            "api_key é obrigatória quando base_url difere da conexão salva",
-                        ))
+                        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_other_url", Map::new()))
                     }
-                    None => return Err(ApiError::unprocessable("api_key é obrigatória")),
+                    None => return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required", Map::new())),
                 },
             };
             Connection {
@@ -733,6 +770,7 @@ async fn resolve_test_target(
                 base_url: normalized_url,
                 api_key,
                 wire_api: saved.map(|c| c.wire_api).unwrap_or_default(),
+                kind: Default::default(),
             }
         }
     };
@@ -782,6 +820,24 @@ async fn run_handshake(conn: &Connection, model: String) -> TestResult {
     run_handshake_with(conn, model, TEST_TIMEOUT).await
 }
 
+/// Teste da conexão pelo plano ChatGPT (spec 116 T02), com o token do login: com modelo, o mesmo
+/// handshake (em streaming, como toda chamada do plano); sem modelo, a lista de modelos da conta.
+pub async fn run_plan_test(state: &AppState, conn: &Connection, model: Option<String>, timeout: Duration) -> TestResult {
+    let started = Instant::now();
+    let elapsed = || Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    let Some(model) = model else {
+        return match models_api::fetch_plan(state, conn, timeout).await {
+            Ok(list) => TestResult { ok: true, latency_ms: elapsed(), error: None, status: None, models_count: Some(list.models.len()) },
+            Err(failure) => TestResult { ok: false, latency_ms: None, error: Some(failure.code), status: failure.status, models_count: None },
+        };
+    };
+    let client = match super::chatgpt::plan_client::llm_client(state, conn).and_then(|c| c.with_timeout(timeout)) {
+        Ok(client) => client.with_throttle_delays(Vec::new()).without_pacing(),
+        Err(e) => return classify_error(&e),
+    };
+    handshake(&client, model).await
+}
+
 /// Handshake mínimo: uma chat completion com "ping". O resultado usa apenas
 /// códigos fixos; erros de transporte, URL e corpo remoto nunca são devolvidos.
 pub async fn run_handshake_with(conn: &Connection, model: String, timeout: Duration) -> TestResult {
@@ -792,6 +848,11 @@ pub async fn run_handshake_with(conn: &Connection, model: String, timeout: Durat
         Ok(client) => client.with_throttle_delays(Vec::new()).without_pacing(),
         Err(e) => return classify_error(&e),
     };
+    handshake(&client, model).await
+}
+
+/// Uma chamada "ping" pelo cliente pronto; só códigos fixos no resultado.
+async fn handshake(client: &LlmClient, model: String) -> TestResult {
     let req = ChatRequest {
         model,
         messages: vec![ChatMessage::text(Role::User, "ping")],
@@ -821,6 +882,8 @@ fn classify_error(err: &LlmError) -> TestResult {
         LlmError::Transport(_) => ("connect_failed", None),
         LlmError::Http { status, .. } => ("http_error", Some(*status)),
         LlmError::Parse(_) => ("bad_response", None),
+        // Plano ChatGPT (spec 116 T02): `plan_limit`, `plan_not_eligible` ou `plan_needs_login`.
+        LlmError::Plan(plan) => (plan.as_str(), None),
     };
     TestResult {
         ok: false,
@@ -838,6 +901,10 @@ pub async fn test_connection(
 ) -> Result<Response, ApiError> {
     let input: TestInput = parse_body(&body)?;
     let (conn, model) = resolve_test_target(&state, &input).await?;
+    if conn.is_chatgpt_plan() {
+        let result = run_plan_test(&state, &conn, model, TEST_TIMEOUT).await;
+        return Ok((StatusCode::OK, Json(result)).into_response());
+    }
     let result = match model {
         Some(model) => run_handshake(&conn, model).await,
         None => run_models_probe(&conn).await,
@@ -869,6 +936,7 @@ mod tests {
                     base_url: base_url.to_string(),
                     api_key: KEY.to_string(),
                     wire_api: WireApi::default(),
+                    kind: Default::default(),
                 }],
                 ..Config::default()
             };
@@ -894,6 +962,7 @@ mod tests {
                     base_url: "https://api.example.com/v1".to_string(),
                     api_key: KEY.to_string(),
                     wire_api: wire,
+                    kind: Default::default(),
                 }],
                 ..Config::default()
             };
@@ -1272,6 +1341,7 @@ mod pricing_estimate_tests {
             cfg.connections.push(Connection {
                 id: "c".into(), name: "n".into(), base_url: "https://a.example/v1".into(),
                 api_key: "k".into(), wire_api: WireApi::default(),
+                kind: Default::default(),
             });
         }
         let body = r#"{"architect":{"connection_id":"c","model":"gpt-4o","effort":"low"},
@@ -1307,6 +1377,7 @@ mod pricing_estimate_tests {
             cfg.connections.push(Connection {
                 id: "c".into(), name: "n".into(), base_url: "https://a.example/v1".into(),
                 api_key: "k".into(), wire_api: WireApi::default(),
+                kind: Default::default(),
             });
         }
         let body = |dev: &str| format!(

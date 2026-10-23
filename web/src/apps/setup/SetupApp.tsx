@@ -2,7 +2,7 @@
  * Janela "Primeiros passos" (spec 093, decisão 15): setup guiado pelo `/api/readiness`.
  * 1. Sua máquina: o que falta, os comandos para copiar (o Nants nunca executa), "Verificar de novo"
  *    e o diagnóstico completo, o mesmo do `nants doctor` (spec 103 T02, `GET /api/system/prereqs`);
- * 2. Conexão: adicionar e testar;
+ * 2. Conexão: como conectar (chave de API ou plano ChatGPT, spec 116), adicionar e testar;
  * 3. Agentes: com "Usar o mesmo modelo para todos";
  * 4. Primeiro projeto: abre o diálogo Novo projeto.
  * Os formulários são os de `apps/settings/` (reutilizados pela janela Configurações).
@@ -16,7 +16,7 @@ import { useAppStore } from "../../store";
 import { prereqDetail, prereqFix, prereqLabel, readinessItemFix, readinessItemLabel } from "../shared/readiness";
 import { AgentsForm } from "../settings/AgentsForm";
 import { ConnectionRow } from "../settings/ConnectionRow";
-import { ConnectionForm } from "../settings/ConnectionForm";
+import { NewConnection } from "../settings/NewConnection";
 import {
   DIAGNOSIS_STATUS_LABELS,
   diagnosisStatus,
@@ -212,7 +212,7 @@ function ConnectionStep() {
         </ul>
       ) : null}
       {showForm ? (
-        <ConnectionForm
+        <NewConnection
           existingIds={connections.map((c) => c.id)}
           onSaved={() => {
             setAdding(false);

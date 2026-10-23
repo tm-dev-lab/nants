@@ -38,6 +38,26 @@ describe("reidratação de atividade", () => {
     expect(mergeServerActivities([], [snap({ age_ms: 130_000 })], 1_000_000)).toHaveLength(0);
   });
 
+  it("a chamada ao modelo em curso volta pela reidratação, com o início e os bytes (spec 114 T04)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ activities: [{ ...snap({ reasoning: "", tool: "", activity_id: "m1" }), model_started_at: 490_000, received_bytes: 1_258_291 }, { ...snap({ agent: "reviewer", activity_id: "r1" }), model_started_at: "x", received_bytes: -1 }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    await refreshActivities("pm");
+    const list = appStore.getState().activities["pm"] ?? [];
+    expect(list.find((a) => a.agent === "developer")).toMatchObject({ modelStartedAt: 490_000, modelBytes: 1_258_291 });
+    const reviewer = list.find((a) => a.agent === "reviewer");
+    expect(reviewer?.modelStartedAt).toBeUndefined();
+    expect(reviewer?.modelBytes).toBeUndefined();
+  });
+
   it("resposta atrasada (mais antiga) é ignorada; falha de rede não quebra", async () => {
     const resolvers: Array<(r: Response) => void> = [];
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((res) => resolvers.push(res))));

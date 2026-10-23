@@ -42,13 +42,11 @@ pub enum SafeFsError {
 
 impl SafeFsError {
     /// Mensagem estática para respostas HTTP.
-    pub fn static_message(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
-            Self::Unsafe => "diretório do projeto inseguro (symlink)",
-            Self::NotRegular | Self::TooLarge | Self::Invalid => {
-                "diretório do projeto inseguro (arquivo especial ou grande demais)"
-            }
-            Self::Missing | Self::Io => "falha de I/O no diretório do projeto",
+            Self::Unsafe => "project_dir_symlink",
+            Self::NotRegular | Self::TooLarge | Self::Invalid => "project_dir_special",
+            Self::Missing | Self::Io => "project_dir_io",
         }
     }
 }

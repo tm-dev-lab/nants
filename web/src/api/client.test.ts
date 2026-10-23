@@ -35,26 +35,21 @@ afterEach(() => {
 });
 
 describe("cliente de API: erros mapeados", () => {
-  it("usa a mensagem fixa conhecida do servidor", async () => {
-    stubFetch(async () => jsonResponse(404, { error: "projeto não encontrado" }));
+  it("guarda o código do servidor e a reserva do status; o texto do servidor não é repassado (spec 115 T02)", async () => {
+    stubFetch(async () => jsonResponse(404, { error: "projeto não encontrado", code: "project_not_found" }));
     const result = await getConfig();
     expect(result).toEqual({
       ok: false,
-      error: { kind: "http", status: 404, message: "projeto não encontrado", messageKey: "serverMessage.projectNotFound" },
+      error: { kind: "http", status: 404, message: "recurso não encontrado", messageKey: "api.status.404", code: "project_not_found" },
     });
   });
 
-  it("usa a mensagem fixa de decisão inválida do servidor (permissões)", async () => {
-    stubFetch(async () => jsonResponse(422, { error: 'decision deve ser "once", "run", "always" ou "deny"' }));
+  it("decisão inválida das permissões vem pelo código", async () => {
+    stubFetch(async () => jsonResponse(422, { error: 'decision deve ser "once", "run", "always" ou "deny"', code: "decision_invalid" }));
     const result = await resolvePermission("p1", "r1", "once");
     expect(result).toEqual({
       ok: false,
-      error: {
-        kind: "http",
-        status: 422,
-        message: 'decision deve ser "once", "run", "always" ou "deny"',
-        messageKey: "serverMessage.decisionInvalidRun",
-      },
+      error: { kind: "http", status: 422, message: "dados inválidos", messageKey: "api.status.422", code: "decision_invalid" },
     });
   });
 
@@ -193,12 +188,13 @@ describe("cliente de API: requisições", () => {
   });
 
   it("resumeSpec devolve o motivo fixo de 409 e nunca o corpo cru", async () => {
-    stubFetch(async () => jsonResponse(409, { error: "não há tarefa bloqueada para retomar" }));
+    stubFetch(async () => jsonResponse(409, { error: "não há tarefa bloqueada para retomar", code: "no_blocked_task" }));
     const result = await resumeSpec("p1", "001");
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.status).toBe(409);
-    expect(result.error.message).toBe("não há tarefa bloqueada para retomar");
+    expect(result.error.code).toBe("no_blocked_task");
+    expect(result.error.message).toBe("operação não permitida no estado atual");
   });
 
   it("resumeSpec mapeia base_dirty e 422 de agente com o mesmo vocabulário do approve", async () => {
@@ -207,10 +203,10 @@ describe("cliente de API: requisições", () => {
     expect(dirty.ok).toBe(false);
     if (!dirty.ok) expect(dirty.error.reason).toBe("base_dirty");
 
-    stubFetch(async () => jsonResponse(422, { error: "agente developer não configurado" }));
+    stubFetch(async () => jsonResponse(422, { error: "agente developer não configurado", code: "developer_not_configured" }));
     const agent = await resumeSpec("p1", "001");
     expect(agent.ok).toBe(false);
-    if (!agent.ok) expect(agent.error.message).toBe("agente developer não configurado");
+    if (!agent.ok) expect(agent.error.code).toBe("developer_not_configured");
   });
 
   it("resumeSpec: texto desconhecido de 409 vira mensagem do status, e falha de rede é estática", async () => {
@@ -278,8 +274,8 @@ describe("cliente de API: requisições", () => {
 });
 
 describe("504 timeout do chat", () => {
-  it("corpo {error: timeout} com 504 vira kind timeout (não erro de servidor)", async () => {
-    stubFetch(async () => jsonResponse(504, { error: "timeout" }));
+  it("504 com code chat_timeout vira kind timeout (não erro de servidor)", async () => {
+    stubFetch(async () => jsonResponse(504, { error: "o turno do Arquiteto excedeu o tempo limite", code: "chat_timeout" }));
     const result = await postChat("p1", "oi");
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -298,7 +294,7 @@ describe("502 do chat: causa fixa do provedor", () => {
     ["provider_bad_response", "O provedor devolveu uma resposta inesperada."],
     ["provider_invalid_config", "A conexão está mal configurada (chave ou URL inválida)."],
   ])("%s vira mensagem fixa e guarda o código", async (code, text) => {
-    stubFetch(async () => jsonResponse(502, { error: code }));
+    stubFetch(async () => jsonResponse(502, { error: "o provedor do modelo falhou", code: "provider_failed", params: { provider: code } }));
     const result = await postChat("p1", "oi");
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -308,7 +304,7 @@ describe("502 do chat: causa fixa do provedor", () => {
   });
 
   it("código de provedor fora do vocabulário é 'falha interna' e nunca aparece cru", async () => {
-    stubFetch(async () => jsonResponse(502, { error: `provider_http_600 ${SECRET}` }));
+    stubFetch(async () => jsonResponse(502, { error: `provider_http_600 ${SECRET}`, code: "provider_failed", params: { provider: "provider_http_600" } }));
     const result = await postChat("p1", "oi");
     if (result.ok) throw new Error("esperado erro");
     expect(result.error.message).toBe("O provedor devolveu uma resposta inesperada.");
@@ -340,7 +336,9 @@ describe("502 do chat: causa fixa do provedor", () => {
   });
 
   it("detail do 502 entra entre parênteses e fica guardado (spec 088)", async () => {
-    stubFetch(async () => jsonResponse(502, { error: "provider_bad_response", detail: "sem texto nem ação" }));
+    stubFetch(async () =>
+      jsonResponse(502, { error: "x", detail: "sem texto nem ação", code: "provider_failed", params: { provider: "provider_bad_response" } }),
+    );
     const result = await postChat("p1", "oi");
     if (result.ok) throw new Error("esperado erro");
     expect(result.error.message).toBe("O provedor devolveu uma resposta inesperada (sem texto nem ação).");

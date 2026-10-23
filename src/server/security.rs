@@ -82,30 +82,30 @@ pub fn check_host_and_origin_with(
     port: u16,
     policy: HostPolicy,
 ) -> Result<(), ApiError> {
-    let forbidden = |msg: &str| ApiError::new(StatusCode::FORBIDDEN, msg).with_code(CODE_HOST_FORBIDDEN, Map::new());
-    let bad_origin = |msg: &str| ApiError::new(StatusCode::FORBIDDEN, msg).with_code(CODE_ORIGIN_FORBIDDEN, Map::new());
+    let forbidden = || ApiError::coded(StatusCode::FORBIDDEN, CODE_HOST_FORBIDDEN, Map::new());
+    let bad_origin = || ApiError::coded(StatusCode::FORBIDDEN, CODE_ORIGIN_FORBIDDEN, Map::new());
     // Exige exatamente um Host: valores repetidos podem enganar proxies/validadores.
     let mut hosts = headers.get_all(header::HOST).iter();
     let host = match (hosts.next(), hosts.next()) {
         (Some(v), None) => v
             .to_str()
-            .map_err(|_| forbidden("cabeçalho Host ausente ou inválido"))?,
-        _ => return Err(forbidden("cabeçalho Host ausente ou repetido")),
+            .map_err(|_| forbidden())?,
+        _ => return Err(forbidden()),
     };
     if !host_allowed(host, port, policy) {
-        return Err(forbidden("Host não permitido"));
+        return Err(forbidden());
     }
     // Origin é opcional, mas no máximo um valor, idêntico ao Host.
     let mut origins = headers.get_all(header::ORIGIN).iter();
     if let Some(origin) = origins.next() {
         if origins.next().is_some() {
-            return Err(bad_origin("Origin repetido"));
+            return Err(bad_origin());
         }
         let origin = origin
             .to_str()
-            .map_err(|_| bad_origin("Origin inválida"))?;
+            .map_err(|_| bad_origin())?;
         if !origin.eq_ignore_ascii_case(&format!("http://{host}")) {
-            return Err(bad_origin("Origin não permitida"));
+            return Err(bad_origin());
         }
     }
     Ok(())
@@ -120,11 +120,7 @@ pub fn check_content_type(method: &Method, headers: &HeaderMap) -> Result<(), Ap
     if !mutating || is_json(headers) {
         return Ok(());
     }
-    Err(ApiError::new(
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "Content-Type deve ser application/json",
-    )
-    .with_code(CODE_CONTENT_TYPE, Map::new()))
+    Err(ApiError::coded(StatusCode::UNSUPPORTED_MEDIA_TYPE, CODE_CONTENT_TYPE, Map::new()))
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -159,12 +155,10 @@ pub async fn finalize(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let status = resp.status();
     if (status.is_client_error() || status.is_server_error()) && !is_json_response(&resp) {
-        let reason = status.canonical_reason().unwrap_or("erro HTTP");
-        let err = ApiError::new(status, reason);
         resp = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            err.with_code(CODE_TOO_LARGE, Map::new())
+            ApiError::coded(status, CODE_TOO_LARGE, Map::new())
         } else {
-            err.with_code(CODE_HTTP, params([("status", json!(status.as_u16()))]))
+            ApiError::coded(status, CODE_HTTP, params([("status", json!(status.as_u16()))]))
         }
         .into_response();
     }
@@ -278,11 +272,11 @@ mod tests {
     async fn finalize_turns_bare_errors_into_json_with_code() {
         assert_eq!(
             finalized(StatusCode::PAYLOAD_TOO_LARGE).await,
-            json!({"error": "Payload Too Large", "code": CODE_TOO_LARGE})
+            json!({"error": "pedido grande demais", "code": CODE_TOO_LARGE})
         );
         assert_eq!(
             finalized(StatusCode::METHOD_NOT_ALLOWED).await,
-            json!({"error": "Method Not Allowed", "code": CODE_HTTP, "params": {"status": 405}})
+            json!({"error": "erro HTTP 405", "code": CODE_HTTP, "params": {"status": 405}})
         );
     }
 

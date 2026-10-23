@@ -976,13 +976,14 @@ async fn complete_with_images(
     req: ChatRequest,
 ) -> Result<ChatResponse, LlmError> {
     let on_delta = |d| run.delta(d);
-    match with_cancel_scope(ctx.cancel.clone(), ctx.backend.complete_stream(&req, &on_delta)).await {
+    // Spec 114 T04: a Atividade mostra a chamada em curso (início, tempo e bytes recebidos).
+    match run.track_model(with_cancel_scope(ctx.cancel.clone(), ctx.backend.complete_stream(&req, &on_delta))).await {
         Err(e) if is_client_error(&e) && strip_images(messages) => {
             if ctx.host.refuse_images() {
                 run.tool(IMAGES_REFUSED_NOTE, "{}");
             }
             let req = ChatRequest { messages: messages.to_vec(), ..req };
-            with_cancel_scope(ctx.cancel.clone(), ctx.backend.complete_stream(&req, &on_delta)).await
+            run.track_model(with_cancel_scope(ctx.cancel.clone(), ctx.backend.complete_stream(&req, &on_delta))).await
         }
         other => other,
     }
@@ -2190,6 +2191,7 @@ mod tests {
             web_search_calls: 0,
             citations: Vec::new(),
             web_search_rejected: false,
+            billing: Default::default(),
         })
     }
 
@@ -2217,6 +2219,7 @@ mod tests {
             web_search_calls: 0,
             citations: Vec::new(),
             web_search_rejected: false,
+            billing: Default::default(),
         })
     }
 
@@ -3655,6 +3658,7 @@ mod tests {
             base_url: base,
             api_key: KEY.into(),
             wire_api: WireApi::Responses,
+            kind: Default::default(),
         };
         let client = LlmClient::from_connection(&conn).expect("cliente");
         let dev = LlmDeveloper::new(
@@ -3709,6 +3713,7 @@ mod tests {
             base_url: base,
             api_key: KEY.into(),
             wire_api: WireApi::Responses,
+            kind: Default::default(),
         };
         let dev = LlmDeveloper::new(
             Arc::new(LlmClient::from_connection(&conn).expect("cliente")),
@@ -3863,14 +3868,15 @@ mod tests {
         let kinds: Vec<K> = ev.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
-            vec![K::Start, K::Reasoning, K::Tool, K::End, K::Start, K::Text, K::End]
+            vec![K::Start, K::Model, K::ModelEnd, K::Reasoning, K::Tool, K::End, K::Start, K::Model, K::ModelEnd, K::Text, K::End]
         );
-        assert_eq!(ev[2].text.as_deref(), Some("lendo src/lib.rs"));
+        assert_eq!(ev[4].text.as_deref(), Some("lendo src/lib.rs"));
         assert_eq!(ev[0].agent, "developer");
         assert_eq!(ev[0].task_id.as_deref(), Some("T05"));
         assert_eq!(ev[0].spec_id.as_deref(), Some("003"));
-        assert_eq!(ev[0].activity_id, ev[3].activity_id);
-        assert_ne!(ev[0].activity_id, ev[4].activity_id);
+        assert_eq!(ev[0].activity_id, ev[5].activity_id);
+        assert_eq!(ev[0].activity_id, ev[1].activity_id);
+        assert_ne!(ev[0].activity_id, ev[6].activity_id);
     }
 
     #[tokio::test]
@@ -3883,7 +3889,7 @@ mod tests {
         let dev = developer(backend).with_activity(rec.clone());
         assert!(dev.implement(&brief(&root)).await.is_err());
         let kinds: Vec<K> = rec.events().iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, vec![K::Start, K::End]);
+        assert_eq!(kinds, vec![K::Start, K::Model, K::ModelEnd, K::End]);
     }
 
     // ---- Revisor ----

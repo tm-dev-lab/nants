@@ -70,7 +70,7 @@ async function openFiles({ taskActive = false, truncated = false, ui, extra = {}
     const path = params.get("path");
     if (path === "README.md") return { status: 200, body: { kind: "text", size: 12, content: "# Titulo\n<b>x</b>\n", masked: false } };
     if (path === "src/main.rs") return { status: 200, body: { kind: "text", size: 14, content: "fn main() {}\n", masked: false } };
-    return { status: 404, body: { error: "não encontrado" } };
+    return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
   await act(async () => {
     fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Arquivos" }));

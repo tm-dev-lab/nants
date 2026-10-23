@@ -27,7 +27,7 @@ function serve(): void {
   installFetch((_method, url) => {
     if (url === "/api/config") return { body: makeConfig([makeProject("p1", "Loja"), makeProject("p2", "Blog")]) };
     if (url === "/api/attention") return { body: { setup_incomplete: false, projects: [] } };
-    return { status: 404, body: { error: "não encontrado" } };
+    return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
 }
 
@@ -52,7 +52,7 @@ describe("serviços da aba", () => {
     installFetch((_method, url) => (url === "/api/config" ? { status: 500, body: { error: "corpo cru do servidor" } } : { body: {} }));
     renderHook(() => useDesktopRuntime({ attentionIntervalMs: 0 }));
     await waitFor(() => expect(appStore.getState().configError).not.toBeNull());
-    expect(appStore.getState().configError).not.toContain("corpo cru");
+    expect(appStore.getState().configError?.message).not.toContain("corpo cru");
   });
 
   it("a aba oculta ganha a classe que pausa as animações; ao desmontar, a classe sai", async () => {

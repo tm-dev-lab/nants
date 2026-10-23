@@ -725,10 +725,50 @@ pub enum YoloHostVerdict {
     /// Nenhuma exclusão nem dúvida: aprova.
     Auto,
     /// Exclusão de princípio ou caminho que sai da raiz / cai em `.git`/`.sdd`/`.nants`: humano.
+    /// O motivo é nota interna (testes e depuração): o pedido vai à pessoa sem ele, no fluxo normal
+    /// de aprovação, então fica fora do dicionário (spec 115 T04).
     Excluded(String),
     /// Construção que as checagens não decidem (`$(`, crase, `$VAR`, shell, aspas abertas, caminho
     /// em texto citado): vai ao juiz.
-    NeedsJudge(String),
+    NeedsJudge(JudgeDoubt),
+}
+
+/// Dúvida que leva um comando ao juiz (spec 115 T03). O texto sai pelo dicionário, no idioma de
+/// quem lê: o juiz recebe em pt-BR (o prompt dele é em português) e, sem juiz, a pessoa recebe no
+/// idioma do projeto, no aviso de que o pedido foi para ela.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JudgeDoubt {
+    /// Aspas não fechadas: o comando não se divide em palavras.
+    UnclosedQuotes,
+    /// Executa um shell (a palavra do programa).
+    Shell(String),
+    /// Expansão dinâmica (`$`, crase) na palavra.
+    Dynamic(String),
+    /// Caminho fora da raiz do projeto.
+    OutsideRoot(String),
+    /// Caminho dentro de `.git`, `.sdd` ou `.nants`.
+    Protected(String),
+    /// A raiz do projeto não pôde ser resolvida no disco.
+    RootUnresolvable,
+    /// O argumento abrange a raiz ou uma pasta que contém `.git`, `.sdd` ou `.nants`.
+    CoversRoot(String),
+}
+
+impl JudgeDoubt {
+    /// Texto da dúvida em `lang`.
+    pub fn text(&self, lang: crate::i18n::Lang) -> String {
+        let (key, param) = match self {
+            Self::UnclosedQuotes => ("allowlist.doubt.unclosed_quotes", None),
+            Self::Shell(word) => ("allowlist.doubt.shell", Some(("word", word))),
+            Self::Dynamic(word) => ("allowlist.doubt.dynamic", Some(("word", word))),
+            Self::OutsideRoot(path) => ("allowlist.doubt.outside_root", Some(("path", path))),
+            Self::Protected(path) => ("allowlist.doubt.protected", Some(("path", path))),
+            Self::RootUnresolvable => ("allowlist.doubt.root_unresolvable", None),
+            Self::CoversRoot(path) => ("allowlist.doubt.covers_root", Some(("path", path))),
+        };
+        let params: Vec<(&str, &str)> = param.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        crate::i18n::tr(lang, key, &params)
+    }
 }
 
 /// Resolve `raw` no disco relativo à raiz: cada componente existente é canonicalizado (symlinks e
@@ -737,15 +777,15 @@ pub enum YoloHostVerdict {
 ///
 /// `Ok(Some(motivo))`: o argumento resolve para a raiz ou para um ancestral de pasta protegida
 /// existente (`.`, `./`, `src/..`): um comando destrutivo atingiria `.git`/`.sdd`/`.nants`; o juiz decide.
-fn yolo_resolve(root: &std::path::Path, raw: &str) -> Result<Option<String>, String> {
+fn yolo_resolve(root: &std::path::Path, raw: &str) -> Result<Option<JudgeDoubt>, JudgeDoubt> {
     use std::path::{Component, Path, PathBuf};
     if raw.is_empty() || raw == "/dev/null" {
         return Ok(None);
     }
     if raw.starts_with('~') {
-        return Err(format!("caminho fora da raiz: {raw}"));
+        return Err(JudgeDoubt::OutsideRoot(raw.to_string()));
     }
-    let canon_root = root.canonicalize().map_err(|_| "raiz do projeto não resolvível".to_string())?;
+    let canon_root = root.canonicalize().map_err(|_| JudgeDoubt::RootUnresolvable)?;
     let path = if Path::new(raw).is_absolute() { PathBuf::from(raw) } else { canon_root.join(raw) };
     let mut cur = PathBuf::new();
     for comp in path.components() {
@@ -764,17 +804,17 @@ fn yolo_resolve(root: &std::path::Path, raw: &str) -> Result<Option<String>, Str
         }
     }
     let Ok(rel) = cur.strip_prefix(&canon_root) else {
-        return Err(format!("caminho fora da raiz: {raw}"));
+        return Err(JudgeDoubt::OutsideRoot(raw.to_string()));
     };
     let protected = rel.components().any(|c| match c {
         Component::Normal(n) => YOLO_PROTECTED_DIRS.iter().any(|p| n == std::ffi::OsStr::new(p)),
         _ => false,
     });
     if protected {
-        return Err(format!("caminho protegido (.git/.sdd/.nants): {raw}"));
+        return Err(JudgeDoubt::Protected(raw.to_string()));
     }
     if rel.as_os_str().is_empty() || YOLO_PROTECTED_DIRS.iter().any(|p| cur.join(p).exists()) {
-        return Ok(Some(format!("o argumento {raw} abrange a raiz ou um diretório que contém .git/.sdd/.nants")));
+        return Ok(Some(JudgeDoubt::CoversRoot(raw.to_string())));
     }
     Ok(None)
 }
@@ -790,16 +830,16 @@ pub fn yolo_host_verdict(command: &str, root: &std::path::Path) -> YoloHostVerdi
         return YoloHostVerdict::Excluded(reason.to_string());
     }
     let Some(words) = yolo_words(command) else {
-        return YoloHostVerdict::NeedsJudge("aspas não fechadas".to_string());
+        return YoloHostVerdict::NeedsJudge(JudgeDoubt::UnclosedQuotes);
     };
-    let mut judge: Option<String> = None;
+    let mut judge: Option<JudgeDoubt> = None;
     for word in &words {
         let w = word.text.as_str();
         if word.head && YOLO_SHELLS.contains(&base_name(w)) {
-            judge.get_or_insert(format!("executa um shell ({w})"));
+            judge.get_or_insert(JudgeDoubt::Shell(w.to_string()));
         }
         if w.contains('$') || w.contains('`') {
-            judge.get_or_insert(format!("expansão dinâmica em: {w}"));
+            judge.get_or_insert(JudgeDoubt::Dynamic(w.to_string()));
             continue;
         }
         // Candidatos a caminho: o valor de `--opt=valor`/`VAR=valor`, o argumento inteiro e, para
@@ -830,7 +870,8 @@ pub fn yolo_host_verdict(command: &str, root: &std::path::Path) -> YoloHostVerdi
                 Err(why) if multiword => {
                     judge.get_or_insert(why);
                 }
-                Err(why) => return YoloHostVerdict::Excluded(why),
+                // O motivo da exclusão é interno (o pedido vai à pessoa sem ele).
+                Err(why) => return YoloHostVerdict::Excluded(why.text(crate::i18n::Lang::PtBr)),
                 Ok(Some(why)) => {
                     judge.get_or_insert(why);
                 }
@@ -1009,6 +1050,37 @@ mod tests {
         // Exclusão de princípio vence a dúvida; caminho fora da raiz vence também.
         assert!(matches!(yolo_host_verdict("sudo echo $(id)", &root), YoloHostVerdict::Excluded(_)));
         assert!(matches!(yolo_host_verdict("cat ../x $(id)", &root), YoloHostVerdict::Excluded(_)));
+    }
+
+    /// Spec 115 T03: a dúvida que vai ao juiz é um tipo, com o texto no idioma de quem lê.
+    #[test]
+    fn judge_doubt_names_the_construct_in_each_language() {
+        use crate::i18n::Lang;
+        let root = yolo_root("doubt");
+        let doubt = |cmd: &str| match yolo_host_verdict(cmd, &root) {
+            YoloHostVerdict::NeedsJudge(d) => d,
+            other => panic!("{cmd}: {other:?}"),
+        };
+        assert_eq!(doubt("echo 'unclosed"), JudgeDoubt::UnclosedQuotes);
+        assert_eq!(doubt("bash x.sh"), JudgeDoubt::Shell("bash".into()));
+        assert_eq!(doubt("echo $HOME"), JudgeDoubt::Dynamic("$HOME".into()));
+        assert_eq!(doubt("git commit -m \"ver ../fora agora\""), JudgeDoubt::OutsideRoot("../fora".into()));
+        for (d, pt, en) in [
+            (JudgeDoubt::UnclosedQuotes, "aspas não fechadas", "unclosed quotes"),
+            (JudgeDoubt::Shell("bash".into()), "executa um shell (bash)", "runs a shell (bash)"),
+            (JudgeDoubt::Dynamic("$HOME".into()), "expansão dinâmica em: $HOME", "dynamic expansion in: $HOME"),
+            (JudgeDoubt::OutsideRoot("../x".into()), "caminho fora da raiz: ../x", "path outside the project root: ../x"),
+            (JudgeDoubt::Protected(".git/x".into()), "caminho protegido (.git/.sdd/.nants): .git/x", "protected path (.git/.sdd/.nants): .git/x"),
+            (JudgeDoubt::RootUnresolvable, "raiz do projeto não resolvível", "the project root could not be resolved"),
+            (
+                JudgeDoubt::CoversRoot(".".into()),
+                "o argumento . abrange a raiz ou um diretório que contém .git/.sdd/.nants",
+                "the argument . covers the root or a folder that contains .git/.sdd/.nants",
+            ),
+        ] {
+            assert_eq!(d.text(Lang::PtBr), pt);
+            assert_eq!(d.text(Lang::En), en);
+        }
     }
 
     #[test]

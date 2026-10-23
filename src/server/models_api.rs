@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::config_api::{validate_base_url, validate_connection_id, valid_env_name};
 use super::error::ApiError;
@@ -38,10 +38,14 @@ pub const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 /// Número de entradas de lock por chave a partir do qual as ociosas são limpas.
 const GATES_PRUNE_AT: usize = 64;
 
-/// Modelo listado (só o id; o esforço é decidido pela UI).
+/// Modelo listado (o esforço é decidido pela UI).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelInfo {
+    /// O que vai no pedido (no plano ChatGPT, o `slug`).
     pub id: String,
+    /// Nome mostrado (no plano ChatGPT, o `display_name`); ausente nas conexões por chave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Resultado de uma consulta de modelos: ids ordenados, sem duplicatas, até o teto.
@@ -109,6 +113,12 @@ pub(super) fn classify(err: &LlmError) -> Failure {
             status: Some(*status),
         },
         LlmError::Parse(_) => BAD_RESPONSE,
+        // Plano ChatGPT (spec 116 T02): o motivo próprio (`plan_limit`, `plan_not_eligible`,
+        // `plan_needs_login`).
+        LlmError::Plan(plan) => Failure {
+            code: plan.as_str(),
+            status: None,
+        },
     }
 }
 
@@ -205,9 +215,7 @@ impl ModelsCache {
 /// Chave salva com `env:` precisa referenciar um nome de variável válido.
 fn validate_saved_key(key: &str) -> Result<(), ApiError> {
     match key.strip_prefix("env:") {
-        Some(name) if !valid_env_name(name) => Err(ApiError::unprocessable(
-            "api_key com prefixo env: deve ser um nome de variável de ambiente válido",
-        )),
+        Some(name) if !valid_env_name(name) => Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_env_invalid", Map::new())),
         _ => Ok(()),
     }
 }
@@ -259,7 +267,7 @@ pub fn normalize_models(body: &Value, secret: &str) -> Option<ModelList> {
     let models = unique
         .into_iter()
         .take(MODELS_MAX)
-        .map(|id| ModelInfo { id: id.to_string() })
+        .map(|id| ModelInfo { id: id.to_string(), name: None })
         .collect();
     Some(ModelList { models, truncated })
 }
@@ -269,6 +277,16 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Modelos da conexão pelo plano ChatGPT (spec 116 T02): `GET /models` com o token do login, só os
+/// visíveis, na ordem do servidor.
+pub(super) async fn fetch_plan(state: &AppState, conn: &Connection, timeout: Duration) -> Result<ModelList, Failure> {
+    let client = super::chatgpt::plan_client::llm_client(state, conn)
+        .and_then(|c| c.with_timeout(timeout))
+        .map_err(|e| classify(&e))?
+        .without_pacing();
+    super::chatgpt::plan_client::fetch_plan_models(&client).await.map_err(|e| classify(&e))
 }
 
 /// Consulta `{base_url}/models` da conexão salva. A chave só vai ao `base_url` salvo.
@@ -321,10 +339,10 @@ pub async fn list_models(
         let found = guard.connections.iter().find(|c| c.id == id).cloned();
         found
     }
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "conexão não encontrada"))?;
+    .ok_or_else(|| ApiError::coded(StatusCode::NOT_FOUND, "connection_not_found", Map::new()))?;
     // Conexão salva à mão fora do padrão atual: não usar a chave nesse endpoint.
     let base_url = validate_base_url(&saved.base_url)
-        .map_err(|_| ApiError::unprocessable("base_url salva inválida; recrie a conexão"))?;
+        .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_saved_invalid", Map::new()))?;
     validate_saved_key(&saved.api_key)?;
 
     let key = CacheKey::new(&id, &base_url);
@@ -337,7 +355,12 @@ pub async fn list_models(
             return Ok(success_response(&id, &list, fetched_at));
         }
     }
-    match fetch(&saved, &base_url, state.models_timeout()).await {
+    let fetched = if saved.is_chatgpt_plan() {
+        fetch_plan(&state, &saved, state.models_timeout()).await
+    } else {
+        fetch(&saved, &base_url, state.models_timeout()).await
+    };
+    match fetched {
         Ok(list) => {
             let fetched_at = unix_now();
             cache.insert(key, list.clone(), fetched_at, Instant::now());
@@ -377,6 +400,7 @@ mod tests {
             base_url: base_url.into(),
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
+            kind: Default::default(),
         }
     }
 
