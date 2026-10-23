@@ -257,6 +257,40 @@ fn entry_link_is_single_use_and_expires_in_ten_minutes() {
     assert!(store.redeem_entry_link(&t).expect("ok").is_none(), "expirado");
 }
 
+/// Spec 117: só o link de entrada do terminal marca "Este computador"; o código não marca, renomear
+/// não tira a marcação, revogar apaga junto e um registro antigo sem o campo conta como falso
+/// (mesmo com o nome "Este computador").
+#[test]
+fn only_the_entry_link_marks_this_computer() {
+    let dir = TempDir::new("this-computer");
+    let clock = Clock::new();
+    let store = store_in(&dir, &clock);
+    let t = store.issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let (computer, _) = store.redeem_entry_link(&t).expect("grava").expect("válido");
+    let CodeState::Open { code, .. } = store.open_window().expect("abre") else { panic!("aberta") };
+    clock.advance(PAIR_MIN_INTERVAL_MS);
+    let (phone, _) = store.pair(&code, "Este computador".into()).expect("pareia");
+    assert!(!phone.this_computer, "o código nunca marca, nem com o mesmo nome");
+    assert!(store.is_this_computer(&computer.id));
+    assert!(!store.is_this_computer(&phone.id));
+    assert!(!store.is_this_computer("ffffffffffffffff"));
+    store.rename(&computer.id, "Notebook".into()).expect("renomeia");
+    let raw = std::fs::read_to_string(dir.path().join("data").join(DEVICES_FILE)).expect("arquivo");
+    let file: Value = serde_json::from_str(&raw).expect("json");
+    let flags: Vec<_> = file["devices"].as_array().expect("lista").iter().map(|d| d["this_computer"].clone()).collect();
+    assert_eq!(flags, vec![json!(true), json!(false)], "gravado no devices.json");
+    let reopened = store_in(&dir, &clock);
+    assert!(reopened.is_this_computer(&computer.id), "sobrevive ao reinício e à troca de nome");
+    reopened.revoke(&computer.id).expect("revoga");
+    assert!(!reopened.is_this_computer(&computer.id), "revogar apaga a marcação junto");
+    // Registro antigo, sem o campo: conta como falso.
+    let old = json!({"version": 1, "devices": [{"id": "0123456789abcdef", "name": "Este computador", "token_hash": "a".repeat(64), "created_at": 1, "last_seen": 1}]});
+    std::fs::write(dir.path().join("data").join(DEVICES_FILE), old.to_string()).expect("grava");
+    let legacy = store_in(&dir, &clock);
+    assert_eq!(legacy.list().len(), 1);
+    assert!(!legacy.is_this_computer("0123456789abcdef"));
+}
+
 #[test]
 fn code_rotates_every_minute_and_the_window_lasts_ten_minutes() {
     let dir = TempDir::new("code");

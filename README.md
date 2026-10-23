@@ -113,8 +113,10 @@ an API key. This feature is in preview.
 1. In **Settings**, click **New connection** and pick **ChatGPT plan (Plus or Pro)**. The same
    choice is in **Getting started**.
 2. Click **Continue with ChatGPT** and sign in. The sign-in happens in the browser of the computer
-   running Nants, because OpenAI returns to `127.0.0.1`. On a phone or another device, the screen
-   asks you to do this step on that computer.
+   running Nants, because OpenAI returns to `127.0.0.1`. In network mode, that includes the browser
+   of this computer that signed in with the terminal link, even on WSL, where it reaches Nants
+   through the Windows address. On a phone or another device added by code, the screen asks you to
+   do this step on that computer.
 3. Back in Settings, the connection is ready, named after your account e-mail, with the models of
    your account. Pick them under **Agents**.
 

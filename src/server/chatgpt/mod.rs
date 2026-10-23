@@ -6,7 +6,8 @@
 //!   `agent_name_hint=Nants` e o `ext_agent_host_id` da instalação. Na reautorização: o
 //!   `client_id` emitido, `id_token_hint` e `login_hint`. O `redirect_uri` é sempre
 //!   `http://127.0.0.1:<porta do Nants>/auth/callback`. A tentativa vale [`ATTEMPT_TTL_MS`], é de
-//!   uso único e fica ligada ao dispositivo que a iniciou (quando não veio de loopback).
+//!   uso único e fica ligada ao dispositivo que a iniciou (quando não veio de loopback). `local` vale
+//!   para o loopback e para o dispositivo do link de entrada do terminal (spec 117).
 //! - **Retorno** (`GET /auth/callback`): consome o `state`, troca o código (form-urlencoded, sem
 //!   secret, com o `code_verifier`, o mesmo `redirect_uri` e o `resource`), valida o ID token
 //!   ([`jwt`]: RS256 pelo JWKS com cache, `iss`, `aud`, `exp` e `nonce`), confere o escopo
@@ -701,8 +702,9 @@ struct StartInput {
 }
 
 /// `POST /api/connections/chatgpt/start`: devolve `{url, local}`. `local` diz se a chamada veio
-/// deste computador; num aparelho da rede, a interface explica que o login é feito no computador
-/// onde o Nants roda (o retorno é loopback).
+/// deste computador (loopback ou o dispositivo autorizado pelo link do terminal); num aparelho da
+/// rede, a interface explica que o login é feito no computador onde o Nants roda (o retorno é
+/// loopback).
 pub async fn post_start(
     State(state): State<AppState>,
     Extension(access): Extension<Access>,
@@ -741,7 +743,12 @@ pub async fn post_start(
     let url = auth
         .authorize_url(&st, &nonce, &pkce_challenge(&verifier), &redirect_uri, &host_id, reauth.as_ref())
         .ok_or_else(store_error)?;
-    let local = !state.lan_mode() || access.loopback;
+    // Deste computador: loopback ou o dispositivo do link de entrada do terminal (spec 117). No
+    // WSL em NAT, o navegador do Windows chega pelo `portproxy` com o IP do Windows, e o retorno
+    // em 127.0.0.1 funciona nele. Fora do loopback, a tentativa fica ligada ao dispositivo.
+    let this_computer = access.device.as_deref().is_some_and(|id| state.devices().is_this_computer(id));
+    let local = !state.lan_mode() || access.loopback || this_computer;
+    let bound = state.lan_mode() && !access.loopback;
     auth.remember(
         &st,
         Attempt {
@@ -752,7 +759,7 @@ pub async fn post_start(
             connection_id: input.connection_id,
             name,
             saved_client_id: reauth.map(|c| c.client_id),
-            initiator: if local { None } else { access.device.clone() },
+            initiator: if bound { access.device.clone() } else { None },
         },
     );
     Ok(Json(json!({ "url": url, "local": local })).into_response())

@@ -405,6 +405,13 @@ impl DeviceStore {
         Some(id)
     }
 
+    /// O dispositivo existe e foi criado pelo link de entrada do terminal ("Este computador",
+    /// spec 117)? A marcação vem só da origem do registro, nunca do nome (que é editável), e some
+    /// junto com o dispositivo revogado.
+    pub fn is_this_computer(&self, id: &str) -> bool {
+        self.lock().devices.iter().any(|d| d.id == id && d.this_computer)
+    }
+
     /// O dispositivo ainda existe?
     pub fn is_active(&self, id: &str) -> bool {
         self.lock().devices.iter().any(|d| d.id == id)

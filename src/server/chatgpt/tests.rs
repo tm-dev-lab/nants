@@ -716,9 +716,8 @@ async fn network_mode_binds_the_attempt_to_this_computer_or_the_device() {
     e.mock.reply(move |_| (200, reply.clone()));
     let loc = callback(&e, &[("code", "c"), ("state", &q["state"]), ("client_id", &client)]).await;
     assert!(loc.starts_with("/?chatgpt=connected&connection="), "quem iniciou termina: {loc}");
-    // Iniciado por um aparelho autorizado: `local` falso; o retorno vale no loopback.
-    let link = e.state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
-    let (_, cookie) = e.state.devices().redeem_entry_link(&link).expect("troca").expect("dispositivo");
+    // Iniciado por um aparelho adicionado por código: `local` falso; o retorno vale no loopback.
+    let cookie = pair_by_code(&e, "Chrome no iPhone");
     let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&cookie), Some(json!({})))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v: Value = serde_json::from_str(&body_text(resp).await).expect("json");
@@ -729,6 +728,57 @@ async fn network_mode_binds_the_attempt_to_this_computer_or_the_device() {
     e.mock.reply(move |_| (200, reply.clone()));
     let loc = callback(&e, &[("code", "c"), ("state", &q["state"]), ("client_id", &client)]).await;
     assert!(loc.starts_with("/?chatgpt=connected&connection="), "{loc}");
+}
+
+/// Aparelho adicionado pelo código de 6 dígitos (remoto); devolve o token do cookie.
+fn pair_by_code(e: &Env, name: &str) -> String {
+    let devices = e.state.devices();
+    let crate::server::devices::CodeState::Open { code, .. } = devices.open_window().expect("abre") else {
+        panic!("janela aberta");
+    };
+    let (device, cookie) = devices.pair(&code, name.into()).expect("pareia");
+    assert!(!device.this_computer);
+    cookie
+}
+
+/// Spec 117: no WSL em NAT, o navegador do Windows chega pelo `portproxy` com o IP do Windows. O
+/// dispositivo autorizado pelo link do terminal conta como deste computador (`local:true`) e
+/// termina o login vindo do mesmo IP; outro aparelho não usa o `state` dele.
+#[tokio::test]
+async fn this_computer_device_logs_in_through_the_nat_address() {
+    let e = env_with("este-computador", lan).await;
+    let link = e.state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let (computer, cookie) = e.state.devices().redeem_entry_link(&link).expect("troca").expect("dispositivo");
+    assert!(computer.this_computer);
+    let phone = pair_by_code(&e, "Chrome no iPhone");
+    let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&phone), Some(json!({})))).await;
+    let v: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+    assert_eq!(v["local"], json!(false), "aparelho por código continua remoto");
+    let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&cookie), Some(json!({})))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+    assert_eq!(v["local"], json!(true), "este computador pelo IP do NAT");
+    let q = query_of(v["url"].as_str().expect("url"));
+    assert_eq!(q["redirect_uri"], "http://127.0.0.1:3000/auth/callback");
+    let client = issued_client();
+    let uri = callback_uri(&[("code", "c"), ("state", &q["state"]), ("client_id", &client)]);
+    // Outro aparelho, ou ninguém, com o mesmo state: recusado sem consumir.
+    for other in [Some(phone.as_str()), None] {
+        let resp = send(&e.state, req(Method::GET, &uri, NAT_PEER, other, None)).await;
+        assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    }
+    assert_eq!(e.mock.token_hits(), 0);
+    assert!(e.state.chatgpt().callback_pending(&q["state"]), "segue pendente");
+    let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
+    e.mock.reply(move |_| (200, reply.clone()));
+    let resp = send(&e.state, req(Method::GET, &uri, NAT_PEER, Some(&cookie), None)).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = location(&resp);
+    assert!(loc.starts_with("/?chatgpt=connected&connection="), "o mesmo dispositivo termina: {loc}");
+    // Revogado, a marcação vai junto: o cookie deixa de valer.
+    e.state.devices().revoke(&computer.id).expect("revoga");
+    let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&cookie), Some(json!({})))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[test]
