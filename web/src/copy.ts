@@ -9,8 +9,9 @@
  * (outras janelas) e para os testes que conferem o texto pt-BR.
  */
 import type { PermissionDecision, TaskStatus, WireApi } from "./api/types";
-import { formatNumber, localized, t, tp, type MessageKey } from "./i18n";
+import { formatNumber, getLanguage, localized, t, tp, type MessageKey } from "./i18n";
 import { ptBR } from "./i18n/ptBR";
+import { localizeProviderDetailIn } from "./i18n/serverCodes";
 
 /** Mensagem humana para cada `reason` de 409 de `approve` (runs.rs), no idioma ativo. */
 export const APPROVE_REASON_MESSAGES: Readonly<Record<string, string>> = localized({
@@ -184,6 +185,37 @@ export function providerFailureDetail(raw: unknown): string | null {
   return detail;
 }
 
+/** Prefixo das chaves do rótulo do motivo da falha do provedor (`provider.kind.<kind>`). */
+const PROVIDER_KIND_PREFIX = "provider.kind.";
+/** Código saneado do provedor (o mesmo formato do servidor, `ProviderCode`). */
+const PROVIDER_REASON_CODE = /^[a-z0-9_.-]{1,40}$/;
+
+/**
+ * Motivo da falha do provedor no idioma ativo (spec 119), pelos `params` neutros do servidor: o
+ * rótulo do `kind` no dicionário, com `: <provider_code>` quando houver. `null` sem `kind`
+ * conhecido.
+ */
+export function providerReasonText(kind: unknown, providerCode: unknown): string | null {
+  if (typeof kind !== "string" || !Object.hasOwn(ptBR, `${PROVIDER_KIND_PREFIX}${kind}`)) return null;
+  const label = t(`${PROVIDER_KIND_PREFIX}${kind}` as MessageKey);
+  return typeof providerCode === "string" && PROVIDER_REASON_CODE.test(providerCode) ? `${label}: ${providerCode}` : label;
+}
+
+/**
+ * Detalhe já gravado em pt-BR (registros antigos e textos de reserva do servidor, spec 119) no
+ * idioma ativo: o rótulo é lido de volta pelo dicionário pt-BR (`provider.kind.*`). Fora do
+ * vocabulário, como veio.
+ */
+export function localizeProviderDetail(detail: string): string {
+  return localizeProviderDetailIn(detail, getLanguage());
+}
+
+/** Detalhe de limite do provedor (spec 089), no rótulo pt-BR de sempre ou no do idioma ativo. */
+function isThrottleDetail(detail: string | null): boolean {
+  if (detail === null) return false;
+  return detail.startsWith(PROVIDER_THROTTLE_DETAIL_PREFIX) || detail.startsWith(t("provider.kind.throttled"));
+}
+
 /** Põe o detalhe entre parênteses antes do ponto final da frase. */
 function withDetail(text: string, detail: string | null): string {
   if (detail === null) return text;
@@ -227,7 +259,7 @@ export function providerFailureMessage(
     case "provider_bad_response": {
       const base = withDetail(t("providerMsg.badResponse"), detail);
       // Detalhe de limite do provedor (spec 089) ganha a dica de espera.
-      return detail?.startsWith(PROVIDER_THROTTLE_DETAIL_PREFIX) === true ? `${base} ${throttleHint()}` : base;
+      return isThrottleDetail(detail) ? `${base} ${throttleHint()}` : base;
     }
     case "provider_invalid_config":
       return withDetail(t("providerMsg.invalidConfig"), detail);
@@ -255,7 +287,9 @@ export function providerFailureText(text: string, architectWireApi: WireApi | nu
   if (match === null) return providerFailureMessage(text, architectWireApi);
   const code = match[1] ?? "";
   if (!isProviderFailureCode(code)) return null;
-  return providerFailureMessage(code, architectWireApi, providerFailureDetail(match[2]));
+  // Spec 119: o detalhe gravado em pt-BR (texto de reserva antigo) sai no idioma ativo.
+  const detail = providerFailureDetail(match[2]);
+  return providerFailureMessage(code, architectWireApi, detail === null ? null : localizeProviderDetail(detail));
 }
 
 /*

@@ -13,7 +13,7 @@
 import { t } from "../../i18n";
 import { parseReviewMessage } from "../../reviewMessage";
 import { belongsToSpec, type ActivityEntry, type ChatMessage } from "../../store";
-import { isPacing, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
+import { isPacing, RETRY_CODE, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
 import type { InfoKind } from "../attention/attentionModel";
 import { formatBytes } from "../files/filesModel";
 import type { AppSummary, AppSummaryInput } from "../registry";
@@ -79,6 +79,8 @@ export function liveActionOf(activity: LiveSource, now: number = Date.now()): Li
   const call = modelProgress(activity, now);
   const model = call === null ? null : `${call.state} ${call.detail}`;
   if (isPacing(activity)) return { kind: "pacing", state: t("activity.state.pacing"), detail: tailLine(stepText(activity)), stage, model: null };
+  // Spec 119: com `code`, o aviso sai do dicionário com o motivo no idioma ativo.
+  if (activity.textCode?.code === RETRY_CODE) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(stepText(activity)), stage, model: null };
   const retry = [text, tool].find((t) => t.includes(RETRY_MARK));
   if (retry !== undefined) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(retryDetail(retry)), stage, model: null };
   if (activity.toolCode?.code === "tool.generate_image") {

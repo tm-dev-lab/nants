@@ -50,9 +50,9 @@ pub(crate) async fn raw_server(
             cap2.lock()
                 .expect("lock")
                 .push(String::from_utf8_lossy(&buf).to_string());
-            let head = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n"
-            );
+            // Tipo vazio: resposta sem `Content-Type` (spec 119, como a API do plano).
+            let ctype_line = if ctype.is_empty() { String::new() } else { format!("Content-Type: {ctype}\r\n") };
+            let head = format!("HTTP/1.1 {status} X\r\n{ctype_line}Connection: close\r\n\r\n");
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(body.as_bytes()).await;
             let _ = sock.shutdown().await;
@@ -222,6 +222,56 @@ async fn chat_stream_assembles_fragmented_tool_calls_equal_to_non_streaming() {
     let body = body_of(&cap.lock().expect("lock")[0]);
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
+}
+
+/// Spec 119: sem `Content-Type`, um pedido em stream lê o corpo SSE como stream, nos dois
+/// protocolos; um JSON inteiro sem o cabeçalho continua aceito.
+#[tokio::test]
+async fn stream_without_content_type_is_read_as_sse() {
+    let (base, _) = raw_server(vec![(200, "", responses_sse())]).await;
+    let (seen, cb) = collector();
+    let got = client(base, WireApi::Responses).chat_stream(&req(Some(Effort::High)), &cb).await.expect("responses");
+    assert_eq!(got, parse_responses(RESP_TOOL, false).expect("parse"));
+    assert!(seen.lock().expect("lock").contains(&StreamDelta::Text("vou ler".into())));
+
+    // Espaços antes do primeiro evento e o corpo dividido não atrapalham.
+    let (base, _) = raw_server(vec![(200, "", format!("\n\n{}", chat_chunks()))]).await;
+    let got = client(base, WireApi::Chat).chat_stream(&req(None), &cb).await.expect("chat");
+    assert_eq!(got.message.content, "vou ler");
+    assert_eq!(got.message.tool_calls.len(), 2);
+
+    let plain = r#"{"choices":[{"message":{"role":"assistant","content":"olá"},"finish_reason":"stop"}]}"#;
+    let (base, _) = raw_server(vec![(200, "", plain.to_string())]).await;
+    let got = client(base, WireApi::Chat).chat_stream(&req(None), &cb).await.expect("json sem cabeçalho");
+    assert_eq!(got.message.content, "olá");
+}
+
+/// Spec 119, negativo: corpo que não é SSE nem JSON, sem cabeçalho, dá um erro claro (JSON
+/// inválido), sem texto remoto.
+#[tokio::test]
+async fn non_sse_body_without_content_type_is_a_clear_error() {
+    let html = "<html>SEGREDO-REMOTO</html>".to_string();
+    let (base, cap) = raw_server(vec![(200, "", html.clone()), (200, "", html.clone()), (200, "", html)]).await;
+    let (_, cb) = collector();
+    let e = client(base, WireApi::Responses).chat_stream(&req(None), &cb).await.expect_err("erro");
+    assert!(matches!(e, LlmError::Parse(r) if r.kind == BadKind::InvalidJson), "{e:?}");
+    assert!(!format!("{e:?} {e}").contains("SEGREDO"));
+    assert_eq!(cap.lock().expect("lock").len(), 3, "resposta ruim repete como de costume");
+
+    // Corpo vazio sem cabeçalho: também erro, nunca sucesso.
+    let (base, _) = raw_server(vec![(200, "", String::new()); 3]).await;
+    let e = client(base, WireApi::Responses).chat_stream(&req(None), &cb).await.expect_err("vazio");
+    assert!(matches!(e, LlmError::Parse(_)), "{e:?}");
+}
+
+#[test]
+fn sse_is_recognized_by_the_start_of_the_body() {
+    for sse in ["event: x\n", "data: {}\n", ": ping\n", "\r\n  id: 1\n", "retry: 10\n", "\u{feff}data: 1"] {
+        assert!(looks_like_sse(sse.as_bytes()), "{sse:?}");
+    }
+    for other in ["{\"a\":1}", "[1]", "<html>", "", "   ", "dat"] {
+        assert!(!looks_like_sse(other.as_bytes()), "{other:?}");
+    }
 }
 
 #[tokio::test]

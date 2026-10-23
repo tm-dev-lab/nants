@@ -350,6 +350,90 @@ async fn models_list_uses_the_access_token() {
     assert!(head.contains(&format!("bearer {}", token(0))), "{head}");
 }
 
+/// Spec 119: a sequência de eventos medida na API do plano (2026-10-23), para uma resposta só com
+/// texto. A API devolve esse stream **sem `Content-Type`**.
+fn measured_text_sse() -> String {
+    let item = r#"{"type":"message","id":"msg_2","role":"assistant","status":"in_progress","content":[]}"#;
+    let part = r#"{"type":"output_text","text":"","annotations":[]}"#;
+    let mut s = ev("response.created", r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_2","object":"response","status":"in_progress","output":[]}}"#);
+    s += &ev("response.in_progress", r#"{"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_2","object":"response","status":"in_progress","output":[]}}"#);
+    s += &ev("response.output_item.added", &format!(r#"{{"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{item}}}"#));
+    s += &ev("response.content_part.added", &format!(r#"{{"type":"response.content_part.added","sequence_number":3,"output_index":0,"content_index":0,"item_id":"msg_2","part":{part}}}"#));
+    s += &ev("response.output_text.delta", r#"{"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"item_id":"msg_2","delta":"olá"}"#);
+    s += &ev("response.metadata", r#"{"type":"response.metadata","sequence_number":5,"response_id":"resp_2","metadata":{}}"#);
+    s += &ev("response.output_text.done", r#"{"type":"response.output_text.done","sequence_number":6,"output_index":0,"content_index":0,"item_id":"msg_2","logprobs":[],"text":"olá"}"#);
+    s += &ev("response.content_part.done", r#"{"type":"response.content_part.done","sequence_number":7,"output_index":0,"content_index":0,"item_id":"msg_2","part":{"type":"output_text","text":"olá","annotations":[]}}"#);
+    s += &ev("response.output_item.done", r#"{"type":"response.output_item.done","sequence_number":8,"output_index":0,"item":{"type":"message","id":"msg_2","role":"assistant","status":"completed","content":[{"type":"output_text","text":"olá","annotations":[]}]}}"#);
+    s += &ev("response.completed", &format!(r#"{{"type":"response.completed","sequence_number":9,"response":{RESP_TEXT}}}"#));
+    s
+}
+
+/// Spec 119: a mesma forma, com chamada de ferramenta (como as do Arquiteto e do Developer).
+fn measured_tool_sse() -> String {
+    let call = r#"{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}","status":"completed"}"#;
+    let mut s = ev("response.created", r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}"#);
+    s += &ev("response.in_progress", r#"{"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}"#);
+    s += &ev("response.output_item.added", r#"{"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"read_file","arguments":"","status":"in_progress"}}"#);
+    s += &ev("response.function_call_arguments.delta", r#"{"type":"response.function_call_arguments.delta","sequence_number":3,"output_index":0,"item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#);
+    s += &ev("response.metadata", r#"{"type":"response.metadata","sequence_number":4,"response_id":"resp_1","metadata":{}}"#);
+    s += &ev("response.function_call_arguments.done", r#"{"type":"response.function_call_arguments.done","sequence_number":5,"output_index":0,"item_id":"fc_1","arguments":"{\"path\":\"a.txt\"}"}"#);
+    s += &ev("response.output_item.done", &format!(r#"{{"type":"response.output_item.done","sequence_number":6,"output_index":0,"item":{call}}}"#));
+    s += &ev("response.completed", &format!(r#"{{"type":"response.completed","sequence_number":7,"response":{}}}"#, super::tests::RESP_TOOL));
+    s
+}
+
+/// Sem `Content-Type` na resposta (spec 119).
+const NO_CTYPE: &str = "";
+
+#[tokio::test]
+async fn plan_stream_without_content_type_completes() {
+    // Três cópias: sem a correção, cada uma vira `NoFinal` (repetível) e o erro final é esse.
+    let (base, cap) = raw_server(vec![(200, NO_CTYPE, measured_text_sse()); 3]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let deltas = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&deltas);
+    let resp = client
+        .chat_stream(&request(false), &move |d| {
+            if let StreamDelta::Text(t) = d {
+                seen.lock().expect("lock").push(t);
+            }
+        })
+        .await
+        .expect("o stream sem cabeçalho conclui");
+    assert_eq!(requests(&cap).len(), 1, "conclui na primeira resposta");
+    assert_eq!(resp.message.content, "olá");
+    assert_eq!(*deltas.lock().expect("lock"), ["olá"]);
+    assert_eq!(resp.billing, Billing::ChatgptPlan);
+
+    // `chat` (sem consumidor de deltas) também conclui.
+    let (base, _) = raw_server(vec![(200, NO_CTYPE, measured_text_sse())]).await;
+    let resp = plan_client(base, Arc::new(FakeTokens::default())).chat(&request(false)).await.expect("chat");
+    assert_eq!(resp.message.content, "olá");
+}
+
+#[tokio::test]
+async fn plan_stream_without_content_type_completes_with_tools() {
+    let (base, _) = raw_server(vec![(200, NO_CTYPE, measured_tool_sse()); 3]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let resp = client.chat_stream(&request(true), &|_| {}).await.expect("com ferramenta");
+    assert_eq!(resp.message.tool_calls.len(), 1);
+    assert_eq!(resp.message.tool_calls[0].name, "read_file");
+}
+
+#[tokio::test]
+async fn plan_failures_mid_stream_are_recognized_without_content_type() {
+    let mut failed = ev("response.created", r#"{"type":"response.created","response":{"status":"in_progress"}}"#);
+    failed += &ev(
+        "response.failed",
+        r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"subscription_sharing_usage_limit_exceeded","message":"x"}}}"#,
+    );
+    let (base, cap) = raw_server(vec![(200, NO_CTYPE, failed)]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let err = client.chat_stream(&request(false), &|_| {}).await.expect_err("limite no stream");
+    assert!(matches!(err, LlmError::Plan(PlanError::UsageLimit)), "{err:?}");
+    assert_eq!(requests(&cap).len(), 1);
+}
+
 #[test]
 fn plan_connection_needs_the_token_source() {
     let conn = Connection::chatgpt_plan("c-plano", "ChatGPT");

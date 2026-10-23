@@ -39,6 +39,45 @@ function withProviderReason(params: CodeParams, lang: Lang): CodeParams {
   return out;
 }
 
+/** Prefixo das chaves do rótulo do motivo da falha do provedor. */
+const PROVIDER_KIND_PREFIX = "provider.kind.";
+/** Código saneado do provedor (o mesmo formato do servidor, `ProviderCode`). */
+const PROVIDER_REASON_CODE = /^[a-z0-9_.-]{1,40}$/;
+/** Texto de `ProviderFailure::describe`: `<provider>` ou `<provider> (<detalhe>)`. */
+const DESCRIBED = /^(provider_[a-z0-9_]+)(?: \((.*)\))?$/;
+
+/**
+ * Detalhe gravado em pt-BR (`<rótulo>` ou `<rótulo>: <código>`, spec 119) em `lang`: o rótulo é
+ * lido de volta pelo dicionário pt-BR (`provider.kind.*`). Fora do vocabulário, como veio.
+ */
+export function localizeProviderDetailIn(detail: string, lang: Lang): string {
+  const pt = DICTIONARIES["pt-BR"];
+  const cut = detail.lastIndexOf(": ");
+  const candidates: [string, string][] = [[detail, ""]];
+  if (cut > 0) candidates.push([detail.slice(0, cut), detail.slice(cut + 2)]);
+  for (const [label, code] of candidates) {
+    const key = Object.keys(pt).find((k) => k.startsWith(PROVIDER_KIND_PREFIX) && pt[k as MessageKey] === label);
+    if (key === undefined || (code !== "" && !PROVIDER_REASON_CODE.test(code))) continue;
+    const text = DICTIONARIES[lang][key as MessageKey];
+    return code === "" ? text : `${text}: ${code}`;
+  }
+  return detail;
+}
+
+/**
+ * `failure` da falha da imagem gravada antes da spec 119 (`params.reason` com o texto de
+ * `describe`): o detalhe entre parênteses sai em `lang`; fora do vocabulário, como veio.
+ */
+function withLegacyImageFailure(params: CodeParams, lang: Lang): CodeParams {
+  if (Object.hasOwn(params, "failure") || typeof params.reason !== "string") return params;
+  const match = DESCRIBED.exec(params.reason);
+  const provider = match?.[1];
+  const detail = match?.[2];
+  const failure =
+    provider === undefined ? params.reason : detail === undefined ? provider : `${provider} (${localizeProviderDetailIn(detail, lang)})`;
+  return { ...params, failure };
+}
+
 /**
  * `item` do `docker_unavailable` (spec 115 T02): o servidor manda o id do pré-requisito
  * (`docker_cli`, `docker_daemon`...); a tela mostra o nome dele, o mesmo de Primeiros passos
@@ -66,7 +105,12 @@ export function translateCode(prefix: CodePrefix, code: string, params: CodePara
   if (!Object.hasOwn(dict, key)) return null;
   const template = dict[key as MessageKey];
   const base = withProviderReason(params ?? {}, lang);
-  const values = prefix === "serverError" && code === "docker_unavailable" ? withDockerItem(base, lang) : base;
+  const values =
+    prefix === "serverError" && code === "docker_unavailable"
+      ? withDockerItem(base, lang)
+      : prefix === "activity.code" && code === "tool.image_failed"
+        ? withLegacyImageFailure(base, lang)
+        : base;
   for (const match of template.matchAll(PARAM_RE)) {
     const name = match[1] ?? "";
     if (!Object.hasOwn(values, name)) return null;

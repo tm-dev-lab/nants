@@ -376,9 +376,10 @@ mod tests {
     /// dicionário precisa cair numa família, para nenhuma família nova escapar da sentinela.
     #[test]
     fn system_messages_have_no_portuguese_in_english() {
-        const PREFIXES: [&str; 18] = [
+        // A spec 119 acrescenta o motivo da resposta ruim do provedor (`provider.`).
+        const PREFIXES: [&str; 19] = [
             "runner.", "advisor.", "survey.", "report.", "ui.", "approvals.", "runs.", "serverError.", "approval.", "system.", "cli.",
-            "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.",
+            "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.",
         ];
         const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
         const PT_WORDS: [&str; 19] = [

@@ -7,6 +7,10 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::i18n::{self, Lang};
+
+/// Prefixo das chaves do dicionário com o rótulo do motivo (`provider.kind.<kind>`), o mesmo da web.
+pub const LABEL_PREFIX: &str = "provider.kind.";
 /// Tamanho máximo do código do provedor.
 pub const PROVIDER_CODE_MAX: usize = 40;
 /// Prefixos de chave/token conhecidos: código assim é omitido.
@@ -76,21 +80,30 @@ impl BadKind {
         }
     }
 
-    /// Rótulo curto pt-BR.
-    fn label(self) -> &'static str {
-        match self {
-            BadKind::InvalidJson => "JSON inválido",
-            BadKind::ProviderError => "erro do provedor",
-            BadKind::Incomplete => "incompleta",
-            BadKind::UnsupportedStatus => "status não suportado",
-            BadKind::Empty => "sem texto nem ação",
-            BadKind::NoFinal => "transmissão sem evento final",
-            BadKind::TooLarge => "resposta grande demais",
-            BadKind::StepsExhausted => "passos esgotados",
-            BadKind::Throttled => "provedor no limite",
-            BadKind::ImageUnsupported => "geração de imagens indisponível",
-            BadKind::ImageUnreadable => "o provedor não devolveu uma imagem legível (pode ter cobrado)",
-        }
+    /// Todos os tipos, na ordem da declaração.
+    pub const ALL: [BadKind; 11] = [
+        BadKind::InvalidJson,
+        BadKind::ProviderError,
+        BadKind::Incomplete,
+        BadKind::UnsupportedStatus,
+        BadKind::Empty,
+        BadKind::NoFinal,
+        BadKind::TooLarge,
+        BadKind::StepsExhausted,
+        BadKind::Throttled,
+        BadKind::ImageUnsupported,
+        BadKind::ImageUnreadable,
+    ];
+
+    /// Rótulo curto no idioma `lang`, do dicionário (`provider.kind.<kind>`, spec 119).
+    pub fn label(self, lang: Lang) -> String {
+        i18n::text(lang, &format!("{LABEL_PREFIX}{}", self.as_str()))
+    }
+
+    /// Tipo pelo rótulo em qualquer idioma (spec 119): lê de volta o motivo de um texto de reserva
+    /// ou de um aviso já montado, para mandar o código à tela.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| [Lang::PtBr, Lang::En].into_iter().any(|lang| k.label(lang) == label))
     }
 
     /// Só estes motivos aceitam código do provedor.
@@ -208,12 +221,30 @@ impl BadReason {
         Self { kind: BadKind::ProviderError, code }.classified()
     }
 
-    /// Detalhe pt-BR curto, ex.: `incompleta: content_filter`.
-    pub fn detail(&self) -> String {
+    /// Detalhe curto no idioma `lang`, ex.: `incompleta: content_filter` / `incomplete:
+    /// content_filter` (spec 119: o rótulo vem do dicionário).
+    pub fn detail_in(&self, lang: Lang) -> String {
         match &self.code {
-            Some(code) => format!("{}: {}", self.kind.label(), code.as_str()),
-            None => self.kind.label().to_string(),
+            Some(code) => format!("{}: {}", self.kind.label(lang), code.as_str()),
+            None => self.kind.label(lang),
         }
+    }
+
+    /// Detalhe do texto de reserva e do log técnico, em pt-BR (o de sempre, que
+    /// [`Self::parse_detail`] lê de volta). A tela não o mostra: ela monta o motivo pelo `kind` e
+    /// pelo `provider_code`, no idioma dela (spec 102 e 119).
+    pub fn detail(&self) -> String {
+        self.detail_in(Lang::PtBr)
+    }
+
+    /// Lê um detalhe (`<rótulo>` ou `<rótulo>: <código>`, em qualquer idioma) de volta para o
+    /// motivo neutro. Outro texto devolve `None`.
+    pub fn parse_detail(detail: &str) -> Option<Self> {
+        if let Some(kind) = BadKind::from_label(detail) {
+            return Some(Self::new(kind));
+        }
+        let (label, code) = detail.rsplit_once(": ")?;
+        Some(Self { kind: BadKind::from_label(label)?, code: Some(ProviderCode::parse(code)?) })
     }
 
     /// Motivo que vale repetir: lado do provedor, possivelmente passageiro (`throttled` também, mas
@@ -276,6 +307,31 @@ mod tests {
         // Tipos sem código ignoram o código; código inválido é omitido.
         assert_eq!(d(BadKind::Empty, Some("x")), "sem texto nem ação");
         assert_eq!(d(BadKind::Incomplete, Some("motivo com espaço")), "incompleta");
+    }
+
+    /// Spec 119: o rótulo de cada motivo sai do dicionário nos dois idiomas (nunca a própria chave),
+    /// e o detalhe em qualquer idioma é lido de volta para o motivo neutro.
+    #[test]
+    fn labels_come_from_both_dictionaries_and_parse_back() {
+        for kind in BadKind::ALL {
+            let key = format!("{LABEL_PREFIX}{}", kind.as_str());
+            let (pt, en) = (kind.label(Lang::PtBr), kind.label(Lang::En));
+            assert_eq!(i18n::lookup(Lang::PtBr, &key), Some(pt.as_str()), "{key}");
+            assert_eq!(i18n::lookup(Lang::En, &key), Some(en.as_str()), "{key}");
+            assert_ne!(pt, en, "{key}");
+            for lang in [Lang::PtBr, Lang::En] {
+                let plain = BadReason::new(kind);
+                assert_eq!(BadReason::parse_detail(&plain.detail_in(lang)), Some(plain), "{key}");
+            }
+        }
+        let coded = BadReason::with_code(BadKind::Incomplete, Some("content_filter"));
+        assert_eq!(coded.detail_in(Lang::En), "incomplete: content_filter");
+        assert_eq!(BadReason::parse_detail("incomplete: content_filter"), Some(coded));
+        assert_eq!(BadReason::parse_detail(&coded.detail()), Some(coded));
+        assert_eq!(BadReason::new(BadKind::NoFinal).detail_in(Lang::En), "stream without a final event");
+        for other in ["", "texto livre", "incompleta: com espaço", "x: y"] {
+            assert_eq!(BadReason::parse_detail(other), None, "{other}");
+        }
     }
 
     #[test]

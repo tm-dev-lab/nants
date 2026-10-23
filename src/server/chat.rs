@@ -636,16 +636,13 @@ pub(super) async fn architect_client(state: &AppState) -> Result<(String, Effort
     Ok((agent.model, agent.effort, client))
 }
 
-/// Mapeia falhas do Arquiteto para códigos fixos, com o motivo fechado em `detail` quando houver
-/// (spec 088).
+/// Mapeia falhas do Arquiteto para códigos fixos, com o motivo fechado nos `params` neutros
+/// (`kind`, `provider_code`) quando houver (spec 088 e 102). Spec 119: sem o `detail` em pt-BR; a
+/// tela monta o motivo pelo dicionário, no idioma dela.
 fn architect_error(err: ArchitectError) -> ApiError {
     let ArchitectError::Backend(failure) = err;
     let params = super::error::provider_failure_params(&failure);
-    let api = ApiError::coded(StatusCode::BAD_GATEWAY, CODE_PROVIDER_FAILED, params);
-    match failure.detail() {
-        Some(detail) => api.with_detail(detail),
-        None => api,
-    }
+    ApiError::coded(StatusCode::BAD_GATEWAY, CODE_PROVIDER_FAILED, params)
 }
 
 /// Código (spec 102) da falha do provedor no turno do Arquiteto (`params.provider`: a causa fixa,
@@ -1899,7 +1896,8 @@ mod tests {
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["params"]["provider"], "provider_bad_response");
-        assert_eq!(body["detail"], "sem texto nem ação");
+        // Spec 119: nenhum rótulo em pt-BR no corpo; o motivo vai neutro nos `params`.
+        assert!(body.get("detail").is_none(), "{body}");
         // Spec 102: `code` estável e `params` com a causa e o motivo.
         assert_eq!(body["code"], CODE_PROVIDER_FAILED);
         assert_eq!(body["params"], json!({"provider": "provider_bad_response", "kind": "empty"}));
@@ -1952,11 +1950,11 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_GATEWAY, "caso {code}");
             assert_eq!(body["params"]["provider"], code);
             assert!(!body.to_string().contains(SECRET), "caso {code}: {body}");
-            // Só a resposta ruim leva `detail` (código com caractere inválido é omitido).
+            // Spec 119: nenhum caso leva `detail` em pt-BR; a resposta ruim leva o `kind` (o código
+            // com caractere inválido é omitido).
+            assert!(body.get("detail").is_none(), "caso {code}: {body}");
             if code == "provider_bad_response" {
-                assert_eq!(body["detail"], "incompleta", "{body}");
-            } else {
-                assert!(body.get("detail").is_none(), "caso {code}: {body}");
+                assert_eq!(body["params"], json!({"provider": "provider_bad_response", "kind": "incomplete"}), "{body}");
             }
         }
     }

@@ -44,7 +44,7 @@ const ACTIVITY_CODES = [
   "tool.read_file", "tool.list_dir", "tool.search_code", "tool.write_file", "tool.write_sdd_artifacts", "tool.run_command",
   "tool.fetch_url", "tool.package_versions", "tool.web_source", "tool.web_search_unavailable", "tool.view_reference",
   "tool.view_screenshot", "tool.images_refused", "tool.generate_image", "tool.image_failed", "tool.other",
-  "pace.waiting", "pace.throttled", "pace.queued", "plan.checking",
+  "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry",
 ];
 const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed"];
 
@@ -103,9 +103,11 @@ describe("atividade ao vivo em en pelo code", () => {
     // Etapa antiga, sem code.
     expect(stageText({ stage: "Escrevendo relatório final" })).toBe("Escrevendo relatório final");
     expect(stageText({ stage: "final_verification" })).toBe("Final verification in progress");
-    // Nova tentativa: em en só a contagem; em pt-BR, como veio.
+    // Nova tentativa antiga, sem code: em en o motivo lido de volta pelo dicionário (spec 119), ou só
+    // a contagem com motivo fora do vocabulário; em pt-BR, como veio.
     const retry = { text: "resposta do provedor falhou (incompleta: x); repetindo (1/2)" };
-    expect(stepText(retry)).toBe("attempt 1 of 2");
+    expect(stepText(retry)).toBe("the provider response failed (incomplete: x); retrying (1/2)");
+    expect(stepText({ text: "resposta do provedor falhou (outra coisa); repetindo (1/2)" })).toBe("attempt 1 of 2");
     setLanguage("pt-BR", { persist: false, storage: null });
     expect(stepText(retry)).toBe(retry.text);
   });

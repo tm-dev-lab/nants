@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use super::LlmError;
 use crate::config::{Connection, Effort, WireApi};
+use crate::i18n::Lang;
 
 mod bad_reason;
 pub use bad_reason::{BadKind, BadReason, ProviderCode, THROTTLE_CODES};
@@ -310,14 +311,23 @@ impl ProviderFailure {
         }
     }
 
-    /// Detalhe pt-BR curto do motivo: o de `BadResponse` (ex.: `incompleta: content_filter`) ou o
-    /// código saneado de `Http` (ex.: `código: invalid_value`).
-    pub fn detail(&self) -> Option<String> {
+    /// Detalhe curto do motivo no idioma `lang`, pelo dicionário (spec 119): o de `BadResponse`
+    /// (ex.: `incompleta: content_filter`) ou o código saneado de `Http` (ex.: `código:
+    /// invalid_value`).
+    pub fn detail_in(&self, lang: Lang) -> Option<String> {
         match self {
-            ProviderFailure::BadResponse(reason) => Some(reason.detail()),
-            ProviderFailure::Http(_, Some(code)) => Some(format!("código: {}", code.as_str())),
+            ProviderFailure::BadResponse(reason) => Some(reason.detail_in(lang)),
+            ProviderFailure::Http(_, Some(code)) => {
+                Some(format!("{}: {}", crate::i18n::text(lang, &format!("{}http_code", bad_reason::LABEL_PREFIX)), code.as_str()))
+            }
             _ => None,
         }
+    }
+
+    /// Detalhe do texto de reserva e do log técnico, em pt-BR ([`Self::detail_in`]). A tela monta o
+    /// motivo pelos parâmetros neutros ([`Self::reason_kind`]), no idioma dela.
+    pub fn detail(&self) -> Option<String> {
+        self.detail_in(Lang::PtBr)
     }
 
     /// Código fixo seguido do detalhe entre parênteses, quando houver:
@@ -516,7 +526,8 @@ fn ceil_secs(d: Duration) -> u64 {
 /// Rótulo do limite no aviso: o código saneado do provedor ou `HTTP 429`.
 fn throttle_label(err: &LlmError) -> String {
     match err {
-        LlmError::Parse(reason) => reason.code.map_or_else(|| reason.detail(), |c| c.as_str().to_string()),
+        // Sem código, o nome estável do motivo (spec 119: nunca o rótulo em pt-BR).
+        LlmError::Parse(reason) => reason.code.map_or_else(|| reason.kind.as_str().to_string(), |c| c.as_str().to_string()),
         _ => "HTTP 429".to_string(),
     }
 }
@@ -1193,6 +1204,11 @@ impl LlmClient {
 
     /// Lê o corpo restante respeitando `max_response_bytes`.
     async fn read_capped(&self, resp: &mut reqwest::Response) -> Result<String, LlmError> {
+        self.read_capped_from(resp, Vec::new()).await
+    }
+
+    /// Como [`Self::read_capped`], continuando a partir de `buf` (o começo já lido).
+    async fn read_capped_from(&self, resp: &mut reqwest::Response, mut buf: Vec<u8>) -> Result<String, LlmError> {
         let too_large = || LlmError::Parse(TOO_LARGE);
         if resp
             .content_length()
@@ -1200,7 +1216,6 @@ impl LlmClient {
         {
             return Err(too_large());
         }
-        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = self.next_chunk(resp).await? {
             if buf.len().saturating_add(chunk.len()) > self.max_response_bytes {
                 return Err(too_large());
@@ -1323,17 +1338,27 @@ impl LlmClient {
             }
             let fallback_used = req.effort.is_some() && opts.effort.is_none();
             let web_rejected = responses && req.web_search && !opts.web;
-            let is_sse = resp
+            // Spec 119: o stream se reconhece pelo pedido e pelo corpo, não só pelo cabeçalho. A API
+            // do plano devolve o SSE sem `Content-Type`; no plano o pedido é sempre `stream:true`,
+            // então a resposta 200 é sempre lida como stream (só `response.completed` conta como
+            // sucesso). Nos outros modos, sem o cabeçalho e com o pedido em stream, decide o começo
+            // do corpo ([`looks_like_sse`]).
+            let ctype = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+                .map(str::to_ascii_lowercase);
+            let mut first: Vec<u8> = Vec::new();
+            let is_sse = if plan || ctype.as_deref().is_some_and(|v| v.contains("text/event-stream")) {
+                true
+            } else if ctype.is_none() && opts.stream {
+                first = self.read_until_content(&mut resp).await?;
+                looks_like_sse(&first)
+            } else {
+                false
+            };
             if !is_sse {
-                let text = self.read_capped(&mut resp).await?;
-                // Modo plano: só o evento `response.completed` do stream conta como sucesso.
-                if plan {
-                    return Err(LlmError::Parse(NO_FINAL).into());
-                }
+                let text = self.read_capped_from(&mut resp, first).await?;
                 return if responses {
                     parse_responses(&text, fallback_used).map(|mut r| {
                         r.web_search_rejected = web_rejected;
@@ -1344,7 +1369,7 @@ impl LlmClient {
                 }
                 .map_err(Failed::from);
             }
-            let out = self.read_sse(resp, responses, fallback_used, on_delta, &mut diag).await;
+            let out = self.read_sse(resp, first, responses, fallback_used, on_delta, &mut diag).await;
             // Spec 114 T05: resposta cortada (tamanho, tempo, transmissão ou formato) vira um
             // diagnóstico com o custo, entregue antes do erro subir. Nunca a resposta inteira.
             if let Err(e) = &out {
@@ -1364,9 +1389,12 @@ impl LlmClient {
         }
     }
 
+    /// `first`: bytes do começo do corpo já lidos para reconhecer o stream (spec 119), tratados
+    /// como o primeiro pedaço.
     async fn read_sse(
         &self,
         mut resp: reqwest::Response,
+        first: Vec<u8>,
         responses: bool,
         fallback_used: bool,
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
@@ -1380,7 +1408,15 @@ impl LlmClient {
             SseAcc::Chat(ChatAcc::default())
         };
         let mut total = 0usize;
-        'read: while let Some(chunk) = self.next_chunk(&mut resp).await? {
+        let mut pending = (!first.is_empty()).then(|| axum::body::Bytes::from(first));
+        'read: loop {
+            let chunk = match pending.take() {
+                Some(c) => c,
+                None => match self.next_chunk(&mut resp).await? {
+                    Some(c) => c,
+                    None => break,
+                },
+            };
             total = total.saturating_add(chunk.len());
             diag.received(total);
             if total > self.max_response_bytes {
@@ -1412,6 +1448,22 @@ impl LlmClient {
             }
         }
         acc.finish(fallback_used)
+    }
+
+    /// Spec 119: lê o começo do corpo até o primeiro byte que não seja espaço (ou o fim), para
+    /// reconhecer um stream sem `Content-Type`. Respeita o teto de bytes.
+    async fn read_until_content(&self, resp: &mut reqwest::Response) -> Result<Vec<u8>, LlmError> {
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.iter().all(u8::is_ascii_whitespace) {
+            let Some(chunk) = self.next_chunk(resp).await? else {
+                break;
+            };
+            if buf.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err(LlmError::Parse(TOO_LARGE));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     /// Próximo pedaço do corpo, com timeout de ociosidade `self.timeout`: sem bytes nesse
@@ -1456,6 +1508,15 @@ fn transport_error(e: reqwest::Error) -> LlmError {
     } else {
         LlmError::Transport(e.to_string())
     }
+}
+
+/// Spec 119: o começo do corpo é de um stream SSE (`event:`, `data:`, `id:`, `retry:` ou
+/// comentário `:`), descontados os espaços iniciais e um BOM.
+fn looks_like_sse(head: &[u8]) -> bool {
+    let head = head.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(head);
+    let start = head.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(head.len());
+    let head = &head[start..];
+    [b"event:".as_slice(), b"data:", b"id:", b"retry:", b":"].iter().any(|p| head.starts_with(p))
 }
 
 /// Modo plano: o corpo de erro traz o código `unsupported_capability`.
@@ -1988,12 +2049,61 @@ pub fn throttle_notice_parts(text: &str) -> Option<(String, u64, u64, u64)> {
     Some((label.to_string(), secs.parse().ok()?, attempt.parse().ok()?, total.parse().ok()?))
 }
 
+/// Partes de um aviso de [`retry_notice`] (spec 119: a atividade o publica com `code`): o motivo
+/// lido de volta do detalhe, a tentativa e o total. Outro texto, ou detalhe fora do vocabulário,
+/// devolve `None`.
+pub fn retry_notice_parts(text: &str) -> Option<(BadReason, u64, u64)> {
+    let rest = text.strip_prefix(RETRY_NOTICE_HEAD)?;
+    let at = rest.rfind(RETRY_NOTICE_MID)?;
+    let reason = BadReason::parse_detail(&rest[..at])?;
+    let (attempt, total) = rest[at + RETRY_NOTICE_MID.len()..].strip_suffix(')')?.split_once('/')?;
+    Some((reason, attempt.parse().ok()?, total.parse().ok()?))
+}
+
+/// Parâmetros neutros (`provider`, `kind`, `provider_code`) de um texto de
+/// [`ProviderFailure::describe`] já montado (`provider_bad_response (incompleta: x)`,
+/// `provider_http_400 (código: y)`, `provider_timeout`), para a tela montar o motivo no idioma dela
+/// (spec 119). Outro texto devolve `None`.
+pub fn described_params(text: &str) -> Option<serde_json::Map<String, Value>> {
+    let (provider, detail) = match text.split_once(" (") {
+        Some((provider, rest)) => (provider, Some(rest.strip_suffix(')')?)),
+        None => (text, None),
+    };
+    let valid = provider.strip_prefix("provider_").is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    });
+    if !valid {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("provider".into(), Value::from(provider));
+    let Some(detail) = detail else {
+        return Some(out);
+    };
+    let (kind, code) = match BadReason::parse_detail(detail) {
+        Some(reason) => (reason.kind.as_str(), reason.code),
+        None => {
+            let (label, code) = detail.split_once(": ")?;
+            let http = format!("{}http_code", bad_reason::LABEL_PREFIX);
+            let known = [Lang::PtBr, Lang::En].into_iter().any(|lang| crate::i18n::text(lang, &http) == label);
+            ("http_code", Some(ProviderCode::parse(code).filter(|_| known)?))
+        }
+    };
+    out.insert("kind".into(), Value::from(kind));
+    if let Some(code) = code {
+        out.insert("provider_code".into(), Value::from(code.as_str()));
+    }
+    Some(out)
+}
+
+/// Começo e meio do aviso de [`retry_notice`] (marcadores estruturais lidos por
+/// [`retry_notice_parts`]; a tela mostra o aviso pelo `code`).
+const RETRY_NOTICE_HEAD: &str = "resposta do provedor falhou (";
+const RETRY_NOTICE_MID: &str = "); repetindo (";
+
 /// Aviso de nova tentativa: `resposta do provedor falhou (<detalhe>); repetindo (n/2)`.
 pub fn retry_notice(reason: &BadReason, attempt: usize) -> String {
-    format!(
-        "resposta do provedor falhou ({}); repetindo ({attempt}/{BAD_RESPONSE_RETRIES})",
-        reason.detail()
-    )
+    format!("{RETRY_NOTICE_HEAD}{}{RETRY_NOTICE_MID}{attempt}/{BAD_RESPONSE_RETRIES})", reason.detail())
 }
 
 /// Campos opcionais do pedido em streaming; cada um é removido no máximo uma vez.

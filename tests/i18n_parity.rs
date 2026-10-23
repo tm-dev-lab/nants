@@ -363,6 +363,11 @@ const SAME_TEXT_FAMILIES: &[(&str, &str, &str)] = &[
     ("doctor.label.", "prereq.machine.", "nome do item do diagnóstico, o mesmo no nants doctor e na tela de Primeiros passos"),
     ("doctor.fix.", "prereq.fix.", "ação sugerida do item do diagnóstico, a mesma no nants doctor e na tela de Primeiros passos"),
     (
+        "provider.kind.",
+        "provider.kind.",
+        "rótulo do motivo da falha do provedor (spec 119): o servidor o usa no texto de reserva e lê de volta; a tela o monta pelo `kind`",
+    ),
+    (
         "system.",
         "system.",
         "texto de reserva da mensagem do sistema com code (spec 115 T03): o servidor grava o mesmo texto que a web monta pelo código",

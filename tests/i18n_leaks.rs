@@ -60,6 +60,42 @@ enum Kind {
     JsonText,
     NextAction,
     Terminal,
+    /// Spec 119: corpo das funções que montam o motivo de uma falha do provedor.
+    ProviderReason,
+}
+
+/// Spec 119: funções (arquivo, nome) que montam o motivo de uma falha do provedor, o detalhe entre
+/// parênteses que chega à conversa, ao cartão de pausa, ao Quadro e à Atividade. O rótulo sai do
+/// dicionário (`provider.kind.*`); nenhum literal com texto de pessoa no corpo delas.
+const PROVIDER_REASON_FNS: &[(&str, &str)] = &[
+    ("agents/llm_client/bad_reason.rs", "label"),
+    ("agents/llm_client/bad_reason.rs", "detail_in"),
+    ("agents/llm_client/bad_reason.rs", "detail"),
+    ("agents/llm_client/bad_reason.rs", "parse_detail"),
+    ("agents/llm_client.rs", "detail_in"),
+    ("agents/llm_client.rs", "detail"),
+    ("agents/llm_client.rs", "describe"),
+    ("agents/llm_client.rs", "reason_kind"),
+    ("agents/llm_client.rs", "throttle_label"),
+    ("agents/llm_client.rs", "retry_notice"),
+    ("agents/llm_client.rs", "described_params"),
+    ("server/error.rs", "provider_failure_params"),
+    ("server/chat.rs", "architect_error"),
+];
+
+/// Regiões (corpo) das funções de [`PROVIDER_REASON_FNS`] em `file`.
+fn provider_reason_regions(file: &str, toks: &[Token]) -> Vec<(usize, usize, Kind)> {
+    let mut out = Vec::new();
+    for (_, name) in PROVIDER_REASON_FNS.iter().filter(|(f, _)| *f == file) {
+        for i in 0..toks.len() {
+            if !(toks[i].is_ident("fn") && toks.get(i + 1).is_some_and(|t| t.is_ident(name))) {
+                continue;
+            }
+            let Some(open) = toks[i..].iter().position(|t| t.is_punct('{')).map(|p| i + p) else { continue };
+            out.push((open + 1, matching(toks, open), Kind::ProviderReason));
+        }
+    }
+    out
 }
 
 /// Literal de texto de pessoa num caminho de pessoa.
@@ -102,6 +138,12 @@ const fn ex(file: &'static str, kind: Kind, snippet: &'static str, why: &'static
 const EXCEPTIONS: &[Exception] = &[
     ex("agents/architect.rs", Kind::Terminal, "nants: checagem do plano: continuação", LOG),
     ex("agents/llm_client.rs", Kind::Terminal, "nants: falha do provedor: papel={role}", LOG),
+    ex(
+        "agents/llm_client.rs",
+        Kind::ProviderReason,
+        "HTTP 429",
+        "rótulo técnico do status HTTP no aviso de limite, igual em todos os idiomas; a frase em volta vem do dicionário pelo code `pace.throttled` (spec 119)",
+    ),
     ex("agents/llm_client/pace.rs", Kind::Terminal, "nants: ritmo conexão={} modelo={}", LOG),
     ex("agents/runner.rs", Kind::NextAction, "aguardando developer", INTERNAL_NOTE),
     ex("agents/runner.rs", Kind::Say, "Verificação final: {met} de {total}", REVIEW_MARKER),
@@ -316,7 +358,9 @@ fn person_regions(toks: &[Token]) -> Vec<(usize, usize, Kind)> {
 fn scan_file(file: &str, toks: &[Token], consts: &dyn Fn(&str) -> Option<String>) -> Vec<Hit> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for (from, to, kind) in person_regions(toks) {
+    let mut regions = person_regions(toks);
+    regions.extend(provider_reason_regions(file, toks));
+    for (from, to, kind) in regions {
         for (k, line, text) in texts_in(toks, from, to, consts) {
             if is_person_text(&text) && seen.insert(k) {
                 out.push(Hit { file: file.to_string(), line, kind, text });
@@ -423,6 +467,31 @@ mod t { fn g() { let a = ApiError::new(S, "de teste não conta"); } }
             (Kind::ApiError, "corpo malformado"),
         ]
     );
+}
+
+/// Spec 119: a trava do motivo do provedor pega o rótulo fixo no corpo das funções da lista e
+/// deixa passar o código estável.
+#[test]
+fn provider_reason_sweep_catches_fixed_labels() {
+    let source = r#"
+impl BadKind {
+    fn label(self) -> &'static str { match self { BadKind::NoFinal => "transmissão sem evento final", _ => "no_final" } }
+}
+fn other() -> &'static str { "fora da lista não conta aqui" }
+"#;
+    let toks = production_tokens(source);
+    let hits = scan_file("agents/llm_client/bad_reason.rs", &toks, &|_| None);
+    let got: Vec<(Kind, &str)> = hits.iter().map(|h| (h.kind, h.text.as_str())).collect();
+    assert_eq!(got, vec![(Kind::ProviderReason, "transmissão sem evento final")]);
+    // Toda função da lista existe: a trava não fica sem alvo.
+    let sources = production_sources();
+    for (file, name) in PROVIDER_REASON_FNS {
+        let (_, text) = sources.iter().find(|(rel, _)| rel == file).unwrap_or_else(|| panic!("{file} não existe"));
+        let toks = production_tokens(text);
+        assert!(!provider_reason_regions(file, &toks).is_empty(), "{file}: fn {name} não existe");
+        let found = toks.windows(2).any(|w| w[0].is_ident("fn") && w[1].is_ident(name));
+        assert!(found, "{file}: fn {name} não existe");
+    }
 }
 
 #[test]

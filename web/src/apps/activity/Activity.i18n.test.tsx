@@ -160,7 +160,12 @@ describe("Atividade em en", () => {
       textCode: { code: "pace.waiting", params: { seconds: "12" } },
     });
     expect(pacing).toMatchObject({ state: "adjusting the pace", detail: "adjusting the pace to the provider limit: 12 s" });
+    // Spec 119: o motivo antigo em pt-BR é lido de volta pelo dicionário; fora do vocabulário, só a contagem.
     expect(liveActionOf({ ...base, text: "resposta do provedor falhou (incompleta: x); repetindo (1/2)" })).toMatchObject({
+      state: "retrying",
+      detail: "the provider response failed (incomplete: x); retrying (1/2)",
+    });
+    expect(liveActionOf({ ...base, text: "resposta do provedor falhou (outra); repetindo (1/2)" })).toMatchObject({
       state: "retrying",
       detail: "attempt 1 of 2",
     });

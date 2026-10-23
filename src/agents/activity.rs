@@ -497,7 +497,7 @@ fn tool_label_full(name: &str, arguments: &str) -> String {
 
 /// `code` e `params` de um aviso fixo (spec 102): a espera do limitador e do limite do provedor
 /// (089), a espera da geração de imagem e a conferência do plano. Os textos vêm das funções e
-/// constantes que os montam. A nova tentativa (088) segue só com o texto de reserva.
+/// constantes que os montam. A nova tentativa (088) vai com o motivo neutro desde a spec 119.
 pub fn notice_code(notice: &str) -> Option<ActivityCode> {
     use super::llm_client::{pace_notice_secs, throttle_notice_parts};
     if let Some(secs) = pace_notice_secs(notice) {
@@ -506,6 +506,17 @@ pub fn notice_code(notice: &str) -> Option<ActivityCode> {
     if let Some((label, secs, attempt, total)) = throttle_notice_parts(notice) {
         let mut code = ActivityCode::new("pace.throttled", &[("label", label)]);
         for (k, v) in [("seconds", secs), ("attempt", attempt), ("total", total)] {
+            code.params.insert(k.into(), Value::from(v));
+        }
+        return Some(code);
+    }
+    // Spec 119: a nova tentativa vai com o motivo neutro; a tela monta o rótulo no idioma dela.
+    if let Some((reason, attempt, total)) = super::llm_client::retry_notice_parts(notice) {
+        let mut code = ActivityCode::new("provider.retry", &[("kind", reason.kind.as_str().to_string())]);
+        if let Some(provider_code) = reason.code {
+            code.params.insert("provider_code".into(), Value::from(provider_code.as_str()));
+        }
+        for (k, v) in [("attempt", attempt), ("total", total)] {
             code.params.insert(k.into(), Value::from(v));
         }
         return Some(code);
@@ -548,7 +559,12 @@ pub fn tool_code(name: &str, arguments: &str) -> ActivityCode {
         },
         "images_refused" => c("tool.images_refused", &[]),
         "generate_image" => c("tool.generate_image", &[("path", arg("path"))]),
-        "image_failed" => c("tool.image_failed", &[("reason", arg("reason"))]),
+        // Spec 119: o motivo vai neutro (`provider`, `kind`, `provider_code`) e a tela monta o
+        // `failure` no idioma dela; fora do vocabulário, o motivo como veio.
+        "image_failed" => match super::llm_client::described_params(&arg("reason")) {
+            Some(params) => ActivityCode { code: "tool.image_failed".into(), params },
+            None => c("tool.image_failed", &[("failure", arg("reason"))]),
+        },
         other => c("tool.other", &[("name", other.to_string())]),
     }
 }
@@ -767,7 +783,42 @@ mod tests {
         assert_eq!(code_of(5), Some("plan.checking"));
         assert_eq!(code_of(6), Some("pace.throttled"));
         assert_eq!(coded[6].2.get("attempt"), Some(&Value::from(2)));
-        assert_eq!(code_of(7), None, "a nova tentativa segue só com o texto");
+        assert_eq!(code_of(7), None, "motivo fora do vocabulário: só o texto");
+    }
+
+    /// Spec 119: a nova tentativa e a falha da imagem vão com o motivo neutro (`kind`,
+    /// `provider_code`), sem o rótulo em pt-BR nos `params`.
+    #[test]
+    fn retry_and_image_failure_carry_the_neutral_reason() {
+        use crate::agents::llm_client::{retry_notice, BadKind, BadReason};
+        let reason = BadReason::with_code(BadKind::Incomplete, Some("content_filter"));
+        let code = notice_code(&retry_notice(&reason, 1)).expect("código");
+        assert_eq!(code.code, "provider.retry");
+        assert_eq!(code.params.get("kind"), Some(&Value::from("incomplete")));
+        assert_eq!(code.params.get("provider_code"), Some(&Value::from("content_filter")));
+        assert_eq!(code.params.get("attempt"), Some(&Value::from(1)));
+        assert_eq!(code.params.get("total"), Some(&Value::from(2)));
+        let plain = notice_code(&retry_notice(&BadReason::new(BadKind::NoFinal), 2)).expect("código");
+        assert_eq!(plain.params.get("kind"), Some(&Value::from("no_final")));
+        assert!(!plain.params.contains_key("provider_code"));
+
+        let image = tool_code("image_failed", r#"{"reason":"provider_bad_response (transmissão sem evento final)"}"#);
+        assert_eq!(image.code, "tool.image_failed");
+        assert_eq!(image.params.get("provider"), Some(&Value::from("provider_bad_response")));
+        assert_eq!(image.params.get("kind"), Some(&Value::from("no_final")));
+        let http = tool_code("image_failed", r#"{"reason":"provider_http_400 (código: invalid_value)"}"#);
+        assert_eq!(http.params.get("kind"), Some(&Value::from("http_code")));
+        assert_eq!(http.params.get("provider_code"), Some(&Value::from("invalid_value")));
+        let bare = tool_code("image_failed", r#"{"reason":"provider_timeout"}"#);
+        assert_eq!(bare.params.get("provider"), Some(&Value::from("provider_timeout")));
+        assert!(!bare.params.contains_key("kind"));
+        for params in [&code.params, &plain.params, &image.params, &http.params] {
+            let text = Value::Object(params.clone()).to_string();
+            assert!(!text.contains("incompleta") && !text.contains("transmissão") && !text.contains("código"), "{text}");
+        }
+        // Fora do vocabulário: o motivo como veio, em `failure`.
+        let other = tool_code("image_failed", r#"{"reason":"limite de imagens da spec"}"#);
+        assert_eq!(other.params.get("failure"), Some(&Value::from("limite de imagens da spec")));
     }
 
     #[test]

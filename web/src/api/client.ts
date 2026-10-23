@@ -47,7 +47,14 @@ import type {
   TestConnectionInput,
   TestConnectionResult,
 } from "./types";
-import { isProviderFailureCode, prereqMissingMessage, providerFailureDetail, providerFailureMessage } from "../copy";
+import {
+  isProviderFailureCode,
+  localizeProviderDetail,
+  prereqMissingMessage,
+  providerFailureDetail,
+  providerFailureMessage,
+  providerReasonText,
+} from "../copy";
 import { isAttempt, isSafeSeq } from "./events";
 import { parseNetworkView } from "../desktop/network";
 import { isAttachmentName, MAX_CHAT_ATTACHMENTS } from "../chatImages";
@@ -70,6 +77,12 @@ export interface ApiFailure {
   providerCode?: string;
   /** Motivo curto da falha do provedor (`detail` do 502 do chat, spec 088). Só texto validado. */
   providerDetail?: string;
+  /**
+   * Motivo neutro da falha do provedor (spec 119): `params.kind` e `params.provider_code` do 502
+   * do chat. A tela monta o rótulo pelo dicionário, no idioma ativo.
+   */
+  providerKind?: string;
+  providerKindCode?: string;
   /** Detalhe técnico (já redigido pelo servidor) de falhas do app de teste; exibido recolhido. */
   detail?: string;
   /** Ids das pendências do 412 `prereq_missing` (spec 093 T02); só ids no formato fixo. */
@@ -1009,10 +1022,13 @@ export function postChat(
       // 502 do chat é sempre falha do provedor: código desconhecido (ou legado) vira resposta
       // inesperada, nunca "falha interna do servidor".
       // `detail` (spec 088) só vale com código do vocabulário e passa por `providerFailureDetail`.
+      // Spec 119: o motivo vem dos `params` neutros (`kind`, `provider_code`) e sai no idioma ativo;
+      // um `detail` em pt-BR (servidor antigo) é lido de volta pelo dicionário.
       if (status === 502) {
         const providerCode = providerCodeOf(body);
-        const providerDetail =
-          providerCode !== null && isRecord(body) ? providerFailureDetail(body.detail) : null;
+        const reason = providerCode !== null ? providerReasonOf(body) : null;
+        const legacy = providerCode !== null && reason === null && isRecord(body) ? providerFailureDetail(body.detail) : null;
+        const providerDetail = reason?.text ?? (legacy === null ? null : localizeProviderDetail(legacy));
         return {
           kind: "http",
           status: 502,
@@ -1020,12 +1036,26 @@ export function postChat(
             providerFailureMessage(providerCode ?? "provider_bad_response", null, providerDetail) ??
             SERVER_ERROR_MESSAGE,
           ...(providerCode === null ? {} : { providerCode }),
-          ...(providerDetail === null ? {} : { providerDetail }),
+          ...(legacy === null ? {} : { providerDetail: legacy }),
+          ...(reason === null ? {} : { providerKind: reason.kind }),
+          ...(reason?.code === undefined ? {} : { providerKindCode: reason.code }),
         };
       }
       return null;
     },
   }).then((r) => asObject<ChatReply>(r));
+}
+
+/**
+ * Motivo neutro (`params.kind` e `params.provider_code`) do `provider_failed` (spec 119), com o
+ * rótulo já no idioma ativo; `null` sem `kind` do vocabulário.
+ */
+function providerReasonOf(body: unknown): { kind: string; code?: string; text: string } | null {
+  if (!isRecord(body) || !isRecord(body.params)) return null;
+  const { kind, provider_code: code } = body.params;
+  const text = providerReasonText(kind, code);
+  if (text === null || typeof kind !== "string") return null;
+  return typeof code === "string" && text.endsWith(`: ${code}`) ? { kind, code, text } : { kind, text };
 }
 
 /** Causa fixa do provedor (`params.provider` do `provider_failed`); nunca devolve o texto cru. */
