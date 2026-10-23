@@ -308,6 +308,45 @@ pub fn remove_param(body: &mut Value, param: &str) -> bool {
     }
 }
 
+/// Spec 120, **preparado e não ligado**: ajuste do histórico reenviado no modo plano, para o caso
+/// de o backend recusar os itens como hoje saem (`store:false` não guarda nada no servidor, então
+/// um item reenviado só com `id` pode não ser encontrado). Segue a forma do Codex CLI:
+/// - pede `include: ["reasoning.encrypted_content"]`, para o `reasoning` voltar com o conteúdo
+///   cifrado e poder ser reenviado inteiro;
+/// - tira `id` e `status` dos itens do modelo reenviados em `input` (`message`, `function_call`,
+///   `reasoning`);
+/// - não reenvia `reasoning` sem `encrypted_content`.
+///
+/// Só os testes o usam até o teste real (`plan_live_text_and_tool`) mostrar a recusa.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn replay_without_ids(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    const ENCRYPTED: &str = "reasoning.encrypted_content";
+    let include = obj.entry("include").or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(list) = include {
+        if !list.iter().any(|v| v.as_str() == Some(ENCRYPTED)) {
+            list.push(Value::from(ENCRYPTED));
+        }
+    }
+    if let Some(Value::Array(items)) = obj.get_mut("input") {
+        items.retain(|i| {
+            i.get("type").and_then(Value::as_str) != Some("reasoning")
+                || i.get("encrypted_content").and_then(Value::as_str).is_some_and(|c| !c.is_empty())
+        });
+        for item in items.iter_mut() {
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if matches!(kind, "message" | "function_call" | "reasoning") {
+                if let Some(o) = item.as_object_mut() {
+                    o.remove("id");
+                    o.remove("status");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +425,35 @@ mod tests {
         let other = r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#;
         assert!(stream_failure("", other).is_none());
         assert!(stream_failure("", r#"{"type":"response.completed","response":{}}"#).is_none());
+    }
+
+    #[test]
+    fn replay_without_ids_strips_ids_and_unreplayable_reasoning() {
+        let mut body = json!({
+            "include": ["x"],
+            "input": [
+                {"role": "user", "content": "oi"},
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "ENC"},
+                {"type": "message", "id": "msg_1", "status": "completed", "role": "assistant", "phase": "commentary", "content": [{"type": "output_text", "text": "a"}]},
+                {"type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_1", "name": "get_time", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "12:00"}
+            ]
+        });
+        replay_without_ids(&mut body);
+        assert_eq!(body["include"], json!(["x", "reasoning.encrypted_content"]));
+        assert_eq!(
+            body["input"],
+            json!([
+                {"role": "user", "content": "oi"},
+                {"type": "reasoning", "summary": [], "encrypted_content": "ENC"},
+                {"type": "message", "role": "assistant", "phase": "commentary", "content": [{"type": "output_text", "text": "a"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_time", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "12:00"}
+            ])
+        );
+        // Idempotente: não repete o `include`.
+        replay_without_ids(&mut body);
+        assert_eq!(body["include"], json!(["x", "reasoning.encrypted_content"]));
     }
 }

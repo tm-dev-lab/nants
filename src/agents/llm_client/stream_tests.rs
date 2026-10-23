@@ -500,3 +500,44 @@ async fn idle_timeout_after_some_text_is_a_cut() {
     assert_eq!(cut.head, "comecei");
     assert!(cut.usage().is_some_and(|(_, est)| est));
 }
+
+/// Spec 120, não regressão da conexão por chave de API: com `response.completed.output`
+/// preenchido, ele continua sendo a fonte, mesmo com `output_item.done` no caminho (sem duplicar).
+#[tokio::test]
+async fn api_key_stream_with_filled_output_ignores_output_items() {
+    let mut s = ev("response.output_text.delta", r#"{"type":"response.output_text.delta","delta":"vou ler"}"#);
+    // Itens diferentes dos do `completed`: se fossem usados, o resultado mudaria.
+    s += &ev(
+        "response.output_item.done",
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_x","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OUTRO","annotations":[]}]}}"#,
+    );
+    s += &ev(
+        "response.output_item.done",
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}","status":"completed"}}"#,
+    );
+    s += &ev("response.completed", &completed());
+    let (base, _) = raw_server(vec![(200, SSE, s)]).await;
+    let got = client(base, WireApi::Responses).chat_stream(&req(None), &|_| {}).await.expect("ok");
+    assert_eq!(got, parse_responses(RESP_TOOL, false).expect("parse"));
+    assert_eq!(got.message.content, "vou ler");
+    assert_eq!(got.message.tool_calls.len(), 1, "sem duplicar a chamada");
+    assert_eq!(got.message.provider_items.as_ref().map(Vec::len), Some(3), "os itens do completed, sem acréscimo");
+}
+
+/// Spec 120: a montagem pelos itens vale para qualquer conexão Responses em stream (retrato fiel
+/// do que chegou), inclusive `response.incomplete` por tamanho.
+#[tokio::test]
+async fn api_key_stream_with_empty_output_uses_the_items() {
+    let item = r#"{"type":"message","id":"msg_1","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"parci","annotations":[]}]}"#;
+    let mut s = ev("response.output_item.done", &format!(r#"{{"type":"response.output_item.done","output_index":0,"item":{item}}}"#));
+    s += &ev(
+        "response.incomplete",
+        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":5,"output_tokens":9}}}"#,
+    );
+    let (base, _) = raw_server(vec![(200, SSE, s)]).await;
+    let got = client(base, WireApi::Responses).chat_stream(&req(None), &|_| {}).await.expect("ok");
+    assert_eq!(got.message.content, "parci");
+    assert_eq!(got.finish_reason.as_deref(), Some("length"));
+    let usage = got.usage.expect("usage");
+    assert_eq!((usage.prompt, usage.completion), (5, 9));
+}

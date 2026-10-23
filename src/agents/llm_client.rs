@@ -564,6 +564,14 @@ pub struct LlmClient {
     plan: Option<Arc<dyn PlanTokens>>,
     /// Último access token usado no modo plano, para redigir trechos de erro e de corte.
     plan_secret: Arc<std::sync::Mutex<String>>,
+    /// Só nos testes (spec 120, teste real): `tool_choice` acrescentado ao corpo, para exigir a
+    /// ferramenta. O produto não envia `tool_choice`.
+    #[cfg(test)]
+    test_tool_choice: Option<Value>,
+    /// Só nos testes (spec 120, teste real): aplica o ajuste preparado
+    /// [`plan::replay_without_ids`] ao corpo do modo plano.
+    #[cfg(test)]
+    test_plan_replay_fix: bool,
 }
 
 /// Limitador compartilhado e o id da conexão (a chave é completada pelo modelo do pedido).
@@ -625,6 +633,10 @@ impl LlmClient {
             pace: None,
             plan: None,
             plan_secret: Arc::new(std::sync::Mutex::new(String::new())),
+            #[cfg(test)]
+            test_tool_choice: None,
+            #[cfg(test)]
+            test_plan_replay_fix: false,
         })
     }
 
@@ -1295,6 +1307,14 @@ impl LlmClient {
                     plan::remove_param(&mut body, param);
                 }
             }
+            #[cfg(test)]
+            if let Some(choice) = &self.test_tool_choice {
+                body["tool_choice"] = choice.clone();
+            }
+            #[cfg(test)]
+            if plan && self.test_plan_replay_fix {
+                plan::replay_without_ids(&mut body);
+            }
             let token = self.bearer().await.map_err(Failed::from)?;
             // Streaming (spec 080 T01): o timeout total do cliente cortaria uma resposta viva no
             // meio (com deltas já entregues, sem nova tentativa). Aqui ele é trocado pelo teto
@@ -1403,7 +1423,7 @@ impl LlmClient {
         let mut parser = SseParser::default();
         let plan = self.plan.is_some();
         let mut acc = if responses {
-            SseAcc::Responses(None)
+            SseAcc::Responses(RespAcc::default())
         } else {
             SseAcc::Chat(ChatAcc::default())
         };
@@ -2224,8 +2244,35 @@ struct ChatAcc {
     done: bool,
 }
 
+/// Acumulador do stream Responses.
+#[derive(Default)]
+struct RespAcc {
+    /// A resposta final, montada no `response.completed` (ou `response.incomplete`).
+    done: Option<ChatResponse>,
+    /// Spec 120: os itens completos de `response.output_item.done`, por `output_index`. A API do
+    /// plano devolve `response.completed` com `output: []`; a saída só vem nesses eventos.
+    items: std::collections::BTreeMap<u64, Value>,
+}
+
+impl RespAcc {
+    /// Spec 120: o objeto `response` do evento final, com o `output` montado pelos itens recebidos
+    /// quando o provedor o mandou vazio. Com `output` preenchido, ele continua sendo a fonte (sem
+    /// juntar os itens, para não duplicar). `usage` e `status` vêm sempre do evento final.
+    fn final_response(&mut self, event: &Value) -> Value {
+        let mut response = event["response"].clone();
+        let empty = response.get("output").is_none_or(|o| o.is_null() || o.as_array().is_some_and(Vec::is_empty));
+        if empty && !self.items.is_empty() {
+            if let Some(obj) = response.as_object_mut() {
+                let items: Vec<Value> = std::mem::take(&mut self.items).into_values().collect();
+                obj.insert("output".into(), Value::Array(items));
+            }
+        }
+        response
+    }
+}
+
 enum SseAcc {
-    Responses(Option<ChatResponse>),
+    Responses(RespAcc),
     Chat(ChatAcc),
 }
 
@@ -2244,7 +2291,7 @@ const NO_FINAL: BadReason = BadReason::new(BadKind::NoFinal);
 impl SseAcc {
     fn is_done(&self) -> bool {
         match self {
-            SseAcc::Responses(r) => r.is_some(),
+            SseAcc::Responses(r) => r.done.is_some(),
             SseAcc::Chat(c) => c.done,
         }
     }
@@ -2258,7 +2305,7 @@ impl SseAcc {
         on: &(dyn Fn(StreamDelta) + Send + Sync),
     ) -> Result<bool, LlmError> {
         match self {
-            SseAcc::Responses(slot) => {
+            SseAcc::Responses(acc) => {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     return Ok(false);
                 };
@@ -2269,8 +2316,16 @@ impl SseAcc {
                         emit(on, StreamDelta::Reasoning(delta));
                     }
                     "response.output_text.delta" => emit(on, StreamDelta::Text(delta)),
+                    "response.output_item.done" => {
+                        if v["item"].is_object() {
+                            let next = acc.items.keys().next_back().map_or(0, |k| k.saturating_add(1));
+                            let idx = v["output_index"].as_u64().unwrap_or(next);
+                            acc.items.insert(idx, v["item"].clone());
+                        }
+                    }
                     "response.completed" | "response.incomplete" => {
-                        *slot = Some(parse_responses(&v["response"].to_string(), fallback_used)?);
+                        let response = acc.final_response(&v);
+                        acc.done = Some(parse_responses(&response.to_string(), fallback_used)?);
                         return Ok(true);
                     }
                     "response.failed" => {
@@ -2343,8 +2398,8 @@ impl SseAcc {
 
     fn finish(self, fallback_used: bool) -> Result<ChatResponse, LlmError> {
         match self {
-            SseAcc::Responses(Some(r)) => Ok(r),
-            SseAcc::Responses(None) => Err(LlmError::Parse(NO_FINAL)),
+            SseAcc::Responses(RespAcc { done: Some(r), .. }) => Ok(r),
+            SseAcc::Responses(RespAcc { done: None, .. }) => Err(LlmError::Parse(NO_FINAL)),
             SseAcc::Chat(acc) => {
                 if !acc.done && acc.finish_reason.is_none() {
                     return Err(LlmError::Parse(NO_FINAL));

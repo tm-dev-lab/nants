@@ -441,3 +441,347 @@ fn plan_connection_needs_the_token_source() {
     let client = LlmClient::from_plan_connection(&conn, Arc::new(FakeTokens::default())).expect("cliente");
     assert!(client.is_plan() && client.is_paced(), "modo plano no ritmo da 089");
 }
+
+// Spec 120: no modo plano, `response.completed` traz `output: []`; a saída só vem nos itens de
+// `response.output_item.done` (medido em 2026-10-23, `119-probe/probe2.txt`).
+
+/// `usage` como a sonda mediu (com `output_tokens_details.reasoning_tokens`).
+const PLAN_USAGE: &str = r#"{"input_tokens":44,"input_tokens_details":{"cached_tokens":0},"output_tokens":14,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":58}"#;
+
+fn item_done(index: u64, item: &str) -> String {
+    ev(
+        "response.output_item.done",
+        &format!(r#"{{"type":"response.output_item.done","sequence_number":{},"output_index":{index},"item":{item}}}"#, 10 + index),
+    )
+}
+
+fn message_item(id: &str, phase: &str, text: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","type":"message","status":"completed","content":[{{"type":"output_text","annotations":[],"logprobs":[],"text":"{text}"}}],"phase":"{phase}","role":"assistant"}}"#
+    )
+}
+
+const GET_TIME_CALL: &str = r#"{"id":"fc_0ff7","type":"function_call","status":"completed","arguments":"{}","call_id":"call_b5Ag","name":"get_time"}"#;
+
+/// Stream na forma medida: deltas de texto, os itens completos (na ordem dada; o índice vem do
+/// `output_index`) e um `response.completed` com `output: []` e o `usage`.
+fn plan_items_sse(items: &[(u64, String)], deltas: &[&str]) -> String {
+    let mut s = ev("response.created", r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_p","object":"response","status":"in_progress","output":[]}}"#);
+    for d in deltas {
+        s += &ev("response.output_text.delta", &json!({"type": "response.output_text.delta", "delta": d}).to_string());
+    }
+    for (i, item) in items {
+        s += &item_done(*i, item);
+    }
+    s += &ev("response.metadata", r#"{"type":"response.metadata","sequence_number":30,"response_id":"resp_p","metadata":{}}"#);
+    s += &ev(
+        "response.completed",
+        &format!(r#"{{"type":"response.completed","sequence_number":31,"response":{{"id":"resp_p","object":"response","status":"completed","error":null,"incomplete_details":null,"output":[],"usage":{PLAN_USAGE}}}}}"#),
+    );
+    s
+}
+
+/// Chama no modo plano com o servidor local sem `Content-Type` e devolve a resposta, os cortes
+/// entregues (o diagnóstico do `cuts.jsonl`) e o número de chamadas. Três cópias: sem a correção,
+/// cada uma vira `empty`.
+async fn plan_items_call(sse: String) -> (Result<ChatResponse, LlmError>, Vec<Arc<StreamCut>>, usize) {
+    let (base, cap) = raw_server(vec![(200, NO_CTYPE, sse); 3]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let cuts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&cuts);
+    let out = client
+        .chat_stream(&request(true), &move |d| {
+            if let StreamDelta::Cut(c) = d {
+                seen.lock().expect("lock").push(c);
+            }
+        })
+        .await;
+    let cuts = cuts.lock().expect("lock").clone();
+    (out, cuts, requests(&cap).len())
+}
+
+fn assert_plan_usage(resp: &ChatResponse) {
+    let usage = resp.usage.expect("usage do completed");
+    assert_eq!((usage.prompt, usage.completion, usage.reasoning), (44, 14, Some(3)));
+}
+
+fn cut_reasons(cuts: &[Arc<StreamCut>]) -> Vec<String> {
+    cuts.iter().map(|c| c.reason.to_string()).collect()
+}
+
+#[tokio::test]
+async fn plan_text_is_built_from_output_items() {
+    let sse = plan_items_sse(&[(0, message_item("msg_1", "final_answer", "OK."))], &["OK."]);
+    let (out, cuts, calls) = plan_items_call(sse).await;
+    let resp = out.expect("texto montado pelos itens");
+    assert_eq!(resp.message.content, "OK.");
+    assert!(resp.message.tool_calls.is_empty());
+    assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+    assert_plan_usage(&resp);
+    assert_eq!(resp.billing, Billing::ChatgptPlan);
+    assert_eq!(calls, 1, "conclui na primeira resposta");
+    assert!(cuts.is_empty(), "nenhum `empty` no diagnóstico: {:?}", cut_reasons(&cuts));
+}
+
+#[tokio::test]
+async fn plan_tool_call_is_built_from_output_items() {
+    let (out, cuts, calls) = plan_items_call(plan_items_sse(&[(0, GET_TIME_CALL.to_string())], &[])).await;
+    let resp = out.expect("ferramenta montada pelos itens");
+    assert_eq!(resp.message.tool_calls.len(), 1);
+    let call = &resp.message.tool_calls[0];
+    assert_eq!((call.id.as_str(), call.name.as_str(), call.arguments.as_str()), ("call_b5Ag", "get_time", "{}"));
+    assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+    // O item volta ao histórico como veio (com `call_id`), para a próxima chamada.
+    let items = resp.message.provider_items.as_ref().expect("itens");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["call_id"], "call_b5Ag");
+    assert_plan_usage(&resp);
+    assert_eq!(calls, 1);
+    assert!(cuts.is_empty(), "{:?}", cut_reasons(&cuts));
+}
+
+#[tokio::test]
+async fn plan_text_then_tool_keep_the_output_index_order() {
+    // Os eventos chegam fora de ordem; vale o `output_index`.
+    let items = [(1, GET_TIME_CALL.to_string()), (0, message_item("msg_1", "commentary", "Vou ver a hora."))];
+    let (out, cuts, _) = plan_items_call(plan_items_sse(&items, &["Vou ver a hora."])).await;
+    let resp = out.expect("texto e ferramenta");
+    assert_eq!(resp.message.content, "Vou ver a hora.");
+    assert_eq!(resp.message.tool_calls.len(), 1);
+    assert_eq!(resp.message.tool_calls[0].name, "get_time");
+    let items = resp.message.provider_items.as_ref().expect("itens");
+    let kinds: Vec<&str> = items.iter().filter_map(|i| i["type"].as_str()).collect();
+    assert_eq!(kinds, ["message", "function_call"]);
+    assert_plan_usage(&resp);
+    assert!(cuts.is_empty(), "{:?}", cut_reasons(&cuts));
+}
+
+#[tokio::test]
+async fn plan_commentary_and_final_answer_join_in_order() {
+    // Decisão: as mensagens se juntam na ordem, pela mesma regra do `parse_responses` para um
+    // `output` preenchido (sem filtrar `phase`): é o que a conversa já mostrou pelos deltas.
+    let items = [
+        (0, message_item("msg_c", "commentary", "Vou pensar. ")),
+        (1, message_item("msg_f", "final_answer", "Resposta.")),
+    ];
+    let (out, cuts, _) = plan_items_call(plan_items_sse(&items, &["Vou pensar. ", "Resposta."])).await;
+    let resp = out.expect("as duas mensagens");
+    assert_eq!(resp.message.content, "Vou pensar. Resposta.");
+    // Os itens guardados mantêm o `phase` de cada mensagem.
+    let items = resp.message.provider_items.as_ref().expect("itens");
+    let phases: Vec<&str> = items.iter().filter_map(|i| i["phase"].as_str()).collect();
+    assert_eq!(phases, ["commentary", "final_answer"]);
+    assert!(cuts.is_empty(), "{:?}", cut_reasons(&cuts));
+}
+
+#[tokio::test]
+async fn plan_without_any_item_is_still_empty() {
+    // Sem itens e com `output: []`, continua sendo resposta vazia (e o diagnóstico registra).
+    let (out, cuts, calls) = plan_items_call(plan_items_sse(&[], &[])).await;
+    let err = out.expect_err("vazia");
+    assert!(matches!(err, LlmError::Parse(r) if r.kind == BadKind::Empty), "{err:?}");
+    assert_eq!(calls, 3, "vazia repete como de costume");
+    assert!(!cuts.is_empty() && cuts.iter().all(|c| c.reason == "empty"), "{:?}", cut_reasons(&cuts));
+}
+
+/// Fonte de token para o teste real: o token lido do arquivo, sem renovar nem marcar nada.
+struct LiveToken(String);
+
+impl PlanTokens for LiveToken {
+    fn access_token(&self) -> PlanFuture<'_, Result<String, PlanTokenError>> {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+    fn expire(&self) -> PlanFuture<'_, ()> {
+        Box::pin(async {})
+    }
+    fn needs_login(&self) -> PlanFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// Spec 120: verificação real contra a API do plano, com o cliente do Nants (texto, ferramenta e o
+/// segundo turno com os itens reenviados, sem esforço e com esforço `low`). Só roda à mão:
+/// `NANTS_PLAN_LIVE_FILE=<chatgpt-conn-*.json> scripts/test.sh cargo test --lib plan_live_text_and_tool -- --ignored --nocapture`.
+/// Lê o `access_token` do arquivo; com menos de 2 minutos de validade, não chama nem renova. Nunca
+/// imprime o token. Modelo: `NANTS_PLAN_LIVE_MODEL` (padrão `gpt-6.1-sol`). Sem novas tentativas.
+#[tokio::test]
+#[ignore = "chama a API real do plano ChatGPT com o token do usuário"]
+async fn plan_live_text_and_tool() {
+    let Ok(path) = std::env::var("NANTS_PLAN_LIVE_FILE") else {
+        panic!("defina NANTS_PLAN_LIVE_FILE com o caminho do chatgpt-conn-*.json");
+    };
+    let raw = std::fs::read_to_string(&path).expect("leitura do arquivo de credenciais");
+    let creds: Value = serde_json::from_str(&raw).expect("credenciais em JSON");
+    let access = creds["access_token"].as_str().unwrap_or_default().to_string();
+    assert!(!access.is_empty(), "o arquivo não tem access_token (entre de novo pelo Nants)");
+    let expires_at = creds["expires_at"].as_u64().unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if expires_at < now.saturating_add(120) {
+        eprintln!("token vencido ou a menos de 2 minutos de vencer: nenhuma chamada feita e nada renovado. Use o Nants uma vez para renovar e rode de novo.");
+        return;
+    }
+    let model = std::env::var("NANTS_PLAN_LIVE_MODEL").unwrap_or_else(|_| "gpt-6.1-sol".into());
+    let conn = Connection::chatgpt_plan("c-live", "ChatGPT");
+    let client = LlmClient::from_plan_connection(&conn, Arc::new(LiveToken(access)))
+        .expect("cliente")
+        .with_retry_delays(Vec::new())
+        .with_throttle_delays(Vec::new());
+
+    // Texto.
+    let text_req = ChatRequest {
+        model: model.clone(),
+        messages: vec![ChatMessage::text(Role::User, "Say OK.")],
+        tools: Vec::new(),
+        effort: None,
+        response_json: false,
+        web_search: false,
+    };
+    let resp = client.chat_stream(&text_req, &|_| {}).await.unwrap_or_else(|e| panic!("texto: {e:?}"));
+    eprintln!("texto: {:?} usage={:?}", resp.message.content, resp.usage);
+    assert!(!resp.message.content.trim().is_empty(), "texto vazio");
+
+    // Ferramenta (`tool_choice` obrigatório) e o segundo turno, que reenvia os itens devolvidos
+    // (`provider_items`) e o resultado da ferramenta: sem esforço e com esforço `low` (como o
+    // Arquiteto), para aparecerem itens `reasoning`. Se a forma de hoje for recusada, tenta o
+    // ajuste preparado (`plan::replay_without_ids`) só para mostrar se ele resolve.
+    let mut failures = Vec::new();
+    for (label, effort) in [("sem esforço", None), ("esforço low", Some(Effort::Low))] {
+        if let Err(e) = live_round_trip(&client, &model, effort, false, label).await {
+            eprintln!("{label}: FALHOU na forma de hoje: {e}");
+            let fixed_label = format!("{label} + ajuste preparado");
+            match live_round_trip(&client, &model, effort, true, &fixed_label).await {
+                Ok(()) => eprintln!("{fixed_label}: passou"),
+                Err(e) => eprintln!("{fixed_label}: também falhou: {e}"),
+            }
+            failures.push(label);
+        }
+    }
+    assert!(failures.is_empty(), "segundo turno recusado na forma de hoje: {failures:?}");
+}
+
+fn live_get_time() -> ToolSpec {
+    ToolSpec {
+        name: "get_time".into(),
+        description: "Returns the current time.".into(),
+        parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    }
+}
+
+/// Teste real: chamada com a ferramenta obrigatória e o segundo turno com os itens reenviados.
+/// Imprime os `type` dos itens reenviados (e se trazem `id` ou conteúdo cifrado), nunca o token.
+async fn live_round_trip(base: &LlmClient, model: &str, effort: Option<Effort>, fix: bool, label: &str) -> Result<(), String> {
+    let first = LlmClient { test_tool_choice: Some(json!("required")), test_plan_replay_fix: fix, ..base.clone() };
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage::text(Role::User, "What time is it?")],
+        tools: vec![live_get_time()],
+        effort,
+        response_json: false,
+        web_search: false,
+    };
+    let resp = first.chat_stream(&req, &|_| {}).await.map_err(|e| format!("1º turno: {e:?}"))?;
+    let calls: Vec<(&str, &str, &str)> =
+        resp.message.tool_calls.iter().map(|c| (c.name.as_str(), c.id.as_str(), c.arguments.as_str())).collect();
+    eprintln!("{label}: ferramenta {calls:?} usage={:?}", resp.usage);
+    let call = resp.message.tool_calls.first().cloned().ok_or("1º turno sem chamada de ferramenta")?;
+    if call.name != "get_time" || call.id.is_empty() {
+        return Err(format!("chamada inesperada: {:?} / call_id vazio: {}", call.name, call.id.is_empty()));
+    }
+    let resent: Vec<String> = resp
+        .message
+        .provider_items
+        .iter()
+        .flatten()
+        .map(|i| {
+            let mut tags = vec![i["type"].as_str().unwrap_or("?").to_string()];
+            if i.get("id").is_some() {
+                tags.push("id".into());
+            }
+            if i.get("phase").is_some() {
+                tags.push(format!("phase={}", i["phase"].as_str().unwrap_or("?")));
+            }
+            if i.get("encrypted_content").is_some_and(|c| !c.is_null()) {
+                tags.push("encrypted_content".into());
+            }
+            tags.join("+")
+        })
+        .collect();
+    eprintln!("{label}: itens reenviados no 2º turno = {resent:?}");
+    let mut messages = req.messages.clone();
+    messages.push(resp.message.clone());
+    messages.push(ChatMessage { tool_call_id: Some(call.id.clone()), ..ChatMessage::text(Role::Tool, "2026-10-23T12:00:00Z") });
+    let second = LlmClient { test_tool_choice: None, test_plan_replay_fix: fix, ..base.clone() };
+    let resp = second
+        .chat_stream(&ChatRequest { messages, ..req }, &|_| {})
+        .await
+        .map_err(|e| format!("2º turno: {e:?}"))?;
+    eprintln!("{label}: 2º turno texto={:?} usage={:?}", resp.message.content, resp.usage);
+    if resp.message.content.trim().is_empty() {
+        return Err("2º turno sem texto".into());
+    }
+    Ok(())
+}
+
+/// Spec 120 (F-01): a forma exata do `input` do segundo turno no modo plano, com os itens montados
+/// pelo `output_item.done` (inclusive um `reasoning` sem conteúdo cifrado) reenviados como vieram.
+#[tokio::test]
+async fn plan_second_turn_resends_the_items_as_they_came() {
+    let reasoning = r#"{"id":"rs_1","type":"reasoning","summary":[]}"#.to_string();
+    let first = plan_items_sse(
+        &[(0, reasoning), (1, message_item("msg_c", "commentary", "Vou ver.")), (2, GET_TIME_CALL.to_string())],
+        &["Vou ver."],
+    );
+    let second = plan_items_sse(&[(0, message_item("msg_f", "final_answer", "São 12h."))], &["São 12h."]);
+    let (base, cap) = raw_server(vec![(200, NO_CTYPE, first), (200, NO_CTYPE, second)]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let req = ChatRequest {
+        model: "gpt-plano".into(),
+        messages: vec![ChatMessage::text(Role::User, "que horas são?")],
+        tools: vec![ToolSpec { name: "get_time".into(), description: "hora".into(), parameters: json!({"type": "object"}) }],
+        effort: Some(Effort::Low),
+        response_json: false,
+        web_search: false,
+    };
+    let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
+    let mut messages = req.messages.clone();
+    messages.push(resp.message.clone());
+    messages.push(ChatMessage { tool_call_id: Some("call_b5Ag".into()), ..ChatMessage::text(Role::Tool, "12:00") });
+    let resp = client.chat_stream(&ChatRequest { messages, ..req }, &|_| {}).await.expect("2º turno");
+    assert_eq!(resp.message.content, "São 12h.");
+    let reqs = requests(&cap);
+    let body = body_of(&reqs[1]);
+    assert_eq!(
+        body["input"],
+        json!([
+            {"role": "user", "content": "que horas são?"},
+            {"id": "rs_1", "type": "reasoning", "summary": []},
+            {"id": "msg_c", "type": "message", "status": "completed", "content": [{"type": "output_text", "annotations": [], "logprobs": [], "text": "Vou ver."}], "phase": "commentary", "role": "assistant"},
+            {"id": "fc_0ff7", "type": "function_call", "status": "completed", "arguments": "{}", "call_id": "call_b5Ag", "name": "get_time"},
+            {"type": "function_call_output", "call_id": "call_b5Ag", "output": "12:00"}
+        ])
+    );
+    assert!(body.get("include").is_none(), "o ajuste preparado não está ligado");
+
+    // Com o ajuste preparado (só nos testes até o teste real decidir): sem `id`/`status`, sem o
+    // `reasoning` não reenviável e com o pedido do conteúdo cifrado.
+    let first = plan_items_sse(&[(0, GET_TIME_CALL.to_string())], &[]);
+    let second = plan_items_sse(&[(0, message_item("msg_f", "final_answer", "ok"))], &["ok"]);
+    let (base, cap) = raw_server(vec![(200, NO_CTYPE, first), (200, NO_CTYPE, second)]).await;
+    let client = LlmClient { test_plan_replay_fix: true, ..plan_client(base, Arc::new(FakeTokens::default())) };
+    let req = ChatRequest {
+        model: "gpt-plano".into(),
+        messages: vec![ChatMessage::text(Role::User, "que horas são?")],
+        tools: vec![ToolSpec { name: "get_time".into(), description: "hora".into(), parameters: json!({"type": "object"}) }],
+        effort: None,
+        response_json: false,
+        web_search: false,
+    };
+    let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
+    let mut messages = req.messages.clone();
+    messages.push(resp.message.clone());
+    messages.push(ChatMessage { tool_call_id: Some("call_b5Ag".into()), ..ChatMessage::text(Role::Tool, "12:00") });
+    client.chat_stream(&ChatRequest { messages, ..req }, &|_| {}).await.expect("2º turno");
+    let body = body_of(&requests(&cap)[1]);
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(body["input"][1], json!({"type": "function_call", "arguments": "{}", "call_id": "call_b5Ag", "name": "get_time"}));
+}
