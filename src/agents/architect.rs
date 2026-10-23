@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::chat::ChatBackend;
 use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
-use crate::agents::activity::{ActivityScope, ActivitySink, NullSink};
+use crate::agents::activity::{structured, ActivityScope, ActivitySink, NullSink};
 use crate::agents::llm_agents::{tool_loop, AgentCtx};
 use crate::agents::llm_client::{
     log_provider_failure, provider_failure, BadKind, BadReason, ChatMessage, ChatRequest, ChatResponse, ImageInput, ProviderFailure, Role as ChatRole,
@@ -740,11 +740,20 @@ const RECOVERY_REQUEST: &str = "A tarefa está bloqueada. Analise e responda com
 /// Pedido do turno de diagnóstico de ambiente.
 const DIAGNOSIS_REQUEST: &str = "A tarefa está bloqueada por ambiente. Diagnostique e responda com o JSON.";
 
+/// Pedido de um turno somente leitura e o código da saída estruturada dele (spec 121): o JSON
+/// do diagnóstico e da recuperação não aparece na Atividade; o Markdown do ARCHITECTURE.md, sim.
+#[derive(Debug, Clone, Copy)]
+struct TurnRequest {
+    text: &'static str,
+    structured: Option<&'static str>,
+}
+
 impl LlmArchitect {
     /// Turno de diagnóstico de bloqueio de ambiente: somente leitura, fatos montados pelo servidor.
     /// Devolve o texto bruto (JSON `{"root_cause","what_to_do"}` a validar pelo servidor).
     pub async fn diagnose(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, diagnosis_system_for(self.lang.get()), facts, DIAGNOSIS_REQUEST, true, None).await
+        let request = TurnRequest { text: DIAGNOSIS_REQUEST, structured: Some(structured::DIAGNOSIS) };
+        self.read_only_turn(root, diagnosis_system_for(self.lang.get()), facts, request, true, None).await
     }
 
     /// Turno de recuperação de uma tarefa bloqueada por qualidade: somente leitura (mesmo host do
@@ -753,7 +762,8 @@ impl LlmArchitect {
     /// `root` é a raiz de leitura das ferramentas: a worktree da tarefa quando existe (o servidor
     /// escolhe), senão a raiz do projeto. O host continua `report_only` (sem escrita nem comandos).
     pub async fn recover(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, RECOVERY_REQUEST, true, Some(NetPhase::Recovery))
+        let request = TurnRequest { text: RECOVERY_REQUEST, structured: Some(structured::RECOVERY) };
+        self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, request, true, Some(NetPhase::Recovery))
             .await
     }
 
@@ -762,7 +772,7 @@ impl LlmArchitect {
         root: &Path,
         system: String,
         facts: &str,
-        request: &str,
+        request: TurnRequest,
         with_memory: bool,
         net: Option<NetPhase>,
     ) -> Result<String, ArchitectError> {
@@ -799,13 +809,16 @@ impl LlmArchitect {
             host: &host,
             tools: tool_specs,
             role: ARCHITECT_ROLE,
-            activity: self.scope(),
+            activity: match request.structured {
+                Some(code) => self.scope().with_structured(code),
+                None => self.scope(),
+            },
             cancel: None,
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, system),
             ChatMessage::text(ChatRole::System, format!("{REPORT_FACTS_LABEL}\n{facts}")),
-            ChatMessage::text(ChatRole::User, request),
+            ChatMessage::text(ChatRole::User, request.text),
         ];
         if let Some(mem) = self.memory_message(root).filter(|_| with_memory) {
             messages.insert(1, mem);
@@ -829,7 +842,7 @@ impl LlmArchitect {
     /// Turno de atualização da memória de arquitetura: somente leitura; devolve o NOVO conteúdo
     /// completo do ARCHITECTURE.md (o servidor valida, grava e commita).
     pub async fn update_architecture(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, architecture_update_system_for(self.lang.get()), facts, ARCH_UPDATE_REQUEST, false, None)
+        self.read_only_turn(root, architecture_update_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_UPDATE_REQUEST, structured: None }, false, None)
             .await
     }
 }
@@ -842,7 +855,7 @@ impl LlmArchitect {
     /// Levantamento inicial de projeto existente: somente leitura; devolve o ARCHITECTURE.md
     /// (opcionalmente precedido de `TEST_COMMAND: ...`). O servidor valida, grava e commita.
     pub async fn survey_architecture(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, architecture_survey_system_for(self.lang.get()), facts, ARCH_SURVEY_REQUEST, false, None)
+        self.read_only_turn(root, architecture_survey_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_SURVEY_REQUEST, structured: None }, false, None)
             .await
     }
 }
@@ -1980,6 +1993,37 @@ mod tests {
                 && sys.contains("erro desconhecido"),
             "{sys}"
         );
+    }
+
+    /// Spec 121: o diagnóstico e a recuperação (JSON) marcam a atividade com o código; o chat, o
+    /// relatório e o ARCHITECTURE.md (texto de pessoa) não marcam.
+    #[tokio::test]
+    async fn structured_turns_mark_activity_and_prose_turns_do_not() {
+        let root = tmp_root("arch-structured");
+        let cases: [(&str, Option<&str>); 6] = [
+            ("diagnose", Some("diagnosis")),
+            ("recover", Some("recovery")),
+            ("report", None),
+            ("survey", None),
+            ("update", None),
+            ("reply", None),
+        ];
+        for (turn, expected) in cases {
+            let backend = Scripted::new(vec![text("{\"decision\": \"ESCALATE\"}")]);
+            let rec = Arc::new(Recorder::default());
+            let a = architect(backend).with_activity(rec.clone(), Some("121".into()), Some("T01".into()));
+            match turn {
+                "diagnose" => drop(a.diagnose(&root, "f").await.expect("diagnose")),
+                "recover" => drop(a.recover(&root, "f").await.expect("recover")),
+                "report" => drop(a.report(&root, "f").await.expect("report")),
+                "survey" => drop(a.survey_architecture(&root, "f").await.expect("survey")),
+                "update" => drop(a.update_architecture(&root, "f").await.expect("update")),
+                _ => drop(a.reply(&root, &[], "oi", SNAPSHOT).await.expect("reply")),
+            }
+            let ev = rec.events();
+            assert!(!ev.is_empty(), "{turn}");
+            assert!(ev.iter().all(|e| e.structured == expected), "{turn}: {ev:?}");
+        }
     }
 
     #[tokio::test]

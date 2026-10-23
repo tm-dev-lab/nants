@@ -260,6 +260,11 @@ export interface ActivityEntry {
   stageCode?: Coded;
   toolCode?: Coded;
   textCode?: Coded;
+  /**
+   * Tipo da chamada de saída estruturada do passo (spec 121: `plan_review`, `verdict`...): a tela
+   * mostra o rótulo dele no lugar do texto, que é JSON para o servidor.
+   */
+  structured?: string;
   startedAt: number;
   lastAt: number;
   /** Instante do `end` do passo atual; ausente = passo aberto. */
@@ -384,6 +389,7 @@ export function mergeServerActivities(
       ...codedEntry("stageCode", parseCoded(it.stage_code, undefined)),
       ...codedEntry("toolCode", parseCoded(it.tool_code, it.tool_params)),
       ...codedEntry("textCode", parseCoded(it.text_code, it.text_params)),
+      ...(typeof it.structured === "string" && it.structured !== "" ? { structured: it.structured } : {}),
       startedAt: lastAt,
       lastAt,
     };
@@ -527,6 +533,9 @@ function reduceActivity(
     delete next.stage;
     delete next.stageCode;
   }
+  // Spec 121: o passo novo começa sem tipo; o código vem em todo evento da chamada estruturada.
+  if (typeof payload.structured === "string" && payload.structured !== "") next.structured = payload.structured;
+  else if (payload.kind === "start") delete next.structured;
   const rest = list.filter((a) => a.key !== key);
   return [...rest, next].slice(-MAX_ACTIVITIES_PER_PROJECT);
 }

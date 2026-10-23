@@ -16,7 +16,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 
-use crate::agents::activity::{ActivityRun, ActivityScope, ActivitySink, NullSink};
+use crate::agents::activity::{structured, ActivityRun, ActivityScope, ActivitySink, NullSink};
 use crate::agents::arch_memory;
 use crate::agents::chat::ChatBackend;
 use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
@@ -617,12 +617,14 @@ impl LlmReviewer {
             host: &host,
             tools: review_tools,
             role: REVIEWER_ROLE,
+            // Spec 121: a resposta é o JSON do veredito (ou da verificação final, tarefa `FINAL`).
             activity: ActivityScope::new(
                 Arc::clone(&self.activity),
                 REVIEWER_ROLE,
                 Some(input.spec_id.clone()),
                 Some(input.task_id.clone()),
-            ),
+            )
+            .with_structured(review_structured_code(&input.task_id)),
             cancel: self.cancel.clone(),
         };
         let mut base = vec![ChatMessage::text(ChatRole::System, reviewer_system_for(self.lang.get()))];
@@ -679,6 +681,16 @@ impl LlmReviewer {
         parse_review_with(&resp.message.content, true)
             .map(|result| ReviewResult { screenshots_viewed: viewed, ..result })
             .map_err(|e| port_err(REVIEWER_ROLE, format!("JSON inválido após retry: {e}")))
+    }
+}
+
+/// Código da saída estruturada do Revisor (spec 121): a verificação final roda com a tarefa
+/// `FINAL` (runner); as demais revisões são o veredito de uma tarefa.
+pub(crate) fn review_structured_code(task_id: &str) -> &'static str {
+    if task_id == "FINAL" {
+        structured::FINAL_CHECK
+    } else {
+        structured::VERDICT
     }
 }
 
@@ -4304,6 +4316,37 @@ mod tests {
             .expect_err("revisão parada");
         assert!(matches!(err, RunnerError::Cancelled), "{err:?}");
         assert_eq!(scripted.requests().len(), 2, "nenhuma nova requisição depois da parada");
+    }
+
+    /// Spec 121: a revisão de tarefa marca a atividade como `verdict`; a verificação final (tarefa
+    /// `FINAL`), como `final_check`; o Developer não marca.
+    #[tokio::test]
+    async fn reviewer_activity_is_marked_by_review_kind() {
+        use crate::agents::activity::testing::Recorder;
+        let root = tmp_root("rev-structured");
+        for (task, expected) in [("T01", "verdict"), ("FINAL", "final_check")] {
+            let rec = Arc::new(Recorder::default());
+            let mut input = review_input(&root);
+            input.task_id = task.into();
+            reviewer(Scripted::new(vec![text(approved_json())]))
+                .with_activity(rec.clone())
+                .review(&input)
+                .await
+                .expect("revisão");
+            let ev = rec.events();
+            assert!(!ev.is_empty(), "{task}");
+            assert!(ev.iter().all(|e| e.structured == Some(expected)), "{task}: {ev:?}");
+        }
+        assert_eq!(review_structured_code("T09"), "verdict");
+        assert_eq!(review_structured_code("FINAL"), "final_check");
+        let rec = Arc::new(Recorder::default());
+        LlmDeveloper::new(Scripted::new(vec![text("pronto")]), "modelo-teste", None, Policy::new(Vec::new(), Vec::new()), Arc::new(Deny))
+            .without_final_check()
+            .with_activity(rec.clone())
+            .implement(&brief(&root))
+            .await
+            .expect("relatório");
+        assert!(rec.events().iter().all(|e| e.structured.is_none()));
     }
 
     #[tokio::test]

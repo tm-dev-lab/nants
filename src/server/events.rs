@@ -785,6 +785,13 @@ impl ActivitySink for BusActivitySink {
         if let Some(bytes) = ev.received_bytes {
             payload["received_bytes"] = json!(bytes);
         }
+        // Spec 121: o passo pede saída estruturada; a tela mostra o rótulo do código, nunca o JSON.
+        let structured = ev
+            .structured
+            .filter(|code| crate::agents::activity::structured::ALL.contains(code));
+        if let Some(code) = structured {
+            payload["structured"] = json!(code);
+        }
         if matches!(
             ev.kind,
             crate::agents::activity::ActivityKind::Tool | crate::agents::activity::ActivityKind::Command
@@ -804,6 +811,7 @@ impl ActivitySink for BusActivitySink {
                 stage_code: self.stage.as_ref().map(|(c, _)| *c),
                 code: coded.as_ref().map(|(c, p)| (c.as_str(), p)),
                 received_bytes: ev.received_bytes,
+                structured,
             },
         );
         self.bus.publish(ApiEvent::new(
@@ -1353,6 +1361,7 @@ mod tests {
             text: Some("y".repeat(10_000)),
             code: None,
             received_bytes: None,
+            structured: None,
         });
         let ev = rx.try_recv().expect("evento");
         assert_eq!(ev.event_type(), "agent_activity");
@@ -1377,6 +1386,7 @@ mod tests {
             text: None,
             code: None,
             received_bytes: None,
+            structured: None,
         });
         let entries = std::fs::read_dir(&dir).expect("ler").count();
         assert_eq!(entries, 0, "nada pode ser gravado em disco");
@@ -1399,6 +1409,7 @@ mod tests {
             text: None,
             code: None,
             received_bytes,
+            structured: None,
         };
         sink.emit(ev(ActivityKind::Model, None));
         sink.emit(ev(ActivityKind::ModelBeat, Some(48_000)));
@@ -1410,6 +1421,37 @@ mod tests {
         let beat = rx.try_recv().expect("heartbeat");
         assert_eq!((beat.payload["kind"].as_str(), beat.payload["received_bytes"].as_u64()), (Some("heartbeat"), Some(48_000)));
         assert_eq!(rx.try_recv().expect("fim").payload["kind"], "model_end");
+    }
+
+    /// Spec 121: o código da saída estruturada vai no payload e no instantâneo; fora do
+    /// vocabulário, não vai; o passo sem código não leva o campo.
+    #[test]
+    fn structured_code_reaches_payload_and_snapshot() {
+        use crate::agents::activity::{ActivityEvent, ActivityKind, ActivitySink as _};
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let sink = BusActivitySink::new(bus.clone(), "p", Arc::new(SecretSet::default()));
+        let ev = |agent: &str, kind, text: Option<&str>, structured| ActivityEvent {
+            agent: agent.into(),
+            spec_id: Some("121".into()),
+            task_id: None,
+            activity_id: "a1".into(),
+            kind,
+            text: text.map(String::from),
+            code: None,
+            received_bytes: None,
+            structured,
+        };
+        for code in crate::agents::activity::structured::ALL {
+            sink.emit(ev("reviewer", ActivityKind::Text, Some("{\"issues\": []}"), Some(code)));
+            assert_eq!(rx.try_recv().expect("evento").payload["structured"], code);
+            let snap = bus.live_activity().snapshot("p");
+            assert_eq!(snap[0].structured.as_deref(), Some(code));
+        }
+        sink.emit(ev("developer", ActivityKind::Text, Some("{"), Some("invented")));
+        assert!(rx.try_recv().expect("evento").payload.get("structured").is_none());
+        sink.emit(ev("architect", ActivityKind::Text, Some("texto"), None));
+        assert!(rx.try_recv().expect("evento").payload.get("structured").is_none());
     }
 
     #[test]
@@ -1653,6 +1695,7 @@ mod tests {
             text: Some(text.into()),
             code: None,
             received_bytes: None,
+            structured: None,
         }
     }
 

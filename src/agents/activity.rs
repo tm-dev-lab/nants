@@ -91,6 +91,26 @@ pub struct ActivityEvent {
     pub code: Option<ActivityCode>,
     /// Bytes recebidos da resposta do modelo em curso (só no `heartbeat` da chamada, quando há).
     pub received_bytes: Option<u64>,
+    /// Tipo da chamada de saída estruturada (spec 121), quando o passo pede JSON ao modelo: a
+    /// interface mostra um texto do dicionário no lugar do texto cru (ver [`structured`]).
+    pub structured: Option<&'static str>,
+}
+
+/// Códigos estáveis das chamadas de saída estruturada (spec 121): o texto que o modelo escreve
+/// nelas é JSON para o servidor, não texto de pessoa; a Atividade mostra o rótulo do código.
+pub mod structured {
+    /// Revisão do plano pelo Revisor (`plan_review`, JSON `{"issues": [...]}`).
+    pub const PLAN_REVIEW: &str = "plan_review";
+    /// Veredito do Revisor numa tarefa (JSON do contrato da revisão).
+    pub const VERDICT: &str = "verdict";
+    /// Verificação final dos critérios globais pelo Revisor (mesmo contrato, tarefa `FINAL`).
+    pub const FINAL_CHECK: &str = "final_check";
+    /// Diagnóstico de bloqueio de ambiente pelo Arquiteto (JSON `{"root_cause","what_to_do"}`).
+    pub const DIAGNOSIS: &str = "diagnosis";
+    /// Análise de recuperação de tarefa bloqueada pelo Arquiteto (JSON da decisão).
+    pub const RECOVERY: &str = "recovery";
+    /// Todos os códigos (o servidor só publica estes).
+    pub const ALL: [&str; 5] = [PLAN_REVIEW, VERDICT, FINAL_CHECK, DIAGNOSIS, RECOVERY];
 }
 
 /// Destino dos eventos de atividade.
@@ -119,6 +139,8 @@ pub struct ActivityScope {
     spec_id: Option<String>,
     task_id: Option<String>,
     heartbeat: Duration,
+    /// Código da saída estruturada pedida neste escopo (spec 121), levado em todo evento.
+    structured: Option<&'static str>,
 }
 
 impl ActivityScope {
@@ -134,7 +156,14 @@ impl ActivityScope {
             spec_id,
             task_id,
             heartbeat: COMMAND_HEARTBEAT,
+            structured: None,
         }
+    }
+
+    /// Marca o escopo como chamada de saída estruturada (spec 121; código de [`structured`]).
+    pub fn with_structured(mut self, code: &'static str) -> Self {
+        self.structured = Some(code);
+        self
     }
 
     /// Intervalo do heartbeat de comando (injetável em testes).
@@ -232,6 +261,7 @@ impl ActivityRun {
             text,
             code,
             received_bytes,
+            structured: self.scope.structured,
         });
     }
 
@@ -646,6 +676,22 @@ mod tests {
         let sink = Arc::new(Redacting(Recorder::default(), SECRET));
         let scope = ActivityScope::new(sink.clone(), "developer", None, None);
         (sink, scope)
+    }
+
+    #[test]
+    fn structured_scope_marks_every_event_and_plain_scope_none() {
+        let rec = Arc::new(Recorder::default());
+        let run = scope(&rec).with_structured(structured::PLAN_REVIEW).begin();
+        run.delta(StreamDelta::Text("{\"issues\": []}".into()));
+        run.tool("read_file", "{\"path\": \"a.rs\"}");
+        run.end();
+        let ev = rec.events();
+        assert!(ev.len() >= 4, "{ev:?}");
+        assert!(ev.iter().all(|e| e.structured == Some("plan_review")), "{ev:?}");
+        let rec = Arc::new(Recorder::default());
+        scope(&rec).begin().end();
+        assert!(rec.events().iter().all(|e| e.structured.is_none()));
+        assert!(structured::ALL.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')));
     }
 
     #[test]

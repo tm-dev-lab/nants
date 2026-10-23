@@ -100,6 +100,27 @@ describe("Atividade em en", () => {
     expect(portugueseLeftovers(win)).toEqual([]);
   });
 
+  for (const lang of ["pt-BR", "en"] as const) {
+    it(`saída estruturada nunca aparece crua na janela (spec 121, ${lang})`, async () => {
+      const { stream, scheduler } = await mount(lang);
+      await act(async () => {
+        stream().emit("agent_activity", activity({ agent: "reviewer", activity_id: "r1", kind: "start", stage: "Revisão do plano", stage_code: "plan_review", structured: "plan_review" }));
+        stream().emit("agent_activity", activity({ agent: "reviewer", activity_id: "r1", kind: "text", text: '{"issues": []}', stage: "Revisão do plano", stage_code: "plan_review", structured: "plan_review" }));
+        // Sem código (servidor antigo): a reserva pelo texto.
+        stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", activity_id: "d1", kind: "text", text: '```json\n{"ok": true}' }));
+        scheduler.runFrames();
+      });
+      const win = panel(lang);
+      const rev = win.querySelector('[data-agent-card="reviewer"]') as HTMLElement;
+      expect(rev.querySelector("[data-live-state]")?.textContent).toBe(lang === "en" ? "writing" : "escrevendo");
+      expect(rev.querySelector("[data-live-detail]")?.textContent).toBe(lang === "en" ? "preparing the plan review" : "preparando a revisão do plano");
+      const dev = win.querySelector('[data-agent-card="developer"]') as HTMLElement;
+      expect(dev.querySelector("[data-live-detail]")?.textContent).toBe(lang === "en" ? "preparing the response" : "preparando a resposta");
+      for (const line of win.querySelectorAll("[data-live-detail]")) expect(line.textContent ?? "").not.toContain("{");
+      if (lang === "en") expect(portugueseLeftovers(win)).toEqual([]);
+    });
+  }
+
   it("chamada longa ao modelo em en, sem português (spec 114 T04)", async () => {
     const { stream, scheduler } = await mount("en");
     await act(async () => {

@@ -425,6 +425,7 @@ async fn live_activity_endpoint_masks_secrets_404s_and_is_cleared_on_remove() {
         text: text.map(String::from),
         code: None,
         received_bytes: None,
+        structured: None,
     };
     sink.emit(ev(ActivityKind::Start, None));
     sink.emit(ev(ActivityKind::Reasoning, Some("usar chave-super-secreta agora")));

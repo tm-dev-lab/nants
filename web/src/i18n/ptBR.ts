@@ -1044,6 +1044,13 @@ export const ptBR = {
   "activity.state.tests": "rodando os testes",
   "activity.state.working": "trabalhando",
   "activity.state.writing": "escrevendo",
+  // Resposta estruturada em curso (spec 121): o texto humano no lugar do JSON, pelo tipo da chamada.
+  "activity.structured.plan_review": "preparando a revisão do plano",
+  "activity.structured.verdict": "preparando o parecer",
+  "activity.structured.final_check": "conferindo os critérios",
+  "activity.structured.diagnosis": "preparando o diagnóstico",
+  "activity.structured.recovery": "preparando a decisão sobre a tarefa",
+  "activity.structured.default": "preparando a resposta",
   // Chamada ao modelo em curso (spec 114 T04).
   "activity.state.waitingModel": "aguardando o modelo",
   "activity.state.receiving": "recebendo a resposta",

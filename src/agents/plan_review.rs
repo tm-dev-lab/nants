@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agents::activity::{ActivityScope, ActivitySink, NullSink};
+use crate::agents::activity::{structured, ActivityScope, ActivitySink, NullSink};
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_agents::{tool_loop, AgentCtx};
 use crate::agents::llm_client::{log_provider_failure, BadKind, BadReason, ChatMessage, ProviderFailure, Role as ChatRole};
@@ -110,7 +110,9 @@ impl PlanReviewer {
             host: &host,
             tools: tools::specs_report(),
             role: PLAN_REVIEW_ROLE,
-            activity: ActivityScope::new(Arc::clone(&self.activity), PLAN_REVIEW_ROLE, self.spec_id.clone(), None),
+            // Spec 121: a resposta é o JSON da revisão; a Atividade mostra o rótulo, não o texto.
+            activity: ActivityScope::new(Arc::clone(&self.activity), PLAN_REVIEW_ROLE, self.spec_id.clone(), None)
+                .with_structured(structured::PLAN_REVIEW),
             cancel: None,
         };
         let mut messages = vec![
@@ -174,6 +176,23 @@ mod tests {
         assert_eq!(err, ProviderFailure::BadResponse(BadReason::new(BadKind::StepsExhausted)));
         assert_eq!(err.describe(), "provider_bad_response (passos esgotados)");
         assert!(scripted.requests().len() <= PLAN_REVIEW_MAX_STEPS, "{}", scripted.requests().len());
+    }
+
+    /// Spec 121: todo evento da revisão do plano leva o código `plan_review` (a tela não mostra o JSON).
+    #[tokio::test]
+    async fn activity_is_marked_as_plan_review() {
+        use crate::agents::activity::testing::Recorder;
+        let root = tmp_root("plan-review-structured");
+        let scripted = Scripted::new(vec![text("{\"issues\": []}")]);
+        let rec = Arc::new(Recorder::default());
+        reviewer(scripted)
+            .with_activity(rec.clone(), Some("121".into()))
+            .review(&root, "p")
+            .await
+            .expect("ok");
+        let ev = rec.events();
+        assert!(!ev.is_empty());
+        assert!(ev.iter().all(|e| e.structured == Some("plan_review")), "{ev:?}");
     }
 
     #[tokio::test]

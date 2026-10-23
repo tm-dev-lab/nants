@@ -48,6 +48,8 @@ struct Entry {
     /// `code`/`params` do último rótulo de ferramenta e do último texto (spec 102).
     tool_code: Option<Coded>,
     text_code: Option<Coded>,
+    /// Código da saída estruturada do passo (spec 121), quando há.
+    structured: Option<String>,
     updated: Instant,
 }
 
@@ -72,6 +74,8 @@ pub struct Observed<'a> {
     pub code: Option<(&'a str, &'a serde_json::Map<String, serde_json::Value>)>,
     /// Bytes recebidos da resposta do modelo em curso (heartbeat da chamada, spec 114 T04).
     pub received_bytes: Option<u64>,
+    /// Código da saída estruturada do passo (spec 121), já filtrado pelo vocabulário.
+    pub structured: Option<&'a str>,
 }
 
 /// Atividade ao vivo de um (agente, tarefa), como exposta pela API.
@@ -104,6 +108,9 @@ pub struct LiveActivity {
     pub text_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Código da saída estruturada (spec 121): a interface mostra o rótulo dele, não o texto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<String>,
     pub age_ms: u64,
 }
 
@@ -159,6 +166,7 @@ impl LiveActivityRegistry {
             stage_code: ev.stage_code.map(String::from),
             tool_code: None,
             text_code: None,
+            structured: ev.structured.map(String::from),
             updated: now,
         };
         let entry = map.entry(key).or_insert_with(fresh);
@@ -166,6 +174,9 @@ impl LiveActivityRegistry {
             *entry = fresh();
         }
         entry.updated = now;
+        if let Some(code) = ev.structured {
+            entry.structured = Some(code.to_string());
+        }
         let value = ev.text.map(String::from);
         let coded = ev.code.map(|(code, params)| (code.to_string(), params.clone()));
         match ev.kind {
@@ -246,6 +257,7 @@ impl LiveActivityRegistry {
                 tool_params: e.tool_code.as_ref().map(|(_, p)| p.clone()),
                 text_code: e.text_code.as_ref().map(|(c, _)| c.clone()),
                 text_params: e.text_code.as_ref().map(|(_, p)| p.clone()),
+                structured: e.structured.clone(),
                 age_ms: u64::try_from(now.saturating_duration_since(e.updated).as_millis())
                     .unwrap_or(u64::MAX),
             })
@@ -292,6 +304,7 @@ mod tests {
             stage_code: None,
             code: None,
             received_bytes: None,
+            structured: None,
         };
         r.record_at(now, "p", ev);
     }
@@ -330,6 +343,7 @@ mod tests {
             stage_code: None,
             code: None,
             received_bytes,
+            structured: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None));
         r.record_at(t, "p", ev(ActivityKind::Model, None));
@@ -367,6 +381,7 @@ mod tests {
             stage_code: Some(FINAL_VERIFICATION_STAGE),
             code: None,
             received_bytes: None,
+            structured: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start));
         let late = t + Duration::from_secs(600);
@@ -419,12 +434,42 @@ mod tests {
                 stage_code: None,
                 code: None,
                 received_bytes: None,
+                structured: None,
             };
             r.record_at(t, "p", ev);
         }
         assert_eq!(r.snapshot_at(t, "p").len(), MAX_ENTRIES_PER_PROJECT);
         r.clear_project("p");
         assert!(r.snapshot_at(t, "p").is_empty());
+    }
+
+    /// Spec 121: o código da saída estruturada entra no instantâneo (e só quando há).
+    #[test]
+    fn snapshot_carries_structured_code() {
+        let r = LiveActivityRegistry::default();
+        let t = Instant::now();
+        let ev = |kind, text, structured| Observed {
+            agent: "reviewer",
+            task_id: None,
+            spec_id: Some("121"),
+            activity_id: "a1",
+            kind,
+            text,
+            stage: Some("Revisão do plano"),
+            stage_code: Some("plan_review"),
+            code: None,
+            received_bytes: None,
+            structured,
+        };
+        r.record_at(t, "p", ev(ActivityKind::Start, None, Some("plan_review")));
+        r.record_at(t, "p", ev(ActivityKind::Text, Some("{\"issues\": []}"), Some("plan_review")));
+        let s = r.snapshot_at(t, "p");
+        assert_eq!(s[0].structured.as_deref(), Some("plan_review"));
+        assert_eq!(serde_json::to_value(&s[0]).expect("json")["structured"], "plan_review");
+        r.record_at(t, "p", ev(ActivityKind::Start, None, None));
+        let s = r.snapshot_at(t, "p");
+        assert!(s[0].structured.is_none(), "passo novo sem código limpa o anterior");
+        assert!(serde_json::to_value(&s[0]).expect("json").get("structured").is_none());
     }
 
     /// Spec 102: o instantâneo leva o `code`/`params` do último rótulo e do último texto; um
@@ -447,6 +492,7 @@ mod tests {
             stage_code: Some("report"),
             code,
             received_bytes: None,
+            structured: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None, None));
         r.record_at(t, "p", ev(ActivityKind::Tool, Some("gerando imagem web/a.png"), Some(("tool.generate_image", &params))));

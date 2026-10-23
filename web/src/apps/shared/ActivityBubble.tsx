@@ -7,13 +7,13 @@
  */
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { COMMAND_STALE_MS, type ActivityEntry } from "../../store";
-import { stageText, stepText, toolText } from "./activityText";
+import { draftText, stageText, toolText } from "./activityText";
 import { avatarStateForActivity } from "./AgentAvatar";
 import { useT } from "../../i18n/react";
 import { agentLabel, agentTone } from "./agents";
 
 export type ActivityView = Pick<ActivityEntry, "key" | "agent" | "taskId" | "reasoning" | "text" | "tool"> &
-  Partial<Pick<ActivityEntry, "command" | "commandStartedAt" | "commandLastBeat" | "stage" | "stageCode" | "toolCode" | "textCode">>;
+  Partial<Pick<ActivityEntry, "command" | "commandStartedAt" | "commandLastBeat" | "stage" | "stageCode" | "toolCode" | "textCode" | "structured">>;
 
 function Dots() {
   return (
@@ -135,7 +135,7 @@ function ActivityBubble({ activity }: { activity: ActivityView }) {
               {...(testsRun ? { verb: t("activity.running") } : { verb: t("activity.executing"), lastBeat: activity.commandLastBeat })}
             />
           ) : null}
-          {activity.text !== "" ? <Tail testId="activity-text" text={stepText(activity)} className="nd-activity-text" /> : null}
+          {activity.text !== "" ? <Tail testId="activity-text" text={draftText(activity)} className="nd-activity-text" /> : null}
         </div>
       ) : null}
     </div>

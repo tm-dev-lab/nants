@@ -6,7 +6,7 @@
  */
 import type { Coded } from "../../api/codes";
 import type { ToolActionItem } from "../../api/types";
-import { getLanguage, t } from "../../i18n";
+import { getLanguage, t, type MessageKey } from "../../i18n";
 import { translateCode } from "../../i18n/serverCodes";
 import { localizeProviderDetail } from "../../copy";
 import { FINAL_VERIFICATION_STAGE, type ActivityEntry } from "../../store";
@@ -38,6 +38,42 @@ export function stepText(entry: Pick<ActivityEntry, "text"> & Partial<Pick<Activ
   const byCode = activityCodeText(entry.textCode);
   if (byCode !== null) return byCode;
   return entry.text.includes(RETRY_MARK) ? retryDetail(entry.text) : entry.text;
+}
+
+/**
+ * Rótulos das chamadas de saída estruturada (spec 121), pelo código que o servidor manda em
+ * `structured` (`agents::activity::structured`). Código desconhecido usa o rótulo genérico.
+ */
+const STRUCTURED_KEYS: Readonly<Record<string, MessageKey>> = {
+  plan_review: "activity.structured.plan_review",
+  verdict: "activity.structured.verdict",
+  final_check: "activity.structured.final_check",
+  diagnosis: "activity.structured.diagnosis",
+  recovery: "activity.structured.recovery",
+};
+
+/** Rótulo do passo que escreve uma resposta estruturada (spec 121), ou `null` sem código. */
+export function structuredText(entry: Partial<Pick<ActivityEntry, "structured">>): string | null {
+  const code = entry.structured;
+  if (code === undefined) return null;
+  return t(Object.hasOwn(STRUCTURED_KEYS, code) ? (STRUCTURED_KEYS[code] as MessageKey) : "activity.structured.default");
+}
+
+/** Texto que começa como JSON (`{`, `[` ou bloco de código JSON): a reserva da prévia (spec 121). */
+const JSON_START = /^(?:[{[]|```[ \t]*(?:json[ \t]*(?:\r?\n|$)|\r?\n[ \t]*[{[]))/i;
+
+/** O texto ao vivo parece saída estruturada (reserva sem código; só para a prévia da Atividade). */
+export function looksStructured(text: string): boolean {
+  return JSON_START.test(text.trim());
+}
+
+/**
+ * Texto ao vivo do passo (spec 121): aviso fixo pelo `code` primeiro; depois, na chamada de saída
+ * estruturada, o rótulo do tipo dela, nunca o JSON; senão, o texto como veio.
+ */
+export function draftText(entry: Pick<ActivityEntry, "text"> & Partial<Pick<ActivityEntry, "textCode" | "structured">>): string {
+  if (entry.textCode !== undefined) return stepText(entry);
+  return structuredText(entry) ?? stepText(entry);
 }
 
 /** O passo está esperando o limite do provedor (limitador ou limite do provedor, spec 089). */

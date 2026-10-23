@@ -8,12 +8,13 @@
  *
  * Spec 102: os estados, as etapas e os avisos fixos do servidor saem do dicionário no idioma ativo,
  * pelo `code` que o servidor manda junto do texto de reserva (`../shared/activityText`). Só a nova
- * tentativa (088) ainda é reconhecida pela marca do texto. O que o agente escreve aparece como veio.
+ * tentativa (088) ainda é reconhecida pela marca do texto. O que o agente escreve aparece como veio,
+ * exceto a saída estruturada (spec 121), que vira o rótulo do tipo da chamada.
  */
 import { t } from "../../i18n";
 import { parseReviewMessage } from "../../reviewMessage";
 import { belongsToSpec, type ActivityEntry, type ChatMessage } from "../../store";
-import { isPacing, RETRY_CODE, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
+import { draftText, isPacing, looksStructured, RETRY_CODE, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
 import type { InfoKind } from "../attention/attentionModel";
 import { formatBytes } from "../files/filesModel";
 import type { AppSummary, AppSummaryInput } from "../registry";
@@ -47,7 +48,7 @@ export function tailLine(text: string, max = DETAIL_MAX): string {
 }
 
 type LiveSource = Pick<ActivityEntry, "agent" | "reasoning" | "text" | "tool"> &
-  Partial<Pick<ActivityEntry, "command" | "stage" | "stageCode" | "toolCode" | "textCode" | "modelStartedAt" | "modelBytes">>;
+  Partial<Pick<ActivityEntry, "command" | "stage" | "stageCode" | "toolCode" | "textCode" | "structured" | "modelStartedAt" | "modelBytes">>;
 
 /** Tempo decorrido curto: "45 s", "2 min", "1 h 5 min" (sem inventar precisão). */
 export function elapsedText(ms: number): string {
@@ -71,6 +72,17 @@ function modelProgress(activity: Pick<LiveSource, "modelStartedAt" | "modelBytes
   return { state: t(receiving ? "activity.state.receiving" : "activity.state.waitingModel"), detail };
 }
 
+/**
+ * O que o agente está escrevendo (spec 121): nunca a saída estruturada crua. Com o tipo da chamada
+ * (código do servidor), o rótulo dele; sem código, o texto que começa como JSON vira "preparando a
+ * resposta" (reserva só desta prévia: a Conversa mostra a resposta como veio).
+ */
+function writingDetail(activity: LiveSource): string {
+  const shown = draftText(activity);
+  if (activity.textCode === undefined && activity.structured === undefined && looksStructured(shown)) return t("activity.structured.default");
+  return tailLine(shown);
+}
+
 /** Estado e ação ao vivo de uma atividade (`now`: o relógio do tempo da chamada ao modelo). */
 export function liveActionOf(activity: LiveSource, now: number = Date.now()): LiveAction {
   const stage = stageText(activity);
@@ -90,7 +102,7 @@ export function liveActionOf(activity: LiveSource, now: number = Date.now()): Li
   if (activity.agent === "tests" && activity.command !== undefined) return { kind: "tests", state: t("activity.state.tests"), detail: activity.command, stage, model: null };
   if (activity.command !== undefined) return { kind: "command", state: t("activity.executing"), detail: activity.command, stage, model: null };
   if (tool !== "") return { kind: "tool", state: t("activity.state.working"), detail: toolText(activity), stage, model };
-  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: tailLine(stepText(activity)), stage, model };
+  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: writingDetail(activity), stage, model };
   if (activity.reasoning.trim() !== "" || call === null) return { kind: "thinking", state: t("activity.thinking"), detail: tailLine(activity.reasoning), stage, model };
   return { kind: "model", state: call.state, detail: call.detail, stage, model: null };
 }

@@ -640,6 +640,7 @@ export function getProjectActivity(projectId: string): Promise<ApiResult<Activit
         ...(typeof it.received_bytes === "number" && Number.isSafeInteger(it.received_bytes) && it.received_bytes >= 0 ? { received_bytes: it.received_bytes } : {}),
         stage: typeof it.stage === "string" && it.stage !== "" ? it.stage : null,
         ...codedFields(it),
+        ...(typeof it.structured === "string" && it.structured !== "" ? { structured: it.structured } : {}),
         age_ms: age,
       });
     }

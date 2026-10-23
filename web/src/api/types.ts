@@ -765,6 +765,8 @@ export interface AgentActivityPayload {
   stage_params?: unknown;
   code?: unknown;
   params?: unknown;
+  /** Tipo da chamada de saída estruturada (spec 121), em todo evento do passo que a pede. */
+  structured?: unknown;
   /** Só no agente `tests` (spec 071): testes ou checagem, e a tentativa da tarefa. */
   run_kind?: "tests" | "check";
   attempt?: number;
@@ -791,6 +793,8 @@ export interface ActivitySnapshot {
   tool_params?: Readonly<Record<string, string | number>> | null;
   text_code?: string | null;
   text_params?: Readonly<Record<string, string | number>> | null;
+  /** Tipo da chamada de saída estruturada do passo (spec 121). */
+  structured?: string;
   age_ms: number;
 }
 
