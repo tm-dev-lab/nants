@@ -24,7 +24,7 @@ use super::safe_fs::{self, SafeFsError};
 use super::spec_result::validate_spec_id;
 use super::state::AppState;
 use crate::agents::llm_client::StreamCut;
-use crate::agents::usage::{BudgetGuard, CutEvent, UsageEvent, UsageScope, UsageSink};
+use crate::agents::usage::{BudgetGuard, ContextEvent, ContextKind, CutEvent, UsageEvent, UsageScope, UsageSink};
 use crate::config::{PriceSource, Pricing};
 
 /// Limite de tamanho de cada `usage.jsonl` (4 MiB).
@@ -74,6 +74,22 @@ pub struct UsageRecord {
     /// US$). Ausente = pela chave de API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
+    /// Bytes do histórico enviado na chamada (spec 122 T01); ausente nos registros antigos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_bytes: Option<u64>,
+    /// Mensagens do histórico enviado (spec 122 T01).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<u32>,
+    /// Passo da chamada na sessão, a partir de 0 (spec 122 T01).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u32>,
+    /// Id estável da sessão: papel, tarefa e tentativa (spec 122 T01).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Chamada de resumo do histórico (spec 122 T04); ausente = chamada normal do laço. Entra nos
+    /// totais como qualquer outra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<bool>,
 }
 
 /// Valor de `billing` das chamadas pelo plano ChatGPT.
@@ -94,6 +110,15 @@ const NO_SPEC_CUTS_FILE: &str = ".sdd/specs/.cuts.jsonl";
 /// Linhas do exclude local para os diagnósticos de corte (por spec e do chat).
 pub const CUTS_EXCLUDE_LINE: &str = ".sdd/specs/**/cuts.jsonl";
 pub const CUTS_CHAT_EXCLUDE_LINE: &str = ".sdd/specs/.cuts.jsonl";
+
+/// Limite de tamanho de cada `context.jsonl` (1 MiB): eventos de contexto (spec 122 T01).
+pub const MAX_CONTEXT_BYTES: u64 = 1024 * 1024;
+const CONTEXT_FILE: &str = "context.jsonl";
+/// Arquivo dos eventos de contexto sem spec (chat).
+const NO_SPEC_CONTEXT_FILE: &str = ".sdd/specs/.context.jsonl";
+/// Linhas do exclude local para os eventos de contexto (por spec e do chat).
+pub const CONTEXT_EXCLUDE_LINE: &str = ".sdd/specs/**/context.jsonl";
+pub const CONTEXT_CHAT_EXCLUDE_LINE: &str = ".sdd/specs/.context.jsonl";
 
 /// Sink que anexa ao `usage.jsonl` do projeto. Falhas de I/O são ignoradas (não derrubam o agente).
 /// Os diagnósticos de resposta cortada vão para `cuts.jsonl`, com a redação de segredos.
@@ -123,7 +148,7 @@ impl FileUsageSink {
         spec: Option<String>,
         task: Option<String>,
     ) -> UsageScope {
-        UsageScope { sink: Self::new(root, project), agent: agent.to_string(), spec, task }
+        UsageScope::new(Self::new(root, project), agent, spec, task)
     }
 }
 
@@ -154,9 +179,44 @@ impl UsageSink for FileUsageSink {
             estimated: event.estimated.then_some(true),
             cut: event.cut.filter(|c| valid_cut_reason(c)),
             billing: event.billing.as_record().map(str::to_string),
+            context_bytes: event.context.as_ref().map(|c| c.bytes),
+            messages: event.context.as_ref().map(|c| c.messages),
+            step: event.context.as_ref().map(|c| c.step),
+            summary: event.context.as_ref().and_then(|c| c.summary.then_some(true)),
+            session: event.context.and_then(|c| safe_label(&c.session)),
         };
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_USAGE_BYTES);
+        }
+    }
+
+    fn record_context(&self, event: ContextEvent) {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let spec = event.spec.filter(|s| validate_spec_id(s).is_ok());
+        let rel = match &spec {
+            Some(s) => format!("{SPECS_DIR}/{s}/{CONTEXT_FILE}"),
+            None => NO_SPEC_CONTEXT_FILE.to_string(),
+        };
+        let tools: BTreeMap<String, u32> =
+            event.tools.into_iter().filter_map(|(name, n)| safe_label(&name).map(|name| (name, n))).collect();
+        let line = ContextLine {
+            at: format_utc(secs),
+            kind: event.kind.as_str().to_string(),
+            spec,
+            task: event.task.and_then(|t| safe_label(&t)),
+            agent: safe_label(&event.agent).unwrap_or_default(),
+            session: safe_label(&event.session).unwrap_or_default(),
+            step: event.step,
+            before_bytes: event.before_bytes,
+            after_bytes: event.after_bytes,
+            items: event.items,
+            tools,
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            reason: event.reason.filter(|r| valid_cut_reason(r)).map(str::to_string),
+        };
+        if let Ok(line) = serde_json::to_string(&line) {
+            let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_CONTEXT_BYTES);
         }
     }
 
@@ -172,6 +232,52 @@ impl UsageSink for FileUsageSink {
             let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_CUTS_BYTES);
         }
     }
+}
+
+/// Rótulo gravado nos registros de contexto (sessão, tarefa, papel, ferramenta): só
+/// `[A-Za-z0-9_.:-]`, até 80 bytes; outro texto vira `None` (nada de conteúdo do usuário).
+fn safe_label(s: &str) -> Option<String> {
+    let ok = !s.is_empty()
+        && s.len() <= 80
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+    ok.then(|| s.to_string())
+}
+
+/// Linha de `context.jsonl` (spec 122 T01): um evento de contexto, só números e nomes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextLine {
+    pub at: String,
+    /// `compact`, `spill`, `dedup`, `summary` ou `summary_failed`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub step: u32,
+    #[serde(default)]
+    pub before_bytes: u64,
+    #[serde(default)]
+    pub after_bytes: u64,
+    #[serde(default)]
+    pub items: u32,
+    /// Itens afetados por ferramenta (só nomes).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, u32>,
+    /// Tokens de entrada da chamada de resumo (spec 122 T04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Tokens de saída da chamada de resumo (spec 122 T04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// `summary`: o gatilho (`threshold` ou `overflow`); `summary_failed`: o motivo (`empty`,
+    /// `truncated`, `larger`, `provider`). Vocabulário fechado `[a-z_]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Motivo de corte aceito no registro: o vocabulário fixo `[a-z_]`, curto.
@@ -436,6 +542,48 @@ pub struct SpecUsage {
     pub totals: Totals,
     pub tasks: Vec<TaskTotals>,
     pub agents: Vec<NamedTotals>,
+    /// Resumo do contexto da spec (spec 122 T01).
+    pub context: ContextSummary,
+}
+
+/// Resumo do contexto (spec 122 T01), o instrumento de calibração da gestão de contexto. Conta
+/// todas as chamadas, inclusive as do plano ChatGPT: o assunto são tokens, não US$.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ContextSummary {
+    pub calls: u64,
+    /// Tokens de entrada somados.
+    pub input: u64,
+    /// Entrada média por chamada (tokens, arredondada para baixo).
+    pub avg_input: u64,
+    /// Maior entrada de uma chamada (tokens).
+    pub max_input: u64,
+    /// Maior contexto medido em bytes (`context_bytes`); 0 sem chamada medida.
+    pub max_context_bytes: u64,
+    /// Compactações registradas no `context.jsonl`.
+    pub compactions: u64,
+    /// Resumos do histórico bem-sucedidos (`summary`, spec 122 T04); as falhas não contam.
+    pub summaries: u64,
+    /// Bytes evitados: soma de `before_bytes - after_bytes` de todos os eventos de contexto.
+    pub saved_bytes: u64,
+}
+
+impl ContextSummary {
+    fn add_record(&mut self, r: &UsageRecord) {
+        self.calls += 1;
+        self.input += r.input;
+        self.avg_input = self.input / self.calls;
+        self.max_input = self.max_input.max(r.input);
+        self.max_context_bytes = self.max_context_bytes.max(r.context_bytes.unwrap_or(0));
+    }
+
+    fn add_event(&mut self, e: &ContextLine) {
+        if e.kind == ContextKind::Compact.as_str() {
+            self.compactions += 1;
+        } else if e.kind == ContextKind::Summary.as_str() {
+            self.summaries += 1;
+        }
+        self.saved_bytes += e.before_bytes.saturating_sub(e.after_bytes);
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -449,6 +597,8 @@ pub struct UsageView {
     pub by_spec: Vec<NamedTotals>,
     /// Orçamento da spec consultada (`?spec=`), quando definido.
     pub budget: Option<Budget>,
+    /// Resumo do contexto do projeto ou da spec consultada (spec 122 T01).
+    pub context: ContextSummary,
 }
 
 /// Agrega registros por spec, tarefa e agente (sem a trilha de ações).
@@ -472,7 +622,11 @@ pub fn aggregate_with_tools(
     let mut models: BTreeMap<String, Totals> = BTreeMap::new();
     let mut agents: BTreeMap<String, Totals> = BTreeMap::new();
     let mut specs: BTreeMap<String, Totals> = BTreeMap::new();
+    let mut context = ContextSummary::default();
+    let mut spec_context: BTreeMap<Option<String>, ContextSummary> = BTreeMap::new();
     for r in records {
+        context.add_record(r);
+        spec_context.entry(r.spec.clone()).or_default().add_record(r);
         total.add(r, pricing);
         models.entry(r.model.clone()).or_default().add(r, pricing);
         agents.entry(r.agent.clone()).or_default().add(r, pricing);
@@ -525,7 +679,8 @@ pub fn aggregate_with_tools(
                         }
                     })
                     .collect();
-                SpecUsage { spec, totals, tasks, agents: named(agents) }
+                let context = spec_context.remove(&spec).unwrap_or_default();
+                SpecUsage { spec, totals, tasks, agents: named(agents), context }
             })
             .collect(),
         total,
@@ -533,23 +688,40 @@ pub fn aggregate_with_tools(
         by_agent: named(agents),
         by_spec: named(specs),
         budget: None,
+        context,
+    }
+}
+
+/// Soma os eventos de contexto (`context.jsonl`) ao resumo do projeto e ao de cada spec.
+pub fn add_context_events(view: &mut UsageView, events: &[ContextLine]) {
+    for e in events {
+        view.context.add_event(e);
+        if let Some(s) = view.specs.iter_mut().find(|s| s.spec == e.spec) {
+            s.context.add_event(e);
+        }
     }
 }
 
 /// Linhas válidas de um arquivo; ausente ou ilegível → vazio. Linhas inválidas são ignoradas.
-fn read_records(root: &Path, rel: &str) -> Vec<UsageRecord> {
-    match safe_fs::read_regular(root, rel, MAX_USAGE_BYTES + 4096) {
+fn read_lines<T: serde::de::DeserializeOwned>(root: &Path, rel: &str, max: u64) -> Vec<T> {
+    match safe_fs::read_regular(root, rel, max + 4096) {
         Ok(text) => text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect(),
         Err(SafeFsError::Missing) | Err(_) => Vec::new(),
     }
 }
 
-/// Lê o uso de uma spec ou, sem filtro, de todas (inclusive o arquivo sem spec).
-pub fn load_records(root: &Path, spec: Option<&str>) -> Vec<UsageRecord> {
+/// Linhas de um arquivo da spec (ou, sem filtro, de todas e do arquivo sem spec).
+fn load_spec_files<T: serde::de::DeserializeOwned>(
+    root: &Path,
+    spec: Option<&str>,
+    file: &str,
+    no_spec_file: &str,
+    max: u64,
+) -> Vec<T> {
     if let Some(s) = spec {
-        return read_records(root, &format!("{SPECS_DIR}/{s}/{USAGE_FILE}"));
+        return read_lines(root, &format!("{SPECS_DIR}/{s}/{file}"), max);
     }
-    let mut out = read_records(root, NO_SPEC_FILE);
+    let mut out = read_lines(root, no_spec_file, max);
     let Ok(dir) = safe_fs::check_chain(root, SPECS_DIR) else {
         return out;
     };
@@ -563,9 +735,20 @@ pub fn load_records(root: &Path, spec: Option<&str>) -> Vec<UsageRecord> {
         .unwrap_or_default();
     names.sort();
     for n in names {
-        out.extend(read_records(root, &format!("{SPECS_DIR}/{n}/{USAGE_FILE}")));
+        out.extend(read_lines(root, &format!("{SPECS_DIR}/{n}/{file}"), max));
     }
     out
+}
+
+/// Lê o uso de uma spec ou, sem filtro, de todas (inclusive o arquivo sem spec).
+pub fn load_records(root: &Path, spec: Option<&str>) -> Vec<UsageRecord> {
+    load_spec_files(root, spec, USAGE_FILE, NO_SPEC_FILE, MAX_USAGE_BYTES)
+}
+
+/// Eventos de contexto (`context.jsonl`, spec 122 T01) de uma spec ou, sem filtro, de todas. Cada
+/// linha leva a própria spec (a do chat fica `None`).
+pub fn load_context_events(root: &Path, spec: Option<&str>) -> Vec<ContextLine> {
+    load_spec_files(root, spec, CONTEXT_FILE, NO_SPEC_CONTEXT_FILE, MAX_CONTEXT_BYTES)
 }
 
 /// Ações da trilha (`tools.jsonl`, via `safe_fs`) da spec consultada; sem filtro, vazio.
@@ -720,6 +903,7 @@ pub async fn get_usage(
         let records = load_records(&root, q.spec.as_deref());
         let tools = load_tool_marks(&root, q.spec.as_deref());
         let mut view = aggregate_with_tools(&records, &tools, &pricing);
+        add_context_events(&mut view, &load_context_events(&root, q.spec.as_deref()));
         if q.spec.is_some() {
             view.by_spec.clear();
         }
@@ -735,6 +919,7 @@ pub async fn get_usage(
 mod tests {
     use super::*;
     use crate::agents::llm_client::Usage;
+    use crate::agents::usage::ContextStats;
     use crate::i18n::Lang;
     use std::fs;
 
@@ -758,6 +943,7 @@ mod tests {
             estimated: false,
             cut: None,
             billing: Default::default(),
+            context: None,
         }
     }
 
@@ -784,6 +970,11 @@ mod tests {
             estimated: None,
             cut: None,
             billing: None,
+            context_bytes: None,
+            messages: None,
+            step: None,
+            session: None,
+            summary: None,
         };
         let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
         let v = aggregate(&[mk(Some(2)), mk(Some(1)), mk(None)], &pr);
@@ -861,7 +1052,7 @@ mod tests {
     fn cached_without_cached_price_bills_as_input() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None,
         };
         let c = cost_of(&r, &price(1.0, 1.0, None)).expect("preço");
         assert!((c - 0.001).abs() < 1e-12);
@@ -874,7 +1065,7 @@ mod tests {
         let img = |n: u64, q: Option<&str>| UsageRecord {
             at: String::new(), project: String::new(), spec: Some("s1".into()), task: Some("T01".into()),
             agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None,
-            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None,
+            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None,
         };
         // Sem image_per_unit: padrão por qualidade, estimado; soma ao custo dos tokens (US$ 1).
         let pr = price(1.0, 1.0, None);
@@ -1072,6 +1263,11 @@ mod tests {
             estimated: None,
             cut: None,
             billing: None,
+            context_bytes: None,
+            messages: None,
+            step: None,
+            session: None,
+            summary: None,
         };
         let mut pricing = price(1.0, 1.0, None);
         let c = cost_of(&r, &pricing).expect("preço");
@@ -1181,6 +1377,11 @@ mod tests {
             estimated: None,
             cut: None,
             billing: None,
+            context_bytes: None,
+            messages: None,
+            step: None,
+            session: None,
+            summary: None,
         }
     }
 
@@ -1320,12 +1521,7 @@ mod tests {
             .with_wire_api(WireApi::Responses)
             .with_max_response_bytes(256 * 1024);
         let secrets = Arc::new(SecretSet::new(vec![CONFIG_SECRET.to_string(), KEY.to_string()]));
-        let scope = UsageScope {
-            sink: FileUsageSink::redacting(&root, "p1", secrets),
-            agent: "developer".into(),
-            spec: Some("s1".into()),
-            task: Some("T01".into()),
-        };
+        let scope = UsageScope::new(FileUsageSink::redacting(&root, "p1", secrets), "developer", Some("s1".into()), Some("T01".into()));
         let metered = UsageBackend::new(&client, Some(scope));
         let req = ChatRequest {
             model: "m".into(),
@@ -1334,6 +1530,7 @@ mod tests {
             effort: None,
             response_json: false,
             web_search: false,
+            cache_key: None,
         };
         let err = metered.complete_stream(&req, &|_| {}).await.expect_err("cortada");
         assert!(format!("{err:?}").contains("TooLarge"), "{err:?}");
@@ -1379,5 +1576,182 @@ mod tests {
         FileUsageSink::new(&root, "p").record(e);
         let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
         assert!(!text.contains("segredo"), "motivo fora do vocabulário é descartado");
+    }
+
+    fn ctx_event(spec: Option<&str>, session: &str, before: u64, after: u64) -> ContextEvent {
+        ContextEvent {
+            kind: ContextKind::Compact,
+            agent: "developer".into(),
+            spec: spec.map(String::from),
+            task: Some("T01".into()),
+            session: session.into(),
+            step: 7,
+            before_bytes: before,
+            after_bytes: after,
+            items: 3,
+            tools: BTreeMap::from([("read_file".to_string(), 2), ("run_command".to_string(), 1)]),
+            input_tokens: None,
+            output_tokens: None,
+            reason: None,
+        }
+    }
+
+    fn with_context(mut e: UsageEvent, bytes: u64, step: u32) -> UsageEvent {
+        e.context = Some(ContextStats { bytes, messages: 4, step, session: "developer:T01:a1".into(), summary: false });
+        e
+    }
+
+    /// Spec 122 T01: os campos novos de contexto são gravados e relidos.
+    #[test]
+    fn context_fields_are_recorded_and_read_back() {
+        let root = tmp("ctx-fields");
+        let sink = FileUsageSink::new(&root, "p1");
+        sink.record(with_context(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(100, 1)), 2048, 3));
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        let line: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(line["context_bytes"], 2048);
+        assert_eq!(line["messages"], 4);
+        assert_eq!(line["step"], 3);
+        assert_eq!(line["session"], "developer:T01:a1");
+        assert_eq!(line["input"], 100, "os campos antigos continuam");
+        let r = &load_records(&root, Some("s1"))[0];
+        assert_eq!((r.context_bytes, r.messages, r.step, r.session.as_deref()), (Some(2048), Some(4), Some(3), Some("developer:T01:a1")));
+        // Sessão fora do vocabulário não é gravada (nada de texto livre).
+        let mut odd = with_context(ev(Some("s1"), None, "a", "m", Usage::new(1, 1)), 1, 0);
+        if let Some(c) = odd.context.as_mut() {
+            c.session = "dev senha=123".into();
+        }
+        sink.record(odd);
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        assert!(!text.contains("senha"), "{text}");
+    }
+
+    /// Spec 122 T01: registros antigos, sem os campos de contexto, continuam sendo lidos e somados.
+    #[test]
+    fn old_records_without_context_fields_are_still_read() {
+        let root = tmp("ctx-old");
+        let old = r#"{"at":"2026-10-23T12:49:43Z","project":"p1","spec":"s1","task":"T01","agent":"developer","model":"m","input":500,"output":10,"cached":100}"#;
+        fs::write(root.join(".sdd/specs/s1/usage.jsonl"), format!("{old}\n")).expect("w");
+        let records = load_records(&root, Some("s1"));
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].context_bytes, records[0].step, records[0].session.as_deref()), (None, None, None));
+        let mut view = aggregate(&records, &BTreeMap::new());
+        add_context_events(&mut view, &load_context_events(&root, Some("s1")));
+        assert_eq!(view.total.calls, 1);
+        assert_eq!(
+            view.context,
+            ContextSummary { calls: 1, input: 500, avg_input: 500, max_input: 500, max_context_bytes: 0, compactions: 0, summaries: 0, saved_bytes: 0 }
+        );
+    }
+
+    /// Spec 122 T01: o evento de compactação vai para o `context.jsonl` da spec (ou o do chat), com
+    /// o antes e o depois e só números e nomes de ferramentas.
+    #[test]
+    fn compaction_event_is_written_with_before_and_after() {
+        let root = tmp("ctx-events");
+        let sink = FileUsageSink::new(&root, "p1");
+        sink.record_context(ctx_event(Some("s1"), "developer:T01:a1", 300_000, 120_000));
+        sink.record_context(ctx_event(None, "architect:-", 10, 4));
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/context.jsonl")).expect("eventos");
+        let line: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(line["kind"], "compact");
+        assert_eq!(line["session"], "developer:T01:a1");
+        assert_eq!(line["step"], 7);
+        assert_eq!((line["before_bytes"].as_u64(), line["after_bytes"].as_u64()), (Some(300_000), Some(120_000)));
+        assert_eq!(line["items"], 3);
+        assert_eq!(line["tools"]["read_file"], 2);
+        assert!(line["at"].as_str().is_some_and(|a| parse_utc(a).is_some()));
+        assert!(root.join(".sdd/specs/.context.jsonl").is_file(), "sem spec: o arquivo do chat");
+        let all = load_context_events(&root, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|e| e.spec.is_none()).count(), 1);
+    }
+
+    /// Spec 122 T04: a chamada de resumo vai ao `usage.jsonl` marcada (e somada como as demais); o
+    /// evento `summary` leva os tokens e o motivo, e motivo fora do vocabulário é descartado.
+    #[test]
+    fn summary_call_is_marked_and_summary_event_keeps_tokens_and_reason() {
+        let root = tmp("ctx-summary");
+        let sink = FileUsageSink::new(&root, "p1");
+        let mut marked = with_context(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(900, 70)), 3600, 4);
+        if let Some(c) = marked.context.as_mut() {
+            c.summary = true;
+        }
+        sink.record(marked);
+        sink.record(with_context(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(100, 5)), 400, 5));
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains(r#""summary":true"#), "{text}");
+        assert!(!lines[1].contains("summary"), "ausente na chamada normal: {text}");
+        let recs = load_records(&root, Some("s1"));
+        assert_eq!((recs[0].summary, recs[1].summary), (Some(true), None));
+        let view = aggregate(&recs, &BTreeMap::new());
+        assert_eq!((view.total.calls, view.total.input), (2, 1000), "o resumo entra nos Custos");
+        let mut e = ctx_event(Some("s1"), "developer:T01:a1", 40_000, 9_000);
+        e.kind = ContextKind::Summary;
+        e.input_tokens = Some(10_000);
+        e.output_tokens = Some(77);
+        e.reason = Some("threshold");
+        sink.record_context(e.clone());
+        e.kind = ContextKind::SummaryFailed;
+        e.reason = Some("Fora do vocabulário");
+        sink.record_context(e);
+        let events = load_context_events(&root, Some("s1"));
+        assert_eq!(events[0].kind, "summary");
+        assert_eq!((events[0].input_tokens, events[0].output_tokens), (Some(10_000), Some(77)));
+        assert_eq!(events[0].reason.as_deref(), Some("threshold"));
+        assert_eq!((events[1].kind.as_str(), events[1].reason.as_deref()), ("summary_failed", None));
+        let raw = fs::read_to_string(root.join(".sdd/specs/s1/context.jsonl")).expect("eventos");
+        assert!(!raw.contains("Fora"), "{raw}");
+    }
+
+    /// Spec 122 T01: a API de custos devolve o resumo do contexto por projeto e por spec.
+    #[tokio::test]
+    async fn usage_route_returns_the_context_summary() {
+        use crate::config::{Config, Project};
+        let root = tmp("ctx-api");
+        fs::create_dir_all(root.join(".sdd/specs/s2")).expect("mkdir");
+        let sink = FileUsageSink::new(&root, "p1");
+        sink.record(with_context(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(1000, 5)), 4000, 0));
+        sink.record(with_context(ev(Some("s1"), Some("T01"), "developer", "m", Usage::new(3000, 5)), 12000, 1));
+        sink.record(ev(Some("s2"), Some("T01"), "reviewer", "m", Usage::new(500, 5)));
+        sink.record_context(ctx_event(Some("s1"), "developer:T01:a1", 300, 100));
+        sink.record_context(ctx_event(Some("s1"), "developer:T01:a1", 250, 150));
+        // Spec 122 T06: o resumo bem-sucedido conta em `summaries`; a falha, não.
+        let mut summary = ctx_event(Some("s1"), "developer:T01:a1", 1000, 400);
+        summary.kind = ContextKind::Summary;
+        sink.record_context(summary);
+        let mut failed = ctx_event(Some("s1"), "developer:T01:a1", 0, 0);
+        failed.kind = ContextKind::SummaryFailed;
+        sink.record_context(failed);
+        let cfg = Config {
+            projects: vec![Project {
+                id: "p1".into(),
+                name: "P".into(),
+                path: root.to_string_lossy().into_owned(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }],
+            ..Config::default()
+        };
+        let state = AppState::new(tmp("ctx-api-cfg").join("config.toml"), cfg, 3000);
+        let get = |spec: Option<&str>| {
+            get_usage(State(state.clone()), AxPath("p1".into()), Query(UsageQuery { spec: spec.map(String::from) }))
+        };
+        let json = |r: Response| async move {
+            let b = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&b).expect("json")
+        };
+        let all = json(get(None).await.expect("ok")).await;
+        let c = &all["context"];
+        assert_eq!((c["calls"].as_u64(), c["input"].as_u64(), c["avg_input"].as_u64()), (Some(3), Some(4500), Some(1500)));
+        assert_eq!((c["max_input"].as_u64(), c["max_context_bytes"].as_u64()), (Some(3000), Some(12000)));
+        assert_eq!((c["compactions"].as_u64(), c["summaries"].as_u64(), c["saved_bytes"].as_u64()), (Some(2), Some(1), Some(900)));
+        let s1 = all["specs"].as_array().and_then(|a| a.iter().find(|s| s["spec"] == "s1")).expect("s1");
+        assert_eq!((s1["context"]["calls"].as_u64(), s1["context"]["compactions"].as_u64(), s1["context"]["summaries"].as_u64()), (Some(2), Some(2), Some(1)));
+        let s2 = all["specs"].as_array().and_then(|a| a.iter().find(|s| s["spec"] == "s2")).expect("s2");
+        assert_eq!((s2["context"]["compactions"].as_u64(), s2["context"]["max_context_bytes"].as_u64()), (Some(0), Some(0)));
+        let one = json(get(Some("s1")).await.expect("ok")).await;
+        assert_eq!((one["context"]["calls"].as_u64(), one["context"]["saved_bytes"].as_u64()), (Some(2), Some(900)));
+        assert_eq!(one["total"]["calls"], 2, "os totais de antes continuam");
     }
 }

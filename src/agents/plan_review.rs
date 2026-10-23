@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::agents::activity::{structured, ActivityScope, ActivitySink, NullSink};
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_agents::{tool_loop, AgentCtx};
+use crate::agents::summary::SummaryPolicy;
 use crate::agents::llm_client::{log_provider_failure, BadKind, BadReason, ChatMessage, ProviderFailure, Role as ChatRole};
 #[cfg(test)]
 use crate::agents::prompts::plan_review_system;
@@ -94,15 +95,8 @@ impl PlanReviewer {
             Arc::clone(&self.approver),
         )
         .report_only();
-        let metered = UsageBackend::new(
-            self.backend.as_ref(),
-            self.usage.as_ref().map(|sink| UsageScope {
-                sink: Arc::clone(sink),
-                agent: PLAN_REVIEW_ROLE.to_string(),
-                spec: None,
-                task: None,
-            }),
-        );
+        let usage = self.usage.as_ref().map(|sink| UsageScope::new(Arc::clone(sink), PLAN_REVIEW_ROLE, None, None));
+        let metered = UsageBackend::new(self.backend.as_ref(), usage.clone());
         let ctx = AgentCtx {
             backend: &metered,
             model: &self.model,
@@ -114,6 +108,8 @@ impl PlanReviewer {
             activity: ActivityScope::new(Arc::clone(&self.activity), PLAN_REVIEW_ROLE, self.spec_id.clone(), None)
                 .with_structured(structured::PLAN_REVIEW),
             cancel: None,
+            usage,
+            summary: Some(SummaryPolicy::for_window(None)),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, plan_review_system_for(self.lang.get())),
@@ -216,6 +212,8 @@ mod tests {
             assert!(p.contains(kind), "{kind}");
         }
         assert!(p.contains("Preferência") && p.contains("lista vazia") && p.contains("No máximo 8"));
-        assert!(p.len() < 2000, "{}", p.len());
+        // Spec 122 T05: +~200 bytes (ações independentes na mesma resposta; teto 2200 -> 2400).
+        // Spec 122 T02: +~200 bytes (íntegra das saídas cortadas; teto 2000 -> 2200).
+        assert!(p.len() < 2400, "{}", p.len());
     }
 }

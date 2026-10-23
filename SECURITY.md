@@ -39,6 +39,16 @@ Nants runs locally. Examples of what is in scope:
 - ways for agent commands to escape the permission checks or the project folder;
 - problems in the installer or in the verification of release packages.
 
+## Stored tool outputs
+
+When a command or another agent tool produces more output than fits in the agent's context, the
+agent receives the start and the end, and the full output is saved in a local file so the agent
+can read it later. These files stay in the `.nants-outputs` folder of the task's worktree, readable
+only by your user (folder `0700`, files `0600`). They are excluded from Git and deleted with the
+worktree; like any file the agent reads, only the parts it reads go to your model provider. Outside a worktree, the session folder is deleted when
+the session ends. Command output may contain whatever the command printed, so treat the folder like
+the project itself.
+
 ## Local network access
 
 With local network access on (or any address outside loopback, such as `--host` with

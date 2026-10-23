@@ -427,6 +427,7 @@ fn record_usage(link: &ImageGenLink, usage: Option<Usage>, quality: &str) {
             estimated: false,
             cut: None,
             billing: Default::default(),
+            context: None,
         });
     }
 }
@@ -588,12 +589,7 @@ mod tests {
                 spec_dir: self.spec_dir.clone(),
                 task_id: task.into(),
                 guide: guide.into(),
-                usage: Some(UsageScope {
-                    sink: self.sink.clone(),
-                    agent: "developer".into(),
-                    spec: Some("090".into()),
-                    task: Some(task.into()),
-                }),
+                usage: Some(UsageScope::new(self.sink.clone(), "developer", Some("090".into()), Some(task.into()))),
                 secrets: Some(secrets),
             })
         }

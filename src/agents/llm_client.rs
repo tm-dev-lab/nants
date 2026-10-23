@@ -233,6 +233,10 @@ pub struct ChatRequest {
     /// Quando `true` em `wire_api = responses`, acrescenta a ferramenta hospedada `web_search`
     /// (com fallback automático se o provedor a recusar). Ignorado em `chat`.
     pub web_search: bool,
+    /// Spec 122 T05: `prompt_cache_key` do corpo em `wire_api = responses` (inclusive o plano),
+    /// estável dentro de um histórico ([`crate::agents::usage::cache_key`]). Retirada uma vez se o
+    /// provedor recusar o campo. Ignorada em `chat`.
+    pub cache_key: Option<String>,
 }
 
 /// Fonte citada pela busca na web (anotação `url_citation`).
@@ -1077,8 +1081,11 @@ impl LlmClient {
     ) -> Result<(String, bool, bool), Failed> {
         let mut effort = req.effort;
         let mut web = supports_web && req.web_search;
+        // Spec 122 T05: a chave de cache recusada sai uma vez (só existe no corpo Responses).
+        let mut cache = req.cache_key.is_some();
         loop {
-            let attempt = ChatRequest { web_search: web, ..req.clone() };
+            let cache_key = if cache { req.cache_key.clone() } else { None };
+            let attempt = ChatRequest { web_search: web, cache_key, ..req.clone() };
             let builder = self
                 .http
                 .post(format!("{}{path}", self.base_url))
@@ -1088,7 +1095,9 @@ impl LlmClient {
                 let web_rejected = supports_web && req.web_search && !web;
                 return Ok((body, req.effort.is_some() && effort.is_none(), web_rejected));
             }
-            if status.as_u16() == 400 && web && rejects_web_search(&body) {
+            if status.as_u16() == 400 && cache && rejects_cache_key(&body) {
+                cache = false;
+            } else if status.as_u16() == 400 && web && rejects_web_search(&body) {
                 web = false;
             } else if status.as_u16() == 400 && effort.is_some() && rejected(&body) {
                 effort = None;
@@ -1287,6 +1296,7 @@ impl LlmClient {
             effort: req.effort,
             web: responses && req.web_search,
             plan,
+            cache: responses && req.cache_key.is_some(),
         };
         let prompt_estimate = self.estimate_tokens(req);
         // Modo plano (spec 116 T02): item retirado por `unsupported_capability` (uma vez por chamada,
@@ -1296,7 +1306,8 @@ impl LlmClient {
         let mut renewed = false;
         loop {
             let mut body = if responses {
-                build_responses_body(&ChatRequest { web_search: opts.web, ..req.clone() }, opts.effort)?
+                let cache_key = if opts.cache { req.cache_key.clone() } else { None };
+                build_responses_body(&ChatRequest { web_search: opts.web, cache_key, ..req.clone() }, opts.effort)?
             } else {
                 build_body(req, opts.effort)
             };
@@ -1800,7 +1811,18 @@ fn build_responses_body(req: &ChatRequest, effort: Option<Effort>) -> Result<Val
     if req.response_json {
         body["text"] = json!({ "format": { "type": "json_object" } });
     }
+    if let Some(key) = req.cache_key.as_deref().filter(|k| !k.is_empty()) {
+        body[PROMPT_CACHE_KEY_FIELD] = json!(key);
+    }
     Ok(body)
+}
+
+/// Campo da chave de cache no corpo Responses (spec 122 T05).
+const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+
+/// O 400 recusou a `prompt_cache_key`?
+fn rejects_cache_key(body: &str) -> bool {
+    body.contains(PROMPT_CACHE_KEY_FIELD)
 }
 
 /// Acrescenta a `input` os itens correspondentes a uma mensagem (exceto `system`).
@@ -2136,6 +2158,8 @@ struct StreamOpts {
     web: bool,
     /// Modo plano ChatGPT (spec 116): `stream` nunca sai do pedido.
     plan: bool,
+    /// `prompt_cache_key` ainda incluída no pedido (spec 122 T05).
+    cache: bool,
 }
 
 impl StreamOpts {
@@ -2153,6 +2177,10 @@ impl StreamOpts {
 
     /// Desliga o campo recusado por um 400; `false` quando nada resta a relaxar.
     fn relax(&mut self, body: &str, responses: bool) -> bool {
+        if self.cache && rejects_cache_key(body) {
+            self.cache = false;
+            return true;
+        }
         if self.web && rejects_web_search(body) {
             self.web = false;
             return true;
@@ -2475,6 +2503,7 @@ pub(crate) mod tests {
             effort,
             response_json: false,
             web_search: false,
+            cache_key: None,
         }
     }
 
@@ -3577,6 +3606,57 @@ pub(crate) mod tests {
         let resp = responses_client(base).chat(&web_request()).await.expect("ok");
         assert!(resp.web_search_rejected && resp.fallback_used);
         assert_eq!(cap.lock().expect("lock").len(), 3);
+    }
+
+    fn keyed(mut req: ChatRequest) -> ChatRequest {
+        req.cache_key = Some("nants-abc123-developer:T05:a1-0f0f".into());
+        req
+    }
+
+    /// Spec 122 T05: a chave de cache vai no corpo Responses, como texto.
+    #[tokio::test]
+    async fn responses_body_carries_the_prompt_cache_key() {
+        let (base, cap) = spawn_server(vec![(200, RESP_TEXT)]).await;
+        responses_client(base).chat(&keyed(responses_request())).await.expect("chat");
+        let body = body_of(&cap.lock().expect("lock")[0]);
+        assert_eq!(body["prompt_cache_key"], "nants-abc123-developer:T05:a1-0f0f");
+        // Sem chave, o campo não vai.
+        let (base, cap) = spawn_server(vec![(200, RESP_TEXT)]).await;
+        responses_client(base).chat(&responses_request()).await.expect("chat");
+        assert!(body_of(&cap.lock().expect("lock")[0]).get("prompt_cache_key").is_none());
+    }
+
+    /// Spec 122 T05: o protocolo Chat não muda: o corpo com chave é igual ao corpo sem chave.
+    #[tokio::test]
+    async fn chat_wire_body_is_unchanged_by_the_cache_key() {
+        let (base, cap) = spawn_server(vec![(200, OK_BODY), (200, OK_BODY)]).await;
+        let client = LlmClient::new(base, KEY.into()).expect("client");
+        client.chat(&keyed(request(Some(Effort::High)))).await.expect("ok");
+        client.chat(&request(Some(Effort::High))).await.expect("ok");
+        let captured = cap.lock().expect("lock").clone();
+        assert!(!captured[0].contains("prompt_cache_key"));
+        assert_eq!(body_of(&captured[0]), body_of(&captured[1]));
+    }
+
+    /// Spec 122 T05: o 400 que recusa a chave repete uma vez sem ela, mantendo os demais campos.
+    #[tokio::test]
+    async fn cache_key_refusal_retries_once_without_the_key() {
+        let rejection = r#"{"error":{"message":"Unrecognized request argument supplied: prompt_cache_key"}}"#;
+        let (base, cap) = spawn_server(vec![(400, rejection), (200, RESP_TEXT)]).await;
+        let resp = responses_client(base).chat(&keyed(responses_request())).await.expect("sem a chave");
+        assert_eq!(resp.message.content, "olá");
+        assert!(!resp.fallback_used, "o esforço não foi relaxado");
+        let captured = cap.lock().expect("lock").clone();
+        assert_eq!(captured.len(), 2);
+        assert!(body_of(&captured[0]).get("prompt_cache_key").is_some());
+        let second = body_of(&captured[1]);
+        assert!(second.get("prompt_cache_key").is_none());
+        assert_eq!(second["reasoning"]["effort"], "high");
+        // Recusada de novo, sem mais nada a relaxar: o erro sobe.
+        let (base, cap) = spawn_server(vec![(400, rejection), (400, rejection)]).await;
+        let err = responses_client(base).chat(&keyed(responses_request())).await.expect_err("falha");
+        assert!(matches!(err, LlmError::Http { status: 400, .. }), "{err:?}");
+        assert_eq!(cap.lock().expect("lock").len(), 2);
     }
 
     #[test]

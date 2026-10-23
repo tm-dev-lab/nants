@@ -14,7 +14,7 @@ import { portugueseLeftovers } from "../../i18n/ptLeftovers";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 import { formatTokens, formatUsd } from "../../usageFormat";
-import { budgetProgress, costsSummary, pacingText } from "./costsModel";
+import { budgetProgress, contextEffectText, costsSummary, pacingText } from "./costsModel";
 
 afterEach(() => {
   cleanup();
@@ -26,8 +26,12 @@ afterEach(() => {
 const P1 = makeProject("p1", "Shop");
 const totals = (cost: number | null, input = 1000, output = 500) => ({ calls: 2, input, output, cached: 0, reasoning: 0, cost_usd: cost, unpriced_calls: 0 });
 
+// Resumo do contexto (spec 122): tokens evitados = bytes / 4 (340.000 -> 85,0 mil; 40.000 -> 10,0 mil).
+const ctx = (compactions: number, summaries: number, saved_bytes: number) => ({ calls: 2, input: 1000, avg_input: 500, max_input: 600, max_context_bytes: 2400, compactions, summaries, saved_bytes });
+
 const PROJECT: UsageView = {
   specs: [],
+  context: ctx(12, 1, 340_000),
   total: { ...totals(1234.5, 12_000, 4_000), cost_estimated: true, images: 2, images_usd: 0.04, images_estimated: true, unpriced_calls: 2, web_search_calls: 3, web_search_usd: 0.03 },
   by_spec: [
     { id: "s1", ...totals(1000) },
@@ -46,6 +50,7 @@ const SPEC: UsageView = {
   specs: [{ spec: "s1", ...totals(0.1), agents: [], tasks: [{ id: "T01", ...totals(0.06), active_secs: 600 }] }],
   total: totals(0.1),
   budget: { max_usd: 5 },
+  context: ctx(3, 0, 40_000),
 };
 
 async function openCosts(lang: "pt-BR" | "en", project: UsageView = PROJECT) {
@@ -84,6 +89,10 @@ describe("Custos em en", () => {
     expect(within(win).getByRole("region", { name: "Project cost" })).toBeTruthy();
     expect(within(win).getByTestId("images-hint").textContent).toBe("includes 2 images (estimated)");
     await waitFor(() => expect(win.querySelector("[data-budget-bar]")?.textContent).toBe("Spec s1: US$ 0.10 of US$ 5.00"));
+    expect([...within(win).getByRole("region", { name: "Context management effect" }).querySelectorAll("p")].map((p) => p.textContent)).toEqual([
+      "Context management: 12 compactions, 1 summary, about 85.0K tokens avoided (estimate)",
+      "In spec s1: 3 compactions, 0 summaries, about 10.0K tokens avoided",
+    ]);
     expect(within(win).getByRole("progressbar", { name: "Spec s1 budget" })).toBeTruthy();
     expect([...within(win).getByRole("region", { name: "Top costs" }).querySelectorAll("li")].map((li) => li.textContent)).toEqual([
       "DeveloperUS$ 999.96",
@@ -180,6 +189,10 @@ describe("Custos em pt-BR e troca ao vivo", () => {
     await waitFor(() => expect(within(win).getByTestId("usage-cost").textContent).toBe("US$ 1.234,50 (estimado)"));
     expect(within(win).getByTestId("images-hint").textContent).toBe("inclui 2 imagens (estimado)");
     await waitFor(() => expect(win.querySelector("[data-budget-bar]")?.textContent).toBe("Spec s1: US$ 0,10 de US$ 5,00"));
+    expect([...within(win).getByRole("region", { name: "Efeito da gestão de contexto" }).querySelectorAll("p")].map((p) => p.textContent)).toEqual([
+      "Gestão de contexto: 12 compactações, 1 resumo, cerca de 85,0 mil tokens evitados (estimativa)",
+      "Na spec s1: 3 compactações, 0 resumos, cerca de 10,0 mil tokens evitados",
+    ]);
     expect(win.querySelector("[data-costs-details] summary")?.textContent).toBe("Ver detalhes por tarefa e modelo");
     await openAll(win);
     expect(win.querySelector("[data-costs-tokens]")?.textContent).toBe("12,0 mil entrada, 4,0 mil saída · 2 chamadas");
@@ -195,7 +208,19 @@ describe("Custos em pt-BR e troca ao vivo", () => {
     expect(within(win).getByTestId("usage-cost").textContent).toBe("US$ 1,234.50 (estimated)");
     expect(win.querySelector("[data-costs-tokens]")?.textContent).toBe("12.0K input, 4.0K output · 2 calls");
     expect(win.querySelector("[data-budget-bar]")?.textContent).toBe("Spec s1: US$ 0.10 of US$ 5.00");
+    expect(win.querySelector("[data-costs-context] p")?.textContent).toBe("Context management: 12 compactions, 1 summary, about 85.0K tokens avoided (estimate)");
     expect(document.getElementById(windowSubtitleId("costs"))?.textContent).toBe("live · this project");
     expect(portugueseLeftovers(win)).toEqual([]);
+  });
+
+  it("efeito da gestão de contexto: some sem efeito ou sem o resumo (servidor antigo); singular e plural", () => {
+    setLanguage("pt-BR", { persist: false });
+    expect(contextEffectText(undefined)).toBeNull();
+    expect(contextEffectText(ctx(0, 0, 0))).toBeNull();
+    expect(contextEffectText(ctx(1, 2, 2_000))).toBe("Gestão de contexto: 1 compactação, 2 resumos, cerca de 500 tokens evitados (estimativa)");
+    expect(contextEffectText(ctx(0, 0, 4_000), "s9")).toBe("Na spec s9: 0 compactações, 0 resumos, cerca de 1,0 mil tokens evitados");
+    setLanguage("en", { persist: false });
+    expect(contextEffectText(ctx(1, 1, 2_000))).toBe("Context management: 1 compaction, 1 summary, about 500 tokens avoided (estimate)");
+    expect(contextEffectText(ctx(2, 0, 0), "s9")).toBe("In spec s9: 2 compactions, 0 summaries, about 0 tokens avoided");
   });
 });

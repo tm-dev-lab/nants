@@ -126,7 +126,23 @@ describe("Custos: em destaque (095/T05)", () => {
     expect(more.open).toBe(false);
     expect(more.querySelector("summary")?.textContent).toBe("Ver detalhes por tarefa e modelo");
     expect((win.querySelector("[data-costs-budget]") as HTMLDetailsElement).open).toBe(false);
+    // Sem o resumo do contexto (servidor antigo), nenhuma linha de contexto.
+    expect(win.querySelector("[data-costs-context]")).toBeNull();
     expect(findForbiddenGlyphs(win)).toEqual([]);
+  });
+
+  it("efeito da gestão de contexto (spec 122): uma linha à vista, fora dos detalhes; sem efeito, nada", async () => {
+    const context = { calls: 2, input: 1000, avg_input: 500, max_input: 600, max_context_bytes: 2400, compactions: 4, summaries: 1, saved_bytes: 48_000 };
+    await openCosts({}, { ...PROJECT, context });
+    const win = costs();
+    const region = await within(win).findByRole("region", { name: "Efeito da gestão de contexto" });
+    expect(region.closest("details")).toBeNull();
+    expect([...region.querySelectorAll("p")].map((p) => p.textContent)).toEqual(["Gestão de contexto: 4 compactações, 1 resumo, cerca de 12,0 mil tokens evitados (estimativa)"]);
+    expect(findForbiddenGlyphs(region)).toEqual([]);
+    cleanup();
+    await openCosts({}, { ...PROJECT, context: { ...context, compactions: 0, summaries: 0, saved_bytes: 0 } });
+    await waitFor(() => expect(within(costs()).getByTestId("usage-cost").textContent).toBe("US$ 0,13"));
+    expect(costs().querySelector("[data-costs-context]")).toBeNull();
   });
 
   it("CSS: total de 32 px em 600 com tabular-nums; raio cheio só nas barras de progresso", () => {

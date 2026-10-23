@@ -249,6 +249,23 @@ interface SpecUsage extends UsageTotals {
   spec: string | null;
   tasks: TaskUsage[];
   agents: NamedUsage[];
+  /** Resumo do contexto da spec (spec 122). */
+  context?: ContextSummary;
+}
+
+/**
+ * Resumo da gestão de contexto (spec 122): chamadas e tokens de entrada, compactações, resumos do
+ * histórico e bytes tirados do contexto pelos eventos (`saved_bytes`, soma de antes menos depois).
+ */
+export interface ContextSummary {
+  calls: number;
+  input: number;
+  avg_input: number;
+  max_input: number;
+  max_context_bytes: number;
+  compactions: number;
+  summaries: number;
+  saved_bytes: number;
 }
 
 /** Orçamento opcional de uma spec. */
@@ -266,6 +283,8 @@ export interface UsageView {
   /** Só na consulta do projeto inteiro (sem filtro de spec); chat sem spec vem como `chat`. */
   by_spec?: NamedUsage[];
   budget: SpecBudget | null;
+  /** Resumo do contexto do projeto ou da spec consultada (spec 122); ausente em servidor antigo. */
+  context?: ContextSummary;
 }
 
 /** Corpo de `POST /api/config/connections/test`. */

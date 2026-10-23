@@ -76,6 +76,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::agents::llm_client::{ImageInput, ToolSpec};
 use crate::agents::runner::{validate_scope, BlockReason, ACCEPTANCE, BLOCK_REVISED, OBJECTIVE};
+use crate::agents::spill;
 use crate::harness::allowlist::{evaluate, Decision, Policy};
 use crate::harness::browser::BrowserTests;
 use crate::harness::compose::{ComposeEnv, HeadTail};
@@ -88,6 +89,9 @@ use crate::sdd::{Settings, Spec, SpecStatus, SddError, Task, TaskStatus, Verdict
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Tamanho máximo de arquivo lido, pesquisado ou editado.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Teto de `read_file` por faixas num arquivo acima de [`MAX_FILE_BYTES`] (spec 122 T02): cobre a
+/// íntegra guardada de uma saída de ferramenta (até 50 MB).
+const MAX_STREAMED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Caminhos (relativos à raiz) que nenhuma escrita pode tocar, independentemente do escopo.
 const FIXED_EXCLUDED_FILE: &str = ".sdd/settings.yaml";
 /// Subcomandos de `git` permitidos a qualquer papel (somente leitura).
@@ -1147,6 +1151,11 @@ impl ToolHost {
         self
     }
 
+    /// Raiz do host (a worktree do agente, ou o projeto).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Recusa `write_sdd_artifacts` neste host (turno somente de leitura).
     pub fn report_only(mut self) -> Self {
         self.sdd_writes_enabled = false;
@@ -1495,17 +1504,26 @@ impl ToolHost {
     fn read_file(&self, args: &Value) -> Result<String, ToolError> {
         let raw = arg(args, "path")?;
         let path = self.resolve_read(raw)?;
-        self.report_gate(raw, &path)?;
+        // Spec 122 T02: os turnos só de leitura também leem a íntegra das saídas (só essa pasta).
+        if !self.is_stored_output(raw, &path) {
+            self.report_gate(raw, &path)?;
+        }
         if path.is_dir() {
             return Err(ToolError::InvalidArgs("o caminho é um diretório".into()));
         }
-        ensure_small(&path)?;
         let start = opt_positive(args, "start_line")?;
         let max = opt_positive(args, "max_lines")?;
-        let content = fs::read_to_string(&path)?;
+        // Spec 122 T02: arquivo grande (a íntegra guardada de uma saída de ferramenta, um log) é
+        // lido por faixas sem carregá-lo inteiro, até [`MAX_STREAMED_FILE_BYTES`].
+        let text = if ensure_small(&path).is_ok() {
+            read_range(&fs::read_to_string(&path)?, start, max)
+        } else {
+            ensure_streamable(&path)?;
+            read_range_streamed(&path, start, max)?
+        };
         // Leitura por faixa também conta como leitura prévia.
         self.remember(&path);
-        Ok(read_range(&content, start, max))
+        Ok(text)
     }
 
     fn list_dir(&self, args: &Value) -> Result<String, ToolError> {
@@ -2309,6 +2327,22 @@ impl ToolHost {
         real.strip_prefix(&root).ok().map(Path::to_path_buf)
     }
 
+    /// Arquivo regular de `.nants-outputs/<sessão>/<n>.txt` (spec 122 T02), pelo pedido e pelo
+    /// destino real: a única exceção de leitura à allowlist do relatório.
+    fn is_stored_output(&self, raw: &str, real: &Path) -> bool {
+        let shape = |rel: &Path| {
+            normal_parts(rel).is_some_and(|p| {
+                let outputs: Vec<&str> = spill::OUTPUTS_DIR.split('/').collect();
+                p.len() == outputs.len() + 2 && p.starts_with(&outputs) && p.last().is_some_and(|n| n.ends_with(".txt"))
+            })
+        };
+        let lexical = normalize_rel(raw).ok();
+        let real_rel = self.rel_of_real(real);
+        lexical.as_deref().is_some_and(shape)
+            && real_rel.as_deref().is_some_and(shape)
+            && fs::symlink_metadata(real).is_ok_and(|m| m.is_file())
+    }
+
     /// Relatório: o pedido (`raw`, lexical) e o destino real precisam passar na allowlist.
     fn report_gate(&self, raw: &str, real: &Path) -> Result<(), ToolError> {
         if !self.report {
@@ -2406,6 +2440,20 @@ fn check_scope_key(scope: WriteScope, allowed: &[String], key: &str) -> Result<(
     } else {
         Err(ToolError::OutOfScope(key.to_string()))
     }
+}
+
+/// Como [`ensure_small`], com o teto de [`MAX_STREAMED_FILE_BYTES`] da leitura por faixas.
+fn ensure_streamable(path: &Path) -> Result<(), ToolError> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(ToolError::InvalidArgs("não é arquivo regular".into()));
+    }
+    if meta.len() > MAX_STREAMED_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "arquivo grande demais (limite de {MAX_STREAMED_FILE_BYTES} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 /// Exige arquivo regular (não FIFO, socket ou dispositivo, que poderiam bloquear a thread)
@@ -3206,6 +3254,45 @@ fn read_range(content: &str, start: Option<usize>, max: Option<usize>) -> String
     if first > total {
         return format!("linhas: nenhuma (start_line {first} além do fim; arquivo com {total} linhas)");
     }
+    render_range(&lines[first - 1..], total, first, max, ranged)
+}
+
+/// Leitura de um arquivo grande (spec 122 T02: a íntegra guardada de uma saída de ferramenta),
+/// sem carregá-lo inteiro: conta as linhas e guarda só as da faixa que cabem no resultado. Mesmo
+/// formato de [`read_range`]; bytes fora de UTF-8 viram U+FFFD.
+fn read_range_streamed(path: &Path, start: Option<usize>, max: Option<usize>) -> Result<String, ToolError> {
+    use std::io::BufRead;
+    let ranged = start.is_some() || max.is_some();
+    let first = start.unwrap_or(1);
+    let mut reader = io::BufReader::new(fs::File::open(path)?);
+    let mut window: Vec<String> = Vec::new();
+    let mut kept = 0usize;
+    let mut total = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        total += 1;
+        let in_range = total >= first && max.is_none_or(|m| total - first < m);
+        // Basta guardar até passar do orçamento: a renderização corta na linha que o excede.
+        if in_range && kept <= MAX_TOOL_RESULT_BYTES {
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            kept += line.len();
+            window.push(line);
+        }
+    }
+    if first > total {
+        return Ok(format!("linhas: nenhuma (start_line {first} além do fim; arquivo com {total} linhas)"));
+    }
+    let lines: Vec<&str> = window.iter().map(String::as_str).collect();
+    Ok(render_range(&lines, total, first, max, ranged))
+}
+
+/// Corpo comum de [`read_range`] e [`read_range_streamed`]: `lines` começa na linha `first`
+/// (1-based) e traz pelo menos as linhas que cabem no orçamento mais a que o excede.
+fn render_range(lines: &[&str], total: usize, first: usize, max: Option<usize>, ranged: bool) -> String {
     let wanted = max.unwrap_or(total).min(total - first + 1);
     let footer = format!("\n[arquivo com {total} linhas; use start_line/max_lines para ler o restante]");
     // Reserva o cabeçalho no pior caso (números com o tamanho do total).
@@ -3213,7 +3300,7 @@ fn read_range(content: &str, start: Option<usize>, max: Option<usize>) -> String
     let budget = MAX_TOOL_RESULT_BYTES.saturating_sub(footer.len() + if ranged { header_room } else { 0 });
     let mut body = String::new();
     let mut taken = 0;
-    for line in &lines[first - 1..first - 1 + wanted] {
+    for line in lines.iter().take(wanted) {
         if body.len() + line.len() > budget {
             break;
         }
@@ -3223,7 +3310,7 @@ fn read_range(content: &str, start: Option<usize>, max: Option<usize>) -> String
     let cut = taken < wanted;
     if cut && taken == 0 {
         // Linha única maior que o orçamento: corta a própria linha.
-        let line = lines[first - 1];
+        let line = lines.first().copied().unwrap_or_default();
         body.push_str(&line[..line.floor_char_boundary(budget)]);
         taken = 1;
     }
@@ -3373,7 +3460,9 @@ fn walk(
         let rel = path.strip_prefix(root).unwrap_or(path.as_path());
         if file_type.is_dir() {
             let name = entry.file_name();
-            if name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)) || !filter(rel, true) {
+            // As íntegras guardadas (spec 122 T02) repetiriam saídas antigas na busca.
+            let outputs = rel == Path::new(spill::OUTPUTS_DIR);
+            if name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)) || outputs || !filter(rel, true) {
                 continue;
             }
             walk(&path, root, pattern, filter, hits)?;
@@ -4814,6 +4903,52 @@ mod tests {
         assert_eq!(none, "nenhum resultado");
     }
 
+    /// Spec 122 T02: acima de 1 MiB (a íntegra guardada de uma saída), a leitura por faixas lê o
+    /// arquivo aos poucos, no mesmo formato; acima do teto, recusa sem ler.
+    #[tokio::test]
+    async fn read_file_streams_large_file_by_range() {
+        let root = tmp_dir("readlarge");
+        fs::create_dir_all(root.join(".nants-outputs/s")).expect("mkdir");
+        let text: String = (1..=40_000).map(|i| format!("linha {i} {}\n", "z".repeat(30))).collect();
+        assert!(text.len() as u64 > MAX_FILE_BYTES);
+        fs::write(root.join(".nants-outputs/s/1.txt"), &text).expect("w");
+        let h = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Deny);
+        let read = |args: Value| h.call(ToolName::ReadFile, args);
+        let out = read(json!({"path": ".nants-outputs/s/1.txt", "start_line": 39_999, "max_lines": 5})).await.expect("faixa");
+        assert_eq!(out, format!("linhas 39999 a 40000 de 40000\nlinha 39999 {z}\nlinha 40000 {z}\n", z = "z".repeat(30)));
+        let head = read(json!({"path": ".nants-outputs/s/1.txt"})).await.expect("começo");
+        assert!(head.starts_with("linha 1 ") && head.len() <= MAX_TOOL_RESULT_BYTES, "{}", head.len());
+        assert!(head.ends_with("[arquivo com 40000 linhas; use start_line/max_lines para ler o restante]"));
+        let none = read(json!({"path": ".nants-outputs/s/1.txt", "start_line": 50_000})).await.expect("além");
+        assert!(none.starts_with("linhas: nenhuma"), "{none}");
+        let huge = fs::File::create(root.join("huge.txt")).expect("f");
+        huge.set_len(MAX_STREAMED_FILE_BYTES + 1).expect("esparso");
+        assert!(matches!(read(json!({"path": "huge.txt"})).await, Err(ToolError::InvalidArgs(_))));
+    }
+
+    /// Spec 122 T02: no relatório (`report_only`), só a leitura das íntegras guardadas sai da
+    /// allowlist: arquivo `.txt` em `.nants-outputs/<sessão>/`, também pelo destino real.
+    #[tokio::test]
+    async fn report_only_reads_only_the_stored_outputs() {
+        let root = tmp_dir("report-outputs");
+        fs::create_dir_all(root.join(".nants-outputs/s")).expect("mkdir");
+        fs::create_dir_all(root.join(".nants")).expect("mkdir");
+        fs::write(root.join(".nants/compose.yaml"), "services: {}\n").expect("w");
+        fs::write(root.join(".env"), "SEGREDO=1\n").expect("w");
+        fs::write(root.join(".nants-outputs/s/1.txt"), "saída guardada\n").expect("w");
+        fs::write(root.join(".nants-outputs/s/x.env"), "SEGREDO=2\n").expect("w");
+        fs::write(root.join(".nants-outputs/solto.txt"), "fora da sessão\n").expect("w");
+        std::os::unix::fs::symlink(root.join(".env"), root.join(".nants-outputs/s/2.txt")).expect("ln");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny).report_only();
+        let read = |p: &str| h.call(ToolName::ReadFile, json!({"path": p}));
+        assert_eq!(read(".nants-outputs/s/1.txt").await.expect("íntegra"), "saída guardada\n");
+        for denied in [".nants/compose.yaml", ".nants-outputs/s/x.env", ".nants-outputs/solto.txt", ".nants-outputs/s/2.txt", ".env"] {
+            assert!(matches!(read(denied).await, Err(ToolError::Denied(_))), "{denied}");
+        }
+        let list = h.call(ToolName::ListDir, json!({"path": ".nants-outputs/s"})).await;
+        assert!(matches!(list, Err(ToolError::Denied(_))), "só leitura de arquivo: {list:?}");
+    }
+
     #[tokio::test]
     async fn read_file_by_range_with_header_and_invalid_values() {
         let root = tmp_dir("readrange");
@@ -5415,8 +5550,12 @@ mod tests {
         fs::write(root.join("small.txt"), "needle").expect("small");
         let h = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Deny);
 
-        let read = h.call(ToolName::ReadFile, json!({"path": "big.txt"})).await;
-        assert!(matches!(read, Err(ToolError::InvalidArgs(_))), "{read:?}");
+        // Spec 122 T02: acima de 1 MiB, a leitura é aos poucos e limitada ao resultado.
+        let read = h.call(ToolName::ReadFile, json!({"path": "big.txt"})).await.expect("ler");
+        assert!(read.starts_with("needle aaa") && read.len() <= MAX_TOOL_RESULT_BYTES, "{}", read.len());
+        // As íntegras guardadas das saídas ficam fora da busca.
+        fs::create_dir_all(root.join(".nants-outputs/s")).expect("mkdir");
+        fs::write(root.join(".nants-outputs/s/1.txt"), "needle").expect("saída");
         let patch = h
             .call(ToolName::ApplyPatch, json!({"path": "big.txt", "old": "needle", "new": "x"}))
             .await;

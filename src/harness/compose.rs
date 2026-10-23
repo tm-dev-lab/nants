@@ -1333,6 +1333,42 @@ mod tests {
         assert_eq!(builds, 2, "rebuild forçado");
     }
 
+    /// Spec 122 T02: as íntegras guardadas na raiz do projeto (fora de `.nants/`) não mudam o hash
+    /// aprovado, não tocam o `.dockerignore` versionado do projeto e não sujam a base, nem depois
+    /// de um `prepare`.
+    #[test]
+    fn stored_outputs_leave_the_environment_and_the_base_untouched() {
+        use crate::agents::spill::{Spill, OUTPUTS_DIR};
+        let dir = project("outputs-base", COMPOSE);
+        fs::write(dir.join(".nants/Dockerfile.dockerignore"), "node_modules").expect("w");
+        let vcs = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=Nants Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        vcs(&["init", "-q", "-b", "main"]);
+        vcs(&["add", "."]);
+        vcs(&["commit", "-q", "-m", "inicial"]);
+        let good = env_hash(&dir).expect("hash");
+        let fake = Arc::new(FakeRunner::default());
+        let env = env_with(&fake).with_approved_hash(Some(good.clone()));
+        let mut spill = Spill::new(&dir, "architect");
+        let rel = spill.store(&"x".repeat(4096)).expect("guardada");
+        assert!(rel.starts_with(&format!("{OUTPUTS_DIR}/")), "{rel}");
+        assert_eq!(env_hash(&dir), Some(good), "o hash do ambiente não muda");
+        env.prepare(&dir).expect("o hash continua aprovado");
+        assert!(fake.subcommands().iter().any(|x| x == "build"));
+        assert_eq!(fs::read_to_string(dir.join(".nants/Dockerfile.dockerignore")).expect("r"), "node_modules");
+        assert_eq!(vcs(&["status", "--porcelain", "--untracked-files=all"]), "", "base limpa");
+        drop(spill);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn empty_approved_set_fails_closed() {
         let dir = project("emptyset", COMPOSE);

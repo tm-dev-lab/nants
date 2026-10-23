@@ -41,6 +41,7 @@ fn req() -> ChatRequest {
         effort: None,
         response_json: false,
         web_search: false,
+        cache_key: None,
     }
 }
 

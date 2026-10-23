@@ -45,6 +45,9 @@ const EXCLUDE_LINE: &str = ".sdd/worktrees/";
 const USAGE_EXCLUDE_LINE: &str = ".sdd/specs/**/usage.jsonl";
 /// Cópias das capturas de tela vistas pelo Revisor (spec 082 T03): ficam fora do Git.
 const CAPTURES_EXCLUDE_LINE: &str = ".sdd/specs/*/captures/";
+/// Íntegras das saídas grandes de ferramenta (spec 122 T02): ficam fora do controle de versão. O
+/// `info/exclude` do repositório vale também para as worktrees.
+const OUTPUTS_EXCLUDE_LINE: &str = ".nants-outputs/";
 /// Artefatos do Playwright (spec 036): ficam fora do Git.
 const PLAYWRIGHT_EXCLUDE_LINES: [&str; 2] = ["test-results/", "playwright-report/"];
 const BUDGET_EXCLUDE_LINE: &str = ".sdd/specs/**/budget.json";
@@ -501,7 +504,10 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         USAGE_CHAT_EXCLUDE_LINE,
         super::usage::CUTS_EXCLUDE_LINE,
         super::usage::CUTS_CHAT_EXCLUDE_LINE,
+        super::usage::CONTEXT_EXCLUDE_LINE,
+        super::usage::CONTEXT_CHAT_EXCLUDE_LINE,
         CAPTURES_EXCLUDE_LINE,
+        OUTPUTS_EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
     ] {
@@ -2084,6 +2090,8 @@ Texto.
         assert_eq!(exclude.lines().filter(|l| *l == EXCLUDE_LINE).count(), 1, "{exclude}");
         // Spec 082 T03: as cópias das capturas vistas pelo Revisor ficam fora do Git.
         assert_eq!(exclude.lines().filter(|l| *l == CAPTURES_EXCLUDE_LINE).count(), 1, "{exclude}");
+        // Spec 122 T02: as íntegras das saídas de ferramenta também.
+        assert_eq!(exclude.lines().filter(|l| *l == OUTPUTS_EXCLUDE_LINE).count(), 1, "{exclude}");
         assert_eq!(fs::read_to_string(proj.join(".gitignore")).expect("gi"), "target/\n");
     }
 

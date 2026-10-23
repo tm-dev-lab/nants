@@ -69,6 +69,7 @@ fn req(effort: Option<Effort>) -> ChatRequest {
         effort,
         response_json: false,
         web_search: false,
+        cache_key: None,
     }
 }
 
@@ -540,4 +541,27 @@ async fn api_key_stream_with_empty_output_uses_the_items() {
     assert_eq!(got.finish_reason.as_deref(), Some("length"));
     let usage = got.usage.expect("usage");
     assert_eq!((usage.prompt, usage.completion), (5, 9));
+}
+
+/// Spec 122 T05: no stream Responses, a chave vai no corpo e o 400 que a recusa repete uma vez sem
+/// ela; no Chat, o corpo não muda.
+#[tokio::test]
+async fn stream_cache_key_goes_on_responses_and_is_dropped_when_refused() {
+    let err = r#"{"error":{"message":"Unknown parameter: 'prompt_cache_key'."}}"#.to_string();
+    let ok = ev("response.completed", &completed());
+    let (base, cap) = raw_server(vec![(400, "application/json", err), (200, SSE, ok)]).await;
+    let keyed = ChatRequest { cache_key: Some("nants-k".into()), ..req(Some(Effort::Low)) };
+    client(base, WireApi::Responses).chat_stream(&keyed, &|_| {}).await.expect("ok");
+    let c = cap.lock().expect("lock").clone();
+    assert_eq!(c.len(), 2);
+    assert_eq!(body_of(&c[0])["prompt_cache_key"], "nants-k");
+    let second = body_of(&c[1]);
+    assert!(second.get("prompt_cache_key").is_none());
+    assert_eq!(second["stream"], true);
+    assert_eq!(second["reasoning"], json!({"effort":"low","summary":"auto"}));
+
+    let (base, cap) = raw_server(vec![(200, SSE, chat_chunks())]).await;
+    client(base, WireApi::Chat).chat_stream(&keyed, &|_| {}).await.expect("ok");
+    let body = body_of(&cap.lock().expect("lock")[0]);
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
 }

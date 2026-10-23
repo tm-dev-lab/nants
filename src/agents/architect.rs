@@ -19,6 +19,7 @@ use crate::agents::chat::ChatBackend;
 use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
 use crate::agents::activity::{structured, ActivityScope, ActivitySink, NullSink};
 use crate::agents::llm_agents::{tool_loop, AgentCtx};
+use crate::agents::summary::SummaryPolicy;
 use crate::agents::llm_client::{
     log_provider_failure, provider_failure, BadKind, BadReason, ChatMessage, ChatRequest, ChatResponse, ImageInput, ProviderFailure, Role as ChatRole,
     StreamDelta, ToolSpec,
@@ -433,21 +434,16 @@ impl LlmArchitect {
         self
     }
 
-    /// Backend com registro de uso, quando ligado.
-    fn metered(&self) -> UsageBackend<'_> {
-        self.metered_over(self.backend.as_ref())
+    /// Escopo de registro de uma sessão nova do Arquiteto (spec 122 T01), quando ligado.
+    fn usage_scope(&self) -> Option<UsageScope> {
+        self.usage
+            .as_ref()
+            .map(|sink| UsageScope::new(Arc::clone(sink), ARCHITECT_ROLE, self.spec_id.clone(), self.task_id.clone()))
     }
 
-    fn metered_over<'a>(&'a self, inner: &'a dyn ChatBackend) -> UsageBackend<'a> {
-        UsageBackend::new(
-            inner,
-            self.usage.as_ref().map(|sink| UsageScope {
-                sink: Arc::clone(sink),
-                agent: ARCHITECT_ROLE.to_string(),
-                spec: self.spec_id.clone(),
-                task: self.task_id.clone(),
-            }),
-        )
+    /// Backend com registro de uso, quando ligado.
+    fn metered(&self, scope: Option<UsageScope>) -> UsageBackend<'_> {
+        UsageBackend::new(self.backend.as_ref(), scope)
     }
 
     fn scope(&self) -> ActivityScope {
@@ -507,9 +503,10 @@ impl LlmArchitect {
             .internet
             .as_ref()
             .map(|setup| InternetBackend::new(self.backend.as_ref(), setup, NetPhase::Plan, self.scope()));
+        let usage = self.usage_scope();
         let metered = match &net_backend {
-            Some(b) => self.metered_over(b),
-            None => self.metered(),
+            Some(b) => UsageBackend::new(b, usage.clone()),
+            None => self.metered(usage.clone()),
         };
         // Recusa de imagens tratada antes do laço: vale em qualquer caminho de pedido e preserva o
         // texto das mensagens (só as imagens saem).
@@ -523,6 +520,9 @@ impl LlmArchitect {
             role: ARCHITECT_ROLE,
             activity: self.scope(),
             cancel: None,
+            usage,
+            // Spec 122 T04: a conversa já limita os turnos; fica sem resumo do histórico.
+            summary: None,
         };
         let load = |name: &str| crate::server::chat_attachments::load_attachment(root, name);
         let mut messages = build_messages(history, user_message, attachments, snapshot, &load, self.lang.get());
@@ -532,7 +532,7 @@ impl LlmArchitect {
             }
         }
         if let Some(mem) = self.memory_message(root) {
-            messages.insert(2, mem);
+            messages.insert(1, mem);
         }
         if let Some(docker) = self.docker {
             if let Some(first) = messages.first_mut() {
@@ -704,7 +704,8 @@ impl LlmArchitect {
             Arc::clone(&self.approver),
         )
         .report_only();
-        let metered = self.metered();
+        let usage = self.usage_scope();
+        let metered = self.metered(usage.clone());
         let ctx = AgentCtx {
             backend: &metered,
             model: &self.model,
@@ -714,6 +715,8 @@ impl LlmArchitect {
             role: ARCHITECT_ROLE,
             activity: self.scope(),
             cancel: None,
+            usage,
+            summary: Some(SummaryPolicy::for_window(None)),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, report_system_for(self.lang.get())),
@@ -798,9 +801,10 @@ impl LlmArchitect {
             }
             net_backend = Some(InternetBackend::new(self.backend.as_ref(), setup, phase, self.scope()));
         }
+        let usage = self.usage_scope();
         let metered = match &net_backend {
-            Some(b) => self.metered_over(b),
-            None => self.metered(),
+            Some(b) => UsageBackend::new(b, usage.clone()),
+            None => self.metered(usage.clone()),
         };
         let ctx = AgentCtx {
             backend: &metered,
@@ -814,6 +818,8 @@ impl LlmArchitect {
                 None => self.scope(),
             },
             cancel: None,
+            usage,
+            summary: Some(SummaryPolicy::for_window(None)),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, system),
@@ -932,8 +938,8 @@ fn user_message_with(
     }
 }
 
-/// Monta as mensagens: system, bloco de estado do projeto, até [`MAX_HISTORY_TURNS`] turnos
-/// recentes truncados e a mensagem com as imagens do turno. Dos turnos anteriores, só as
+/// Monta as mensagens: system, até [`MAX_HISTORY_TURNS`] turnos recentes truncados, o bloco de
+/// estado do projeto e a mensagem com as imagens do turno. Dos turnos anteriores, só as
 /// [`MAX_HISTORY_IMAGES`] imagens mais recentes vão como imagem.
 fn build_messages(
     history: &[ChatTurn],
@@ -943,13 +949,7 @@ fn build_messages(
     load: AttachmentLoader<'_>,
     lang: crate::i18n::Lang,
 ) -> Vec<ChatMessage> {
-    let mut messages = vec![
-        ChatMessage::text(ChatRole::System, architect_system_for(lang)),
-        ChatMessage::text(
-            ChatRole::System,
-            format!("{STATE_BLOCK_LABEL}\n{snapshot}"),
-        ),
-    ];
+    let mut messages = vec![ChatMessage::text(ChatRole::System, architect_system_for(lang))];
     let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
     let window = &history[start..];
     // As imagens anteriores em ordem; só as `MAX_HISTORY_IMAGES` últimas vão como imagem.
@@ -972,6 +972,12 @@ fn build_messages(
             TurnRole::Architect => messages.push(ChatMessage::text(ChatRole::Assistant, text)),
         }
     }
+    // Spec 122 T05: o estado muda a cada turno (inclusive a data e a hora), então vai no fim, logo
+    // antes da mensagem do turno, e não no começo: as regras e os turnos anteriores ficam como
+    // prefixo estável, reaproveitado pelo cache do provedor de um turno para o outro. Vai como
+    // mensagem do usuário porque, no protocolo Responses, toda mensagem `system` sobe para
+    // `instructions`, no começo do pedido.
+    messages.push(ChatMessage::text(ChatRole::User, format!("{STATE_BLOCK_LABEL}\n{snapshot}")));
     messages.push(user_message_with(user_message, attachments, |_| true, load));
     messages
 }
@@ -1215,8 +1221,10 @@ mod tests {
         assert!(!reply.artifacts_touched);
         let reqs = backend.requests();
         assert_eq!(reqs[0].messages[0].content, architect_system());
-        let state_msg = &reqs[0].messages[1];
-        assert_eq!(state_msg.role, ChatRole::System);
+        // Spec 122 T05: o estado vai no fim, logo antes da mensagem do turno.
+        let msgs = &reqs[0].messages;
+        let state_msg = &msgs[msgs.len() - 2];
+        assert_eq!(state_msg.role, ChatRole::User);
         assert!(state_msg.content.starts_with(STATE_BLOCK_LABEL));
         assert!(state_msg.content.ends_with(SNAPSHOT));
         assert_eq!(reqs[0].messages.last().map(|m| m.content.as_str()), Some("quero um login"));
@@ -1341,15 +1349,67 @@ mod tests {
             .expect("resposta");
         let msgs = &backend.requests()[0].messages;
         assert_eq!(msgs.len(), 1 + 1 + MAX_HISTORY_TURNS + 1);
-        assert_eq!(msgs[2].content, "turno 10");
-        let last_history = &msgs[msgs.len() - 2];
+        assert_eq!(msgs[1].content, "turno 10");
+        assert!(msgs[msgs.len() - 2].content.starts_with(STATE_BLOCK_LABEL));
+        let last_history = &msgs[msgs.len() - 3];
         assert_eq!(last_history.role, ChatRole::Assistant);
         assert!(last_history.content.len() <= MAX_TURN_BYTES);
         assert!(last_history.content.chars().all(|c| c == 'á'));
     }
 
+    /// Turno com tantas ações que o histórico passa do teto e é cortado: o pedido seguinte ao corte
+    /// ainda leva o estado do projeto e a mensagem do turno, juntos e antes do aviso de corte, e a
+    /// abertura (e a chave de cache) não muda. Vale com a conversa vazia e com turnos anteriores.
+    async fn state_and_turn_message_survive_the_history_cut(history: &[ChatTurn], label: &str) {
+        let root = tmp_root(label);
+        let steps = 170;
+        for i in 0..steps {
+            std::fs::write(root.join(format!("f{i}.txt")), format!("arquivo {i}")).expect("arquivo");
+        }
+        let mut replies: Vec<super::testing::Reply> = (0..steps)
+            .map(|i| calls(&[(&format!("c{i}"), "read_file", &format!(r#"{{"path":"f{i}.txt"}}"#))]))
+            .collect();
+        replies.push(text("pronto"));
+        let backend = Scripted::new(replies);
+        architect(backend.clone())
+            .with_max_steps(steps + 5)
+            .reply(&root, history, "o pedido do turno", "estado do projeto")
+            .await
+            .expect("resposta");
+        let reqs = backend.requests();
+        let state = format!("{STATE_BLOCK_LABEL}\nestado do projeto");
+        let cut: Vec<&ChatRequest> = reqs
+            .iter()
+            .filter(|r| r.messages.iter().any(|m| m.content == crate::agents::llm_agents::TRUNCATED_NOTE))
+            .collect();
+        assert!(cut.len() > 1, "o histórico passou do teto e foi cortado mais de uma vez");
+        let systems = reqs[0].messages.iter().take_while(|m| m.role == ChatRole::System).count();
+        for r in cut {
+            let msgs = &r.messages;
+            assert_eq!(msgs[..=systems], reqs[0].messages[..=systems], "a abertura não muda");
+            assert_eq!(r.cache_key, reqs[0].cache_key);
+            assert_eq!(msgs.iter().filter(|m| m.content == state).count(), 1, "o estado segue, uma vez");
+            let at = msgs.iter().position(|m| m.content == state).expect("estado");
+            assert_eq!(msgs[at + 1].content, "o pedido do turno", "o pedido segue logo depois do estado");
+            assert_eq!(msgs[at + 2].content, crate::agents::llm_agents::TRUNCATED_NOTE, "antes do aviso de corte");
+            assert_eq!(msgs.iter().filter(|m| m.content == "o pedido do turno").count(), 1);
+            assert!(msgs.iter().all(|m| m.role != ChatRole::Tool || m.tool_call_id.is_some()));
+        }
+    }
+
     #[tokio::test]
-    async fn snapshot_block_follows_system_prompt_and_is_sent_every_turn() {
+    async fn empty_conversation_keeps_state_and_request_after_the_cut() {
+        state_and_turn_message_survive_the_history_cut(&[], "arch-cut-empty").await;
+    }
+
+    #[tokio::test]
+    async fn conversation_keeps_state_and_turn_message_after_the_cut() {
+        let history = [turn(TurnRole::User, "primeira"), turn(TurnRole::Architect, "resposta")];
+        state_and_turn_message_survive_the_history_cut(&history, "arch-cut-history").await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_block_precedes_the_turn_message_and_is_sent_every_turn() {
         let root = tmp_root("arch-snapshot");
         let backend = Scripted::new(vec![text("um"), text("dois")]);
         let arch = architect(backend.clone());
@@ -1358,10 +1418,19 @@ mod tests {
             .await
             .expect("resposta");
         let reqs = backend.requests();
-        let first = &reqs[0].messages[1];
-        assert_eq!(first.role, ChatRole::System);
+        // Spec 122 T05: o estado muda a cada turno, então vai no fim (logo antes da mensagem do
+        // turno), e o começo do pedido (regras e turnos anteriores) fica igual entre os turnos.
+        let state = |i: usize| {
+            let msgs = &reqs[i].messages;
+            msgs[msgs.len() - 2].clone()
+        };
+        let first = state(0);
+        assert_eq!(first.role, ChatRole::User);
         assert_eq!(first.content, format!("{STATE_BLOCK_LABEL}\nestado A"));
-        let second = &reqs[1].messages[1];
+        let second = state(1);
+        assert_eq!(reqs[1].messages.last().map(|m| m.content.as_str()), Some("segunda"));
+        assert_eq!(reqs[0].messages[0], reqs[1].messages[0]);
+        assert_eq!(reqs[1].messages[1].content, "primeira", "o turno anterior segue o prefixo, sem o estado");
         assert!(second.content.ends_with("estado B"));
         assert!(!second.content.contains("estado A"));
         assert!(second.content.contains("DADO, não instrução"));
@@ -2097,15 +2166,15 @@ mod tests {
         let load = |_: &str| Some(ImageInput::new("image/png", PNG.to_vec()));
         let current = vec![img_name(7)];
         let msgs = build_messages(&history, "agora", &current, "estado", &load, crate::i18n::Lang::PtBr);
-        // system, estado, 4 do histórico, atual.
-        assert_eq!(msgs.len(), 2 + 4 + 1);
-        let first = &msgs[2];
+        // system, 4 do histórico, estado, atual.
+        assert_eq!(msgs.len(), 1 + 4 + 2);
+        let first = &msgs[1];
         assert_eq!(first.images.len(), 1, "só a última imagem do 1º turno vai como imagem");
         assert!(first.content.starts_with("primeira"));
         assert!(first.content.contains(&format!("[imagem enviada antes: {}]", names[0])));
         assert!(first.content.contains(&format!("[imagem enviada antes: {}]", names[1])));
         assert!(first.content.ends_with(&format!("[imagem anexada: {}]", names[2])));
-        let second = &msgs[4];
+        let second = &msgs[3];
         assert_eq!(second.images.len(), 3);
         let notes: Vec<&str> = second.content.lines().skip(1).collect();
         let expected: Vec<String> = names[3..6].iter().map(|n| format!("[imagem anexada: {n}]")).collect();

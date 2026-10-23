@@ -9,6 +9,8 @@ pub mod llm_client;
 pub mod plan_review;
 pub mod prompts;
 pub mod runner;
+pub mod spill;
+pub mod summary;
 pub mod usage;
 
 /// Erros do cliente LLM.

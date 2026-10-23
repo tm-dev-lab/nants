@@ -89,12 +89,9 @@ impl CommandJudge for ArchitectJudge {
         Box::pin(async move {
             let metered = UsageBackend::new(
                 self.backend.as_ref(),
-                self.usage.as_ref().map(|sink| UsageScope {
-                    sink: Arc::clone(sink),
-                    agent: "architect".to_string(),
-                    spec: None,
-                    task: None,
-                }),
+                self.usage
+                    .as_ref()
+                    .map(|sink| UsageScope::new(Arc::clone(sink), "architect", None, None).with_session("architect:judge")),
             );
             let briefing = scrub_text(
                 &self.secrets,
@@ -107,6 +104,7 @@ impl CommandJudge for ArchitectJudge {
                 effort: self.effort,
                 response_json: true,
                 web_search: false,
+                cache_key: None,
             };
             match tokio::time::timeout(JUDGE_TIMEOUT, metered.complete(&req)).await {
                 Ok(Ok(resp)) => parse_verdict(&resp.message.content).ok_or_else(|| "resposta inválida do juiz".to_string()),

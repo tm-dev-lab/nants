@@ -886,6 +886,7 @@ mod tests {
             effort: None,
             response_json: false,
             web_search: false,
+            cache_key: None,
         };
         let client = crate::agents::llm_client::LlmClient::from_connection(&conn)
             .expect("cliente")

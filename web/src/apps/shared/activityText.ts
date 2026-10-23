@@ -50,6 +50,7 @@ const STRUCTURED_KEYS: Readonly<Record<string, MessageKey>> = {
   final_check: "activity.structured.final_check",
   diagnosis: "activity.structured.diagnosis",
   recovery: "activity.structured.recovery",
+  summary: "activity.structured.summary",
 };
 
 /** Rótulo do passo que escreve uma resposta estruturada (spec 121), ou `null` sem código. */

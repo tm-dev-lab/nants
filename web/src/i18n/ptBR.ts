@@ -1050,6 +1050,7 @@ export const ptBR = {
   "activity.structured.final_check": "conferindo os critérios",
   "activity.structured.diagnosis": "preparando o diagnóstico",
   "activity.structured.recovery": "preparando a decisão sobre a tarefa",
+  "activity.structured.summary": "resumindo o histórico",
   "activity.structured.default": "preparando a resposta",
   // Chamada ao modelo em curso (spec 114 T04).
   "activity.state.waitingModel": "aguardando o modelo",
@@ -1164,6 +1165,13 @@ export const ptBR = {
   "costs.budget.invalidUsd": "US$: use um número maior ou igual a zero.",
   "costs.budget.removed": "Limite removido.",
   "costs.budget.saved": "Limite salvo.",
+  "costs.context.project": "Gestão de contexto: {compactions}, {summaries}, cerca de {tokens} tokens evitados (estimativa)",
+  "costs.context.spec": "Na spec {spec}: {compactions}, {summaries}, cerca de {tokens} tokens evitados",
+  "costs.context.compactions.one": "{count} compactação",
+  "costs.context.compactions.other": "{count} compactações",
+  "costs.context.summaries.one": "{count} resumo",
+  "costs.context.summaries.other": "{count} resumos",
+  "costs.context.label": "Efeito da gestão de contexto",
 
   // App, Execução, Arquivos e Relatório (spec 102, T04).
   "common.back": "Voltar",

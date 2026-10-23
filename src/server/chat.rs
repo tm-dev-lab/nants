@@ -1436,10 +1436,12 @@ mod tests {
         let (second, dynb) = backend(vec![text("resposta 2")]);
         turn(&state, PROJECT_ID, "pergunta 2", dynb, CHAT_TIMEOUT).await;
         let msgs = &second.requests()[0].messages;
+        // Spec 122 T05: system, histórico, estado do projeto e a mensagem do turno.
         assert_eq!(msgs.len(), 5);
-        assert_eq!(msgs[2].content, "pergunta 1");
-        assert_eq!(msgs[3].role, ChatRole::Assistant);
-        assert_eq!(msgs[3].content, "resposta 1");
+        assert_eq!(msgs[1].content, "pergunta 1");
+        assert_eq!(msgs[2].role, ChatRole::Assistant);
+        assert_eq!(msgs[2].content, "resposta 1");
+        assert!(msgs[3].content.starts_with("ESTADO ATUAL DO PROJETO"), "{}", msgs[3].content);
         assert_eq!(msgs[4].content, "pergunta 2");
 
         // Histórico longo: só os 40 turnos mais recentes seguem para o modelo.
@@ -1461,7 +1463,7 @@ mod tests {
         turn(&state, PROJECT_ID, "atual", dynb, CHAT_TIMEOUT).await;
         let msgs = &third.requests()[0].messages;
         assert_eq!(msgs.len(), 1 + 1 + MAX_HISTORY_TURNS + 1);
-        assert_eq!(msgs[2].content, "antigo 10");
+        assert_eq!(msgs[1].content, "antigo 10");
     }
 
     #[test]
@@ -1733,6 +1735,7 @@ mod tests {
             effort: None,
             response_json: false,
             web_search: false,
+            cache_key: None,
         }
     }
 
@@ -2277,9 +2280,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let msgs = &second.requests()[0].messages;
         assert_eq!(msgs.len(), 5);
-        assert_eq!(msgs[2].role, ChatRole::User);
-        assert_eq!(msgs[2].content, INTERNAL_MSG);
-        assert_eq!(msgs[3].content, "Plano atualizado.");
+        assert_eq!(msgs[1].role, ChatRole::User);
+        assert_eq!(msgs[1].content, INTERNAL_MSG);
+        assert_eq!(msgs[2].content, "Plano atualizado.");
+        assert!(msgs[3].content.starts_with("ESTADO ATUAL DO PROJETO"), "{}", msgs[3].content);
         assert_eq!(msgs[4].content, "próxima");
     }
 
@@ -2303,8 +2307,10 @@ mod tests {
         let (first, dynb) = backend(vec![text("Aguardando aprovação.")]);
         let (status, body) = turn(&state, PROJECT_ID, "primeira", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let msg = &first.requests()[0].messages[1];
-        assert_eq!(msg.role, ChatRole::System);
+        // Spec 122 T05: o estado vai no fim, logo antes da mensagem do turno.
+        let reqs = first.requests();
+        let msg = &reqs[0].messages[reqs[0].messages.len() - 2];
+        assert_eq!(msg.role, ChatRole::User);
         assert!(msg.content.starts_with("ESTADO ATUAL DO PROJETO"), "{}", msg.content);
         assert!(msg.content.contains("001-demo"), "{}", msg.content);
         assert!(msg.content.contains("AWAITING_APPROVAL"), "{}", msg.content);
@@ -2315,8 +2321,9 @@ mod tests {
         let (status, body) = turn(&state, PROJECT_ID, "segunda", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let msgs = &second.requests()[0].messages;
-        assert!(msgs[1].content.contains("COMPLETED"), "{}", msgs[1].content);
-        assert!(!msgs[1].content.contains("AWAITING_APPROVAL"), "{}", msgs[1].content);
+        let state_msg = &msgs[msgs.len() - 2];
+        assert!(state_msg.content.contains("COMPLETED"), "{}", state_msg.content);
+        assert!(!state_msg.content.contains("AWAITING_APPROVAL"), "{}", state_msg.content);
 
         // O snapshot não entra no histórico persistido nem na resposta.
         let persisted = fs::read_to_string(root.join(CHAT_FILE_REL)).expect("histórico");

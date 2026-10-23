@@ -213,6 +213,9 @@ pub struct AgentSetup {
     pub effort: Effort,
     /// Teto de passos configurado (spec 081 T01), já ajustado à faixa; `None` = padrão do papel.
     pub max_steps: Option<usize>,
+    /// Janela de entrada do modelo pelo catálogo de preços em cache (spec 122 T04), base do limiar
+    /// do resumo do histórico; `None` = o padrão declarado.
+    pub context_window: Option<usize>,
 }
 
 /// Entradas para montar o runner de um projeto. Já validadas pelo handler.
@@ -385,6 +388,7 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         .with_memory(Arc::clone(&job.secrets))
         .with_cancel(Arc::clone(&job.cancel))
         .with_lang(job.lang.clone())
+        .with_context_window(job.developer.context_window)
         .with_browser(Arc::new(crate::harness::browser::BrowserTests::real(job.project_id.clone())));
         let developer = match job.developer.max_steps {
             Some(n) => developer.with_max_steps(n),
@@ -421,7 +425,8 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         .with_usage(usage)
         .with_memory(Arc::clone(&job.secrets))
         .with_cancel(Arc::clone(&job.cancel))
-        .with_lang(job.lang.clone());
+        .with_lang(job.lang.clone())
+        .with_context_window(job.reviewer.context_window);
         let reviewer = match job.reviewer.max_steps {
             Some(n) => reviewer.with_max_steps(n),
             None => reviewer,
@@ -1003,9 +1008,21 @@ async fn launch(
         let current = state.config().read().await;
         current.clone()
     };
-    let developer = agent_setup(&cfg, &cfg.agents.developer, "developer", state.llm_backend(), Some(&state))?;
-    let reviewer = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", state.llm_backend(), Some(&state))?;
+    let mut developer = agent_setup(&cfg, &cfg.agents.developer, "developer", state.llm_backend(), Some(&state))?;
+    let mut reviewer = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", state.llm_backend(), Some(&state))?;
     let architect = agent_setup(&cfg, &cfg.agents.architect, "architect", state.llm_backend(), Some(&state)).ok();
+    // Spec 122 T04: a janela de cada modelo pelo catálogo já em cache (sem rede).
+    let catalog_dir = state.config_path().parent().map(Path::to_path_buf).unwrap_or_default();
+    let window_models = [developer.model.clone(), reviewer.model.clone()];
+    let windows = blocking(move || {
+        let names: Vec<&str> = window_models.iter().map(String::as_str).collect();
+        Ok(super::price_catalog::cached_context_windows(&catalog_dir, &names))
+    })
+    .await
+    .unwrap_or_default();
+    let window = |i: usize| windows.get(i).copied().flatten().and_then(|w| usize::try_from(w).ok());
+    developer.context_window = window(0);
+    reviewer.context_window = window(1);
     // Spec 090 T02: com backend substituto (testes), nenhum gerador real chega à rede.
     let images = match state.llm_backend() {
         Some(_) => None,
@@ -2782,6 +2799,7 @@ fn agent_setup(
         model: agent.model.clone(),
         effort: agent.effort,
         max_steps: agent.max_steps_clamped(),
+        context_window: None,
     })
 }
 
@@ -5434,6 +5452,7 @@ mod tests {
             estimated: false,
             cut: None,
             billing: Default::default(),
+            context: None,
         });
         fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
         let before = fs::read_to_string(root.join(TASK_T01)).expect("T01");
@@ -6375,6 +6394,7 @@ mod tests {
                 estimated: false,
                 cut: None,
                 billing: Default::default(),
+                context: None,
             });
             fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
             let (task_before, settings_before) = (fs::read_to_string(t01_path(&root)).expect("T01"), settings_text(&root));

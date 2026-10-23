@@ -109,8 +109,11 @@ pub mod structured {
     pub const DIAGNOSIS: &str = "diagnosis";
     /// Análise de recuperação de tarefa bloqueada pelo Arquiteto (JSON da decisão).
     pub const RECOVERY: &str = "recovery";
+    /// Resumo do histórico da sessão pelo próprio modelo do papel (spec 122 T04): o retrato é
+    /// para o modelo, não texto de pessoa.
+    pub const SUMMARY: &str = "summary";
     /// Todos os códigos (o servidor só publica estes).
-    pub const ALL: [&str; 5] = [PLAN_REVIEW, VERDICT, FINAL_CHECK, DIAGNOSIS, RECOVERY];
+    pub const ALL: [&str; 6] = [PLAN_REVIEW, VERDICT, FINAL_CHECK, DIAGNOSIS, RECOVERY, SUMMARY];
 }
 
 /// Destino dos eventos de atividade.

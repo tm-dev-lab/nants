@@ -860,6 +860,7 @@ async fn handshake(client: &LlmClient, model: String) -> TestResult {
         effort: None,
         response_json: false,
         web_search: false,
+        cache_key: None,
     };
     let started = Instant::now();
     match client.chat(&req).await {

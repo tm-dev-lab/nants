@@ -55,6 +55,8 @@ and you decide at every step.
 - **Browser testing.** The generated app is opened in a real browser, with screenshots that you
   and the Reviewer can see.
 - **Cost per task.** Token usage and an estimated cost in dollars for each spec, task and agent.
+  Nants also trims and summarizes the agents' history on its own, so they spend less without
+  losing what matters, and the Costs window shows the effect.
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
 - **Your provider.** Any OpenAI compatible provider, or your ChatGPT plan, with one model per role.
 - **No telemetry.** Your keys and your code stay on your computer.

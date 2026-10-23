@@ -26,7 +26,7 @@ function entry(extra: Partial<ActivityEntry>): ActivityEntry {
   return { key: "k", agent: "reviewer", activityId: "a1", reasoning: "", text: "", tool: "", startedAt: 1, lastAt: 1, ...extra };
 }
 
-const CODES = ["plan_review", "verdict", "final_check", "diagnosis", "recovery"] as const;
+const CODES = ["plan_review", "verdict", "final_check", "diagnosis", "recovery", "summary"] as const;
 const EXPECTED: Record<Lang, Record<(typeof CODES)[number] | "default", string>> = {
   "pt-BR": {
     plan_review: "preparando a revisão do plano",
@@ -34,6 +34,7 @@ const EXPECTED: Record<Lang, Record<(typeof CODES)[number] | "default", string>>
     final_check: "conferindo os critérios",
     diagnosis: "preparando o diagnóstico",
     recovery: "preparando a decisão sobre a tarefa",
+    summary: "resumindo o histórico",
     default: "preparando a resposta",
   },
   en: {
@@ -42,6 +43,7 @@ const EXPECTED: Record<Lang, Record<(typeof CODES)[number] | "default", string>>
     final_check: "checking the criteria",
     diagnosis: "preparing the diagnosis",
     recovery: "preparing the decision on the task",
+    summary: "summarizing the history",
     default: "preparing the response",
   },
 };

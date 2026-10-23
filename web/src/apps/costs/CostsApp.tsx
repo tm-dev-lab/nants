@@ -3,6 +3,8 @@
  * - em destaque: o total do projeto em 32 px (com "inclui N imagens (estimado)", da 092), o
  *   orçamento da spec ativa ("US$ 0,10 de US$ 5,00" e a barra) e os três maiores itens (papéis e
  *   imagens);
+ * - o efeito da gestão de contexto (spec 122), quando houver: compactações, resumos e os tokens
+ *   evitados (estimativa), do projeto e da spec ativa, em uma linha cada;
  * - "Ver detalhes por tarefa e modelo" (`<details>` recolhido): tokens e chamadas, barras por papel
  *   e por tarefa, o ritmo do provedor, a tabela por categoria com TOTAL, as chamadas sem preço com
  *   "Configurar", as buscas na web, as imagens, por agente e por modelo;
@@ -33,6 +35,7 @@ import "./costs.css";
 import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
 import {
   budgetProgress,
+  contextEffectText,
   costBars,
   costText,
   hasApiConsumption,
@@ -86,6 +89,10 @@ function CostsContentView({ size }: AppContentProps) {
   const hasLimit = budget !== null && (budget.max_tokens !== undefined || budget.max_usd !== undefined);
   const top = topCostItems(totals, project.by_agent ?? [], agentLabel);
   const narrow = size === "narrow";
+  // Efeito da gestão de contexto (spec 122): a linha do projeto e, com spec ativa, a da spec.
+  const contextLines = [contextEffectText(project.context), spec === null ? null : contextEffectText(specView?.context, spec.id)].filter(
+    (line): line is string => line !== null,
+  );
   const openPricing = (): void => shell.openSettings("pricing");
   return (
     <div className="nd-app-scroll nd-app-page nd-costs" data-costs="" data-costs-layout={narrow ? "stacked" : "table"}>
@@ -132,6 +139,16 @@ function CostsContentView({ size }: AppContentProps) {
               </li>
             ))}
           </ul>
+        </section>
+      ) : null}
+
+      {contextLines.length > 0 ? (
+        <section className="nd-costs-context" aria-label={t("costs.context.label")} data-costs-context="">
+          {contextLines.map((line) => (
+            <p key={line} className="nd-muted nd-num">
+              {line}
+            </p>
+          ))}
         </section>
       ) : null}
 

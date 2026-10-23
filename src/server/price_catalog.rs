@@ -72,6 +72,10 @@ pub struct CatalogEntry {
     pub output: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached: Option<f64>,
+    /// Janela de entrada do modelo em tokens (`max_input_tokens` do LiteLLM; spec 122 T04): base
+    /// do limiar do resumo do histórico. Ausente no cache antigo ou no modelo sem o dado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -111,19 +115,34 @@ pub fn parse_catalog(raw: &[u8]) -> Option<BTreeMap<String, CatalogEntry>> {
         };
         out.insert(
             name.clone(),
-            CatalogEntry { input, output, cached: per_mtok(v, "cache_read_input_token_cost") },
+            CatalogEntry {
+                input,
+                output,
+                cached: per_mtok(v, "cache_read_input_token_cost"),
+                context: v.get("max_input_tokens").and_then(serde_json::Value::as_u64).filter(|n| *n > 0),
+            },
         );
     }
     Some(out)
 }
 
 impl Catalog {
-    /// Casamento exato; depois sem o prefixo de provedor (`openai/`). Sem aproximação.
-    pub fn lookup(&self, model: &str) -> Option<Pricing> {
-        let found = self.entries.get(model).or_else(|| {
+    /// Entrada do modelo: casamento exato; depois sem o prefixo de provedor (`openai/`).
+    fn entry(&self, model: &str) -> Option<&CatalogEntry> {
+        self.entries.get(model).or_else(|| {
             let (_, rest) = model.split_once('/')?;
             self.entries.get(rest)
-        })?;
+        })
+    }
+
+    /// Janela de entrada do modelo em tokens, quando o catálogo a traz (spec 122 T04).
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.entry(model).and_then(|e| e.context)
+    }
+
+    /// Casamento exato; depois sem o prefixo de provedor (`openai/`). Sem aproximação.
+    pub fn lookup(&self, model: &str) -> Option<Pricing> {
+        let found = self.entry(model)?;
         Some(Pricing {
             input_per_mtok: found.input,
             output_per_mtok: found.output,
@@ -221,6 +240,14 @@ pub async fn load_catalog(
     }
 }
 
+/// Janelas de entrada dos modelos pelo catálogo já em cache (spec 122 T04), sem rede: o limiar do
+/// resumo do histórico usa a do modelo do papel. Sem cache ou sem o dado, `None` (o padrão
+/// declarado vale). Bloqueante: chamar fora do executor assíncrono.
+pub fn cached_context_windows(dir: &Path, models: &[&str]) -> Vec<Option<u64>> {
+    let catalog = read_cache(dir);
+    models.iter().map(|m| catalog.as_ref().and_then(|c| c.context_window(m))).collect()
+}
+
 /// Atalho com o relógio real.
 pub async fn current_catalog(fetcher: &dyn PriceFetcher, dir: &Path, force: bool) -> Option<Catalog> {
     load_catalog(fetcher, dir, now_secs(), force).await
@@ -268,7 +295,7 @@ mod tests {
 
     const FIXTURE: &str = r#"{
       "sample_spec": {"input_cost_per_token": 1, "output_cost_per_token": 1},
-      "gpt-4o": {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "cache_read_input_token_cost": 0.00000125},
+      "gpt-4o": {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "cache_read_input_token_cost": 0.00000125, "max_input_tokens": 128000},
       "claude-x": {"input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015},
       "embed": {"input_cost_per_token": 0.0000001},
       "free": {"mode": "chat"}
@@ -293,6 +320,23 @@ mod tests {
         let d = std::env::temp_dir().join(format!("nants-pc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// Spec 122 T04: a janela de entrada vem do catálogo em cache, sem rede; sem o dado, `None`.
+    #[tokio::test]
+    async fn janela_do_modelo_vem_do_catalogo_em_cache() {
+        let m = parse_catalog(FIXTURE.as_bytes()).expect("parse");
+        assert_eq!(m["gpt-4o"].context, Some(128_000));
+        assert_eq!(m["claude-x"].context, None);
+        let dir = tmp("janela");
+        assert_eq!(cached_context_windows(&dir, &["gpt-4o"]), vec![None], "sem cache");
+        let (f, _) = fake(Some(FIXTURE));
+        load_catalog(&f, &dir, 1_000, false).await.expect("catálogo");
+        assert_eq!(
+            cached_context_windows(&dir, &["gpt-4o", "openai/gpt-4o", "claude-x", "outro"]),
+            vec![Some(128_000), Some(128_000), None, None]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

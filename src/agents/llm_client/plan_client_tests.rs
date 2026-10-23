@@ -72,6 +72,7 @@ fn request(web_search: bool) -> ChatRequest {
         effort: Some(Effort::Low),
         response_json: false,
         web_search,
+        cache_key: None,
     }
 }
 
@@ -635,6 +636,7 @@ async fn plan_live_text_and_tool() {
         effort: None,
         response_json: false,
         web_search: false,
+        cache_key: None,
     };
     let resp = client.chat_stream(&text_req, &|_| {}).await.unwrap_or_else(|e| panic!("texto: {e:?}"));
     eprintln!("texto: {:?} usage={:?}", resp.message.content, resp.usage);
@@ -678,6 +680,7 @@ async fn live_round_trip(base: &LlmClient, model: &str, effort: Option<Effort>, 
         effort,
         response_json: false,
         web_search: false,
+        cache_key: None,
     };
     let resp = first.chat_stream(&req, &|_| {}).await.map_err(|e| format!("1º turno: {e:?}"))?;
     let calls: Vec<(&str, &str, &str)> =
@@ -741,6 +744,7 @@ async fn plan_second_turn_resends_the_items_as_they_came() {
         effort: Some(Effort::Low),
         response_json: false,
         web_search: false,
+        cache_key: None,
     };
     let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
     let mut messages = req.messages.clone();
@@ -775,6 +779,7 @@ async fn plan_second_turn_resends_the_items_as_they_came() {
         effort: None,
         response_json: false,
         web_search: false,
+        cache_key: None,
     };
     let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
     let mut messages = req.messages.clone();
@@ -784,4 +789,20 @@ async fn plan_second_turn_resends_the_items_as_they_came() {
     let body = body_of(&requests(&cap)[1]);
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["input"][1], json!({"type": "function_call", "arguments": "{}", "call_id": "call_b5Ag", "name": "get_time"}));
+}
+
+/// Spec 122 T05: o plano leva a chave de cache; um 400 comum que a recusa repete uma vez sem ela.
+#[tokio::test]
+async fn plan_body_carries_the_cache_key_and_drops_it_when_refused() {
+    let refusal = json!({"error": {"message": "Unsupported parameter: prompt_cache_key"}}).to_string();
+    let (base, cap) = raw_server(vec![(400, JSON, refusal), (200, SSE, completed_sse())]).await;
+    let client = plan_client(base, Arc::new(FakeTokens::default()));
+    let keyed = ChatRequest { cache_key: Some("nants-plano".into()), ..request(false) };
+    client.chat_stream(&keyed, &|_| {}).await.expect("resposta");
+    let reqs = requests(&cap);
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(body_of(&reqs[0])["prompt_cache_key"], json!("nants-plano"));
+    let second = body_of(&reqs[1]);
+    assert!(second.get("prompt_cache_key").is_none());
+    assert_eq!(second["stream"], json!(true));
 }

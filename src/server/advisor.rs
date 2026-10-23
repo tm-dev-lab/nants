@@ -174,11 +174,9 @@ impl ArchitectAdvisor {
     async fn call_model(&self, ctx: &AskContext, briefing: String) -> Result<String, String> {
         let metered = UsageBackend::new(
             self.backend.as_ref(),
-            self.usage.as_ref().map(|sink| UsageScope {
-                sink: Arc::clone(sink),
-                agent: "architect".to_string(),
-                spec: Some(ctx.spec_id.clone()),
-                task: Some(ctx.task_id.clone()),
+            self.usage.as_ref().map(|sink| {
+                UsageScope::new(Arc::clone(sink), "architect", Some(ctx.spec_id.clone()), Some(ctx.task_id.clone()))
+                    .with_session(format!("architect:{}:ask", ctx.task_id))
             }),
         );
         let req = ChatRequest {
@@ -191,6 +189,7 @@ impl ArchitectAdvisor {
             effort: self.effort,
             response_json: true,
             web_search: false,
+            cache_key: None,
         };
         match tokio::time::timeout(ASK_TIMEOUT, metered.complete(&req)).await {
             Ok(Ok(resp)) => Ok(resp.message.content),

@@ -4,8 +4,8 @@
  * Spec 102: textos pelo dicionário no idioma ativo; números e US$ pelos formatadores da 101
  * (`usageFormat`). O aviso do limitador vem do servidor e aparece como veio.
  */
-import type { NamedUsage, SpecBudget, UsageTotals } from "../../api/types";
-import { t } from "../../i18n";
+import type { ContextSummary, NamedUsage, SpecBudget, UsageTotals } from "../../api/types";
+import { t, tp } from "../../i18n";
 import { formatTokens, formatUsd } from "../../usageFormat";
 import { tailLine } from "../activity/activityModel";
 import { isPacing, stepText } from "../shared/activityText";
@@ -32,6 +32,26 @@ export function tokensText(u: Pick<UsageTotals, "input" | "output">): string {
 /** "1,2 mil tokens" no idioma ativo. */
 export function tokensValue(n: number): string {
   return t("costs.tokens", { value: formatTokens(n) });
+}
+
+/**
+ * Efeito da gestão de contexto (spec 122) numa linha: compactações, resumos e os tokens evitados.
+ * Os tokens são uma estimativa (bytes tirados do contexto pelos eventos, divididos por 4), e o texto
+ * diz isso. Sem nenhum efeito (ou servidor antigo, sem o resumo), `null`: a linha não aparece. Com
+ * `spec`, a linha é da spec; sem, do projeto.
+ */
+export function contextEffectText(c: ContextSummary | undefined, spec?: string): string | null {
+  if (c === undefined) return null;
+  const compactions = c.compactions ?? 0;
+  const summaries = c.summaries ?? 0;
+  const tokens = Math.round((c.saved_bytes ?? 0) / 4);
+  if (compactions === 0 && summaries === 0 && tokens === 0) return null;
+  const params = {
+    compactions: tp("costs.context.compactions", compactions),
+    summaries: tp("costs.context.summaries", summaries),
+    tokens: formatTokens(tokens),
+  };
+  return spec === undefined ? t("costs.context.project", params) : t("costs.context.spec", { ...params, spec });
 }
 
 export interface CostBar {

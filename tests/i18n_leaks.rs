@@ -145,6 +145,7 @@ const EXCEPTIONS: &[Exception] = &[
         "rótulo técnico do status HTTP no aviso de limite, igual em todos os idiomas; a frase em volta vem do dicionário pelo code `pace.throttled` (spec 119)",
     ),
     ex("agents/llm_client/pace.rs", Kind::Terminal, "nants: ritmo conexão={} modelo={}", LOG),
+    ex("agents/spill.rs", Kind::Terminal, "nants: saida de ferramenta sem arquivo", LOG),
     ex("agents/runner.rs", Kind::NextAction, "aguardando developer", INTERNAL_NOTE),
     ex("agents/runner.rs", Kind::Say, "Verificação final: {met} de {total}", REVIEW_MARKER),
     ex("main.rs", Kind::Terminal, "nants listening on http://{addr}", MAIN),
