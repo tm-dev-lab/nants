@@ -84,9 +84,11 @@ pub fn router(state: AppState) -> Router {
             "/api/config/connections/:id/models",
             get(models_api::list_models),
         )
-        // Conexão pelo plano ChatGPT (spec 116): início do login, retorno, estado e sair.
+        // Conexão pelo plano ChatGPT (spec 116): início do login, retorno (passagem e conclusão,
+        // spec 118), estado e sair.
         .route(chatgpt::START_PATH, post(chatgpt::post_start))
         .route(chatgpt::CALLBACK_PATH, get(chatgpt::get_callback))
+        .route(chatgpt::FINISH_PATH, get(chatgpt::get_finish))
         .route("/api/connections/:id/chatgpt", get(chatgpt::get_status))
         .route("/api/connections/:id/chatgpt/logout", post(chatgpt::post_logout))
         .route("/api/projects", post(projects::create_project))

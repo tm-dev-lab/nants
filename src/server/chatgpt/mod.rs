@@ -8,14 +8,23 @@
 //!   `http://127.0.0.1:<porta do Nants>/auth/callback`. A tentativa vale [`ATTEMPT_TTL_MS`], é de
 //!   uso único e fica ligada ao dispositivo que a iniciou (quando não veio de loopback). `local` vale
 //!   para o loopback e para o dispositivo do link de entrada do terminal (spec 117).
-//! - **Retorno** (`GET /auth/callback`): consome o `state`, troca o código (form-urlencoded, sem
+//! - **Retorno** (`GET /auth/callback`, spec 118): é uma página de passagem. A volta vem de outro
+//!   site (`auth.openai.com`), e nessa navegação o navegador não manda o cookie `SameSite=Strict`
+//!   do dispositivo. Com um `state` pendente, a rota responde 200 com uma página mínima, sem
+//!   consumir nada e sem exigir cookie, que navega na hora (meta refresh, sem script; com o link
+//!   "Continuar" de reserva) para a conclusão na mesma origem. Uma navegação iniciada por uma
+//!   página do próprio site leva o cookie Strict. A página leva `Referrer-Policy: no-referrer`,
+//!   `Cache-Control: no-store`, uma CSP sem script e nenhum recurso de fora.
+//! - **Conclusão** (`GET /auth/finish`): confere quem pode concluir antes de consumir o `state`
+//!   (o dispositivo que iniciou, pelo cookie, ou o loopback), troca o código (form-urlencoded, sem
 //!   secret, com o `code_verifier`, o mesmo `redirect_uri` e o `resource`), valida o ID token
 //!   ([`jwt`]: RS256 pelo JWKS com cache, `iss`, `aud`, `exp` e `nonce`), confere o escopo
 //!   [`DIRECT_SCOPE`], recusa um `client_id` diferente do salvo, grava as credenciais
 //!   ([`store`], 0600) e cria ou atualiza a conexão. Responde com um redirecionamento para a
 //!   interface com o resultado (`/?chatgpt=connected&connection=<id>` ou
-//!   `/?chatgpt=error&reason=<motivo>`). Em modo rede, a rota só passa sem dispositivo com um
-//!   `state` pendente ([`ChatgptAuth::callback_pending`]).
+//!   `/?chatgpt=error&reason=<motivo>`). Em modo rede, só o retorno passa sem dispositivo, e só
+//!   com um `state` pendente ([`ChatgptAuth::callback_pending`]); a conclusão segue a regra de
+//!   sempre da camada de dispositivos.
 //! - **Renovação** ([`ChatgptAuth::access_token`]): renova quando faltam menos de
 //!   [`REFRESH_MARGIN_SECS`]; uma renovação por conexão de cada vez; erro terminal
 //!   (`invalid_grant`, `refresh_token_*`) marca "precisa entrar de novo" e não repete.
@@ -75,6 +84,11 @@ pub const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
 pub const AGENT_NAME_HINT: &str = "Nants";
 /// Rota do retorno do login (loopback).
 pub const CALLBACK_PATH: &str = "/auth/callback";
+/// Rota da conclusão do login (spec 118): a página de passagem do retorno navega para cá.
+pub const FINISH_PATH: &str = "/auth/finish";
+/// CSP da página de passagem: nada de script, estilo, imagem nem moldura; a navegação é pelo meta
+/// refresh e pelo link.
+const PASSAGE_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 /// Rota do início do login.
 pub const START_PATH: &str = "/api/connections/chatgpt/start";
 /// Validade da tentativa de login (10 minutos).
@@ -819,8 +833,84 @@ fn new_connection_id(existing: &[Connection]) -> Option<String> {
     None
 }
 
-/// `GET /auth/callback`: termina o login e volta para a interface com o resultado.
+/// Escapa texto para HTML (conteúdo e valor de atributo).
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Endereço relativo da conclusão com os parâmetros do retorno (`code`, `state`, `error` e
+/// `client_id`), codificados de novo.
+fn finish_location(q: &CallbackQuery) -> Option<String> {
+    let mut url = reqwest::Url::parse(&format!("http://127.0.0.1{FINISH_PATH}")).ok()?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        let fields = [("code", &q.code), ("state", &q.state), ("error", &q.error), ("client_id", &q.client_id)];
+        for (name, value) in fields {
+            if let Some(value) = value {
+                pairs.append_pair(name, value);
+            }
+        }
+    }
+    Some(format!("{}?{}", url.path(), url.query().unwrap_or("")))
+}
+
+/// Página de passagem do retorno (spec 118): navega na hora para a conclusão, da própria origem.
+fn passage_page(q: &CallbackQuery, lang: crate::i18n::Lang) -> Response {
+    let Some(target) = finish_location(q) else {
+        return fail(LoginFailure::StateInvalid);
+    };
+    let target = html_escape(&target);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta http-equiv=\"refresh\" content=\"0; url={target}\">\
+         <title>{title}</title></head>\
+         <body><p>{body}</p><p><a href=\"{target}\" rel=\"noreferrer\">{cont}</a></p></body></html>\n",
+        lang = lang.tag(),
+        title = html_escape(&crate::i18n::text(lang, "chatgpt.passage.title")),
+        body = html_escape(&crate::i18n::text(lang, "chatgpt.passage.body")),
+        cont = html_escape(&crate::i18n::text(lang, "chatgpt.passage.continue")),
+    );
+    let mut resp = Response::new(Body::from(html));
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(PASSAGE_CSP));
+    resp
+}
+
+/// `GET /auth/callback`: página de passagem (spec 118). Não exige cookie, não consome o `state` e
+/// não troca o código: a volta vem de outro site e chega sem o cookie `SameSite=Strict`. Com um
+/// `state` pendente, devolve a página que segue para [`FINISH_PATH`] a partir da própria origem;
+/// sem ele, volta para a interface com o erro.
 pub async fn get_callback(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    query: Result<Query<CallbackQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let q = query.map(|Query(q)| q).unwrap_or_default();
+    if !q.state.as_deref().is_some_and(|st| state.chatgpt().callback_pending(st)) {
+        return fail(LoginFailure::StateInvalid);
+    }
+    passage_page(&q, super::devices::request_lang(&headers))
+}
+
+/// `GET /auth/finish`: termina o login e volta para a interface com o resultado. Só o dispositivo
+/// que iniciou (cookie) ou o loopback; fora do modo rede, como antes.
+pub async fn get_finish(
     State(state): State<AppState>,
     Extension(access): Extension<Access>,
     query: Result<Query<CallbackQuery>, axum::extract::rejection::QueryRejection>,

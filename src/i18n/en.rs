@@ -388,6 +388,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("devices.log.authorized_code", "device authorized by code: {id} ({name})"),
     ("devices.log.revoked", "device revoked: {id} ({name})"),
     ("devices.log.all_revoked", "all devices revoked ({count})"),
+    // Pass-through page of the sign-in return (spec 118).
+    ("chatgpt.passage.title", "Signing in to Nants"),
+    ("chatgpt.passage.body", "Finishing the connection to the ChatGPT plan."),
+    ("chatgpt.passage.continue", "Continue"),
     // Conexão pelo plano ChatGPT (spec 116): log técnico do terminal, sem segredos.
     ("chatgpt.log.connected", "ChatGPT plan connected: connection {id}"),
     ("chatgpt.log.host_id_failed", "warning: could not save the identifier of this computer for the ChatGPT plan"),

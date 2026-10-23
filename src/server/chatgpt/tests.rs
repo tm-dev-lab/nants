@@ -324,8 +324,28 @@ fn callback_uri(params: &[(&str, &str)]) -> String {
     format!("{}?{}", url.path(), url.query().unwrap_or(""))
 }
 
+/// Destino do link "Continuar" da página de passagem (spec 118), já sem o escape do HTML.
+fn passage_target(html: &str) -> String {
+    let start = html.find("<a href=\"").expect("link da passagem") + "<a href=\"".len();
+    let end = html[start..].find('"').expect("fim do link") + start;
+    html[start..end].replace("&amp;", "&")
+}
+
+/// O retorno como o navegador faz (spec 118): o `GET /auth/callback` chega SEM cookie (a volta
+/// vem de outro site, e o cookie é `SameSite=Strict`); a página de passagem leva à conclusão, que
+/// chega com o cookie dado. Sem passagem (recusa direta do retorno), devolve a resposta do retorno.
+async fn browser_return(e: &Env, params: &[(&str, &str)], peer: &str, cookie: Option<&str>) -> Response<Body> {
+    let resp = send(&e.state, req(Method::GET, &callback_uri(params), peer, None, None)).await;
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    let target = passage_target(&body_text(resp).await);
+    assert!(target.starts_with("/auth/finish?"), "{target}");
+    send(&e.state, req(Method::GET, &target, peer, cookie, None)).await
+}
+
 async fn callback(e: &Env, params: &[(&str, &str)]) -> String {
-    let resp = send(&e.state, req(Method::GET, &callback_uri(params), LOOPBACK_PEER, None, None)).await;
+    let resp = browser_return(e, params, LOOPBACK_PEER, None).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     location(&resp)
 }
@@ -704,12 +724,13 @@ async fn network_mode_binds_the_attempt_to_this_computer_or_the_device() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = send(&e.state, req(Method::GET, &callback_uri(&[("code", "c"), ("state", "x")]), NAT_PEER, None, None)).await;
     assert_eq!(location(&resp), crate::server::devices::ENTRY_PATH, "segue a regra dos dispositivos");
-    // Iniciado neste computador: o retorno de fora do loopback é recusado e NÃO consome o state
-    // (um state vazado não cancela o login de quem iniciou).
+    // Iniciado neste computador: de fora do loopback e sem dispositivo, a passagem abre, mas a
+    // conclusão segue a regra dos dispositivos e NÃO consome o state (um state vazado não cancela
+    // o login de quem iniciou).
     let q = start(&e, json!({})).await;
     let client = issued_client();
-    let resp = send(&e.state, req(Method::GET, &callback_uri(&[("code", "c"), ("state", &q["state"]), ("client_id", &client)]), NAT_PEER, None, None)).await;
-    assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    let resp = browser_return(&e, &[("code", "c"), ("state", &q["state"]), ("client_id", &client)], NAT_PEER, None).await;
+    assert_eq!(location(&resp), crate::server::devices::ENTRY_PATH);
     assert_eq!(e.mock.token_hits(), 0);
     assert!(e.state.chatgpt().callback_pending(&q["state"]), "segue pendente");
     let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
@@ -761,17 +782,17 @@ async fn this_computer_device_logs_in_through_the_nat_address() {
     let q = query_of(v["url"].as_str().expect("url"));
     assert_eq!(q["redirect_uri"], "http://127.0.0.1:3000/auth/callback");
     let client = issued_client();
-    let uri = callback_uri(&[("code", "c"), ("state", &q["state"]), ("client_id", &client)]);
+    let params = [("code", "c"), ("state", q["state"].as_str()), ("client_id", client.as_str())];
     // Outro aparelho, ou ninguém, com o mesmo state: recusado sem consumir.
-    for other in [Some(phone.as_str()), None] {
-        let resp = send(&e.state, req(Method::GET, &uri, NAT_PEER, other, None)).await;
-        assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    for (other, expected) in [(Some(phone.as_str()), "/?chatgpt=error&reason=state_invalid"), (None, crate::server::devices::ENTRY_PATH)] {
+        let resp = browser_return(&e, &params, NAT_PEER, other).await;
+        assert_eq!(location(&resp), expected);
     }
     assert_eq!(e.mock.token_hits(), 0);
     assert!(e.state.chatgpt().callback_pending(&q["state"]), "segue pendente");
     let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
     e.mock.reply(move |_| (200, reply.clone()));
-    let resp = send(&e.state, req(Method::GET, &uri, NAT_PEER, Some(&cookie), None)).await;
+    let resp = browser_return(&e, &params, NAT_PEER, Some(&cookie)).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = location(&resp);
     assert!(loc.starts_with("/?chatgpt=connected&connection="), "o mesmo dispositivo termina: {loc}");
@@ -779,6 +800,205 @@ async fn this_computer_device_logs_in_through_the_nat_address() {
     e.state.devices().revoke(&computer.id).expect("revoga");
     let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&cookie), Some(json!({})))).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// --- spec 118: página de passagem no retorno ------------------------------------------------------
+
+/// Inicia o login pelo dispositivo "Este computador" (link do terminal) vindo do IP do NAT.
+async fn start_as_this_computer(e: &Env) -> (String, HashMap<String, String>) {
+    let link = e.state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let (_, cookie) = e.state.devices().redeem_entry_link(&link).expect("troca").expect("dispositivo");
+    let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&cookie), Some(json!({})))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+    (cookie, query_of(v["url"].as_str().expect("url")))
+}
+
+/// O retorno chega sem cookie (navegação vinda de outro site): com o `state` pendente, a rota
+/// devolve a página de passagem, não consome nada, não troca o código, leva os cabeçalhos certos e
+/// não tem script.
+#[tokio::test]
+async fn callback_returns_the_passage_without_cookie_and_without_consuming() {
+    let e = env_with("passagem", lan).await;
+    let (_cookie, q) = start_as_this_computer(&e).await;
+    let client = issued_client();
+    // Um código com caracteres de HTML e de URL: vai codificado, sem quebrar a página.
+    let code = "c\"><script>x</script>&y=1";
+    let uri = callback_uri(&[("code", code), ("state", &q["state"]), ("client_id", &client), ("error", "e r")]);
+    for _ in 0..2 {
+        let resp = send(&e.state, req(Method::GET, &uri, NAT_PEER, None, None)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "sem cookie, a passagem abre");
+        let h = |name: header::HeaderName| resp.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        assert_eq!(h(header::CONTENT_TYPE), "text/html; charset=utf-8");
+        assert_eq!(h(header::CACHE_CONTROL), "no-store");
+        assert_eq!(h(header::REFERRER_POLICY), "no-referrer");
+        let csp = h(header::CONTENT_SECURITY_POLICY);
+        assert!(csp.contains("default-src 'none'") && !csp.contains("script-src") && !csp.contains("unsafe"), "{csp}");
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        let html = body_text(resp).await;
+        let lower = html.to_lowercase();
+        assert!(!lower.contains("<script") && !lower.contains("onload") && !lower.contains("javascript:"), "sem script: {html}");
+        assert!(!lower.contains("http://") && !lower.contains("https://") && !lower.contains("src="), "nenhum recurso de fora: {html}");
+        assert!(lower.contains("<meta name=\"referrer\" content=\"no-referrer\">"), "{html}");
+        let target = passage_target(&html);
+        assert!(html.contains(&format!("<meta http-equiv=\"refresh\" content=\"0; url={}\">", target.replace('&', "&amp;"))), "{html}");
+        let got = query_of(&format!("http://127.0.0.1:3000{target}"));
+        assert_eq!(reqwest::Url::parse(&format!("http://127.0.0.1:3000{target}")).expect("url").path(), FINISH_PATH);
+        assert_eq!((got["code"].as_str(), got["state"].as_str(), got["client_id"].as_str(), got["error"].as_str()), (code, q["state"].as_str(), client.as_str(), "e r"));
+        assert!(html.contains(">Continuar</a>"), "{html}");
+    }
+    assert_eq!(e.mock.token_hits(), 0, "a passagem não troca o código");
+    assert!(e.state.chatgpt().callback_pending(&q["state"]), "a passagem não consome");
+    // O texto vem do dicionário, no idioma do navegador.
+    let mut r = req(Method::GET, &uri, NAT_PEER, None, None);
+    r.headers_mut().insert(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().expect("cabeçalho"));
+    let html = body_text(send(&e.state, r).await).await;
+    assert!(html.contains("<html lang=\"en\">") && html.contains(">Continue</a>"), "{html}");
+    // Sem state pendente: nada de passagem; fora do loopback e sem cookie, a regra de sempre.
+    let resp = send(&e.state, req(Method::GET, &callback_uri(&[("code", "c"), ("state", "outro")]), NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), crate::server::devices::ENTRY_PATH);
+    let resp = send(&e.state, req(Method::GET, &callback_uri(&[("code", "c"), ("state", "outro")]), LOOPBACK_PEER, None, None)).await;
+    assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+}
+
+/// A conclusão: o mesmo dispositivo termina; outro dispositivo e quem não tem cookie são recusados
+/// sem consumir; o loopback também termina.
+#[tokio::test]
+async fn finish_only_for_the_initiating_device_or_loopback() {
+    let e = env_with("conclusao", lan).await;
+    let (cookie, q) = start_as_this_computer(&e).await;
+    let phone = pair_by_code(&e, "Chrome no iPhone");
+    let client = issued_client();
+    let finish = |st: &str| {
+        let mut url = reqwest::Url::parse("http://127.0.0.1:3000/auth/finish").expect("url");
+        url.query_pairs_mut().extend_pairs([("code", "c"), ("state", st), ("client_id", client.as_str())]);
+        format!("{}?{}", url.path(), url.query().unwrap_or(""))
+    };
+    // Outro dispositivo: recusado pelo handler, sem consumir.
+    let resp = send(&e.state, req(Method::GET, &finish(&q["state"]), NAT_PEER, Some(&phone), None)).await;
+    assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    // Sem cookie, de fora do loopback: a conclusão não é rota aberta.
+    let resp = send(&e.state, req(Method::GET, &finish(&q["state"]), NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), crate::server::devices::ENTRY_PATH);
+    // State desconhecido, mesmo com o cookie certo: recusado.
+    let resp = send(&e.state, req(Method::GET, &finish("outro"), NAT_PEER, Some(&cookie), None)).await;
+    assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    assert_eq!(e.mock.token_hits(), 0);
+    assert!(e.state.chatgpt().callback_pending(&q["state"]), "segue pendente");
+    // O mesmo dispositivo termina, e o state é de uso único.
+    let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
+    e.mock.reply(move |_| (200, reply.clone()));
+    let resp = send(&e.state, req(Method::GET, &finish(&q["state"]), NAT_PEER, Some(&cookie), None)).await;
+    assert!(location(&resp).starts_with("/?chatgpt=connected&connection="), "{}", location(&resp));
+    let resp = send(&e.state, req(Method::GET, &finish(&q["state"]), NAT_PEER, Some(&cookie), None)).await;
+    assert_eq!(location(&resp), "/?chatgpt=error&reason=state_invalid");
+    // Iniciado por um aparelho, terminado no loopback: vale (como antes).
+    let resp = send(&e.state, req(Method::POST, START_PATH, NAT_PEER, Some(&phone), Some(json!({})))).await;
+    let v: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+    let q = query_of(v["url"].as_str().expect("url"));
+    let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
+    e.mock.reply(move |_| (200, reply.clone()));
+    let resp = send(&e.state, req(Method::GET, &finish(&q["state"]), LOOPBACK_PEER, None, None)).await;
+    assert!(location(&resp).starts_with("/?chatgpt=connected&connection="), "{}", location(&resp));
+}
+
+/// Fora do modo rede, o login continua passando pela página de passagem e termina de qualquer
+/// origem, como antes.
+#[tokio::test]
+async fn outside_network_mode_the_passage_leads_to_the_login() {
+    let e = env("fora-da-rede").await;
+    let q = start(&e, json!({})).await;
+    let reply = login_reply(&e.mock, &q["nonce"], e.clock.secs() + 3600);
+    e.mock.reply(move |_| (200, reply.clone()));
+    let client = issued_client();
+    let resp = browser_return(&e, &[("code", "c"), ("state", &q["state"]), ("client_id", &client)], NAT_PEER, None).await;
+    assert!(location(&resp).starts_with("/?chatgpt=connected&connection="), "{}", location(&resp));
+}
+
+// --- prova no navegador real (spec 118, critério 4) ---------------------------------------------
+
+/// Authorize falso do harness: uma página do emissor com o botão "Permitir", como a tela de
+/// consentimento real. A volta parte de uma página do emissor (outro site), e não de um
+/// redirecionamento direto da navegação aberta pelo Nants.
+async fn harness_authorize(axum::extract::RawQuery(raw): axum::extract::RawQuery) -> axum::response::Response {
+    let raw = raw.unwrap_or_default().replace('&', "&amp;").replace('"', "&quot;");
+    let html = format!("<!doctype html><html><body><h1>Emissor falso</h1><a id=\"allow\" href=\"/consent?{raw}\">Permitir</a></body></html>");
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Consentimento do emissor falso: guarda o `nonce` para assinar o ID token da troca e redireciona
+/// para o `redirect_uri` com o código.
+async fn harness_consent(
+    AxState(m): AxState<Arc<Mock>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let q = query_of(&format!("http://emissor.test/?{}", raw.unwrap_or_default()));
+    let (Some(redirect), Some(st), Some(nonce)) = (q.get("redirect_uri"), q.get("state"), q.get("nonce")) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let exp = system_now_ms() / 1000 + 3600;
+    let reply = login_reply(&m, nonce, exp);
+    m.reply(move |_| (200, reply.clone()));
+    let mut url = reqwest::Url::parse(redirect).expect("redirect_uri");
+    url.query_pairs_mut().extend_pairs([("code", "codigo-navegador"), ("state", st.as_str()), ("client_id", issued_client().as_str())]);
+    (StatusCode::FOUND, [(header::LOCATION, url.to_string())]).into_response()
+}
+
+/// Servidor de prova para um Chrome de verdade (spec 118). Não roda na suíte (`#[ignore]`) e não
+/// faz nada sem `NANTS_BROWSER_HARNESS_OUT`. Sobe, com pasta de dados e configuração dentro dessa
+/// pasta, um Nants em modo rede em `NANTS_BROWSER_HARNESS_BIND` (um IP fora do loopback, para o
+/// pedido não contar como loopback, como no `portproxy` do WSL) e um emissor OAuth falso em
+/// `127.0.0.1:NANTS_BROWSER_HARNESS_ISSUER_PORT`, com o authorize anunciado em `localhost` (outro
+/// site para o SameSite). Grava o link de entrada em `link.txt` e para quando aparece `stop`. Rode
+/// com `HTTPS_PROXY` apontando para uma porta fechada (e `NO_PROXY=127.0.0.1,localhost`): a
+/// interface lista os modelos da conexão nova, e nada pode sair para a rede real.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn browser_harness() {
+    let Ok(out) = std::env::var("NANTS_BROWSER_HARNESS_OUT") else { return };
+    let out = PathBuf::from(out);
+    let bind: SocketAddr = std::env::var("NANTS_BROWSER_HARNESS_BIND").expect("bind").parse().expect("bind");
+    let issuer_port: u16 = std::env::var("NANTS_BROWSER_HARNESS_ISSUER_PORT").expect("porta").parse().expect("porta");
+    let (mock, _) = spawn_mock().await;
+    let app = Router::new()
+        .route("/authorize", get(harness_authorize))
+        .route("/consent", get(harness_consent))
+        .route("/jwks", get(jwks))
+        .route("/token", post(token))
+        .route("/revoke", post(revoke))
+        .with_state(Arc::clone(&mock));
+    let issuer = tokio::net::TcpListener::bind(("127.0.0.1", issuer_port)).await.expect("emissor");
+    tokio::spawn(async move {
+        let _ = axum::serve(issuer, app).await;
+    });
+    let base = format!("http://127.0.0.1:{issuer_port}");
+    let endpoints = ChatgptEndpoints {
+        authorize: format!("http://localhost:{issuer_port}/authorize"),
+        token: format!("{base}/token"),
+        revoke: format!("{base}/revoke"),
+        jwks: format!("{base}/jwks"),
+    };
+    let port = bind.port();
+    let state = AppState::new(out.join("config.toml"), Config::default(), port)
+        .with_data_dir(out.join("data"))
+        .with_chatgpt(ChatgptAuth::new(endpoints, Arc::new(system_now_ms)))
+        .with_host_policy(HostPolicy::Lan)
+        .with_network_run(NetworkRun { lan: true, source: ModeSource::Flag, requested_port: port });
+    let link = state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let listener = tokio::net::TcpListener::bind(bind).await.expect("bind do Nants");
+    std::fs::write(out.join("link.txt"), format!("http://127.0.0.1:{port}/pair?t={link}\n")).expect("link.txt");
+    let stop = out.join("stop");
+    let shutdown = async move {
+        for _ in 0..3000 {
+            if stop.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    crate::server::serve_with_shutdown(listener, state, shutdown).await.expect("serve");
+    let grants: Vec<String> = mock.token_forms.lock().expect("lock").iter().map(|f| f.get("grant_type").cloned().unwrap_or_default()).collect();
+    std::fs::write(out.join("token_hits.txt"), grants.join(" ")).expect("token_hits");
 }
 
 #[test]

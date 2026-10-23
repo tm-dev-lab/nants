@@ -406,6 +406,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("devices.log.authorized_code", "dispositivo autorizado pelo código: {id} ({name})"),
     ("devices.log.revoked", "dispositivo revogado: {id} ({name})"),
     ("devices.log.all_revoked", "todos os dispositivos revogados ({count})"),
+    // Página de passagem do retorno do login (spec 118).
+    ("chatgpt.passage.title", "Entrando no Nants"),
+    ("chatgpt.passage.body", "Concluindo a conexão com o plano ChatGPT."),
+    ("chatgpt.passage.continue", "Continuar"),
     // Conexão pelo plano ChatGPT (spec 116): log técnico do terminal, sem segredos.
     ("chatgpt.log.connected", "plano ChatGPT conectado: conexão {id}"),
     ("chatgpt.log.host_id_failed", "aviso: não foi possível gravar o identificador deste computador para o plano ChatGPT"),

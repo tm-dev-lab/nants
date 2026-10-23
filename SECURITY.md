@@ -76,6 +76,11 @@ A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and ha
   by the terminal entry link (marked `this_computer` in `devices.json` when it is created, never by
   its name); on WSL with NAT, that browser arrives with the Windows address. Devices added by code
   count as remote.
+- **Return page:** the return comes from another site, so the browser does not send the
+  `SameSite=Strict` device cookie with it. `/auth/callback` only answers a pending `state` with a
+  minimal page (no script, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, no external
+  resource) that consumes nothing and moves on, from Nants itself, to `/auth/finish`, which gets
+  the cookie and checks the device before it uses the `state` and exchanges the code.
 - **Identity:** the ID token is checked before anything is stored: the RS256 signature against the
   OpenAI keys (JWKS), the exact issuer, the audience, the expiry and the `nonce`. The account must
   have granted the scope that allows using the plan. A later sign-in that returns a different

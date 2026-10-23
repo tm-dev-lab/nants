@@ -19,8 +19,9 @@
 //!   - `GET /pair?t=...`: o link de entrada de uso único impresso no terminal;
 //!   - `POST /api/devices/pair`: a troca do código de 6 dígitos;
 //!   - `GET /auth/callback`, só com um `state` pendente e válido do login pelo plano ChatGPT
-//!     (spec 116): o retorno chega pelo navegador deste computador, e o handler consome o `state`
-//!     e confere o dispositivo que iniciou a tentativa.
+//!     (spec 116): o retorno vem de outro site e chega sem o cookie Strict. A rota só devolve a
+//!     página de passagem (spec 118), sem consumir nada; a conclusão (`GET /auth/finish`) não é
+//!     aberta, consome o `state` e confere o dispositivo que iniciou a tentativa.
 //! - **Link de entrada:** gerado ao subir em modo rede ([`DeviceStore::issue_entry_link`]), de uso
 //!   único e válido por 10 minutos; cria o dispositivo "Este computador".
 //! - **Código de 6 dígitos:** só com a janela de adicionar aberta (até 10 minutos), troca a cada
@@ -684,7 +685,7 @@ fn is_invisible_format(c: char) -> bool {
 }
 
 /// Idioma do pedido: o cabeçalho da interface, senão o `Accept-Language`, senão pt-BR.
-fn request_lang(headers: &HeaderMap) -> Lang {
+pub(crate) fn request_lang(headers: &HeaderMap) -> Lang {
     if let Some(lang) = super::lang::header_lang(headers) {
         return lang;
     }
@@ -808,7 +809,8 @@ fn is_event_stream(resp: &Response) -> bool {
 }
 
 /// Retorno do login pelo plano ChatGPT (spec 116) com um `state` pendente e válido: passa sem
-/// dispositivo, e o handler consome o `state` e confere o dispositivo que iniciou a tentativa.
+/// dispositivo e só devolve a página de passagem (spec 118); a conclusão, que consome o `state` e
+/// confere o dispositivo que iniciou a tentativa, segue a regra de sempre.
 /// Sem `state` válido, a rota segue a regra de sempre.
 fn chatgpt_callback_pending(state: &AppState, req: &Request) -> bool {
     req.method() == Method::GET
