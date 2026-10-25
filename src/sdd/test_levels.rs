@@ -230,16 +230,27 @@ fn install_state_path(dir: &Path) -> Option<PathBuf> {
     Git::new(dir.to_path_buf()).private_git_dir().ok().map(|d| d.join(INSTALL_STATE_FILE))
 }
 
-/// Chave da última instalação bem-sucedida na pasta; `None` se nunca instalou ou não dá para ler.
-pub fn installed_key(dir: &Path) -> Option<String> {
+/// Linhas do estado gravado: a chave e, desde a spec 126, quando a instalação passou.
+fn install_state_lines(dir: &Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(install_state_path(dir)?).ok()?;
-    Some(text.trim().to_string()).filter(|k| !k.is_empty())
+    Some(text.lines().map(|l| l.trim().to_string()).collect())
 }
 
-/// Grava a chave da instalação que acabou de passar (melhor esforço).
-pub fn remember_install(dir: &Path, key: &str) {
+/// Chave da última instalação bem-sucedida na pasta; `None` se nunca instalou ou não dá para ler.
+pub fn installed_key(dir: &Path) -> Option<String> {
+    install_state_lines(dir)?.into_iter().next().filter(|k| !k.is_empty())
+}
+
+/// Quando a última instalação bem-sucedida na pasta passou (o texto gravado com ela); `None` se
+/// nunca instalou ou o estado é anterior à spec 126 (só a chave).
+pub fn installed_at(dir: &Path) -> Option<String> {
+    install_state_lines(dir)?.into_iter().nth(1).filter(|a| !a.is_empty())
+}
+
+/// Grava a chave da instalação que acabou de passar e quando (`at`, melhor esforço).
+pub fn remember_install(dir: &Path, key: &str, at: &str) {
     if let Some(path) = install_state_path(dir) {
-        let _ = std::fs::write(path, format!("{key}\n"));
+        let _ = std::fs::write(path, format!("{key}\n{}\n", at.trim()));
     }
 }
 
@@ -254,6 +265,29 @@ pub fn forget_install(dir: &Path) {
 /// como saber se as dependências mudaram: roda sempre (na dúvida, repete).
 pub fn install_needed(settings: &Settings, command: &str, dir: &Path) -> bool {
     settings.lockfiles.is_empty() || installed_key(dir).as_deref() != Some(install_key(settings, command, dir).as_str())
+}
+
+/// Spec 126 T01: campos de teste (`test_command`, `full_test_command`) que começam com o próprio
+/// `install_command` (o mesmo texto, seguido de nada, de espaço ou de um operador do shell), ou
+/// seja, que repetem a instalação que o Nants já roda antes. Vazio sem `install_command`.
+pub fn repeated_install(settings: &Settings) -> Vec<(&'static str, String)> {
+    let Some(install) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        return Vec::new();
+    };
+    let starts_with_install = |command: &str| {
+        command
+            .trim()
+            .strip_prefix(install)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || "&;|".contains(c)))
+    };
+    let mut out = Vec::new();
+    if starts_with_install(&settings.test_command) {
+        out.push(("test_command", settings.test_command.trim().to_string()));
+    }
+    if let Some(full) = settings.full_test_command.as_deref().filter(|f| starts_with_install(f)) {
+        out.push(("full_test_command", full.trim().to_string()));
+    }
+    out
 }
 
 /// O runner pode aceitar a rodada do Desenvolvedor deste comando no ambiente do projeto? No
@@ -362,14 +396,14 @@ mod tests {
         assert_eq!(s.lockfiles, vec!["deps.lock".to_string()]);
         fs::write(dir.join("deps.lock"), "a=1\n").expect("w");
         assert!(install_needed(&s, "make deps", &dir), "nunca instalou");
-        remember_install(&dir, &install_key(&s, "make deps", &dir));
+        remember_install(&dir, &install_key(&s, "make deps", &dir), "2026-10-25T10:00:00Z");
         assert!(!install_needed(&s, "make deps", &dir), "trava igual");
         // O estado fica fora da árvore: não aparece para o Git.
         let status = Command::new("git").args(["status", "--porcelain"]).current_dir(&dir).output().expect("git");
         assert!(!String::from_utf8_lossy(&status.stdout).contains("nants-install"));
         fs::write(dir.join("deps.lock"), "a=2\n").expect("w");
         assert!(install_needed(&s, "make deps", &dir), "trava mudou");
-        remember_install(&dir, &install_key(&s, "make deps", &dir));
+        remember_install(&dir, &install_key(&s, "make deps", &dir), "2026-10-25T10:00:00Z");
         assert!(!install_needed(&s, "make deps", &dir));
         // Outro ambiente ou outro comando: instala de novo.
         let mut other = s.clone();
@@ -381,9 +415,38 @@ mod tests {
         assert!(install_needed(&s, "make deps", &dir));
         // Sem arquivos de trava, roda sempre.
         let no_locks = settings("test_command: \"make test\"\ninstall_command: \"make deps\"\n");
-        remember_install(&dir, &install_key(&no_locks, "make deps", &dir));
+        remember_install(&dir, &install_key(&no_locks, "make deps", &dir), "2026-10-25T10:00:00Z");
         assert!(install_needed(&no_locks, "make deps", &dir));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_state_keeps_the_key_and_when_and_reads_the_old_format() {
+        let dir = repo("state");
+        let s = settings("test_command: \"make test\"\ninstall_command: \"make deps\"\nlockfiles: [deps.lock]\n");
+        assert!(installed_at(&dir).is_none());
+        let key = install_key(&s, "make deps", &dir);
+        remember_install(&dir, &key, "2026-10-25T10:00:00Z");
+        assert_eq!(installed_key(&dir).as_deref(), Some(key.as_str()));
+        assert_eq!(installed_at(&dir).as_deref(), Some("2026-10-25T10:00:00Z"));
+        // Estado gravado antes da spec 126 (só a chave): continua em dia, sem data.
+        let path = install_state_path(&dir).expect("estado");
+        fs::write(&path, format!("{key}\n")).expect("w");
+        assert!(!install_needed(&s, "make deps", &dir));
+        assert!(installed_at(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_install_finds_test_commands_that_start_with_the_install() {
+        let s = settings("test_command: \"npm ci --no-audit && npm run test:fast\"\nfull_test_command: \"npm run test:full\"\ninstall_command: \"npm ci --no-audit\"\n");
+        assert_eq!(repeated_install(&s), vec![("test_command", "npm ci --no-audit && npm run test:fast".to_string())]);
+        let both = settings("test_command: \"make deps; make fast\"\nfull_test_command: \" make deps \"\ninstall_command: \"make deps\"\n");
+        assert_eq!(repeated_install(&both).iter().map(|r| r.0).collect::<Vec<_>>(), vec!["test_command", "full_test_command"]);
+        // Outro comando com o mesmo começo de palavra não conta; sem instalação, nada.
+        let other = settings("test_command: \"make depsx && make test\"\ninstall_command: \"make deps\"\n");
+        assert!(repeated_install(&other).is_empty());
+        assert!(repeated_install(&settings("test_command: \"make deps && make test\"\n")).is_empty());
     }
 
     #[test]

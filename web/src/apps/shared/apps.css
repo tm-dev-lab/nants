@@ -718,6 +718,64 @@
   overflow-wrap: anywhere;
 }
 
+/* Tabela GFM (spec 126 T04): a moldura rola na horizontal dentro do balão; a página não. */
+.nd-md-table-wrap {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--r-md);
+  background: var(--surface2);
+}
+
+/* A coluna nunca fica mais estreita que a maior palavra (sem quebra dentro da palavra): quando a
+   soma não cabe, a moldura rola. O prefixo `.nd-md` vence a regra estreita do celular
+   (`.nd-content[data-size="narrow"]`, que limita a tabela e quebra a palavra em qualquer ponto). */
+.nd-md .nd-md-table {
+  min-width: 100%;
+  max-width: none;
+  border-collapse: collapse;
+  font-size: var(--fs-label);
+  line-height: 1.45;
+  color: var(--ink2);
+}
+
+.nd-md .nd-md-table th,
+.nd-md .nd-md-table td {
+  padding: var(--sp-1) var(--sp-2);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.nd-md .nd-md-table code {
+  overflow-wrap: normal;
+}
+
+.nd-md-table th {
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+  white-space: nowrap;
+}
+
+.nd-md-table tbody tr {
+  border-top: 1px solid var(--line);
+}
+
+.nd-md .nd-md-table .nd-md-al-left {
+  text-align: left;
+}
+
+.nd-md .nd-md-table .nd-md-al-center {
+  text-align: center;
+}
+
+.nd-md .nd-md-table .nd-md-al-right {
+  text-align: right;
+}
+
 .nd-md-code {
   padding: 0 var(--sp-1);
   border-radius: var(--r-xs);
@@ -1553,6 +1611,16 @@
   flex-direction: column;
   gap: var(--sp-1);
   color: var(--ink);
+}
+
+/* Tarefa grande demais (spec 126 T03): primeiro item da faixa, com a tarefa em destaque. */
+.nd-plan-big {
+  color: var(--ink);
+}
+
+.nd-plan-big-title {
+  font-weight: var(--fw-semibold);
+  color: var(--pill-amber-ink);
 }
 
 .nd-plan-warn-note {

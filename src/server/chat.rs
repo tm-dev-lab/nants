@@ -230,6 +230,20 @@ pub async fn post_chat(
     run_turn(&state, &id, &body, CHAT_TIMEOUT, state.llm_backend()).await
 }
 
+/// Turno interno pedido pelo próprio servidor (spec 126 T03: divisão das tarefas `too_large` antes
+/// da aprovação). Passa pelo mesmo caminho do `POST /chat` com `internal: true` (reserva do turno,
+/// prontidão, persistência e eventos) e devolve só o código HTTP. Futuro em caixa: o turno dispara
+/// a revisão do plano, que pode pedir este turno (quebra o ciclo de tipos).
+pub(super) fn internal_turn(state: AppState, project_id: String, message: String) -> Pin<Box<dyn Future<Output = StatusCode> + Send>> {
+    Box::pin(async move {
+        let body = json!({ "message": message, "internal": true }).to_string();
+        match run_turn(&state, &project_id, body.as_bytes(), CHAT_TIMEOUT, state.llm_backend()).await {
+            Ok(resp) => resp.status(),
+            Err(err) => err.into_response().status(),
+        }
+    })
+}
+
 /// `GET /api/projects/:id/chat`: últimos turnos do histórico, em ordem cronológica, com texto
 /// redigido. Sem efeitos colaterais; arquivo ausente ou inseguro vira lista vazia.
 pub async fn get_chat(

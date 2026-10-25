@@ -174,17 +174,37 @@ pub fn by_recurrence(findings: &mut [Finding]) {
 /// Aplica a revisão (`current`, os bloqueantes depois da convergência) ao registro. `attempt` é a
 /// tentativa que está sendo revisada; a revisão é a seguinte à maior `last_review` do registro.
 pub fn track(registry: &[Finding], previous_open: &[Finding], current: Vec<Finding>, attempt: u32) -> Tracked {
+    track_with_observations(registry, previous_open, current, &[], attempt)
+}
+
+/// Spec 126 T04: como [`track`], com as observações da mesma revisão (o que a convergência
+/// rebaixou). O id de uma observação fica reservado: nenhum bloqueante desta revisão o recebe (nem
+/// por reutilização, nem pela numeração do runner), então um id nunca aparece duas vezes na mesma
+/// mensagem. Um aberto do registro rebaixado a observação fica `resolved` no registro (decisão da
+/// 124/T01), mas não entra em [`Tracked::resolved`]: na mensagem ele aparece só como observação.
+pub fn track_with_observations(
+    registry: &[Finding],
+    previous_open: &[Finding],
+    current: Vec<Finding>,
+    observations: &[Finding],
+    attempt: u32,
+) -> Tracked {
     let mut reg = seed(registry, previous_open);
     let review = reg.iter().map(|f| f.last_review).max().unwrap_or(0) + 1;
+    let reserved: HashSet<String> =
+        observations.iter().map(|f| f.id.trim().to_string()).filter(|id| !id.is_empty()).collect();
     let mut next = reg
         .iter()
         .chain(current.iter())
+        .chain(observations.iter())
         .filter_map(|f| id_number(&f.id))
         .max()
         .unwrap_or(0)
         + 1;
-    let current_ids: HashSet<String> = current.iter().map(|f| f.id.trim().to_string()).collect();
-    let mut claimed: HashSet<String> = HashSet::new();
+    let current_ids: HashSet<String> =
+        current.iter().map(|f| f.id.trim().to_string()).chain(reserved.iter().cloned()).collect();
+    // Os ids das observações contam como já usados nesta revisão.
+    let mut claimed: HashSet<String> = reserved.clone();
     let mut open = Vec::with_capacity(current.len());
     for mut f in current {
         f.id = f.id.trim().to_string();
@@ -209,11 +229,17 @@ pub fn track(registry: &[Finding], previous_open: &[Finding], current: Vec<Findi
                 f.first_attempt = prior.first_attempt;
                 // Spec 124 T02: a decisão sobre a contestação acompanha o apontamento.
                 f.arbitration = prior.arbitration.clone();
+                // Spec 126 T02: a contagem de "corrigido" sem efeito e o gatilho antecipado seguem o id.
+                f.fixed_claims = prior.fixed_claims;
+                f.early_review = prior.early_review;
             }
             Some(i) => {
                 // Resolvido que volta: mesmo id, conta de novo.
                 f.id = reg[i].id.clone();
                 f.arbitration = reg[i].arbitration.clone();
+                // Spec 126 T02: o "corrigido" que não durou continua contando quando o apontamento volta.
+                f.early_review = reg[i].early_review;
+                f.fixed_claims = reg[i].fixed_claims;
                 f.state = Some(FindingState::New);
                 f.recurrence = 1;
                 f.first_review = review;
@@ -233,20 +259,25 @@ pub fn track(registry: &[Finding], previous_open: &[Finding], current: Vec<Findi
                 f.recurrence = 1;
                 f.first_review = review;
                 f.first_attempt = attempt;
+                f.fixed_claims = 0;
+                f.early_review = 0;
             }
         }
         f.last_review = review;
         claimed.insert(f.id.clone());
         open.push(f);
     }
+    let blocking: HashSet<&str> = open.iter().map(|f| f.id.as_str()).collect();
     let mut resolved = Vec::new();
     for e in reg.iter_mut() {
-        if claimed.contains(&e.id) || !e.state.is_some_and(FindingState::is_pending) {
+        if blocking.contains(e.id.as_str()) || !e.state.is_some_and(FindingState::is_pending) {
             continue;
         }
         e.state = Some(FindingState::Resolved);
         e.last_review = review;
-        resolved.push(e.clone());
+        if !reserved.contains(&e.id) {
+            resolved.push(e.clone());
+        }
     }
     for f in &open {
         match reg.iter_mut().find(|e| e.id == f.id) {
@@ -256,6 +287,20 @@ pub fn track(registry: &[Finding], previous_open: &[Finding], current: Vec<Findi
     }
     reg.sort_by(|a, b| id_number(&a.id).unwrap_or(u32::MAX).cmp(&id_number(&b.id).unwrap_or(u32::MAX)).then(a.id.cmp(&b.id)));
     Tracked { open, resolved, registry: reg }
+}
+
+/// Spec 126 T02: soma uma revisão a `fixed_claims` de cada apontamento que continuou aberto (estado
+/// `open`) depois de o Desenvolvedor respondê-lo como corrigido ou com teste (`claimed`, os ids dessas
+/// respostas na tentativa revisada). Atualiza os abertos e o registro.
+pub fn count_fixed_claims(tracked: &mut Tracked, claimed: &[String]) {
+    for f in tracked.open.iter_mut() {
+        if f.state == Some(FindingState::Open) && claimed.iter().any(|c| c == &f.id) {
+            f.fixed_claims += 1;
+            if let Some(e) = tracked.registry.iter_mut().find(|e| e.id == f.id) {
+                e.fixed_claims = f.fixed_claims;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +474,21 @@ mod tests {
         assert_eq!(back, t.registry);
         let old: Vec<Finding> = serde_yaml::from_str("- id: F-01\n  severity: HIGH\n  location: a\n  description: b\n  recommendation: c\n").expect("antigo");
         assert_eq!((old[0].state, old[0].recurrence), (None, 0));
+    }
+
+    /// Spec 126 T02: só conta o "corrigido" que continuou aberto, e a contagem segue o id quando o
+    /// apontamento volta depois de resolvido.
+    #[test]
+    fn fixed_claims_count_only_what_stayed_open() {
+        let first = track(&[], &[], vec![f("F-01", "src/a.rs:1", "Falta X"), f("F-02", "src/b.rs:1", "Falta Y")], 1);
+        let mut second = track(&first.registry, &first.open, vec![f("F-01", "src/a.rs:1", "Falta X"), f("F-02", "src/b.rs:1", "Falta Y")], 2);
+        count_fixed_claims(&mut second, &["F-01".to_string()]);
+        let claims = |t: &Tracked, id: &str| t.registry.iter().find(|e| e.id == id).map(|e| e.fixed_claims);
+        assert_eq!((claims(&second, "F-01"), claims(&second, "F-02")), (Some(1), Some(0)));
+        let mut third = track(&second.registry, &second.open, vec![f("F-02", "src/b.rs:1", "Falta Y")], 3);
+        count_fixed_claims(&mut third, &["F-01".to_string()]);
+        assert_eq!(claims(&third, "F-01"), Some(1), "resolvido: não conta");
+        let back = track(&third.registry, &third.open, vec![f("F-01", "src/a.rs:1", "Falta X")], 4);
+        assert_eq!(back.open[0].fixed_claims, 1, "volta com a contagem");
     }
 }

@@ -21,7 +21,11 @@ const MAX_CHOICE_QUESTIONS = 4;
 const MIN_CHOICE_OPTIONS = 2;
 const MAX_CHOICE_OPTIONS = 6;
 
-const BLOCK = /```nants-choices[ \t]*\r?\n([\s\S]*?)```[ \t]*(?:\r?\n|$)/g;
+/**
+ * O fechamento pode vir colado ao texto seguinte (```` ```Once you… ````, spec 126 T04): o resto vira
+ * texto normal, num parágrafo próprio.
+ */
+const BLOCK = /```nants-choices[ \t]*\r?\n([\s\S]*?)```[ \t]*(\r?\n)?/g;
 
 function validate(raw: unknown): ChoiceQuestion[] | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -50,13 +54,13 @@ function validate(raw: unknown): ChoiceQuestion[] | null {
 /** Remove todos os blocos do texto; devolve as perguntas do ÚLTIMO bloco válido (ou null). */
 export function parseChoices(text: string): { text: string; questions: ChoiceQuestion[] | null } {
   let questions: ChoiceQuestion[] | null = null;
-  const stripped = text.replace(BLOCK, (_all, body: string) => {
+  const stripped = text.replace(BLOCK, (_all, body: string, newline: string | undefined) => {
     try {
       questions = validate(JSON.parse(body));
     } catch {
       questions = null;
     }
-    return "";
+    return newline === undefined ? "\n\n" : "";
   });
   return { text: stripped.trim(), questions };
 }

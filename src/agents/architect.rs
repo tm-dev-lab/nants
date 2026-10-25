@@ -744,7 +744,7 @@ const RECOVERY_REQUEST: &str = "A tarefa está bloqueada. Analise e responda com
 const DIAGNOSIS_REQUEST: &str = "A tarefa está bloqueada por ambiente. Diagnostique e responda com o JSON.";
 
 /// Pedido do turno de arbitragem (spec 124 T02).
-const ARBITRATION_REQUEST: &str = "O Desenvolvedor contestou apontamentos do Revisor. Decida cada um e responda com o JSON.";
+const ARBITRATION_REQUEST: &str = "Decida cada apontamento dos FATOS (contestado pelo Desenvolvedor ou recorrente) e responda com o JSON.";
 
 /// Pedido de um turno somente leitura e o código da saída estruturada dele (spec 121): o JSON
 /// do diagnóstico e da recuperação não aparece na Atividade; o Markdown do ARCHITECTURE.md, sim.

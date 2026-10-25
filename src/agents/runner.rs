@@ -132,7 +132,7 @@ pub const BLOCK_REVISED: &str = "revised";
 /// Códigos estáveis dos motivos de bloqueio gravados em `next_action_code` (spec 114 T02). Cada um
 /// tem o texto `runner.block.<código>` nos dois dicionários, menos o orçamento (`runner.budget.*`,
 /// montado pelo [`BudgetGuard`]).
-pub const BLOCK_CODES: [&str; 22] = [
+pub const BLOCK_CODES: [&str; 23] = [
     "budget",
     "docker",
     "external_edit",
@@ -155,6 +155,7 @@ pub const BLOCK_CODES: [&str; 22] = [
     "finalize_dirty",
     BLOCK_REVISED,
     "blocked",
+    "recurring",
 ];
 
 /// Motivo de bloqueio (spec 114 T02): o código estável, lido pelas máquinas, e o texto para a
@@ -410,6 +411,8 @@ const FLAKY_MAX_LINES: usize = 10;
 pub const DEV_REUSED_MARK: &str = "Resultado reaproveitado da rodada do Desenvolvedor, mesmo comando sobre a mesma árvore:";
 /// Seção do corpo da tarefa com as rodadas reaproveitadas do Desenvolvedor (spec 124 T05).
 pub const REUSE_SECTION: &str = "Testes reaproveitados";
+/// Seção do corpo da tarefa com os avisos sobre a instalação das dependências (spec 126 T01).
+pub const INSTALL_SECTION: &str = "Instalação das dependências";
 /// Nome da etapa de instalação das dependências nos eventos da rodada (spec 124 T05).
 const INSTALL_STEP: &str = "install";
 /// Primeira linha da saída quando a instalação falha (marcador lido por modelo).
@@ -417,10 +420,14 @@ const INSTALL_FAILED_MARK: &str = "install_command falhou";
 
 /// Resultado da garantia de dependências antes de uma rodada (spec 124 T05).
 enum Install {
-    /// Sem `install_command`, ou a trava não mudou desde a última instalação nesta pasta.
-    Current,
-    /// Rodou agora e passou (no Docker, o estado do Compose já foi recriado por ela).
-    Ran,
+    /// Sem `install_command`.
+    Absent,
+    /// A trava não mudou desde a última instalação nesta pasta (`since`, quando o estado guarda a
+    /// data; spec 126 T01).
+    Current { since: Option<String> },
+    /// Rodou agora e passou (no Docker, o estado do Compose já foi recriado por ela). `clean` = do
+    /// zero, com o estado apagado antes (a rodada limpa final; spec 126 T01).
+    Ran { clean: bool },
     /// Rodou e falhou: a saída vale como a da rodada, com a duração dela.
     Failed(TestResult, Duration),
 }
@@ -2699,6 +2706,7 @@ impl TaskRunner {
         self.developer.begin_attempt(&task.frontmatter.id);
         // Spec 124 T02: as respostas aos apontamentos são desta tentativa (as sessões se somam).
         task.body = replace_section(&task.body, RESPONSES, None);
+        self.warn_repeated_install(settings, task, attempt);
         loop {
             self.check_cancel()?;
             if let Some(step) = self.budget_stop(task)? {
@@ -2707,7 +2715,7 @@ impl TaskRunner {
             // Spec 124 T05: dependências em dia antes da sessão (só quando a trava mudou). Melhor
             // esforço: a falha reaparece na rodada de testes, com a saída.
             if settings.install_command.is_some() {
-                let _ = self.ensure_installed(settings, &wt, "", &task.frontmatter.id, attempt).await;
+                let _ = self.ensure_installed(settings, &wt, "", &task.frontmatter.id, attempt, false).await;
             }
             // Spec 124 T05: as rodadas destes comandos pelo Desenvolvedor ficam registradas.
             self.suite_ledger.watch(test_levels::watched_commands(settings), test_levels::environment_key(settings));
@@ -2758,6 +2766,9 @@ impl TaskRunner {
             let mut flaky: Option<(String, Vec<String>)> = None;
             let dev_final = self.dev_reusable(settings, &wt, tree.as_deref(), &suite_label);
             let mut dispensed: Vec<String> = Vec::new();
+            // Spec 126 T01: linha do estado da instalação da rodada que deu o resultado.
+            let mut fast_note: Option<String> = None;
+            let mut final_note: Option<String> = None;
             let fast = if full.is_some() {
                 let dev_fast = dev_final.clone().or_else(|| self.dev_reusable(settings, &wt, tree.as_deref(), &settings.test_command));
                 match dev_fast {
@@ -2766,7 +2777,7 @@ impl TaskRunner {
                         dispensed.push(settings.test_command.clone());
                         None
                     }
-                    None => match self.suite_round(settings, task, &wt, attempt, &settings.test_command, &mut rerun_used, &mut flaky).await? {
+                    None => match self.suite_round(settings, task, &wt, attempt, &settings.test_command, false, &mut fast_note, &mut rerun_used, &mut flaky).await? {
                         Ok(t) => Some(t),
                         Err(step) => return Ok(step),
                     },
@@ -2774,16 +2785,25 @@ impl TaskRunner {
             } else {
                 None
             };
+            // Spec 126 T01: a rodada limpa final (a que vai ao Revisor) instala do zero.
             let mut test = match fast {
-                Some(f) if !f.passed => f,
+                Some(f) if !f.passed => {
+                    final_note = fast_note;
+                    f
+                }
                 _ => {
                     self.check_cancel()?;
-                    match self.suite_round(settings, task, &wt, attempt, &suite_label, &mut rerun_used, &mut flaky).await? {
+                    match self.suite_round(settings, task, &wt, attempt, &suite_label, true, &mut final_note, &mut rerun_used, &mut flaky).await? {
                         Ok(t) => t,
                         Err(step) => return Ok(step),
                     }
                 }
             };
+            // A saída só do Docker Compose é silenciosa antes de receber a linha da instalação.
+            let silent_suite = test.passed && test.exit_code.unwrap_or(0) == 0 && is_silent_output(&test.output);
+            if let Some(note) = &final_note {
+                test.output = format!("{note}\n\n{}", test.output);
+            }
             if test.passed && (!dispensed.is_empty() || dev_final.is_some()) {
                 self.note_clean_round(task, attempt, &suite_label, tree.as_deref().unwrap_or(""), &dispensed);
             }
@@ -2802,7 +2822,7 @@ impl TaskRunner {
                         checks_from_dev.push(check.name.clone());
                         self.accept_dev_check(task, attempt, &run)
                     } else {
-                        match self.run_tracked(settings, &wt, &check.command, false, Some(&check.name), "", &task.frontmatter.id, attempt).await {
+                        match self.run_check(settings, &wt, &check.command, &check.name, "", &task.frontmatter.id, attempt).await {
                             Ok(r) => r,
                             Err(RunnerError::Docker(reason)) => {
                                 return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
@@ -2871,7 +2891,7 @@ impl TaskRunner {
             }
             if test.passed {
                 let crit = if dev_criteria.is_empty() { String::new() } else { format!("{DEV_CRITERIA_MARK}{dev_criteria}") };
-                let silent = if test.exit_code.unwrap_or(0) == 0 && is_silent_output(&test.output) {
+                let silent = if silent_suite {
                     format!("\n{SILENT_PASS_WARNING}\n")
                 } else {
                     String::new()
@@ -2981,7 +3001,9 @@ impl TaskRunner {
 
     /// Uma rodada de `command` na worktree (spec 124 T04/T05): as dependências em dia, a rodada, o
     /// aviso de orçamento e, se falhou, a repetição única por tentativa da rodada instável (só se
-    /// couber no limite). `Ok(Err(step))` = a tarefa bloqueou por ambiente.
+    /// couber no limite). `Ok(Err(step))` = a tarefa bloqueou por ambiente. Spec 126 T01: `clean` =
+    /// a rodada limpa final, que instala do zero; `install_note` recebe a linha do estado da
+    /// instalação da primeira rodada.
     #[allow(clippy::too_many_arguments)]
     async fn suite_round(
         &self,
@@ -2990,11 +3012,14 @@ impl TaskRunner {
         wt: &Path,
         attempt: u32,
         command: &str,
+        clean: bool,
+        install_note: &mut Option<String>,
         rerun_used: &mut bool,
         flaky: &mut Option<(String, Vec<String>)>,
     ) -> Result<Result<TestResult, Step>, RunnerError> {
         let task_id = task.frontmatter.id.clone();
-        let (first, elapsed) = self.install_then_run(settings, wt, command, "", &task_id, attempt).await;
+        let (first, elapsed, note) = self.install_then_run(settings, wt, command, "", &task_id, attempt, clean).await;
+        *install_note = note;
         let mut test = match first {
             Ok(t) => t,
             Err(RunnerError::Docker(reason)) => {
@@ -3009,7 +3034,7 @@ impl TaskRunner {
             *rerun_used = true;
             self.check_cancel()?;
             self.tests_message(task, attempt, i18n::text(self.lang.get(), "runner.tests.rerun"));
-            let (again, again_elapsed) = self.install_then_run(settings, wt, command, "", &task_id, attempt).await;
+            let (again, again_elapsed, _) = self.install_then_run(settings, wt, command, "", &task_id, attempt, false).await;
             let again = match again {
                 Ok(t) => t,
                 Err(RunnerError::Docker(reason)) => {
@@ -3032,6 +3057,10 @@ impl TaskRunner {
     /// como a rodada (a saída dela volta ao Desenvolvedor). Depois de instalar, o estado do Compose já
     /// foi recriado, então a rodada não o recria de novo. Rodada que falha com 126/127 (programa
     /// ausente ou não executável, em qualquer shell POSIX) esquece a instalação: a próxima instala.
+    ///
+    /// Spec 126 T01: `clean` apaga o estado e instala do zero, mesmo com a trava sem mudança (a
+    /// rodada limpa final antes do Revisor). O terceiro valor é a linha do estado da instalação para
+    /// a evidência (`None` sem `install_command` ou quando a instalação falhou, que já se descreve).
     #[allow(clippy::too_many_arguments)]
     async fn install_then_run(
         &self,
@@ -3041,25 +3070,87 @@ impl TaskRunner {
         place: &str,
         task_id: &str,
         attempt: u32,
-    ) -> (Result<TestResult, RunnerError>, Duration) {
-        let fresh = match self.ensure_installed(settings, dir, place, task_id, attempt).await {
-            Err(e) => return (Err(e), Duration::ZERO),
-            Ok(Install::Failed(result, elapsed)) => return (Ok(result), elapsed),
-            Ok(Install::Ran) => false,
-            Ok(Install::Current) => true,
+        clean: bool,
+    ) -> (Result<TestResult, RunnerError>, Duration, Option<String>) {
+        let install = match self.ensure_installed(settings, dir, place, task_id, attempt, clean).await {
+            Err(e) => return (Err(e), Duration::ZERO, None),
+            Ok(Install::Failed(result, elapsed)) => return (Ok(result), elapsed, None),
+            Ok(install) => install,
         };
-        let (out, elapsed) = self.run_tracked_timed(settings, dir, command, fresh, None, place, task_id, attempt).await;
-        if let Ok(t) = &out {
-            if !t.passed && settings.install_command.is_some() && matches!(t.exit_code, Some(126 | 127)) {
-                test_levels::forget_install(dir);
-            }
+        let note = self.install_note(settings, &install);
+        let fresh = !matches!(install, Install::Ran { .. });
+        let (mut out, elapsed) = self.run_tracked_timed(settings, dir, command, fresh, None, place, task_id, attempt).await;
+        if let Ok(t) = &mut out {
+            self.after_failed_round(settings, dir, t);
         }
-        (out, elapsed)
+        (out, elapsed, note)
+    }
+
+    /// Spec 126 T01: a rodada que falhou com 126/127 (programa ausente ou não executável, em
+    /// qualquer shell POSIX) esquece a instalação da pasta (a próxima instala) e ganha, no fim da
+    /// saída (a parte que sobrevive aos cortes), o diagnóstico de dependência ausente para o
+    /// Desenvolvedor e a recuperação não procurarem defeito no código.
+    fn after_failed_round(&self, settings: &Settings, dir: &Path, result: &mut TestResult) {
+        if result.passed || result.timed_out {
+            return;
+        }
+        let Some(code) = result.exit_code.filter(|c| matches!(c, 126 | 127)) else { return };
+        if settings.install_command.is_some() {
+            test_levels::forget_install(dir);
+        }
+        let install = settings.install_command.as_deref().map(|c| self.scrub(c)).unwrap_or_default();
+        let key = if install.is_empty() { "runner.tests.missing_program" } else { "runner.tests.missing_program_install" };
+        let note = i18n::tr(self.lang.get(), key, &[("code", &code.to_string()), ("install", &install)]);
+        result.output = format!("{}\n\n{note}\n", result.output.trim_end());
+    }
+
+    /// Spec 126 T01: linha da evidência com o estado da instalação desta rodada (o comando, se rodou
+    /// do zero, porque a trava mudou ou foi pulada, e desde quando). Texto no idioma do projeto.
+    fn install_note(&self, settings: &Settings, install: &Install) -> Option<String> {
+        let command = self.scrub(settings.install_command.as_deref()?.trim());
+        let locks = settings.lockfiles.join(", ");
+        let lang = self.lang.get();
+        let tr = |key: &str, since: &str| {
+            i18n::tr(lang, key, &[("command", command.as_str()), ("locks", locks.as_str()), ("since", since)])
+        };
+        Some(match install {
+            Install::Absent | Install::Failed(..) => return None,
+            Install::Ran { clean: true } => tr("runner.install.clean", ""),
+            Install::Ran { clean: false } if settings.lockfiles.is_empty() => tr("runner.install.always", ""),
+            Install::Ran { clean: false } => tr("runner.install.changed", ""),
+            Install::Current { since: Some(since) } => tr("runner.install.skipped", since),
+            Install::Current { since: None } => tr("runner.install.skipped_no_date", ""),
+        })
+    }
+
+    /// Spec 126 T01: uma checagem em `dir` (worktree ou base) com as dependências garantidas antes,
+    /// pela mesma regra da trava (na base sem estado de instalação, instala). A instalação que falha
+    /// vale como o resultado da checagem; a que sai com 126/127 tem o diagnóstico de dependência
+    /// ausente e esquece a instalação.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_check(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        name: &str,
+        place: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> Result<TestResult, RunnerError> {
+        if let Install::Failed(result, _) = self.ensure_installed(settings, dir, place, task_id, attempt, false).await? {
+            return Ok(result);
+        }
+        let mut out = self.run_tracked(settings, dir, command, false, Some(name), place, task_id, attempt).await?;
+        self.after_failed_round(settings, dir, &mut out);
+        Ok(out)
     }
 
     /// Spec 124 T05: roda o `install_command` em `dir` só quando o hash dos arquivos de trava (com o
     /// comando e o ambiente) mudou desde a última instalação bem-sucedida naquela pasta. Sem
-    /// `install_command`, nada muda. O estado fica no diretório Git privado da pasta.
+    /// `install_command`, nada muda. O estado fica no diretório Git privado da pasta. Spec 126 T01:
+    /// `clean` apaga o estado antes, e a instalação roda do zero.
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_installed(
         &self,
         settings: &Settings,
@@ -3067,21 +3158,27 @@ impl TaskRunner {
         place: &str,
         task_id: &str,
         attempt: u32,
+        clean: bool,
     ) -> Result<Install, RunnerError> {
         let Some(command) = settings.install_command.as_deref().filter(|c| !c.trim().is_empty()) else {
-            return Ok(Install::Current);
+            return Ok(Install::Absent);
         };
+        if clean {
+            test_levels::forget_install(dir);
+        }
         if !test_levels::install_needed(settings, command, dir) {
-            return Ok(Install::Current);
+            return Ok(Install::Current { since: test_levels::installed_at(dir) });
         }
         let started = Instant::now();
-        let out = self.run_tracked(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt).await?;
+        let mut out = self.run_tracked(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt).await?;
         if out.passed {
             // A chave sai do disco depois da instalação (ela pode ter reescrito a trava).
-            test_levels::remember_install(dir, &test_levels::install_key(settings, command, dir));
-            return Ok(Install::Ran);
+            let at = rfc3339_of(std::time::SystemTime::now());
+            test_levels::remember_install(dir, &test_levels::install_key(settings, command, dir), &at);
+            return Ok(Install::Ran { clean });
         }
         test_levels::forget_install(dir);
+        self.after_failed_round(settings, dir, &mut out);
         let output = format!("{INSTALL_FAILED_MARK} (`{}`):\n{}", self.scrub(command), out.output);
         Ok(Install::Failed(TestResult { output, ..out }, started.elapsed()))
     }
@@ -3106,6 +3203,33 @@ impl TaskRunner {
             settings.environment == Environment::Docker,
             self.round_limit(settings),
         )
+    }
+
+    /// Spec 126 T01: o `test_command` ou o `full_test_command` que começa com o próprio
+    /// `install_command` repete a instalação que o Nants já roda antes. O Nants avisa, sem alterar o
+    /// comando aprovado, na tarefa (seção [`INSTALL_SECTION`], uma vez por comando) e na conversa.
+    fn warn_repeated_install(&self, settings: &Settings, task: &mut Task, attempt: u32) {
+        let repeated = test_levels::repeated_install(settings);
+        let Some(install) = settings.install_command.as_deref().map(|c| self.scrub(c.trim())) else { return };
+        let lang = self.lang.get();
+        let mut log = section_text(&task.body, INSTALL_SECTION).unwrap_or_default().trim_end().to_string();
+        let mut changed = false;
+        for (field, command) in repeated {
+            let command = self.scrub(&command);
+            let entry = i18n::tr(lang, "runner.install.repeated", &[("field", field), ("command", &command), ("install", &install)]);
+            if log.lines().any(|l| l.trim_start_matches("- ") == entry) {
+                continue;
+            }
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&format!("- {entry}"));
+            changed = true;
+            self.tests_message(task, attempt, entry);
+        }
+        if changed {
+            task.body = replace_section(&task.body, INSTALL_SECTION, Some(log));
+        }
     }
 
     /// Spec 124 T05: acrescenta uma linha à seção [`REUSE_SECTION`] da tarefa (gravada com ela).
@@ -3211,16 +3335,35 @@ impl TaskRunner {
         if let Some(step) = self.budget_stop(task)? {
             return Ok(Some(step));
         }
-        let (spec_id, task_id) = (task.frontmatter.spec_id.clone(), task.frontmatter.id.clone());
         let ids: Vec<String> = contested.iter().map(|(f, _)| f.id.clone()).collect();
-        let acceptance = acceptance_of(&task.body);
-        let mut facts = finding_reply::facts(
-            &task_id,
+        let facts = finding_reply::facts(
+            &task.frontmatter.id,
             &task.frontmatter.title,
             &section_text(&task.body, OBJECTIVE).unwrap_or_default(),
-            &acceptance,
+            &acceptance_of(&task.body),
             &contested,
         );
+        self.rule(arbiter.as_ref(), task, &registry, &previous, &ids, facts, "task.arbitration_unavailable").await?;
+        Ok(None)
+    }
+
+    /// Turno do Arquiteto sobre `ids` (a arbitragem da contestação, spec 124 T02, ou a decisão
+    /// antecipada da recorrência, spec 126 T02): `keep`, `adjust` ou `manual`, gravados como na
+    /// arbitragem. Resposta inválida ou falha do turno: o aviso `unavailable` e nada decidido.
+    #[allow(clippy::too_many_arguments)]
+    async fn rule(
+        &self,
+        arbiter: &dyn ArbiterPort,
+        task: &mut Task,
+        registry: &[Finding],
+        previous: &[Finding],
+        ids: &[String],
+        facts: String,
+        unavailable: &str,
+    ) -> Result<(), RunnerError> {
+        let (spec_id, task_id) = (task.frontmatter.spec_id.clone(), task.frontmatter.id.clone());
+        let acceptance = acceptance_of(&task.body);
+        let mut facts = facts;
         // Spec 124 T06: o aviso de custo (sinal, não limite) também vai a esta decisão.
         if let Some(alert) = crate::server::cost_alert::task_alert(&self.repo_root, &spec_id, &task_id) {
             facts = format!("{}\n\n{}\n", facts.trim_end(), crate::server::cost_alert::architect_line(&alert));
@@ -3229,22 +3372,22 @@ impl TaskRunner {
         let worktree = self.worktree_path(&spec_id, &task_id);
         let root = if worktree.is_dir() { worktree } else { self.repo_root.clone() };
         let ruling = match arbiter.arbitrate(&spec_id, &task_id, &root, &facts).await {
-            Ok(raw) => finding_reply::parse_ruling(&raw, &ids),
+            Ok(raw) => finding_reply::parse_ruling(&raw, ids),
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
             Err(_) => None,
         };
         let Some(ruling) = ruling else {
             let joined = ids.join(", ");
-            self.notice(&task_id, "task.arbitration_unavailable", &[("task", &task_id), ("findings", &joined)]);
-            return Ok(None);
+            self.notice(&task_id, unavailable, &[("task", &task_id), ("findings", &joined)]);
+            return Ok(());
         };
         let review = registry.iter().map(|f| f.last_review).max().unwrap_or(0) + 1;
         let ruling = finding_reply::Ruling { acceptance: ruling.acceptance.map(|a| self.scrub(&a)), ..ruling };
-        let out = finding_reply::apply(&registry, &previous, &acceptance, &ruling, review, &|t| validate_text_block("critérios", t).is_ok());
+        let out = finding_reply::apply(registry, previous, &acceptance, &ruling, review, &|t| validate_text_block("critérios", t).is_ok());
         if out.downgraded {
             // Critérios finais que não podem ser gravados: nada foi dispensado (tudo virou keep).
             let joined = ids.join(", ");
-            self.notice(&task_id, "task.arbitration_unavailable", &[("task", &task_id), ("findings", &joined)]);
+            self.notice(&task_id, unavailable, &[("task", &task_id), ("findings", &joined)]);
         }
         let entries = self.write_ruling(task, &out, review)?;
         self.persist(task)?;
@@ -3254,6 +3397,55 @@ impl TaskRunner {
             let code = format!("task.arbitration_{}", a.arbitration.decision.code());
             self.notice(&task_id, &code, &[("task", &task_id), ("finding", &a.finding.id), ("reason", &reason)]);
         }
+        Ok(())
+    }
+
+    /// Spec 126 T02: gatilho antecipado, depois de uma reprovação e antes da nova tentativa. Os
+    /// apontamentos de [`finding_reply::due_early`] (recorrentes ou "corrigidos" sem fechar) vão ao
+    /// Arquiteto uma vez cada (`early_review` marca):
+    /// - com [`finding_reply::EARLY_RECOVERY_HIGH`] ou mais HIGH, a recuperação é antecipada: a tarefa
+    ///   fica BLOQUEADA por qualidade (`recurring`) e o servidor roda a análise de recuperação (SPLIT,
+    ///   ADJUST, RETRY com estratégia nova ou ASK), o mesmo caminho do limite de tentativas;
+    /// - senão, a arbitragem decide cada um (`keep`, `adjust` ou `manual`), como numa contestação.
+    ///
+    /// Só com o Arquiteto ligado (o mesmo critério da arbitragem): sem ele, nada muda.
+    async fn early_decision(&self, task: &mut Task) -> Result<Option<Step>, RunnerError> {
+        let Some(arbiter) = self.arbiter.clone() else { return Ok(None) };
+        let mut previous = read_findings(&task.body)?;
+        let mut registry = finding_track::seed(&read_registry(&task.body)?, &previous);
+        let due = finding_reply::due_early(&registry);
+        if due.is_empty() {
+            return Ok(None);
+        }
+        let task_id = task.frontmatter.id.clone();
+        let ids: Vec<String> = due.iter().map(|f| f.id.clone()).collect();
+        let joined = ids.join(", ");
+        let review = registry.iter().map(|f| f.last_review).max().unwrap_or(0);
+        finding_reply::mark_early(&mut registry, &mut previous, &ids, review);
+        task.body = replace_section(&task.body, REGISTRY, render_findings(&registry)?);
+        task.body = replace_section(&task.body, FINDINGS, render_findings(&previous)?);
+        if finding_reply::high_count(&due) >= finding_reply::EARLY_RECOVERY_HIGH {
+            self.notice(&task_id, "task.recurring_recovery", &[("task", &task_id), ("findings", &joined)]);
+            let high: Vec<String> =
+                due.iter().filter(|f| f.severity.trim().eq_ignore_ascii_case("HIGH")).map(|f| f.id.clone()).collect();
+            return self.block(task, self.block_reason("recurring", &[("findings", &high.join(", "))]), BlockKind::Quality).map(Some);
+        }
+        self.persist(task)?;
+        if let Some(step) = self.budget_stop(task)? {
+            return Ok(Some(step));
+        }
+        self.notice(&task_id, "task.recurring_arbitration", &[("task", &task_id), ("findings", &joined)]);
+        let responses = finding_reply::read_section(&section_text(&task.body, RESPONSES).unwrap_or_default());
+        let items: Vec<(Finding, Option<FindingResponse>)> =
+            due.iter().map(|f| (f.clone(), responses.iter().find(|r| r.id == f.id).cloned())).collect();
+        let facts = finding_reply::recurring_facts(
+            &task_id,
+            &task.frontmatter.title,
+            &section_text(&task.body, OBJECTIVE).unwrap_or_default(),
+            &acceptance_of(&task.body),
+            &items,
+        );
+        self.rule(arbiter.as_ref(), task, &registry, &previous, &ids, facts, "task.recurring_unavailable").await?;
         Ok(None)
     }
 
@@ -3470,7 +3662,16 @@ impl TaskRunner {
         let mut observations = observations;
         observations.extend(dispensed);
         // Spec 124 T01: identidade, estado e recorrência dos apontamentos (aprovação resolve todos).
-        let tracked = finding_track::track(&registry, &previous, result.findings.clone(), attempt);
+        // Spec 126 T04: o id de uma observação desta revisão não vai para nenhum bloqueante.
+        let mut tracked =
+            finding_track::track_with_observations(&registry, &previous, result.findings.clone(), &observations, attempt);
+        // Spec 126 T02: "corrigido" ou "teste adicionado" que não fechou o apontamento conta.
+        let claimed: Vec<String> = responses
+            .iter()
+            .filter(|r| matches!(r.kind, finding_reply::ResponseKind::Fixed | finding_reply::ResponseKind::TestAdded))
+            .map(|r| r.id.clone())
+            .collect();
+        finding_track::count_fixed_claims(&mut tracked, &claimed);
         let result = ReviewResult { findings: tracked.open.clone(), ..result };
         let sections = TrackedSections { resolved: &tracked.resolved, responses: &responses, decisions: &decision_lines };
         let text = render_review_message_tracked(
@@ -3534,7 +3735,13 @@ impl TaskRunner {
                         BlockKind::Quality,
                     );
                 }
+                // A reprovação fica gravada antes de qualquer turno do Arquiteto: uma interrupção no
+                // meio da decisão antecipada retoma pela correção, nunca pela mesma revisão.
                 self.transition(task, TaskStatus::ChangesRequested, "corrigir findings")?;
+                // Spec 126 T02: recorrência leva ao Arquiteto antes da nova tentativa.
+                if let Some(step) = self.early_decision(task).await? {
+                    return Ok(step);
+                }
                 Ok(Step::Next)
             }
             Verdict::None => Err(RunnerError::Invalid(
@@ -3640,7 +3847,7 @@ impl TaskRunner {
                 summary: i18n::tr(self.lang.get(), "runner.tests.reused_summary", &[("sha", short)]),
             }
         } else {
-            let (base_run, _) = self.install_then_run(settings, root.root(), &suite_command, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await;
+            let (base_run, _, _) = self.install_then_run(settings, root.root(), &suite_command, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1, false).await;
             match base_run {
                 Ok(t) if t.passed => TestRun {
                     command: self.scrub(&suite_command),
@@ -3649,6 +3856,9 @@ impl TaskRunner {
                     summary: test_summary(&self.scrub(&t.output)),
                 },
                 Ok(t) => {
+                    // Spec 126 T01: a falha na base vira a evidência (com o cabeçalho e o
+                    // diagnóstico de dependência ausente), o fato que a recuperação lê.
+                    task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(t.exit_code, t.timed_out), self.scrub(&t.output)));
                     self.events.emit(RunnerEvent::AgentMessage {
                         agent: "tests".into(),
                         text: t.output,
@@ -3681,16 +3891,19 @@ impl TaskRunner {
         let checks_from_dev = task.frontmatter.test_evidence.as_deref().is_some_and(|e| e.contains(CHECKS_FROM_DEV_MARK));
         let base_checks = if reused_sha.is_some() && !checks_from_dev { &[][..] } else { &settings.checks[..] };
         for check in base_checks.iter().filter(|c| c.blocking) {
-            match self.run_tracked(settings, root.root(), &check.command, false, Some(&check.name), " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await {
+            match self.run_check(settings, root.root(), &check.command, &check.name, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await {
                 Ok(t) if t.passed => {}
                 Ok(t) => {
+                    let text = format!(
+                        "{}\n{}",
+                        i18n::tr(self.lang.get(), "runner.checks.failed_on_base", &[("name", &check.name)]),
+                        tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES)
+                    );
+                    // Spec 126 T01: a falha na base vira a evidência que a recuperação lê.
+                    task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(t.exit_code, t.timed_out), self.scrub(&text)));
                     self.events.emit(RunnerEvent::AgentMessage {
                         agent: "tests".into(),
-                        text: format!(
-                            "{}\n{}",
-                            i18n::tr(self.lang.get(), "runner.checks.failed_on_base", &[("name", &check.name)]),
-                            tail_bytes(t.output.trim_end(), CHECK_TAIL_BYTES)
-                        ),
+                        text,
                         task_id: Some(id.clone()),
                         attempt: Some(task.frontmatter.attempts + 1),
                     });
@@ -4404,7 +4617,7 @@ impl TaskRunner {
                 None => {
                     self.check_cancel()?;
                     let result = match self
-                        .run_tracked(settings, &self.repo_root, &check.command, false, Some(&check.name), " na base", task_id, attempt)
+                        .run_check(settings, &self.repo_root, &check.command, &check.name, " na base", task_id, attempt)
                         .await
                     {
                         Ok(r) => Some(r.passed),
@@ -4437,7 +4650,9 @@ impl TaskRunner {
         let command = self.scrub(&suite);
         let lang = self.lang.get();
         let mut test_mark = i18n::text(lang, "runner.final_base.not_run");
-        let test_text = match self.install_then_run(settings, root, &suite, WHERE, "FINAL", 1).await.0 {
+        let (base_run, _, install_note) = self.install_then_run(settings, root, &suite, WHERE, "FINAL", 1, false).await;
+        let install_line = install_note.map(|n| format!("{n}\n")).unwrap_or_default();
+        let test_text = match base_run {
             Ok(t) => {
                 test_mark = if t.passed { "✓" } else { "✗" }.to_string();
                 let key = if t.passed { "runner.final_base.tests_passed" } else { "runner.final_base.tests_failed" };
@@ -4447,7 +4662,7 @@ impl TaskRunner {
                     let heading = i18n::text(lang, "runner.final_base.tests_output_heading");
                     fail_tail.push_str(&format!("\n## {heading}\n```\n{tail}\n```\n"));
                 }
-                format!("$ {command}\n{}:\n{tail}\n", i18n::tr(lang, key, &[("code", &code)]))
+                format!("$ {command}\n{install_line}{}:\n{tail}\n", i18n::tr(lang, key, &[("code", &code)]))
             }
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
             Err(e) => format!("$ {command}\n{}\n", i18n::tr(lang, "runner.final_base.tests_not_run", &[("error", &e.to_string())])),
@@ -4457,7 +4672,7 @@ impl TaskRunner {
         let mut not_run_names = Vec::new();
         for check in &settings.checks {
             self.check_cancel()?;
-            match self.run_tracked(settings, root, &check.command, false, Some(&check.name), WHERE, "FINAL", 1).await {
+            match self.run_check(settings, root, &check.command, &check.name, WHERE, "FINAL", 1).await {
                 Ok(r) => outcomes.push(CheckOutcome {
                     name: check.name.clone(),
                     command: self.scrub(&check.command),
@@ -6769,6 +6984,75 @@ mod tests {
 
     fn labeled(f: Finding) -> Finding {
         Finding { severity: format!("{}, {UNCHANGED_FILE_LABEL}", f.severity), ..f }
+    }
+
+    /// Spec 126 T04, caso real do Test 4 (T04, 16:16): o Revisor reprova com F-14 e F-15 MEDIUM
+    /// novos em arquivo que não mudou e dois critérios não atendidos. A convergência rebaixa os dois a
+    /// observação e os critérios voltam como HIGH gerados pelo runner; antes, o registro dava a esses
+    /// gerados os mesmos F-14 e F-15. Agora cada id aparece uma vez só na mensagem.
+    #[test]
+    fn demoted_observation_ids_never_repeat_in_the_same_review_message() {
+        let movement = |id: &str, text: &str| Finding {
+            severity: "MEDIUM".into(),
+            location: "tests/unit/movement.test.ts:36-56".into(),
+            description: text.into(),
+            state: Some(FindingState::New),
+            ..finding(id)
+        };
+        let mut reviewed = rejected(vec![
+            movement("F-14", "The non-finite rejection test supplies NaN as the player's x coordinate."),
+            movement("F-15", "The reach tests pass custom limits of 1.49 and 1.5."),
+        ]);
+        reviewed.criteria = vec![
+            CriterionCheck { criterion: "Fast tests cover nonfinite input rejection".into(), met: false, evidence: "only NaN position".into() },
+            CriterionCheck { criterion: "DDA ray tests cover the six-block maximum reach".into(), met: false, evidence: "custom limits".into() },
+        ];
+        let previous = vec![Finding { location: "tests/e2e/movement.spec.ts:106-122".into(), ..tracked("F-13", 1) }];
+        let mut registry: Vec<Finding> = (1..=12)
+            .map(|n| Finding { state: Some(FindingState::Resolved), ..tracked(&format!("F-{n:02}"), 1) })
+            .collect();
+        registry.extend(previous.clone());
+        let changed = files(&["src/client/main.ts", "tests/e2e/movement.spec.ts"]);
+        let enforced = enforce_criteria(Lang::En, reviewed);
+        let out = converge_with_files(Lang::En, enforced, &previous, &[], Some(&changed), &yes);
+        assert_eq!(out.result.verdict, Verdict::ChangesRequested, "os critérios não atendidos continuam bloqueando");
+        assert_eq!(out.observations.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-14", "F-15"]);
+        // Sem as observações, o registro numeraria os gerados como F-14 e F-15 (o defeito do Test 4).
+        let old = finding_track::track(&registry, &previous, out.result.findings.clone(), 2);
+        assert_eq!(old.open.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-14", "F-15"]);
+        let t = finding_track::track_with_observations(&registry, &previous, out.result.findings.clone(), &out.observations, 2);
+        assert_eq!(t.open.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-16", "F-17"]);
+        assert!(t.registry.iter().all(|e| e.id != "F-14" && e.id != "F-15"), "observação não entra no registro");
+        let sections = TrackedSections { resolved: &t.resolved, responses: &[], decisions: &[] };
+        let text = render_review_message_tracked(
+            out.result.verdict,
+            &out.result.summary,
+            &t.open,
+            &out.observations,
+            &sections,
+            &[],
+            &out.result.criteria,
+            &|s| s.to_string(),
+        );
+        for id in ["F-13", "F-14", "F-15", "F-16", "F-17"] {
+            assert_eq!(text.matches(&format!("- {id} [")).count(), 1, "{id} uma vez só:\n{text}");
+        }
+    }
+
+    /// Spec 126 T04: um aberto do registro rebaixado a observação fica resolvido no registro e aparece
+    /// só como observação, sem repetir em "Resolvidos:" nem ir para um bloqueante parecido.
+    #[test]
+    fn open_finding_demoted_to_observation_is_resolved_but_listed_only_as_observation() {
+        let registry = vec![tracked("F-01", 1), Finding { location: "src/b.rs:1".into(), ..tracked("F-02", 1) }];
+        let observation = Finding { severity: "MEDIUM, baixa confiança".into(), ..tracked("F-01", 1) };
+        // O gerado tem o mesmo local e texto do F-01: sem a reserva, o registro o ligaria ao F-01.
+        let blocking = Finding { state: Some(FindingState::New), ..finding("F-09") };
+        let t = finding_track::track_with_observations(&registry, &registry, vec![blocking], &[observation], 2);
+        assert_eq!(t.open.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-09"]);
+        assert_eq!(t.resolved.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02"]);
+        let state = |id: &str| t.registry.iter().find(|e| e.id == id).and_then(|e| e.state);
+        assert_eq!(state("F-01"), Some(FindingState::Resolved));
+        assert_eq!(state("F-09"), Some(FindingState::New));
     }
 
     /// Spec 092 T04: finding novo MEDIUM (ou LOW) em arquivo inalterado vira observação e aprova.
@@ -9188,6 +9472,167 @@ mod tests {
         let t = fx.read_task("T01");
         assert!(read_registry(&t.body).unwrap().iter().all(|f| f.arbitration.is_none()));
         assert!(section_text(&t.body, ARBITRATION_LOG).is_none());
+    }
+
+    fn task_with_attempts(id: &str, max_attempts: u32) -> Task {
+        let mut t = task(id, TaskStatus::Todo, &[]);
+        t.frontmatter.max_attempts = max_attempts;
+        t
+    }
+
+    /// Spec 126 T02: o apontamento aberto há 3 revisões vai ao Arquiteto antes da nova tentativa,
+    /// sem contestação e antes de esgotar as tentativas; depois do `keep` ele segue obrigatório e não
+    /// dispara de novo (uma vez por apontamento).
+    #[tokio::test]
+    async fn recurrence_three_goes_to_the_architect_once_before_the_attempts_run_out() {
+        let fx = Fixture::new("recorrencia-tres", "true");
+        fx.add_task(&task_with_attempts("T01", 6));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, _| rejected(vec![gpu()]));
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"keep","reason":"o código ainda não cobre"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(outcome, Outcome::Blocked { .. }), "{outcome:?}");
+        let facts = arbiter.facts();
+        assert_eq!(facts.len(), 1, "uma vez só, em 6 revisões");
+        assert!(facts[0].contains("Apontamentos recorrentes, sem contestação") && facts[0].contains("- F-01 [HIGH] src/gpu.rs:1"), "{}", facts[0]);
+        assert!(facts[0].contains("Aberto há 3 revisões") && facts[0].contains("Última resposta do Desenvolvedor: sem resposta"), "{}", facts[0]);
+        let briefs = dev.briefs();
+        assert!(briefs[2].findings[0].arbitration.is_none(), "a 3ª tentativa ainda não tinha a decisão");
+        assert_eq!(briefs[3].findings[0].arbitration.as_ref().map(|a| a.decision), Some(ArbitrationDecision::Keep), "a 4ª recebe a decisão");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"), "segue até o limite com o apontamento obrigatório");
+        let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.early_review, f1.recurrence), (3, 6));
+        assert_eq!(f1.arbitration.map(|a| (a.decision, a.review)), Some((ArbitrationDecision::Keep, 4)));
+        let codes: Vec<String> = notices(&rec).into_iter().map(|(c, _)| c).collect();
+        assert_eq!(codes.iter().filter(|c| *c == "task.recurring_arbitration").count(), 1, "{codes:?}");
+        assert_eq!(codes.iter().filter(|c| *c == "task.arbitration_keep").count(), 1, "{codes:?}");
+    }
+
+    /// Spec 126 T02: respondido como corrigido em duas revisões e ainda aberto dispara, mesmo com a
+    /// recorrência abaixo de 3 (o apontamento fechou e voltou); `manual` o tira da cobrança.
+    #[tokio::test]
+    async fn fixed_twice_and_still_open_goes_to_the_architect() {
+        let fx = Fixture::new("corrigido-duas-vezes", "true");
+        fx.add_task(&task_with_attempts("T01", 8));
+        let dev = answering_dev(|id| format!("{id}: fixed: src/gpu.rs:2"));
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 | 1 | 3 | 4 => rejected(vec![gpu()]),
+            2 => rejected(vec![at("F-02", "src/b.rs:1", "Outro problema", None)]),
+            _ => approved(vec![]),
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"manual","reason":"o Docker não tem GPU"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let facts = arbiter.facts();
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(facts[0].contains("Aberto há 2 revisões; respondido como corrigido ou com teste em 2 delas"), "{}", facts[0]);
+        assert!(facts[0].contains("Última resposta do Desenvolvedor: fixed: src/gpu.rs:2"), "{}", facts[0]);
+        let t = fx.read_task("T01");
+        let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.fixed_claims, f1.early_review), (2, 5));
+        assert_eq!(f1.arbitration.map(|a| a.decision), Some(ArbitrationDecision::Manual));
+        assert!(acceptance_of(&t.body).contains("(manual) F-01"), "{}", acceptance_of(&t.body));
+        assert_eq!(rev.inputs().len(), 6, "a 6ª revisão aprova, sem o apontamento dispensado");
+    }
+
+    /// Spec 126 T02: decisão indisponível também gasta o gatilho (uma vez por apontamento): aviso
+    /// próprio, nada decidido e a execução segue.
+    #[tokio::test]
+    async fn unavailable_early_decision_is_not_retried() {
+        let fx = Fixture::new("recorrencia-indisponivel", "true");
+        fx.add_task(&task_with_attempts("T01", 5));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, _| rejected(vec![gpu()]));
+        let arbiter = FakeArbiter::new(|_| "não sei".into());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+        assert_eq!(arbiter.facts().len(), 1);
+        let unavailable: Vec<_> = notices(&rec).into_iter().filter(|(c, _)| c == "task.recurring_unavailable").collect();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].1.get("findings").and_then(|v| v.as_str()), Some("F-01"));
+        let f1 = read_registry(&fx.read_task("T01").body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert!(f1.arbitration.is_none() && f1.early_review == 3);
+    }
+
+    /// Árbitro que simula Parar no meio do turno (spec 126 T02).
+    struct CancellingArbiter;
+
+    impl ArbiterPort for CancellingArbiter {
+        fn arbitrate<'a>(&'a self, _spec: &'a str, _task: &'a str, _root: &'a Path, _facts: &'a str) -> Fut<'a, Result<String, RunnerError>> {
+            Box::pin(async move { Err(RunnerError::Cancelled) })
+        }
+    }
+
+    /// Spec 126 T02: Parar no meio da decisão antecipada deixa a reprovação gravada
+    /// (CHANGES_REQUESTED, a tentativa contada uma vez) e o gatilho gasto; a retomada segue pela
+    /// correção, sem revisar de novo o mesmo HEAD (nada de `stalled`) e sem disparar outra vez.
+    #[tokio::test]
+    async fn interrupted_early_decision_resumes_from_the_correction() {
+        let fx = Fixture::new("recorrencia-interrompida", "true");
+        fx.add_task(&task_with_attempts("T01", 5));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, _| rejected(vec![gpu()]));
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(CancellingArbiter));
+        assert!(matches!(runner.run_task(SPEC, "T01").await, Err(RunnerError::Cancelled)));
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.status, t.frontmatter.attempts), (TaskStatus::ChangesRequested, 3));
+        let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.recurrence, f1.early_review), (3, 3));
+        assert_eq!(rev.inputs().len(), 3);
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"keep","reason":"x"}]}"#.to_string());
+        let resumed = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        assert!(matches!(resumed.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"), "não é stalled");
+        assert_eq!(t.frontmatter.attempts, 5, "cada revisão conta uma vez");
+        assert_eq!(rev.inputs().len(), 5, "a retomada não revisa de novo o mesmo HEAD");
+        let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.recurrence, f1.early_review), (5, 3));
+        assert!(arbiter.facts().is_empty(), "o gatilho já foi usado");
+    }
+
+    /// Spec 126 T02: dois HIGH recorrentes antecipam a recuperação: a tarefa fica BLOQUEADA por
+    /// qualidade (`recurring`) com tentativas sobrando, sem arbitragem; depois do RETRY da
+    /// recuperação, os mesmos apontamentos não disparam de novo.
+    #[tokio::test]
+    async fn two_recurring_high_findings_anticipate_the_recovery() {
+        let fx = Fixture::new("recuperacao-antecipada", "true");
+        fx.add_task(&task_with_attempts("T01", 6));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, _| {
+            rejected(vec![
+                gpu(),
+                at("F-02", "src/b.rs:1", "Falta validar a entrada", None),
+                Finding { severity: "LOW".into(), ..at("F-03", "src/c.rs:1", "Nome confuso", None) },
+            ])
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("{outcome:?}") };
+        assert_eq!(kind, BlockKind::Quality, "vai à análise de recuperação do servidor");
+        assert!(reason.contains("(F-01, F-02)"), "só os HIGH no motivo: {reason}");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("recurring"));
+        assert_eq!((t.frontmatter.attempts, t.frontmatter.max_attempts), (3, 6), "antes de esgotar as tentativas");
+        assert!(arbiter.facts().is_empty(), "a recuperação decide, não a arbitragem");
+        assert!(read_findings(&t.body).unwrap().iter().all(|f| f.early_review == 3));
+        let recovery = notices(&rec).into_iter().find(|(c, _)| c == "task.recurring_recovery").expect("aviso");
+        assert_eq!(recovery.1.get("findings").and_then(|v| v.as_str()), Some("F-01, F-02, F-03"));
+        runner.record_recovery(SPEC, "T01", true, "- Causa raiz: x\n- Estratégia: outra").unwrap();
+        let again = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(again, Outcome::Blocked { .. }), "{again:?}");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"), "não dispara de novo");
+        assert_eq!(notices(&rec).iter().filter(|(c, _)| c == "task.recurring_recovery").count(), 1);
+        assert!(arbiter.facts().is_empty());
     }
 
     /// Spec 124 T02: o dispensado que volta com o mesmo id (ou o mesmo problema) vira observação; com
@@ -12175,19 +12620,22 @@ mod tests {
     }
 
     /// Spec 124 T05: a instalação roda antes da primeira sessão e só de novo quando o arquivo de
-    /// trava muda naquela pasta; o `test_command` não instala. Na base (outra pasta), instala uma vez
-    /// antes da bateria quando ela roda.
+    /// trava muda naquela pasta; o `test_command` não instala. Spec 126 T01: a rodada limpa final
+    /// (aqui a bateria completa) instala do zero mesmo com a trava igual, e a evidência diz o estado
+    /// da instalação: pulada (com a data) ou rodada porque a trava mudou nas intermediárias, do zero
+    /// na que vai ao Revisor.
     #[tokio::test]
     async fn install_runs_only_when_the_lockfile_changes() {
-        let fx = Fixture::new("install-lock", "make test");
+        let fx = Fixture::new("install-lock", "make fast");
         fs::write(fx.repo.join("deps.lock"), "a=1\n").unwrap();
         edit_settings(&fx, |s| {
+            s.full_test_command = Some("make full".into());
             s.install_command = Some("make deps".into());
             s.lockfiles = vec!["deps.lock".into()];
         });
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         // Três sessões: a 1ª falha, a 2ª muda a trava e falha, a 3ª passa.
-        let tests = CmdTests::default().script("make test", vec![false, false]);
+        let tests = CmdTests::default().script("make fast", vec![false, false]);
         let dev = FakeDev {
             summary: Some(Arc::new(|n, brief: &DevBrief| {
                 if n == 2 {
@@ -12201,15 +12649,23 @@ mod tests {
         assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let wt = fx.worktree("T01");
         assert_eq!(dev.briefs().len(), 3);
-        // Antes da 1ª sessão (trava nova na pasta) e depois da 2ª (trava mudou): só duas.
-        assert_eq!(tests.count_in(&wt, "make deps"), 2, "{:?}", tests.commands());
-        assert_eq!(tests.count_in(&wt, "make test"), 3, "{:?}", tests.commands());
         assert_eq!(
             tests.commands(),
-            vec!["make deps", "make test", "make deps", "make test", "make test"],
-            "a instalação vem antes da rodada e nunca se repete com a trava igual"
+            vec!["make deps", "make fast", "make deps", "make fast", "make fast", "make deps", "make full"],
+            "antes da 1ª sessão (trava nova), depois da 2ª (trava mudou) e do zero antes da bateria final"
         );
+        assert_eq!(tests.count_in(&wt, "make deps"), 3);
         assert!(dev.briefs()[0].test_plan.contains("install_command: `make deps`") && dev.briefs()[0].test_plan.contains("deps.lock"));
+        // Rodada intermediária com a trava igual: pulada, e desde quando.
+        let first = dev.briefs()[1].test_output.clone().unwrap_or_default();
+        assert!(first.starts_with("Instalação pulada: `make deps` não rodou de novo, trava sem mudança desde 20"), "{first}");
+        assert!(first.contains("(deps.lock)") && first.contains("make fast: FAILED"), "{first}");
+        // Rodada intermediária depois de a trava mudar.
+        let second = dev.briefs()[2].test_output.clone().unwrap_or_default();
+        assert!(second.starts_with("Instalação: `make deps` rodou antes desta rodada porque a trava (deps.lock) mudou"), "{second}");
+        // A evidência do Revisor diz que a rodada limpa instalou do zero e passou.
+        let review = &rev.inputs()[0].test_output;
+        assert!(review.contains("Instalação: `make deps` rodou do zero antes desta rodada limpa") && review.contains("make full: ok"), "{review}");
         // A integração reaproveitou a árvore testada: nada roda na base.
         assert_eq!(tests.count_in(&fx.repo, "make deps"), 0);
     }
@@ -12226,10 +12682,12 @@ mod tests {
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         // Falha antes da sessão 1 (melhor esforço) e na rodada 1, que vale como falha dos testes;
         // antes da sessão 2 passa e a rodada 2 só testa.
+        // Spec 126 T01: a rodada (a final, sem `full_test_command`) instala do zero de novo depois
+        // da instalação antes da sessão 2.
         let tests = CmdTests::default().script("make deps", vec![false, false]);
         let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
         assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
-        assert_eq!(tests.commands(), vec!["make deps", "make deps", "make deps", "make test"], "{:?}", tests.commands());
+        assert_eq!(tests.commands(), vec!["make deps", "make deps", "make deps", "make deps", "make test"], "{:?}", tests.commands());
         let out = dev.briefs()[1].test_output.clone().unwrap_or_default();
         assert!(out.starts_with("install_command falhou (`make deps`)") && out.contains("make deps: FAILED"), "{out}");
         assert!(tests_texts(&rec).contains(&"test_command falhou (1/5)".to_string()));
@@ -12245,7 +12703,12 @@ mod tests {
         let tests = Exit127Once::default();
         let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
         assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
-        assert_eq!(tests.commands(), vec!["make deps", "make test", "make deps", "make test"], "{:?}", tests.commands());
+        // Antes de cada sessão (trava nova; esquecida pelo 127) e do zero antes de cada rodada final.
+        assert_eq!(tests.commands(), vec!["make deps", "make deps", "make test", "make deps", "make deps", "make test"], "{:?}", tests.commands());
+        // Spec 126 T01: o Desenvolvedor lê que é dependência ausente, não defeito de código.
+        let out = dev.briefs()[1].test_output.clone().unwrap_or_default();
+        assert!(out.contains("sh: vitest: not found") && out.contains("Diagnóstico: o comando saiu com o código 127"), "{out}");
+        assert!(out.contains("dependência ausente no ambiente, não defeito de código") && out.contains("install_command (`make deps`)"), "{out}");
     }
 
     /// Spec 124 T05: no Docker, a rodada que o Desenvolvedor passou no container (sem o `prepare`)
@@ -12289,6 +12752,121 @@ mod tests {
         assert_eq!(fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let out = &rev.inputs()[0].test_output;
         assert!(out.contains(&flaky_pass_warning("make full")) && !out.contains("`make fast` falhou"), "{out}");
+    }
+
+    /// Spec 126 T01: a checagem bloqueante aceita da rodada do Desenvolvedor roda de novo na base,
+    /// que não tem dependências instaladas: o runner instala antes (sem estado da base, instala) e
+    /// a checagem passa, em vez do `tsc: not found` do Test 4.
+    #[tokio::test]
+    async fn reused_check_rerun_on_the_base_installs_first_and_passes() {
+        let fx = Fixture::new("base-install", "make test");
+        fs::write(fx.repo.join("deps.lock"), "a=1\n").unwrap();
+        edit_settings(&fx, |s| {
+            s.install_command = Some("make deps".into());
+            s.lockfiles = vec!["deps.lock".into()];
+            s.checks = vec![check("typecheck", "make typecheck", true)];
+        });
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = NeedsDeps::new(&["make typecheck", "make test"]);
+        let dev = dev_running(vec![(1, "make typecheck", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let out = fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(out, Outcome::Done, "{:?}", tests.calls());
+        let on_base: Vec<String> = tests.calls().into_iter().filter(|(d, _)| *d == fx.repo).map(|(_, c)| c).collect();
+        assert_eq!(on_base, vec!["make deps", "make typecheck"], "instala na base antes da checagem");
+        // Com a base já instalada e a trava igual, a próxima checagem na base não reinstala.
+        assert!(!test_levels::install_needed(&read_settings(&fx.settings_path()).unwrap(), "make deps", &fx.repo));
+    }
+
+    /// Spec 126 T01: checagem ou teste que sai com 126/127 chega ao Desenvolvedor e à recuperação
+    /// (a evidência da tarefa bloqueada) com o diagnóstico de dependência ausente. Na worktree, a
+    /// saída que volta ao Desenvolvedor; na base, a evidência passa a ser a falha, com o cabeçalho
+    /// que a recuperação lê como ambiente.
+    #[tokio::test]
+    async fn missing_program_is_diagnosed_as_missing_dependency_for_developer_and_recovery() {
+        // Na worktree: a checagem falha com 127 a cada sessão até o limite.
+        let fx = Fixture::new("missing-wt", "make test");
+        edit_settings(&fx, |s| s.checks = vec![check("typecheck", "make typecheck", true)]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = NeedsDeps::new(&["make typecheck"]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let out = fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(out, Outcome::Blocked { .. }), "{out:?}");
+        let back = dev.briefs()[1].test_output.clone().unwrap_or_default();
+        assert!(back.contains("tsc: not found") && back.contains("É dependência ausente no ambiente, não defeito de código"), "{back}");
+        assert!(!back.contains("install_command"), "sem install_command, o diagnóstico não fala dele: {back}");
+        let evidence = fx.read_task("T01").frontmatter.test_evidence.unwrap_or_default();
+        assert!(crate::server::recovery::command_did_not_run(&evidence) && evidence.contains("Diagnóstico: o comando saiu com o código 127"), "{evidence}");
+
+        // Na base: a checagem aceita da rodada do Desenvolvedor falha com 127 depois do squash.
+        let fx = Fixture::new("missing-base", "make test");
+        edit_settings(&fx, |s| s.checks = vec![check("typecheck", "make typecheck", true)]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = NeedsDeps::new(&["make typecheck"]);
+        let dev = dev_running(vec![(1, "make typecheck", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let out = fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(out, Outcome::Blocked { .. }), "{out:?}");
+        let t = fx.read_task("T01");
+        let evidence = t.frontmatter.test_evidence.unwrap_or_default();
+        assert!(evidence.starts_with("[falha dos testes: código 127]\nchecagem typecheck falhou na base:"), "{evidence}");
+        assert!(crate::server::recovery::command_did_not_run(&evidence) && evidence.contains("não defeito de código"), "{evidence}");
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("checagem typecheck falhou na base:") && t.contains("Diagnóstico")), "{texts:?}");
+    }
+
+    /// Spec 126 T01: o comando de teste que começa com o próprio `install_command` gera um aviso na
+    /// tarefa e na conversa, uma vez, e o comando aprovado não muda.
+    #[tokio::test]
+    async fn test_command_repeating_the_install_is_warned_and_left_unchanged() {
+        let fx = Fixture::new("install-repeated", "make deps && make test");
+        edit_settings(&fx, |s| s.install_command = Some("make deps".into()));
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let expected = "Aviso: o test_command (`make deps && make test`) começa com o install_command (`make deps`)";
+        let texts = tests_texts(&rec);
+        assert_eq!(texts.iter().filter(|t| t.starts_with(expected)).count(), 1, "uma vez, mesmo com duas tentativas: {texts:?}");
+        let log = section_text(&fx.read_task("T01").body, INSTALL_SECTION).expect("aviso na tarefa");
+        assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 1, "{log}");
+        assert!(log.starts_with(&format!("- {expected}")), "{log}");
+        assert_eq!(tests.count_in(&fx.worktree("T01"), "make deps && make test"), 2, "o comando roda como foi aprovado");
+        assert_eq!(read_settings(&fx.settings_path()).unwrap().test_command, "make deps && make test");
+    }
+
+    /// Executor em que os comandos de `needs` saem com 127 (`tsc: not found`) na pasta em que o
+    /// `make deps` ainda não rodou; o resto passa.
+    #[derive(Clone)]
+    struct NeedsDeps {
+        needs: Arc<Vec<String>>,
+        calls: Arc<Mutex<Vec<(PathBuf, String)>>>,
+    }
+
+    impl NeedsDeps {
+        fn new(needs: &[&str]) -> Self {
+            Self { needs: Arc::new(needs.iter().map(|c| c.to_string()).collect()), calls: Arc::default() }
+        }
+
+        fn calls(&self) -> Vec<(PathBuf, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TestExecutor for NeedsDeps {
+        fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().unwrap();
+                let installed = calls.iter().any(|(d, c)| d == dir && c == "make deps");
+                calls.push((dir.to_path_buf(), command.to_string()));
+                Ok(if self.needs.iter().any(|n| n == command) && !installed {
+                    TestResult { passed: false, output: format!("> {command}\nsh: 1: tsc: not found"), exit_code: Some(127), timed_out: false }
+                } else {
+                    TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false }
+                })
+            })
+        }
     }
 
     /// Executor cujo primeiro `make test` sai com 127; o resto passa.

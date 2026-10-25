@@ -62,7 +62,9 @@ and you decide at every step.
   strategy, split the task into smaller ones (keeping the work already on the branch), adjust the
   criteria to what the environment proves, or ask you a question in the Conversation.
 - **Task size and cost.** The plan review flags tasks that are too large, such as many criteria or
-  server, client and end to end tests in one task, and suggests how to split them. When a task
+  server, client and end to end tests in one task, and suggests how to split them. Before the plan
+  reaches you, the Architect gets one turn to split those tasks and the plan is reviewed again; what
+  is still too large shows up highlighted on the approval card, and you can approve anyway. When a task
   spends far more than the others (3 times the median of the finished tasks of the spec, or a fixed
   threshold of 8 million tokens or 400 calls), the Board and the Activity show a quiet notice and
   the Architect gets the signal in its next decision. It is only a signal: the run never stops for it.
@@ -82,7 +84,9 @@ and you decide at every step.
   time limit, and no run of that command on that tree may have failed. When in doubt, Nants runs it.
   For a slow suite, a project can have a quick `test_command` for every attempt and a
   `full_test_command` that runs before review and at integration. With `install_command` and
-  `lockfiles`, dependencies are installed only when a lock file changes, not on every test run.
+  `lockfiles`, dependencies are installed before every test or check run only when a lock file
+  changes, both in the task worktree and on the base branch; the final clean run before review
+  always installs from scratch, and the evidence says how the install went.
 - **Browser testing.** The generated app is opened in a real browser, with screenshots that you
   and the Reviewer can see.
 - **Cost per task.** Token usage and an estimated cost in dollars for each spec, task and agent.

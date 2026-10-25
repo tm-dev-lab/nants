@@ -3,7 +3,8 @@
  * Só produz árvore de dados: a renderização (`apps/shared/ReportMarkdown.tsx`) emite texto React,
  * nunca HTML. Suportado: títulos (# a ###, mais fundos viram ###), parágrafos, listas ordenadas e
  * não ordenadas aninhadas (numeração escrita preservada), blocos de código ``` (também dentro de
- * item de lista, na ordem do Markdown), código inline, negrito e ênfase. Fora do conjunto, o texto
+ * item de lista, na ordem do Markdown), tabelas GFM (cabeçalho, separador `|---|` com alinhamento
+ * opcional, corpo; spec 126 T04), código inline, negrito e ênfase. Fora do conjunto, o texto
  * segue literal: HTML bruto, imagens (viram o texto alternativo), links (viram só o rótulo; URL
  * http(s) aparece entre parênteses, sem ser clicável).
  *
@@ -75,7 +76,24 @@ export interface ListBlock {
   items: ListItem[];
 }
 
-export type Block = ParagraphBlock | HeadingBlock | CodeBlock | ListBlock;
+/** Alinhamento de uma coluna de tabela (`:---`, `:---:`, `---:`); `null` sem marca. */
+export type TableAlign = "left" | "center" | "right" | null;
+
+/**
+ * Tabela GFM (spec 126 T04): linha de cabeçalho, linha separadora (`|---|`, com `:` opcional para
+ * alinhar) e linhas do corpo. Toda linha tem exatamente `align.length` células.
+ */
+export interface TableBlock {
+  kind: "table";
+  align: TableAlign[];
+  header: Inline[][];
+  rows: Inline[][][];
+}
+
+export type Block = ParagraphBlock | HeadingBlock | CodeBlock | ListBlock | TableBlock;
+
+/** Número máximo de colunas de uma tabela; acima disso as linhas seguem como texto. */
+export const MAX_TABLE_COLUMNS = 32;
 
 /** Normaliza quebras de linha Unicode e remove controles (exceto tab e quebra de linha). */
 function sanitizeReportText(input: string): string {
@@ -360,6 +378,108 @@ function parseList(lines: readonly string[], start: number, depth: number): { li
   return { list: { kind: "list", ordered, items }, next: i };
 }
 
+/**
+ * Células de uma linha de tabela, por laço manual: tira um `|` no começo e um no fim (sem escape) e
+ * divide nos demais `|` que não estão escapados (`\|` vira `|` literal). `null` sem nenhum `|`, com
+ * indentação de bloco de código (4 colunas) ou acima de [`MAX_TABLE_COLUMNS`].
+ */
+function tableCells(line: string): string[] | null {
+  const { width, pos } = indentInfo(line);
+  if (width > 3) return null;
+  let end = line.length;
+  while (end > pos && isSpace(line[end - 1])) end -= 1;
+  let start = pos;
+  let piped = false;
+  if (line[start] === "|") {
+    start += 1;
+    piped = true;
+  }
+  if (end > start && line[end - 1] === "|" && line[end - 2] !== "\\") {
+    end -= 1;
+    piped = true;
+  }
+  const cells: string[] = [];
+  let cell = "";
+  for (let k = start; k < end; k += 1) {
+    const ch = line[k];
+    if (ch === "\\" && line[k + 1] === "|") {
+      cell += "|";
+      k += 1;
+    } else if (ch === "|") {
+      cells.push(cell.trim());
+      cell = "";
+      piped = true;
+      if (cells.length > MAX_TABLE_COLUMNS) return null;
+    } else {
+      cell += ch;
+    }
+  }
+  cells.push(cell.trim());
+  if (!piped || cells.length > MAX_TABLE_COLUMNS) return null;
+  return cells;
+}
+
+/** Célula da linha separadora: `-` (ao menos um), com `:` opcional em cada ponta. */
+function alignOf(cell: string): TableAlign | undefined {
+  const left = cell.startsWith(":");
+  const right = cell.length > 1 && cell.endsWith(":");
+  const dashes = cell.slice(left ? 1 : 0, right ? cell.length - 1 : cell.length);
+  if (dashes === "") return undefined;
+  for (const ch of dashes) if (ch !== "-") return undefined;
+  if (left && right) return "center";
+  if (right) return "right";
+  if (left) return "left";
+  return null;
+}
+
+/** Início de tabela em `i`: cabeçalho com `|` e, logo abaixo, separador com o mesmo número de células. */
+function tableStartAt(lines: readonly string[], i: number): { header: string[]; align: TableAlign[] } | null {
+  const headLine = lines[i];
+  const delimLine = lines[i + 1];
+  if (headLine === undefined || delimLine === undefined || isBlank(headLine)) return null;
+  const header = tableCells(prose(headLine));
+  if (header === null) return null;
+  const delim = tableCells(prose(delimLine));
+  if (delim === null || delim.length !== header.length) return null;
+  const align: TableAlign[] = [];
+  for (const cell of delim) {
+    const a = alignOf(cell);
+    if (a === undefined) return null;
+    align.push(a);
+  }
+  return { header, align };
+}
+
+/** Linha do corpo com exatamente `columns` células: falta vira célula vazia, excedente sai. */
+function fitRow(cells: readonly string[], columns: number): Inline[][] {
+  const out: Inline[][] = [];
+  for (let k = 0; k < columns; k += 1) out.push(parseInline(cells[k] ?? ""));
+  return out;
+}
+
+/**
+ * Tabela que começa em `start` (já conferida por [`tableStartAt`]). O corpo vai até a linha em
+ * branco, o início de outro bloco ou a primeira linha sem `|`.
+ */
+function parseTable(
+  lines: readonly string[],
+  start: number,
+  head: { header: string[]; align: TableAlign[] },
+): { table: TableBlock; next: number } {
+  const columns = head.align.length;
+  const rows: Inline[][][] = [];
+  let i = start + 2;
+  while (i < lines.length) {
+    const line = prose(lines[i] ?? "");
+    if (isBlank(line) || startsBlock(line)) break;
+    const cells = tableCells(line);
+    if (cells === null) break;
+    rows.push(fitRow(cells, columns));
+    i += 1;
+  }
+  return { table: { kind: "table", align: head.align, header: fitRow(head.header, columns), rows }, next: i };
+}
+
 function startsBlock(line: string): boolean {
   return fenceOpenOf(line, 3) !== null || headingOf(line) !== null || itemOf(line) !== null;
 }
@@ -404,8 +524,21 @@ export function parseReportMarkdown(markdown: string, options: { keepLineBreaks?
       continue;
     }
 
+    const table = tableStartAt(lines, i);
+    if (table !== null) {
+      const parsed = parseTable(lines, i, table);
+      blocks.push(parsed.table);
+      i = parsed.next;
+      continue;
+    }
+
     const parts: string[] = [];
-    while (i < lines.length && !isBlank(lines[i] ?? "") && !startsBlock(prose(lines[i] ?? ""))) {
+    while (
+      i < lines.length &&
+      !isBlank(lines[i] ?? "") &&
+      !startsBlock(prose(lines[i] ?? "")) &&
+      (parts.length === 0 || tableStartAt(lines, i) === null)
+    ) {
       parts.push(prose(lines[i] ?? "").trim());
       i += 1;
     }

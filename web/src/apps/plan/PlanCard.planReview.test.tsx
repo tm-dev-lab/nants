@@ -11,7 +11,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { PLAN_ACTIONS_WAITING_REASON, PLAN_REVIEW_WAITING } from "../../copy";
 import { PLAN_REVIEW_RECHECK_MS } from "../../desktop/useSpaceData";
-import { PlanCard, planMoreLabel, planReviewFixMessage, planWarnTitle } from "./PlanCard";
+import { PlanCard, planMoreLabel, planReviewFixMessage, planWarnTitle, tooLargeIssues } from "./PlanCard";
+import { setLanguage } from "../../i18n";
 import type { PlanReviewView, SpecView } from "../../api/types";
 import { makeSpec, makeTask, resetStore } from "../../test-utils";
 
@@ -238,5 +239,44 @@ describe("PlanCard: aprovação espera a revisão da versão atual", () => {
       vi.advanceTimersByTime(PLAN_REVIEW_RECHECK_MS * 2);
     });
     expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+describe("PlanCard: tarefa grande demais (spec 126 T03)", () => {
+  const BIG = { task: "T01", kind: "too_large", text: "Mistura servidor e cliente; divida em duas tarefas." };
+
+  afterEach(() => {
+    setLanguage("pt-BR", { persist: false });
+  });
+
+  it("o too_large que restou vem primeiro, com a tarefa em destaque e a sugestão; a aprovação continua", () => {
+    renderWith({ review: { status: "ok", issues: [ISSUES[0], BIG] as never } });
+    const reviewer = screen.getByRole("region", { name: "Revisor" });
+    const items = within(reviewer).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(items[0]?.getAttribute("data-plan-too-large")).toBe("T01");
+    expect(within(items[0] as HTMLElement).getByText("A T01 foi apontada como grande demais.").tagName).toBe("STRONG");
+    expect(within(items[0] as HTMLElement).getByText(`Sugestão de divisão: ${BIG.text}`)).toBeTruthy();
+    expect(within(items[1] as HTMLElement).getByText("T02")).toBeTruthy();
+    // A tarefa ganha a marca na lista do plano.
+    const task = screen.getByText("Base").closest("li") as HTMLElement;
+    expect(within(task).getByText("grande demais").hasAttribute("data-task-too-large")).toBe(true);
+    expect(approveButton().disabled).toBe(false);
+  });
+
+  it("sem too_large, nada de destaque nem marca", () => {
+    renderWith({ review: { status: "ok", issues: ISSUES } });
+    expect(document.querySelector("[data-plan-too-large]")).toBeNull();
+    expect(document.querySelector("[data-task-too-large]")).toBeNull();
+    expect(tooLargeIssues([...ISSUES, { task: null, kind: "too_large", text: "x" }])).toEqual([]);
+  });
+
+  it("em inglês, o destaque segue o idioma", () => {
+    setLanguage("en", { persist: false });
+    renderWith({ review: { status: "ok", issues: [BIG] } });
+    const item = document.querySelector("[data-plan-too-large]") as HTMLElement;
+    expect(within(item).getByText("T01 was flagged as too large.")).toBeTruthy();
+    expect(within(item).getByText(`Suggested split: ${BIG.text}`)).toBeTruthy();
+    expect(screen.getByText("too large")).toBeTruthy();
   });
 });

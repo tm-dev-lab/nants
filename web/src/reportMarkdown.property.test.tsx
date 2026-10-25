@@ -18,7 +18,7 @@ function prng(seed: number): () => number {
 /** Alfabeto adversarial: marcadores de inline, cabeçalho, lista, cerca, espaços e quebras. */
 const ALPHABET = [
   "[", "]", "(", ")", "*", "_", "`", "#", "-", "1.", " ", "\t", "\n", " ", "!", "<", ":", ".", "a", "```",
-  "\u2028", "\r\n",
+  "\u2028", "\r\n", "|", "|---|", ":-:", "\\|",
 ];
 const MAX_CHARS = 64 * 1024;
 const INPUT_COUNT = 300;
@@ -74,6 +74,12 @@ describe("propriedade de tempo: entradas adversariais de até 64 KiB", () => {
       `# ${" ".repeat(65536)} `,
       `- ${" ".repeat(65536)}\u2028 b`,
       `${"## Como executar ".repeat(4000)}`,
+      // Spec 126 T04: tabelas (pipes sem fim, colunas no teto, muitas linhas, cabeçalhos candidatos).
+      "|".repeat(65536),
+      "\\|".repeat(32768),
+      `| a | b |\n|---|---|\n${"| 1 | 2 |\n".repeat(6000)}`,
+      `${"| a | b |\n".repeat(6000)}`,
+      `${"|-|\n".repeat(16384)}`,
     ];
     for (const input of named) {
       const start = performance.now();

@@ -389,6 +389,7 @@ fn current_result_and_running_win_over_pending() {
         status: STATUS_OK.into(),
         issues: Vec::new(),
         detail: None,
+        split_requested: false,
     };
     let body = serde_json::to_string(&record).expect("json");
     fs::write(root.join(format!(".sdd/specs/{SPEC}/{PLAN_REVIEW_FILE}")), body).expect("registro");
@@ -516,4 +517,146 @@ async fn review_records_the_too_large_issue_for_a_big_task() {
     let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
     assert_eq!(shown.issues, rec.issues);
     let _ = fs::remove_dir_all(&root);
+}
+
+// ---- Spec 126 T03: divisão das tarefas `too_large` antes da aprovação ----
+
+/// Estado com o Arquiteto e o Revisor configurados, cada um com o seu fake.
+fn split_state(root: &Path, reviewer: Arc<Scripted>, architect: Arc<Scripted>) -> AppState {
+    let mut cfg = config_for(root, true);
+    cfg.agents.architect = AgentConfig { connection_id: "c".into(), model: "arq".into(), effort: Effort::Low, max_steps: None };
+    AppState::new(root.join("config.toml"), cfg, 3000).with_llm_backend(architect).with_report_backend(reviewer)
+}
+
+fn write_task_reply(call: &str, id: &str, content: &str) -> Reply {
+    let args = json!({"path": format!(".sdd/specs/{SPEC}/tasks/{id}.md"), "content": content});
+    crate::agents::architect::testing::calls(&[(call, "write_sdd_artifacts", &args.to_string())])
+}
+
+/// Tarefa `id` com `n` critérios, dependendo de `deps`.
+fn task_of(id: &str, n: usize, deps: &str) -> String {
+    big_task(n).replace("id: \"T01\"", &format!("id: \"{id}\"")).replace("depends_on: []", &format!("depends_on: [{deps}]"))
+}
+
+/// Turnos internos gravados na conversa (o pedido do servidor ao Arquiteto).
+fn internal_turns(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(crate::agents::architect::CHAT_FILE_REL))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["internal"] == true)
+        .filter_map(|v| v["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A revisão com `too_large` leva ao turno de divisão do Arquiteto, antes da aprovação; o plano
+/// dividido é revisado de novo na mesma volta, e a divisão aprovada some com o apontamento.
+#[tokio::test]
+async fn too_large_review_asks_the_architect_to_split_and_reviews_again() {
+    let root = tmp("split");
+    write_plan(&root, "AWAITING_APPROVAL", &big_task(8));
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let reviewer = Scripted::new(vec![text("{\"issues\": []}"), text("{\"issues\": []}")]);
+    let architect = Scripted::new(vec![
+        write_task_reply("a1", "T01", &task_of("T01", 4, "")),
+        write_task_reply("a2", "T02", &task_of("T02", 4, "\"T01\"")),
+        text("Dividi a T01 em T01 e T02."),
+        text("Plano conferido."),
+    ]);
+    let st = split_state(&root, reviewer.clone(), architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    let request = architect.requests()[0].messages.last().map(|m| m.content.clone()).unwrap_or_default();
+    assert!(request.starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO), "{request}");
+    assert!(request.contains(&format!("Spec: {SPEC}")) && request.contains("- T01: 8 critérios"), "{request}");
+    let turns = internal_turns(&root);
+    assert_eq!(turns.len(), 1, "um turno de divisão: {turns:?}");
+    assert!(turns[0].starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO));
+    assert!(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")).exists(), "o Arquiteto dividiu");
+    assert_eq!(reviewer.requests().len(), 2, "o plano revisto foi revisado de novo");
+    let rec = record(&root);
+    assert_eq!(rec.signature, plan_signature(&root, SPEC).expect("sig"), "resultado da versão dividida");
+    assert_eq!(rec.status, STATUS_OK);
+    assert!(rec.issues.is_empty(), "a divisão some com o apontamento: {:?}", rec.issues);
+    assert!(rec.split_requested);
+    assert!(view(&root, SPEC, &SecretSet::default()).expect("vista").issues.is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// O que resta `too_large` depois da divisão fica no resultado (o cartão mostra); a divisão não
+/// roda de novo, nem na mesma volta nem numa versão posterior do plano.
+#[tokio::test]
+async fn leftover_too_large_stays_in_the_review_and_the_split_runs_once() {
+    let root = tmp("split-left");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let big = json!({"issues": [{"task": "T01", "kind": "too_large", "text": "Mistura servidor e cliente; divida em duas."}]}).to_string();
+    let reviewer = Scripted::new(vec![text(&big), text(&big), text(&big)]);
+    let architect = Scripted::new(vec![
+        write_task_reply("a1", "T01", &EXAMPLE_TASK_MD.replace("O que implementar.", "Servidor e cliente juntos.")),
+        text("Mantive a T01: as partes dependem uma da outra."),
+        text("Plano conferido."),
+    ]);
+    let st = split_state(&root, reviewer.clone(), architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(reviewer.requests().len(), 2, "revisa a versão revista uma vez");
+    assert_eq!(internal_turns(&root).len(), 1, "um só turno de divisão");
+    let rec = record(&root);
+    assert!(rec.split_requested);
+    assert_eq!(too_large_issues(&rec.issues), vec![("T01".to_string(), "Mistura servidor e cliente; divida em duas.".to_string())]);
+    let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
+    assert_eq!(shown.status, STATUS_OK);
+    assert_eq!(shown.issues, rec.issues, "o que resta chega ao cartão");
+
+    // Versão posterior do plano (o usuário pediu outra mudança): revisa, mas não divide de novo.
+    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("O que implementar.", "Outra versão."));
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(reviewer.requests().len(), 3);
+    assert_eq!(internal_turns(&root).len(), 1, "a divisão roda no máximo uma vez por spec");
+    assert!(record(&root).split_requested, "a marca passa para o registro seguinte");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Sem o Arquiteto configurado o turno nem começa: a marca é desfeita (uma revisão futura pode
+/// pedir de novo) e o apontamento fica no resultado.
+#[tokio::test]
+async fn split_mark_is_undone_when_the_turn_does_not_start() {
+    let root = tmp("split-none");
+    write_plan(&root, "AWAITING_APPROVAL", &big_task(8));
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let st = state(&root, true, Scripted::new(vec![text("{\"issues\": []}")]));
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert!(!rec.split_requested, "o turno não começou");
+    assert_eq!(too_large_issues(&rec.issues).len(), 1);
+    assert!(internal_turns(&root).is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn split_request_lists_each_too_large_task() {
+    let msg = crate::agents::prompts::plan_split_request("001-x", &[("T05".into(), "Mistura a.".into()), ("T08".into(), "7 critérios.".into())]);
+    assert!(msg.starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO));
+    assert!(msg.contains("DADO NÃO CONFIÁVEL") && msg.contains("AWAITING_APPROVAL") && msg.contains("depends_on"));
+    assert!(msg.ends_with("Spec: 001-x\n- T05: Mistura a.\n- T08: 7 critérios."), "{msg}");
+    let record = PlanReviewRecord {
+        signature: "s".into(),
+        at: "a".into(),
+        status: STATUS_OK.into(),
+        issues: vec![
+            PlanIssue { task: Some("T01".into()), kind: "untestable".into(), text: "x".into() },
+            PlanIssue { task: None, kind: TOO_LARGE.into(), text: "sem tarefa".into() },
+        ],
+        detail: None,
+        split_requested: false,
+    };
+    assert!(!wants_split(&record), "sem too_large com tarefa, nada a dividir");
+    let with_big = PlanReviewRecord {
+        issues: vec![PlanIssue { task: Some("T02".into()), kind: TOO_LARGE.into(), text: "y".into() }],
+        ..record.clone()
+    };
+    assert!(wants_split(&with_big));
+    assert!(!wants_split(&PlanReviewRecord { split_requested: true, ..with_big.clone() }));
+    assert!(!wants_split(&PlanReviewRecord { status: STATUS_UNAVAILABLE.into(), ..with_big }));
+    let json = serde_json::to_string(&record).expect("json");
+    assert!(!json.contains("split_requested"), "sem a marca, o arquivo fica como antes: {json}");
 }

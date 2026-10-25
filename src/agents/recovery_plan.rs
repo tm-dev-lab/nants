@@ -283,6 +283,15 @@ pub fn signals(task: &Task, cost: &[RoleCost]) -> String {
         line.push_str(&format!("; abertos há {RECURRENT_REVIEWS} ou mais revisões: {}", items.join("; ")));
     }
     lines.push(line);
+    // Spec 126 T02: "corrigido" sem fechar, em duas revisões ou mais.
+    let claimed: Vec<String> = pending
+        .iter()
+        .filter(|f| f.fixed_claims >= crate::agents::finding_reply::EARLY_FIXED_CLAIMS)
+        .map(|f| format!("{} ({} vezes: {})", f.id, f.fixed_claims, finding_track::short_title(&f.description)))
+        .collect();
+    if !claimed.is_empty() {
+        lines.push(format!("- Respondidos como corrigidos ou com teste e ainda abertos: {}", claimed.join("; ")));
+    }
     let returned = finding_track::returned_like_resolved(&registry);
     if !returned.is_empty() {
         let items: Vec<String> = returned

@@ -583,6 +583,14 @@ pub struct Finding {
     /// contestado uma vez: com decisão gravada, não volta à arbitragem. Ausente sem contestação.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arbitration: Option<Arbitration>,
+    /// Revisões em que o Desenvolvedor respondeu `fixed` ou `test_added` e o apontamento continuou
+    /// aberto (spec 126 T02). Apurado pelo runner; 0 não é gravado.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixed_claims: u32,
+    /// Revisão em que o gatilho antecipado (spec 126 T02) levou o apontamento ao Arquiteto antes de
+    /// esgotar as tentativas. Vale uma vez por apontamento; 0 = nunca.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub early_review: u32,
 }
 
 /// Decisão do Arquiteto sobre um apontamento contestado (spec 124 T02).

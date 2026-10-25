@@ -310,6 +310,72 @@ pub fn facts(task_id: &str, title: &str, objective: &str, acceptance: &str, cont
     out
 }
 
+/// Spec 126 T02: revisões seguidas em aberto a partir das quais o apontamento vai ao Arquiteto antes
+/// da próxima tentativa (o mesmo patamar que a recuperação já trata como recorrente).
+pub const EARLY_RECURRENCE: u32 = crate::agents::recovery_plan::RECURRENT_REVIEWS;
+/// Spec 126 T02: revisões com `fixed`/`test_added` e o apontamento ainda aberto que levam ao Arquiteto.
+pub const EARLY_FIXED_CLAIMS: u32 = 2;
+/// Spec 126 T02: com este número de apontamentos HIGH no gatilho, a recuperação é antecipada (SPLIT,
+/// ADJUST, RETRY com estratégia nova ou ASK) em vez da arbitragem apontamento a apontamento.
+pub const EARLY_RECOVERY_HIGH: usize = 2;
+
+/// Spec 126 T02: apontamentos que o Arquiteto decide antes da próxima tentativa, mesmo sem
+/// contestação: pendentes, ainda sem decisão do Arquiteto e sem gatilho antecipado anterior (vale uma
+/// vez por apontamento), abertos há [`EARLY_RECURRENCE`] revisões ou mais ou respondidos como
+/// corrigidos em [`EARLY_FIXED_CLAIMS`] revisões sem fechar.
+pub fn due_early(registry: &[Finding]) -> Vec<Finding> {
+    registry
+        .iter()
+        .filter(|f| f.state.is_some_and(FindingState::is_pending) && f.arbitration.is_none() && f.early_review == 0)
+        .filter(|f| f.recurrence >= EARLY_RECURRENCE || f.fixed_claims >= EARLY_FIXED_CLAIMS)
+        .cloned()
+        .collect()
+}
+
+/// Quantos dos apontamentos são HIGH.
+pub fn high_count(findings: &[Finding]) -> usize {
+    findings.iter().filter(|f| f.severity.trim().eq_ignore_ascii_case("HIGH")).count()
+}
+
+/// Marca `ids` com o gatilho antecipado da revisão `review`, no registro e nos abertos.
+pub fn mark_early(registry: &mut [Finding], open: &mut [Finding], ids: &[String], review: u32) {
+    for f in registry.iter_mut().chain(open.iter_mut()) {
+        if ids.iter().any(|id| id == &f.id) {
+            f.early_review = review.max(1);
+        }
+    }
+}
+
+/// FATOS do turno de decisão antecipada (spec 126 T02): o mesmo turno da arbitragem, para
+/// apontamentos que continuam abertos sem contestação, com a última resposta do Desenvolvedor.
+pub fn recurring_facts(task_id: &str, title: &str, objective: &str, acceptance: &str, due: &[(Finding, Option<FindingResponse>)]) -> String {
+    let mut out = format!(
+        "Tarefa {task_id}: {title}\n\n## Objetivo\n{}\n\n## Critérios de aceitação atuais\n{}\n\n## Apontamentos recorrentes, sem contestação (decisão antes da próxima tentativa)\n",
+        objective.trim(),
+        acceptance.trim()
+    );
+    for (f, r) in due {
+        let answer = match r {
+            Some(r) => match r.reason {
+                Some(reason) => format!("{} ({}): {}", r.kind.code(), reason.code(), r.detail),
+                None => format!("{}: {}", r.kind.code(), r.detail),
+            },
+            None => "sem resposta".to_string(),
+        };
+        out.push_str(&format!(
+            "- {} [{}] {}: {}\n  Recomendação do Revisor: {}\n  Aberto há {} revisões; respondido como corrigido ou com teste em {} delas.\n  Última resposta do Desenvolvedor: {answer}\n",
+            f.id,
+            f.severity,
+            f.location,
+            flat(&f.description),
+            flat(&f.recommendation),
+            f.recurrence.max(1),
+            f.fixed_claims,
+        ));
+    }
+    out
+}
+
 /// Resposta validada do Arquiteto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruling {
@@ -600,6 +666,35 @@ mod tests {
         let out = apply(&registry, &registry, "1. a", &ruling, 2, &ok);
         assert_eq!(out.registry[0].last_review, 1);
         assert_eq!(out.registry[0].arbitration.as_ref().map(|a| a.review), Some(2));
+    }
+
+    /// Spec 126 T02: o gatilho antecipado pega o recorrente e o "corrigido" duas vezes, uma vez só,
+    /// e nunca o que já tem decisão do Arquiteto.
+    #[test]
+    fn due_early_once_per_finding() {
+        let mut fresh = finding("F-01");
+        fresh.recurrence = 2;
+        let mut recurring = finding("F-02");
+        recurring.recurrence = 3;
+        let mut claimed = finding("F-03");
+        claimed.fixed_claims = 2;
+        let mut decided = finding("F-04");
+        decided.recurrence = 5;
+        decided.arbitration = Some(Arbitration { decision: ArbitrationDecision::Keep, reason: "x".into(), review: 2 });
+        let mut resolved = finding("F-05");
+        resolved.recurrence = 4;
+        resolved.state = Some(FindingState::Resolved);
+        let mut registry = vec![fresh, recurring, claimed, decided, resolved];
+        let due = due_early(&registry);
+        assert_eq!(due.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02", "F-03"]);
+        assert_eq!(high_count(&due), 2);
+        let ids: Vec<String> = due.iter().map(|f| f.id.clone()).collect();
+        let mut open = registry.clone();
+        mark_early(&mut registry, &mut open, &ids, 4);
+        assert!(due_early(&registry).is_empty(), "uma vez por apontamento");
+        assert_eq!(open.iter().filter(|f| f.early_review == 4).count(), 2);
+        let text = recurring_facts("T05", "Render", "obj", "1. a", &[(registry[2].clone(), parse_line("- F-03: test_added: tests/a.rs::x"))]);
+        assert!(text.contains("respondido como corrigido ou com teste em 2 delas") && text.contains("Última resposta do Desenvolvedor: test_added: tests/a.rs::x"), "{text}");
     }
 
     #[test]

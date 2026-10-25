@@ -4,7 +4,7 @@
  * tokens (`.nd-md`).
  */
 import { useMemo } from "react";
-import { parseReportMarkdown, type Block, type Inline, type ListBlock } from "../../reportMarkdown";
+import { parseReportMarkdown, type Block, type Inline, type ListBlock, type TableAlign, type TableBlock } from "../../reportMarkdown";
 
 export function ReportMarkdown({ blocks }: { blocks: readonly Block[] }) {
   return (
@@ -40,7 +40,51 @@ function BlockView({ block }: { block: Block }) {
       );
     case "list":
       return <List list={block} />;
+    case "table":
+      return <Table table={block} />;
   }
+}
+
+const ALIGN_CLASS: Record<"left" | "center" | "right", string> = {
+  left: "nd-md-al-left",
+  center: "nd-md-al-center",
+  right: "nd-md-al-right",
+};
+
+function alignClass(align: TableAlign | undefined): string | undefined {
+  return align === null || align === undefined ? undefined : ALIGN_CLASS[align];
+}
+
+/** Tabela GFM: a moldura rola na horizontal quando não cabe (celular), sem alargar a página. */
+function Table({ table }: { table: TableBlock }) {
+  return (
+    <div className="nd-md-table-wrap">
+      <table className="nd-md-table">
+        <thead>
+          <tr>
+            {table.header.map((cell, index) => (
+              <th key={index} scope="col" className={alignClass(table.align[index])}>
+                <Inlines inlines={cell} />
+              </th>
+            ))}
+          </tr>
+        </thead>
+        {table.rows.length > 0 ? (
+          <tbody>
+            {table.rows.map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {row.map((cell, index) => (
+                  <td key={index} className={alignClass(table.align[index])}>
+                    <Inlines inlines={cell} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        ) : null}
+      </table>
+    </div>
+  );
 }
 
 function Heading({ level, inlines }: { level: 1 | 2 | 3; inlines: readonly Inline[] }) {

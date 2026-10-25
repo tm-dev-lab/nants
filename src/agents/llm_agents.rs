@@ -1521,9 +1521,12 @@ impl LoopGuard {
 /// Regra das respostas no briefing do Desenvolvedor (spec 124 T02).
 const RESPONSES_RULE: &str = "Antes de concluir, responda a CADA finding pendente: corrigido (fixed), teste adicionado (test_added) \
 ou contestado (contested) com o motivo: inviável no ambiente (environment), fora do escopo (out_of_scope) ou incorreto \
-(incorrect). A contestação vai ao Arquiteto, que decide; cada finding só pode ser contestado uma vez.";
+(incorrect). A contestação vai ao Arquiteto, que decide; cada finding só pode ser contestado uma vez. Conteste \
+(environment ou out_of_scope) quando o finding depende do que o ambiente não consegue provar ou pede algo fora do escopo da \
+tarefa, em vez de responder fixed ou test_added sem uma mudança efetiva: um finding que continua aberto depois de \"corrigido\" \
+vai ao Arquiteto do mesmo jeito.";
 /// Marca do finding cuja contestação o Arquiteto já decidiu (spec 124 T02).
-const DECIDED_NOTE: &str = "Contestação já decidida pelo Arquiteto: o finding é obrigatório (responda fixed ou test_added).";
+const DECIDED_NOTE: &str = "Já decidido pelo Arquiteto: o finding é obrigatório (responda fixed ou test_added).";
 
 /// Marca "aberto há N revisões" do briefing do Desenvolvedor (spec 124 T01); vazia sem apuração.
 fn open_since(recurrence: u32) -> String {

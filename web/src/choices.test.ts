@@ -27,6 +27,24 @@ describe("parseChoices", () => {
     expect(r.questions).toHaveLength(1);
     expect(r.text).toBe("Antes\nDepois");
   });
+  it("fechamento colado ao texto seguinte (caso real do Test 4): o resto é texto normal", () => {
+    const json =
+      '{"questions":[{"id":"view_distance","text":"How should the 12-chunk view distance be interpreted?","multi":false,"options":["Horizontal radius of 12 chunks (384 blocks), with vertical sub-chunks loaded as needed","12 chunks across the full horizontal diameter","A reference scene containing 12 loaded chunks total"],"recommended":"Horizontal radius of 12 chunks (384 blocks), with vertical sub-chunks loaded as needed","why":"Matches typical voxel-game view-distance settings."}]}';
+    const real =
+      "One detail affects the draw-call budget.\n\n```nants-choices\n" +
+      json +
+      "\n```Once you confirm the view-distance interpretation, I will write the specification.";
+    const r = parseChoices(real);
+    expect(r.questions).toHaveLength(1);
+    expect(r.questions?.[0]?.options).toHaveLength(3);
+    expect(r.questions?.[0]?.recommended).toEqual(["Horizontal radius of 12 chunks (384 blocks), with vertical sub-chunks loaded as needed"]);
+    expect(r.text).toBe("One detail affects the draw-call budget.\n\n\n\nOnce you confirm the view-distance interpretation, I will write the specification.");
+    expect(r.text).not.toContain("```");
+    expect(r.text).not.toContain("questions");
+    // Com espaço antes do texto colado, e com o fechamento no fim, o mesmo.
+    expect(parseChoices("A\n```nants-choices\n" + json + "\n```  Depois").text).toBe("A\n\n\nDepois");
+    expect(parseChoices("A\n```nants-choices\n" + json + "\n```").text).toBe("A");
+  });
   it("usa o último bloco; sem bloco devolve o texto", () => {
     const two = block({ questions: q(1) }) + block({ questions: q(2) });
     expect(parseChoices(two).questions).toHaveLength(2);

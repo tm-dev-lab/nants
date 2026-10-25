@@ -560,14 +560,14 @@ async fn plan_text_then_tool_keep_the_output_index_order() {
 #[tokio::test]
 async fn plan_commentary_and_final_answer_join_in_order() {
     // Decisão: as mensagens se juntam na ordem, pela mesma regra do `parse_responses` para um
-    // `output` preenchido (sem filtrar `phase`): é o que a conversa já mostrou pelos deltas.
+    // `output` preenchido (sem filtrar `phase`). Spec 126 T04: com uma quebra de parágrafo entre elas.
     let items = [
         (0, message_item("msg_c", "commentary", "Vou pensar. ")),
         (1, message_item("msg_f", "final_answer", "Resposta.")),
     ];
     let (out, cuts, _) = plan_items_call(plan_items_sse(&items, &["Vou pensar. ", "Resposta."])).await;
     let resp = out.expect("as duas mensagens");
-    assert_eq!(resp.message.content, "Vou pensar. Resposta.");
+    assert_eq!(resp.message.content, "Vou pensar.\n\nResposta.");
     // Os itens guardados mantêm o `phase` de cada mensagem.
     let items = resp.message.provider_items.as_ref().expect("itens");
     let phases: Vec<&str> = items.iter().filter_map(|i| i["phase"].as_str()).collect();

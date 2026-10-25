@@ -1947,6 +1947,22 @@ fn item_str<'a>(item: &'a Value, key: &str) -> &'a str {
 }
 
 /// Interpreta a resposta de `POST /responses`. Mensagens de erro são fixas: nunca ecoam o corpo.
+/// Acrescenta o texto de um item `message` ao já lido, separado por uma quebra de parágrafo (as
+/// quebras de linha nas pontas e os espaços no fim do anterior viram exatamente uma linha em branco).
+/// Item vazio não muda nada.
+fn join_message(text: &mut String, message: &str) {
+    if message.is_empty() {
+        return;
+    }
+    if text.is_empty() {
+        text.push_str(message);
+        return;
+    }
+    text.truncate(text.trim_end().len());
+    text.push_str("\n\n");
+    text.push_str(message.trim_start_matches(['\n', '\r']));
+}
+
 fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmError> {
     let wire: WireResponsesReply = serde_json::from_str(body)
         .map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)))?;
@@ -1977,10 +1993,13 @@ fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmE
         match item_str(item, "type") {
             "web_search_call" => web_search_calls = web_search_calls.saturating_add(1),
             "message" => {
+                // Spec 126 T04: cada item `message` é um bloco; juntá-los sem separador colava a cerca
+                // de fechamento de um bloco ao texto do seguinte (```` ```Once you… ````).
+                let mut message = String::new();
                 for part in item["content"].as_array().into_iter().flatten() {
                     match item_str(part, "type") {
                         "output_text" => {
-                            text.push_str(item_str(part, "text"));
+                            message.push_str(item_str(part, "text"));
                             for ann in part["annotations"].as_array().into_iter().flatten() {
                                 if item_str(ann, "type") != "url_citation" {
                                     continue;
@@ -1994,10 +2013,11 @@ fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmE
                                 }
                             }
                         }
-                        "refusal" => text.push_str(item_str(part, "refusal")),
+                        "refusal" => message.push_str(item_str(part, "refusal")),
                         _ => {}
                     }
                 }
+                join_message(&mut text, &message);
             }
             "function_call" => tool_calls.push(ToolCall {
                 id: item_str(item, "call_id").to_string(),
@@ -2486,6 +2506,26 @@ pub(crate) mod tests {
     pub(crate) const KEY: &str = "sk-test-SEGREDO-987";
     const OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"olá"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
     /// Responses: reasoning + function_call + message com `reasoning_tokens` em usage.
+    /// Spec 126 T04: itens `message` distintos (modo plano) são juntados com uma quebra de parágrafo;
+    /// as partes de um mesmo item continuam coladas.
+    #[test]
+    fn distinct_message_items_are_joined_with_a_paragraph_break() {
+        let body = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Escolha:\n```nants-choices\n{\"options\":[]}\n```"}]},
+                {"type": "reasoning", "content": []},
+                {"type": "message", "content": [{"type": "output_text", "text": "Once you confirm"}, {"type": "output_text", "text": ", I will plan."}]},
+                {"type": "message", "content": [{"type": "output_text", "text": ""}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "\n\nFim.\n"}]}
+            ]
+        })
+        .to_string();
+        let text = parse_responses(&body, false).expect("responses").message.content;
+        assert_eq!(text, "Escolha:\n```nants-choices\n{\"options\":[]}\n```\n\nOnce you confirm, I will plan.\n\nFim.\n");
+        assert!(!text.contains("```Once"));
+    }
+
     pub(crate) const RESP_TOOL: &str = r#"{"id":"resp_1","object":"response","status":"completed","error":null,"output":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC-SEGREDO-123"},{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}","status":"completed"},{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"vou ler","annotations":[]}]}],"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16,"output_tokens_details":{"reasoning_tokens":2}}}"#;
     /// Responses: somente texto.
     pub(crate) const RESP_TEXT: &str = r#"{"id":"resp_2","object":"response","status":"completed","error":null,"output":[{"type":"message","id":"msg_2","role":"assistant","status":"completed","content":[{"type":"output_text","text":"olá","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}"#;

@@ -13,6 +13,9 @@
  *   Revisor"); "Aguardando" = "Aprovar e iniciar" com confirmação. Spec legada sem comando de
  *   testes pede ao Arquiteto. A reconsulta do estado durante a revisão é do espaço
  *   (`useSpaceData`), não deste cartão;
+ * - tarefa grande demais (spec 126 T03): o `too_large` que restou depois da divisão pelo Arquiteto
+ *   vem primeiro na faixa, com a tarefa em destaque e a sugestão de divisão, e a tarefa ganha a
+ *   marca "grande demais" na lista; a aprovação continua possível;
  * - prontidão (decisão 15): sem `readiness.execute`, o botão fica desabilitado com o que falta;
  *   o 412 `prereq_missing` mostra o que falta com "Configurar".
  */
@@ -38,6 +41,11 @@ import { SPEC_STATUS_LABELS } from "./summary";
 export function planReviewFixMessage(automatic: readonly string[], issues: readonly PlanIssue[]): string {
   const lines = [...automatic.map((warning) => `- ${warning}`), ...issues.map((issue) => `- ${issue.task ?? "spec"}: ${issue.text}`)];
   return [t("plan.review.fixPrefix"), ...lines].join("\n");
+}
+
+/** Apontamentos `too_large` com tarefa (spec 126 T03): os que pedem destaque no cartão. */
+export function tooLargeIssues(issues: readonly PlanIssue[]): PlanIssue[] {
+  return issues.filter((issue) => issue.kind === "too_large" && issue.task !== null);
 }
 
 /** Título da faixa âmbar das checagens ("O Revisor fez 1 apontamento"), no idioma ativo. */
@@ -140,6 +148,8 @@ function PlanChecksSummary({ checks }: { checks: Checks }) {
     );
   }
   const reviewerShown = review !== undefined && (issues.length > 0 || !reviewDone);
+  const big = tooLargeIssues(issues);
+  const others = issues.filter((issue) => !big.includes(issue));
   const both = reviewerShown && automatic.length > 0;
   return (
     <section aria-label={t("plan.checks.title")} aria-describedby={titleId} className="nd-plan-warn" data-plan-warn="">
@@ -153,7 +163,13 @@ function PlanChecksSummary({ checks }: { checks: Checks }) {
             {both ? <h4 className="nd-plan-warn-source">{t("role.reviewer")}</h4> : null}
             {issues.length > 0 ? (
               <ul className="nd-plan-warn-list">
-                {issues.map((issue, i) => (
+                {big.map((issue, i) => (
+                  <li key={`big-${i}-${issue.text}`} className="nd-break nd-plan-big" data-plan-too-large={issue.task ?? ""}>
+                    <strong className="nd-plan-big-title">{t("plan.tooLarge.flag", { task: issue.task ?? "" })}</strong>{" "}
+                    <span>{t("plan.tooLarge.suggestion", { text: issue.text })}</span>
+                  </li>
+                ))}
+                {others.map((issue, i) => (
                   <li key={`${i}-${issue.text}`} className="nd-break">
                     <span className="nd-mono">{issue.task ?? "spec"}</span>: {issue.text}
                   </li>
@@ -294,6 +310,7 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
   const stale = spec.plan_review?.status === "stale";
   const blocked = stage === "awaiting" && gateBlocked(shell.readiness, "execute");
   const checks = checksOf(spec);
+  const bigTasks = new Set(tooLargeIssues(checks.issues).map((issue) => issue.task));
   const premises = spec.premises ?? [];
   const skills = spec.skills ?? [];
   const changes = spec.plan_changes ?? [];
@@ -427,6 +444,11 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
             {/* Só o id identifica a tarefa (094/T08, A-09): sem numeração redundante. */}
             <span className="nd-mono nd-plan-task-id">{task.id}</span>
             <span className="nd-plan-task-title nd-break">{task.title}</span>
+            {bigTasks.has(task.id) ? (
+              <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone="amber" data-task-too-large="">
+                {t("plan.tooLarge.badge")}
+              </span>
+            ) : null}
             {task.depends_on.length > 0 ? (
               <span className="nd-meta-line nd-plan-task-meta" data-task-meta="">
                 <span className="nd-meta-part nd-break">{t("plan.dependsOn", { ids: task.depends_on.join(", ") })}</span>

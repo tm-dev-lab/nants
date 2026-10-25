@@ -10,7 +10,9 @@
 //!    [`PlanReviewer`] responde o JSON e o servidor valida, redige e grava
 //!    `.sdd/specs/<spec>/plan-review.json` (`{signature, at, status, issues}`; escrita atômica, sem
 //!    seguir symlink, local via `.git/info/exclude`);
-//! 4. se o plano mudou durante a revisão, revisa de novo a versão nova (uma revisão por vez);
+//! 4. se o plano mudou durante a revisão, revisa de novo a versão nova (uma revisão por vez); com
+//!    `too_large` na revisão (spec 126 T03), antes disso o Arquiteto recebe um turno interno para
+//!    dividir essas tarefas, no máximo uma vez por spec;
 //! 5. ao concluir (com ou sem gravação; só o shutdown não publica), publica `sdd_draft_updated`
 //!    para a UI recarregar e sair de "revisando…".
 //!
@@ -149,6 +151,10 @@ pub struct PlanReviewRecord {
     /// Vocabulário fixo; nunca texto remoto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Spec 126 T03: a spec já teve o turno de divisão das tarefas `too_large` (no máximo um por
+    /// spec, para não haver laço). Passa de um registro para o seguinte, mesmo com outra assinatura.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split_requested: bool,
 }
 
 /// `plan_review` exposto no estado do projeto.
@@ -247,8 +253,12 @@ enum Stop {
     Shutdown,
 }
 
-/// Revisa enquanto a versão atual do plano não tem resultado.
+/// Revisa enquanto a versão atual do plano não tem resultado. Com `too_large` na primeira revisão
+/// (spec 126 T03), o Arquiteto recebe um turno interno para dividir essas tarefas; o plano revisto
+/// é revisado de novo nesta mesma volta (a vaga continua reservada: a UI segue em "revisando" e a
+/// aprovação espera). A divisão roda no máximo uma vez por spec.
 async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &str, setup: &ReviewerSetup) -> Stop {
+    let mut split_tried = false;
     loop {
         let (check_root, sid) = (root.to_path_buf(), spec_id.to_string());
         let pending = tokio::task::spawn_blocking(move || {
@@ -259,15 +269,75 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
         if !pending {
             return Stop::Done;
         }
-        if let Err(stop) = review_once(state, project_id, root, spec_id, setup).await {
-            return stop;
+        let record = match review_once(state, project_id, root, spec_id, setup).await {
+            Ok(record) => record,
+            Err(stop) => return stop,
+        };
+        if !split_tried && wants_split(&record) {
+            split_tried = true;
+            if let Err(stop) = split_turn(state, project_id, root, spec_id, record).await {
+                return stop;
+            }
         }
     }
 }
 
-/// Uma revisão da versão atual: grava o resultado. `Err` em shutdown, plano ilegível ou falha de
-/// escrita (nada gravado).
-async fn review_once(state: &AppState, project_id: &str, root: &Path, spec_id: &str, setup: &ReviewerSetup) -> Result<(), Stop> {
+/// Apontamentos `too_large` com tarefa, na ordem: `(tarefa, texto)`.
+pub fn too_large_issues(issues: &[PlanIssue]) -> Vec<(String, String)> {
+    issues
+        .iter()
+        .filter(|i| i.kind == TOO_LARGE)
+        .filter_map(|i| i.task.as_ref().map(|task| (task.clone(), i.text.clone())))
+        .collect()
+}
+
+/// `true` quando a revisão gravada pede o turno de divisão: resultado `ok`, algum `too_large` com
+/// tarefa e a spec ainda sem divisão pedida.
+fn wants_split(record: &PlanReviewRecord) -> bool {
+    record.status == STATUS_OK && !record.split_requested && !too_large_issues(&record.issues).is_empty()
+}
+
+/// Turno interno do Arquiteto para dividir as tarefas `too_large` (spec 126 T03). A marca de
+/// divisão pedida é gravada antes do turno (nem uma queda repete a divisão) e desfeita só quando o
+/// turno nem começou (código 4xx: turno ocupado, Arquiteto não configurado, prontidão), para uma
+/// revisão futura poder pedir de novo. Sem gravar a marca, não pede (evita o laço).
+async fn split_turn(state: &AppState, project_id: &str, root: &Path, spec_id: &str, record: PlanReviewRecord) -> Result<(), Stop> {
+    let message = crate::agents::prompts::plan_split_request(spec_id, &too_large_issues(&record.issues));
+    let marked = PlanReviewRecord { split_requested: true, ..record.clone() };
+    let (write_root, sid) = (root.to_path_buf(), spec_id.to_string());
+    let saved = tokio::task::spawn_blocking(move || persist(&write_root, &sid, &marked)).await.ok().flatten();
+    if saved.is_none() {
+        return Ok(());
+    }
+    let mut shutdown = state.shutdown_signal();
+    let turn = super::chat::internal_turn(state.clone(), project_id.to_string(), message);
+    let status = tokio::select! {
+        biased;
+        _ = wait_shutdown(&mut shutdown) => return Err(Stop::Shutdown),
+        status = turn => status,
+    };
+    if status.is_client_error() {
+        let (write_root, sid) = (root.to_path_buf(), spec_id.to_string());
+        let _ = tokio::task::spawn_blocking(move || {
+            // Só desfaz a marca da mesma versão do plano (o turno que nem começou não mudou nada).
+            if plan_signature(&write_root, &sid).as_deref() == Some(record.signature.as_str()) {
+                persist(&write_root, &sid, &record);
+            }
+        })
+        .await;
+    }
+    Ok(())
+}
+
+/// Uma revisão da versão atual: grava e devolve o resultado. `Err` em shutdown, plano ilegível ou
+/// falha de escrita (nada gravado).
+async fn review_once(
+    state: &AppState,
+    project_id: &str,
+    root: &Path,
+    spec_id: &str,
+    setup: &ReviewerSetup,
+) -> Result<PlanReviewRecord, Stop> {
     let secrets = state.secret_set().await;
     let (plan_root, sid, plan_secrets) = (root.to_path_buf(), spec_id.to_string(), Arc::clone(&secrets));
     let (signature, plan) = tokio::task::spawn_blocking(move || {
@@ -307,7 +377,11 @@ async fn review_once(state: &AppState, project_id: &str, root: &Path, spec_id: &
     };
     let lang = state.project_lang(project_id).get();
     let (size_root, sid) = (root.to_path_buf(), spec_id.to_string());
-    let sizes = tokio::task::spawn_blocking(move || task_sizes(&size_root, &sid)).await.unwrap_or_default();
+    let (sizes, split_requested) = tokio::task::spawn_blocking(move || {
+        (task_sizes(&size_root, &sid), read_record(&size_root, &sid).is_some_and(|r| r.split_requested))
+    })
+    .await
+    .unwrap_or_default();
     let issues = answer
         .as_deref()
         .ok()
@@ -324,9 +398,15 @@ async fn review_once(state: &AppState, project_id: &str, root: &Path, spec_id: &
         status: if issues.is_some() { STATUS_OK } else { STATUS_UNAVAILABLE }.to_string(),
         issues: issues.unwrap_or_default(),
         detail,
+        split_requested,
     };
-    let (write_root, sid) = (root.to_path_buf(), spec_id.to_string());
-    tokio::task::spawn_blocking(move || persist(&write_root, &sid, &record)).await.ok().flatten().ok_or(Stop::Failed)
+    let (write_root, sid, saved) = (root.to_path_buf(), spec_id.to_string(), record.clone());
+    tokio::task::spawn_blocking(move || persist(&write_root, &sid, &saved))
+        .await
+        .ok()
+        .flatten()
+        .ok_or(Stop::Failed)?;
+    Ok(record)
 }
 
 fn unix_now() -> u64 {
