@@ -1,5 +1,6 @@
 //! Estado SDD versionável em `<repo>/.sdd/`: tipos, parser Markdown+YAML e carga.
 
+pub mod capabilities;
 pub mod coverage;
 pub mod docker_command;
 pub mod environment;
@@ -13,6 +14,7 @@ pub mod role_guidance;
 pub mod scope_warnings;
 pub mod screenshots;
 pub mod skills;
+pub mod test_levels;
 mod parser;
 mod schema;
 
@@ -24,7 +26,7 @@ pub use parser::{
     write_task,
 };
 pub use schema::{
-    check_name_valid, normalize_formatter_glob, normalize_workdir, validate_failure_artifacts, validate_formatters, Formatter, MAX_FAILURE_ARTIFACTS, MAX_FORMATTERS, DEFAULT_LIMIT, DEFAULT_REVIEW_DIFF_BUDGET, LIMIT_RANGE, check_run_url, check_test_command_shape, validate_checks, Check, Confidence, Environment, MAX_CHECKS, Finding, Sdd, Settings, Spec, SpecMeta, SpecStatus, Task, TaskMeta, TASK_KIND_FINAL_FIX,
+    check_name_valid, normalize_formatter_glob, valid_optional_command, validate_lockfiles, MAX_LOCKFILES, normalize_workdir, validate_failure_artifacts, validate_formatters, Formatter, MAX_FAILURE_ARTIFACTS, MAX_FORMATTERS, DEFAULT_LIMIT, DEFAULT_REVIEW_DIFF_BUDGET, LIMIT_RANGE, check_run_url, check_test_command_shape, validate_checks, Check, Confidence, Environment, MAX_CHECKS, Finding, FindingState, Arbitration, ArbitrationDecision, Sdd, Settings, Spec, SpecMeta, SpecStatus, Task, TaskMeta, TASK_KIND_FINAL_FIX,
     TaskStatus, TestCommandError, TestRun, Verdict, TEST_COMMAND_MAX_CHARS,
 };
 

@@ -51,16 +51,21 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::agents::finding_reply::{self, FindingResponse, ARBITRATION_LOG, RESPONSES, SPEC_DECISIONS};
+use crate::agents::finding_track::{self, REGISTRY};
 use crate::agents::llm_client::ProviderFailure;
 use crate::agents::usage::BudgetGuard;
 use crate::harness::compose::ComposeEnv;
 use crate::harness::git::{Git, LOCAL_SETTINGS};
 use crate::harness::GitError;
+use crate::harness::progress::CommandProgress;
 use crate::i18n::{self, Lang};
+use crate::sdd::capabilities;
 use crate::sdd::formatting;
+use crate::sdd::test_levels;
 use crate::sdd::reconciler::is_task_commit;
 use crate::sdd::{
-    read_settings, read_spec, read_task, sdd_dir, Confidence, Environment, Finding, Formatter, SddError, Settings, SpecStatus, Task,
+    read_settings, read_spec, read_task, sdd_dir, Confidence, Environment, Finding, FindingState, Formatter, SddError, Settings, SpecStatus, Task,
     TaskStatus, TestRun, Verdict,
 };
 
@@ -243,12 +248,57 @@ fn test_signature(settings: &Settings) -> String {
     for c in settings.checks.iter().filter(|c| c.blocking) {
         canon.push_str(&format!("\n{}\t{}", c.name, c.command));
     }
+    // Spec 124 T05: só entram quando definidos (sem eles, a assinatura é a de antes).
+    if let Some(full) = &settings.full_test_command {
+        canon.push_str(&format!("\nfull\t{full}"));
+    }
+    if let Some(install) = &settings.install_command {
+        canon.push_str(&format!("\ninstall\t{install}\t{}", settings.lockfiles.join("\t")));
+    }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in canon.bytes() {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{h:016x}")
+}
+
+/// Seção "Testes do projeto" do briefing do Desenvolvedor (spec 124 T05): os comandos que o Nants
+/// roda, a instalação por arquivo de trava e quais rodadas dele o Nants aceita sem repetir. Texto
+/// para o modelo; vazio sem `test_command`.
+fn test_plan(settings: &Settings) -> String {
+    if settings.test_command.trim().is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Testes do projeto (o Nants roda estes comandos na sua worktree, no mesmo ambiente do run_command)\n");
+    match &settings.full_test_command {
+        Some(full) => {
+            out.push_str(&format!("- test_command, o nível rápido, a cada entrega: `{}`\n", settings.test_command));
+            out.push_str(&format!("- full_test_command, a bateria completa, antes da revisão e na integração: `{full}`\n"));
+        }
+        None => out.push_str(&format!("- test_command, a bateria do projeto: `{}`\n", settings.test_command)),
+    }
+    for check in settings.checks.iter().filter(|c| c.blocking) {
+        out.push_str(&format!("- checagem bloqueante {}: `{}`\n", check.name, check.command));
+    }
+    if let Some(install) = &settings.install_command {
+        if settings.lockfiles.is_empty() {
+            out.push_str(&format!("- install_command: `{install}`. O Nants a roda antes de cada rodada de testes; os comandos acima não instalam.\n"));
+        } else {
+            out.push_str(&format!(
+                "- install_command: `{install}`. O Nants a roda antes dos testes só quando mudam os arquivos de trava ({}); os comandos acima não instalam. Se você mudar uma trava ou faltar dependência, rode-a você.\n",
+                settings.lockfiles.join(", ")
+            ));
+        }
+    }
+    let reusable = test_levels::watched_commands(settings);
+    if !reusable.is_empty() {
+        let list = reusable.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!(
+            "Reaproveitamento: a última rodada sua de {list}, exatamente com esse texto, que passou sobre o código entregue (sem nenhuma mudança depois dela) dispensa a rodada do Nants nas checagens bloqueantes e no nível rápido. A bateria completa o Nants sempre roda uma vez, com o ambiente recriado, antes da revisão: é ela que vale.\n"
+        ));
+    }
+    out
 }
 
 fn test_summary(output: &str) -> String {
@@ -337,6 +387,43 @@ pub fn final_base_prefix(lang: Lang) -> String {
 }
 
 /// Alerta anexado à evidência quando um comando termina com 0 sem saída própria.
+/// Alerta na evidência de testes quando a rodada falhou e passou ao repetir sem mudança (spec 124
+/// T04): o Revisor vê que a aprovação veio da repetição. Marcador lido por modelo, como o
+/// [`SILENT_PASS_WARNING`].
+pub const FLAKY_PASS_WARNING: &str = "ALERTA: rodada instável:";
+
+/// Alerta completo da rodada instável, com o comando que falhou (o nível rápido ou a bateria
+/// completa; spec 124 T05).
+pub fn flaky_pass_warning(command: &str) -> String {
+    format!("{FLAKY_PASS_WARNING} `{command}` falhou e passou ao repetir sem mudança na árvore. Linhas de falha da primeira rodada:")
+}
+
+/// Linha da evidência com as checagens bloqueantes reaproveitadas da rodada do Desenvolvedor (spec
+/// 124 T05): a integração as roda de novo na base. Marcador lido por modelo e pelo runner.
+pub const CHECKS_FROM_DEV_MARK: &str = "Checagens bloqueantes reaproveitadas da rodada do Desenvolvedor (rodam de novo na integração):";
+/// Seção do corpo da tarefa com os alertas de rodada instável (spec 124 T04).
+pub const FLAKY_SECTION: &str = "Testes instáveis";
+/// Linhas de falha guardadas por rodada instável.
+const FLAKY_MAX_LINES: usize = 10;
+/// Primeira linha da evidência reaproveitada da rodada do Desenvolvedor (spec 124 T05): o Revisor
+/// sabe de onde veio a saída. Marcador lido por modelo, como o [`FLAKY_PASS_WARNING`].
+pub const DEV_REUSED_MARK: &str = "Resultado reaproveitado da rodada do Desenvolvedor, mesmo comando sobre a mesma árvore:";
+/// Seção do corpo da tarefa com as rodadas reaproveitadas do Desenvolvedor (spec 124 T05).
+pub const REUSE_SECTION: &str = "Testes reaproveitados";
+/// Nome da etapa de instalação das dependências nos eventos da rodada (spec 124 T05).
+const INSTALL_STEP: &str = "install";
+/// Primeira linha da saída quando a instalação falha (marcador lido por modelo).
+const INSTALL_FAILED_MARK: &str = "install_command falhou";
+
+/// Resultado da garantia de dependências antes de uma rodada (spec 124 T05).
+enum Install {
+    /// Sem `install_command`, ou a trava não mudou desde a última instalação nesta pasta.
+    Current,
+    /// Rodou agora e passou (no Docker, o estado do Compose já foi recriado por ela).
+    Ran,
+    /// Rodou e falhou: a saída vale como a da rodada, com a duração dela.
+    Failed(TestResult, Duration),
+}
 pub const SILENT_PASS_WARNING: &str = "ALERTA: o comando terminou sem saída própria; verifique se ele rodou de fato.";
 
 /// `true` quando a saída só tem linhas do próprio Docker Compose (Network/Container/Volume
@@ -541,6 +628,18 @@ pub struct DevBrief {
     /// Seção "## Guia de arte" do spec.md (redigida, ≤ 1500 caracteres), anteposta ao prompt de
     /// `generate_image`; vazia sem ela.
     pub art_guide: String,
+    /// Capacidades do ambiente de testes (spec 124 T04, seção curta já com a regra do papel e o
+    /// aviso de orçamento de tempo); vazia sem nada medido.
+    pub environment: String,
+    /// Seção "Testes instáveis" da tarefa (spec 124 T04): rodadas que falharam e passaram ao repetir
+    /// sem mudança, com as linhas de falha; vazia sem alerta.
+    pub flaky_tests: String,
+    /// Seção "Testes do projeto" (spec 124 T05): os comandos de teste, de instalação e das
+    /// checagens bloqueantes, com a regra do reaproveitamento; vazia sem `test_command`.
+    pub test_plan: String,
+    /// Registro das rodadas dos comandos de teste do projeto feitas pelo Desenvolvedor (spec 124
+    /// T05), consultado pelo runner na entrega.
+    pub suite_ledger: crate::sdd::test_levels::SuiteLedger,
 }
 
 /// Relato do Desenvolvedor após uma rodada.
@@ -572,6 +671,12 @@ pub struct ReviewInput {
     pub other_tasks: String,
     /// Findings da revisão anterior (texto), quando houver; vazio na primeira revisão.
     pub prior_findings: String,
+    /// Respostas do Desenvolvedor aos apontamentos abertos (spec 124 T02), uma linha cada
+    /// (`- F-01: fixed: local`); vazio sem respostas.
+    pub finding_responses: String,
+    /// Decisões do Arquiteto sobre contestações (spec 124 T02), uma linha cada
+    /// (`- F-03 [manual] título: motivo`); vazio sem decisões.
+    pub arbitration: String,
     /// Diff desde a última reprovação (`rejected_sha..branch`, mesmo orçamento do diff); vazio sem reprovação.
     pub incremental_diff: String,
     /// Arquivos alterados desde o commit revisado na rodada anterior (`rejected_sha...branch`, spec
@@ -606,6 +711,9 @@ pub struct ReviewInput {
     /// Imagens planejadas da tarefa (spec 092 T03, do objetivo e dos critérios) e a disponibilidade
     /// da geração nesta execução; sem caminhos planejados, nada muda nos FATOS.
     pub planned_images: crate::sdd::images::PlannedImages,
+    /// Capacidades do ambiente de testes (spec 124 T04, seção curta com a regra do Revisor); vazia
+    /// sem nada medido.
+    pub environment: String,
 }
 
 /// Época da tentativa corrente da tarefa: muda a cada tentativa nova e a cada análise de recuperação
@@ -913,6 +1021,8 @@ pub fn enforce_criteria(lang: Lang, mut result: ReviewResult) -> ReviewResult {
             location: i18n::text(lang, "runner.review.unmet_location"),
             description: i18n::tr(lang, "runner.review.unmet_description", &[("criterion", &c.criterion), ("evidence", &evidence)]),
             recommendation: i18n::text(lang, "runner.review.unmet_recommendation"),
+            // Spec 124 T01: o id é do runner, não do Revisor; o registro o liga ao aberto pelo texto.
+            state: Some(FindingState::New),
             ..Finding::default()
         });
     }
@@ -939,6 +1049,26 @@ pub const SCENARIO_PREFIX: &str = "Cenário de falha:";
 pub const LOW_CONFIDENCE_LABEL: &str = "baixa confiança";
 /// Limite de bytes de cada linha de finding na mensagem do Revisor.
 const FINDING_LINE_BYTES: usize = 400;
+/// Spec 124 T01: marca, junto da severidade, do apontamento que apareceu nesta revisão. Marcador
+/// estrutural (sempre em pt-BR, como os demais): a tela mostra `review.stateNew` no idioma ativo.
+pub const STATE_NEW_LABEL: &str = "novo";
+/// Spec 124 T01: início da marca do apontamento ainda aberto: `aberto há N revisões`.
+pub const STATE_OPEN_PREFIX: &str = "aberto há";
+/// Spec 124 T01: seção da mensagem do Revisor com os apontamentos anteriores resolvidos nesta revisão;
+/// vem depois das observações e antes de [`CAPTURES_HEADER`].
+pub const RESOLVED_HEADER: &str = "Resolvidos:";
+
+/// Marca de estado de um apontamento apurado pelo runner; vazia sem apuração (`recurrence` 0).
+fn state_mark(f: &Finding) -> Option<String> {
+    match (f.state, f.recurrence) {
+        (_, 0) => None,
+        (Some(FindingState::Open), n) if n > 1 => {
+            Some(format!("{STATE_OPEN_PREFIX} {n} revisões"))
+        }
+        (Some(FindingState::New), _) | (Some(FindingState::Open), _) => Some(STATE_NEW_LABEL.to_string()),
+        _ => None,
+    }
+}
 
 /// Resultado da convergência: veredito ajustado e findings que não bloqueiam.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,6 +1185,34 @@ fn demote_low_confidence(lang: Lang, mut result: ReviewResult) -> (ReviewResult,
         result = enforce_criteria(lang, result);
     }
     (result, low)
+}
+
+/// Spec 124 T02: o Revisor não cobra o que o Arquiteto ajustou ou tornou manual (`waived`). Um
+/// apontamento desta revisão que é um dispensado (o mesmo id declarado como continuação, ou o mesmo
+/// local e a mesma primeira frase) vira observação. Sem outro bloqueante, o veredito vira APPROVED; o
+/// critério não atendido continua bloqueando, salvo quando o apontamento gerado por ele é o dispensado.
+pub fn demote_waived(lang: Lang, mut result: ReviewResult, waived: &[Finding]) -> (ReviewResult, Vec<Finding>) {
+    if waived.is_empty() || result.verdict != Verdict::ChangesRequested {
+        return (result, Vec::new());
+    }
+    let is_waived = |f: &Finding| {
+        waived.iter().any(|w| (f.state != Some(FindingState::New) && f.id.trim() == w.id) || finding_track::same_problem(w, f))
+    };
+    if !result.findings.iter().any(is_waived) {
+        return (result, Vec::new());
+    }
+    let (dispensed, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut result.findings).into_iter().partition(is_waived);
+    result.findings = kept;
+    if result.findings.is_empty() {
+        result.verdict = Verdict::Approved;
+        result.summary = i18n::tr(lang, "runner.review.waived_demoted", &[("summary", result.summary.trim_end())]);
+        result = enforce_criteria(lang, result);
+        result.findings.retain(|f| !is_waived(f));
+        if result.findings.is_empty() {
+            result.verdict = Verdict::Approved;
+        }
+    }
+    (result, dispensed)
 }
 
 /// Spec 092 T04: rótulo, junto da severidade, da observação rebaixada porque o arquivo não mudou
@@ -1238,10 +1396,13 @@ fn converge_findings(lang: Lang, mut result: ReviewResult, previous: &[Finding],
 
 fn finding_line(f: &Finding, with_recommendation: bool, redact: &dyn Fn(&str) -> String) -> String {
     let flat = |t: &str| redact(t).split_whitespace().collect::<Vec<_>>().join(" ");
-    let severity = match f.confidence {
+    let mut severity = match f.confidence {
         Confidence::High => flat(&f.severity),
         Confidence::Low => format!("{}, {LOW_CONFIDENCE_LABEL}", flat(&f.severity)),
     };
+    if let Some(mark) = state_mark(f) {
+        severity.push_str(&format!(", {mark}"));
+    }
     let mut line = format!("{} [{severity}] {}: {}", flat(&f.id), flat(&f.location), flat(&f.description));
     let rec = flat(&f.recommendation);
     if with_recommendation && !rec.is_empty() {
@@ -1283,6 +1444,35 @@ pub fn render_review_message(
     criteria: &[CriterionCheck],
     redact: &dyn Fn(&str) -> String,
 ) -> String {
+    render_review_message_tracked(verdict, summary, findings, observations, &TrackedSections::default(), captures, criteria, redact)
+}
+
+/// Seções da mensagem do Revisor que vêm do registro dos apontamentos (spec 124 T01 e T02).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackedSections<'a> {
+    /// Apontamentos anteriores que não voltaram nesta revisão.
+    pub resolved: &'a [Finding],
+    /// Respostas do Desenvolvedor que o Revisor conferiu.
+    pub responses: &'a [FindingResponse],
+    /// Decisões do Arquiteto (`F-03 [manual] título: motivo`), ver [`finding_reply::decision_lines`].
+    pub decisions: &'a [String],
+}
+
+/// [`render_review_message`] com a seção `Resolvidos:` (spec 124 T01): os apontamentos anteriores
+/// que não voltaram nesta revisão, uma linha cada, sem recomendação, logo depois das observações.
+/// Em seguida (spec 124 T02), `Respostas do Desenvolvedor:` (`- F-01 [fixed] detalhe`) e `Decisões do
+/// Arquiteto:` (`- F-03 [manual] título: motivo`), marcadores estruturais lidos pela web.
+#[allow(clippy::too_many_arguments)]
+pub fn render_review_message_tracked(
+    verdict: Verdict,
+    summary: &str,
+    findings: &[Finding],
+    observations: &[Finding],
+    sections: &TrackedSections<'_>,
+    captures: &[String],
+    criteria: &[CriterionCheck],
+    redact: &dyn Fn(&str) -> String,
+) -> String {
     let label = if verdict == Verdict::Approved { VERDICT_APPROVED_LABEL } else { VERDICT_CHANGES_LABEL };
     let mut out = format!("{label}: {}", summary.trim());
     if !findings.is_empty() {
@@ -1295,6 +1485,27 @@ pub fn render_review_message(
         out.push_str(&format!("\n\n{OBSERVATIONS_HEADER}"));
         for f in observations {
             out.push_str(&format!("\n- {}", finding_line(f, false, redact)));
+        }
+    }
+    if !sections.resolved.is_empty() {
+        out.push_str(&format!("\n\n{RESOLVED_HEADER}"));
+        for f in sections.resolved {
+            // Só a primeira linha (sem cenário) e sem marca de estado: o cabeçalho já diz "resolvido".
+            let plain = Finding { state: None, recurrence: 0, failure_scenario: String::new(), ..f.clone() };
+            out.push_str(&format!("\n- {}", finding_line(&plain, false, redact)));
+        }
+    }
+    let flat = |t: &str| redact(t).split_whitespace().collect::<Vec<_>>().join(" ");
+    if !sections.responses.is_empty() {
+        out.push_str(&format!("\n\n{}", finding_reply::RESPONSES_HEADER));
+        for r in sections.responses {
+            out.push_str(&format!("\n- {}", clip_line(flat(&r.message_line()))));
+        }
+    }
+    if !sections.decisions.is_empty() {
+        out.push_str(&format!("\n\n{}", finding_reply::DECISIONS_HEADER));
+        for line in sections.decisions {
+            out.push_str(&format!("\n- {}", clip_line(flat(line))));
         }
     }
     if !captures.is_empty() {
@@ -1369,10 +1580,38 @@ pub trait ReviewerPort: Send + Sync {
         -> Fut<'a, Result<ReviewResult, RunnerError>>;
 }
 
+/// Árbitro das contestações (spec 124 T02): o Arquiteto decide, em turno próprio e estruturado, os
+/// apontamentos que o Desenvolvedor contestou. Devolve o texto bruto (JSON validado pelo runner);
+/// `root` é a raiz de leitura (a worktree da tarefa). Sem árbitro, a contestação segue só como
+/// resposta ao Revisor.
+pub trait ArbiterPort: Send + Sync {
+    fn arbitrate<'a>(&'a self, spec_id: &'a str, task_id: &'a str, root: &'a Path, facts: &'a str)
+        -> Fut<'a, Result<String, RunnerError>>;
+}
+
 /// Executor do `test_command` em um diretório.
 pub trait TestExecutor: Send + Sync {
     fn run<'a>(&'a self, dir: &'a Path, command: &'a str)
         -> Fut<'a, Result<TestResult, RunnerError>>;
+
+    /// Como [`Self::run`], copiando cada pedaço da saída em `progress` enquanto roda (spec 123
+    /// T01: o heartbeat da rodada leva os bytes e a última linha). O resultado não muda. Padrão:
+    /// sem progresso.
+    fn run_watched<'a>(
+        &'a self,
+        dir: &'a Path,
+        command: &'a str,
+        progress: Arc<CommandProgress>,
+    ) -> Fut<'a, Result<TestResult, RunnerError>> {
+        let _ = progress;
+        self.run(dir, command)
+    }
+
+    /// Limite de tempo de cada execução, quando o executor tem um (spec 123 T02: a tela mostra
+    /// "rodando os testes há 7 min (limite de 10 min)"). Padrão: sem limite conhecido.
+    fn time_limit(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Tipo de comando de verificação em execução.
@@ -1455,6 +1694,20 @@ pub enum RunnerEvent {
         command: String,
         task_id: String,
         attempt: u32,
+        /// Limite de tempo da rodada (spec 123 T02): o do executor no host, o [`TEST_TIMEOUT`] no
+        /// Docker. A tela mostra o tempo contra ele, nunca um valor fixo dela.
+        limit: Option<Duration>,
+    },
+    /// Sinal de vida da rodada em curso (spec 123 T01), a cada [`COMMAND_HEARTBEAT`]: bytes de
+    /// saída capturados até agora e a última linha não vazia (com scrub). Efêmero, como o início.
+    ///
+    /// [`COMMAND_HEARTBEAT`]: crate::agents::activity::COMMAND_HEARTBEAT
+    CommandBeat {
+        /// O mesmo id do início.
+        run_id: String,
+        task_id: String,
+        output_bytes: u64,
+        last_line: Option<String>,
     },
     TaskUpdated {
         spec_id: String,
@@ -1570,10 +1823,31 @@ impl TestExecutor for ShellTestExecutor {
         let timeout = self.timeout;
         let lang = self.lang.get();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || run_shell(&dir, &command, timeout, lang))
+            tokio::task::spawn_blocking(move || run_shell(&dir, &command, timeout, lang, None))
                 .await
                 .map_err(|e| RunnerError::Tests(format!("execução interrompida: {e}")))?
         })
+    }
+
+    fn run_watched<'a>(
+        &'a self,
+        dir: &'a Path,
+        command: &'a str,
+        progress: Arc<CommandProgress>,
+    ) -> Fut<'a, Result<TestResult, RunnerError>> {
+        let dir = dir.to_path_buf();
+        let command = command.to_string();
+        let timeout = self.timeout;
+        let lang = self.lang.get();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || run_shell(&dir, &command, timeout, lang, Some(&progress)))
+                .await
+                .map_err(|e| RunnerError::Tests(format!("execução interrompida: {e}")))?
+        })
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        Some(self.timeout)
     }
 }
 
@@ -1619,7 +1893,7 @@ fn timed_out_mark(lang: Lang, timeout: Duration) -> String {
 }
 
 /// Executa `command` com `sh -c` em `dir`. Após o timeout, mata o processo e não espera os pipes.
-fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang) -> Result<TestResult, RunnerError> {
+fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang, progress: Option<&CommandProgress>) -> Result<TestResult, RunnerError> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -1648,6 +1922,9 @@ fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang) -> Result
     let mut exit_code: Option<i32> = None;
     loop {
         while let Ok(chunk) = rx.try_recv() {
+            if let Some(p) = progress {
+                p.push(&chunk);
+            }
             capture.push(&chunk);
         }
         match child.try_wait() {
@@ -1725,6 +2002,14 @@ pub struct TaskRunner {
     formatter_failures: Mutex<HashSet<(String, String)>>,
     /// Idioma ativo do projeto (spec 107 T01): título da tarefa de correção da verificação final.
     lang: crate::i18n::SharedLang,
+    /// Intervalo do sinal de vida da rodada de testes (spec 123 T01; injetável nos testes).
+    command_heartbeat: Duration,
+    /// Árbitro das contestações do Desenvolvedor (spec 124 T02); `None` = sem arbitragem.
+    arbiter: Option<Arc<dyn ArbiterPort>>,
+    /// Chave do ambiente cujas capacidades já foram medidas nesta execução (spec 124 T04).
+    probed_env: Mutex<Option<String>>,
+    /// Rodadas dos comandos de teste do projeto feitas pelo Desenvolvedor (spec 124 T05).
+    suite_ledger: test_levels::SuiteLedger,
 }
 
 /// Rótulo (`stage`) da atividade ao vivo da verificação final.
@@ -1761,7 +2046,24 @@ impl TaskRunner {
             base_checks: Mutex::new(HashMap::new()),
             formatter_failures: Mutex::new(HashSet::new()),
             lang: crate::i18n::SharedLang::default(),
+            command_heartbeat: crate::agents::activity::COMMAND_HEARTBEAT,
+            arbiter: None,
+            probed_env: Mutex::new(None),
+            suite_ledger: test_levels::SuiteLedger::default(),
         }
+    }
+
+    /// Liga o árbitro das contestações (spec 124 T02): o Arquiteto decide antes da próxima revisão.
+    pub fn with_arbiter(mut self, arbiter: Arc<dyn ArbiterPort>) -> Self {
+        self.arbiter = Some(arbiter);
+        self
+    }
+
+    /// Intervalo do sinal de vida das rodadas de testes e checagens (padrão
+    /// [`COMMAND_HEARTBEAT`](crate::agents::activity::COMMAND_HEARTBEAT)).
+    pub fn with_command_heartbeat(mut self, interval: Duration) -> Self {
+        self.command_heartbeat = interval;
+        self
     }
 
     /// Idioma ativo do projeto, lido na hora de criar a tarefa de correção da verificação final.
@@ -1869,8 +2171,23 @@ impl TaskRunner {
         command: &str,
         fresh: bool,
     ) -> Result<TestResult, RunnerError> {
+        self.exec_cmd_watched(settings, dir, command, fresh, None).await
+    }
+
+    /// Como [`Self::exec_cmd`], com o progresso da saída em `progress` enquanto roda (spec 123 T01).
+    async fn exec_cmd_watched(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        fresh: bool,
+        progress: Option<Arc<CommandProgress>>,
+    ) -> Result<TestResult, RunnerError> {
         if settings.environment != Environment::Docker {
-            return self.tests.run(dir, command).await;
+            return match progress {
+                Some(p) => self.tests.run_watched(dir, command, p).await,
+                None => self.tests.run(dir, command).await,
+            };
         }
         let compose = self
             .compose
@@ -1881,7 +2198,7 @@ impl TaskRunner {
             if fresh {
                 compose.prepare(&dir)?;
             }
-            let out = compose.exec(&dir, &command, TEST_TIMEOUT);
+            let out = compose.exec_watched(&dir, &command, TEST_TIMEOUT, progress.as_ref());
             // Devolve ao usuário o que um container root (imagens antigas) tenha criado.
             let _ = compose.repair_ownership(&dir);
             out
@@ -1899,6 +2216,65 @@ impl TaskRunner {
     /// nome da checagem (`None` = `test_command`); `place` = " na base" ou vazio.
     #[allow(clippy::too_many_arguments)]
     async fn run_tracked(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        fresh: bool,
+        check: Option<&str>,
+        place: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> Result<TestResult, RunnerError> {
+        self.run_tracked_timed(settings, dir, command, fresh, check, place, task_id, attempt).await.0
+    }
+
+    /// Limite de tempo de uma rodada (spec 123 T02): o Docker usa sempre o `TEST_TIMEOUT`; no host,
+    /// o do executor, quando ele tem um.
+    fn round_limit(&self, settings: &Settings) -> Option<Duration> {
+        if settings.environment == Environment::Docker { Some(TEST_TIMEOUT) } else { self.tests.time_limit() }
+    }
+
+    /// Como [`Self::run_tracked`], devolvendo também a duração medida. A rodada do `test_command`
+    /// (sem `check`) entra nas capacidades do projeto (spec 124 T04), com o limite e o resultado.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tracked_timed(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        fresh: bool,
+        check: Option<&str>,
+        place: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> (Result<TestResult, RunnerError>, Duration) {
+        let started = std::time::Instant::now();
+        let out = self.run_tracked_inner(settings, dir, command, fresh, check, place, task_id, attempt).await;
+        let elapsed = started.elapsed();
+        if let (None, Ok(result)) = (check, &out) {
+            let limit = self.round_limit(settings);
+            let run = capabilities::SuiteRun::measured(
+                elapsed,
+                limit,
+                result.passed,
+                result.timed_out,
+                rfc3339_of(std::time::SystemTime::now()),
+            );
+            let environment = environment_name(settings);
+            // Melhor esforço: sem o estado gravado, a rodada segue igual.
+            let _ = capabilities::update(&self.repo_root, |c| {
+                if c.environment.is_empty() {
+                    c.environment = environment.to_string();
+                }
+                c.push_run(run);
+            });
+        }
+        (out, elapsed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tracked_inner(
         &self,
         settings: &Settings,
         dir: &Path,
@@ -1930,6 +2306,8 @@ impl TaskRunner {
             attempt,
             COMMAND_RUN_SEQ.fetch_add(1, Ordering::SeqCst)
         );
+        // Spec 123 T02: o limite que vale para esta rodada (o Docker usa sempre o `TEST_TIMEOUT`).
+        let limit = self.round_limit(settings);
         let event = |started: bool| RunnerEvent::CommandRun {
             run_id: run_id.clone(),
             started,
@@ -1940,9 +2318,31 @@ impl TaskRunner {
             command: self.scrub(command),
             task_id: task_id.to_string(),
             attempt,
+            limit,
         };
         self.events.emit(event(true));
-        let out = self.exec_cmd(settings, dir, command, fresh).await;
+        // Spec 123 T01: enquanto a rodada corre, um sinal de vida a cada intervalo com o progresso
+        // real da saída (bytes e última linha). Antes, só saíam o início e o fim.
+        let progress = Arc::new(CommandProgress::new());
+        let work = self.exec_cmd_watched(settings, dir, command, fresh, Some(progress.clone()));
+        tokio::pin!(work);
+        let mut ticker = tokio::time::interval(self.command_heartbeat.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        let out = loop {
+            tokio::select! {
+                out = &mut work => break out,
+                _ = ticker.tick() => {
+                    let snap = progress.snapshot();
+                    self.events.emit(RunnerEvent::CommandBeat {
+                        run_id: run_id.clone(),
+                        task_id: task_id.to_string(),
+                        output_bytes: snap.bytes,
+                        last_line: snap.last_line.map(|line| self.scrub(&line)),
+                    });
+                }
+            }
+        };
         self.events.emit(event(false));
         out
     }
@@ -2292,19 +2692,31 @@ impl TaskRunner {
         // Spec 081 T01: progresso da sessão anterior que esgotou o limite de passos.
         let mut previous_progress = String::new();
         let mut failed_runs: u32 = 0;
+        // Spec 124 T04: a repetição da rodada instável acontece no máximo uma vez por tentativa.
+        let mut rerun_used = false;
         let max_cycles = settings.max_test_cycles;
         // Spec 092 T03: a falha de geração vale para a tentativa inteira (todas as sessões).
         self.developer.begin_attempt(&task.frontmatter.id);
+        // Spec 124 T02: as respostas aos apontamentos são desta tentativa (as sessões se somam).
+        task.body = replace_section(&task.body, RESPONSES, None);
         loop {
             self.check_cancel()?;
             if let Some(step) = self.budget_stop(task)? {
                 return Ok(step);
             }
+            // Spec 124 T05: dependências em dia antes da sessão (só quando a trava mudou). Melhor
+            // esforço: a falha reaparece na rodada de testes, com a saída.
+            if settings.install_command.is_some() {
+                let _ = self.ensure_installed(settings, &wt, "", &task.frontmatter.id, attempt).await;
+            }
+            // Spec 124 T05: as rodadas destes comandos pelo Desenvolvedor ficam registradas.
+            self.suite_ledger.watch(test_levels::watched_commands(settings), test_levels::environment_key(settings));
             let mut brief = self.brief(task, &wt, test_output.clone(), settings)?;
             brief.previous_progress = std::mem::take(&mut previous_progress);
             let report = self.developer.implement(&brief).await?;
             let exhausted = report.exhausted;
             self.sync_advice(task);
+            self.record_responses(task, &report.summary)?;
             let dev_criteria = extract_dev_criteria(&report.summary);
             let history_summary = report.summary.clone();
             self.events.emit(RunnerEvent::AgentMessage {
@@ -2331,24 +2743,72 @@ impl TaskRunner {
             // Início da execução: artefatos de falha (spec 079) e capturas de tela (spec 082 T03) mais
             // antigos que isto são ignorados.
             let run_started = std::time::SystemTime::now();
-            let mut test = match self.run_tracked(settings, &wt, &settings.test_command, true, None, "", &task.frontmatter.id, attempt).await {
-                Ok(t) => t,
-                Err(RunnerError::Docker(reason)) => {
-                    return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
-                }
-                Err(e) => return Err(e),
+            // Spec 124 T05: a árvore entregue (fora do `.sdd/`, do ignorado e do `.nants-outputs/`);
+            // com ela, a rodada do Desenvolvedor do mesmo comando dispensa a do runner.
+            let tree = {
+                let dir = wt.clone();
+                tokio::task::spawn_blocking(move || test_levels::tree_hash(&dir)).await.ok().flatten()
             };
+            // Spec 124 T05: níveis. A bateria final (`full_test_command` ou, sem ela, o
+            // `test_command`) roda SEMPRE pelo runner, com o estado recriado, antes da revisão: é a
+            // rodada limpa que vale. A rodada do Desenvolvedor sobre a mesma árvore só dispensa o
+            // nível rápido. Sem `full_test_command`, tudo como antes.
+            let full = settings.full_test_command.clone();
+            let suite_label = full.clone().unwrap_or_else(|| settings.test_command.clone());
+            let mut flaky: Option<(String, Vec<String>)> = None;
+            let dev_final = self.dev_reusable(settings, &wt, tree.as_deref(), &suite_label);
+            let mut dispensed: Vec<String> = Vec::new();
+            let fast = if full.is_some() {
+                let dev_fast = dev_final.clone().or_else(|| self.dev_reusable(settings, &wt, tree.as_deref(), &settings.test_command));
+                match dev_fast {
+                    Some(run) => {
+                        self.note_fast_skipped(task, attempt, &run, &suite_label);
+                        dispensed.push(settings.test_command.clone());
+                        None
+                    }
+                    None => match self.suite_round(settings, task, &wt, attempt, &settings.test_command, &mut rerun_used, &mut flaky).await? {
+                        Ok(t) => Some(t),
+                        Err(step) => return Ok(step),
+                    },
+                }
+            } else {
+                None
+            };
+            let mut test = match fast {
+                Some(f) if !f.passed => f,
+                _ => {
+                    self.check_cancel()?;
+                    match self.suite_round(settings, task, &wt, attempt, &suite_label, &mut rerun_used, &mut flaky).await? {
+                        Ok(t) => t,
+                        Err(step) => return Ok(step),
+                    }
+                }
+            };
+            if test.passed && (!dispensed.is_empty() || dev_final.is_some()) {
+                self.note_clean_round(task, attempt, &suite_label, tree.as_deref().unwrap_or(""), &dispensed);
+            }
+            // Spec 124 T04: capacidades medidas no ambiente aprovado (uma vez por execução).
+            self.refresh_capabilities(settings, &wt).await;
             let mut checks_text = String::new();
+            let mut checks_from_dev: Vec<String> = Vec::new();
             if test.passed && !settings.checks.is_empty() {
                 let mut outcomes = Vec::with_capacity(settings.checks.len());
                 for check in &settings.checks {
                     self.check_cancel()?;
-                    let r = match self.run_tracked(settings, &wt, &check.command, false, Some(&check.name), "", &task.frontmatter.id, attempt).await {
-                        Ok(r) => r,
-                        Err(RunnerError::Docker(reason)) => {
-                            return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
+                    // Spec 124 T05: a checagem bloqueante segue a mesma regra do reaproveitamento; na
+                    // integração ela roda de novo na base (não foi o runner que a viu passar).
+                    let reused = if check.blocking { self.dev_reusable(settings, &wt, tree.as_deref(), &check.command) } else { None };
+                    let r = if let Some(run) = reused {
+                        checks_from_dev.push(check.name.clone());
+                        self.accept_dev_check(task, attempt, &run)
+                    } else {
+                        match self.run_tracked(settings, &wt, &check.command, false, Some(&check.name), "", &task.frontmatter.id, attempt).await {
+                            Ok(r) => r,
+                            Err(RunnerError::Docker(reason)) => {
+                                return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
                     };
                     outcomes.push(CheckOutcome {
                         name: check.name.clone(),
@@ -2370,7 +2830,7 @@ impl TaskRunner {
                 let summary = checks_summary_in(self.lang.get(), &outcomes, &regressions);
                 // Só afirma "testes ✓" se nenhuma checagem bloqueante falhou (senão contradiz a falha).
                 let text = if blocking_failed.is_empty() {
-                    pass_summary_in(self.lang.get(), false, &self.scrub(&settings.test_command), Some(&summary))
+                    pass_summary_in(self.lang.get(), false, &self.scrub(&suite_label), Some(&summary))
                 } else {
                     summary
                 };
@@ -2393,6 +2853,9 @@ impl TaskRunner {
                     test = TestResult { passed: false, output, exit_code, timed_out };
                 } else {
                     checks_text = format!("{CHECKS_MARK}{}", checks_section(&outcomes));
+                    if !checks_from_dev.is_empty() {
+                        checks_text.push_str(&format!("\n{CHECKS_FROM_DEV_MARK} {}\n", checks_from_dev.join(", ")));
+                    }
                     if !regressions.is_empty() {
                         checks_text.push_str(REGRESSIONS_MARK);
                         checks_text.push_str(&regressions.join(", "));
@@ -2401,7 +2864,7 @@ impl TaskRunner {
             } else if test.passed {
                 self.events.emit(RunnerEvent::AgentMessage {
                     agent: "tests".into(),
-                    text: pass_summary_in(self.lang.get(), false, &self.scrub(&settings.test_command), None),
+                    text: pass_summary_in(self.lang.get(), false, &self.scrub(&suite_label), None),
                     task_id: Some(task.frontmatter.id.clone()),
                     attempt: Some(attempt),
                 });
@@ -2413,7 +2876,11 @@ impl TaskRunner {
                 } else {
                     String::new()
                 };
-                task.frontmatter.test_evidence = Some(format!("{}{silent}{checks_text}{crit}", test.output));
+                let flaky_note = match &flaky {
+                    Some((command, lines)) => format!("\n{}{}\n", flaky_pass_warning(&self.scrub(command)), flaky_list(lines)),
+                    None => String::new(),
+                };
+                task.frontmatter.test_evidence = Some(format!("{}{silent}{flaky_note}{checks_text}{crit}", test.output));
                 // Vincula a evidência ao sha e ao que foi rodado: só então a base pode reaproveitá-la.
                 task.frontmatter.tested_sha = Git::new(wt.clone()).rev_parse("HEAD").ok();
                 task.frontmatter.tested_signature = Some(test_signature(settings));
@@ -2457,6 +2924,415 @@ impl TaskRunner {
         }
     }
 
+    /// Spec 124 T04: seção das capacidades do ambiente para o papel `audience` (redigida).
+    fn capabilities_section(&self, audience: capabilities::Audience) -> String {
+        self.scrub(&capabilities::prompt_section(&capabilities::read(&self.repo_root), audience))
+    }
+
+    /// Spec 124 T04: mede as capacidades do ambiente aprovado (GPU ou vídeo, tela, núcleos e
+    /// memória) uma vez por execução e a cada mudança dos arquivos de ambiente. No Docker, a medida
+    /// roda dentro do serviço `workspace`; no host, o Nants lê as mesmas fontes. Falha da medida não
+    /// muda nada (as capacidades anteriores ficam) e não se repete na mesma execução.
+    async fn refresh_capabilities(&self, settings: &Settings, wt: &Path) {
+        let docker = settings.environment == Environment::Docker;
+        let key = if docker {
+            crate::sdd::environment::env_hash(wt).unwrap_or_default()
+        } else {
+            "host".to_string()
+        };
+        {
+            let mut probed = self.probed_env.lock().unwrap_or_else(PoisonError::into_inner);
+            if probed.as_deref() == Some(key.as_str()) {
+                return;
+            }
+            *probed = Some(key.clone());
+        }
+        let probe = if docker {
+            let Some(compose) = self.compose.clone() else { return };
+            let dir = wt.to_path_buf();
+            let joined = tokio::task::spawn_blocking(move || {
+                compose.probe(&dir, capabilities::PROBE_SCRIPT, capabilities::PROBE_TIMEOUT)
+            })
+            .await;
+            match joined {
+                Ok(Ok(out)) if out.success() => capabilities::parse_probe(&out.output),
+                _ => return,
+            }
+        } else {
+            capabilities::probe_host()
+        };
+        let at = rfc3339_of(std::time::SystemTime::now());
+        let _ = capabilities::update(&self.repo_root, |c| c.apply_probe(environment_name(settings), &key, probe, at));
+    }
+
+    /// Spec 124 T04: rodada que passou de 70% do limite avisa na conversa (o Desenvolvedor e o
+    /// Arquiteto recebem o mesmo aviso nos briefings, pelas capacidades). Sinal, não corte.
+    fn budget_notice(&self, task: &Task, attempt: u32, elapsed: Duration, limit: Option<Duration>) {
+        let Some(limit) = limit.filter(|_| capabilities::over_budget(elapsed, limit)) else { return };
+        let run = capabilities::SuiteRun::measured(elapsed, Some(limit), false, false, String::new());
+        let (secs, limit_secs, percent) = (run.secs(), run.limit_secs().unwrap_or(0), run.percent().unwrap_or(0));
+        let text = i18n::tr(
+            self.lang.get(),
+            "runner.tests.budget",
+            &[("secs", &secs.to_string()), ("limit", &limit_secs.to_string()), ("percent", &percent.to_string())],
+        );
+        self.tests_message(task, attempt, text);
+    }
+
+    /// Uma rodada de `command` na worktree (spec 124 T04/T05): as dependências em dia, a rodada, o
+    /// aviso de orçamento e, se falhou, a repetição única por tentativa da rodada instável (só se
+    /// couber no limite). `Ok(Err(step))` = a tarefa bloqueou por ambiente.
+    #[allow(clippy::too_many_arguments)]
+    async fn suite_round(
+        &self,
+        settings: &Settings,
+        task: &mut Task,
+        wt: &Path,
+        attempt: u32,
+        command: &str,
+        rerun_used: &mut bool,
+        flaky: &mut Option<(String, Vec<String>)>,
+    ) -> Result<Result<TestResult, Step>, RunnerError> {
+        let task_id = task.frontmatter.id.clone();
+        let (first, elapsed) = self.install_then_run(settings, wt, command, "", &task_id, attempt).await;
+        let mut test = match first {
+            Ok(t) => t,
+            Err(RunnerError::Docker(reason)) => {
+                return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental).map(Err);
+            }
+            Err(e) => return Err(e),
+        };
+        self.budget_notice(task, attempt, elapsed, self.round_limit(settings));
+        // Spec 124 T04: rodada que falha é repetida uma vez por tentativa, sem mudança na árvore,
+        // só se a repetição couber no que sobra do limite. Passou na repetição: instável.
+        if !test.passed && !test.timed_out && !*rerun_used && capabilities::rerun_fits(elapsed, self.round_limit(settings)) {
+            *rerun_used = true;
+            self.check_cancel()?;
+            self.tests_message(task, attempt, i18n::text(self.lang.get(), "runner.tests.rerun"));
+            let (again, again_elapsed) = self.install_then_run(settings, wt, command, "", &task_id, attempt).await;
+            let again = match again {
+                Ok(t) => t,
+                Err(RunnerError::Docker(reason)) => {
+                    return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental).map(Err);
+                }
+                Err(e) => return Err(e),
+            };
+            self.budget_notice(task, attempt, again_elapsed, self.round_limit(settings));
+            if again.passed {
+                let lines = capabilities::failing_lines(&self.scrub(&test.output), FLAKY_MAX_LINES);
+                self.record_flaky(task, attempt, &lines);
+                *flaky = Some((command.to_string(), lines));
+            }
+            test = again;
+        }
+        Ok(Ok(test))
+    }
+
+    /// Spec 124 T05: garante as dependências e roda `command` em `dir`. A instalação que falha vale
+    /// como a rodada (a saída dela volta ao Desenvolvedor). Depois de instalar, o estado do Compose já
+    /// foi recriado, então a rodada não o recria de novo. Rodada que falha com 126/127 (programa
+    /// ausente ou não executável, em qualquer shell POSIX) esquece a instalação: a próxima instala.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_then_run(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        place: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> (Result<TestResult, RunnerError>, Duration) {
+        let fresh = match self.ensure_installed(settings, dir, place, task_id, attempt).await {
+            Err(e) => return (Err(e), Duration::ZERO),
+            Ok(Install::Failed(result, elapsed)) => return (Ok(result), elapsed),
+            Ok(Install::Ran) => false,
+            Ok(Install::Current) => true,
+        };
+        let (out, elapsed) = self.run_tracked_timed(settings, dir, command, fresh, None, place, task_id, attempt).await;
+        if let Ok(t) = &out {
+            if !t.passed && settings.install_command.is_some() && matches!(t.exit_code, Some(126 | 127)) {
+                test_levels::forget_install(dir);
+            }
+        }
+        (out, elapsed)
+    }
+
+    /// Spec 124 T05: roda o `install_command` em `dir` só quando o hash dos arquivos de trava (com o
+    /// comando e o ambiente) mudou desde a última instalação bem-sucedida naquela pasta. Sem
+    /// `install_command`, nada muda. O estado fica no diretório Git privado da pasta.
+    async fn ensure_installed(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        place: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> Result<Install, RunnerError> {
+        let Some(command) = settings.install_command.as_deref().filter(|c| !c.trim().is_empty()) else {
+            return Ok(Install::Current);
+        };
+        if !test_levels::install_needed(settings, command, dir) {
+            return Ok(Install::Current);
+        }
+        let started = Instant::now();
+        let out = self.run_tracked(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt).await?;
+        if out.passed {
+            // A chave sai do disco depois da instalação (ela pode ter reescrito a trava).
+            test_levels::remember_install(dir, &test_levels::install_key(settings, command, dir));
+            return Ok(Install::Ran);
+        }
+        test_levels::forget_install(dir);
+        let output = format!("{INSTALL_FAILED_MARK} (`{}`):\n{}", self.scrub(command), out.output);
+        Ok(Install::Failed(TestResult { output, ..out }, started.elapsed()))
+    }
+
+    /// Spec 124 T05: a rodada do Desenvolvedor de `command` que vale pela do runner sobre a árvore
+    /// `tree` (as condições estão em [`test_levels`]). Com `install_command`, só se a instalação da
+    /// pasta estiver em dia (a trava pode ter mudado sem instalar). `None` = o runner roda.
+    fn dev_reusable(&self, settings: &Settings, wt: &Path, tree: Option<&str>, command: &str) -> Option<test_levels::SuiteRun> {
+        let tree = tree?;
+        if !test_levels::reuse_possible(settings, command) {
+            return None;
+        }
+        if let Some(install) = settings.install_command.as_deref() {
+            if test_levels::install_needed(settings, install, wt) {
+                return None;
+            }
+        }
+        self.suite_ledger.reusable(
+            command,
+            tree,
+            &test_levels::environment_key(settings),
+            settings.environment == Environment::Docker,
+            self.round_limit(settings),
+        )
+    }
+
+    /// Spec 124 T05: acrescenta uma linha à seção [`REUSE_SECTION`] da tarefa (gravada com ela).
+    fn reuse_log(&self, task: &mut Task, entry: &str) {
+        let mut log = section_text(&task.body, REUSE_SECTION).unwrap_or_default().trim_end().to_string();
+        if !log.is_empty() {
+            log.push('\n');
+        }
+        log.push_str(&format!("- {entry}"));
+        task.body = replace_section(&task.body, REUSE_SECTION, Some(log));
+    }
+
+    /// Spec 124 T05: o nível rápido dispensado pela rodada do Desenvolvedor sobre a mesma árvore. A
+    /// conversa diz que a bateria completa roda agora, limpa, e que é ela que vale.
+    fn note_fast_skipped(&self, task: &Task, attempt: u32, run: &test_levels::SuiteRun, full: &str) {
+        let tree = run.tree_before.as_deref().unwrap_or("");
+        let short = tree.get(..7).unwrap_or(tree);
+        let (command, full) = (self.scrub(&run.command), self.scrub(full));
+        let params = [("command", command.as_str()), ("tree", short), ("full", full.as_str())];
+        self.tests_message(task, attempt, i18n::tr(self.lang.get(), "runner.tests.fast_skipped", &params));
+    }
+
+    /// Spec 124 T05: a rodada limpa do runner (estado recriado) passou depois de o Desenvolvedor já
+    /// ter passado a bateria ou de o nível rápido ter sido dispensado: fica na tarefa e na conversa
+    /// qual rodada valeu para a revisão.
+    fn note_clean_round(&self, task: &mut Task, attempt: u32, command: &str, tree: &str, dispensed: &[String]) {
+        let short = tree.get(..7).unwrap_or(tree);
+        let command = self.scrub(command);
+        let lang = self.lang.get();
+        let attempt_text = attempt.to_string();
+        let list = dispensed.iter().map(|c| format!("`{}`", self.scrub(c))).collect::<Vec<_>>().join(", ");
+        let params = [("command", command.as_str()), ("tree", short), ("attempt", attempt_text.as_str()), ("list", list.as_str())];
+        let key = if dispensed.is_empty() { "runner.reuse.entry_clean" } else { "runner.reuse.entry" };
+        let entry = i18n::tr(lang, key, &params);
+        self.reuse_log(task, &entry);
+        self.tests_message(task, attempt, i18n::tr(lang, "runner.tests.clean_round", &params));
+    }
+
+    /// Spec 124 T05: aceita a rodada do Desenvolvedor de uma checagem bloqueante. Fica na tarefa e na
+    /// conversa; a saída começa com [`DEV_REUSED_MARK`].
+    fn accept_dev_check(&self, task: &mut Task, attempt: u32, run: &test_levels::SuiteRun) -> TestResult {
+        let tree = run.tree_before.as_deref().unwrap_or("");
+        let short = tree.get(..7).unwrap_or(tree);
+        let command = self.scrub(&run.command);
+        let lang = self.lang.get();
+        let attempt_text = attempt.to_string();
+        let params = [("command", command.as_str()), ("tree", short), ("attempt", attempt_text.as_str())];
+        let entry = i18n::tr(lang, "runner.reuse.check_entry", &params);
+        self.reuse_log(task, &entry);
+        self.tests_message(task, attempt, i18n::tr(lang, "runner.tests.dev_reused", &params));
+        TestResult {
+            passed: true,
+            output: format!("{DEV_REUSED_MARK} `{command}` ({short})\n{}", self.scrub(&run.output)),
+            exit_code: Some(0),
+            timed_out: false,
+        }
+    }
+
+    /// Spec 124 T04: alerta de rodada instável registrado na tarefa (seção [`FLAKY_SECTION`], no
+    /// idioma do projeto) e na conversa. Gravado com a tarefa, na próxima transição.
+    fn record_flaky(&self, task: &mut Task, attempt: u32, lines: &[String]) {
+        let lang = self.lang.get();
+        let tests = if lines.is_empty() { i18n::text(lang, "runner.flaky.unnamed") } else { lines.join("; ") };
+        let entry = i18n::tr(lang, "runner.flaky.entry", &[("attempt", &attempt.to_string()), ("tests", &tests)]);
+        let mut log = section_text(&task.body, FLAKY_SECTION).unwrap_or_default().trim_end().to_string();
+        if !log.is_empty() {
+            log.push('\n');
+        }
+        log.push_str(&format!("- {entry}"));
+        task.body = replace_section(&task.body, FLAKY_SECTION, Some(log));
+        self.tests_message(task, attempt, i18n::tr(lang, "runner.tests.flaky", &[("tests", &tests)]));
+    }
+
+    /// Spec 124 T02: respostas do Desenvolvedor aos apontamentos abertos (seção da resposta final),
+    /// somadas às das sessões anteriores da mesma tentativa e gravadas na seção [`RESPONSES`]. Só os
+    /// ids abertos contam. O arquivo é gravado depois, com a tentativa.
+    fn record_responses(&self, task: &mut Task, summary: &str) -> Result<(), RunnerError> {
+        let open = read_findings(&task.body)?;
+        let fresh = finding_reply::for_open(finding_reply::extract(&self.scrub(summary)), &open);
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let prior = finding_reply::read_section(&section_text(&task.body, RESPONSES).unwrap_or_default());
+        let merged = finding_reply::merge(&prior, &fresh);
+        task.body = replace_section(&task.body, RESPONSES, finding_reply::render_section(&merged));
+        Ok(())
+    }
+
+    /// Spec 124 T02: antes da revisão, as contestações sem decisão vão ao Arquiteto. A decisão
+    /// (`keep`, `adjust` ou `manual`) entra no registro, nos abertos e, quando muda, nos critérios;
+    /// fica no arquivo da tarefa ([`ARBITRATION_LOG`]) e no spec.md ([`SPEC_DECISIONS`]) e aparece na
+    /// conversa por `code`. Sem árbitro, sem contestação nova ou com o orçamento esgotado, nada muda;
+    /// resposta inválida ou falha do turno: aviso e a revisão segue com as contestações.
+    async fn arbitrate(&self, task: &mut Task) -> Result<Option<Step>, RunnerError> {
+        let Some(arbiter) = self.arbiter.clone() else { return Ok(None) };
+        let responses = finding_reply::read_section(&section_text(&task.body, RESPONSES).unwrap_or_default());
+        let previous = read_findings(&task.body)?;
+        let registry = finding_track::seed(&read_registry(&task.body)?, &previous);
+        let contested = finding_reply::to_arbitrate(&registry, &responses);
+        if contested.is_empty() {
+            return Ok(None);
+        }
+        if let Some(step) = self.budget_stop(task)? {
+            return Ok(Some(step));
+        }
+        let (spec_id, task_id) = (task.frontmatter.spec_id.clone(), task.frontmatter.id.clone());
+        let ids: Vec<String> = contested.iter().map(|(f, _)| f.id.clone()).collect();
+        let acceptance = acceptance_of(&task.body);
+        let mut facts = finding_reply::facts(
+            &task_id,
+            &task.frontmatter.title,
+            &section_text(&task.body, OBJECTIVE).unwrap_or_default(),
+            &acceptance,
+            &contested,
+        );
+        // Spec 124 T06: o aviso de custo (sinal, não limite) também vai a esta decisão.
+        if let Some(alert) = crate::server::cost_alert::task_alert(&self.repo_root, &spec_id, &task_id) {
+            facts = format!("{}\n\n{}\n", facts.trim_end(), crate::server::cost_alert::architect_line(&alert));
+        }
+        let facts = self.scrub(&facts);
+        let worktree = self.worktree_path(&spec_id, &task_id);
+        let root = if worktree.is_dir() { worktree } else { self.repo_root.clone() };
+        let ruling = match arbiter.arbitrate(&spec_id, &task_id, &root, &facts).await {
+            Ok(raw) => finding_reply::parse_ruling(&raw, &ids),
+            Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
+            Err(_) => None,
+        };
+        let Some(ruling) = ruling else {
+            let joined = ids.join(", ");
+            self.notice(&task_id, "task.arbitration_unavailable", &[("task", &task_id), ("findings", &joined)]);
+            return Ok(None);
+        };
+        let review = registry.iter().map(|f| f.last_review).max().unwrap_or(0) + 1;
+        let ruling = finding_reply::Ruling { acceptance: ruling.acceptance.map(|a| self.scrub(&a)), ..ruling };
+        let out = finding_reply::apply(&registry, &previous, &acceptance, &ruling, review, &|t| validate_text_block("critérios", t).is_ok());
+        if out.downgraded {
+            // Critérios finais que não podem ser gravados: nada foi dispensado (tudo virou keep).
+            let joined = ids.join(", ");
+            self.notice(&task_id, "task.arbitration_unavailable", &[("task", &task_id), ("findings", &joined)]);
+        }
+        let entries = self.write_ruling(task, &out, review)?;
+        self.persist(task)?;
+        self.record_spec_decisions(&spec_id, &entries)?;
+        for a in &out.applied {
+            let reason = self.scrub(&a.arbitration.reason);
+            let code = format!("task.arbitration_{}", a.arbitration.decision.code());
+            self.notice(&task_id, &code, &[("task", &task_id), ("finding", &a.finding.id), ("reason", &reason)]);
+        }
+        Ok(None)
+    }
+
+    /// Grava no corpo da tarefa o efeito de uma decisão do Arquiteto sobre os apontamentos (a
+    /// arbitragem da T02 ou o ADJUST da recuperação, spec 124 T03): registro, abertos, critérios e o
+    /// histórico ([`ARBITRATION_LOG`]). Devolve as entradas do histórico, para o spec.md. Não persiste.
+    fn write_ruling(&self, task: &mut Task, out: &finding_reply::Outcome, review: u32) -> Result<Vec<String>, RunnerError> {
+        let task_id = task.frontmatter.id.clone();
+        task.body = replace_section(&task.body, REGISTRY, render_findings(&out.registry)?);
+        task.body = replace_section(&task.body, FINDINGS, render_findings(&out.open)?);
+        if let Some(criteria) = &out.acceptance {
+            task.body = replace_section(&task.body, ACCEPTANCE, Some(criteria.clone()));
+        }
+        let lang = self.lang.get();
+        let entries: Vec<String> = out
+            .applied
+            .iter()
+            .map(|a| {
+                let decision = i18n::text(lang, &format!("runner.arbitration.{}", a.arbitration.decision.code()));
+                let reason = self.scrub(&a.arbitration.reason);
+                i18n::tr(
+                    lang,
+                    "runner.arbitration.entry",
+                    &[
+                        ("review", &review.to_string()),
+                        ("task", &task_id),
+                        ("finding", &a.finding.id),
+                        ("decision", &decision),
+                        ("title", &finding_track::short_title(&self.scrub(&a.finding.description))),
+                        ("reason", &reason),
+                    ],
+                )
+            })
+            .collect();
+        let mut log = section_text(&task.body, ARBITRATION_LOG).unwrap_or_default().trim_end().to_string();
+        for entry in &entries {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(entry);
+        }
+        if !log.is_empty() {
+            task.body = replace_section(&task.body, ARBITRATION_LOG, Some(log));
+        }
+        Ok(entries)
+    }
+
+    /// Acrescenta as decisões à seção [`SPEC_DECISIONS`] do spec.md. Edição externa do spec.md
+    /// durante a execução não bloqueia a tarefa: o registro fica no arquivo da tarefa.
+    fn record_spec_decisions(&self, spec_id: &str, entries: &[String]) -> Result<(), RunnerError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let path = self.spec_dir(spec_id).join("spec.md");
+        let mut spec = read_spec(&path)?;
+        let mut log = section_text(&spec.body, SPEC_DECISIONS).unwrap_or_default().trim_end().to_string();
+        for entry in entries {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(entry);
+        }
+        spec.body = replace_section(&spec.body, SPEC_DECISIONS, Some(log));
+        match self.write_guarded(&path, &spec.render()?) {
+            Err(RunnerError::ExternalEdit { .. }) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Mensagem do sistema com `code` (spec 102) ligada à tarefa; `params` neutros ou do modelo.
+    fn notice(&self, task_id: &str, code: &str, pairs: &[(&str, &str)]) {
+        self.events.emit(RunnerEvent::SystemNotice {
+            text: system_text(self.lang.get(), code, pairs),
+            code: code.to_string(),
+            params: notice_params(pairs),
+            task_id: Some(task_id.to_string()),
+        });
+    }
+
     /// Revisão: `APPROVED` grava `reviewed_sha`; `CHANGES_REQUESTED` conta a tentativa.
     async fn review(&self, settings: &Settings, task: &mut Task) -> Result<Step, RunnerError> {
         let root = self.git();
@@ -2466,6 +3342,10 @@ impl TaskRunner {
                 "tarefa {} sem branch registrada",
                 task.frontmatter.id
             )));
+        }
+        // Spec 124 T02: contestação nova vai ao Arquiteto antes da revisão.
+        if let Some(step) = self.arbitrate(task).await? {
+            return Ok(step);
         }
         let budget = settings
             .review_diff_budget
@@ -2481,7 +3361,7 @@ impl TaskRunner {
             None => (evidence, String::new()),
         };
         // Spec 082 T01: o Revisor vê qual comando (redigido) gerou a saída.
-        let test_output = format!("$ {}\n{test_output}", self.scrub(&settings.test_command));
+        let test_output = format!("$ {}\n{test_output}", self.scrub(settings.full_test_command.as_deref().unwrap_or(&settings.test_command)));
         let (checks, regressions) = match checks.rsplit_once(REGRESSIONS_MARK) {
             Some((c, r)) => (c.to_string(), r.trim().to_string()),
             None => (checks, String::new()),
@@ -2495,16 +3375,16 @@ impl TaskRunner {
             .collect::<Vec<_>>()
             .join("\n");
         let previous = read_findings(&task.body)?;
-        let prior_findings = previous
-            .iter()
-            .map(|f| {
-                format!(
-                    "- {} [{}] {}: {}. Recomendação: {}",
-                    f.id, f.severity, f.location, f.description, f.recommendation
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Spec 124 T01: o Revisor recebe os abertos do registro (id, título curto, local e há quantas
+        // revisões estão abertos) para reutilizar os ids.
+        let registry = finding_track::seed(&read_registry(&task.body)?, &previous);
+        let mut prior_open = finding_track::pending(&registry);
+        finding_track::by_recurrence(&mut prior_open);
+        let prior_findings = prior_findings_text(&prior_open);
+        // Spec 124 T02: respostas do Desenvolvedor e decisões do Arquiteto, para o Revisor conferir.
+        let responses = finding_reply::read_section(&section_text(&task.body, RESPONSES).unwrap_or_default());
+        let waived = finding_reply::waived(&registry);
+        let decision_lines = finding_reply::decision_lines(&registry);
         let incremental_diff = match task.frontmatter.rejected_sha.as_deref() {
             Some(sha) => review_diff(&root, sha, &branch, budget).unwrap_or_default(),
             None => String::new(),
@@ -2534,6 +3414,8 @@ impl TaskRunner {
         };
         let input = ReviewInput {
             prior_findings: self.scrub(&prior_findings),
+            finding_responses: self.scrub(&responses.iter().map(|r| format!("- {}", r.line())).collect::<Vec<_>>().join("\n")),
+            arbitration: self.scrub(&decision_lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")),
             spec_context: self.spec_context(&task.frontmatter.spec_id),
             role_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("reviewer"),
@@ -2558,6 +3440,7 @@ impl TaskRunner {
             references: self.references(&task.frontmatter.spec_id),
             images: crate::sdd::images::SpecImages::load(&self.spec_dir(&task.frontmatter.spec_id)),
             planned_images: self.planned_images(task),
+            environment: self.capabilities_section(capabilities::Audience::Reviewer),
         };
         if let Some(step) = self.budget_stop(task)? {
             return Ok(step);
@@ -2582,11 +3465,20 @@ impl TaskRunner {
             Some(h) => converge_with_files(self.lang.get(), enforced, &previous, h, changed_files.as_deref(), &exists),
             None => converge_with_files(self.lang.get(), enforced, &previous, &[], changed_files.as_deref(), &exists),
         };
-        let text = render_review_message(
+        // Spec 124 T02: o que o Arquiteto ajustou ou tornou manual não bloqueia mais.
+        let (result, dispensed) = demote_waived(self.lang.get(), result, &waived);
+        let mut observations = observations;
+        observations.extend(dispensed);
+        // Spec 124 T01: identidade, estado e recorrência dos apontamentos (aprovação resolve todos).
+        let tracked = finding_track::track(&registry, &previous, result.findings.clone(), attempt);
+        let result = ReviewResult { findings: tracked.open.clone(), ..result };
+        let sections = TrackedSections { resolved: &tracked.resolved, responses: &responses, decisions: &decision_lines };
+        let text = render_review_message_tracked(
             result.verdict,
             &result.summary,
             &result.findings,
             &observations,
+            &sections,
             &captures,
             &result.criteria,
             &|t| self.scrub(t),
@@ -2601,6 +3493,9 @@ impl TaskRunner {
             let existing = section_text(&task.body, OBSERVATIONS).unwrap_or_default();
             task.body = replace_section(&task.body, OBSERVATIONS, append_observations(&existing, &observations, &|t| self.scrub(t)));
         }
+        if result.verdict != Verdict::None {
+            task.body = replace_section(&task.body, REGISTRY, render_findings(&tracked.registry)?);
+        }
         match result.verdict {
             Verdict::Approved => {
                 task.frontmatter.last_verdict = Verdict::Approved;
@@ -2613,7 +3508,9 @@ impl TaskRunner {
             Verdict::ChangesRequested => {
                 task.frontmatter.last_verdict = Verdict::ChangesRequested;
                 task.frontmatter.attempts += 1;
-                task.body = replace_section(&task.body, FINDINGS, render_findings(&result.findings)?);
+                let mut open = result.findings.clone();
+                finding_track::by_recurrence(&mut open);
+                task.body = replace_section(&task.body, FINDINGS, render_findings(&open)?);
                 let log = append_findings_log(
                     &section_text(&task.body, FINDINGS_LOG).unwrap_or_default(),
                     task.frontmatter.attempts,
@@ -2726,6 +3623,8 @@ impl TaskRunner {
         // (test_command e checagens bloqueantes passaram antes da revisão): não repete na base.
         // Erro do git na comparação => falha segura: roda normalmente.
         let reused_sha = self.reusable_sha(settings, task, &root);
+        // Spec 124 T05: na integração roda a bateria completa, quando o projeto a define.
+        let suite_command = settings.full_test_command.clone().unwrap_or_else(|| settings.test_command.clone());
         let test_run = if let Some(sha) = &reused_sha {
             let short = sha.get(..7).unwrap_or(sha);
             self.events.emit(RunnerEvent::AgentMessage {
@@ -2735,15 +3634,16 @@ impl TaskRunner {
                 attempt: Some(task.frontmatter.attempts + 1),
             });
             TestRun {
-                command: self.scrub(&settings.test_command),
+                command: self.scrub(&suite_command),
                 exit_code: Some(0),
                 at: crate::server::projects::now_rfc3339(),
                 summary: i18n::tr(self.lang.get(), "runner.tests.reused_summary", &[("sha", short)]),
             }
         } else {
-            match self.run_tracked(settings, root.root(), &settings.test_command, true, None, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await {
+            let (base_run, _) = self.install_then_run(settings, root.root(), &suite_command, " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await;
+            match base_run {
                 Ok(t) if t.passed => TestRun {
-                    command: self.scrub(&settings.test_command),
+                    command: self.scrub(&suite_command),
                     exit_code: t.exit_code,
                     at: crate::server::projects::now_rfc3339(),
                     summary: test_summary(&self.scrub(&t.output)),
@@ -2776,7 +3676,10 @@ impl TaskRunner {
         };
 
         // Na base rodam só as checagens bloqueantes (as não bloqueantes já foram insumo do Revisor).
-        let base_checks = if reused_sha.is_some() { &[][..] } else { &settings.checks[..] };
+        // Spec 124 T05: a árvore idêntica dispensa a base só no que o runner viu passar; a checagem
+        // bloqueante aceita da rodada do Desenvolvedor roda de novo aqui.
+        let checks_from_dev = task.frontmatter.test_evidence.as_deref().is_some_and(|e| e.contains(CHECKS_FROM_DEV_MARK));
+        let base_checks = if reused_sha.is_some() && !checks_from_dev { &[][..] } else { &settings.checks[..] };
         for check in base_checks.iter().filter(|c| c.blocking) {
             match self.run_tracked(settings, root.root(), &check.command, false, Some(&check.name), " na base", &task.frontmatter.id, task.frontmatter.attempts + 1).await {
                 Ok(t) if t.passed => {}
@@ -2818,7 +3721,7 @@ impl TaskRunner {
             let checks = (!blocking.is_empty()).then(|| i18n::tr(lang, "runner.checks.list", &[("list", &blocking.join(", "))]));
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "tests".into(),
-                text: pass_summary_in(lang, true, &self.scrub(&settings.test_command), checks.as_deref()),
+                text: pass_summary_in(lang, true, &self.scrub(&suite_command), checks.as_deref()),
                 task_id: Some(id.clone()),
                 attempt: Some(task.frontmatter.attempts + 1),
             });
@@ -3168,7 +4071,7 @@ impl TaskRunner {
             allowed_scope: task.frontmatter.allowed_scope.clone(),
             worktree: wt.to_path_buf(),
             branch: task.frontmatter.branch.clone(),
-            findings: read_findings(&task.body)?,
+            findings: open_findings_by_recurrence(&task.body)?,
             test_output,
             recovery: recovery_notes_for_dev(&task.body, yolo),
             history: section_text(&task.body, HISTORY).unwrap_or_default().trim().to_string(),
@@ -3190,6 +4093,10 @@ impl TaskRunner {
             base_branch: settings.base_branch.clone(),
             spec_dir: self.spec_dir(&task.frontmatter.spec_id),
             art_guide: self.art_guide(&task.frontmatter.spec_id),
+            environment: self.capabilities_section(capabilities::Audience::Developer),
+            flaky_tests: section_text(&task.body, FLAKY_SECTION).unwrap_or_default().trim().to_string(),
+            test_plan: self.scrub(&test_plan(settings)),
+            suite_ledger: self.suite_ledger.clone(),
         })
     }
 
@@ -3327,6 +4234,8 @@ impl TaskRunner {
                 .collect::<Vec<_>>()
                 .join("\n"),
             prior_findings: String::new(),
+            finding_responses: String::new(),
+            arbitration: String::new(),
             incremental_diff: String::new(),
             changed_files: None,
             spec_context: self.spec_context(spec_id),
@@ -3341,6 +4250,7 @@ impl TaskRunner {
             references: self.references(spec_id),
             images: crate::sdd::images::SpecImages::load(&self.spec_dir(spec_id)),
             planned_images: crate::sdd::images::PlannedImages::default(),
+            environment: self.capabilities_section(capabilities::Audience::Reviewer),
         };
         let reviewed = self.reviewer.review(&input).await;
         drop(live);
@@ -3522,10 +4432,12 @@ impl TaskRunner {
         const WHERE: &str = " na base";
         let root = self.repo_root.as_path();
         let mut fail_tail = String::new();
-        let command = self.scrub(&settings.test_command);
+        // Spec 124 T05: a bateria completa, quando o projeto a define, com as dependências em dia.
+        let suite = settings.full_test_command.clone().unwrap_or_else(|| settings.test_command.clone());
+        let command = self.scrub(&suite);
         let lang = self.lang.get();
         let mut test_mark = i18n::text(lang, "runner.final_base.not_run");
-        let test_text = match self.run_tracked(settings, root, &settings.test_command, true, None, WHERE, "FINAL", 1).await {
+        let test_text = match self.install_then_run(settings, root, &suite, WHERE, "FINAL", 1).await.0 {
             Ok(t) => {
                 test_mark = if t.passed { "✓" } else { "✗" }.to_string();
                 let key = if t.passed { "runner.final_base.tests_passed" } else { "runner.final_base.tests_failed" };
@@ -3709,6 +4621,147 @@ impl TaskRunner {
         Ok(n)
     }
 
+    /// SPLIT (spec 124 T03): grava as tarefas novas no `.sdd` (formato do plano, `TODO`), cada uma
+    /// dependendo da atual e da nova anterior; quem dependia da atual (e não está `DONE`) passa a
+    /// depender também das novas. A atual fica com a definição menor (como no REVISE_TASK), mantém a
+    /// branch (o trabalho feito é aproveitado) e volta a `TODO`. A seção da análise ganha a linha das
+    /// tarefas novas. Cada arquivo gravado emite `TaskUpdated` (o Quadro se atualiza). Devolve o
+    /// ciclo e o texto registrado.
+    pub fn record_split(
+        &self,
+        spec_id: &str,
+        task_id: &str,
+        split: &crate::agents::recovery_plan::TaskSplit,
+        text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        use crate::agents::recovery_plan as plan;
+        validate_id("spec_id", spec_id)?;
+        validate_id("task_id", task_id)?;
+        split.validate().map_err(RunnerError::Invalid)?;
+        let mut task = read_task(&self.task_path(spec_id, task_id))?;
+        if task.frontmatter.status != TaskStatus::Blocked {
+            return Err(RunnerError::Invalid(format!("tarefa {task_id} não está bloqueada")));
+        }
+        let tasks = self.load_tasks(spec_id)?;
+        let ids = plan::next_ids(&tasks, split.new_tasks.len(), &|id| self.task_path(spec_id, id).exists());
+        let n = recovery_total(&task.body) + 1;
+        let origin = i18n::tr(self.lang.get(), "runner.split.origin", &[("task", task_id), ("cycle", &n.to_string())]);
+        let mut created = Vec::with_capacity(ids.len());
+        for (i, (id, part)) in ids.iter().zip(&split.new_tasks).enumerate() {
+            let mut depends = vec![task_id.to_string()];
+            if let Some(prev) = i.checked_sub(1).and_then(|p| ids.get(p)) {
+                depends.push(prev.clone());
+            }
+            let part = plan::SplitTask {
+                title: self.scrub(&part.title),
+                objective: self.scrub(&part.objective),
+                acceptance: self.scrub(&part.acceptance),
+                allowed_scope: part.allowed_scope.clone(),
+            };
+            created.push(plan::new_task(spec_id, id, depends, task.frontmatter.covers.clone(), &part, &origin));
+        }
+        let mut dependents = Vec::new();
+        for other in tasks {
+            let meta = &other.frontmatter;
+            if meta.id == task_id || meta.status == TaskStatus::Done || !meta.depends_on.iter().any(|d| d == task_id) {
+                continue;
+            }
+            let mut other = other;
+            for id in &ids {
+                if !other.frontmatter.depends_on.contains(id) {
+                    other.frontmatter.depends_on.push(id.clone());
+                }
+            }
+            dependents.push(other);
+        }
+        apply_revision(&mut task, &split.current);
+        let ext = apply_scope_added(&mut task.frontmatter.allowed_scope, text);
+        let listed: Vec<(String, String)> = created.iter().map(|t| (t.frontmatter.id.clone(), t.frontmatter.title.clone())).collect();
+        let recorded = format!("{}\n{}", record_scope_extension(text, &ext).trim_end(), plan::new_tasks_line(&listed));
+        task.body = replace_section(&task.body, &format!("{RECOVERY_PREFIX}{n}"), Some(recorded.clone()));
+        task.frontmatter.status = TaskStatus::Todo;
+        task.frontmatter.attempts = 0;
+        task.frontmatter.rejected_sha = None;
+        task.frontmatter.next_action = None;
+        task.frontmatter.next_action_code = None;
+        for t in created.iter().chain(dependents.iter()) {
+            self.write_guarded(&self.task_path(spec_id, &t.frontmatter.id), &t.render()?)?;
+            self.events.emit(RunnerEvent::TaskUpdated {
+                spec_id: spec_id.to_string(),
+                task_id: t.frontmatter.id.clone(),
+                status: t.frontmatter.status,
+            });
+        }
+        self.persist(&task)?;
+        Ok((n, recorded))
+    }
+
+    /// ADJUST (spec 124 T03): reescreve os critérios para o que o ambiente prova e dispensa os
+    /// apontamentos indicados (`adjust` ou `manual`, que vira um critério `(manual)`), pelo mesmo
+    /// caminho da arbitragem da T02 ([`finding_reply::apply`], a mesma validação dos critérios e o
+    /// mesmo registro na tarefa e no spec.md). A tarefa volta a `TODO`. Critérios que não podem ser
+    /// gravados: nada muda e o erro é `Invalid` (quem chama segue com a estratégia, como `keep`).
+    /// Devolve o ciclo e o texto registrado.
+    pub fn record_adjust(
+        &self,
+        spec_id: &str,
+        task_id: &str,
+        adjustment: &crate::agents::recovery_plan::CriteriaAdjustment,
+        text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        use crate::agents::recovery_plan as plan;
+        validate_id("spec_id", spec_id)?;
+        validate_id("task_id", task_id)?;
+        adjustment.validate().map_err(RunnerError::Invalid)?;
+        let mut task = read_task(&self.task_path(spec_id, task_id))?;
+        if task.frontmatter.status != TaskStatus::Blocked {
+            return Err(RunnerError::Invalid(format!("tarefa {task_id} não está bloqueada")));
+        }
+        let previous = read_findings(&task.body)?;
+        let registry = finding_track::seed(&read_registry(&task.body)?, &previous);
+        let review = registry.iter().map(|f| f.last_review).max().unwrap_or(0) + 1;
+        // Só os apontamentos pendentes no registro (como na arbitragem); os demais ids são ignorados.
+        let decisions = adjustment
+            .findings
+            .iter()
+            .filter(|(id, _, _)| registry.iter().any(|f| &f.id == id && f.state.is_some_and(FindingState::is_pending)))
+            .map(|(id, d, reason)| (id.clone(), *d, self.scrub(reason)))
+            .collect();
+        let ruling = finding_reply::Ruling { decisions, acceptance: Some(self.scrub(&adjustment.acceptance)) };
+        let valid = |t: &str| validate_text_block("critérios", t).is_ok();
+        let out = finding_reply::apply(&registry, &previous, &acceptance_of(&task.body), &ruling, review, &valid);
+        let adjusted = out.acceptance.is_some()
+            && !out.downgraded
+            && out.applied.iter().all(|a| a.arbitration.decision.waives());
+        if !adjusted {
+            return Err(RunnerError::Invalid("os critérios do ajuste não podem ser gravados".into()));
+        }
+        let entries = self.write_ruling(&mut task, &out, review)?;
+        let n = recovery_total(&task.body) + 1;
+        let waived: Vec<(String, crate::sdd::ArbitrationDecision)> =
+            out.applied.iter().map(|a| (a.finding.id.clone(), a.arbitration.decision)).collect();
+        let ext = apply_scope_added(&mut task.frontmatter.allowed_scope, text);
+        let mut recorded = record_scope_extension(text, &ext).trim_end().to_string();
+        if let Some(line) = plan::waived_line(&waived) {
+            recorded.push('\n');
+            recorded.push_str(&line);
+        }
+        task.body = replace_section(&task.body, &format!("{RECOVERY_PREFIX}{n}"), Some(recorded.clone()));
+        task.frontmatter.status = TaskStatus::Todo;
+        task.frontmatter.attempts = 0;
+        task.frontmatter.rejected_sha = None;
+        task.frontmatter.next_action = None;
+        task.frontmatter.next_action_code = None;
+        self.persist(&task)?;
+        let flat = adjustment.reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        let reason = self.scrub(truncate_bytes(&flat, 600));
+        let mut spec_entries =
+            vec![i18n::tr(self.lang.get(), "runner.adjust.entry", &[("cycle", &n.to_string()), ("task", task_id), ("reason", &reason)])];
+        spec_entries.extend(entries);
+        self.record_spec_decisions(spec_id, &spec_entries)?;
+        Ok((n, recorded))
+    }
+
     /// Troca o status, registra `next_action` e persiste.
     fn transition(
         &self,
@@ -3859,6 +4912,16 @@ fn reason_of(task: &Task, lang: Lang) -> String {
         .clone()
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| BlockReason::new(lang, "blocked", &[]).text)
+}
+
+/// Nome do ambiente de testes nas capacidades (spec 124 T04).
+fn environment_name(settings: &Settings) -> &'static str {
+    if settings.environment == Environment::Docker { "docker" } else { "host" }
+}
+
+/// Lista dos testes instáveis na evidência: uma linha por teste, ou nada sem nomes.
+fn flaky_list(lines: &[String]) -> String {
+    lines.iter().map(|l| format!("\n- {l}")).collect()
 }
 
 /// Instante em RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`, segundos truncados).
@@ -4659,6 +5722,39 @@ fn render_findings(findings: &[Finding]) -> Result<Option<String>, RunnerError> 
         .map_err(|e| RunnerError::Invalid(format!("findings não serializáveis: {e}")))
 }
 
+/// Lê o registro dos apontamentos (spec 124 T01). Seção ausente ou vazia significa nenhum.
+fn read_registry(body: &str) -> Result<Vec<Finding>, RunnerError> {
+    match section_text(body, REGISTRY) {
+        None => Ok(Vec::new()),
+        Some(text) if text.trim().is_empty() => Ok(Vec::new()),
+        Some(text) => serde_yaml::from_str::<Vec<Finding>>(&text)
+            .map_err(|e| RunnerError::Invalid(format!("'{REGISTRY}' inválido: {e}"))),
+    }
+}
+
+/// Findings abertos para o Desenvolvedor (spec 124 T01): os abertos há mais revisões primeiro.
+fn open_findings_by_recurrence(body: &str) -> Result<Vec<Finding>, RunnerError> {
+    let mut open = read_findings(body)?;
+    finding_track::by_recurrence(&mut open);
+    Ok(open)
+}
+
+/// Lista dos abertos da revisão anterior para o Revisor (spec 124 T01): id, severidade, local,
+/// título curto e há quantas revisões estão abertos. Texto de prompt (não de pessoa).
+fn prior_findings_text(open: &[Finding]) -> String {
+    open.iter()
+        .map(|f| {
+            let since = match f.recurrence {
+                0 => String::new(),
+                1 => " (aberto há 1 revisão)".to_string(),
+                n => format!(" (aberto há {n} revisões)"),
+            };
+            format!("- {} [{}] {}: {}{since}", f.id, f.severity, f.location, finding_track::short_title(&f.description))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Lê os findings abertos do corpo da tarefa. Seção ausente ou vazia significa nenhum.
 fn read_findings(body: &str) -> Result<Vec<Finding>, RunnerError> {
     match section_text(body, FINDINGS) {
@@ -4672,6 +5768,7 @@ fn read_findings(body: &str) -> Result<Vec<Finding>, RunnerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sdd::{Arbitration, ArbitrationDecision};
 
     #[test]
     fn block_kind_wire_values_and_inference_for_blocked_on_disk() {
@@ -4747,6 +5844,18 @@ mod tests {
         }
     }
 
+    /// `finding(id)` como o runner o grava depois de `rec` revisões seguidas desde a 1ª tentativa.
+    fn tracked(id: &str, rec: u32) -> Finding {
+        Finding {
+            state: Some(if rec > 1 { FindingState::Open } else { FindingState::New }),
+            recurrence: rec,
+            first_review: 1,
+            first_attempt: 1,
+            last_review: rec,
+            ..finding(id)
+        }
+    }
+
     fn approved(findings: Vec<Finding>) -> ReviewResult {
         ReviewResult {
             verdict: Verdict::Approved,
@@ -4779,6 +5888,8 @@ mod tests {
         image_status: Option<crate::sdd::images::GenerationStatus>,
         /// Tarefas de cada `begin_attempt` recebido, em ordem.
         begun: Arc<Mutex<Vec<String>>>,
+        /// Resposta final roteirizada por chamada (`n` a partir de 1); `None` = a padrão.
+        summary: Option<Arc<dyn Fn(usize, &DevBrief) -> String + Send + Sync>>,
     }
 
     impl FakeDev {
@@ -4808,10 +5919,11 @@ mod tests {
                         exhausted: true,
                     });
                 }
-                Ok(DevReport {
-                    summary: format!("dev {n}\n\n## Critérios\n1. ok — src/a.rs:{n}\n\n## Outro\nx"),
-                    exhausted: false,
-                })
+                let summary = match &self.summary {
+                    Some(f) => f(n, brief),
+                    None => format!("dev {n}\n\n## Critérios\n1. ok — src/a.rs:{n}\n\n## Outro\nx"),
+                };
+                Ok(DevReport { summary, exhausted: false })
             })
         }
 
@@ -4979,6 +6091,9 @@ mod tests {
                     base_branch: "main".into(),
                     merge_strategy: "squash".into(),
                     test_command: test_command.into(),
+                    full_test_command: None,
+                    install_command: None,
+                    lockfiles: Vec::new(),
                     allowed_commands: vec![],
                     denied_commands: vec![],
                     checks: Vec::new(),
@@ -5008,6 +6123,9 @@ mod tests {
                         base_branch: "main".into(),
                         created_at: "2026-10-13".into(),
                         test_command: None,
+                        full_test_command: None,
+                        install_command: None,
+                        lockfiles: None,
                         run_command: None,
                         run_url: None,
                         checks: None,
@@ -5318,7 +6436,7 @@ mod tests {
         let briefs = dev.briefs();
         assert_eq!(briefs.len(), 2);
         assert!(briefs[0].findings.is_empty());
-        assert_eq!(briefs[1].findings, vec![finding("F-01")]);
+        assert_eq!(briefs[1].findings, vec![tracked("F-01", 1)]);
         let t = fx.read_task("T01");
         assert_eq!(t.frontmatter.attempts, 1);
         assert_eq!(t.frontmatter.last_verdict, Verdict::Approved);
@@ -5885,7 +7003,7 @@ mod tests {
         let obs = section_text(&t.body, OBSERVATIONS).expect("observações registradas");
         assert!(obs.contains("F-02") && obs.contains("docs/intocado.md:7"), "{obs}");
         let texts = reviewer_texts(&rec);
-        assert!(texts[0].starts_with("Pediu ajustes: ") && texts[0].contains("Apontamentos:\n- F-01 [HIGH] src/lib.rs:1"), "{}", texts[0]);
+        assert!(texts[0].starts_with("Pediu ajustes: ") && texts[0].contains("Apontamentos:\n- F-01 [HIGH, novo] src/lib.rs:1"), "{}", texts[0]);
         assert!(texts[1].starts_with("Aprovado: ") && texts[1].contains("Observações (não bloqueiam):\n- F-02"), "{}", texts[1]);
     }
 
@@ -6068,7 +7186,7 @@ mod tests {
             Outcome::Blocked {
                 reason: "3 reprovações do revisor".into(),
                 kind: BlockKind::Quality,
-                open_findings: vec![finding("F-01")],
+                open_findings: vec![tracked("F-01", 3)],
             }
         );
         let t = fx.read_task("T01");
@@ -6581,16 +7699,18 @@ mod tests {
             .with_compose(Arc::new(crate::harness::compose::fake::test_env("rok", fake.clone())));
         assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let subs = fake.subcommands();
-        // worktree: down, build, up, run(test), run(check); base: down, up, run(test), run(check)
+        // worktree: down, build, up, run(test), run(medida das capacidades, spec 124 T04), run(check);
+        // base: down, up, run(test), run(check)
         assert_eq!(subs.iter().filter(|s| *s == "down").count(), 2, "{subs:?}");
-        assert_eq!(subs.iter().filter(|s| *s == "run").count(), 4, "{subs:?}");
+        assert_eq!(subs.iter().filter(|s| *s == "run").count(), 5, "{subs:?}");
         assert_eq!(subs[0], "down");
         assert_eq!(subs[1], "up", "sem build: workspace usa image");
         assert_eq!(subs[2], "run");
         let calls = fake.calls.lock().unwrap();
         assert!(calls[2].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make test".into()]));
-        assert!(calls[3].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make build".into()]));
-        assert_eq!(calls[4].args[7], "down", "estado limpo antes do test_command na base");
+        assert!(calls[3].args.ends_with(&["workspace".into(), "-c".into(), capabilities::PROBE_SCRIPT.into()]));
+        assert!(calls[4].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make build".into()]));
+        assert_eq!(calls[5].args[7], "down", "estado limpo antes do test_command na base");
     }
 
     #[tokio::test]
@@ -7594,6 +8714,507 @@ mod tests {
         assert!(t.body.contains("## Análise de recuperação #1"));
     }
 
+    fn blocked_t01(fx: &Fixture, findings: &str) {
+        let mut t = task("T01", TaskStatus::Blocked, &[]);
+        t.frontmatter.branch = branch_name(SPEC, "T01");
+        t.frontmatter.covers = vec!["G1".into()];
+        t.body.push_str(findings);
+        fx.put_task(&t);
+    }
+
+    fn split_of(titles: &[&str]) -> crate::agents::recovery_plan::TaskSplit {
+        crate::agents::recovery_plan::TaskSplit {
+            current: TaskRevision { objective: "Só o servidor".into(), acceptance: "- validação no servidor".into(), allowed_scope: Some(vec!["src/**".into()]) },
+            new_tasks: titles
+                .iter()
+                .map(|t| crate::agents::recovery_plan::SplitTask {
+                    title: (*t).into(),
+                    objective: format!("Fazer {t}"),
+                    acceptance: format!("- {t} provado"),
+                    allowed_scope: vec!["tests/**".into()],
+                })
+                .collect(),
+        }
+    }
+
+    /// Spec 124 T03: SPLIT grava as tarefas novas no formato do plano, encadeadas depois da atual;
+    /// quem dependia da atual passa a depender delas; a atual fica menor, mantém a branch e reabre.
+    #[tokio::test]
+    async fn record_split_writes_new_tasks_rewires_dependents_and_reopens() {
+        let fx = Fixture::new("split", "true");
+        blocked_t01(&fx, "");
+        fx.add_task(&task("T02", TaskStatus::Todo, &["T01"]));
+        let rec = Recorder::default();
+        let (dev, rev) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])));
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec);
+        let text = "- Causa raiz: grande demais\n- Decisão: tarefa dividida (SPLIT)\n- Escopo ampliado: docs/x.md";
+        let (n, recorded) = runner.record_split(SPEC, "T01", &split_of(&["Provas e2e", "Capturas"]), text).unwrap();
+        assert_eq!(n, 1);
+        assert!(recorded.ends_with("- Tarefas novas: T03 (Provas e2e), T04 (Capturas)"), "{recorded}");
+        let t01 = fx.read_task("T01");
+        assert_eq!((t01.frontmatter.status, t01.frontmatter.attempts), (TaskStatus::Todo, 0));
+        assert_eq!(t01.frontmatter.branch, branch_name(SPEC, "T01"), "a branch é mantida");
+        assert_eq!(t01.frontmatter.allowed_scope, vec!["src/**", "docs/x.md"]);
+        assert_eq!(section_text(&t01.body, ACCEPTANCE).unwrap().trim(), "- validação no servidor");
+        assert!(section_text(&t01.body, "Análise de recuperação #1").unwrap().contains("- Tarefas novas: T03"));
+        let t03 = fx.read_task("T03");
+        assert_eq!(t03.frontmatter.status, TaskStatus::Todo);
+        assert_eq!(t03.frontmatter.depends_on, vec!["T01"]);
+        assert_eq!(t03.frontmatter.covers, vec!["G1"]);
+        assert_eq!(t03.frontmatter.allowed_scope, vec!["tests/**"]);
+        assert!(section_text(&t03.body, OBJECTIVE).unwrap().contains("Parte da T01, separada na análise de recuperação #1"));
+        assert_eq!(fx.read_task("T04").frontmatter.depends_on, vec!["T01", "T03"]);
+        assert_eq!(fx.read_task("T02").frontmatter.depends_on, vec!["T01", "T03", "T04"]);
+        for id in ["T03", "T04", "T02", "T01"] {
+            assert_eq!(rec.statuses(id).last(), Some(&TaskStatus::Todo), "TaskUpdated de {id} (o Quadro)");
+        }
+        // Tarefa que não está bloqueada não é dividida.
+        assert!(runner.record_split(SPEC, "T01", &split_of(&["x"]), text).is_err());
+    }
+
+    /// Spec 124 T03: ADJUST pelo caminho da arbitragem: critérios reescritos, apontamento manual
+    /// dispensado no registro, histórico na tarefa e decisão no spec.md; a tarefa reabre.
+    #[tokio::test]
+    async fn record_adjust_uses_the_arbitration_path_and_records_on_the_spec() {
+        let fx = Fixture::new("adjust", "true");
+        let open = "\n## Findings Abertos\n- id: F-01\n  severity: HIGH\n  location: src/gpu.rs:1\n  description: WebGPU nativo não provado. Detalhe.\n  recommendation: provar\n- id: F-02\n  severity: HIGH\n  location: src/a.rs:1\n  description: Falta validar.\n  recommendation: validar\n";
+        blocked_t01(&fx, open);
+        let rec = Recorder::default();
+        let (dev, rev) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])));
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec);
+        let adjustment = crate::agents::recovery_plan::CriteriaAdjustment {
+            acceptance: "- render por software verificado no Docker".into(),
+            findings: vec![("F-01".into(), crate::sdd::ArbitrationDecision::Manual, "sem GPU no Docker".into()), ("F-09".into(), crate::sdd::ArbitrationDecision::Adjust, "x".into())],
+            reason: "o Docker não tem GPU".into(),
+        };
+        let (n, recorded) = runner.record_adjust(SPEC, "T01", &adjustment, "- Causa raiz: sem GPU\n- Decisão: critérios ajustados ao que o ambiente prova (ADJUST)").unwrap();
+        assert_eq!(n, 1);
+        assert!(recorded.ends_with("- Apontamentos dispensados: F-01 [manual]"), "id fora do registro é ignorado: {recorded}");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Todo);
+        assert_eq!(
+            section_text(&t.body, ACCEPTANCE).unwrap().trim(),
+            "- render por software verificado no Docker\n- (manual) F-01: WebGPU nativo não provado (sem GPU no Docker)"
+        );
+        let open = read_findings(&t.body).unwrap();
+        assert_eq!(open.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02"]);
+        let registry = read_registry(&t.body).unwrap();
+        let f1 = registry.iter().find(|f| f.id == "F-01").unwrap();
+        assert_eq!((f1.state, f1.arbitration.as_ref().map(|a| a.decision)), (Some(FindingState::Resolved), Some(crate::sdd::ArbitrationDecision::Manual)));
+        assert!(section_text(&t.body, ARBITRATION_LOG).is_some_and(|l| l.contains("F-01 (verificação manual)")));
+        let spec = fs::read_to_string(fx.repo.join(".sdd/specs/s1/spec.md")).unwrap();
+        assert!(spec.contains(&format!("## {SPEC_DECISIONS}\n- Recuperação #1, T01: critérios ajustados ao que o ambiente prova. Motivo: o Docker não tem GPU")), "{spec}");
+        assert!(spec.contains("T01 F-01 (verificação manual)"), "{spec}");
+    }
+
+    /// Critérios do ajuste que não podem ser gravados: nada muda (nem o registro, nem a spec).
+    #[tokio::test]
+    async fn record_adjust_with_unwritable_criteria_changes_nothing() {
+        let fx = Fixture::new("adjust-bad", "true");
+        blocked_t01(&fx, "\n## Findings Abertos\n- id: F-01\n  severity: HIGH\n  location: src/a.rs:1\n  description: x\n  recommendation: y\n");
+        let before = fs::read_to_string(fx.repo.join(".sdd/specs/s1/tasks/T01.md")).unwrap();
+        let rec = Recorder::default();
+        let (dev, rev) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])));
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec);
+        // O ajuste sozinho cabe; somado à linha manual passa do limite dos critérios.
+        let adjustment = crate::agents::recovery_plan::CriteriaAdjustment {
+            acceptance: "a".repeat(MAX_REVISION_BYTES - 5),
+            findings: vec![("F-01".into(), crate::sdd::ArbitrationDecision::Manual, "m".into())],
+            reason: "r".into(),
+        };
+        assert!(matches!(runner.record_adjust(SPEC, "T01", &adjustment, "- Causa raiz: x"), Err(RunnerError::Invalid(_))));
+        assert_eq!(fs::read_to_string(fx.repo.join(".sdd/specs/s1/tasks/T01.md")).unwrap(), before);
+        assert!(!fs::read_to_string(fx.repo.join(".sdd/specs/s1/spec.md")).unwrap().contains(SPEC_DECISIONS));
+    }
+
+    fn at(id: &str, location: &str, description: &str, state: Option<FindingState>) -> Finding {
+        Finding { location: location.into(), description: description.into(), state, ..finding(id) }
+    }
+
+    /// Spec 124 T01: o id reutilizado mantém a identidade e conta a recorrência; o novo que recomeça em
+    /// F-01 ganha o próximo número; o Revisor recebe os abertos com título e local; o Desenvolvedor, os
+    /// mais antigos primeiro; a mensagem traz o estado e os resolvidos; o registro fica no arquivo.
+    #[tokio::test]
+    async fn findings_keep_identity_recurrence_and_order_across_reviews() {
+        let fx = Fixture::new("identidade", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![at("F-01", "src/a.rs:1", "Falta validar a entrada. Detalhe longo.", None), at("F-02", "src/b.rs:2", "Sem teste de convergência", None)]),
+            1 => rejected(vec![
+                at("F-01", "src/c.rs:3", "Captura cortada", Some(FindingState::New)),
+                at("F-02", "src/b.rs:9", "Ainda sem teste de convergência", Some(FindingState::Open)),
+            ]),
+            _ => approved(vec![]),
+        });
+        let rec = Recorder::default();
+        let outcome = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        let inputs = rev.inputs();
+        assert!(inputs[1].prior_findings.contains("- F-01 [HIGH] src/a.rs:1: Falta validar a entrada (aberto há 1 revisão)"), "{}", inputs[1].prior_findings);
+        assert!(!inputs[1].prior_findings.contains("Detalhe longo"), "só o título curto");
+        assert!(inputs[2].prior_findings.starts_with("- F-02 [HIGH] src/b.rs:9:"), "o mais antigo primeiro: {}", inputs[2].prior_findings);
+        assert!(inputs[2].prior_findings.contains("(aberto há 2 revisões)") && inputs[2].prior_findings.contains("- F-03 "));
+        let briefs = dev.briefs();
+        let order: Vec<(&str, u32)> = briefs[2].findings.iter().map(|f| (f.id.as_str(), f.recurrence)).collect();
+        assert_eq!(order, vec![("F-02", 2), ("F-03", 1)], "abertos há mais revisões primeiro");
+        let texts = reviewer_texts(&rec);
+        assert!(texts[0].contains("- F-01 [HIGH, novo] src/a.rs:1"), "{}", texts[0]);
+        assert!(texts[1].contains("- F-03 [HIGH, novo] src/c.rs:3"), "{}", texts[1]);
+        assert!(texts[1].contains("- F-02 [HIGH, aberto há 2 revisões] src/b.rs:9"), "{}", texts[1]);
+        assert!(texts[1].contains("\n\nResolvidos:\n- F-01 [HIGH] src/a.rs:1"), "{}", texts[1]);
+        assert!(texts[2].starts_with("Aprovado: ") && texts[2].contains("Resolvidos:\n- F-02 [HIGH] src/b.rs:9"), "{}", texts[2]);
+        let t = fx.read_task("T01");
+        let registry = read_registry(&t.body).unwrap();
+        let summary: Vec<(&str, Option<FindingState>, u32, u32, u32)> =
+            registry.iter().map(|f| (f.id.as_str(), f.state, f.recurrence, f.first_review, f.last_review)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("F-01", Some(FindingState::Resolved), 1, 1, 2),
+                ("F-02", Some(FindingState::Resolved), 2, 1, 3),
+                ("F-03", Some(FindingState::Resolved), 1, 2, 3),
+            ]
+        );
+        assert_eq!(registry[1].description, "Ainda sem teste de convergência", "texto mais recente");
+        assert!(t.body.contains("## Registro de Apontamentos\n- id: F-01"), "legível no arquivo: {}", t.body);
+    }
+
+    /// Spec 124 T01: Revisor falso que reutiliza um id aberto para um problema diferente. O runner aceita
+    /// o que ele declara (mesmo apontamento, recorrência sobe), mas registra o texto mais recente.
+    #[tokio::test]
+    async fn reused_id_for_another_problem_is_accepted_with_latest_text() {
+        let fx = Fixture::new("id-reusado", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![at("F-01", "src/a.rs:1", "Falta validar a entrada", None)]),
+            _ => rejected(vec![at("F-01", "src/z.rs:7", "Vazamento no cache", Some(FindingState::Open))]),
+        });
+        let rec = Recorder::default();
+        fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        let t = fx.read_task("T01");
+        let open = read_findings(&t.body).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].id.as_str(), open[0].recurrence, open[0].location.as_str()), ("F-01", 3, "src/z.rs:7"));
+        assert_eq!(open[0].description, "Vazamento no cache");
+        let registry = read_registry(&t.body).unwrap();
+        assert_eq!(registry.len(), 1, "nenhum id novo inventado pelo runner");
+        assert_eq!(registry[0].description, "Vazamento no cache");
+    }
+
+    /// Spec 124 T01: a recuperação zera `attempts`, mas a numeração e a recorrência continuam.
+    #[tokio::test]
+    async fn numbering_and_recurrence_survive_a_recovery() {
+        let fx = Fixture::new("id-recuperacao", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|n, _| match n {
+            0..=2 => rejected(vec![finding("F-01")]),
+            _ => rejected(vec![finding("F-01"), at("F-01x", "src/n.rs:1", "Novo depois da recuperação", Some(FindingState::New))]),
+        });
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec);
+        runner.run_task(SPEC, "T01").await.unwrap();
+        let revision = TaskRevision { objective: "Objetivo".into(), acceptance: "1. Critério".into(), allowed_scope: None };
+        runner.record_revision(SPEC, "T01", &revision, "- Causa raiz: x").unwrap();
+        runner.run_task(SPEC, "T01").await.unwrap();
+        let t = fx.read_task("T01");
+        let registry = read_registry(&t.body).unwrap();
+        let f1 = registry.iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.recurrence, f1.first_review, f1.first_attempt), (6, 1, 1), "conta as revisões das duas rodadas");
+        let fresh = registry.iter().find(|f| f.description == "Novo depois da recuperação").expect("novo");
+        assert_eq!((fresh.id.as_str(), fresh.first_review, fresh.first_attempt), ("F-02", 4, 1), "id fora do formato ganha o próximo número");
+    }
+
+    /// Árbitro falso (spec 124 T02): devolve a resposta roteirizada e guarda os FATOS recebidos.
+    #[derive(Clone)]
+    struct FakeArbiter {
+        reply: Arc<dyn Fn(usize) -> String + Send + Sync>,
+        facts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeArbiter {
+        fn new(reply: impl Fn(usize) -> String + Send + Sync + 'static) -> Self {
+            Self { reply: Arc::new(reply), facts: Arc::default() }
+        }
+
+        fn facts(&self) -> Vec<String> {
+            self.facts.lock().unwrap().clone()
+        }
+    }
+
+    impl ArbiterPort for FakeArbiter {
+        fn arbitrate<'a>(&'a self, _spec: &'a str, _task: &'a str, root: &'a Path, facts: &'a str) -> Fut<'a, Result<String, RunnerError>> {
+            Box::pin(async move {
+                assert!(root.is_dir(), "raiz de leitura existente");
+                let n = {
+                    let mut all = self.facts.lock().unwrap();
+                    all.push(facts.to_string());
+                    all.len() - 1
+                };
+                Ok((self.reply)(n))
+            })
+        }
+    }
+
+    /// Desenvolvedor que, a partir da 2ª sessão, responde aos findings abertos com `line(id)`.
+    fn answering_dev(line: impl Fn(&str) -> String + Send + Sync + 'static) -> FakeDev {
+        FakeDev {
+            summary: Some(Arc::new(move |n, brief: &DevBrief| {
+                let answers: Vec<String> = brief.findings.iter().map(|f| format!("- {}", line(&f.id))).collect();
+                format!("dev {n}\n\n## Respostas aos apontamentos\n{}\n\n## Critérios\n1. ok — src/a.rs:{n}", answers.join("\n"))
+            })),
+            ..FakeDev::default()
+        }
+    }
+
+    fn notices(rec: &Recorder) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        rec.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RunnerEvent::SystemNotice { code, params, .. } => Some((code, params)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn gpu() -> Finding {
+        at("F-01", "src/gpu.rs:1", "Falta teste do WebGPU nativo. Sem cobertura.", None)
+    }
+
+    /// Spec 124 T02: a contestação vai ao Arquiteto antes da revisão; `manual` documenta a verificação
+    /// nos critérios, grava a decisão na tarefa e na spec, e o Revisor não cobra mais o apontamento
+    /// (repetido, vira observação e a tarefa é aprovada). As respostas chegam ao Revisor e à tela.
+    #[tokio::test]
+    async fn contested_finding_is_arbitrated_and_manual_stops_blocking() {
+        let fx = Fixture::new("arbitragem-manual", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| match id {
+            "F-01" => "F-01: contested (environment): o Docker do projeto não tem GPU".to_string(),
+            other => format!("{other}: fixed: src/a.rs:3"),
+        });
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![gpu(), at("F-02", "src/a.rs:3", "Falta validar a entrada", None)]),
+            _ => rejected(vec![at("F-01", "src/gpu.rs:9", "Ainda sem teste do WebGPU nativo", Some(FindingState::Open))]),
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"manual","reason":"sem GPU no Docker"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        let facts = arbiter.facts();
+        assert_eq!(facts.len(), 1, "um turno, só para a contestação");
+        assert!(facts[0].contains("- F-01 [HIGH] src/gpu.rs:1") && facts[0].contains("Contestação (environment): o Docker do projeto não tem GPU"), "{}", facts[0]);
+        assert!(!facts[0].contains("F-02 [HIGH]"), "o corrigido não vai ao Arquiteto");
+        let inputs = rev.inputs();
+        assert!(inputs[1].finding_responses.contains("- F-01: contested (environment): o Docker do projeto não tem GPU"), "{}", inputs[1].finding_responses);
+        assert!(inputs[1].finding_responses.contains("- F-02: fixed: src/a.rs:3"));
+        assert_eq!(inputs[1].arbitration, "- F-01 [manual] Falta teste do WebGPU nativo: sem GPU no Docker");
+        assert!(!inputs[1].prior_findings.contains("F-01") && inputs[1].prior_findings.contains("F-02"), "{}", inputs[1].prior_findings);
+        assert!(inputs[1].acceptance.contains("(manual) F-01: Falta teste do WebGPU nativo (sem GPU no Docker)"), "{}", inputs[1].acceptance);
+        let texts = reviewer_texts(&rec);
+        assert!(texts[1].starts_with("Aprovado: "), "{}", texts[1]);
+        assert!(texts[1].contains("Observações (não bloqueiam):\n- F-01"), "{}", texts[1]);
+        assert!(texts[1].contains("\n\nRespostas do Desenvolvedor:\n- F-01 [contested, environment] o Docker do projeto não tem GPU\n- F-02 [fixed] src/a.rs:3"), "{}", texts[1]);
+        assert!(texts[1].contains("\n\nDecisões do Arquiteto:\n- F-01 [manual] Falta teste do WebGPU nativo: sem GPU no Docker"), "{}", texts[1]);
+        let t = fx.read_task("T01");
+        let registry = read_registry(&t.body).unwrap();
+        let f1 = registry.iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!(f1.arbitration.as_ref().map(|a| (a.decision, a.review)), Some((ArbitrationDecision::Manual, 2)));
+        let log = section_text(&t.body, ARBITRATION_LOG).expect("registro na tarefa");
+        assert!(log.contains("- Revisão 2, T01 F-01 (verificação manual): Falta teste do WebGPU nativo. Motivo: sem GPU no Docker"), "{log}");
+        let spec = fs::read_to_string(fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
+        assert!(spec.contains(&format!("## {SPEC_DECISIONS}\n- Revisão 2, T01 F-01 (verificação manual)")), "{spec}");
+        let notice = notices(&rec).into_iter().find(|(c, _)| c == "task.arbitration_manual").expect("aviso");
+        assert_eq!(notice.1.get("finding").and_then(|v| v.as_str()), Some("F-01"));
+        assert_eq!(notice.1.get("reason").and_then(|v| v.as_str()), Some("sem GPU no Docker"));
+    }
+
+    /// Spec 124 T06: com a tarefa acima do patamar de custo, o Arquiteto recebe o aviso nos FATOS
+    /// da arbitragem e a execução segue até o fim (sinal, nunca corte).
+    #[tokio::test]
+    async fn cost_alert_reaches_the_architect_and_never_stops_the_run() {
+        let fx = Fixture::new("aviso-de-custo", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let line = |input: u64| {
+            format!(
+                "{{\"at\":\"2026-10-24T10:00:00Z\",\"project\":\"p\",\"spec\":\"{SPEC}\",\"task\":\"T01\",\"agent\":\"developer\",\"model\":\"m\",\"input\":{input},\"output\":1000}}\n"
+            )
+        };
+        let usage = fx.repo.join(".sdd/specs").join(SPEC).join("usage.jsonl");
+        fs::write(&usage, format!("{}{}", line(5_000_000), line(4_000_000))).unwrap();
+        let dev = answering_dev(|id| format!("{id}: contested (environment): sem GPU no Docker"));
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![gpu()]),
+            _ => approved(Vec::new()),
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"manual","reason":"sem GPU no Docker"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done, "o aviso não para a execução");
+        let facts = arbiter.facts();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            facts[0].contains("- Aviso de custo: a tarefa já usou 9002000 tokens em 2 chamadas, patamar absoluto") && facts[0].contains("não um limite"),
+            "{}",
+            facts[0]
+        );
+        assert_eq!(fx.read_task("T01").frontmatter.status, TaskStatus::Done);
+    }
+
+    /// Spec 124 T02: a arbitragem não conta como revisão. Decidida antes da revisão 2, o apontamento
+    /// novo dessa revisão nasce na revisão 2 (a numeração não pula).
+    #[tokio::test]
+    async fn arbitration_keeps_the_review_counter() {
+        let fx = Fixture::new("arbitragem-contador", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| match id {
+            "F-01" => "F-01: contested (environment): sem GPU".to_string(),
+            other => format!("{other}: fixed: src/b.rs:1"),
+        });
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![gpu()]),
+            1 => rejected(vec![
+                at("F-01", "src/gpu.rs:1", "Ainda sem WebGPU", Some(FindingState::Open)),
+                at("F-02", "src/b.rs:1", "Problema novo", Some(FindingState::New)),
+            ]),
+            _ => approved(vec![]),
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"manual","reason":"sem GPU"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let registry = read_registry(&fx.read_task("T01").body).unwrap();
+        let f1 = registry.iter().find(|f| f.id == "F-01").expect("F-01");
+        let f2 = registry.iter().find(|f| f.id == "F-02").expect("F-02");
+        assert_eq!(f1.arbitration.as_ref().map(|a| a.review), Some(2));
+        assert_eq!((f1.last_review, f1.first_review), (1, 1), "a arbitragem não mexe no contador");
+        assert_eq!((f2.first_review, f2.last_review), (2, 3), "a revisão 2 existe e a 3 aprova");
+    }
+
+    /// Spec 124 T02: spec.md editado por fora durante a execução: a decisão fica na tarefa, o
+    /// spec.md não é sobrescrito e a execução segue.
+    #[tokio::test]
+    async fn external_spec_edit_keeps_the_decision_in_the_task() {
+        let fx = Fixture::new("arbitragem-spec-externo", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| format!("{id}: contested (environment): sem GPU"));
+        let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![gpu()]) } else { approved(vec![]) });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"manual","reason":"sem GPU"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter));
+        let spec_path = fx.repo.join(".sdd/specs").join(SPEC).join("spec.md");
+        runner.remember(&spec_path).unwrap();
+        let edited = format!("{}\n\nEditado pelo humano.\n", fs::read_to_string(&spec_path).unwrap());
+        fs::write(&spec_path, &edited).unwrap();
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(fs::read_to_string(&spec_path).unwrap(), edited, "o spec.md do humano fica como está");
+        let t = fx.read_task("T01");
+        assert!(section_text(&t.body, ARBITRATION_LOG).is_some_and(|l| l.contains("F-01 (verificação manual)")));
+        assert!(notices(&rec).iter().any(|(c, _)| c == "task.arbitration_manual"));
+    }
+
+    /// Spec 124 T02: `keep` mantém o apontamento e o torna obrigatório; a 2ª contestação não volta ao
+    /// Arquiteto (sem laço) e o briefing seguinte traz a decisão.
+    #[tokio::test]
+    async fn keep_is_final_and_a_second_contest_is_not_arbitrated() {
+        let fx = Fixture::new("arbitragem-keep", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| format!("{id}: contested (incorrect): o código já cobre"));
+        let rev = FakeReviewer::new(|_, _| rejected(vec![gpu()]));
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"keep","reason":"dá para testar com software"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(outcome, Outcome::Blocked { .. }), "{outcome:?}");
+        assert_eq!(arbiter.facts().len(), 1, "contestado uma vez só");
+        let briefs = dev.briefs();
+        assert_eq!(briefs[2].findings[0].arbitration.as_ref().map(|a| a.decision), Some(ArbitrationDecision::Keep));
+        let inputs = rev.inputs();
+        assert!(inputs[1].prior_findings.contains("F-01"), "o mantido continua aberto");
+        assert_eq!(inputs[2].arbitration, "- F-01 [keep] Falta teste do WebGPU nativo: dá para testar com software");
+        let t = fx.read_task("T01");
+        let f1 = read_findings(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("aberto");
+        assert_eq!(f1.arbitration.map(|a| a.decision), Some(ArbitrationDecision::Keep));
+        assert_eq!(notices(&rec).iter().filter(|(c, _)| c == "task.arbitration_keep").count(), 1);
+        assert!(acceptance_of(&t.body).starts_with("- arquivo criado") && !acceptance_of(&t.body).contains("(manual)"));
+    }
+
+    /// Spec 124 T02: `adjust` reescreve os critérios para o que o ambiente prova; o Revisor recebe os
+    /// critérios novos e o apontamento ajustado não bloqueia mais.
+    #[tokio::test]
+    async fn adjust_rewrites_the_criteria_and_the_reviewer_respects_it() {
+        let fx = Fixture::new("arbitragem-adjust", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| format!("{id}: contested (environment): sem GPU"));
+        let rev = FakeReviewer::new(|n, _| match n {
+            0 => rejected(vec![gpu()]),
+            _ => rejected(vec![gpu()]),
+        });
+        let arbiter = FakeArbiter::new(|_| {
+            r#"{"decisions":[{"id":"F-01","decision":"adjust","reason":"o Docker prova o render por software"}],"acceptance":"- arquivo criado\n- render por software verificado no Docker"}"#.to_string()
+        });
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done, "{:?}", notices(&rec));
+        let inputs = rev.inputs();
+        assert!(inputs[1].acceptance.contains("render por software verificado no Docker"), "{}", inputs[1].acceptance);
+        assert!(inputs[1].arbitration.starts_with("- F-01 [adjust]"));
+        let t = fx.read_task("T01");
+        assert_eq!(acceptance_of(&t.body), "- arquivo criado\n- render por software verificado no Docker");
+        assert!(notices(&rec).iter().any(|(c, _)| c == "task.arbitration_adjust"));
+        assert!(reviewer_texts(&rec)[1].contains("Decisões do Arquiteto:\n- F-01 [adjust]"));
+    }
+
+    /// Spec 124 T02: resposta inválida do Arquiteto não decide nada: aviso, nenhuma decisão gravada e
+    /// o Revisor recebe a contestação para julgar. Sem árbitro, nada muda.
+    #[tokio::test]
+    async fn invalid_ruling_leaves_the_contest_to_the_reviewer() {
+        let fx = Fixture::new("arbitragem-invalida", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = answering_dev(|id| format!("{id}: contested (out_of_scope): é da T02"));
+        let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![gpu()]) } else { approved(vec![]) });
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(FakeArbiter::new(|_| "não sei".into())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let inputs = rev.inputs();
+        assert_eq!(inputs[1].finding_responses, "- F-01: contested (out_of_scope): é da T02");
+        assert!(inputs[1].arbitration.is_empty());
+        let unavailable = notices(&rec).into_iter().find(|(c, _)| c == "task.arbitration_unavailable").expect("aviso");
+        assert_eq!(unavailable.1.get("findings").and_then(|v| v.as_str()), Some("F-01"));
+        let t = fx.read_task("T01");
+        assert!(read_registry(&t.body).unwrap().iter().all(|f| f.arbitration.is_none()));
+        assert!(section_text(&t.body, ARBITRATION_LOG).is_none());
+    }
+
+    /// Spec 124 T02: o dispensado que volta com o mesmo id (ou o mesmo problema) vira observação; com
+    /// outro bloqueante, o veredito continua; o critério não atendido do dispensado não bloqueia.
+    #[test]
+    fn demote_waived_respects_the_decision() {
+        let waived = vec![Finding {
+            arbitration: Some(Arbitration { decision: ArbitrationDecision::Manual, reason: "x".into(), review: 2 }),
+            state: Some(FindingState::Resolved),
+            ..gpu()
+        }];
+        let same_id = at("F-01", "src/outro.rs:1", "outra redação", Some(FindingState::Open));
+        let (r, obs) = demote_waived(Lang::PtBr, rejected(vec![same_id.clone(), finding("F-02")]), &waived);
+        assert_eq!((r.verdict, r.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 1));
+        let (r, obs) = demote_waived(Lang::PtBr, rejected(vec![same_id]), &waived);
+        assert_eq!((r.verdict, obs.len()), (Verdict::Approved, 1));
+        assert!(r.summary.contains("o que o Arquiteto ajustou ou tornou manual virou observação"), "{}", r.summary);
+        // Id novo declarado para outro problema não é o dispensado.
+        let other = at("F-01", "src/c.rs:1", "Vazamento no cache", Some(FindingState::New));
+        assert_eq!(demote_waived(Lang::PtBr, rejected(vec![other]), &waived).1.len(), 0);
+        // Mesmo problema com outro id também é o dispensado.
+        let same_text = at("F-07", "src/gpu.rs:1", "Falta teste do WebGPU nativo. Outra frase.", Some(FindingState::New));
+        assert_eq!(demote_waived(Lang::PtBr, rejected(vec![same_text]), &waived).0.verdict, Verdict::Approved);
+        let (r, _) = demote_waived(Lang::En, rejected(vec![gpu()]), &[]);
+        assert_eq!(r.verdict, Verdict::ChangesRequested, "sem dispensados, nada muda");
+    }
+
     /// Spec 079: a linha "Escopo ampliado" da análise amplia o `allowed_scope` na mesma decisão
     /// (RETRY e REVISE_TASK), sem duplicar; ESCALATE e linha recuada (texto do modelo) não ampliam.
     #[tokio::test]
@@ -8053,7 +9674,7 @@ mod tests {
                 task_id: "T03".into(),
                 reason: "3 reprovações do revisor".into(),
                 kind: BlockKind::Quality,
-                open_findings: vec![finding("F-09")],
+                open_findings: vec![tracked("F-09", 3)],
             }
         );
         let briefs = dev.briefs();
@@ -9103,7 +10724,7 @@ mod tests {
 
     #[test]
     fn shell_missing_command_exits_127_and_header_is_structured() {
-        let r = run_shell(&env::temp_dir(), "comando_que_nao_existe_xyz", Duration::from_secs(10), Lang::PtBr).unwrap();
+        let r = run_shell(&env::temp_dir(), "comando_que_nao_existe_xyz", Duration::from_secs(10), Lang::PtBr, None).unwrap();
         assert!(!r.passed);
         assert_eq!(r.exit_code, Some(127));
         assert_eq!(failure_header(r.exit_code, r.timed_out), "[falha dos testes: código 127]\n");
@@ -10060,6 +11681,641 @@ mod tests {
         assert_eq!(fx.feat_commits(), 1, "nenhum novo squash");
         assert!(dev.briefs().is_empty());
         assert!(rev.inputs().is_empty());
+    }
+
+    /// Sink que guarda cada evento com o instante (ms desde a criação): a medição da spec 123 T01.
+    #[derive(Clone)]
+    struct TimedRec(Arc<Mutex<Vec<(u128, RunnerEvent)>>>, Instant);
+
+    impl TimedRec {
+        fn new() -> Self {
+            Self(Arc::default(), Instant::now())
+        }
+
+        fn events(&self) -> Vec<(u128, RunnerEvent)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl EventSink for TimedRec {
+        fn emit(&self, ev: RunnerEvent) {
+            let at = self.1.elapsed().as_millis();
+            self.0.lock().unwrap().push((at, ev));
+        }
+    }
+
+    /// Instantes dos sinais de vida e o último deles, entre o início e o fim da rodada.
+    fn beats(events: &[(u128, RunnerEvent)]) -> (Vec<u128>, Option<(u64, Option<String>)>) {
+        let mut at = Vec::new();
+        let mut last = None;
+        for (t, ev) in events {
+            if let RunnerEvent::CommandBeat { output_bytes, last_line, .. } = ev {
+                at.push(*t);
+                last = Some((*output_bytes, last_line.clone()));
+            }
+        }
+        (at, last)
+    }
+
+    /// Spec 123 T01, critério 1 e 2 (medição): a rodada de testes do runner, com um comando de
+    /// verdade que dura ~12 intervalos, emite o sinal de vida no ritmo até o fim, com os bytes da
+    /// saída e a última linha. Antes da correção, só saíam o início e o fim (0 sinais no meio).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tests_run_emits_paced_heartbeats_with_real_output_progress() {
+        let fx = Fixture::new("beat-host", "true");
+        let rec = TimedRec::new();
+        let (dev, rev) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])));
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(dev),
+            Box::new(rev),
+            Box::new(ShellTestExecutor::with_timeout(Duration::from_secs(20))),
+            Box::new(rec.clone()),
+        )
+        .with_command_heartbeat(Duration::from_millis(100));
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        let cmd = "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"passo $i de 12\"; sleep 0.1; done";
+        let out = runner.run_tracked(&settings, &fx.repo, cmd, false, None, "", "T01", 1).await.unwrap();
+        assert!(out.passed, "{}", out.output);
+        let events = rec.events();
+        let (at, last) = beats(&events);
+        eprintln!("MEDICAO runner/host: {} sinais em {:?} ms", at.len(), at);
+        assert!(at.len() >= 9, "sinais no ritmo durante ~1,2 s: {at:?}");
+        assert!(at.windows(2).all(|w| w[1] - w[0] < 400), "sem buracos: {at:?}");
+        assert!(matches!(events.first(), Some((_, RunnerEvent::CommandRun { started: true, .. }))));
+        assert!(matches!(events.last(), Some((_, RunnerEvent::CommandRun { started: false, .. }))));
+        // Spec 123 T02: o limite que a tela mostra é o do executor (aqui, 20 s), não um fixo.
+        assert!(matches!(events.first(), Some((_, RunnerEvent::CommandRun { limit: Some(l), .. })) if *l == Duration::from_secs(20)));
+        let (bytes, line) = last.unwrap();
+        assert!(bytes > 0, "bytes de saída");
+        assert!(line.as_deref().is_some_and(|l| l.starts_with("passo ") && l.ends_with(" de 12")), "{line:?}");
+        // O resultado e a captura não mudam.
+        assert!(out.output.contains("passo 1 de 12") && out.output.contains("passo 12 de 12"), "{}", out.output);
+    }
+
+    /// O mesmo no Docker (executor do Compose falso, saída aos poucos): sinais no ritmo e a última
+    /// linha que o comando escreveu.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn docker_tests_run_emits_paced_heartbeats_with_output_progress() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("beat-docker", "npx playwright test");
+        enable_docker(&fx);
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "5 passed\n");
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(1000));
+        *fake.stream.lock().unwrap() = (1..=5).map(|i| format!("  ok {i} cena.spec.ts")).collect();
+        let rec = TimedRec::new();
+        let (dev, rev) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])));
+        let runner = TaskRunner::new(fx.repo.clone(), Box::new(dev), Box::new(rev), Box::new(ScriptedTests::default()), Box::new(rec.clone()))
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("beat", fake)))
+            .with_command_heartbeat(Duration::from_millis(100));
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        let out = runner.run_tracked(&settings, &fx.repo, "npx playwright test", false, None, "", "T01", 1).await.unwrap();
+        assert!(out.passed);
+        let events = rec.events();
+        // Spec 123 T02: no Docker, o limite é o `TEST_TIMEOUT` (o mesmo do `compose.exec`).
+        assert!(matches!(events.first(), Some((_, RunnerEvent::CommandRun { limit: Some(l), .. })) if *l == TEST_TIMEOUT));
+        let (at, last) = beats(&events);
+        eprintln!("MEDICAO runner/docker: {} sinais em {:?} ms", at.len(), at);
+        assert!(at.len() >= 7, "{at:?}");
+        assert!(at.windows(2).all(|w| w[1] - w[0] < 400), "{at:?}");
+        let (bytes, line) = last.unwrap();
+        assert!(bytes > 0);
+        assert!(line.as_deref().is_some_and(|l| l.starts_with("ok ") && l.ends_with(" cena.spec.ts")), "{line:?}");
+    }
+    /// Spec 124 T04: executor com limite conhecido e rodadas roteirizadas (passou, saída, espera).
+    #[derive(Clone)]
+    struct TimedTests {
+        script: Arc<Mutex<VecDeque<(bool, &'static str, Duration)>>>,
+        limit: Duration,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl TimedTests {
+        fn new(limit: Duration, script: Vec<(bool, &'static str, Duration)>) -> Self {
+            Self { script: Arc::new(Mutex::new(script.into())), limit, calls: Arc::default() }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl TestExecutor for TimedTests {
+        fn run<'a>(&'a self, _dir: &'a Path, _command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                *self.calls.lock().unwrap() += 1;
+                let (passed, output, wait) = self.script.lock().unwrap().pop_front().unwrap_or((true, "ok", Duration::ZERO));
+                tokio::time::sleep(wait).await;
+                Ok(TestResult { passed, output: output.into(), exit_code: Some(i32::from(!passed)), timed_out: false })
+            })
+        }
+
+        fn time_limit(&self) -> Option<Duration> {
+            Some(self.limit)
+        }
+    }
+
+    /// Spec 124 T04: a rodada que falha é repetida uma vez sem mudança; passou, segue aprovada com o
+    /// alerta na tarefa, na conversa e na evidência que o Revisor vê, e o Desenvolvedor não é chamado
+    /// de novo.
+    #[tokio::test]
+    async fn flaky_round_fails_then_passes_on_the_rerun_with_an_alert() {
+        let fx = Fixture::new("flaky-pass", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = TimedTests::new(
+            Duration::from_secs(600),
+            vec![(false, "test a ... ok\ntest dois_clientes ... FAILED\n", Duration::ZERO), (true, "test result: ok", Duration::ZERO)],
+        );
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(dev.briefs().len(), 1, "a repetição não chama o Desenvolvedor");
+        assert!(tests.calls() >= 2);
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("A rodada de testes falhou. Repetindo uma vez")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("alerta de teste instável") && t.contains("test dois_clientes ... FAILED")), "{texts:?}");
+        let body = fx.read_task("T01").body;
+        let flaky = section_text(&body, FLAKY_SECTION).expect("alerta registrado na tarefa");
+        assert!(flaky.contains("Tentativa 1") && flaky.contains("test dois_clientes ... FAILED"), "{flaky}");
+        let review = &rev.inputs()[0];
+        assert!(review.test_output.contains(&flaky_pass_warning("make test")) && review.test_output.contains("- test dois_clientes ... FAILED"), "{}", review.test_output);
+    }
+
+    /// Spec 124 T04: falha nas duas rodadas conta como uma falha e volta ao Desenvolvedor; na mesma
+    /// tentativa, a repetição acontece no máximo uma vez. O alerta da instabilidade chega ao
+    /// Desenvolvedor quando a tarefa volta a ele.
+    #[tokio::test]
+    async fn flaky_rerun_failing_twice_counts_once_and_happens_once_per_attempt() {
+        let fx = Fixture::new("flaky-twice", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fail = (false, "FAIL e2e/render.spec.ts", Duration::ZERO);
+        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, fail, fail, (true, "ok", Duration::ZERO)]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        // 1ª sessão: falha + repetição (falha); 2ª: falha sem repetir; 3ª: passa.
+        assert_eq!(dev.briefs().len(), 3);
+        let texts = tests_texts(&rec);
+        assert_eq!(texts.iter().filter(|t| t.starts_with("A rodada de testes falhou. Repetindo")).count(), 1, "{texts:?}");
+        assert!(texts.contains(&"test_command falhou (1/5)".to_string()) && texts.contains(&"test_command falhou (2/5)".to_string()), "{texts:?}");
+        assert!(section_text(&fx.read_task("T01").body, FLAKY_SECTION).is_none(), "nada passou na repetição");
+
+        // Instável numa tentativa reprovada: o Desenvolvedor recebe a lista na volta.
+        let fx = Fixture::new("flaky-brief", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = TimedTests::new(Duration::from_secs(600), vec![(false, "✘ two clients converge", Duration::ZERO)]);
+        let rev = FakeReviewer::new(|prior, _| if prior == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let second = &dev.briefs()[1];
+        assert!(second.flaky_tests.contains("✘ two clients converge"), "{}", second.flaky_tests);
+    }
+
+    /// Spec 124 T04: sem tempo restante no limite, a rodada que falhou não se repete; a duração
+    /// acima de 70% do limite gera o aviso de orçamento na conversa e no briefing seguinte.
+    #[tokio::test]
+    async fn no_rerun_without_time_left_and_budget_warning_reaches_the_developer() {
+        let fx = Fixture::new("flaky-no-time", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = TimedTests::new(Duration::from_millis(400), vec![(false, "FAILED", Duration::from_millis(320)), (true, "ok", Duration::ZERO)]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let texts = tests_texts(&rec);
+        assert!(!texts.iter().any(|t| t.contains("Repetindo")), "{texts:?}");
+        assert_eq!(dev.briefs().len(), 2, "a falha volta ao Desenvolvedor");
+        assert!(texts.iter().any(|t| t.starts_with("A rodada de testes levou") && t.contains("do limite de 1 s") && t.contains("o limite continua o mesmo")), "{texts:?}");
+        let env = &dev.briefs()[1].environment;
+        assert!(env.contains("ATENÇÃO, orçamento de tempo") && env.contains("Divida ou foque a bateria"), "{env}");
+        assert!(env.contains("(falhou)"), "{env}");
+    }
+
+    /// Spec 124 T04: as capacidades medidas (no host, nesta execução) e as durações das rodadas
+    /// entram no briefing do Desenvolvedor e do Revisor, cada um com a sua regra.
+    #[tokio::test]
+    async fn capabilities_reach_developer_and_reviewer_prompts() {
+        let fx = Fixture::new("caps-prompts", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        fx.add_task(&task("T02", TaskStatus::Todo, &["T01"]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec);
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let caps = capabilities::read(&fx.repo);
+        assert_eq!(caps.environment, "host");
+        assert!(caps.cpus.is_some() && caps.measured_at.is_some() && !caps.runs.is_empty(), "{caps:?}");
+        let review = &rev.inputs()[0];
+        assert!(review.environment.contains("Onde os testes rodam: host"), "{}", review.environment);
+        assert!(review.environment.contains("Presente ou não medido não dispensa nada"), "{}", review.environment);
+        assert_eq!(runner.run_task(SPEC, "T02").await.unwrap(), Outcome::Done);
+        let env = &dev.briefs()[1].environment;
+        assert!(env.contains("GPU ou dispositivo de vídeo:") && env.contains("Tela ou servidor gráfico:"), "{env}");
+        assert!(env.contains("Duração das últimas rodadas do test_command") && env.contains("espere por uma condição"), "{env}");
+        // O estado fica em `.sdd/specs/` e não suja a base.
+        assert!(fx.repo.join(capabilities::CAPABILITIES_REL).is_file());
+    }
+
+    /// Spec 124 T04: no Docker, a medida roda uma vez dentro do serviço `workspace`, sem subir os
+    /// serviços de apoio, e o que ela acha fica nas capacidades.
+    #[tokio::test]
+    async fn docker_capabilities_are_measured_inside_the_workspace_once() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("caps-docker", "make test");
+        enable_docker(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "nants-cap:gpu=0\nnants-cap:display=0\nnants-cap:cpus=2\nnants-cap:mem_kb=4096000\n");
+        let (dev, rev, rec) = (FakeDev::default(), base_moving_reviewer(fx.repo.clone()), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("capsd", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let calls = fake.calls.lock().unwrap();
+        let probes: Vec<_> = calls.iter().filter(|c| c.args.iter().any(|a| a == capabilities::PROBE_SCRIPT)).collect();
+        assert_eq!(probes.len(), 1, "uma medida por execução");
+        assert!(probes[0].args.contains(&"--no-deps".to_string()) && probes[0].args.contains(&"workspace".to_string()));
+        let caps = capabilities::read(&fx.repo);
+        assert_eq!(
+            (caps.environment.as_str(), caps.gpu, caps.display, caps.cpus, caps.memory_mb),
+            ("docker", Some(false), Some(false), Some(2), Some(4000))
+        );
+        assert_eq!(caps.runs.last().and_then(|r| r.limit_ms), Some(u64::try_from(TEST_TIMEOUT.as_millis()).unwrap()));
+    }
+
+
+    /// Spec 124 T05: executor que registra cada rodada (pasta, comando) e responde por comando:
+    /// as falhas roteirizadas de cada um saem em ordem; o resto passa.
+    #[derive(Clone, Default)]
+    struct CmdTests {
+        calls: Arc<Mutex<Vec<(PathBuf, String)>>>,
+        fails: Arc<Mutex<HashMap<String, VecDeque<bool>>>>,
+    }
+
+    impl CmdTests {
+        fn script(self, command: &str, results: Vec<bool>) -> Self {
+            self.fails.lock().unwrap().insert(command.to_string(), results.into());
+            self
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.calls.lock().unwrap().iter().map(|(_, c)| c.clone()).collect()
+        }
+
+        fn count_in(&self, dir: &Path, command: &str) -> usize {
+            self.calls.lock().unwrap().iter().filter(|(d, c)| d == dir && c == command).count()
+        }
+    }
+
+    impl TestExecutor for CmdTests {
+        fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((dir.to_path_buf(), command.to_string()));
+                let passed = self.fails.lock().unwrap().get_mut(command).and_then(VecDeque::pop_front).unwrap_or(true);
+                let output = if passed { format!("{command}: ok") } else { format!("{command}: FAILED") };
+                Ok(TestResult { passed, output, exit_code: Some(i32::from(!passed)), timed_out: false })
+            })
+        }
+    }
+
+    fn edit_settings(fx: &Fixture, edit: impl FnOnce(&mut Settings)) {
+        let mut settings = read_settings(&fx.settings_path()).unwrap();
+        edit(&mut settings);
+        crate::sdd::write_settings(&fx.settings_path(), &settings).unwrap();
+        fx.commit_all("chore: settings");
+    }
+
+    /// Desenvolvedor que, na sessão `n`, simula ter rodado pelo `run_command` cada `(comando, passou)`
+    /// sobre a árvore como ele a deixou (o mesmo registro que a ferramenta faz).
+    fn dev_running(runs: Vec<(usize, &'static str, bool)>) -> FakeDev {
+        dev_running_in(runs, false)
+    }
+
+    /// Como [`dev_running`], dizendo se a rodada foi no container do projeto.
+    fn dev_running_in(runs: Vec<(usize, &'static str, bool)>, in_container: bool) -> FakeDev {
+        let runs = Arc::new(runs);
+        FakeDev {
+            summary: Some(Arc::new(move |n, brief: &DevBrief| {
+                for (session, command, passed) in runs.iter().filter(|r| r.0 == n) {
+                    let _ = session;
+                    let tree = test_levels::tree_hash(&brief.worktree);
+                    brief.suite_ledger.record(test_levels::SuiteRun {
+                        command: command.to_string(),
+                        tree_before: tree.clone(),
+                        tree_after: tree,
+                        in_container,
+                        passed: *passed,
+                        elapsed: Duration::from_millis(10),
+                        started: std::time::SystemTime::now(),
+                        output: format!("exit: {}\n{command} do dev", i32::from(!passed)),
+                    });
+                }
+                format!("dev {n}\n\n## Critérios\n1. ok — src/a.rs:{n}")
+            })),
+            ..FakeDev::default()
+        }
+    }
+
+    /// Spec 124 T05: o `test_command` que o Desenvolvedor passou sobre a árvore entregue não se
+    /// dispensa a rodada limpa do runner: ela roda e é a que vale, registrada na tarefa e na
+    /// conversa. A checagem bloqueante que ele passou é aceita na tentativa e roda de novo na
+    /// integração; a bateria, testada pelo runner sobre a árvore idêntica, não se repete na base.
+    #[tokio::test]
+    async fn developer_run_never_replaces_the_clean_round_and_checks_run_again_on_integration() {
+        let fx = Fixture::new("reuse-same", "make test");
+        edit_settings(&fx, |s| s.checks = vec![check("build", "make build", true), check("lint", "make lint", false)]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = dev_running(vec![(1, "make test", true), (1, "make build", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let wt = fx.worktree("T01");
+        assert_eq!(tests.count_in(&wt, "make test"), 1, "a rodada limpa roda sempre");
+        assert_eq!(tests.count_in(&wt, "make build"), 0, "a checagem do Desenvolvedor vale na tentativa");
+        assert_eq!(tests.count_in(&wt, "make lint"), 1);
+        assert_eq!(tests.count_in(&fx.repo, "make build"), 1, "na integração a checagem roda de novo");
+        assert_eq!(tests.count_in(&fx.repo, "make test"), 0, "a bateria testada pelo runner não se repete na base");
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("Valeu para a revisão a rodada limpa do Nants de `make test`")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("Checagem não repetida: o Desenvolvedor rodou `make build`")), "{texts:?}");
+        let t = fx.read_task("T01");
+        let log = section_text(&t.body, REUSE_SECTION).expect("registro na tarefa");
+        assert!(log.contains("Tentativa 1: o Desenvolvedor já tinha passado `make test`") && log.contains("valeu a rodada limpa do Nants"), "{log}");
+        assert!(log.contains("checagem `make build` reaproveitada"), "{log}");
+        let review = &rev.inputs()[0];
+        assert!(!review.test_output.contains(DEV_REUSED_MARK) && review.test_output.contains("make test: ok"), "{}", review.test_output);
+        assert!(review.checks.contains(CHECKS_FROM_DEV_MARK), "{}", review.checks);
+        assert_eq!(t.frontmatter.status, TaskStatus::Done);
+        // O brief diz quais comandos valem e a regra do teste focado está no prompt do papel.
+        let brief = &dev.briefs()[0];
+        assert!(brief.test_plan.contains("`make test`") && brief.test_plan.contains("Reaproveitamento"), "{}", brief.test_plan);
+        assert!(crate::agents::prompts::developer_system(brief).contains("rode só os testes do que você mexeu"));
+    }
+
+    /// Spec 124 T05: árvore diferente (o Desenvolvedor mexeu depois), rodada que falhou sobre a
+    /// mesma árvore ou comando com shell no host: o runner repete.
+    #[tokio::test]
+    async fn developer_run_on_another_tree_or_failing_is_repeated() {
+        // Mexeu depois de rodar: o registro é de outra árvore.
+        let fx = Fixture::new("reuse-other", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, brief: &DevBrief| {
+                let tree = test_levels::tree_hash(&brief.worktree);
+                brief.suite_ledger.record(test_levels::SuiteRun {
+                    command: "make test".into(),
+                    tree_before: tree.clone(),
+                    tree_after: tree,
+                    in_container: false,
+                    passed: true,
+                    elapsed: Duration::from_millis(10),
+                    started: std::time::SystemTime::now(),
+                    output: "exit: 0\nok".into(),
+                });
+                fs::write(brief.worktree.join("depois.txt"), "mudou depois do teste\n").unwrap();
+                format!("dev {n}")
+            })),
+            ..FakeDev::default()
+        };
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.count_in(&fx.worktree("T01"), "make test"), 1, "{:?}", tests.commands());
+        assert!(texts_without_reuse(&rec));
+        assert!(section_text(&fx.read_task("T01").body, REUSE_SECTION).is_none());
+
+        // Passou e depois falhou sobre a mesma árvore: na dúvida, repete.
+        let fx = Fixture::new("reuse-flaky-dev", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = dev_running(vec![(1, "make test", true), (1, "make test", false)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.count_in(&fx.worktree("T01"), "make test"), 1);
+
+        // No host, comando com shell não é observado: o runner roda.
+        let fx = Fixture::new("reuse-shell", "make deps && make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = dev_running(vec![(1, "make deps && make test", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.count_in(&fx.worktree("T01"), "make deps && make test"), 1);
+        assert!(dev.briefs()[0].test_plan.contains("`make deps && make test`") && !dev.briefs()[0].test_plan.contains("Reaproveitamento"));
+    }
+
+    /// Spec 124 T05: com `full_test_command`, o nível rápido roda a cada tentativa e a bateria
+    /// completa só depois dele passar, antes da revisão; a integração usa a completa. Rápido que
+    /// falha volta ao Desenvolvedor sem rodar a completa; a completa que ele já passou dispensa as duas.
+    #[tokio::test]
+    async fn test_levels_run_fast_each_attempt_and_full_before_review_and_on_integration() {
+        let fx = Fixture::new("levels", "make fast");
+        edit_settings(&fx, |s| s.full_test_command = Some("make full".into()));
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default().script("make fast", vec![false, false]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        // Sem limite conhecido não há repetição: duas sessões com o rápido falhando, sem a completa;
+        // na 3ª, o rápido e depois a completa.
+        assert_eq!(tests.commands(), vec!["make fast", "make fast", "make fast", "make full"], "{:?}", tests.commands());
+        assert_eq!(dev.briefs().len(), 3);
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.test_run.expect("test_run").command, "make full", "a integração é da bateria completa");
+        assert!(rev.inputs()[0].test_output.contains("make full: ok"), "{}", rev.inputs()[0].test_output);
+        assert!(tests_texts(&rec).iter().any(|t| t.contains("make full")), "{:?}", tests_texts(&rec));
+        assert!(dev.briefs()[0].test_plan.contains("full_test_command, a bateria completa"));
+
+        // A completa que o Desenvolvedor passou sobre a árvore entregue: nenhuma das duas roda.
+        let fx = Fixture::new("levels-reuse", "make fast");
+        edit_settings(&fx, |s| s.full_test_command = Some("make full".into()));
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = dev_running(vec![(1, "make full", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.commands(), vec!["make full".to_string()], "a completa roda limpa, sempre");
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("Nível rápido não repetido") && t.contains("Agora roda `make full` em ambiente limpo")), "{texts:?}");
+        let log = section_text(&fx.read_task("T01").body, REUSE_SECTION).expect("registro");
+        assert!(log.contains("`make fast` dispensado") && log.contains("valeu a rodada limpa do Nants de `make full`"), "{log}");
+
+        // Só o rápido reaproveitado: a completa roda.
+        let fx = Fixture::new("levels-fast-reuse", "make fast");
+        edit_settings(&fx, |s| s.full_test_command = Some("make full".into()));
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let dev = dev_running(vec![(1, "make fast", true)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.commands(), vec!["make full".to_string()]);
+    }
+
+    /// Spec 124 T05: sem os campos novos, o runner roda exatamente o que rodava (o `test_command` na
+    /// worktree, nada de instalação) e a assinatura da evidência é a mesma.
+    #[tokio::test]
+    async fn without_the_new_fields_everything_runs_as_before() {
+        let fx = Fixture::new("levels-compat", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default().script("make test", vec![false, false]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.commands(), vec!["make test", "make test", "make test"]);
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        assert!(settings.full_test_command.is_none() && settings.install_command.is_none() && settings.lockfiles.is_empty());
+        assert!(!fs::read_to_string(fx.settings_path()).unwrap().contains("full_test_command"));
+        let mut legacy = settings.clone();
+        let before = test_signature(&legacy);
+        legacy.lockfiles = vec!["x.lock".into()];
+        assert_eq!(test_signature(&legacy), before, "travas sem instalação não mudam nada");
+        legacy.full_test_command = Some("make full".into());
+        assert_ne!(test_signature(&legacy), before);
+        assert!(texts_without_reuse(&rec));
+    }
+
+    fn texts_without_reuse(rec: &Recorder) -> bool {
+        !tests_texts(rec).iter().any(|t| t.contains("rodada limpa") || t.starts_with("Checagem não repetida") || t.starts_with("Nível rápido não repetido"))
+    }
+
+    /// Spec 124 T05: a instalação roda antes da primeira sessão e só de novo quando o arquivo de
+    /// trava muda naquela pasta; o `test_command` não instala. Na base (outra pasta), instala uma vez
+    /// antes da bateria quando ela roda.
+    #[tokio::test]
+    async fn install_runs_only_when_the_lockfile_changes() {
+        let fx = Fixture::new("install-lock", "make test");
+        fs::write(fx.repo.join("deps.lock"), "a=1\n").unwrap();
+        edit_settings(&fx, |s| {
+            s.install_command = Some("make deps".into());
+            s.lockfiles = vec!["deps.lock".into()];
+        });
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        // Três sessões: a 1ª falha, a 2ª muda a trava e falha, a 3ª passa.
+        let tests = CmdTests::default().script("make test", vec![false, false]);
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, brief: &DevBrief| {
+                if n == 2 {
+                    fs::write(brief.worktree.join("deps.lock"), "a=2\n").unwrap();
+                }
+                format!("dev {n}")
+            })),
+            ..FakeDev::default()
+        };
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let wt = fx.worktree("T01");
+        assert_eq!(dev.briefs().len(), 3);
+        // Antes da 1ª sessão (trava nova na pasta) e depois da 2ª (trava mudou): só duas.
+        assert_eq!(tests.count_in(&wt, "make deps"), 2, "{:?}", tests.commands());
+        assert_eq!(tests.count_in(&wt, "make test"), 3, "{:?}", tests.commands());
+        assert_eq!(
+            tests.commands(),
+            vec!["make deps", "make test", "make deps", "make test", "make test"],
+            "a instalação vem antes da rodada e nunca se repete com a trava igual"
+        );
+        assert!(dev.briefs()[0].test_plan.contains("install_command: `make deps`") && dev.briefs()[0].test_plan.contains("deps.lock"));
+        // A integração reaproveitou a árvore testada: nada roda na base.
+        assert_eq!(tests.count_in(&fx.repo, "make deps"), 0);
+    }
+
+    /// Spec 124 T05: instalação que falha vale como a rodada (a saída volta ao Desenvolvedor) e a
+    /// próxima tenta de novo; a rodada que falha com 127 esquece a instalação.
+    #[tokio::test]
+    async fn failed_install_is_the_round_result_and_is_retried() {
+        let fx = Fixture::new("install-fail", "make test");
+        edit_settings(&fx, |s| {
+            s.install_command = Some("make deps".into());
+            s.lockfiles = vec!["deps.lock".into()];
+        });
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        // Falha antes da sessão 1 (melhor esforço) e na rodada 1, que vale como falha dos testes;
+        // antes da sessão 2 passa e a rodada 2 só testa.
+        let tests = CmdTests::default().script("make deps", vec![false, false]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.commands(), vec!["make deps", "make deps", "make deps", "make test"], "{:?}", tests.commands());
+        let out = dev.briefs()[1].test_output.clone().unwrap_or_default();
+        assert!(out.starts_with("install_command falhou (`make deps`)") && out.contains("make deps: FAILED"), "{out}");
+        assert!(tests_texts(&rec).contains(&"test_command falhou (1/5)".to_string()));
+
+        // Rodada que falha com 127 (programa ausente) esquece a instalação: a próxima instala.
+        let fx = Fixture::new("install-127", "make test");
+        fs::write(fx.repo.join("deps.lock"), "a=1\n").unwrap();
+        edit_settings(&fx, |s| {
+            s.install_command = Some("make deps".into());
+            s.lockfiles = vec!["deps.lock".into()];
+        });
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = Exit127Once::default();
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(tests.commands(), vec!["make deps", "make test", "make deps", "make test"], "{:?}", tests.commands());
+    }
+
+    /// Spec 124 T05: no Docker, a rodada que o Desenvolvedor passou no container (sem o `prepare`)
+    /// não dispensa a rodada limpa: o runner recria o estado (`down -v`, serviços) e roda a bateria
+    /// antes da revisão, e diz que foi ela que valeu.
+    #[tokio::test]
+    async fn docker_developer_run_still_gets_a_clean_runner_round_before_review() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("reuse-docker", "make test");
+        enable_docker(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fake = Arc::new(FakeRunner::default());
+        let dev = dev_running_in(vec![(1, "make test", true), (1, "make build", true)], true);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ShellTestExecutor::with_timeout(Duration::from_secs(5)), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("reuse-docker", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let calls = fake.calls.lock().unwrap().clone();
+        let test_run = calls
+            .iter()
+            .position(|c| c.args.ends_with(&["-lc".into(), "make test".into()]))
+            .expect("a rodada limpa do runner");
+        assert!(calls[..test_run].iter().any(|c| c.args.iter().any(|a| a == "down") && c.args.iter().any(|a| a == "-v")), "estado recriado antes");
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("Valeu para a revisão a rodada limpa do Nants de `make test`, com o ambiente recriado")), "{texts:?}");
+        assert!(rev.inputs()[0].test_output.contains("$ make test"), "{}", rev.inputs()[0].test_output);
+    }
+
+    /// Spec 124 T05: o alerta de rodada instável diz qual comando falhou (aqui, a bateria completa).
+    #[tokio::test]
+    async fn flaky_alert_names_the_command_that_failed() {
+        let fx = Fixture::new("flaky-full", "make fast");
+        edit_settings(&fx, |s| s.full_test_command = Some("make full".into()));
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = TimedTests::new(
+            Duration::from_secs(600),
+            vec![(true, "ok", Duration::ZERO), (false, "FAIL e2e/x.spec.ts", Duration::ZERO), (true, "ok", Duration::ZERO)],
+        );
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let out = &rev.inputs()[0].test_output;
+        assert!(out.contains(&flaky_pass_warning("make full")) && !out.contains("`make fast` falhou"), "{out}");
+    }
+
+    /// Executor cujo primeiro `make test` sai com 127; o resto passa.
+    #[derive(Clone, Default)]
+    struct Exit127Once {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Exit127Once {
+        fn commands(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TestExecutor for Exit127Once {
+        fn run<'a>(&'a self, _dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(command.to_string());
+                let first_test = command == "make test" && calls.iter().filter(|c| *c == "make test").count() == 1;
+                Ok(if first_test {
+                    TestResult { passed: false, output: "sh: vitest: not found".into(), exit_code: Some(127), timed_out: false }
+                } else {
+                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false }
+                })
+            })
+        }
     }
 }
 

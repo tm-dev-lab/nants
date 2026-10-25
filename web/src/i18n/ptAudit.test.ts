@@ -68,6 +68,11 @@ const EXCEPTIONS: readonly Exception[] = [
     text: /^- (Decisão: (configuração de testes revisada \(REVISE_CONFIG\)|tarefa revisada \(REVISE_TASK\)|nova estratégia \(RETRY\)|escalar ao humano)|Configuração de testes corrigida e aplicada pelo servidor|Contagem: não conta como ciclo \(escalada determinística\))$/,
     why: `linhas fixas de decisão e contagem da análise de recuperação; ${SERVER_FORMAT}`,
   },
+  {
+    file: "recoveryAnalysis.ts",
+    text: /^- (Pergunta ao humano|Tarefas novas|Apontamentos dispensados):$|^- Decisão: (tarefa dividida \(SPLIT\)|critérios ajustados ao que o ambiente prova \(ADJUST\)|pergunta ao humano \(ASK\))$|^- Ajuste não aplicado: os critérios não puderam ser gravados; a tarefa segue com a estratégia \(RETRY\)$/,
+    why: `rótulos e linhas fixas do SPLIT, ADJUST e ASK (spec 124 T03, \`recovery_plan.rs\`); ${SERVER_FORMAT} (\`recoveryText.*\`)`,
+  },
   { file: "recoveryAnalysis.ts", text: /^- opções: /, why: `linhas fixas de opções da escalada (\`recovery.rs\`); ${SERVER_FORMAT} (\`recoveryText.options.*\`)` },
   {
     file: "recoveryAnalysis.ts",
@@ -86,7 +91,7 @@ const EXCEPTIONS: readonly Exception[] = [
   },
   {
     file: "reviewMessage.ts",
-    text: /^(Critérios:|Apontamentos:|Observações \(não bloqueiam\):|Cenário de falha:|observação \(arquivo não mudou nesta rodada\)|baixa confiança|Capturas avaliadas:|Aprovado|Pediu ajustes|Verificação final:)$/,
+    text: /^(Critérios:|Apontamentos:|Observações \(não bloqueiam\):|Cenário de falha:|observação \(arquivo não mudou nesta rodada\)|baixa confiança|Capturas avaliadas:|Aprovado|Pediu ajustes|Verificação final:|novo|Resolvidos:|Respostas do Desenvolvedor:|Decisões do Arquiteto:)$/,
     why: `cabeçalhos e vereditos da mensagem do Revisor; ${SERVER_FORMAT} (\`review.*\`)`,
   },
 ];

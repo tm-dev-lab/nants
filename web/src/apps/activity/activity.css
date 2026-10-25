@@ -171,6 +171,17 @@
   color: var(--muted);
 }
 
+/* Perto do limite de tempo (spec 123 T02): aviso discreto, na cor de atenção, no lugar do progresso. */
+.nd-agent-row-warning {
+  color: var(--pill-amber-ink);
+}
+
+/* Última linha da saída do comando em curso (spec 123 T01): o servidor já manda só o fim dela. */
+.nd-agent-row-output {
+  display: block;
+  font-size: var(--fs-caption);
+}
+
 /* Texto secundário do agente parado (094/T08, A-05): sem serifa e `--muted`; o mono fica para comando e ferramenta. */
 .nd-agent-card-idle {
   font-family: var(--font-sans);
@@ -235,4 +246,25 @@
 /* Estreita: o nome encolhe para a ação ter espaço. */
 [data-size="narrow"] .nd-agent-row-name {
   flex-basis: 88px;
+}
+
+/* Aviso de custo (spec 124 T06): discreto, texto pequeno em `--ink2`, sem caixa nem botão. */
+.nd-cost-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-cost-alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-cost-alert-item {
+  font-size: var(--fs-label);
+  color: var(--ink2);
 }

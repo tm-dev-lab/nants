@@ -24,6 +24,7 @@ import type {
   RecoveryOption,
 } from "./api/types";
 import { pickActiveSpec } from "./phase";
+import { pausesForHuman } from "./api/events";
 
 /** Cap de mensagens mantidas por projeto (as mais antigas saem primeiro). */
 export const MAX_MESSAGES_PER_PROJECT = 500;
@@ -245,6 +246,17 @@ export interface ActivityEntry {
   /** Último sinal do comando (command/heartbeat, ms locais); sem sinal por COMMAND_STALE_MS ele some. */
   commandLastBeat?: number;
   /**
+   * Progresso real do comando em curso, do `heartbeat` (spec 123 T01): bytes de saída capturados e
+   * a última linha não vazia. Ausentes até o primeiro sinal que os traga.
+   */
+  commandBytes?: number;
+  commandLine?: string;
+  /**
+   * Limite de tempo do comando em curso (spec 123 T02), em ms, como o servidor mandou no início
+   * (rodada de testes do runner ou comando do agente). Ausente = sem limite conhecido.
+   */
+  commandLimitMs?: number;
+  /**
    * Chamada ao modelo em curso (spec 114 T04): início (ms, época Unix) e os bytes da resposta já
    * recebidos (ausente = nenhum ainda). O heartbeat da chamada mantém a entrada viva; sem sinal por
    * COMMAND_STALE_MS, a chamada some da tela.
@@ -290,7 +302,8 @@ const COMMAND_SNAPSHOT_GUARD_MS = 5_000;
 
 /**
  * Execução de `test_command`/checagem (agente "tests", spec 071): vive até o `end`/resultado do
- * servidor, sem heartbeat; por isso não expira por inatividade nem pelo snapshot do servidor.
+ * servidor e não expira por inatividade. Desde a spec 123 (T01) ela tem heartbeat com o progresso
+ * e está no instantâneo do servidor, que é a verdade sobre ela na reidratação.
  */
 /** Etapa `stage` da atividade da verificação final (emitida pelo runner). */
 export const FINAL_VERIFICATION_STAGE = "final_verification";
@@ -308,8 +321,13 @@ function isTestsRun(a: Pick<ActivityEntry, "agent" | "command">): boolean {
 export const COMMAND_STALE_MS = 60_000;
 
 function withoutCommand(a: ActivityEntry): ActivityEntry {
-  const { command: _c, commandStartedAt: _s, commandActivityId: _i, commandLastBeat: _b, ...rest } = a;
+  const { command: _c, commandStartedAt: _s, commandActivityId: _i, commandLastBeat: _b, commandBytes: _n, commandLine: _l, commandLimitMs: _m, ...rest } = a;
   return rest;
+}
+
+/** Última linha de saída válida (texto não vazio), ou `undefined`. */
+function outputLine(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 function withoutModel(a: ActivityEntry): ActivityEntry {
@@ -318,6 +336,11 @@ function withoutModel(a: ActivityEntry): ActivityEntry {
 }
 
 /** Bytes válidos de `received_bytes` (inteiro não negativo), ou `undefined`. */
+/** Limite de tempo válido do comando (ms, inteiro positivo), ou `undefined`. */
+function commandLimit(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function receivedBytes(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
@@ -339,9 +362,10 @@ export function mergeServerActivities(
   let out = list.slice();
   // O servidor é a verdade sobre comandos: um `command_end` perdido (SSE caído no celular) não pode
   // deixar o relógio preso. Entrada sem comando no servidor, ou ausente dele, encerra o comando local.
+  // Desde a spec 123 (T01) a rodada de testes do runner também está no instantâneo.
   const seen = new Set(items.map((it) => activityKey(it.agent, it.task_id)));
   out = out.map((a) => {
-    if (a.command === undefined || seen.has(a.key) || isTestsRun(a)) return a;
+    if (a.command === undefined || seen.has(a.key)) return a;
     if (now - (a.commandStartedAt ?? now) < COMMAND_SNAPSHOT_GUARD_MS) return a;
     return withoutCommand(a);
   });
@@ -377,6 +401,9 @@ export function mergeServerActivities(
             commandStartedAt: Math.min(it.command_started_at ?? lastAt, now),
             commandActivityId: it.activity_id,
             commandLastBeat: lastAt,
+            ...(receivedBytes(it.output_bytes) !== undefined ? { commandBytes: receivedBytes(it.output_bytes) } : {}),
+            ...(outputLine(it.last_line) !== undefined ? { commandLine: outputLine(it.last_line) } : {}),
+            ...(commandLimit(it.command_limit_ms) !== undefined ? { commandLimitMs: commandLimit(it.command_limit_ms) } : {}),
           }
         : {}),
       ...(typeof it.model_started_at === "number"
@@ -386,7 +413,7 @@ export function mergeServerActivities(
           }
         : {}),
       ...(typeof it.stage === "string" && it.stage !== "" ? { stage: it.stage } : {}),
-      ...codedEntry("stageCode", parseCoded(it.stage_code, undefined)),
+      ...codedEntry("stageCode", parseCoded(it.stage_code, it.stage_params)),
       ...codedEntry("toolCode", parseCoded(it.tool_code, it.tool_params)),
       ...codedEntry("textCode", parseCoded(it.text_code, it.text_params)),
       ...(typeof it.structured === "string" && it.structured !== "" ? { structured: it.structured } : {}),
@@ -449,6 +476,9 @@ function reduceActivity(
       delete next.commandStartedAt;
       delete next.commandActivityId;
       delete next.commandLastBeat;
+      delete next.commandBytes;
+      delete next.commandLine;
+      delete next.commandLimitMs;
       delete next.modelStartedAt;
       delete next.modelBytes;
       delete next.endedAt;
@@ -491,38 +521,39 @@ function reduceActivity(
         commandLastBeat: now,
         lastAt: now,
       };
+      delete next.commandBytes;
+      delete next.commandLine;
+      delete next.commandLimitMs;
+      // Spec 123 T02: o limite de tempo vem do servidor no início do comando.
+      if (commandLimit(payload.command_limit_ms) !== undefined) next.commandLimitMs = commandLimit(payload.command_limit_ms);
       delete next.endedAt;
       break;
     }
     case "heartbeat": {
-      // Mantém a bolha viva (não expira por inatividade enquanto o comando ou a chamada rodam) e,
-      // na chamada ao modelo, atualiza os bytes recebidos.
+      // Mantém a bolha viva (não expira por inatividade enquanto o comando ou a chamada rodam) e
+      // atualiza o progresso real: no comando, os bytes de saída e a última linha (spec 123 T01);
+      // na chamada ao modelo, os bytes recebidos.
       const bytes = receivedBytes(payload.received_bytes);
+      const outBytes = receivedBytes(payload.output_bytes);
+      const line = outputLine(payload.last_line);
       next = {
         ...base,
         lastAt: now,
         ...(base.command !== undefined ? { commandLastBeat: now } : {}),
+        ...(base.command !== undefined && outBytes !== undefined ? { commandBytes: outBytes } : {}),
+        ...(base.command !== undefined && line !== undefined ? { commandLine: line } : {}),
         ...(base.modelStartedAt !== undefined && bytes !== undefined ? { modelBytes: bytes } : {}),
       };
       break;
     }
     case "command_end":
-      next = { ...base, lastAt: now };
-      delete next.command;
-      delete next.commandStartedAt;
-      delete next.commandActivityId;
-      delete next.commandLastBeat;
-      delete next.commandLastBeat;
+      next = withoutCommand({ ...base, lastAt: now });
       break;
     default:
       // `end` de um passo antigo (outro activity_id) não encerra o passo atual.
       if (existing !== undefined && existing.activityId !== payload.activity_id) return list.slice();
-      next = { ...base, endedAt: now, lastAt: now };
+      next = withoutCommand({ ...base, endedAt: now, lastAt: now });
       // O passo acabou: nenhum comando nem chamada ao modelo dele segue rodando.
-      delete next.command;
-      delete next.commandStartedAt;
-      delete next.commandActivityId;
-      delete next.commandLastBeat;
       delete next.modelStartedAt;
       delete next.modelBytes;
   }
@@ -1151,8 +1182,9 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
     }
     case "recovery_decided": {
       const { spec_id, task_id, cycle, decision, options, options_analysis } = event.payload;
-      const entry: RecoveryEntry = { phase: decision === "RETRY" ? "retry" : "escalate", cycle };
-      if (decision === "ESCALATE" && options !== undefined && options.length > 0 && options_analysis !== undefined) {
+      const pauses = pausesForHuman(decision);
+      const entry: RecoveryEntry = { phase: pauses ? "escalate" : "retry", cycle };
+      if (pauses && options !== undefined && options.length > 0 && options_analysis !== undefined) {
         entry.options = options;
         entry.options_analysis = options_analysis;
       }

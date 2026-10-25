@@ -3,6 +3,7 @@
  * em português (o que os agentes escrevem aparece como veio); pt-BR igual a hoje; o subtítulo, o
  * selo e o vazio seguem o idioma; a troca vale na hora, sem recarregar.
  */
+import { parseReviewMessage } from "../../reviewMessage";
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState, SpecView, TaskView, UsageView } from "../../api/types";
@@ -188,6 +189,8 @@ describe("Quadro em en", () => {
     expect(toolActionsLabel(3)).toBe("Actions (3)");
     expect(recoveryLabel({ phase: "applied", cycle: 1 } as never)).toBe("New strategy applied (cycle 1)");
     expect(lastReviewLine("T02", "approved")).toBe("Last review · T02 · Approved");
+    const tracked = parseReviewMessage("Pediu ajustes: x\n\nApontamentos:\n- F-02 [HIGH, aberto há 4 revisões] a:1: d\n\nResolvidos:\n- F-01 [HIGH] c:1: f\n- F-03 [HIGH] c:2: g");
+    if (tracked !== null) expect(lastReviewLine("T02", tracked.verdict, tracked)).toBe("Last review · T02 · Asked for changes · 1 still open · 2 resolved");
     // Hora sempre em 24 h, nos dois idiomas.
     const at = new Date(2026, 9, 21, 18, 5, 9).getTime() / 1000;
     expect(formatClock(at)).toBe("18:05:09");

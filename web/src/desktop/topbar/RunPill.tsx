@@ -1,6 +1,9 @@
 /*
  * Pílula de execução da barra superior (spec 093, decisão 8): fase (com destaque ao integrar), título da spec, tarefa, tempo e custo; "Parar" com
  * confirmação; "Retomar" (execução pausada) ou "Continuar" (execução parada).
+ *
+ * Spec 123 T02: durante uma operação longa a fase mostra o que roda ("Testes · 7 min"). Sem espaço,
+ * os detalhes encolhem com reticências e o botão nunca passa por cima dos controles ao lado.
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { getUsage, resumeSpec, stopSpec, type ApiFailure } from "../../api/client";
@@ -13,6 +16,9 @@ import { gateBlocked, gateLevel, isPrereqFailure, prereqItems, prereqMessage, re
 import { t } from "../../i18n";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
+import { barOperationText, currentOperation, nearLimit, OPERATION_TICK_MS, type LongOperation } from "../../longOperation";
+import { useLongOperations } from "../../useLongOperations";
+import { useNowWhile } from "../../useNowWhile";
 import { Dialog } from "../Dialog";
 import { Icon } from "../Icon";
 import { PHASE_TONE } from "../theme/tokens";
@@ -86,6 +92,28 @@ interface RunPillProps {
   resumeSignal?: number;
 }
 
+/**
+ * Fase da execução (spec 123 T02): o rótulo da fase ("Executando") ou, durante uma operação longa,
+ * a fase curta dela ("Testes · 7 min"). O rótulo da fase segue no `status` (para leitores de
+ * tela, sem anunciar o relógio a cada passo); a operação fica visível ao lado.
+ */
+function RunPhase({ label, operations, active }: { label: string; operations: readonly LongOperation[]; active: boolean }) {
+  const now = useNowWhile(active && operations.length > 0, OPERATION_TICK_MS);
+  const op = active ? currentOperation(operations, now) : null;
+  return (
+    <>
+      <span role="status" className={op === null ? "nd-run-phase" : "nd-sr-only"}>
+        {label}
+      </span>
+      {op !== null ? (
+        <span className="nd-run-phase nd-run-op" data-run-operation={op.kind} data-near-limit={nearLimit(op, now) ? "true" : undefined}>
+          {barOperationText(op, now)}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 /** O que falta para retomar ou continuar ("Falta: Docker daemon, Revisor."). */
 function resumeBlockedText(labels: readonly string[]): string {
   return t("run.resumeBlocked", { items: labels.join(", ") });
@@ -110,6 +138,7 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
   // 412 do "Continuar": a mensagem sai dos rótulos da prontidão ATUAL (relida depois do 412).
   const [prereqFailure, setPrereqFailure] = useState<ApiFailure | null>(null);
   const usage = useSpecUsageLine(projectId, activeSpec?.id ?? null, space.execution);
+  const operations = useLongOperations(projectId);
 
   // A execução acabou (estado recarregado sem `run`): o "Parando" sai.
   useEffect(() => {
@@ -185,9 +214,7 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
       data-flash={phase === "integrated" && flash === "integrated" ? "true" : undefined}
     >
       <span className="nd-dot nd-dot-sm" data-tone={tone} data-pulse={PULSING_PHASES.has(phase) ? "true" : undefined} aria-hidden="true" />
-      <span role="status" className="nd-run-phase">
-        {PHASE_LABELS[phase]}
-      </span>
+      <RunPhase label={PHASE_LABELS[phase]} operations={operations} active={space.running} />
       {/*
         Título da spec (095/T07, A-01): o encaixe esconde o título quando cabem menos de ~12
         caracteres (nunca uma letra com reticências); o texto segue no DOM, na dica e no rótulo.
@@ -197,7 +224,13 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
           {specTitle}
         </span>
       </span>
-      {details.length > 0 ? <span className="nd-run-details">{details.join(" · ")}</span> : null}
+      {details.length > 0 ? (
+        // Spec 123 T02: o mesmo encaixe do título; sem espaço para ~10 caracteres, os detalhes
+        // saem inteiros (nunca "T..."), seguem na dica, e o botão ao lado nunca é empurrado para fora.
+        <span className="nd-run-details-slot" data-run-details-slot="" title={details.join(" · ")}>
+          <span className="nd-run-details">{details.join(" · ")}</span>
+        </span>
+      ) : null}
       {space.running ? (
         <button
           type="button"

@@ -3,8 +3,10 @@
  * - em destaque: o total do projeto em 32 px (com "inclui N imagens (estimado)", da 092), o
  *   orçamento da spec ativa ("US$ 0,10 de US$ 5,00" e a barra) e os três maiores itens (papéis e
  *   imagens);
- * - o efeito da gestão de contexto (spec 122), quando houver: compactações, resumos e os tokens
- *   evitados (estimativa), do projeto e da spec ativa, em uma linha cada;
+ * - a área Contexto (spec 122; 123/T03), com chamadas medidas ou algum efeito: à vista, uma linha
+ *   do projeto e uma da spec ativa (compactações, resumos e os tokens evitados, estimativa); em
+ *   "Ver detalhes do contexto" (recolhido), por projeto e spec, chamadas, entrada média, maior
+ *   contexto, cache, os eventos por tipo e os tokens evitados, com a nota da estimativa;
  * - "Ver detalhes por tarefa e modelo" (`<details>` recolhido): tokens e chamadas, barras por papel
  *   e por tarefa, o ritmo do provedor, a tabela por categoria com TOTAL, as chamadas sem preço com
  *   "Configurar", as buscas na web, as imagens, por agente e por modelo;
@@ -16,7 +18,7 @@
  */
 import { memo, useId, useState, type FormEvent } from "react";
 import { putBudget } from "../../api/client";
-import type { NamedUsage, PlanUsageTotals, SpecBudget, UsageTotals } from "../../api/types";
+import type { ContextSummary, NamedUsage, PlanUsageTotals, SpecBudget, UsageTotals } from "../../api/types";
 import { imagesCostHint, imagesCostLine, webSearchCostLine } from "../../copy";
 import { EmptyState } from "../../desktop/EmptyState";
 import { Icon } from "../../desktop/Icon";
@@ -36,10 +38,12 @@ import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
 import {
   budgetProgress,
   contextEffectText,
+  contextRows,
   costBars,
   costText,
   hasApiConsumption,
   hasConsumption,
+  hasContextArea,
   pacingNotice,
   pacingText,
   tokensText,
@@ -89,10 +93,16 @@ function CostsContentView({ size }: AppContentProps) {
   const hasLimit = budget !== null && (budget.max_tokens !== undefined || budget.max_usd !== undefined);
   const top = topCostItems(totals, project.by_agent ?? [], agentLabel);
   const narrow = size === "narrow";
-  // Efeito da gestão de contexto (spec 122): a linha do projeto e, com spec ativa, a da spec.
-  const contextLines = [contextEffectText(project.context), spec === null ? null : contextEffectText(specView?.context, spec.id)].filter(
-    (line): line is string => line !== null,
-  );
+  // Área Contexto (spec 122; 123/T03): a linha do projeto (sem efeito ainda, diz isso) e, com spec
+  // ativa e efeito nela, a da spec; os detalhes por projeto e pela spec ativa.
+  const projectContext = hasContextArea(project.context) ? project.context : null;
+  const specContext = spec !== null && hasContextArea(specView?.context) ? (specView?.context ?? null) : null;
+  const contextLines =
+    projectContext === null
+      ? []
+      : [contextEffectText(projectContext) ?? t("costs.context.none"), specContext === null || spec === null ? null : contextEffectText(specContext, spec.id)].filter(
+          (line): line is string => line !== null,
+        );
   const openPricing = (): void => shell.openSettings("pricing");
   return (
     <div className="nd-app-scroll nd-app-page nd-costs" data-costs="" data-costs-layout={narrow ? "stacked" : "table"}>
@@ -142,13 +152,26 @@ function CostsContentView({ size }: AppContentProps) {
         </section>
       ) : null}
 
-      {contextLines.length > 0 ? (
+      {projectContext !== null ? (
         <section className="nd-costs-context" aria-label={t("costs.context.label")} data-costs-context="">
           {contextLines.map((line) => (
-            <p key={line} className="nd-muted nd-num">
+            <p key={line} className="nd-muted nd-num" data-costs-context-line="">
               {line}
             </p>
           ))}
+          <details className="nd-costs-more" data-costs-context-details="">
+            <summary className="nd-costs-more-summary">
+              <Icon name="chevron-right" size={14} className="nd-details-chevron" />
+              {t("costs.context.details")}
+            </summary>
+            <div className="nd-costs-more-body">
+              <ContextDetails title={t("costs.context.scopeProject")} context={projectContext} scope="project" />
+              {specContext !== null && spec !== null ? <ContextDetails title={t("costs.context.scopeSpec", { spec: spec.id })} context={specContext} scope="spec" /> : null}
+              <p className="nd-muted" data-costs-context-note="">
+                {t("costs.context.estimateNote")}
+              </p>
+            </div>
+          </details>
         </section>
       ) : null}
 
@@ -237,6 +260,26 @@ function BudgetBar({ specId, progress }: { specId: string; progress: BudgetProgr
 }
 
 export const CostsContent = memo(CostsContentView);
+
+/** Números do contexto de um escopo (projeto ou spec ativa), em pares rótulo e valor (123/T03). */
+function ContextDetails({ title, context, scope }: { title: string; context: ContextSummary; scope: "project" | "spec" }) {
+  const headingId = useId();
+  return (
+    <section aria-labelledby={headingId} className="nd-stack-xs" data-context-scope={scope}>
+      <h3 id={headingId} className="nd-section-label">
+        {title}
+      </h3>
+      <dl className="nd-costs-context-list">
+        {contextRows(context).map((row) => (
+          <div key={row.id} className="nd-costs-context-row" data-context-row={row.id}>
+            <dt className="nd-muted">{row.label}</dt>
+            <dd className="nd-num">{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
 
 /**
  * Uso pelo plano ChatGPT (spec 116 T03): os tokens e as chamadas, sem US$ (o uso sai do limite do

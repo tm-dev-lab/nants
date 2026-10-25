@@ -40,6 +40,17 @@ pub struct Settings {
     pub base_branch: String,
     pub merge_strategy: String,
     pub test_command: String,
+    /// Bateria completa (spec 124 T05), opcional: com ela, o `test_command` é o nível rápido de
+    /// cada tentativa e este comando roda antes da revisão e na integração. Ausente = tudo como antes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_test_command: Option<String>,
+    /// Instalação das dependências (spec 124 T05), opcional: o runner a roda antes dos testes só
+    /// quando o hash de `lockfiles` mudou desde a última instalação naquela pasta e ambiente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    /// Arquivos de trava das dependências (caminhos relativos à raiz) que decidem o `install_command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lockfiles: Vec<String>,
     #[serde(default)]
     pub allowed_commands: Vec<String>,
     #[serde(default)]
@@ -229,6 +240,32 @@ fn normalize_rel(raw: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Máximo de arquivos de trava (spec 124 T05).
+pub const MAX_LOCKFILES: usize = 16;
+
+/// Valida `lockfiles` (spec 124 T05): caminhos relativos à raiz, sem `..`, sem glob, sem
+/// duplicata, até [`MAX_LOCKFILES`]. Os inválidos são ignorados.
+pub fn validate_lockfiles(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        let Some(path) = normalize_rel(item).filter(|p| !p.is_empty()) else { continue };
+        if path.contains(['*', '?', '[', '{']) || out.contains(&path) {
+            continue;
+        }
+        out.push(path);
+        if out.len() == MAX_LOCKFILES {
+            break;
+        }
+    }
+    out
+}
+
+/// Comando opcional (spec 124 T05: `full_test_command`, `install_command`) com a forma do
+/// `test_command`; vazio ou inválido = ausente.
+pub fn valid_optional_command(raw: Option<&str>) -> Option<String> {
+    raw.filter(|r| !r.trim().is_empty()).and_then(|r| check_test_command_shape(r).ok())
+}
+
 /// Normaliza `workdir`: relativo, sem `..` (vazio = `.`).
 pub fn normalize_workdir(raw: &str) -> Option<String> {
     normalize_rel(raw).map(|p| if p.is_empty() { ".".to_string() } else { p })
@@ -378,6 +415,15 @@ pub struct SpecMeta {
     /// Ambiente proposto pelo Arquiteto (`docker` ou `host`); valor desconhecido é ignorado.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Bateria completa proposta pelo Arquiteto (spec 124 T05; mesma forma do `test_command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_test_command: Option<String>,
+    /// Instalação das dependências proposta pelo Arquiteto (spec 124 T05; mesma forma do `test_command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    /// Arquivos de trava propostos pelo Arquiteto (spec 124 T05); inválidos são ignorados.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfiles: Option<Vec<String>>,
 }
 
 /// Valida `run_url`: só `http://localhost`, `http://127.0.0.1` ou `http://[::1]`, porta explícita
@@ -517,6 +563,98 @@ pub struct Finding {
     /// Confiança do Revisor (spec 087 T05): `low` não bloqueia e vira observação. `high` não é gravado.
     #[serde(default, skip_serializing_if = "Confidence::is_high")]
     pub confidence: Confidence,
+    /// Estado entre revisões (spec 124 T01). Na resposta do Revisor é o que ele declara (`new` ou
+    /// `open`); no registro da tarefa é o que o runner apurou. Ausente nos findings antigos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<FindingState>,
+    /// Revisões seguidas em que o apontamento está aberto (1 = apareceu nesta). 0 = não apurado.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub recurrence: u32,
+    /// Revisão da tarefa (contagem estável entre tentativas e recuperações) em que apareceu.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_review: u32,
+    /// Tentativa (`attempts + 1` na hora da revisão) em que apareceu.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_attempt: u32,
+    /// Última revisão que tratou o apontamento (o viu aberto ou o deu como resolvido).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_review: u32,
+    /// Decisão do Arquiteto sobre a contestação do Desenvolvedor (spec 124 T02). Um apontamento só é
+    /// contestado uma vez: com decisão gravada, não volta à arbitragem. Ausente sem contestação.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbitration: Option<Arbitration>,
+}
+
+/// Decisão do Arquiteto sobre um apontamento contestado (spec 124 T02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Arbitration {
+    pub decision: ArbitrationDecision,
+    /// Motivo dado pelo Arquiteto (texto do modelo, no idioma do projeto).
+    #[serde(default)]
+    pub reason: String,
+    /// Revisão da tarefa antes da qual a decisão foi tomada.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review: u32,
+}
+
+/// Opções do Arquiteto diante de uma contestação (spec 124 T02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArbitrationDecision {
+    /// O apontamento continua e passa a ser obrigatório (não pode ser contestado de novo).
+    Keep,
+    /// O critério foi reescrito para o que o ambiente prova; o apontamento sai da cobrança.
+    Adjust,
+    /// Vira verificação manual documentada e sai da cobrança automática.
+    Manual,
+}
+
+impl ArbitrationDecision {
+    /// Código estável (`keep`, `adjust`, `manual`), o mesmo do JSON e da marca na mensagem.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Adjust => "adjust",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code.trim() {
+            "keep" => Some(Self::Keep),
+            "adjust" => Some(Self::Adjust),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    /// O apontamento sai da cobrança automática (ajustado ou manual).
+    pub fn waives(self) -> bool {
+        self != Self::Keep
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Estado de um apontamento entre revisões (spec 124 T01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FindingState {
+    /// Apareceu nesta revisão.
+    New,
+    /// Já estava aberto na revisão anterior e continua.
+    Open,
+    /// Estava aberto e não voltou nesta revisão.
+    Resolved,
+}
+
+impl FindingState {
+    /// Ainda pendente (novo ou aberto).
+    pub fn is_pending(self) -> bool {
+        self != FindingState::Resolved
+    }
 }
 
 /// Confiança do Revisor num finding (spec 087 T05); padrão `high`.

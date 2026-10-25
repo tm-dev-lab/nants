@@ -5,7 +5,7 @@
  * (`usageFormat`). O aviso do limitador vem do servidor e aparece como veio.
  */
 import type { ContextSummary, NamedUsage, SpecBudget, UsageTotals } from "../../api/types";
-import { t, tp } from "../../i18n";
+import { formatNumber, t, tp } from "../../i18n";
 import { formatTokens, formatUsd } from "../../usageFormat";
 import { tailLine } from "../activity/activityModel";
 import { isPacing, stepText } from "../shared/activityText";
@@ -35,16 +35,25 @@ export function tokensValue(n: number): string {
 }
 
 /**
- * Efeito da gestão de contexto (spec 122) numa linha: compactações, resumos e os tokens evitados.
- * Os tokens são uma estimativa (bytes tirados do contexto pelos eventos, divididos por 4), e o texto
- * diz isso. Sem nenhum efeito (ou servidor antigo, sem o resumo), `null`: a linha não aparece. Com
- * `spec`, a linha é da spec; sem, do projeto.
+ * Tokens evitados (spec 123 T03): a estimativa do servidor, o que cada evento tirou do histórico
+ * vezes as chamadas seguintes da mesma sessão (`reinjection_avoided_tokens`). Servidor antigo, sem
+ * o campo: os bytes tirados uma vez só (`saved_bytes`), divididos por 4.
+ */
+function contextAvoidedTokens(c: ContextSummary): number {
+  return c.reinjection_avoided_tokens ?? Math.round((c.saved_bytes ?? 0) / 4);
+}
+
+/**
+ * Efeito da gestão de contexto (spec 122; resumo da área Contexto na 123/T03) numa linha:
+ * compactações, resumos e os tokens evitados, que são uma estimativa ([`contextAvoidedTokens`]), e
+ * o texto diz isso. Sem nenhum efeito (ou servidor antigo, sem o resumo), `null`. Com `spec`, a
+ * linha é da spec; sem, do projeto.
  */
 export function contextEffectText(c: ContextSummary | undefined, spec?: string): string | null {
   if (c === undefined) return null;
   const compactions = c.compactions ?? 0;
   const summaries = c.summaries ?? 0;
-  const tokens = Math.round((c.saved_bytes ?? 0) / 4);
+  const tokens = contextAvoidedTokens(c);
   if (compactions === 0 && summaries === 0 && tokens === 0) return null;
   const params = {
     compactions: tp("costs.context.compactions", compactions),
@@ -52,6 +61,39 @@ export function contextEffectText(c: ContextSummary | undefined, spec?: string):
     tokens: formatTokens(tokens),
   };
   return spec === undefined ? t("costs.context.project", params) : t("costs.context.spec", { ...params, spec });
+}
+
+/** A área Contexto aparece com chamadas medidas ou algum efeito; servidor antigo, sem o resumo, não. */
+export function hasContextArea(c: ContextSummary | undefined): c is ContextSummary {
+  return c !== undefined && ((c.calls ?? 0) > 0 || contextEffectText(c) !== null);
+}
+
+interface ContextRow {
+  id: string;
+  label: string;
+  value: string;
+}
+
+/**
+ * Linhas dos detalhes da área Contexto (spec 123 T03): chamadas, entrada média, maior contexto,
+ * cache, os eventos por tipo e os tokens evitados (estimativa). O cache e os eventos novos só
+ * aparecem quando o servidor os informa.
+ */
+export function contextRows(c: ContextSummary): ContextRow[] {
+  const rows: ContextRow[] = [
+    { id: "calls", label: t("costs.context.row.calls"), value: formatNumber(c.calls ?? 0) },
+    { id: "avg", label: t("costs.context.row.avgInput"), value: tokensValue(c.avg_input ?? 0) },
+    { id: "max", label: t("costs.context.row.maxInput"), value: tokensValue(c.max_input ?? 0) },
+  ];
+  if (c.cache_pct !== undefined) {
+    rows.push({ id: "cache", label: t("costs.context.row.cache"), value: formatNumber(c.cache_pct / 100, { style: "percent", maximumFractionDigits: 0 }) });
+  }
+  rows.push({ id: "compactions", label: t("costs.context.row.compactions"), value: formatNumber(c.compactions ?? 0) });
+  if (c.spills !== undefined) rows.push({ id: "spills", label: t("costs.context.row.spills"), value: formatNumber(c.spills) });
+  if (c.dedups !== undefined) rows.push({ id: "dedups", label: t("costs.context.row.dedups"), value: formatNumber(c.dedups) });
+  rows.push({ id: "summaries", label: t("costs.context.row.summaries"), value: formatNumber(c.summaries ?? 0) });
+  rows.push({ id: "avoided", label: t("costs.context.row.avoided"), value: tokensValue(contextAvoidedTokens(c)) });
+  return rows;
 }
 
 export interface CostBar {

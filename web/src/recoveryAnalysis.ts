@@ -23,6 +23,9 @@ const LABELS: readonly (readonly [string, MessageKey])[] = [
   ["- Escopo não ampliado: ", "recoveryText.scopeNotAdded"],
   ["- Escopo recusado: ", "recoveryText.scopeRefused"],
   ["- Proposta: ", "recoveryText.proposal"],
+  ["- Pergunta ao humano: ", "recoveryText.question"],
+  ["- Tarefas novas: ", "recoveryText.newTasks"],
+  ["- Apontamentos dispensados: ", "recoveryText.waived"],
   ["- Opções descartadas: ", "recoveryText.discarded"],
   ["- comando: ", "recoveryText.command"],
   ["- código: ", "recoveryText.exitCode"],
@@ -35,6 +38,13 @@ const FIXED: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
   ["- Decisão: tarefa revisada (REVISE_TASK)", "recoveryText.decision.revise"],
   ["- Decisão: nova estratégia (RETRY)", "recoveryText.decision.retry"],
   ["- Decisão: escalar ao humano", "recoveryText.decision.escalate"],
+  ["- Decisão: tarefa dividida (SPLIT)", "recoveryText.decision.split"],
+  ["- Decisão: critérios ajustados ao que o ambiente prova (ADJUST)", "recoveryText.decision.adjust"],
+  ["- Decisão: pergunta ao humano (ASK)", "recoveryText.decision.ask"],
+  [
+    "- Ajuste não aplicado: os critérios não puderam ser gravados; a tarefa segue com a estratégia (RETRY)",
+    "recoveryText.adjustRefused",
+  ],
   ["- Configuração de testes corrigida e aplicada pelo servidor", "recoveryText.configApplied"],
   ["Ambiente docker ajustado: o run será relançado com o ambiente novo.", "recoveryText.migrated"],
   ["- Contagem: não conta como ciclo (escalada determinística)", "recoveryText.notCounted"],
@@ -53,6 +63,10 @@ const FIXED: ReadonlyMap<string, MessageKey> = new Map<string, MessageKey>([
   [
     "- opções: (1) orientar o Desenvolvedor com uma estratégia concreta e usar Retomar; (2) revisar o objetivo/critérios da tarefa; (3) decidir o ponto de produto em aberto",
     "recoveryText.options.quality",
+  ],
+  [
+    "- opções: responda à pergunta acima no campo de orientação; a tarefa volta a executar com a sua resposta",
+    "recoveryText.options.ask",
   ],
 ]);
 

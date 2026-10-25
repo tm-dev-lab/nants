@@ -50,6 +50,13 @@ struct Entry {
     text_code: Option<Coded>,
     /// Código da saída estruturada do passo (spec 121), quando há.
     structured: Option<String>,
+    /// `params` da etapa (rodada do runner: tentativa e checagem, spec 123 T01).
+    stage_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Progresso real do comando em curso (spec 123 T01): bytes de saída e a última linha.
+    output_bytes: Option<u64>,
+    last_line: Option<String>,
+    /// Limite de tempo do comando em curso (spec 123 T02, rodada de testes do runner), em ms.
+    command_limit_ms: Option<u64>,
     updated: Instant,
 }
 
@@ -76,6 +83,13 @@ pub struct Observed<'a> {
     pub received_bytes: Option<u64>,
     /// Código da saída estruturada do passo (spec 121), já filtrado pelo vocabulário.
     pub structured: Option<&'a str>,
+    /// `params` (já saneados) da etapa, quando há (rodada do runner, spec 123 T01).
+    pub stage_params: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// Progresso do comando em curso, do `heartbeat` (spec 123 T01), já redigido.
+    pub output_bytes: Option<u64>,
+    pub last_line: Option<&'a str>,
+    /// Limite de tempo do comando que começa (spec 123 T02), em ms; só no `command`.
+    pub command_limit_ms: Option<u64>,
 }
 
 /// Atividade ao vivo de um (agente, tarefa), como exposta pela API.
@@ -111,6 +125,17 @@ pub struct LiveActivity {
     /// Código da saída estruturada (spec 121): a interface mostra o rótulo dele, não o texto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Progresso do comando em curso (spec 123 T01): bytes de saída e a última linha não vazia.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_line: Option<String>,
+    /// Limite de tempo do comando em curso (spec 123 T02), em ms, quando há: a tela mostra o tempo
+    /// contra ele ("há 7 min (limite de 10 min)").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_limit_ms: Option<u64>,
     pub age_ms: u64,
 }
 
@@ -167,6 +192,10 @@ impl LiveActivityRegistry {
             tool_code: None,
             text_code: None,
             structured: ev.structured.map(String::from),
+            stage_params: ev.stage_params.cloned(),
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             updated: now,
         };
         let entry = map.entry(key).or_insert_with(fresh);
@@ -192,8 +221,20 @@ impl LiveActivityRegistry {
             ActivityKind::Command => {
                 entry.command = value;
                 entry.command_started_at = Some(epoch_ms());
+                entry.output_bytes = None;
+                entry.last_line = None;
+                entry.command_limit_ms = ev.command_limit_ms;
             }
-            ActivityKind::Heartbeat => {}
+            ActivityKind::Heartbeat => {
+                if entry.command.is_some() {
+                    if ev.output_bytes.is_some() {
+                        entry.output_bytes = ev.output_bytes;
+                    }
+                    if let Some(line) = ev.last_line {
+                        entry.last_line = Some(line.to_string());
+                    }
+                }
+            }
             ActivityKind::ModelBeat => {
                 if entry.model_started_at.is_some() && ev.received_bytes.is_some() {
                     entry.received_bytes = ev.received_bytes;
@@ -202,6 +243,9 @@ impl LiveActivityRegistry {
             ActivityKind::CommandEnd => {
                 entry.command = None;
                 entry.command_started_at = None;
+                entry.output_bytes = None;
+                entry.last_line = None;
+                entry.command_limit_ms = None;
             }
             ActivityKind::Model => {
                 entry.model_started_at = Some(epoch_ms());
@@ -258,6 +302,10 @@ impl LiveActivityRegistry {
                 text_code: e.text_code.as_ref().map(|(c, _)| c.clone()),
                 text_params: e.text_code.as_ref().map(|(_, p)| p.clone()),
                 structured: e.structured.clone(),
+                stage_params: e.stage_params.clone(),
+                output_bytes: e.output_bytes,
+                last_line: e.last_line.clone(),
+                command_limit_ms: e.command_limit_ms,
                 age_ms: u64::try_from(now.saturating_duration_since(e.updated).as_millis())
                     .unwrap_or(u64::MAX),
             })
@@ -305,6 +353,10 @@ mod tests {
             code: None,
             received_bytes: None,
             structured: None,
+            stage_params: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
         };
         r.record_at(now, "p", ev);
     }
@@ -344,6 +396,10 @@ mod tests {
             code: None,
             received_bytes,
             structured: None,
+            stage_params: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None));
         r.record_at(t, "p", ev(ActivityKind::Model, None));
@@ -382,6 +438,10 @@ mod tests {
             code: None,
             received_bytes: None,
             structured: None,
+            stage_params: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start));
         let late = t + Duration::from_secs(600);
@@ -435,6 +495,10 @@ mod tests {
                 code: None,
                 received_bytes: None,
                 structured: None,
+                stage_params: None,
+                output_bytes: None,
+                last_line: None,
+                command_limit_ms: None,
             };
             r.record_at(t, "p", ev);
         }
@@ -460,6 +524,10 @@ mod tests {
             code: None,
             received_bytes: None,
             structured,
+            stage_params: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None, Some("plan_review")));
         r.record_at(t, "p", ev(ActivityKind::Text, Some("{\"issues\": []}"), Some("plan_review")));
@@ -493,6 +561,10 @@ mod tests {
             code,
             received_bytes: None,
             structured: None,
+            stage_params: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
         };
         r.record_at(t, "p", ev(ActivityKind::Start, None, None));
         r.record_at(t, "p", ev(ActivityKind::Tool, Some("gerando imagem web/a.png"), Some(("tool.generate_image", &params))));

@@ -10,7 +10,24 @@
  */
 import { isMessageCode, parseCodeParams } from "./codes";
 import { useEffect, useRef } from "react";
-import type { ApiEvent, ApiEventType, LaggedEvent } from "./types";
+import type { ApiEvent, ApiEventType, LaggedEvent, RecoveryDecision } from "./types";
+
+/** Decisões que o servidor anuncia no `recovery_decided` (spec 124 T03: SPLIT, ADJUST e ASK). */
+const RECOVERY_DECISIONS: readonly string[] = [
+  "RETRY",
+  "REVISE_TASK",
+  "REVISE_CONFIG",
+  "MIGRATE_ENVIRONMENT",
+  "SPLIT",
+  "ADJUST",
+  "ASK",
+  "ESCALATE",
+] satisfies readonly RecoveryDecision[];
+
+/** Decisões que pausam a execução à espera do humano (ESCALATE e ASK). */
+export function pausesForHuman(decision: RecoveryDecision): boolean {
+  return decision === "ESCALATE" || decision === "ASK";
+}
 
 const EVENT_STREAM_PATH = "/api/events";
 /** Primeiro atraso de reconexão. */
@@ -259,7 +276,8 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
         isStr(p.spec_id) &&
         isStr(p.task_id) &&
         isAttempt(p.cycle) &&
-        (p.decision === "RETRY" || p.decision === "ESCALATE") &&
+        typeof p.decision === "string" &&
+        RECOVERY_DECISIONS.includes(p.decision) &&
         (p.options === undefined || Array.isArray(p.options)) &&
         (p.options_analysis === undefined || (typeof p.options_analysis === "number" && Number.isFinite(p.options_analysis)))
       );

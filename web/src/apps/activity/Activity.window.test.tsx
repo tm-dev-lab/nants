@@ -144,6 +144,66 @@ describe("Atividade: cartões por agente e ação ao vivo", () => {
     expect(findForbiddenGlyphs(win)).toEqual([]);
   });
 
+  it("comando longo e rodada de testes: o cartão mostra o comando, o tempo e a última linha (spec 123 T01)", async () => {
+    const { stream, scheduler } = await mount();
+    const started = Date.now() - 190_000;
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "start" }));
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "command", text: "npx playwright test --workers=1", command_started_at: started }));
+      scheduler.runFrames();
+    });
+    const win = panel();
+    const dev = win.querySelector('[data-agent-card="developer"]') as HTMLElement;
+    expect(dev.getAttribute("data-live")).toBe("command");
+    expect(dev.querySelector("[data-live-detail]")?.textContent).toBe("npx playwright test --workers=1");
+    expect(dev.querySelector("[data-live-progress]")?.textContent).toBe("há 3 min");
+    expect(dev.querySelector("[data-live-output]")).toBeNull();
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "heartbeat", output_bytes: 14_336, last_line: "ok 12 cena.spec.ts:40 desenha o voxel (2.1s)" }));
+      scheduler.runFrames();
+    });
+    expect(dev.querySelector("[data-live-progress]")?.textContent).toBe("há 3 min · 14 KB de saída");
+    expect(dev.querySelector("[data-live-output]")?.textContent).toBe("ok 12 cena.spec.ts:40 desenha o voxel (2.1s)");
+    expect(dev.querySelector("[data-agent-idle]")).toBeNull();
+    // A rodada do runner ganha o próprio cartão, com o mesmo sinal de vida.
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-3", kind: "command", text: "npm test", command_started_at: Date.now() - 420_000 }));
+      stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-3", kind: "heartbeat", output_bytes: 900, last_line: "Tests: 41 passed" }));
+      scheduler.runFrames();
+    });
+    const tests = win.querySelector('[data-agent-card="tests"]') as HTMLElement;
+    expect(tests.querySelector("[data-live-state]")?.textContent).toBe("rodando os testes");
+    expect(tests.querySelector("[data-live-progress]")?.textContent).toBe("há 7 min · 900 B de saída");
+    expect(tests.querySelector("[data-live-output]")?.textContent).toBe("Tests: 41 passed");
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", kind: "command_end" }));
+      scheduler.runFrames();
+    });
+    expect(dev.querySelector("[data-live-progress]")).toBeNull();
+    expect(dev.querySelector("[data-live-output]")).toBeNull();
+    expect(findForbiddenGlyphs(win)).toEqual([]);
+  });
+
+  it("rodada de testes com o limite do servidor: tempo contra o limite e, perto dele, o aviso no mesmo lugar (spec 123 T02)", async () => {
+    const { stream, scheduler } = await mount();
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-3", kind: "command", text: "npx playwright test", command_started_at: Date.now() - 420_000, command_limit_ms: 600_000 }));
+      stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-3", kind: "heartbeat", output_bytes: 900, last_line: "ok 30 cena.spec.ts" }));
+      scheduler.runFrames();
+    });
+    const win = panel();
+    const tests = () => win.querySelector('[data-agent-card="tests"]') as HTMLElement;
+    expect(tests().querySelector("[data-live-progress]")?.textContent).toBe("há 7 min (limite de 10 min) · 900 B de saída");
+    expect(tests().querySelector("[data-live-warning]")).toBeNull();
+    await act(async () => {
+      stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-4", kind: "command", text: "npx playwright test", command_started_at: Date.now() - 545_000, command_limit_ms: 600_000 }));
+      scheduler.runFrames();
+    });
+    expect(tests().querySelector("[data-live-progress]")?.textContent).toBe("há 9 min (limite de 10 min)");
+    expect(tests().querySelector("[data-live-warning]")?.textContent).toBe("perto do limite de tempo");
+    expect(findForbiddenGlyphs(win)).toEqual([]);
+  });
+
   it("rajada de eventos: um render por quadro, com o valor mais recente", async () => {
     const { stream, scheduler } = await mount();
     await act(async () => {

@@ -11,7 +11,7 @@
  * no máximo um render por quadro, e só desta janela. A trilha não é buscada com a janela fora de
  * vista.
  */
-import { memo, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { memo, useId, useMemo, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { ToolActionItem } from "../../api/types";
 import { Icon, type IconName } from "../../desktop/Icon";
 import { useSpace } from "../../desktop/shellContext";
@@ -25,7 +25,9 @@ import { toolActionText } from "../shared/activityText";
 import { agentLabel, agentTone } from "../shared/agents";
 import { ToolLabel } from "../shared/ActivityBubble";
 import { FinalVerificationNotice } from "../shared/FinalVerificationNotice";
+import { costAlertText, openCostAlerts, type TaskCostAlert } from "../shared/costAlert";
 import { useStoreByFrame } from "../shared/useFrameStore";
+import { useNowWhile } from "../../useNowWhile";
 import { useToolTrail } from "../shared/useToolTrail";
 import "../shared/apps.css";
 import "./activity.css";
@@ -39,18 +41,6 @@ const RECENT_ACTIONS = 8;
 /** Passo do relógio da chamada ao modelo (o texto mostra segundos e minutos). */
 const MODEL_TICK_MS = 5_000;
 
-/** Instante atual, renovado a cada `ms` só enquanto `active` (sem relógio parado na tela). */
-function useNowWhile(active: boolean, ms: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return undefined;
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), ms);
-    return () => clearInterval(timer);
-  }, [active, ms]);
-  return active ? now : Date.now();
-}
-
 type Tab = "live" | "history";
 
 function ActivityContentView(_props: AppContentProps) {
@@ -60,6 +50,9 @@ function ActivityContentView(_props: AppContentProps) {
   const tabsId = useId();
   const liveRef = useRef<HTMLButtonElement>(null);
   const historyRef = useRef<HTMLButtonElement>(null);
+  // Spec 124 T06: a lista só muda com o estado da spec (o `LiveTab` é `memo`).
+  const activeSpec = space?.data.activeSpec ?? null;
+  const costAlerts = useMemo(() => openCostAlerts(activeSpec), [activeSpec]);
   if (space === null) return null;
   const tab: Tab = space.selection.activityTab ?? "live";
   const pick = (next: Tab): void => {
@@ -109,7 +102,13 @@ function ActivityContentView(_props: AppContentProps) {
       </div>
       <div role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`} className="nd-activity-panel nd-app-scroll">
         {tab === "live" ? (
-          <LiveTab projectId={data.projectId} specId={data.activeSpec?.id ?? null} activeTaskId={data.activeSpec === null ? null : (pickActiveTask(data.activeSpec.tasks)?.id ?? null)} running={data.running} />
+          <LiveTab
+            projectId={data.projectId}
+            specId={data.activeSpec?.id ?? null}
+            activeTaskId={data.activeSpec === null ? null : (pickActiveTask(data.activeSpec.tasks)?.id ?? null)}
+            running={data.running}
+            costAlerts={costAlerts}
+          />
         ) : (
           <HistoryTab projectId={data.projectId} specId={data.activeSpec?.id ?? null} />
         )}
@@ -120,7 +119,19 @@ function ActivityContentView(_props: AppContentProps) {
 
 export const ActivityContent = memo(ActivityContentView);
 
-const LiveTab = memo(function LiveTab({ projectId, specId, activeTaskId, running }: { projectId: string; specId: string | null; activeTaskId: string | null; running: boolean }) {
+const LiveTab = memo(function LiveTab({
+  projectId,
+  specId,
+  activeTaskId,
+  running,
+  costAlerts,
+}: {
+  projectId: string;
+  specId: string | null;
+  activeTaskId: string | null;
+  running: boolean;
+  costAlerts: readonly TaskCostAlert[];
+}) {
   const { t } = useT();
   const activities = useStoreByFrame(projectId, (s) => s.activities[projectId] ?? NO_ACTIVITIES);
   const visible = useWindowVisibility("activity");
@@ -134,6 +145,7 @@ const LiveTab = memo(function LiveTab({ projectId, specId, activeTaskId, running
         {names.length === 0 ? "" : t("activity.summaryActive", { names: names.join(", ") })}
       </p>
       <FinalVerificationNotice projectId={projectId} />
+      <CostAlerts items={costAlerts} />
       <ul className="nd-agent-rows" aria-label={t("activity.agents")}>
         {agents.map((agent) => (
           <AgentRow key={agent} agent={agent} activity={latest.get(agent)} running={running} />
@@ -155,8 +167,9 @@ function dotTone(agent: string, live: { kind: LiveKind } | null): string {
  * `--muted` ("gerando imagem web/img/gato.webp"), com a tarefa em mono e a etapa abaixo, quando há.
  */
 function AgentRow({ agent, activity, running }: { agent: string; activity: ActivityEntry | undefined; running: boolean }) {
-  // Spec 114 T04: durante a chamada ao modelo, o tempo segue andando entre os sinais do servidor.
-  const now = useNowWhile(activity?.modelStartedAt !== undefined, MODEL_TICK_MS);
+  // Spec 114 T04 e 123 T01: durante a chamada ao modelo ou o comando, o tempo segue andando entre
+  // os sinais do servidor.
+  const now = useNowWhile(activity?.modelStartedAt !== undefined || activity?.command !== undefined, MODEL_TICK_MS);
   const live = activity === undefined ? null : liveActionOf(activity, now);
   const tone = dotTone(agent, live);
   return (
@@ -196,8 +209,44 @@ function AgentRow({ agent, activity, running }: { agent: string; activity: Activ
             {live.model}
           </span>
         ) : null}
+        {live !== null && live.progress !== null ? (
+          <span className="nd-agent-row-stage" data-live-progress="">
+            {live.progress}
+          </span>
+        ) : null}
+        {live !== null && live.warning !== null ? (
+          <span className="nd-agent-row-stage nd-agent-row-warning" data-live-warning="" data-tone="amber">
+            {live.warning}
+          </span>
+        ) : null}
+        {live !== null && live.output !== null ? (
+          <span className="nd-agent-row-stage nd-agent-row-output nd-mono nd-break" data-live-output="">
+            {live.output}
+          </span>
+        ) : null}
       </span>
     </li>
+  );
+}
+
+/** Aviso de custo das tarefas abertas (spec 124 T06): uma linha discreta por tarefa, sem botão. */
+function CostAlerts({ items }: { items: readonly TaskCostAlert[] }) {
+  const headingId = useId();
+  const { t } = useT();
+  if (items.length === 0) return null;
+  return (
+    <section aria-labelledby={headingId} className="nd-cost-alerts" data-cost-alerts="">
+      <h3 id={headingId} className="nd-section-label" data-tone="amber">
+        {t("cost.alert.title")}
+      </h3>
+      <ul className="nd-cost-alert-list">
+        {items.map((item) => (
+          <li key={item.task} className="nd-cost-alert-item nd-break" data-cost-alert={item.task}>
+            {costAlertText(item.task, item.alert)}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

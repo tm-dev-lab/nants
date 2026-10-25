@@ -80,6 +80,7 @@ use crate::agents::spill;
 use crate::harness::allowlist::{evaluate, Decision, Policy};
 use crate::harness::browser::BrowserTests;
 use crate::harness::compose::{ComposeEnv, HeadTail};
+use crate::harness::progress::CommandProgress;
 use crate::harness::web::WebClient;
 use crate::server::events::SecretSet;
 use crate::sdd::environment;
@@ -800,6 +801,8 @@ pub struct ToolHost {
     report: bool,
     /// Modo docker: `run_command` do Desenvolvedor executa no serviço `workspace` do Compose.
     compose: Option<Arc<ComposeEnv>>,
+    /// Registro das rodadas dos comandos de teste do projeto (spec 124 T05); ausente = nada é observado.
+    suite_ledger: Option<crate::sdd::test_levels::SuiteLedger>,
     /// Executor de `run_browser_tests` (container Playwright efêmero); ausente → indisponível.
     browser: Option<Arc<BrowserTests>>,
     /// `(base, branch)` para `diff_file` do Revisor.
@@ -953,6 +956,7 @@ impl ToolHost {
             sdd_writes_enabled: true,
             report: false,
             compose: None,
+            suite_ledger: None,
             browser: None,
             diff_range: None,
             secrets: None,
@@ -1151,6 +1155,13 @@ impl ToolHost {
         self
     }
 
+    /// Spec 124 T05: o `run_command` do Desenvolvedor registra em `ledger` as rodadas dos comandos de
+    /// teste do projeto (com o hash da árvore antes e depois), para o runner não repeti-las.
+    pub fn with_suite_ledger(mut self, ledger: crate::sdd::test_levels::SuiteLedger) -> Self {
+        self.suite_ledger = Some(ledger);
+        self
+    }
+
     /// Raiz do host (a worktree do agente, ou o projeto).
     pub fn root(&self) -> &Path {
         &self.root
@@ -1181,6 +1192,22 @@ impl ToolHost {
         args: Value,
         on_notice: &(dyn Fn(String) + Send + Sync),
     ) -> Result<String, ToolError> {
+        self.call_inner(tool, args, on_notice, None).await
+    }
+
+    /// Como [`Self::call`], copiando a saída de `run_command`/`run_browser_tests` em `progress`
+    /// enquanto o comando roda (spec 123 T01: o heartbeat leva os bytes e a última linha).
+    pub async fn call_progress(&self, tool: ToolName, args: Value, progress: &Arc<CommandProgress>) -> Result<String, ToolError> {
+        self.call_inner(tool, args, &|_| {}, Some(progress)).await
+    }
+
+    async fn call_inner(
+        &self,
+        tool: ToolName,
+        args: Value,
+        on_notice: &(dyn Fn(String) + Send + Sync),
+        progress: Option<&Arc<CommandProgress>>,
+    ) -> Result<String, ToolError> {
         if !is_allowed(self.role, tool)
             || (tool == ToolName::WriteSddArtifacts && !self.sdd_writes_enabled)
             || (self.report && tool == ToolName::RunCommand)
@@ -1194,9 +1221,9 @@ impl ToolHost {
             ToolName::WriteSddArtifacts => self.write_sdd_artifacts(&args)?,
             ToolName::WriteFile => self.write_file(&args)?,
             ToolName::ApplyPatch => self.apply_patch(&args)?,
-            ToolName::RunCommand => self.run_command(&args).await?,
+            ToolName::RunCommand => self.run_command(&args, progress).await?,
             ToolName::RequestEnvironmentChange => self.request_environment_change(&args).await?,
-            ToolName::RunBrowserTests => self.run_browser_tests(&args).await?,
+            ToolName::RunBrowserTests => self.run_browser_tests(&args, progress).await?,
             ToolName::DiffFile => self.diff_file(&args)?,
             ToolName::AskArchitect => self.ask_architect(&args).await?,
             ToolName::ViewScreenshot => self.view_screenshot(&args)?,
@@ -1656,7 +1683,7 @@ impl ToolHost {
                 "ARCHITECTURE.md só pode ser alterado enquanto a spec está em rascunho (DRAFT/AWAITING_APPROVAL)",
             ));
         }
-        let normalized = crate::server::architecture::validate_content(content)
+        let normalized = crate::server::architecture::validate_content_for(content, self.lang)
             .map_err(|code| ToolError::InvalidArgs(format!("ARCHITECTURE.md inválido: {code}")))?;
         let target = self.check_write_target(rel, WriteScope::Env)?;
         if fs::symlink_metadata(self.root.join(rel)).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -2051,7 +2078,24 @@ impl ToolHost {
         Ok(patch_report(path, &patched))
     }
 
-    async fn run_browser_tests(&self, args: &Value) -> Result<String, ToolError> {
+    /// Limite de tempo do caminho que vai rodar a ferramenta de comando (spec 123 T02), para a tela
+    /// mostrar "há 3 min (limite de 5 min)": `run_command` usa o `command_timeout` (no host e no
+    /// workspace do Compose); `run_browser_tests` usa o `BROWSER_TIMEOUT` no workspace do Compose
+    /// e o limite do container efêmero fora dele. Sem caminho (sem navegador), `None`.
+    pub fn command_limit(&self, tool: &str) -> Option<Duration> {
+        if tool == ToolName::RunCommand.name() {
+            return Some(self.command_timeout);
+        }
+        if tool == ToolName::RunBrowserTests.name() {
+            if self.compose.is_some() && self.role == Role::Developer {
+                return Some(crate::harness::browser::BROWSER_TIMEOUT);
+            }
+            return self.browser.as_ref().map(|b| b.timeout());
+        }
+        None
+    }
+
+    async fn run_browser_tests(&self, args: &Value, progress: Option<&Arc<CommandProgress>>) -> Result<String, ToolError> {
         let command = arg(args, "command")?.to_string();
         if command.trim().is_empty() {
             return Err(ToolError::InvalidArgs("comando vazio".into()));
@@ -2069,19 +2113,20 @@ impl ToolHost {
         // caminho do `run_command` do Desenvolvedor; a aprovação continua dispensada.
         if self.compose.is_some() && self.role == Role::Developer {
             // Spec 087 T01: o estouro do limite já volta como texto (`exit: timeout`) com a cauda.
-            return self.compose_exec(&command, crate::harness::browser::BROWSER_TIMEOUT).await;
+            return self.compose_exec(&command, crate::harness::browser::BROWSER_TIMEOUT, progress).await;
         }
         let Some(browser) = self.browser.clone() else {
             return Ok(crate::harness::browser::UNAVAILABLE.to_string());
         };
         let root = self.canonical_root()?;
-        tokio::task::spawn_blocking(move || browser.run(&root, &command))
+        let progress = progress.cloned();
+        tokio::task::spawn_blocking(move || browser.run_watched(&root, &command, progress.as_ref()))
             .await
             .map_err(|e| io::Error::other(e.to_string()))?
             .map_err(ToolError::InvalidArgs)
     }
 
-    async fn run_command(&self, args: &Value) -> Result<String, ToolError> {
+    async fn run_command(&self, args: &Value, progress: Option<&Arc<CommandProgress>>) -> Result<String, ToolError> {
         let command = arg(args, "command")?;
         // Spec 071: elevação de privilégio é recusada na hora, em qualquer modo/papel, sem
         // pedir ao humano nem ao juiz (nenhum evento de permissão).
@@ -2100,7 +2145,7 @@ impl ToolHost {
         self.check_command_paths(&tokens)?;
         match evaluate(command, &self.policy) {
             Decision::Deny(reason) => Err(self.permission_denied(reason)),
-            Decision::Allow => self.exec(command, &tokens).await,
+            Decision::Allow => self.exec_observed(command, &tokens, progress).await,
             Decision::NeedsApproval => {
                 let req = ApprovalRequest {
                     role: self.role,
@@ -2110,7 +2155,7 @@ impl ToolHost {
                 };
                 match self.approver.approve(&req).await {
                     ApprovalDecision::Once | ApprovalDecision::Run | ApprovalDecision::Always => {
-                        self.exec(command, &tokens).await
+                        self.exec_observed(command, &tokens, progress).await
                     }
                     ApprovalDecision::Deny => Err(self.permission_denied(DENY_MESSAGE.to_string())),
                 }
@@ -2205,17 +2250,50 @@ impl ToolHost {
         Ok(())
     }
 
+    /// [`Self::exec`] do Desenvolvedor; quando o comando é um dos de teste do projeto observados
+    /// (spec 124 T05), registra a rodada com o hash da árvore antes e depois e o resultado.
+    async fn exec_observed(&self, command: &str, tokens: &[String], progress: Option<&Arc<CommandProgress>>) -> Result<String, ToolError> {
+        let ledger = match &self.suite_ledger {
+            Some(l) if self.role == Role::Developer && l.watches(command) => l.clone(),
+            _ => return self.exec(command, tokens, progress).await,
+        };
+        let tree = |root: PathBuf| async move {
+            tokio::task::spawn_blocking(move || crate::sdd::test_levels::tree_hash(&root)).await.ok().flatten()
+        };
+        let tree_before = tree(self.root.clone()).await;
+        let started = std::time::SystemTime::now();
+        let clock = std::time::Instant::now();
+        let out = self.exec(command, tokens, progress).await?;
+        let elapsed = clock.elapsed();
+        let tree_after = tree(self.root.clone()).await;
+        ledger.record(crate::sdd::test_levels::SuiteRun {
+            command: command.to_string(),
+            tree_before,
+            tree_after,
+            in_container: self.compose.is_some(),
+            passed: out == "exit: 0" || out.starts_with("exit: 0\n"),
+            elapsed,
+            started,
+            output: out.clone(),
+        });
+        Ok(out)
+    }
+
     /// Executa o comando já tokenizado (sem shell), com `current_dir` na raiz e timeout.
     /// Stdout e stderr são capturados aos poucos, cada um limitado a `MAX_OUTPUT_BYTES` com
     /// cabeça + cauda (o meio excedente é descartado). No estouro do limite o processo é morto e a
     /// saída já capturada volta como `exit: timeout (<N> s)` (spec 087 T01).
-    async fn exec(&self, command: &str, tokens: &[String]) -> Result<String, ToolError> {
+    async fn exec(&self, command: &str, tokens: &[String], progress: Option<&Arc<CommandProgress>>) -> Result<String, ToolError> {
         let (program, args) = tokens
             .split_first()
             .ok_or_else(|| ToolError::InvalidArgs("comando vazio".into()))?;
         let timeout = self.command_timeout;
         if self.compose.is_some() && self.role == Role::Developer {
-            return self.compose_exec(command, timeout).await;
+            return self.compose_exec(command, timeout, progress).await;
+        }
+        // Spec 123 T02: o processo vai rodar agora (autorização já resolvida): o relógio da tela começa.
+        if let Some(p) = progress {
+            p.mark_started();
         }
         let started = std::time::Instant::now();
         let mut child = tokio::process::Command::new(program)
@@ -2239,8 +2317,8 @@ impl ToolHost {
         let work = async {
             let (status, out, err) = tokio::join!(
                 child.wait(),
-                read_capture(stdout, &mut out_cap),
-                read_capture(stderr, &mut err_cap)
+                read_capture(stdout, &mut out_cap, progress.map(|p| &**p)),
+                read_capture(stderr, &mut err_cap, progress.map(|p| &**p))
             );
             out?;
             err?;
@@ -2272,14 +2350,19 @@ impl ToolHost {
     }
 
     /// Executa `command` no serviço `workspace` do Compose (modo docker), com `timeout`.
-    async fn compose_exec(&self, command: &str, timeout: Duration) -> Result<String, ToolError> {
+    async fn compose_exec(&self, command: &str, timeout: Duration, progress: Option<&Arc<CommandProgress>>) -> Result<String, ToolError> {
         let compose = self
             .compose
             .clone()
             .ok_or_else(|| ToolError::InvalidArgs("ambiente docker indisponível".into()))?;
         let (root, command) = (self.root.clone(), command.to_string());
+        // Spec 123 T02: autorização resolvida; o comando entra no workspace agora.
+        if let Some(p) = progress {
+            p.mark_started();
+        }
         let started = std::time::Instant::now();
-        let out = tokio::task::spawn_blocking(move || compose.exec(&root, &command, timeout))
+        let progress = progress.cloned();
+        let out = tokio::task::spawn_blocking(move || compose.exec_watched(&root, &command, timeout, progress.as_ref()))
             .await
             .map_err(|e| io::Error::other(e.to_string()))?
             .map_err(|e| ToolError::Io(io::Error::other(e)))?;
@@ -2771,7 +2854,7 @@ fn stage_tmp(tmp: &Path, content: &str) -> io::Result<()> {
 }
 
 /// Lê `reader` até o fim, guardando cabeça + cauda em `capture` (o meio excedente é descartado).
-async fn read_capture<R: AsyncRead + Unpin>(mut reader: R, capture: &mut HeadTail) -> io::Result<()> {
+async fn read_capture<R: AsyncRead + Unpin>(mut reader: R, capture: &mut HeadTail, progress: Option<&CommandProgress>) -> io::Result<()> {
     let mut buf = [0u8; 8192];
     loop {
         // `read` é seguro sob cancelamento: o que já foi lido já está na captura.
@@ -2780,6 +2863,9 @@ async fn read_capture<R: AsyncRead + Unpin>(mut reader: R, capture: &mut HeadTai
             return Ok(());
         }
         capture.push(&buf[..n]);
+        if let Some(p) = progress {
+            p.push(&buf[..n]);
+        }
     }
 }
 
@@ -4599,6 +4685,40 @@ mod tests {
         assert_eq!(fake.calls.lock().expect("lock").len(), 1);
     }
 
+    /// Spec 124 T05: o `run_command` do Desenvolvedor registra as rodadas dos comandos de teste
+    /// observados (exatos), com o hash da árvore antes e depois, o lugar e o resultado; o resto não.
+    #[tokio::test]
+    async fn developer_test_command_runs_are_recorded_with_the_tree_hash() {
+        use crate::harness::compose::fake::FakeRunner;
+        let root = tmp_dir("suite-ledger");
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&root).status().expect("git").success());
+        fs::create_dir_all(root.join(".nants")).expect("mkdir");
+        fs::write(root.join(".nants/compose.yaml"), "services:\n  workspace:\n    image: alpine:3\n").expect("w");
+        fs::write(root.join("a.txt"), "a").expect("w");
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "3 passed");
+        let ledger = crate::sdd::test_levels::SuiteLedger::default();
+        ledger.watch(vec!["echo suite".into()], "Docker|h".into());
+        let h = host(Role::Developer, &root, &[], &["echo*"], &[], ApprovalDecision::Deny)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("ledger", fake.clone())))
+            .with_suite_ledger(ledger.clone());
+        let out = h.call(ToolName::RunCommand, json!({"command": "echo suite"})).await.expect("executa");
+        assert!(out.starts_with("exit: 0\n"), "{out}");
+        h.call(ToolName::RunCommand, json!({"command": "echo outra"})).await.expect("executa");
+        let tree = crate::sdd::test_levels::tree_hash(&root).expect("hash");
+        let run = ledger.reusable("echo suite", &tree, "Docker|h", true, None).expect("registrada");
+        assert!(run.passed && run.in_container && run.output.contains("3 passed"), "{run:?}");
+        assert!(ledger.reusable("echo outra", &tree, "Docker|h", true, None).is_none());
+        // Falhou: a mesma árvore deixa de valer.
+        let failing = Arc::new(FakeRunner::default());
+        failing.reply("run", 1, "1 failed");
+        let h = host(Role::Developer, &root, &[], &["echo*"], &[], ApprovalDecision::Deny)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("ledger2", failing)))
+            .with_suite_ledger(ledger.clone());
+        h.call(ToolName::RunCommand, json!({"command": "echo suite"})).await.expect("executa");
+        assert!(ledger.reusable("echo suite", &tree, "Docker|h", true, None).is_none());
+    }
+
     #[tokio::test]
     async fn browser_tests_in_docker_project_run_in_compose_workspace_without_approval() {
         use crate::harness::compose::fake::FakeRunner;
@@ -5877,6 +5997,21 @@ mod tests {
         assert!(write_art(&h, "ARCHITECTURE.md", ARCH_DOC).await.is_err());
     }
 
+    /// Spec 125: no projeto en, o ARCHITECTURE.md do plano é gravado com os títulos em en, mesmo
+    /// que o modelo os escreva em pt; o conteúdo fica.
+    #[tokio::test]
+    async fn architecture_md_headings_follow_the_project_language() {
+        let root = sdd_root("arch-lang");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny).with_lang(crate::i18n::Lang::En);
+        write_art(&h, ".sdd/specs/001-exemplo/spec.md", EXAMPLE_SPEC_MD).await.expect("spec");
+        write_art(&h, "ARCHITECTURE.md", ARCH_DOC).await.expect("válido");
+        let text = fs::read_to_string(root.join("ARCHITECTURE.md")).expect("r");
+        assert_eq!(
+            text,
+            "# P\n\n## Overview\nx\n\n## Stack\nx\n\n## Structure\nx\n\n## Commands\nx\n\n## Patterns and conventions\nx\n\n## Decisions\nx\n\n## Constraints\nx\n"
+        );
+    }
+
     const SKILL_DOC: &str = "---\nrole: developer\nstack: [clojure]\nupdated_at: 2026-10-16\nsource_spec: 001-exemplo\n---\nVocê é um desenvolvedor especialista em Clojure neste projeto.\n## Papel\n- Clojure com deps.edn.\n";
 
     #[tokio::test]
@@ -6754,5 +6889,166 @@ mod tests {
         let out = h.call(ToolName::RequestEnvironmentChange, env_args("FROM other\n")).await;
         assert!(out.is_err());
         assert_eq!(fs::read_to_string(f.root.join(".nants/Dockerfile")).expect("r"), "FROM alpine:3\n");
+    }
+
+    /// Sink que guarda cada evento de atividade com o instante (ms): a medição da spec 123 T01.
+    struct TimedActivity(std::sync::Mutex<Vec<(u128, crate::agents::activity::ActivityEvent)>>, std::time::Instant);
+
+    impl crate::agents::activity::ActivitySink for TimedActivity {
+        fn emit(&self, e: crate::agents::activity::ActivityEvent) {
+            let at = self.1.elapsed().as_millis();
+            self.0.lock().expect("lock").push((at, e));
+        }
+    }
+
+    /// Spec 123 T02: o limite de cada caminho de comando. Sem navegador nem Compose, o
+    /// `run_browser_tests` não tem limite (responde na hora que está indisponível); com o container
+    /// efêmero, vale o limite dele; outras ferramentas não têm limite de comando.
+    #[test]
+    fn command_limit_follows_the_path_that_runs_the_command() {
+        use crate::harness::browser::BrowserTests;
+        use crate::harness::compose::fake::FakeRunner;
+        let root = tmp_dir("limit-paths");
+        let h = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Once).with_command_timeout(Duration::from_secs(42));
+        assert_eq!(h.command_limit("run_command"), Some(Duration::from_secs(42)));
+        assert_eq!(h.command_limit("run_browser_tests"), None);
+        assert_eq!(h.command_limit("read_file"), None);
+        let browser = BrowserTests::new("p", Arc::new(FakeRunner::default())).with_timeout(Duration::from_secs(77));
+        let h = h.with_browser(Arc::new(browser));
+        assert_eq!(h.command_limit("run_browser_tests"), Some(Duration::from_secs(77)));
+        assert_eq!(h.command_limit("run_command"), Some(Duration::from_secs(42)));
+    }
+
+    /// Roda a ferramenta como o laço do agente roda (`track_command_progress` + `call_progress`),
+    /// com heartbeat de 100 ms, e devolve os eventos com o instante.
+    async fn measure_command_with(h: &ToolHost, tool: ToolName, cmd: &str, progress: Arc<CommandProgress>, rec: Arc<TimedActivity>) -> String {
+        use crate::agents::activity::ActivityScope;
+        let run = ActivityScope::new(rec.clone(), "developer", None, Some("T01".into())).with_heartbeat(Duration::from_millis(100)).begin();
+        let out = run
+            .track_command_progress(cmd, &progress, h.command_limit(tool.name()), h.call_progress(tool, json!({ "command": cmd }), &progress))
+            .await
+            .unwrap_or_else(|e| format!("erro: {e}"));
+        drop(run);
+        out
+    }
+
+    /// Aprovador que demora a decidir e guarda o instante da decisão.
+    struct SlowApprover(ApprovalDecision, Duration, std::sync::Mutex<Option<std::time::Instant>>);
+
+    impl Approver for SlowApprover {
+        fn approve<'a>(&'a self, _req: &'a ApprovalRequest) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send + 'a>> {
+            Box::pin(async move {
+                tokio::time::sleep(self.1).await;
+                *self.2.lock().expect("lock") = Some(std::time::Instant::now());
+                self.0
+            })
+        }
+    }
+
+    /// Spec 123 T02 (F-01): com o pedido de aprovação demorando 300 ms, nenhum `command` sai antes
+    /// da decisão; o relógio (o `command`, com o limite) começa depois dela, e até lá só heartbeats
+    /// simples mantêm o passo vivo. Com a negação, nenhum `command` nem `command_end`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_command_clock_starts_after_the_approval_and_deny_opens_no_command() {
+        use crate::agents::activity::ActivityKind;
+        let root = tmp_dir("clock-approval");
+        slow_script(&root, "echo pronto\n");
+        for decision in [ApprovalDecision::Once, ApprovalDecision::Deny] {
+            let approver = Arc::new(SlowApprover(decision, Duration::from_millis(300), std::sync::Mutex::default()));
+            let h = ToolHost::new(Role::Developer, root.clone(), vec!["**".into()], Policy::new(vec![], vec![]), approver.clone());
+            let rec = Arc::new(TimedActivity(std::sync::Mutex::default(), std::time::Instant::now()));
+            let out = measure_command_with(&h, ToolName::RunCommand, "sh slow.sh", Arc::new(CommandProgress::gated()), rec.clone()).await;
+            let events = rec.0.lock().expect("lock").clone();
+            let decided = approver.2.lock().expect("lock").expect("decidiu").duration_since(rec.1).as_millis();
+            let kinds: Vec<_> = events.iter().map(|(_, e)| e.kind).collect();
+            let before: Vec<_> = events.iter().filter(|(at, _)| *at < decided).map(|(_, e)| e.kind).collect();
+            assert!(!before.contains(&ActivityKind::Command), "nada de relógio antes da decisão: {before:?}");
+            assert!(before.contains(&ActivityKind::Heartbeat), "o passo segue vivo enquanto espera: {before:?}");
+            assert!(events.iter().filter(|(at, _)| *at < decided).all(|(_, e)| e.output_bytes.is_none()));
+            if decision == ApprovalDecision::Once {
+                assert!(out.starts_with("exit: 0\npronto"), "{out}");
+                let (at, ev) = events.iter().find(|(_, e)| e.kind == ActivityKind::Command).expect("command");
+                assert!(*at >= decided, "command em {at} ms, decisão em {decided} ms");
+                assert_eq!(ev.command_limit_ms, Some(u64::try_from(COMMAND_TIMEOUT.as_millis()).unwrap_or(u64::MAX)));
+                assert!(kinds.ends_with(&[ActivityKind::CommandEnd, ActivityKind::End]), "{kinds:?}");
+            } else {
+                assert!(!kinds.contains(&ActivityKind::Command) && !kinds.contains(&ActivityKind::CommandEnd), "{kinds:?}");
+                assert!(out.contains("erro"), "a negação volta como resultado da ferramenta: {out}");
+            }
+        }
+    }
+
+    async fn measure_command(h: &ToolHost, tool: ToolName, cmd: &str) -> (String, Vec<(u128, crate::agents::activity::ActivityEvent)>) {
+        use crate::agents::activity::ActivityScope;
+        let rec = Arc::new(TimedActivity(std::sync::Mutex::default(), std::time::Instant::now()));
+        let run = ActivityScope::new(rec.clone(), "developer", None, Some("T01".into())).with_heartbeat(Duration::from_millis(100)).begin();
+        let progress = Arc::new(CommandProgress::new());
+        let out = run
+            .track_command_progress(cmd, &progress, h.command_limit(tool.name()), h.call_progress(tool, json!({ "command": cmd }), &progress))
+            .await
+            .expect("executa");
+        drop(run);
+        let events = rec.0.lock().expect("lock").clone();
+        (out, events)
+    }
+
+    /// Instantes dos heartbeats e o progresso do último.
+    fn heartbeats(events: &[(u128, crate::agents::activity::ActivityEvent)]) -> (Vec<u128>, Option<(Option<u64>, Option<String>)>) {
+        use crate::agents::activity::ActivityKind;
+        let beats: Vec<_> = events.iter().filter(|(_, e)| e.kind == ActivityKind::Heartbeat).collect();
+        let last = beats.last().map(|(_, e)| (e.output_bytes, e.last_line.clone()));
+        (beats.iter().map(|(t, _)| *t).collect(), last)
+    }
+
+    /// Spec 123 T01, critérios 1 a 3 (medição): o comando do agente, no host e no Docker
+    /// (`run_command` e `run_browser_tests` pelo Compose, executor falso com saída aos poucos),
+    /// emite heartbeats no ritmo do escopo até o fim, com os bytes de saída e a última linha não
+    /// vazia. O resultado que volta ao modelo não muda.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_command_heartbeats_carry_real_output_progress() {
+        use crate::agents::activity::ActivityKind;
+        use crate::harness::compose::fake::FakeRunner;
+        let root = tmp_dir("beat-progress");
+        slow_script(&root, "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"linha $i\"; sleep 0.1; done\necho fim do log >&2\n");
+        let h = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Once).with_command_timeout(Duration::from_secs(20));
+        let (out, events) = measure_command(&h, ToolName::RunCommand, "sh slow.sh").await;
+        let (at, last) = heartbeats(&events);
+        eprintln!("MEDICAO agente/host run_command: {} heartbeats em {at:?} ms", at.len());
+        assert!(out.starts_with("exit: 0\nlinha 1\n") && out.contains("stderr:\nfim do log"), "{out}");
+        assert!(at.len() >= 9 && at.windows(2).all(|w| w[1] - w[0] < 400), "{at:?}");
+        let kinds: Vec<_> = events.iter().map(|(_, e)| e.kind).collect();
+        assert_eq!(&kinds[..2], &[ActivityKind::Start, ActivityKind::Command]);
+        // Spec 123 T02: o `command` leva o limite do caminho (aqui, o `command_timeout` de 20 s);
+        // os outros eventos, não.
+        assert_eq!(events[1].1.command_limit_ms, Some(20_000));
+        assert!(events.iter().filter(|(_, e)| e.kind != ActivityKind::Command).all(|(_, e)| e.command_limit_ms.is_none()));
+        assert!(kinds.ends_with(&[ActivityKind::CommandEnd, ActivityKind::End]), "{kinds:?}");
+        let (bytes, line) = last.expect("heartbeat");
+        assert!(bytes.is_some_and(|b| b > 0), "{bytes:?}");
+        assert!(line.as_deref().is_some_and(|l| l.starts_with("linha ")), "{line:?}");
+
+        fs::create_dir_all(root.join(".nants")).expect("mkdir");
+        fs::write(root.join(".nants/compose.yaml"), "services:\n  workspace:\n    image: alpine:3\n").expect("w");
+        let slow = Arc::new(FakeRunner::default());
+        slow.reply("run", 0, "ok\n");
+        *slow.delay.lock().expect("lock") = Some(Duration::from_millis(1000));
+        *slow.stream.lock().expect("lock") = (1..=5).map(|i| format!("\u{1b}[32m  ok {i}\u{1b}[39m cena.spec.ts")).collect();
+        let h = host(Role::Developer, &root, &[], &["npm*", "npx*"], &[], ApprovalDecision::Deny)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("beat", slow)));
+        for (tool, cmd) in [(ToolName::RunCommand, "npm test"), (ToolName::RunBrowserTests, "npx playwright test --workers=1")] {
+            let (out, events) = measure_command(&h, tool, cmd).await;
+            // Spec 123 T02: no workspace do Compose, `run_command` usa o `COMMAND_TIMEOUT` e
+            // `run_browser_tests` o `BROWSER_TIMEOUT`.
+            let limit = events.iter().find(|(_, e)| e.kind == ActivityKind::Command).and_then(|(_, e)| e.command_limit_ms);
+            let expected = if tool == ToolName::RunCommand { COMMAND_TIMEOUT } else { crate::harness::browser::BROWSER_TIMEOUT };
+            assert_eq!(limit, Some(u64::try_from(expected.as_millis()).unwrap_or(u64::MAX)));
+            let (at, last) = heartbeats(&events);
+            eprintln!("MEDICAO agente/docker {}: {} heartbeats em {at:?} ms", tool.name(), at.len());
+            assert!(out.starts_with("exit: 0\nok"), "{out}");
+            assert!(at.len() >= 7 && at.windows(2).all(|w| w[1] - w[0] < 400), "{at:?}");
+            let (bytes, line) = last.expect("heartbeat");
+            assert!(bytes.is_some_and(|b| b > 0), "{bytes:?}");
+            assert!(line.as_deref().is_some_and(|l| l.starts_with("ok ") && l.ends_with(" cena.spec.ts")), "sem ANSI: {line:?}");
+        }
     }
 }

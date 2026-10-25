@@ -14,7 +14,7 @@ import type { TaskStatus, TaskView } from "../../api/types";
 import { TASK_STATUS_LABEL } from "../../copy";
 import type { Tone } from "../../desktop/theme/tokens";
 import { localized, t, tp, type MessageKey } from "../../i18n";
-import { parseReviewMessage, type ReviewMessage } from "../../reviewMessage";
+import { parseReviewMessage, reviewStateCounts, reviewStateLine, type ReviewMessage } from "../../reviewMessage";
 import { belongsToSpec, type ChatMessage, type RecoveryEntry, type RunStart } from "../../store";
 import type { AppSummary, AppSummaryInput } from "../registry";
 
@@ -268,11 +268,16 @@ export function lastReviewMessage(messages: readonly ChatMessage[] | undefined, 
   return null;
 }
 
-/** Linha recolhida da última revisão: "Última revisão · T02 · Pediu ajustes" (sem veredito, sem o fim). */
-export function lastReviewLine(taskId: string, verdict: ReviewMessage["verdict"]): string {
+/**
+ * Linha recolhida da última revisão: "Última revisão · T02 · Pediu ajustes" (sem veredito, sem o fim),
+ * seguida do resumo dos estados dos apontamentos (spec 124 T01), quando a mensagem os traz:
+ * "· 1 novo · 2 ainda abertos · 1 resolvido".
+ */
+export function lastReviewLine(taskId: string, verdict: ReviewMessage["verdict"], review?: ReviewMessage): string {
   const head = t("board.lastReview", { task: taskId });
-  if (verdict === null) return head;
-  return `${head} · ${t(verdict === "approved" ? "review.approved" : "review.changes")}`;
+  const states = review === undefined ? "" : reviewStateLine(reviewStateCounts(review), tp);
+  const withVerdict = verdict === null ? head : `${head} · ${t(verdict === "approved" ? "review.approved" : "review.changes")}`;
+  return states === "" ? withVerdict : `${withVerdict} · ${states}`;
 }
 
 export function parsedReview(message: ChatMessage | null): ReviewMessage | null {

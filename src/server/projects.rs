@@ -178,6 +178,10 @@ pub struct SpecView {
     /// "Ações (N)" da UI. Contagem em cache por tamanho/mtime. Omitido quando vazio.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     tool_counts: BTreeMap<String, usize>,
+    /// Aviso de custo por tarefa (spec 124 T06): só as que passaram do patamar. Sinal, nunca
+    /// limite. Omitido quando vazio.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    cost_alerts: BTreeMap<String, super::cost_alert::CostAlert>,
 }
 
 #[derive(Serialize)]
@@ -510,6 +514,8 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         OUTPUTS_EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
+        crate::sdd::capabilities::CAPABILITIES_EXCLUDE_LINE,
+        crate::sdd::capabilities::CAPABILITIES_TMP_EXCLUDE_LINE,
     ] {
         safe_fs::append_line_once(root, EXCLUDE_REL, line).map_err(safe_error)?;
     }
@@ -553,6 +559,9 @@ fn init_sdd(root: &Path, yolo: bool, lang: crate::i18n::Lang) -> Result<DiskStat
         base_branch: base,
         merge_strategy: "squash".into(),
         test_command: String::new(),
+        full_test_command: None,
+        install_command: None,
+        lockfiles: Vec::new(),
         allowed_commands: Vec::new(),
         denied_commands: Vec::new(),
         checks: Vec::new(),
@@ -1404,6 +1413,8 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
             let spec_rel = format!("{SPECS_REL}/{name}");
             let tasks = load_tasks(root, &spec_rel, secrets);
             let tool_counts = super::tools_trail::counts(root, name, secrets);
+            let states: Vec<(String, bool)> = tasks.iter().map(|t| (t.id.clone(), t.status == Some(TaskStatus::Done))).collect();
+            let cost_alerts = super::cost_alert::alerts(&super::cost_alert::spend_by_task(root, name), &states);
             match read_spec(root, &format!("{spec_rel}/spec.md")) {
                 Ok(spec) => SpecView {
                     id: id_view(secrets, &spec.frontmatter.id),
@@ -1442,6 +1453,7 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
                         None
                     },
                     tool_counts,
+                    cost_alerts,
                 },
                 Err(_) => SpecView {
                     id: id_view(secrets, name),
@@ -1458,6 +1470,7 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
                     plan_review: None,
                     plan_changes: None,
                     tool_counts,
+                    cost_alerts,
                 },
             }
         })

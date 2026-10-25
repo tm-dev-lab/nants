@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::schema::{check_run_url, check_test_command_shape, validate_checks, validate_failure_artifacts, validate_formatters, Sdd, Settings, Spec, SpecMeta, Task};
+use super::schema::{check_run_url, check_test_command_shape, valid_optional_command, validate_checks, validate_failure_artifacts, validate_formatters, validate_lockfiles, Sdd, Settings, Spec, SpecMeta, Task};
 use super::{sdd_dir, SddError};
 
 const FENCE: &str = "---";
@@ -90,6 +90,14 @@ impl Spec {
             .as_deref()
             .map(super::references::validate)
             .filter(|r| !r.is_empty());
+        // Spec 124 T05: níveis de teste e instalação; inválidos ou vazios equivalem a ausentes.
+        frontmatter.full_test_command = valid_optional_command(frontmatter.full_test_command.as_deref());
+        frontmatter.install_command = valid_optional_command(frontmatter.install_command.as_deref());
+        frontmatter.lockfiles = frontmatter
+            .lockfiles
+            .as_deref()
+            .map(validate_lockfiles)
+            .filter(|l| !l.is_empty());
         frontmatter.environment = frontmatter
             .environment
             .as_deref()
@@ -126,6 +134,9 @@ impl Settings {
         settings.formatters = validate_formatters(&settings.formatters);
         settings.failure_artifacts = validate_failure_artifacts(&settings.failure_artifacts);
         settings.screenshots = validate_failure_artifacts(&settings.screenshots);
+        settings.full_test_command = valid_optional_command(settings.full_test_command.as_deref());
+        settings.install_command = valid_optional_command(settings.install_command.as_deref());
+        settings.lockfiles = validate_lockfiles(&settings.lockfiles);
         let (lo, hi) = (*super::schema::LIMIT_RANGE.start(), *super::schema::LIMIT_RANGE.end());
         settings.max_attempts = settings.max_attempts.clamp(lo, hi);
         settings.max_test_cycles = settings.max_test_cycles.clamp(lo, hi);
@@ -538,6 +549,32 @@ denied_commands:
         assert_eq!(loaded.specs[1].0.frontmatter.id, "002-b");
         assert!(loaded.specs[1].1.is_empty(), "sem diretório tasks");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Spec 124 T05: os campos novos são opcionais; inválidos equivalem a ausentes, e o settings
+    /// antigo segue lendo e gravando igual.
+    #[test]
+    fn test_levels_fields_are_optional_and_validated() {
+        let base = "base_branch: \"main\"\nmerge_strategy: \"squash\"\ntest_command: \"cargo test\"\n";
+        let legacy = Settings::parse(base).expect("settings antigo");
+        assert!(legacy.full_test_command.is_none() && legacy.install_command.is_none() && legacy.lockfiles.is_empty());
+        assert!(!legacy.render().expect("render").contains("lockfiles"));
+        let full = Settings::parse(&format!(
+            "{base}full_test_command: \"make all\"\ninstall_command: \"  \"\nlockfiles:\n  - ./a.lock\n  - a.lock\n  - /abs.lock\n  - \"x/*.lock\"\n"
+        ))
+        .expect("settings novo");
+        assert_eq!(full.full_test_command.as_deref(), Some("make all"));
+        assert!(full.install_command.is_none(), "vazio = ausente");
+        assert_eq!(full.lockfiles, vec!["a.lock".to_string()]);
+        let spec = Spec::parse(&SPEC_EXAMPLE.replacen(
+            "base_branch: \"main\"",
+            "base_branch: \"main\"\nfull_test_command: \"make all\"\ninstall_command: \"make deps\"\nlockfiles: [\"deps.lock\", \"../x\"]",
+            1,
+        ))
+        .expect("spec");
+        assert_eq!(spec.frontmatter.full_test_command.as_deref(), Some("make all"));
+        assert_eq!(spec.frontmatter.install_command.as_deref(), Some("make deps"));
+        assert_eq!(spec.frontmatter.lockfiles, Some(vec!["deps.lock".to_string()]));
     }
 
     #[test]

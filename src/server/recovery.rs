@@ -30,6 +30,7 @@ use super::state::AppState;
 use crate::server::events::BusActivitySink;
 use crate::agents::architect::{truncate_bytes, LlmArchitect};
 use crate::agents::chat::ChatBackend;
+use crate::agents::recovery_plan::{self as plan, CriteriaAdjustment, SplitTask, TaskSplit};
 use crate::agents::runner::{
     add_human_guidance, apply_revision, diagnosis_notes, latest_options_block, recovery_cycles, recovery_notes,
     section_text, task_worktree_path, TaskRevision, ACCEPTANCE, FINDINGS, MAX_REVISION_BYTES, OBJECTIVE, OPTIONS_CLOSE,
@@ -39,7 +40,7 @@ use super::approvals::{replace_atomic, PERSIST_LOCK};
 use crate::harness::allowlist::{self, Policy};
 use crate::harness::tools::ApprovalDecision;
 use crate::sdd::docker_command;
-use crate::sdd::{Check, Environment, Settings, Task, TaskStatus};
+use crate::sdd::{ArbitrationDecision, Check, Environment, Settings, Task, TaskStatus};
 
 const SETTINGS_REL: &str = ".sdd/settings.yaml";
 /// Causa fixa quando a proposta REVISE_CONFIG é inválida.
@@ -60,11 +61,11 @@ pub const AUTONOMOUS_ROUND_PREFIX: &str = "- Rodada autônoma (aprovação autom
 /// Prefixo antigo (antes da 095/T08), ainda contado nas tarefas já gravadas.
 const LEGACY_AUTONOMOUS_ROUND_PREFIX: &str = "- Rodada autônoma (YOLO) #";
 /// Instrução extra ao modelo na rodada autônoma.
-const AUTONOMOUS_NOTE: &str = "\n## Aprovação automática: rodada autônoma\nO limite de ciclos foi atingido, mas o humano pediu autonomia. NÃO escale: responda RETRY com estratégia realmente diferente ou REVISE_TASK (reescreva objetivo/critérios; um critério inviável de automatizar pode virar verificação manual, mas NUNCA tire testes do `test_command` nem afrouxe critérios globais).\n";
+const AUTONOMOUS_NOTE: &str = "\n## Aprovação automática: rodada autônoma\nO limite de ciclos foi atingido, mas o humano pediu autonomia. NÃO escale: responda RETRY com estratégia realmente diferente, SPLIT (divida a tarefa), ADJUST (critérios ao que o ambiente prova) ou REVISE_TASK (reescreva objetivo/critérios; um critério inviável de automatizar pode virar verificação manual, mas NUNCA tire testes do `test_command` nem afrouxe critérios globais).\n";
 /// Instrução ao modelo em YOLO desde o 1º ciclo (tarefa não ambiental).
-const YOLO_NOTE: &str = "\n## Aprovação automática: autonomia\nO humano ligou a aprovação automática: NÃO escale por decisão de produto ou técnica (trocar dependência, aceitar risco, ambiguidade). Decida você, registre a premissa adotada na causa raiz e responda RETRY (estratégia nova) ou REVISE_TASK.\n";
+const YOLO_NOTE: &str = "\n## Aprovação automática: autonomia\nO humano ligou a aprovação automática: NÃO escale nem pergunte (ESCALATE ou ASK) por decisão de produto ou técnica (trocar dependência, aceitar risco, ambiguidade). Decida você, registre a premissa adotada na causa raiz e responda RETRY (estratégia nova), SPLIT, ADJUST ou REVISE_TASK.\n";
 /// Reforço quando o modelo escalou mesmo em YOLO.
-const YOLO_REINFORCED_NOTE: &str = "\n## Aprovação automática: ESCALATE NÃO É PERMITIDO\nSua resposta anterior foi ESCALATE, mas o humano pediu autonomia total. Responda OBRIGATORIAMENTE RETRY ou REVISE_TASK: escolha a opção mais razoável, registre a premissa em `root_cause` e siga em frente.\n";
+const YOLO_REINFORCED_NOTE: &str = "\n## Aprovação automática: ESCALATE NÃO É PERMITIDO\nSua resposta anterior foi ESCALATE ou ASK, mas o humano pediu autonomia total. Responda OBRIGATORIAMENTE RETRY, SPLIT, ADJUST ou REVISE_TASK: escolha a opção mais razoável, registre a premissa em `root_cause` e siga em frente.\n";
 /// Linha persistida no corpo da tarefa que conta a correção de ambiente tentada em YOLO (C-04).
 pub const ENV_FIX_PREFIX: &str = "- Correção de ambiente (aprovação automática) #";
 /// Prefixo antigo (antes da 095/T08), ainda contado nas tarefas já gravadas.
@@ -140,6 +141,30 @@ pub struct Decision {
     /// `scope_add` da estratégia (RETRY, REVISE_TASK, REVISE_CONFIG; spec 079): caminhos a acrescentar
     /// ao `allowed_scope` na mesma decisão. Validados ao registrar ([`section_body`]).
     pub scope_add: Vec<String>,
+    /// SPLIT, ADJUST ou ASK (spec 124 T03); `None` nas decisões de sempre.
+    pub change: Option<Change>,
+}
+
+/// Decisões da spec 124 T03 além de RETRY, REVISE_TASK, REVISE_CONFIG e ESCALATE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A tarefa fica menor e as tarefas novas recebem o restante (`retry`).
+    Split(TaskSplit),
+    /// Critérios ajustados ao que o ambiente prova; o restante vira verificação manual (`retry`).
+    Adjust(CriteriaAdjustment),
+    /// Pergunta objetiva ao humano: a execução pausa (como ESCALATE, sem `retry`).
+    Ask(String),
+}
+
+impl Change {
+    /// Nome da decisão, o mesmo do JSON e do cabeçalho da análise.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Split(_) => "SPLIT",
+            Self::Adjust(_) => "ADJUST",
+            Self::Ask(_) => "ASK",
+        }
+    }
 }
 
 /// Instrução da chamada que só gera opções quando o orçamento de recuperação acabou.
@@ -242,6 +267,7 @@ impl Decision {
             discarded: Vec::new(),
             migrate: None,
             scope_add: Vec::new(),
+            change: None,
         }
     }
 }
@@ -408,7 +434,11 @@ pub async fn recover(
     if decision.retry {
         // Spec 094 T07: a linha "Escopo ampliado" mostra só o que vai entrar (mesmas regras do
         // runner ao registrar), e a conversa vê o mesmo registro do corpo da tarefa.
-        let base = match decision.revise.as_ref().and_then(|r| r.allowed_scope.as_ref()) {
+        let revised = match &decision.change {
+            Some(Change::Split(split)) => Some(&split.current),
+            _ => decision.revise.as_ref(),
+        };
+        let base = match revised.and_then(|r| r.allowed_scope.as_ref()) {
             Some(scope) => scope.iter().map(|g| g.trim().to_string()).collect(),
             None => loaded.allowed_scope.clone(),
         };
@@ -441,28 +471,30 @@ pub async fn recover(
     }
     let (spec_id, tid, body) = (scope.spec_id.to_string(), task_id.to_string(), text.clone());
     let runner_job = Arc::clone(runner);
-    let retry = decision.retry;
-    let revision = decision.revise.as_ref().map(|r| TaskRevision {
-        objective: scrub_text(scope.secrets, &r.objective),
-        acceptance: scrub_text(scope.secrets, &r.acceptance),
-        allowed_scope: r.allowed_scope.clone(),
-    });
-    let is_revision = revision.is_some();
-    let recorded = tokio::task::spawn_blocking(move || match revision {
-        Some(rev) => runner_job.record_revision(&spec_id, &tid, &rev, &body),
-        None => runner_job.record_recovery(&spec_id, &tid, retry, &body),
-    })
-    .await
-    .ok()
-    .and_then(Result::ok);
+    let job_decision = decision.clone();
+    let job_secrets = Arc::clone(scope.secrets);
+    let written = tokio::task::spawn_blocking(move || record(&*runner_job, &spec_id, &tid, &job_decision, &body, &job_secrets))
+        .await
+        .ok()
+        .flatten();
     // Sem registro não há retomada: a tarefa fica como está (BLOCKED).
-    let applied_retry = decision.retry && recorded.is_some();
-    let announced = match (applied_retry, is_revision) {
-        (true, _) if decision.config.is_some() => "REVISE_CONFIG",
-        (true, _) if migrated.is_some() => "MIGRATE_ENVIRONMENT",
-        (true, true) => "REVISE_TASK",
-        (true, false) => "RETRY",
-        _ => "ESCALATE",
+    let (recorded, kind) = match written {
+        Some(w) => {
+            text = w.text;
+            (Some(w.cycle), w.kind)
+        }
+        None => (None, Recorded::Escalate),
+    };
+    let applied_retry = decision.retry && recorded.is_some() && kind != Recorded::Escalate;
+    let announced = match kind {
+        _ if !applied_retry && matches!(decision.change, Some(Change::Ask(_))) && recorded.is_some() => "ASK",
+        _ if !applied_retry => "ESCALATE",
+        _ if decision.config.is_some() => "REVISE_CONFIG",
+        _ if migrated.is_some() => "MIGRATE_ENVIRONMENT",
+        Recorded::Split => "SPLIT",
+        Recorded::Adjust => "ADJUST",
+        Recorded::Revise => "REVISE_TASK",
+        Recorded::Retry | Recorded::Escalate => "RETRY",
     };
     let published: &[RecoveryOption] = if applied_retry { &[] } else { &decision.options };
     let analysis = if published.is_empty() { None } else { recorded };
@@ -498,6 +530,65 @@ pub async fn recover(
         Next::Retry
     } else {
         Next::Stay
+    }
+}
+
+/// Como a decisão ficou registrada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recorded {
+    Retry,
+    Revise,
+    Split,
+    Adjust,
+    Escalate,
+}
+
+/// Registro feito: ciclo, texto da seção (o que a conversa também mostra) e como ficou.
+struct Written {
+    cycle: usize,
+    text: String,
+    kind: Recorded,
+}
+
+/// Grava a decisão pelo runner: SPLIT e ADJUST pelos caminhos próprios (spec 124 T03), REVISE_TASK
+/// pela revisão e o resto pela seção de sempre. ADJUST cujos critérios não podem ser gravados segue
+/// como RETRY com a estratégia (como o `keep` da arbitragem), com a linha que diz isso.
+fn record(runner: &dyn SpecRunner, spec_id: &str, task_id: &str, decision: &Decision, body: &str, secrets: &SecretSet) -> Option<Written> {
+    let scrub = |t: &str| scrub_text(secrets, t);
+    match &decision.change {
+        Some(Change::Split(split)) if decision.retry => {
+            let current = TaskRevision {
+                objective: scrub(&split.current.objective),
+                acceptance: scrub(&split.current.acceptance),
+                allowed_scope: split.current.allowed_scope.clone(),
+            };
+            let split = TaskSplit { current, new_tasks: split.new_tasks.clone() };
+            let (cycle, text) = runner.record_split(spec_id, task_id, &split, body).ok()?;
+            Some(Written { cycle, text, kind: Recorded::Split })
+        }
+        Some(Change::Adjust(adjustment)) if decision.retry => match runner.record_adjust(spec_id, task_id, adjustment, body) {
+            Ok((cycle, text)) => Some(Written { cycle, text, kind: Recorded::Adjust }),
+            Err(crate::agents::runner::RunnerError::Invalid(_)) => {
+                let text = format!("{}\n{}", body.trim_end(), plan::ADJUST_REFUSED_LINE);
+                let cycle = runner.record_recovery(spec_id, task_id, true, &text).ok()?;
+                Some(Written { cycle, text, kind: Recorded::Retry })
+            }
+            Err(_) => None,
+        },
+        _ => {
+            if let (true, Some(r)) = (decision.retry, decision.revise.as_ref()) {
+                let revision = TaskRevision {
+                    objective: scrub(&r.objective),
+                    acceptance: scrub(&r.acceptance),
+                    allowed_scope: r.allowed_scope.clone(),
+                };
+                let cycle = runner.record_revision(spec_id, task_id, &revision, body).ok()?;
+                return Some(Written { cycle, text: body.to_string(), kind: Recorded::Revise });
+            }
+            let cycle = runner.record_recovery(spec_id, task_id, decision.retry, body).ok()?;
+            let kind = if decision.retry { Recorded::Retry } else { Recorded::Escalate };
+            Some(Written { cycle, text: body.to_string(), kind })
+        }
     }
 }
 
@@ -700,6 +791,7 @@ fn env_fix_decision(reason: &str) -> Decision {
         discarded: Vec::new(),
         migrate: None,
         scope_add: Vec::new(),
+        change: None,
     }
 }
 
@@ -714,11 +806,16 @@ fn auto_applied(lang: crate::i18n::Lang, cause: &str, label: &str) -> String {
 /// lê no Quadro e no cartão de recuperação: saem no idioma do projeto (spec 115 T04).
 fn premise_retry(lang: crate::i18n::Lang, escalate: Decision) -> Decision {
     let mut strategy = escalate.strategy.clone().unwrap_or_default();
-    if let Some(proposal) = &escalate.proposal {
+    // A pergunta de um ASK vira parte da estratégia: o Desenvolvedor adota a premissa mais razoável.
+    let question = match &escalate.change {
+        Some(Change::Ask(q)) => Some(q),
+        _ => None,
+    };
+    for extra in escalate.proposal.iter().chain(question) {
         if !strategy.is_empty() {
             strategy.push_str("; ");
         }
-        strategy.push_str(proposal);
+        strategy.push_str(extra);
     }
     if strategy.trim().is_empty() {
         strategy = crate::i18n::text(lang, "recovery.default_strategy");
@@ -734,6 +831,7 @@ fn premise_retry(lang: crate::i18n::Lang, escalate: Decision) -> Decision {
         discarded: Vec::new(),
         migrate: None,
         scope_add: Vec::new(),
+        change: None,
     }
 }
 
@@ -762,6 +860,7 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
                 discarded: Vec::new(),
                 migrate: None,
                 scope_add: Vec::new(),
+                change: None,
             };
         }
         // Ajuste do ambiente docker (spec 074): a primeira opção `environment` com `files` válida.
@@ -778,6 +877,7 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
                 discarded: Vec::new(),
                 migrate: Some(option.clone()),
                 scope_add: Vec::new(),
+                change: None,
             };
         }
     }
@@ -925,7 +1025,9 @@ async fn apply_config_decision(
 /// Falha de ambiente admite RETRY (estratégia nova), REVISE_CONFIG ou ESCALATE; REVISE_TASK escala,
 /// porque reescrever objetivo/critérios para contornar o ambiente rebaixaria a verificação.
 fn restrict_environmental(environmental: bool, decision: Decision) -> Decision {
-    if environmental && decision.revise.is_some() {
+    // SPLIT e ADJUST também reescrevem a tarefa (spec 124 T03): mesma regra do REVISE_TASK.
+    let rewrites = decision.revise.is_some() || matches!(decision.change, Some(Change::Split(_) | Change::Adjust(_)));
+    if environmental && rewrites {
         Decision::escalate(CAUSE_ENV_REVISE)
     } else {
         decision
@@ -1075,6 +1177,8 @@ fn escalation_context(secrets: &SecretSet, loaded: &Loaded, decision: &Decision)
     lines.push(format!("  - por que não resolveu: {}", clean(secrets, &decision.root_cause)));
     let options = if !decision.options.is_empty() {
         "  - opções: escolha uma das opções propostas acima, escreva uma orientação própria ou use Retomar"
+    } else if matches!(decision.change, Some(Change::Ask(_))) {
+        plan::ASK_OPTIONS_LINE
     } else if loaded.environmental {
         "  - opções: (1) ajustar `test_command`/checks nas configurações para preparar o que falta (ex.: instalar dependências antes dos testes); \
          (2) ajustar o ambiente docker (.nants/) quando a imagem não tem o componente; \
@@ -1778,7 +1882,10 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 pub fn parse_decision(raw: &str) -> Option<Decision> {
     let value: Value = serde_json::from_str(raw.trim()).ok()?;
     let map = value.as_object()?;
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 14] = [
+        "new_tasks",
+        "findings",
+        "question",
         "scope_add",
         "options",
         "test_command",
@@ -1820,7 +1927,94 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
     if decision != "REVISE_CONFIG" && (config_value.is_some() || checks_value.is_some()) {
         return None;
     }
+    // Campos da spec 124 T03: cada um só na sua decisão.
+    let present = |name: &str| map.get(name).is_some_and(|v| !v.is_null());
+    if (decision != "SPLIT" && present("new_tasks"))
+        || (decision != "ADJUST" && present("findings"))
+        || (decision != "ASK" && present("question"))
+    {
+        return None;
+    }
+    let scope_list = |value: Option<&Value>| -> Option<Option<Vec<String>>> {
+        match value.filter(|v| !v.is_null()) {
+            None => Some(None),
+            Some(Value::Array(items)) => Some(Some(items.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?)),
+            Some(_) => None,
+        }
+    };
+    let retry_with = |change: Change, revise: Option<TaskRevision>, strategy: String| Decision {
+        retry: true,
+        revise,
+        root_cause: root_cause.clone(),
+        strategy: Some(strategy),
+        proposal: proposal.clone(),
+        config: None,
+        options: Vec::new(),
+        discarded: Vec::new(),
+        migrate: None,
+        scope_add: scope_add.clone(),
+        change: Some(change),
+    };
     match decision {
+        "SPLIT" => {
+            let current = TaskRevision { objective: objective?, acceptance: acceptance?, allowed_scope: scope_list(scope_value)? };
+            let mut new_tasks = Vec::new();
+            for item in map.get("new_tasks")?.as_array()? {
+                let o = item.as_object()?;
+                if o.keys().any(|k| !["title", "objective", "acceptance", "allowed_scope"].contains(&k.as_str())) {
+                    return None;
+                }
+                let text = |name: &str| o.get(name)?.as_str().map(|s| s.trim().to_string());
+                new_tasks.push(SplitTask {
+                    title: text("title")?,
+                    objective: text("objective")?,
+                    acceptance: text("acceptance")?,
+                    allowed_scope: scope_list(o.get("allowed_scope"))??,
+                });
+            }
+            let split = TaskSplit { current, new_tasks };
+            split.validate().ok()?;
+            Some(retry_with(Change::Split(split), None, strategy?))
+        }
+        "ADJUST" if objective.is_none() && scope_value.is_none() => {
+            let mut findings = Vec::new();
+            match map.get("findings").filter(|v| !v.is_null()) {
+                None => {}
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        let o = item.as_object()?;
+                        if o.keys().any(|k| !["id", "decision", "reason"].contains(&k.as_str())) {
+                            return None;
+                        }
+                        let id = o.get("id")?.as_str()?.trim().to_string();
+                        let decision = ArbitrationDecision::from_code(o.get("decision")?.as_str()?)?;
+                        let reason = o.get("reason").map_or(Some(""), Value::as_str)?.split_whitespace().collect::<Vec<_>>().join(" ");
+                        findings.push((id, decision, reason));
+                    }
+                }
+                Some(_) => return None,
+            }
+            let adjustment = CriteriaAdjustment { acceptance: acceptance?, findings, reason: root_cause.clone() };
+            adjustment.validate().ok()?;
+            Some(retry_with(Change::Adjust(adjustment), None, strategy?))
+        }
+        "ASK" if !has_revision_fields => {
+            let question = field("question", plan::MAX_QUESTION_BYTES).ok()??;
+            let (options, discarded) = parse_options(map.get("options"));
+            Some(Decision {
+                retry: false,
+                revise: None,
+                root_cause,
+                strategy,
+                proposal,
+                config: None,
+                options,
+                discarded,
+                migrate: None,
+                scope_add: Vec::new(),
+                change: Some(Change::Ask(question)),
+            })
+        }
         "REVISE_CONFIG" if !has_revision_fields => {
             let test_command = match config_value {
                 None => None,
@@ -1860,6 +2054,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
                 discarded: Vec::new(),
                 migrate: None,
                 scope_add,
+                change: None,
             })
         }
         "RETRY" if !has_revision_fields => Some(Decision {
@@ -1873,6 +2068,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
             discarded: Vec::new(),
             migrate: None,
             scope_add,
+            change: None,
         }),
         "ESCALATE" if !has_revision_fields => {
             let (options, discarded) = parse_options(map.get("options"));
@@ -1887,6 +2083,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
                 discarded,
                 migrate: None,
                 scope_add: Vec::new(),
+                change: None,
             })
         }
         "REVISE_TASK" => {
@@ -1917,6 +2114,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
                 discarded: Vec::new(),
                 migrate: None,
                 scope_add,
+                change: None,
             })
         }
         _ => None,
@@ -2145,7 +2343,24 @@ fn section_body(secrets: &SecretSet, decision: &Decision) -> String {
         decision.root_cause.clone()
     };
     let mut lines = vec![format!("- Causa raiz: {}", clean(secrets, &cause))];
-    if let Some(config) = &decision.config {
+    if let Some(change) = &decision.change {
+        match change {
+            Change::Split(split) => {
+                lines.push(plan::SPLIT_DECISION_LINE.to_string());
+                if let Some(scope) = &split.current.allowed_scope {
+                    lines.push(format!("- Novo allowed_scope: {}", clean(secrets, &scope.join(", "))));
+                }
+            }
+            Change::Adjust(_) => lines.push(plan::ADJUST_DECISION_LINE.to_string()),
+            Change::Ask(question) => {
+                lines.push(plan::ASK_DECISION_LINE.to_string());
+                lines.push(format!("{}{}", plan::QUESTION_LABEL, clean(secrets, question)));
+            }
+        }
+        if let (true, Some(strategy)) = (decision.retry, &decision.strategy) {
+            lines.push(format!("- Estratégia: {}", clean(secrets, strategy)));
+        }
+    } else if let Some(config) = &decision.config {
         lines.push("- Decisão: configuração de testes revisada (REVISE_CONFIG)".to_string());
         if let Some(strategy) = &decision.strategy {
             lines.push(format!("- Estratégia: {}", clean(secrets, strategy)));
@@ -2327,6 +2542,25 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
             cap(previous, MAX_SECTION_BYTES * 2)
         ));
     }
+    // Spec 124 T03: recorrência, contestações, tamanho, histórico e custo, para escolher entre RETRY,
+    // SPLIT, ADJUST e ASK.
+    out.push('\n');
+    out.push_str(&cap(plan::signals(&task, &task_cost(root, spec_id, &meta.id)), MAX_SECTION_BYTES));
+    out.push('\n');
+    // Spec 124 T06: o aviso de custo (sinal, não limite) quando a tarefa passou do patamar.
+    if let Some(alert) = super::cost_alert::task_alert(root, spec_id, &meta.id) {
+        out.push_str(&super::cost_alert::architect_line(&alert));
+        out.push('\n');
+    }
+    // Spec 124 T04: capacidades do ambiente, aviso de orçamento de tempo e rodadas instáveis.
+    let caps = crate::sdd::capabilities::prompt_section(&crate::sdd::capabilities::read(root), crate::sdd::capabilities::Audience::Architect);
+    if !caps.is_empty() {
+        out.push_str(&format!("\n{}\n", cap(caps, MAX_SECTION_BYTES)));
+    }
+    let flaky = section(crate::agents::runner::FLAKY_SECTION);
+    if !flaky.trim().is_empty() {
+        out.push_str(&format!("\n## Rodadas instáveis desta tarefa (falharam e passaram ao repetir sem mudança)\n{}\n", cap(flaky, MAX_SECTION_BYTES)));
+    }
     out.push_str(&mode_facts());
     if let Some(config) = config_facts {
         out.push_str(&format!("\n## Configuração de testes atual (REVISE_CONFIG pode corrigi-la)\n{}\n", cap(config, MAX_SECTION_BYTES)));
@@ -2369,6 +2603,32 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
         allowed_scope: task.frontmatter.allowed_scope.clone(),
         facts: scrub_text(secrets, &truncate_bytes(&out, MAX_FACTS_BYTES)),
     })
+}
+
+/// Uso da tarefa até aqui, por papel, na ordem em que aparecem (`usage.jsonl` da spec).
+pub(crate) fn task_cost(root: &Path, spec_id: &str, task_id: &str) -> Vec<plan::RoleCost> {
+    task_cost_of(&super::usage::load_records(root, Some(spec_id)), task_id)
+}
+
+/// [`task_cost`] sobre registros já lidos (spec 124 T06: o aviso de custo lê o arquivo uma vez só
+/// para todas as tarefas da spec).
+pub(crate) fn task_cost_of(records: &[super::usage::UsageRecord], task_id: &str) -> Vec<plan::RoleCost> {
+    let mut out: Vec<plan::RoleCost> = Vec::new();
+    for r in records.iter().filter(|r| r.task.as_deref() == Some(task_id)) {
+        let at = match out.iter().position(|c| c.agent == r.agent) {
+            Some(at) => at,
+            None => {
+                out.push(plan::RoleCost { agent: r.agent.clone(), ..plan::RoleCost::default() });
+                out.len() - 1
+            }
+        };
+        if let Some(c) = out.get_mut(at) {
+            c.calls += 1;
+            c.input += r.input;
+            c.output += r.output;
+        }
+    }
+    out
 }
 
 /// Spec 087 T05: linha dos FATOS com o diff de código (sem testes nem docs) da 1ª e da última

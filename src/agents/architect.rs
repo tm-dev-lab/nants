@@ -28,7 +28,7 @@ use crate::agents::LlmError;
 use crate::agents::runner::RunnerError;
 use crate::agents::arch_memory;
 use crate::server::events::SecretSet;
-use crate::agents::prompts::{image_generation_note, internet_plan_note, internet_recovery_note, architect_system_for, environment_note, nants_port_note, architecture_survey_system_for, architecture_update_system_for, diagnosis_system_for, recovery_system_for, report_system_for};
+use crate::agents::prompts::{image_generation_note, internet_plan_note, internet_recovery_note, architect_system_for, environment_note, nants_port_note, architecture_survey_system_for, architecture_update_system_for, arbitration_system_for, diagnosis_system_for, recovery_system_for, report_system_for};
 #[cfg(test)]
 use crate::agents::prompts::{architect_system, recovery_system, report_system};
 use crate::config::Effort;
@@ -743,6 +743,9 @@ const RECOVERY_REQUEST: &str = "A tarefa está bloqueada. Analise e responda com
 /// Pedido do turno de diagnóstico de ambiente.
 const DIAGNOSIS_REQUEST: &str = "A tarefa está bloqueada por ambiente. Diagnostique e responda com o JSON.";
 
+/// Pedido do turno de arbitragem (spec 124 T02).
+const ARBITRATION_REQUEST: &str = "O Desenvolvedor contestou apontamentos do Revisor. Decida cada um e responda com o JSON.";
+
 /// Pedido de um turno somente leitura e o código da saída estruturada dele (spec 121): o JSON
 /// do diagnóstico e da recuperação não aparece na Atividade; o Markdown do ARCHITECTURE.md, sim.
 #[derive(Debug, Clone, Copy)]
@@ -768,6 +771,14 @@ impl LlmArchitect {
         let request = TurnRequest { text: RECOVERY_REQUEST, structured: Some(structured::RECOVERY) };
         self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, request, true, Some(NetPhase::Recovery))
             .await
+    }
+
+    /// Turno de arbitragem (spec 124 T02): o Desenvolvedor contestou apontamentos; o Arquiteto decide
+    /// `keep`, `adjust` ou `manual` para cada um. Somente leitura, sem internet nem memória, com a
+    /// worktree da tarefa como raiz de leitura. Devolve o texto bruto (JSON a validar pelo runner).
+    pub async fn arbitrate(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
+        let request = TurnRequest { text: ARBITRATION_REQUEST, structured: Some(structured::ARBITRATION) };
+        self.read_only_turn(root, arbitration_system_for(self.lang.get()), facts, request, false, None).await
     }
 
     async fn read_only_turn(
@@ -1681,13 +1692,15 @@ mod tests {
         }
     }
 
-    /// Turno com `run_command` aprovado seguido de outra ferramenta: todo `command` fecha.
+    /// Turno com `run_command` aprovado seguido de outra ferramenta: todo `command` fecha. O
+    /// comando é de leitura (`ls`): desde a spec 123 T02, um comando recusado (como `echo`, que o
+    /// Arquiteto não pode rodar) não abre `command` nenhum, porque o processo nunca começa.
     #[tokio::test]
     async fn architect_command_is_closed_before_next_tool() {
         use crate::agents::activity::ActivityKind;
         let root = tmp_root("arch-cmd-end");
         let backend = Scripted::new(vec![
-            calls(&[("c1", "run_command", r#"{"command":"echo oi"}"#)]),
+            calls(&[("c1", "run_command", r#"{"command":"ls"}"#)]),
             calls(&[("c2", "write_sdd_artifacts", &write_args(".sdd/specs/001-exemplo/spec.md", EXAMPLE_SPEC_MD))]),
             text("pronto"),
         ]);
@@ -2069,9 +2082,10 @@ mod tests {
     #[tokio::test]
     async fn structured_turns_mark_activity_and_prose_turns_do_not() {
         let root = tmp_root("arch-structured");
-        let cases: [(&str, Option<&str>); 6] = [
+        let cases: [(&str, Option<&str>); 7] = [
             ("diagnose", Some("diagnosis")),
             ("recover", Some("recovery")),
+            ("arbitrate", Some("arbitration")),
             ("report", None),
             ("survey", None),
             ("update", None),
@@ -2084,6 +2098,7 @@ mod tests {
             match turn {
                 "diagnose" => drop(a.diagnose(&root, "f").await.expect("diagnose")),
                 "recover" => drop(a.recover(&root, "f").await.expect("recover")),
+                "arbitrate" => drop(a.arbitrate(&root, "f").await.expect("arbitrate")),
                 "report" => drop(a.report(&root, "f").await.expect("report")),
                 "survey" => drop(a.survey_architecture(&root, "f").await.expect("survey")),
                 "update" => drop(a.update_architecture(&root, "f").await.expect("update")),

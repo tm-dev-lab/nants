@@ -3,6 +3,8 @@ export interface EscalationContext {
   /** Texto antes do bloco "Contexto" (causa raiz, decisão). */
   summary: string;
   rootCause: string | null;
+  /** Pergunta objetiva do Arquiteto numa decisão ASK (spec 124 T03). */
+  question: string | null;
   command: string | null;
   code: string | null;
   excerpt: string | null;
@@ -41,6 +43,7 @@ export function parseEscalation(text: string): EscalationContext | null {
   const ctx: EscalationContext = {
     summary: head.trim(),
     rootCause: null,
+    question: null,
     command: null,
     code: null,
     excerpt: null,
@@ -59,6 +62,18 @@ export function parseEscalation(text: string): EscalationContext | null {
       parts.push(l.trim());
     }
     ctx.rootCause = parts.join("\n").trim();
+  }
+
+  const qIdx = headLines.findIndex((l) => /^[ \t]*-[ \t]*Pergunta ao humano:/.test(l));
+  if (qIdx >= 0) {
+    const parts = [(headLines[qIdx] ?? "").replace(/^[ \t]*-[ \t]*Pergunta ao humano:[ \t]*/, "").trim()];
+    for (let k = qIdx + 1; k < headLines.length; k += 1) {
+      const l = headLines[k] ?? "";
+      if (/^-\s/.test(l)) break;
+      parts.push(l.trim());
+    }
+    const q = parts.join("\n").trim();
+    ctx.question = q === "" ? null : q;
   }
 
   const known = new Set(["comando", "codigo", "trecho do erro", "o que foi tentado", "por que nao resolveu", "opcoes"]);

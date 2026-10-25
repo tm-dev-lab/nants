@@ -281,6 +281,39 @@ describe("Shell: barra superior", () => {
     expect(within(pill).getByRole("button", { name: "Parando" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("pílula (spec 123 T02): durante os testes a fase é 'Testes · 7 min', âmbar perto do limite; no fim volta a 'Executando'", async () => {
+    const spec = makeSpec("s1", "Carrinho", "IN_PROGRESS", [makeTask("T01", "a", "IN_PROGRESS")]);
+    const { stream } = await renderShell({
+      url: "/?space=p1",
+      projects: [P1],
+      states: { p1: makeProjectState({ id: "p1", name: "Loja", running: true, run: { spec_id: "s1", status: "running" }, specs: [spec] }) },
+    });
+    const pill = (): HTMLElement => {
+      const el = document.querySelector<HTMLElement>("[data-run-pill]");
+      if (el === null) throw new Error("pílula ausente");
+      return el;
+    };
+    const emit = (payload: Record<string, unknown>): void =>
+      stream().emit("agent_activity", { event_type: "agent_activity", project_id: "p1", payload: { agent: "tests", task_id: "T01", activity_id: "T01-1-3", ...payload } });
+    expect(pill().querySelector("[data-run-operation]")).toBeNull();
+    await act(async () => emit({ kind: "command", text: "npx playwright test", command_started_at: Date.now() - 420_000, command_limit_ms: 600_000 }));
+    await settle();
+    const op = pill().querySelector<HTMLElement>("[data-run-operation]");
+    expect(op?.textContent).toBe("Testes · 7 min");
+    expect(op?.getAttribute("data-near-limit")).toBeNull();
+    // O rótulo da fase continua no `status`, para leitores de tela, fora da vista.
+    expect(within(pill()).getByRole("status").textContent).toBe("Executando");
+    expect(within(pill()).getByRole("status").className).toBe("nd-sr-only");
+    expect(findForbiddenGlyphs(pill())).toEqual([]);
+    await act(async () => emit({ activity_id: "T01-1-4", kind: "command", text: "npx playwright test", command_started_at: Date.now() - 500_000, command_limit_ms: 600_000 }));
+    await settle();
+    expect(pill().querySelector("[data-run-operation]")?.getAttribute("data-near-limit")).toBe("true");
+    await act(async () => emit({ activity_id: "T01-1-4", kind: "end" }));
+    await settle();
+    expect(pill().querySelector("[data-run-operation]")).toBeNull();
+    expect(within(pill()).getByRole("status").className).toBe("nd-run-phase");
+  });
+
   it("pílula: Cancelar não chama a rota; erro da rota de Parar aparece no diálogo e o Parar continua utilizável", async () => {
     const spec = makeSpec("s1", "Carrinho", "IN_PROGRESS", [makeTask("T01", "a", "IN_PROGRESS")]);
     const { server } = await renderShell({

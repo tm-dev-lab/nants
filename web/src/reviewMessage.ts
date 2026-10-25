@@ -9,6 +9,9 @@
  *   [\n\nApontamentos:\n- F-01 [MEDIUM] local: descrição (seta) recomendação]
  *   [\n  Cenário de falha: gatilho (seta) resultado errado]
  *   [\n\nObservações (não bloqueiam):\n- F-02 [LOW] local: descrição]
+ *   [\n\nResolvidos:\n- F-03 [HIGH] local: descrição]
+ *   [\n\nRespostas do Desenvolvedor:\n- F-01 [fixed] local | F-03 [contested, environment] motivo]
+ *   [\n\nDecisões do Arquiteto:\n- F-03 [manual] título: motivo]
  *   [\n\nCapturas avaliadas: t01-1-a.png, t01-1-b.png]
  *   [\n\nCritérios:\n(marca) critério: evidência]
  *
@@ -34,6 +37,22 @@ const UNCHANGED_FILE_LABEL = "observação (arquivo não mudou nesta rodada)";
  * 087 T05): `[HIGH, baixa confiança]`. A tela mostra `review.lowConfidence` no idioma ativo (spec 115 T03).
  */
 const LOW_CONFIDENCE_LABEL = "baixa confiança";
+/**
+ * Spec 124 T01: marcas de estado junto da severidade (`runner::STATE_NEW_LABEL` e
+ * `runner::STATE_OPEN_PREFIX`): `[HIGH, novo]` e `[HIGH, aberto há 3 revisões]`. A tela mostra
+ * `review.stateNew` e `review.stateOpen` no idioma ativo.
+ */
+const STATE_NEW_LABEL = "novo";
+const STATE_OPEN_MARK = /, aberto há (\d+) revis(?:ão|ões)/;
+/** Seção dos apontamentos anteriores resolvidos nesta revisão (`runner::RESOLVED_HEADER`). */
+const RESOLVED_HEADER = "Resolvidos:";
+/**
+ * Spec 124 T02: respostas do Desenvolvedor por apontamento (`finding_reply::RESPONSES_HEADER`) e
+ * decisões do Arquiteto sobre as contestações (`finding_reply::DECISIONS_HEADER`). Os tipos entre
+ * colchetes são códigos (`fixed`, `contested, environment`, `manual`); a tela mostra o dicionário.
+ */
+const RESPONSES_HEADER = "Respostas do Desenvolvedor:";
+const DECISIONS_HEADER = "Decisões do Arquiteto:";
 /** Linha das capturas vistas pelo Revisor (`runner::CAPTURES_HEADER`), última antes dos critérios. */
 const CAPTURES_HEADER = "Capturas avaliadas:";
 /** Nome de captura servido por `/captures/:name` (`sdd::screenshots::copy_name`). */
@@ -91,6 +110,30 @@ export interface ReviewFinding {
   unchangedFile?: boolean;
   /** Spec 087 T05: finding de baixa confiança (vira observação). */
   lowConfidence?: boolean;
+  /** Spec 124 T01: estado apurado pelo runner; ausente em mensagens antigas. */
+  state?: "new" | "open" | "resolved";
+  /** Spec 124 T01: revisões seguidas em que está aberto (só com `state` "open"). */
+  recurrence?: number;
+}
+
+/** Spec 124 T02: resposta do Desenvolvedor a um apontamento. */
+export interface ReviewResponse {
+  id: string;
+  /** `fixed`, `test_added` ou `contested` (código; desconhecido aparece como veio). */
+  kind: string;
+  /** Só em `contested`: `environment`, `out_of_scope` ou `incorrect`. */
+  reason?: string;
+  /** Local, teste ou motivo, como o Desenvolvedor escreveu. */
+  detail: string;
+}
+
+/** Spec 124 T02: decisão do Arquiteto sobre um apontamento contestado. */
+export interface ReviewDecision {
+  id: string;
+  /** `keep`, `adjust` ou `manual` (código). */
+  decision: string;
+  /** Título do apontamento e motivo, como o servidor gravou. */
+  detail: string;
 }
 
 export interface ReviewMessage {
@@ -101,6 +144,12 @@ export interface ReviewMessage {
   summary: string;
   findings: ReviewFinding[];
   observations: ReviewFinding[];
+  /** Spec 124 T01: apontamentos anteriores resolvidos nesta revisão; vazio sem a seção. */
+  resolved: ReviewFinding[];
+  /** Spec 124 T02: respostas do Desenvolvedor conferidas nesta revisão; vazio sem a seção. */
+  responses: ReviewResponse[];
+  /** Spec 124 T02: decisões do Arquiteto sobre contestações; vazio sem a seção. */
+  decisions: ReviewDecision[];
   items: ChecklistItem[];
   /** Nomes das capturas avaliadas (linha `Capturas avaliadas:`), na ordem; vazio sem a linha. */
   captures: string[];
@@ -149,15 +198,25 @@ function parseFindingLine(line: string): ReviewFinding {
   // Os rótulos podem vir juntos (`, observação (...), baixa confiança`): tira cada um, onde estiver.
   const unchangedFile = rawSeverity.includes(unchangedMark);
   const lowConfidence = rawSeverity.includes(lowMark);
+  const openMatch = STATE_OPEN_MARK.exec(rawSeverity);
+  // Depois da severidade, as marcas vêm separadas por ", "; "novo" é uma delas.
+  const parts = rawSeverity.replace(unchangedMark, "").replace(lowMark, "").replace(STATE_OPEN_MARK, "").split(", ");
+  const isNew = parts.slice(1).includes(STATE_NEW_LABEL);
   const finding: ReviewFinding = {
     id: head[1] ?? "",
-    severity: rawSeverity.replace(unchangedMark, "").replace(lowMark, ""),
+    severity: parts.filter((p, i) => i === 0 || p !== STATE_NEW_LABEL).join(", "),
     location,
     description: arrow < 0 ? tail : tail.slice(0, arrow),
     recommendation: arrow < 0 ? "" : tail.slice(arrow + 3),
   };
   if (unchangedFile) finding.unchangedFile = true;
   if (lowConfidence) finding.lowConfidence = true;
+  if (openMatch !== null) {
+    finding.state = "open";
+    finding.recurrence = Number(openMatch[1]);
+  } else if (isNew) {
+    finding.state = "new";
+  }
   return finding;
 }
 
@@ -176,6 +235,29 @@ function parseFindingList(body: string): ReviewFinding[] {
     }
   }
   return out;
+}
+
+/** Linhas `- ID [código(, código)] detalhe` de uma seção (respostas ou decisões). */
+function parseCodedLines(body: string): { id: string; codes: string[]; detail: string }[] {
+  const out: { id: string; codes: string[]; detail: string }[] = [];
+  for (const line of body.split("\n")) {
+    const match = /^- (\S+) \[([a-z_]+(?:, [a-z_]+)?)\] ?(.*)$/.exec(line.trim());
+    if (match === null) continue;
+    out.push({ id: match[1] ?? "", codes: (match[2] ?? "").split(", "), detail: (match[3] ?? "").trim() });
+  }
+  return out;
+}
+
+function parseResponses(body: string): ReviewResponse[] {
+  return parseCodedLines(body).map(({ id, codes, detail }) => {
+    const response: ReviewResponse = { id, kind: codes[0] ?? "", detail };
+    if (codes[1] !== undefined) response.reason = codes[1];
+    return response;
+  });
+}
+
+function parseDecisions(body: string): ReviewDecision[] {
+  return parseCodedLines(body).map(({ id, codes, detail }) => ({ id, decision: codes[0] ?? "", detail }));
 }
 
 function parseVerdictHead(head: string): { prefix: string; verdict: ReviewVerdict; rest: string } | null {
@@ -209,23 +291,60 @@ export function parseReviewMessage(text: string): ReviewMessage | null {
   const parsed = parseVerdictHead(head);
   if (parsed === null) {
     if (items.length === 0) return null;
-    return { prefix: "", verdict: null, summary: head, findings: [], observations: [], items, captures };
+    return { prefix: "", verdict: null, summary: head, findings: [], observations: [], resolved: [], responses: [], decisions: [], items, captures };
   }
-  const findingsMark = `\n\n${FINDINGS_HEADER}\n`;
-  const observationsMark = `\n\n${OBSERVATIONS_HEADER}\n`;
-  const fAt = parsed.rest.indexOf(findingsMark);
-  const oAt = parsed.rest.indexOf(observationsMark);
-  const ends = [fAt, oAt].filter((n) => n >= 0);
-  const summaryEnd = ends.length === 0 ? parsed.rest.length : Math.min(...ends);
-  const findingsBody = fAt < 0 ? "" : parsed.rest.slice(fAt + findingsMark.length, oAt > fAt ? oAt : undefined);
-  const observationsBody = oAt < 0 ? "" : parsed.rest.slice(oAt + observationsMark.length, fAt > oAt ? fAt : undefined);
+  // Cada seção vai do seu cabeçalho até o próximo cabeçalho encontrado (em qualquer ordem).
+  const marks = [FINDINGS_HEADER, OBSERVATIONS_HEADER, RESOLVED_HEADER, RESPONSES_HEADER, DECISIONS_HEADER].map((h) => `\n\n${h}\n`);
+  const starts = marks.map((m) => parsed.rest.indexOf(m));
+  const found = starts.filter((n) => n >= 0);
+  const summaryEnd = found.length === 0 ? parsed.rest.length : Math.min(...found);
+  const bodyOf = (i: number): string => {
+    const at = starts[i] ?? -1;
+    if (at < 0) return "";
+    const next = found.filter((n) => n > at);
+    return parsed.rest.slice(at + (marks[i] ?? "").length, next.length === 0 ? undefined : Math.min(...next));
+  };
+  const resolved = parseFindingList(bodyOf(2)).map((f): ReviewFinding => ({ ...f, state: "resolved" }));
   return {
     prefix: parsed.prefix,
     verdict: parsed.verdict,
     summary: parsed.rest.slice(0, summaryEnd).trim(),
-    findings: parseFindingList(findingsBody),
-    observations: parseFindingList(observationsBody),
+    findings: parseFindingList(bodyOf(0)),
+    observations: parseFindingList(bodyOf(1)),
+    resolved,
+    responses: parseResponses(bodyOf(3)),
+    decisions: parseDecisions(bodyOf(4)),
     items,
     captures,
   };
+}
+
+/** Spec 124 T01: contagem dos estados dos apontamentos de uma revisão (bloqueantes e resolvidos). */
+interface ReviewStateCounts {
+  new: number;
+  open: number;
+  resolved: number;
+}
+
+export function reviewStateCounts(review: ReviewMessage): ReviewStateCounts {
+  return {
+    new: review.findings.filter((f) => f.state === "new").length,
+    open: review.findings.filter((f) => f.state === "open").length,
+    resolved: review.resolved.length,
+  };
+}
+
+/**
+ * Resumo "2 novos · 1 ainda aberto · 1 resolvido" no idioma de `tp`; vazio quando a mensagem não
+ * traz estados (mensagens antigas).
+ */
+export function reviewStateLine(
+  counts: ReviewStateCounts,
+  tp: (base: "review.countNew" | "review.countOpen" | "review.countResolved", count: number) => string,
+): string {
+  const parts: string[] = [];
+  if (counts.new > 0) parts.push(tp("review.countNew", counts.new));
+  if (counts.open > 0) parts.push(tp("review.countOpen", counts.open));
+  if (counts.resolved > 0) parts.push(tp("review.countResolved", counts.resolved));
+  return parts.join(" · ");
 }

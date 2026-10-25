@@ -371,4 +371,46 @@ describe("análise de recuperação no diálogo (role agent, agente architect)",
     expect(localizeRecoveryAnalysis(RECOVERY_ESCALATE, "pt-BR")).toBe(RECOVERY_ESCALATE);
     expect(localizeRecoveryAnalysis("Texto livre do agente", "en")).toBe("Texto livre do agente");
   });
+
+  // Spec 124 T03: as linhas fixas de SPLIT, ADJUST e ASK saem no idioma ativo; o conteúdo fica.
+  it("em en: SPLIT, ADJUST e ASK pelo dicionário", () => {
+    const split = [
+      "Análise de recuperação #1 (SPLIT)",
+      "- Causa raiz: too big",
+      "- Decisão: tarefa dividida (SPLIT)",
+      "- Estratégia: keep the server part",
+      "- Tarefas novas: T07 (End to end proofs)",
+    ].join("\n");
+    expect(localizeRecoveryAnalysis(split, "en")).toBe(
+      [
+        "Recovery analysis #1 (SPLIT)",
+        "- Root cause: too big",
+        en["recoveryText.decision.split"],
+        "- Strategy: keep the server part",
+        "- New tasks: T07 (End to end proofs)",
+      ].join("\n"),
+    );
+    const adjust = [
+      "Análise de recuperação #2 (ADJUST)",
+      "- Decisão: critérios ajustados ao que o ambiente prova (ADJUST)",
+      "- Apontamentos dispensados: F-03 [manual]",
+    ].join("\n");
+    expect(localizeRecoveryAnalysis(adjust, "en")).toBe(
+      ["Recovery analysis #2 (ADJUST)", en["recoveryText.decision.adjust"], "- Findings waived: F-03 [manual]"].join("\n"),
+    );
+    const refused = "Análise de recuperação #3 (RETRY)\n- Ajuste não aplicado: os critérios não puderam ser gravados; a tarefa segue com a estratégia (RETRY)";
+    expect(localizeRecoveryAnalysis(refused, "en")).toBe(`Recovery analysis #3 (RETRY)\n${en["recoveryText.adjustRefused"]}`);
+    const ask = [
+      "Análise de recuperação #4 (ASK)",
+      "- Decisão: pergunta ao humano (ASK)",
+      "- Pergunta ao humano: May the captures be manual?",
+      "- Contexto:",
+      "  - opções: responda à pergunta acima no campo de orientação; a tarefa volta a executar com a sua resposta",
+    ].join("\n");
+    const shown = localizeRecoveryAnalysis(ask, "en");
+    expect(shown).toContain(en["recoveryText.decision.ask"]);
+    expect(shown).toContain("- Question for the human: May the captures be manual?");
+    expect(shown).toContain(en["recoveryText.options.ask"]);
+    expect(shown).not.toMatch(/Pergunta|Decisão|opções/);
+  });
 });

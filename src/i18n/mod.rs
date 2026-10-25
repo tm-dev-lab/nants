@@ -376,10 +376,13 @@ mod tests {
     /// dicionário precisa cair numa família, para nenhuma família nova escapar da sentinela.
     #[test]
     fn system_messages_have_no_portuguese_in_english() {
-        // A spec 119 acrescenta o motivo da resposta ruim do provedor (`provider.`).
-        const PREFIXES: [&str; 19] = [
+        // A spec 119 acrescenta o motivo da resposta ruim do provedor (`provider.`); a spec 124 T06, o
+        // apontamento de tarefa grande da revisão do plano (`plan_review.`); a spec 125, os títulos do
+        // ARCHITECTURE.md (`architecture.`).
+        const PREFIXES: [&str; 21] = [
             "runner.", "advisor.", "survey.", "report.", "ui.", "approvals.", "runs.", "serverError.", "approval.", "system.", "cli.",
-            "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.",
+            "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.", "plan_review.",
+            "architecture.",
         ];
         const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
         const PT_WORDS: [&str; 19] = [
@@ -410,7 +413,7 @@ mod tests {
 
     /// Chaves com o mesmo texto nos dois idiomas, com o motivo (a sentinela acima exige pt-BR
     /// diferente do en no resto).
-    const SAME_IN_BOTH: [(&str, &str); 9] = [
+    const SAME_IN_BOTH: [(&str, &str); 10] = [
         ("doctor.status.ok", "marca de status do doctor, igual nos dois"),
         ("doctor.status.info", "marca de status do doctor, igual nos dois"),
         ("doctor.label.git", "nome de ferramenta"),
@@ -420,6 +423,7 @@ mod tests {
         ("doctor.label.wsl", "nome de ferramenta"),
         ("doctor.detail.disk", "só a lista, montada por idioma nos itens"),
         ("report.traceability.commit", "id e hash do commit, sem texto traduzível"),
+        ("architecture.section.stack", "título de seção do ARCHITECTURE.md: \"Stack\" é o mesmo termo nos dois idiomas"),
     ];
 
     /// Spec 115 T01: plural com `.one` e `.other` sempre juntos, nos dois dicionários, sem a chave

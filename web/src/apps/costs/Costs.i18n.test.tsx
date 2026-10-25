@@ -14,7 +14,7 @@ import { portugueseLeftovers } from "../../i18n/ptLeftovers";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 import { formatTokens, formatUsd } from "../../usageFormat";
-import { budgetProgress, contextEffectText, costsSummary, pacingText } from "./costsModel";
+import { budgetProgress, contextEffectText, contextRows, costsSummary, pacingText } from "./costsModel";
 
 afterEach(() => {
   cleanup();
@@ -26,8 +26,11 @@ afterEach(() => {
 const P1 = makeProject("p1", "Shop");
 const totals = (cost: number | null, input = 1000, output = 500) => ({ calls: 2, input, output, cached: 0, reasoning: 0, cost_usd: cost, unpriced_calls: 0 });
 
-// Resumo do contexto (spec 122): tokens evitados = bytes / 4 (340.000 -> 85,0 mil; 40.000 -> 10,0 mil).
+// Resumo do contexto (spec 122): sem a estimativa do servidor (antigo), tokens evitados = bytes / 4
+// (340.000 -> 85,0 mil; 40.000 -> 10,0 mil).
 const ctx = (compactions: number, summaries: number, saved_bytes: number) => ({ calls: 2, input: 1000, avg_input: 500, max_input: 600, max_context_bytes: 2400, compactions, summaries, saved_bytes });
+// Com os campos da 123/T03: a estimativa do servidor manda (12.620.914 tokens, como no Test 3).
+const ctxFull = { calls: 1456, input: 33_227_375, avg_input: 22_820, max_input: 52_130, max_context_bytes: 151_678, cached: 8_780_800, cache_pct: 26, compactions: 88, spills: 21, dedups: 2, summaries: 0, saved_bytes: 2_761_500, reinjection_avoided_tokens: 12_620_914 };
 
 const PROJECT: UsageView = {
   specs: [],
@@ -89,7 +92,7 @@ describe("Custos em en", () => {
     expect(within(win).getByRole("region", { name: "Project cost" })).toBeTruthy();
     expect(within(win).getByTestId("images-hint").textContent).toBe("includes 2 images (estimated)");
     await waitFor(() => expect(win.querySelector("[data-budget-bar]")?.textContent).toBe("Spec s1: US$ 0.10 of US$ 5.00"));
-    expect([...within(win).getByRole("region", { name: "Context management effect" }).querySelectorAll("p")].map((p) => p.textContent)).toEqual([
+    expect([...within(win).getByRole("region", { name: "Context" }).querySelectorAll("[data-costs-context-line]")].map((p) => p.textContent)).toEqual([
       "Context management: 12 compactions, 1 summary, about 85.0K tokens avoided (estimate)",
       "In spec s1: 3 compactions, 0 summaries, about 10.0K tokens avoided",
     ]);
@@ -101,7 +104,21 @@ describe("Custos em en", () => {
     ]);
     expect(win.querySelector("[data-costs-details] summary")?.textContent).toBe("See details by task and model");
     expect(win.querySelector("[data-costs-budget] summary")?.textContent).toBe("Edit the spec budget");
+    expect(win.querySelector("[data-costs-context-details] summary")?.textContent).toBe("See context details");
     await openAll(win);
+    const scopes = [...win.querySelectorAll("[data-context-scope]")];
+    expect(scopes.map((el) => el.querySelector("h3")?.textContent)).toEqual(["In the project", "In spec s1"]);
+    expect([...(scopes[0]?.querySelectorAll("[data-context-row]") ?? [])].map((r) => `${r.querySelector("dt")?.textContent}: ${r.querySelector("dd")?.textContent}`)).toEqual([
+      "Calls: 2",
+      "Average input per call: 500 tokens",
+      "Largest context: 600 tokens",
+      "Compactions: 12",
+      "History summaries: 1",
+      "Tokens avoided (estimate): 85.0K tokens",
+    ]);
+    expect(win.querySelector("[data-costs-context-note]")?.textContent).toBe(
+      "Tokens avoided are an estimate: what each compaction, saved output, avoided read or summary removed from the history, times the calls the same agent session made afterwards. It is not an exact value.",
+    );
     expect(win.querySelector("[data-costs-tokens]")?.textContent).toBe("12.0K input, 4.0K output · 2 calls");
     expect(within(win).getByTestId("images-cost").textContent).toBe("Generated images: 2 (US$ 0.04, estimated)");
     expect(within(win).getByTestId("web-search-cost").textContent).toBe("Web searches: 3 (US$ 0.03)");
@@ -189,7 +206,7 @@ describe("Custos em pt-BR e troca ao vivo", () => {
     await waitFor(() => expect(within(win).getByTestId("usage-cost").textContent).toBe("US$ 1.234,50 (estimado)"));
     expect(within(win).getByTestId("images-hint").textContent).toBe("inclui 2 imagens (estimado)");
     await waitFor(() => expect(win.querySelector("[data-budget-bar]")?.textContent).toBe("Spec s1: US$ 0,10 de US$ 5,00"));
-    expect([...within(win).getByRole("region", { name: "Efeito da gestão de contexto" }).querySelectorAll("p")].map((p) => p.textContent)).toEqual([
+    expect([...within(win).getByRole("region", { name: "Contexto" }).querySelectorAll("[data-costs-context-line]")].map((p) => p.textContent)).toEqual([
       "Gestão de contexto: 12 compactações, 1 resumo, cerca de 85,0 mil tokens evitados (estimativa)",
       "Na spec s1: 3 compactações, 0 resumos, cerca de 10,0 mil tokens evitados",
     ]);
@@ -222,5 +239,34 @@ describe("Custos em pt-BR e troca ao vivo", () => {
     setLanguage("en", { persist: false });
     expect(contextEffectText(ctx(1, 1, 2_000))).toBe("Context management: 1 compaction, 1 summary, about 500 tokens avoided (estimate)");
     expect(contextEffectText(ctx(2, 0, 0), "s9")).toBe("In spec s9: 2 compactions, 0 summaries, about 0 tokens avoided");
+  });
+
+  it("área Contexto (123/T03): a estimativa do servidor no resumo e nos detalhes, nos dois idiomas", () => {
+    setLanguage("pt-BR", { persist: false });
+    expect(contextEffectText(ctxFull)).toBe("Gestão de contexto: 88 compactações, 0 resumos, cerca de 12,6M tokens evitados (estimativa)");
+    expect(contextRows(ctxFull).map((r) => `${r.label}: ${r.value}`)).toEqual([
+      "Chamadas: 1.456",
+      "Entrada média por chamada: 22,8 mil tokens",
+      "Maior contexto: 52,1 mil tokens",
+      "Entrada lida do cache: 26%",
+      "Compactações: 88",
+      "Saídas grandes guardadas em arquivo: 21",
+      "Leituras repetidas evitadas: 2",
+      "Resumos do histórico: 0",
+      "Tokens evitados (estimativa): 12,6M tokens",
+    ]);
+    setLanguage("en", { persist: false });
+    expect(contextEffectText(ctxFull, "s9")).toBe("In spec s9: 88 compactions, 0 summaries, about 12.6M tokens avoided");
+    expect(contextRows(ctxFull).map((r) => `${r.label}: ${r.value}`)).toEqual([
+      "Calls: 1,456",
+      "Average input per call: 22.8K tokens",
+      "Largest context: 52.1K tokens",
+      "Input read from cache: 26%",
+      "Compactions: 88",
+      "Large outputs saved to a file: 21",
+      "Repeated reads avoided: 2",
+      "History summaries: 0",
+      "Tokens avoided (estimate): 12.6M tokens",
+    ]);
   });
 });

@@ -64,6 +64,13 @@ function EscalationDetails({ ctx }: { ctx: EscalationContext }) {
   const cause = ctx.rootCause !== null ? localizeRecoveryCause(ctx.rootCause, lang) : localizeRecoveryAnalysis(ctx.summary, lang);
   return (
     <div className="nd-stack-sm nd-muted">
+      {ctx.question !== null ? (
+        <Block title={t("escalation.question")}>
+          <p className="nd-prewrap nd-strong" data-recovery-question="">
+            {ctx.question}
+          </p>
+        </Block>
+      ) : null}
       {cause !== "" ? (
         <Block title={t("escalation.whatHappened")}>
           <p className="nd-prewrap">{cause}</p>

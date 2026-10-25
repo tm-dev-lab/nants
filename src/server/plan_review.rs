@@ -45,7 +45,10 @@ use super::state::AppState;
 use crate::agents::architect::truncate_bytes;
 use crate::agents::chat::ChatBackend;
 use crate::agents::plan_review::PlanReviewer;
+use crate::agents::recovery_plan::{count_criteria, MANY_CRITERIA};
+use crate::agents::runner::{section_text, ACCEPTANCE};
 use crate::config::Effort;
+use crate::sdd::capabilities;
 use crate::sdd::environment::sha256_hex;
 use crate::sdd::{Spec, SpecStatus};
 
@@ -61,7 +64,10 @@ pub const MAX_ISSUES: usize = 8;
 /// Teto do texto de cada apontamento (bytes, depois da redação).
 pub const MAX_ISSUE_TEXT_BYTES: usize = 300;
 /// Tipos aceitos de apontamento.
-pub const ISSUE_KINDS: [&str; 5] = ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency"];
+pub const ISSUE_KINDS: [&str; 6] = ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", TOO_LARGE];
+/// Tarefa grande demais para uma revisão (spec 124 T06): o modelo aponta as áreas misturadas e o
+/// servidor completa, de forma determinística, as de muitos critérios ([`MANY_CRITERIA`]).
+pub const TOO_LARGE: &str = "too_large";
 
 pub const STATUS_OK: &str = "ok";
 pub const STATUS_UNAVAILABLE: &str = "unavailable";
@@ -299,7 +305,14 @@ async fn review_once(state: &AppState, project_id: &str, root: &Path, spec_id: &
             Err(_) => Err(DETAIL_TIMEOUT.to_string()),
         },
     };
-    let issues = answer.as_deref().ok().and_then(|raw| parse_issues(raw, &secrets));
+    let lang = state.project_lang(project_id).get();
+    let (size_root, sid) = (root.to_path_buf(), spec_id.to_string());
+    let sizes = tokio::task::spawn_blocking(move || task_sizes(&size_root, &sid)).await.unwrap_or_default();
+    let issues = answer
+        .as_deref()
+        .ok()
+        .and_then(|raw| parse_issues(raw, &secrets))
+        .map(|found| with_size_issues(found, &sizes, lang));
     let detail = match (&issues, answer) {
         (Some(_), _) => None,
         (None, Ok(_)) => Some(DETAIL_INVALID_JSON.to_string()),
@@ -406,7 +419,73 @@ fn build_plan(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<String>
         }
         out.push_str(&block);
     }
+    // Spec 124 T06: o tamanho de cada tarefa, para o apontamento `too_large`.
+    let sizes = task_sizes(root, spec_id);
+    if !sizes.is_empty() {
+        out.push_str("\n### Tamanho das tarefas (contado pelo servidor)\n");
+        for size in &sizes {
+            out.push_str(&format!(
+                "- {}: {} critérios de aceitação; allowed_scope: {}\n",
+                size.id,
+                size.criteria,
+                truncate_bytes(&scrub_text(secrets, &size.scope.join(", ")), 300)
+            ));
+        }
+    }
+    // Spec 124 T04: o que o ambiente de testes prova (critério que depende de capacidade ausente
+    // vira verificação manual ou é apontado).
+    let host = safe_fs::read_regular(root, ".sdd/settings.yaml", MAX_READ_BYTES)
+        .ok()
+        .and_then(|t| crate::sdd::Settings::parse(&t).ok())
+        .is_some_and(|s| s.environment.is_host());
+    let caps = capabilities::current(root, host, || format_utc(unix_now()));
+    let section = capabilities::prompt_section(&caps, capabilities::Audience::Plan);
+    if !section.is_empty() {
+        out.push_str(&format!("\n{}", scrub_text(secrets, &section)));
+    }
     Some(out)
+}
+
+/// Tamanho de uma tarefa do plano: critérios de aceitação contados e o `allowed_scope`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskSize {
+    pub id: String,
+    pub criteria: usize,
+    pub scope: Vec<String>,
+}
+
+/// Tamanho das tarefas legíveis do plano, em ordem.
+pub fn task_sizes(root: &Path, spec_id: &str) -> Vec<TaskSize> {
+    task_names(root, spec_id)
+        .iter()
+        .filter_map(|name| safe_fs::read_regular(root, &format!("{SPECS_REL}/{spec_id}/tasks/{name}"), MAX_READ_BYTES).ok())
+        .filter_map(|raw| crate::sdd::Task::parse(&raw).ok())
+        .filter(|t| valid_task_id(&t.frontmatter.id))
+        .map(|t| TaskSize {
+            criteria: count_criteria(&section_text(&t.body, ACCEPTANCE).unwrap_or_default()),
+            scope: t.frontmatter.allowed_scope.clone(),
+            id: t.frontmatter.id,
+        })
+        .collect()
+}
+
+/// Completa os apontamentos do modelo com `too_large` para cada tarefa com [`MANY_CRITERIA`] ou
+/// mais critérios que o modelo não apontou como grande. O texto fica gravado no idioma do projeto.
+/// Os do servidor nunca são cortados: os do modelo cedem a vaga dentro de [`MAX_ISSUES`].
+pub fn with_size_issues(found: Vec<PlanIssue>, sizes: &[TaskSize], lang: crate::i18n::Lang) -> Vec<PlanIssue> {
+    let flagged = |id: &str| found.iter().any(|i| i.kind == TOO_LARGE && i.task.as_deref() == Some(id));
+    let extra: Vec<PlanIssue> = sizes
+        .iter()
+        .filter(|s| s.criteria >= MANY_CRITERIA && !flagged(&s.id))
+        .take(MAX_ISSUES)
+        .map(|s| PlanIssue {
+            task: Some(s.id.clone()),
+            kind: TOO_LARGE.to_string(),
+            text: crate::i18n::tr_plural(lang, "plan_review.too_large", u64::try_from(s.criteria).unwrap_or(u64::MAX), &[]),
+        })
+        .collect();
+    let room = MAX_ISSUES.saturating_sub(extra.len());
+    found.into_iter().take(room).chain(extra).collect()
 }
 
 /// Valida a resposta do modelo: o objeto JSON (entre o primeiro `{` e o último `}`) com `issues`

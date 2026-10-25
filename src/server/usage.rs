@@ -559,12 +559,24 @@ pub struct ContextSummary {
     pub max_input: u64,
     /// Maior contexto medido em bytes (`context_bytes`); 0 sem chamada medida.
     pub max_context_bytes: u64,
+    /// Tokens de entrada lidos do cache do provedor (`cached`), somados (spec 123 T03).
+    pub cached: u64,
+    /// Percentual da entrada lida do cache (`cached` / `input`, arredondado); 0 sem entrada.
+    pub cache_pct: u64,
     /// Compactações registradas no `context.jsonl`.
     pub compactions: u64,
+    /// Saídas grandes guardadas em arquivo (eventos `spill`, spec 123 T03).
+    pub spills: u64,
+    /// Releituras de arquivo inalterado evitadas (eventos `dedup`, spec 123 T03).
+    pub dedups: u64,
     /// Resumos do histórico bem-sucedidos (`summary`, spec 122 T04); as falhas não contam.
     pub summaries: u64,
     /// Bytes evitados: soma de `before_bytes - after_bytes` de todos os eventos de contexto.
     pub saved_bytes: u64,
+    /// Tokens que deixaram de ser reenviados, estimados (spec 123 T03, ver
+    /// [`reinjection_avoided_tokens`]): o que cada evento tirou do histórico vezes as chamadas que
+    /// a mesma sessão fez depois dele, dividido por 4.
+    pub reinjection_avoided_tokens: u64,
 }
 
 impl ContextSummary {
@@ -574,16 +586,117 @@ impl ContextSummary {
         self.avg_input = self.input / self.calls;
         self.max_input = self.max_input.max(r.input);
         self.max_context_bytes = self.max_context_bytes.max(r.context_bytes.unwrap_or(0));
+        self.cached += r.cached.unwrap_or(0).min(r.input);
+        self.cache_pct = percent(self.cached, self.input);
     }
 
     fn add_event(&mut self, e: &ContextLine) {
         if e.kind == ContextKind::Compact.as_str() {
             self.compactions += 1;
+        } else if e.kind == ContextKind::Spill.as_str() {
+            self.spills += 1;
+        } else if e.kind == ContextKind::Dedup.as_str() {
+            self.dedups += 1;
         } else if e.kind == ContextKind::Summary.as_str() {
             self.summaries += 1;
         }
         self.saved_bytes += e.before_bytes.saturating_sub(e.after_bytes);
     }
+}
+
+/// `part` em % de `whole`, arredondado; 0 sem `whole`.
+fn percent(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    let pct = (u128::from(part) * 100 + u128::from(whole) / 2) / u128::from(whole);
+    u64::try_from(pct).unwrap_or(u64::MAX)
+}
+
+/// Bytes por token da estimativa (o mesmo divisor do `Compactor` e da linha dos Custos).
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// Um histórico de uma sessão: as chamadas em ordem, com o passo e o instante (segundos Unix).
+struct History {
+    calls: Vec<(u32, u64)>,
+}
+
+/// Tokens que deixaram de ser reenviados, por spec (spec 123 T03). Uma estimativa, não uma
+/// medida:
+///
+/// - cada evento de contexto tirou `before_bytes - after_bytes` do histórico da sessão, a partir
+///   do passo do evento (o passo é o da chamada que já sai reduzida);
+/// - esses bytes deixam de ir em cada chamada seguinte do **mesmo histórico**: as chamadas da
+///   mesma `session` (na mesma spec) com `step` maior ou igual ao do evento;
+/// - **um `session` junta vários históricos** quando o laço recomeça (o `implement` de novo depois
+///   de um teste falho): o `step` volta a 0. Por isso as chamadas da sessão são cortadas em
+///   históricos sempre que o `step` não cresce, e só contam as do histórico do evento. O evento
+///   pertence ao histórico mais recente cuja chamada do passo anterior (`step - 1`) já tinha
+///   acontecido no instante do evento; no passo 0, ao primeiro histórico que começa depois dele;
+/// - um `summary` refaz o histórico inteiro: o que um evento anterior tirou deixa de contar a
+///   partir do passo do resumo (sem o evento, o resumo teria descartado o mesmo trecho), e o
+///   próprio resumo conta o que tirou dali em diante;
+/// - `summary_failed` não tira nada; registros sem `session` ou `step` (antigos) não entram, e o
+///   evento sem chamada medida depois dele conta 0.
+///
+/// O resultado em bytes é dividido por [`BYTES_PER_TOKEN`].
+pub fn reinjection_avoided_tokens(records: &[UsageRecord], events: &[ContextLine]) -> BTreeMap<Option<String>, u64> {
+    type Key = (Option<String>, String);
+    let mut histories: BTreeMap<Key, Vec<History>> = BTreeMap::new();
+    for r in records {
+        let (Some(session), Some(step)) = (&r.session, r.step) else {
+            continue;
+        };
+        let at = parse_utc(&r.at).unwrap_or(0);
+        let list = histories.entry((r.spec.clone(), session.clone())).or_default();
+        match list.last_mut() {
+            Some(h) if h.calls.last().is_some_and(|&(prev, _)| step > prev) => h.calls.push((step, at)),
+            _ => list.push(History { calls: vec![(step, at)] }),
+        }
+    }
+    // Eventos de cada histórico: (passo, bytes tirados, é resumo).
+    let mut per_history: BTreeMap<(Key, usize), Vec<(u32, u64, bool)>> = BTreeMap::new();
+    for e in events {
+        if e.kind == ContextKind::SummaryFailed.as_str() {
+            continue;
+        }
+        let key = (e.spec.clone(), e.session.clone());
+        let Some(list) = histories.get(&key) else {
+            continue;
+        };
+        let at = parse_utc(&e.at).unwrap_or(0);
+        let index = if e.step == 0 {
+            list.iter().position(|h| h.calls.first().is_some_and(|&(_, t)| t >= at))
+        } else {
+            list.iter().rposition(|h| h.calls.iter().any(|&(s, t)| s == e.step - 1 && t <= at))
+        };
+        let Some(index) = index else {
+            continue;
+        };
+        let is_summary = e.kind == ContextKind::Summary.as_str();
+        per_history
+            .entry((key, index))
+            .or_default()
+            .push((e.step, e.before_bytes.saturating_sub(e.after_bytes), is_summary));
+    }
+    let mut out: BTreeMap<Option<String>, u64> = BTreeMap::new();
+    for ((key, index), evs) in per_history {
+        let Some(history) = histories.get(&key).and_then(|l| l.get(index)) else {
+            continue;
+        };
+        let mut bytes: u64 = 0;
+        for &(step, removed, _) in &evs {
+            // O próximo resumo depois do evento encerra o efeito dele.
+            let until = evs.iter().filter(|&&(s, _, summary)| summary && s > step).map(|&(s, _, _)| s).min();
+            let later = history.calls.iter().filter(|&&(s, _)| s >= step && until.is_none_or(|u| s < u)).count();
+            bytes = bytes.saturating_add(removed.saturating_mul(u64::try_from(later).unwrap_or(u64::MAX)));
+        }
+        if bytes >= BYTES_PER_TOKEN {
+            let tokens = out.entry(key.0).or_default();
+            *tokens = tokens.saturating_add(bytes / BYTES_PER_TOKEN);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -692,12 +805,20 @@ pub fn aggregate_with_tools(
     }
 }
 
-/// Soma os eventos de contexto (`context.jsonl`) ao resumo do projeto e ao de cada spec.
-pub fn add_context_events(view: &mut UsageView, events: &[ContextLine]) {
+/// Soma os eventos de contexto (`context.jsonl`) ao resumo do projeto e ao de cada spec, com os
+/// tokens que deixaram de ser reenviados (estimativa, [`reinjection_avoided_tokens`]), calculados
+/// com as chamadas `records` da mesma consulta.
+pub fn add_context_events(view: &mut UsageView, events: &[ContextLine], records: &[UsageRecord]) {
     for e in events {
         view.context.add_event(e);
         if let Some(s) = view.specs.iter_mut().find(|s| s.spec == e.spec) {
             s.context.add_event(e);
+        }
+    }
+    for (spec, tokens) in reinjection_avoided_tokens(records, events) {
+        view.context.reinjection_avoided_tokens = view.context.reinjection_avoided_tokens.saturating_add(tokens);
+        if let Some(s) = view.specs.iter_mut().find(|s| s.spec == spec) {
+            s.context.reinjection_avoided_tokens = s.context.reinjection_avoided_tokens.saturating_add(tokens);
         }
     }
 }
@@ -903,7 +1024,7 @@ pub async fn get_usage(
         let records = load_records(&root, q.spec.as_deref());
         let tools = load_tool_marks(&root, q.spec.as_deref());
         let mut view = aggregate_with_tools(&records, &tools, &pricing);
-        add_context_events(&mut view, &load_context_events(&root, q.spec.as_deref()));
+        add_context_events(&mut view, &load_context_events(&root, q.spec.as_deref()), &records);
         if q.spec.is_some() {
             view.by_spec.clear();
         }
@@ -1636,11 +1757,25 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!((records[0].context_bytes, records[0].step, records[0].session.as_deref()), (None, None, None));
         let mut view = aggregate(&records, &BTreeMap::new());
-        add_context_events(&mut view, &load_context_events(&root, Some("s1")));
+        add_context_events(&mut view, &load_context_events(&root, Some("s1")), &records);
         assert_eq!(view.total.calls, 1);
         assert_eq!(
             view.context,
-            ContextSummary { calls: 1, input: 500, avg_input: 500, max_input: 500, max_context_bytes: 0, compactions: 0, summaries: 0, saved_bytes: 0 }
+            ContextSummary {
+                calls: 1,
+                input: 500,
+                avg_input: 500,
+                max_input: 500,
+                max_context_bytes: 0,
+                cached: 100,
+                cache_pct: 20,
+                compactions: 0,
+                spills: 0,
+                dedups: 0,
+                summaries: 0,
+                saved_bytes: 0,
+                reinjection_avoided_tokens: 0,
+            }
         );
     }
 
@@ -1705,6 +1840,119 @@ mod tests {
         assert!(!raw.contains("Fora"), "{raw}");
     }
 
+    /// Chamada medida da sessão `session` na spec `spec`, no passo `step`, no segundo `secs`.
+    fn call(spec: &str, session: &str, step: u32, secs: u64) -> UsageRecord {
+        UsageRecord {
+            at: format_utc(1_800_000_000 + secs),
+            project: "p".into(),
+            spec: Some(spec.into()),
+            task: Some("T01".into()),
+            agent: "developer".into(),
+            model: "m".into(),
+            input: 1000,
+            output: 10,
+            cached: None,
+            reasoning: None,
+            web_search_calls: None,
+            images: None,
+            image_quality: None,
+            estimated: None,
+            cut: None,
+            billing: None,
+            context_bytes: Some(4000),
+            messages: Some(3),
+            step: Some(step),
+            session: Some(session.into()),
+            summary: None,
+        }
+    }
+
+    /// Evento `kind` da sessão no passo `step`, no segundo `secs`, que tirou `removed` bytes.
+    fn event(spec: &str, session: &str, kind: &str, step: u32, secs: u64, removed: u64) -> ContextLine {
+        ContextLine {
+            at: format_utc(1_800_000_000 + secs),
+            kind: kind.into(),
+            spec: Some(spec.into()),
+            task: Some("T01".into()),
+            agent: "developer".into(),
+            session: session.into(),
+            step,
+            before_bytes: 10_000 + removed,
+            after_bytes: 10_000,
+            items: 1,
+            tools: BTreeMap::new(),
+            input_tokens: None,
+            output_tokens: None,
+            reason: None,
+        }
+    }
+
+    /// Spec 123 T03: o que cada evento tirou conta uma vez por chamada seguinte da mesma sessão,
+    /// a partir do passo do evento (inclusive), e só no histórico do evento: quando o `step` volta
+    /// a 0, o `implement` recomeçou com outro histórico.
+    #[test]
+    fn reinjection_counts_later_calls_of_the_same_history() {
+        // Histórico 1: passos 0 a 5 (s 0..5); histórico 2 da mesma sessão: passos 0 a 3 (s 100..103).
+        let mut records: Vec<UsageRecord> = (0..6).map(|i| call("s1", "dev:T01:a1", i, u64::from(i))).collect();
+        records.extend((0..4).map(|i| call("s1", "dev:T01:a1", i, 100 + u64::from(i))));
+        // Outra sessão da spec, que não conta para os eventos da primeira.
+        records.extend((0..3).map(|i| call("s1", "rev:T01:a1", i, 50 + u64::from(i))));
+        let events = [
+            // Passo 3 do histórico 1 (depois da chamada 2, no segundo 2): passos 3, 4 e 5 = 3 chamadas.
+            event("s1", "dev:T01:a1", "compact", 3, 2, 400),
+            // Passo 2 do histórico 2 (no segundo 101): passos 2 e 3 = 2 chamadas.
+            event("s1", "dev:T01:a1", "spill", 2, 101, 800),
+            // Passo 0 do histórico 2 (antes da primeira chamada, no segundo 99): 4 chamadas.
+            event("s1", "dev:T01:a1", "dedup", 0, 99, 40),
+            // Falha do resumo: nada sai do histórico.
+            event("s1", "dev:T01:a1", "summary_failed", 4, 3, 9_000),
+            // Sessão sem chamadas medidas: 0.
+            event("s1", "ghost:T09:a1", "compact", 3, 2, 9_000),
+        ];
+        let tokens = reinjection_avoided_tokens(&records, &events);
+        // (400 * 3 + 800 * 2 + 40 * 4) / 4 = (1200 + 1600 + 160) / 4 = 740.
+        assert_eq!(tokens.get(&Some("s1".to_string())), Some(&740));
+    }
+
+    /// Spec 123 T03: o resumo refaz o histórico, então o efeito de um evento anterior para no passo
+    /// do resumo, e o resumo conta o que tirou dali em diante.
+    #[test]
+    fn reinjection_of_earlier_events_stops_at_the_summary() {
+        let records: Vec<UsageRecord> = (0..10).map(|i| call("s1", "dev:T01:a1", i, u64::from(i))).collect();
+        let events = [
+            event("s1", "dev:T01:a1", "compact", 2, 1, 100),
+            // A chamada do resumo é o passo 5; o histórico novo vai a partir do passo 6.
+            event("s1", "dev:T01:a1", "summary", 6, 5, 1000),
+            // Compactação depois do resumo: não para no resumo.
+            event("s1", "dev:T01:a1", "compact", 8, 7, 20),
+        ];
+        let tokens = reinjection_avoided_tokens(&records, &events);
+        // compact: passos 2 a 5 = 4; summary: passos 6 a 9 = 4; compact: passos 8 e 9 = 2.
+        // (100 * 4 + 1000 * 4 + 20 * 2) / 4 = 4440 / 4 = 1110.
+        assert_eq!(tokens.get(&Some("s1".to_string())), Some(&1110));
+    }
+
+    /// Spec 123 T03: a mesma sessão em specs diferentes são históricos diferentes, e registros
+    /// antigos (sem `session` ou `step`) não entram.
+    #[test]
+    fn reinjection_is_per_spec_and_ignores_old_records() {
+        let mut records = vec![call("s1", "dev:T01:a1", 0, 0), call("s1", "dev:T01:a1", 1, 1), call("s2", "dev:T01:a1", 0, 0)];
+        let mut old = call("s2", "dev:T01:a1", 1, 1);
+        old.step = None;
+        old.session = None;
+        records.push(old);
+        let events = [event("s1", "dev:T01:a1", "compact", 1, 0, 400), event("s2", "dev:T01:a1", "compact", 1, 0, 400)];
+        let tokens = reinjection_avoided_tokens(&records, &events);
+        assert_eq!(tokens.get(&Some("s1".to_string())), Some(&100));
+        assert_eq!(tokens.get(&Some("s2".to_string())), None, "sem chamada medida depois do evento");
+        let mut view = aggregate(&records, &BTreeMap::new());
+        add_context_events(&mut view, &events, &records);
+        assert_eq!(view.context.reinjection_avoided_tokens, 100);
+        assert_eq!((view.context.compactions, view.context.saved_bytes), (2, 800), "a soma de antes continua");
+        let s1 = view.specs.iter().find(|s| s.spec.as_deref() == Some("s1")).expect("s1");
+        assert_eq!(s1.context.reinjection_avoided_tokens, 100);
+    }
+
     /// Spec 122 T01: a API de custos devolve o resumo do contexto por projeto e por spec.
     #[tokio::test]
     async fn usage_route_returns_the_context_summary() {
@@ -1724,6 +1972,11 @@ mod tests {
         let mut failed = ctx_event(Some("s1"), "developer:T01:a1", 0, 0);
         failed.kind = ContextKind::SummaryFailed;
         sink.record_context(failed);
+        for kind in [ContextKind::Spill, ContextKind::Dedup] {
+            let mut e = ctx_event(Some("s1"), "developer:T01:a1", 0, 0);
+            e.kind = kind;
+            sink.record_context(e);
+        }
         let cfg = Config {
             projects: vec![Project {
                 id: "p1".into(),
@@ -1750,6 +2003,10 @@ mod tests {
         assert_eq!((s1["context"]["calls"].as_u64(), s1["context"]["compactions"].as_u64(), s1["context"]["summaries"].as_u64()), (Some(2), Some(2), Some(1)));
         let s2 = all["specs"].as_array().and_then(|a| a.iter().find(|s| s["spec"] == "s2")).expect("s2");
         assert_eq!((s2["context"]["compactions"].as_u64(), s2["context"]["max_context_bytes"].as_u64()), (Some(0), Some(0)));
+        // Spec 123 T03: os campos novos. Os eventos estão no passo 7, depois das chamadas medidas
+        // (passos 0 e 1): nenhuma chamada seguinte, nada reenviado a menos.
+        assert_eq!((c["spills"].as_u64(), c["dedups"].as_u64(), c["cache_pct"].as_u64()), (Some(1), Some(1), Some(0)));
+        assert_eq!(c["reinjection_avoided_tokens"].as_u64(), Some(0));
         let one = json(get(Some("s1")).await.expect("ok")).await;
         assert_eq!((one["context"]["calls"].as_u64(), one["context"]["saved_bytes"].as_u64()), (Some(2), Some(900)));
         assert_eq!(one["total"]["calls"], 2, "os totais de antes continuam");

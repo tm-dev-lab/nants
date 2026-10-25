@@ -83,13 +83,18 @@ describe("testes ao vivo na conversa (spec 071)", () => {
     expect(store.getState().activities[P] ?? []).toHaveLength(0);
   });
 
-  it("reidratação: sem a execução no snapshot do servidor nada é criado; a em curso não é apagada", () => {
+  it("reidratação: o servidor é a verdade sobre a rodada (spec 123 T01: ela está no instantâneo)", () => {
     const store = createAppStore();
     store.mergeActivities(P, [], Date.now());
     expect(store.getState().activities[P] ?? []).toHaveLength(0);
     store.applyEvent(ev("agent_activity", start));
     vi.setSystemTime(1_000_000 + 30_000);
-    store.mergeActivities(P, [], Date.now());
+    // Com a rodada no instantâneo, ela continua.
+    const snapshot = { agent: "tests", task_id: "T01", spec_id: null, activity_id: "T01-1-0", reasoning: "", text: "", tool: "", command: "npm test", command_started_at: start.command_started_at, age_ms: 2_000 };
+    store.mergeActivities(P, [snapshot], Date.now());
     expect(store.getState().activities[P]?.[0]?.command).toBe("npm test");
+    // Sem ela (o `end` se perdeu no SSE caído), o relógio não fica preso.
+    store.mergeActivities(P, [], Date.now());
+    expect(store.getState().activities[P]?.[0]?.command).toBeUndefined();
   });
 });

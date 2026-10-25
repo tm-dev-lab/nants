@@ -52,11 +52,43 @@ and you decide at every step.
   acceptance criteria, and every task runs in an isolated Git worktree.
 - **Docker for every project.** Tests, checks and the running app live in containers, with
   nothing installed on your system and no `sudo`.
+- **Review findings with a history.** Each Reviewer finding keeps its id from one review to the
+  next and shows as new, still open (for how many reviews) or resolved, and the Developer gets the
+  oldest open ones first. Before delivering, the Developer answers each one: fixed, test added or
+  contested with a reason. The Architect rules on a contest once: keep the finding, adjust the
+  criterion to what the environment can prove, or turn it into a documented manual check. The
+  ruling is recorded in the spec and the Reviewer follows it.
+- **Recovery with more options.** When a task gets stuck, the Architect can retry with a new
+  strategy, split the task into smaller ones (keeping the work already on the branch), adjust the
+  criteria to what the environment proves, or ask you a question in the Conversation.
+- **Task size and cost.** The plan review flags tasks that are too large, such as many criteria or
+  server, client and end to end tests in one task, and suggests how to split them. When a task
+  spends far more than the others (3 times the median of the finished tasks of the spec, or a fixed
+  threshold of 8 million tokens or 400 calls), the Board and the Activity show a quiet notice and
+  the Architect gets the signal in its next decision. It is only a signal: the run never stops for it.
+- **Tests that fit the environment.** Nants measures what the test environment can prove (GPU or
+  video device, display, cores, memory and how long the test suite takes) and tells the agents, so
+  a criterion that needs something missing becomes a documented manual check. When the suite gets
+  close to its time limit, you get a warning to split or focus it. A failed round is run once more
+  with no change, and if it passes the task goes on with a flaky test alert.
+- **Tests that are not repeated for nothing.** When the Developer runs the project's exact quick
+  test command or a blocking check and it passes on the code it delivers, Nants skips that run and
+  says so in the task and the conversation. The full suite always runs once more by Nants, with
+  the environment recreated, before review: that clean run is the one that counts, and the one
+  integration relies on. Checks taken from the Developer run again at integration. "The same code" means the same tree
+  hash: every file Git would see in the task folder, tracked or not, with its content and mode,
+  except what `.gitignore` ignores (installed dependencies, build output), `.sdd/` and
+  `.nants-outputs/`. It also has to be the same environment, the run must have passed within the
+  time limit, and no run of that command on that tree may have failed. When in doubt, Nants runs it.
+  For a slow suite, a project can have a quick `test_command` for every attempt and a
+  `full_test_command` that runs before review and at integration. With `install_command` and
+  `lockfiles`, dependencies are installed only when a lock file changes, not on every test run.
 - **Browser testing.** The generated app is opened in a real browser, with screenshots that you
   and the Reviewer can see.
 - **Cost per task.** Token usage and an estimated cost in dollars for each spec, task and agent.
   Nants also trims and summarizes the agents' history on its own, so they spend less without
-  losing what matters, and the Costs window shows the effect.
+  losing what matters, and the Context area of the Costs window shows the effect, with an
+  estimate of the tokens that later calls no longer resend.
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
 - **Your provider.** Any OpenAI compatible provider, or your ChatGPT plan, with one model per role.
 - **No telemetry.** Your keys and your code stay on your computer.

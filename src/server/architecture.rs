@@ -23,7 +23,7 @@ use super::report::{build_facts, wait_shutdown};
 use super::safe_fs::{self, O_NOFOLLOW};
 use super::spec_result::{has_real_git_dir, validate_spec_id};
 use super::state::AppState;
-use crate::agents::arch_memory::{ARCH_FILE, ARCH_MAX_FILE_BYTES, ARCH_SECTIONS};
+use crate::agents::arch_memory::{localize_headings, sections_in_order, ARCH_FILE, ARCH_MAX_FILE_BYTES, ARCH_SECTION_KEYS};
 use crate::agents::architect::LlmArchitect;
 use crate::agents::chat::ChatBackend;
 use crate::harness::git::Git;
@@ -249,12 +249,19 @@ fn restore(root: &Path, files: &[(String, String, String)]) {
 /// O assunto do commit mantém o prefixo `docs(<spec>): ` e leva o texto no idioma do projeto.
 pub fn apply(lang: crate::i18n::Lang, root: &Path, spec_id: &str, answer: &str, secrets: &SecretSet) -> Result<Outcome, Skip> {
     let msg = crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), "commit.architecture_file");
-    apply_with_message(root, &msg, answer, secrets)
+    apply_with_message(lang, root, &msg, answer, secrets)
 }
 
-/// Como [`apply`], com a mensagem de commit explícita.
-pub(super) fn apply_with_message(root: &Path, msg: &str, answer: &str, secrets: &SecretSet) -> Result<Outcome, Skip> {
-    let content = validate(&scrub_text(secrets, answer))?;
+/// Como [`apply`], com a mensagem de commit explícita. Os títulos das seções são gravados no
+/// idioma do projeto (spec 125), mesmo que a resposta os traga no outro.
+pub(super) fn apply_with_message(
+    lang: crate::i18n::Lang,
+    root: &Path,
+    msg: &str,
+    answer: &str,
+    secrets: &SecretSet,
+) -> Result<Outcome, Skip> {
+    let content = validate(&scrub_text(secrets, answer), Some(lang))?;
     let git = Git::new(root);
     if !git.is_clean_ignoring_sdd().unwrap_or(false) {
         return Err(Skip("base_suja"));
@@ -284,13 +291,20 @@ pub(super) fn apply_with_message(root: &Path, msg: &str, answer: &str, secrets: 
 
 /// Valida o conteúdo de um `ARCHITECTURE.md` (mesmas regras da atualização pós-spec) e devolve
 /// o texto normalizado. Usado pela escrita em rascunho e pela aprovação do plano.
+/// Aceita os títulos em pt ou en (spec 125).
 pub fn validate_content(answer: &str) -> Result<String, &'static str> {
-    validate(answer).map_err(|Skip(code)| code)
+    validate(answer, None).map_err(|Skip(code)| code)
+}
+
+/// Como [`validate_content`], com os títulos das seções reescritos no idioma `lang` (spec 125).
+pub fn validate_content_for(answer: &str, lang: crate::i18n::Lang) -> Result<String, &'static str> {
+    validate(answer, Some(lang)).map_err(|Skip(code)| code)
 }
 
 /// Normaliza e valida a resposta: remove cerca de código ao redor, exige título `# `, as seções
-/// fixas na ordem e até 64 KiB. Devolve o conteúdo com uma quebra de linha final.
-fn validate(answer: &str) -> Result<String, Skip> {
+/// fixas na ordem (títulos em pt ou en) e até 64 KiB. Devolve o conteúdo com uma quebra de linha
+/// final e, com `lang`, os títulos das seções reescritos nesse idioma.
+fn validate(answer: &str, lang: Option<crate::i18n::Lang>) -> Result<String, Skip> {
     let mut text = answer.trim();
     if let Some(rest) = text.strip_prefix("```") {
         let body = rest.split_once('\n').map_or("", |(_, b)| b);
@@ -299,16 +313,19 @@ fn validate(answer: &str) -> Result<String, Skip> {
     if !text.starts_with("# ") {
         return Err(Skip("sem_titulo"));
     }
-    let mut from = 0;
-    for section in ARCH_SECTIONS {
-        let found = text[from..]
-            .match_indices(section)
-            .find(|(i, _)| *i == 0 || text.as_bytes().get(from + i - 1) == Some(&b'\n'));
-        match found {
-            Some((i, _)) => from += i + section.len(),
-            None => return Err(Skip("secao_ausente")),
+    let mut next = 0;
+    for index in sections_in_order(text) {
+        if index == next {
+            next += 1;
         }
     }
+    if next < ARCH_SECTION_KEYS.len() {
+        return Err(Skip("secao_ausente"));
+    }
+    let text = match lang {
+        Some(lang) => localize_headings(text, lang),
+        None => text.to_string(),
+    };
     let out = format!("{}\n", text.trim_end());
     if out.len() as u64 > ARCH_MAX_FILE_BYTES {
         return Err(Skip("grande_demais"));
@@ -375,7 +392,7 @@ mod tests {
 
     fn valid() -> String {
         let mut s = String::from("# Proj\n");
-        for sec in ARCH_SECTIONS {
+        for sec in crate::agents::arch_memory::section_headings(Lang::PtBr) {
             s.push_str(&format!("\n{sec}\ntexto\n"));
         }
         s
@@ -403,6 +420,60 @@ mod tests {
         let r = repo("ok-en");
         assert_eq!(apply(Lang::En, &r, "028-x", &valid(), &none()), Ok(Outcome::Committed));
         assert_eq!(git(&r, &["log", "-1", "--format=%s"]).trim(), "docs(028-x): update ARCHITECTURE.md");
+    }
+
+    fn doc_in(lang: Lang) -> String {
+        let mut s = String::from("# Proj\n");
+        for (i, sec) in crate::agents::arch_memory::template_headings(lang).iter().enumerate() {
+            s.push_str(&format!("\n{sec}\nconteudo-{i}\n"));
+        }
+        s
+    }
+
+    /// Spec 125: a validação aceita os títulos em pt ou en, e um documento antigo em pt continua
+    /// válido; a ordem e a presença das sete seções seguem exigidas nos dois idiomas.
+    #[test]
+    fn validation_accepts_headings_in_both_languages() {
+        for lang in [Lang::PtBr, Lang::En] {
+            let doc = doc_in(lang);
+            assert_eq!(validate_content(&doc), Ok(doc.clone()), "{lang:?}");
+            assert_eq!(validate_content_for(&doc, lang), Ok(doc.clone()), "{lang:?}");
+            let missing = doc.replace("\n## Stack\n", "\n## Outra\n");
+            assert_eq!(validate_content(&missing), Err("secao_ausente"), "{lang:?}");
+        }
+        // Mistura de idiomas na ordem certa também vale (documento editado à mão).
+        let mixed = doc_in(Lang::PtBr).replace("## Estrutura", "## Structure").replace("## Restrições", "## Constraints");
+        assert!(validate_content(&mixed).is_ok());
+        // Fora de ordem: recusa.
+        let swapped = doc_in(Lang::En).replace("## Overview", "## TMP").replace("## Stack", "## Overview").replace("## TMP", "## Stack");
+        assert_eq!(validate_content(&swapped), Err("secao_ausente"));
+        // Título só dentro de bloco de código não conta.
+        let fenced = doc_in(Lang::En).replace("\n## Constraints\n", "\n```\n## Constraints\n```\n");
+        assert_eq!(validate_content(&fenced), Err("secao_ausente"));
+        // Revisão (F-02): código na linha no meio de uma seção não abre bloco.
+        let inline = doc_in(Lang::PtBr).replace("conteudo-1\n", "```cargo test``` roda os testes\n");
+        assert_eq!(validate_content(&inline), Ok(inline.clone()));
+        // Revisão (F-01): título mais longo não substitui a seção.
+        let longer = doc_in(Lang::En).replace("## Decisions\n", "## Decisions made\n");
+        assert_eq!(validate_content(&longer), Err("secao_ausente"));
+    }
+
+    /// Spec 125: num projeto en com o documento antigo em pt, a atualização grava os títulos em en
+    /// e mantém o conteúdo; no projeto pt, o documento em pt fica igual.
+    #[test]
+    fn update_in_english_project_rewrites_portuguese_headings() {
+        let r = repo("relang");
+        assert_eq!(apply(Lang::En, &r, "125-x", &doc_in(Lang::PtBr), &none()), Ok(Outcome::Committed));
+        let text = fs::read_to_string(r.join(ARCH_FILE)).expect("r");
+        assert_eq!(text, doc_in(Lang::En));
+        for i in 0..7 {
+            assert!(text.contains(&format!("conteudo-{i}")), "{text}");
+        }
+        assert!(!text.contains("Visão geral") && !text.contains("Restrições"), "{text}");
+        // Volta ao pt: títulos em pt de novo.
+        assert_eq!(apply(Lang::PtBr, &r, "125-y", &text, &none()), Ok(Outcome::Committed));
+        assert_eq!(fs::read_to_string(r.join(ARCH_FILE)).expect("r"), doc_in(Lang::PtBr));
+        assert_eq!(apply(Lang::PtBr, &r, "125-z", &doc_in(Lang::PtBr), &none()), Ok(Outcome::Unchanged));
     }
 
     const PROFILE: &str = "---\nrole: developer\nstack: [clojure]\nupdated_at: 2026-10-16\nsource_spec: 063-x\n---\n## Papel\n- Clojure com deps.edn.\n## Notas do usuário\n- usar cljfmt\n";

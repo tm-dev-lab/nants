@@ -17,6 +17,7 @@ import { belongsToSpec, type ActivityEntry, type ChatMessage } from "../../store
 import { draftText, isPacing, looksStructured, RETRY_CODE, RETRY_MARK, retryDetail, stageText, stepText, toolText } from "../shared/activityText";
 import type { InfoKind } from "../attention/attentionModel";
 import { formatBytes } from "../files/filesModel";
+import { nearLimit } from "../../longOperation";
 import type { AppSummary, AppSummaryInput } from "../registry";
 
 /** Cartões fixos, nesta ordem; outros papéis (como os testes) entram só quando ativos. */
@@ -37,6 +38,17 @@ interface LiveAction {
    * (o raciocínio ou o texto que já chegou): "recebendo a resposta há 2 min · 48 KB recebidos".
    */
   model: string | null;
+  /**
+   * Comando ou rodada de testes em curso (spec 123 T01): há quanto tempo roda e quanto já saiu
+   * ("há 3 min · 14 KB de saída"), e a última linha da saída, como o servidor mandou.
+   */
+  progress: string | null;
+  output: string | null;
+  /**
+   * Aviso discreto quando o comando passa de 80% do limite de tempo que o servidor mandou (spec 123
+   * T02): "perto do limite de tempo". `null` longe do limite ou sem limite.
+   */
+  warning: string | null;
 }
 
 const DETAIL_MAX = 160;
@@ -48,7 +60,12 @@ export function tailLine(text: string, max = DETAIL_MAX): string {
 }
 
 type LiveSource = Pick<ActivityEntry, "agent" | "reasoning" | "text" | "tool"> &
-  Partial<Pick<ActivityEntry, "command" | "stage" | "stageCode" | "toolCode" | "textCode" | "structured" | "modelStartedAt" | "modelBytes">>;
+  Partial<
+    Pick<
+      ActivityEntry,
+      "command" | "commandStartedAt" | "commandBytes" | "commandLine" | "commandLimitMs" | "stage" | "stageCode" | "toolCode" | "textCode" | "structured" | "modelStartedAt" | "modelBytes"
+    >
+  >;
 
 /** Tempo decorrido curto: "45 s", "2 min", "1 h 5 min" (sem inventar precisão). */
 export function elapsedText(ms: number): string {
@@ -73,6 +90,27 @@ function modelProgress(activity: Pick<LiveSource, "modelStartedAt" | "modelBytes
 }
 
 /**
+ * Sinal de vida do comando em curso (spec 123 T01): o tempo desde o início e, quando o servidor já
+ * mandou, os bytes de saída ("há 3 min · 14 KB de saída"); e a última linha da saída, numa linha.
+ */
+function commandProgress(activity: LiveSource, now: number): { progress: string | null; output: string | null; warning: string | null } {
+  const parts: string[] = [];
+  const started = activity.commandStartedAt;
+  const limit = activity.commandLimitMs;
+  let warning: string | null = null;
+  if (started !== undefined) {
+    const time = elapsedText(now - started);
+    // Spec 123 T02: com o limite do servidor, "há 7 min (limite de 10 min)" e, passados 80% dele,
+    // o aviso discreto no mesmo lugar.
+    parts.push(limit !== undefined ? t("activity.command.forLimit", { time, limit: elapsedText(limit) }) : t("activity.model.for", { time }));
+    if (nearLimit({ startedAt: started, limitMs: limit ?? null }, now)) warning = t("activity.command.nearLimit");
+  }
+  if (activity.commandBytes !== undefined && activity.commandBytes > 0) parts.push(t("activity.command.output", { size: formatBytes(activity.commandBytes) }));
+  const line = activity.commandLine === undefined ? "" : tailLine(activity.commandLine);
+  return { progress: parts.length === 0 ? null : parts.join(" · "), output: line === "" ? null : line, warning };
+}
+
+/**
  * O que o agente está escrevendo (spec 121): nunca a saída estruturada crua. Com o tipo da chamada
  * (código do servidor), o rótulo dele; sem código, o texto que começa como JSON vira "preparando a
  * resposta" (reserva só desta prévia: a Conversa mostra a resposta como veio).
@@ -90,21 +128,22 @@ export function liveActionOf(activity: LiveSource, now: number = Date.now()): Li
   const text = activity.text.trim();
   const call = modelProgress(activity, now);
   const model = call === null ? null : `${call.state} ${call.detail}`;
-  if (isPacing(activity)) return { kind: "pacing", state: t("activity.state.pacing"), detail: tailLine(stepText(activity)), stage, model: null };
+  const quiet = { progress: null, output: null, warning: null };
+  if (isPacing(activity)) return { kind: "pacing", state: t("activity.state.pacing"), detail: tailLine(stepText(activity)), stage, model: null, ...quiet };
   // Spec 119: com `code`, o aviso sai do dicionário com o motivo no idioma ativo.
-  if (activity.textCode?.code === RETRY_CODE) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(stepText(activity)), stage, model: null };
+  if (activity.textCode?.code === RETRY_CODE) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(stepText(activity)), stage, model: null, ...quiet };
   const retry = [text, tool].find((t) => t.includes(RETRY_MARK));
-  if (retry !== undefined) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(retryDetail(retry)), stage, model: null };
+  if (retry !== undefined) return { kind: "retry", state: t("activity.state.retry"), detail: tailLine(retryDetail(retry)), stage, model: null, ...quiet };
   if (activity.toolCode?.code === "tool.generate_image") {
     const path = activity.toolCode.params.path;
-    return { kind: "image", state: t("activity.state.image"), detail: typeof path === "string" && path !== "" ? path : toolText(activity), stage, model: null };
+    return { kind: "image", state: t("activity.state.image"), detail: typeof path === "string" && path !== "" ? path : toolText(activity), stage, model: null, ...quiet };
   }
-  if (activity.agent === "tests" && activity.command !== undefined) return { kind: "tests", state: t("activity.state.tests"), detail: activity.command, stage, model: null };
-  if (activity.command !== undefined) return { kind: "command", state: t("activity.executing"), detail: activity.command, stage, model: null };
-  if (tool !== "") return { kind: "tool", state: t("activity.state.working"), detail: toolText(activity), stage, model };
-  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: writingDetail(activity), stage, model };
-  if (activity.reasoning.trim() !== "" || call === null) return { kind: "thinking", state: t("activity.thinking"), detail: tailLine(activity.reasoning), stage, model };
-  return { kind: "model", state: call.state, detail: call.detail, stage, model: null };
+  if (activity.agent === "tests" && activity.command !== undefined) return { kind: "tests", state: t("activity.state.tests"), detail: activity.command, stage, model: null, ...commandProgress(activity, now) };
+  if (activity.command !== undefined) return { kind: "command", state: t("activity.executing"), detail: activity.command, stage, model: null, ...commandProgress(activity, now) };
+  if (tool !== "") return { kind: "tool", state: t("activity.state.working"), detail: toolText(activity), stage, model, ...quiet };
+  if (text !== "") return { kind: "writing", state: t("activity.state.writing"), detail: writingDetail(activity), stage, model, ...quiet };
+  if (activity.reasoning.trim() !== "" || call === null) return { kind: "thinking", state: t("activity.thinking"), detail: tailLine(activity.reasoning), stage, model, ...quiet };
+  return { kind: "model", state: call.state, detail: call.detail, stage, model: null, ...quiet };
 }
 
 /** A atividade mais recente de cada agente (as de tarefas diferentes do mesmo agente viram uma). */

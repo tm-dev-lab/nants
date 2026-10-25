@@ -208,12 +208,14 @@ mod tests {
     #[test]
     fn prompt_is_short_and_lists_the_contract() {
         let p = plan_review_system();
-        for kind in ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency"] {
+        for kind in ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", "too_large"] {
             assert!(p.contains(kind), "{kind}");
         }
         assert!(p.contains("Preferência") && p.contains("lista vazia") && p.contains("No máximo 8"));
+        // Spec 124 T06: +~230 bytes (too_large com sugestão de divisão; teto 2600 -> 2850).
+        // Spec 124 T04: +~170 bytes (critério que depende de capacidade ausente é untestable; teto 2400 -> 2600).
         // Spec 122 T05: +~200 bytes (ações independentes na mesma resposta; teto 2200 -> 2400).
         // Spec 122 T02: +~200 bytes (íntegra das saídas cortadas; teto 2000 -> 2200).
-        assert!(p.len() < 2400, "{}", p.len());
+        assert!(p.len() < 2850, "{}", p.len());
     }
 }

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, cleanup } from "@testing-library/react";
 import { parseApiEvent } from "./api/events";
-import { appStore, bumpRevisions, recoveryBadgeFor } from "./store";
+import { appStore, bumpRevisions, recoveryBadgeFor, recoveryKey } from "./store";
 import type { ApiEvent } from "./api/types";
 import { resetStore } from "./test-utils";
 
@@ -25,6 +25,9 @@ describe("parser dos eventos de recuperação", () => {
     expect(
       parseApiEvent(ev("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 2, decision: "RETRY" })),
     ).not.toBeNull();
+    for (const decision of ["SPLIT", "ADJUST", "ASK", "REVISE_TASK", "REVISE_CONFIG", "MIGRATE_ENVIRONMENT"]) {
+      expect(parseApiEvent(ev("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 1, decision }))).not.toBeNull();
+    }
   });
   it("ignora inválidos", () => {
     expect(parseApiEvent(ev("recovery_started", { spec_id: "s1", task_id: "T01", cycle: "1" }))).toBeNull();
@@ -60,6 +63,21 @@ describe("selos de recuperação do Quadro por fase", () => {
     expect(recoveryBadgeFor(appStore.getState(), PID, "s1", "T01")?.phase).toBe("retry");
     apply("task_updated", { spec_id: "s1", task_id: "T01", status: "IN_REVIEW" });
     expect(recoveryBadgeFor(appStore.getState(), PID, "s1", "T01")).toBeNull();
+  });
+
+  // Spec 124 T03: SPLIT e ADJUST reabrem a tarefa (selo de estratégia nova); ASK pausa como a
+  // escalada e guarda as opções do cartão.
+  it("SPLIT e ADJUST viram estratégia nova; ASK pausa com as opções", () => {
+    for (const decision of ["SPLIT", "ADJUST", "REVISE_TASK"]) {
+      apply("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 1, decision });
+      expect(recoveryBadgeFor(appStore.getState(), PID, "s1", "T01")?.phase).toBe("retry");
+    }
+    const options = [{ id: "manual", label: "Sim", kind: "guidance", text: "manual" }];
+    apply("recovery_decided", { spec_id: "s1", task_id: "T02", cycle: 1, decision: "ASK", options, options_analysis: 1 });
+    expect(recoveryBadgeFor(appStore.getState(), PID, "s1", "T02")).toBeNull();
+    const entry = appStore.getState().recoveries[recoveryKey(PID, "s1", "T02")];
+    expect(entry?.phase).toBe("escalate");
+    expect(entry?.options?.[0]?.id).toBe("manual");
   });
 
   it("ESCALATE não gera selo; não vaza entre specs", () => {

@@ -8,7 +8,8 @@
  * rolagem própria; estreita, as colunas viram uma lista com a rolagem dentro da janela.
  *
  * Desempenho: lê o espaço pelo contexto e só fatias estáveis do store (recuperações, a última
- * mensagem do Revisor da tarefa em foco, se a verificação final está ativa). A rajada de
+ * mensagem do Revisor da tarefa em foco, se a verificação final está ativa) e a assinatura das
+ * operações longas em curso (spec 123 T02: muda só no início e no fim de cada uma). A rajada de
  * atividade ao vivo não re-renderiza o Quadro.
  */
 import {
@@ -23,7 +24,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
-import type { SpecView, TaskStatus, TaskView } from "../../api/types";
+import type { CostAlertView, SpecView, TaskStatus, TaskView } from "../../api/types";
 import { TASK_VERDICT_LABEL } from "../../copy";
 import { EmptyState } from "../../desktop/EmptyState";
 import { Icon } from "../../desktop/Icon";
@@ -33,14 +34,18 @@ import { useWindowVisibility } from "../../desktop/useWindowVisibility";
 import type { SpaceData } from "../../desktop/useSpaceData";
 import { useWindowHost } from "../../desktop/windowHost";
 import { useT } from "../../i18n/react";
+import { boardOperationText, currentOperation, nearLimit, OPERATION_TICK_MS, type LongOperation } from "../../longOperation";
 import { recoveryKey, useAppStore, type RecoveryEntry } from "../../store";
+import { useLongOperations } from "../../useLongOperations";
+import { useNowWhile } from "../../useNowWhile";
 import { taskUsageLine } from "../../usageFormat";
 import type { AppContentProps } from "../registry";
 import { AgentAvatar } from "../shared/AgentAvatar";
 import { FinalVerificationNotice } from "../shared/FinalVerificationNotice";
-import { ReviewerChecklist, ReviewFindingList, ReviewVerdictBadge } from "../shared/ReviewMessage";
+import { ReviewDecisionList, ReviewerChecklist, ReviewFindingList, ReviewResponseList, ReviewVerdictBadge } from "../shared/ReviewMessage";
 import { MarkdownText } from "../shared/ReportMarkdown";
 import { taskUsageOf, useUsageView, type TaskUsageMap } from "../shared/useUsage";
+import { costAlertText } from "../shared/costAlert";
 import "../shared/apps.css";
 import "./board.css";
 import {
@@ -160,6 +165,8 @@ function Board({ projectId, spec, halted, permissions, size, selectedTask, board
   const waiting = useMemo(() => new Set(permissions.flatMap((p) => (p.taskId === null ? [] : [p.taskId]))), [permissions]);
   const pauses = useMemo(() => taskPauses(spec.tasks, halted, stopReason, waiting), [spec.tasks, halted, stopReason, waiting]);
   const openConversation = useCallback(() => shell.openWindow("conversation"), [shell]);
+  // Spec 123 T02: a fase de cada tarefa durante os testes ou um comando longo.
+  const operations = useLongOperations(projectId);
 
   const recoveryOf = useCallback(
     (taskId: string): Recovery | undefined => {
@@ -296,6 +303,8 @@ function Board({ projectId, spec, halted, permissions, size, selectedTask, board
                   actions={toolCounts?.[task.id] ?? 0}
                   onOpenActions={(from) => openActions(task.id, from)}
                   usage={taskUsage}
+                  operations={operations}
+                  costAlert={spec.cost_alerts?.[task.id]}
                 />
               )}
             />
@@ -375,9 +384,13 @@ interface CardProps {
   actions: number;
   onOpenActions: (from: HTMLElement) => void;
   usage: TaskUsageMap;
+  /** Operações longas em curso do projeto (spec 123 T02); o cartão mostra a da tarefa dele. */
+  operations: readonly LongOperation[];
+  /** Aviso de custo da tarefa (spec 124 T06): só um sinal na linha de metadados. */
+  costAlert: CostAlertView | undefined;
 }
 
-function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, pause, decide, onOpenConversation, realStatus, actions, onOpenActions, usage }: CardProps) {
+function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, pause, decide, onOpenConversation, realStatus, actions, onOpenActions, usage, operations, costAlert }: CardProps) {
   const { t } = useT();
   const verdict =
     task.last_review_verdict === "APPROVED" || task.last_review_verdict === "CHANGES_REQUESTED" ? task.last_review_verdict : null;
@@ -389,6 +402,18 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
   const meta: { key: string; node: ReactNode }[] = [];
   if (task.attempts > 0) meta.push({ key: "attempts", node: <span>{t("board.attempt", { attempt: task.attempts, max: task.max_attempts })}</span> });
   if (usageLine !== null) meta.push({ key: "usage", node: <span data-task-usage={task.id}>{usageLine}</span> });
+  if (costAlert !== undefined) {
+    const detail = costAlertText(task.id, costAlert);
+    meta.push({
+      key: "cost",
+      node: (
+        <span className="nd-board-cost-alert" data-cost-alert={task.id} data-tone="amber" title={detail}>
+          {t("cost.alert.badge")}
+          <span className="nd-sr-only">{`: ${detail}`}</span>
+        </span>
+      ),
+    });
+  }
   if (task.depends_on.length > 0) meta.push({ key: "deps", node: <span className="nd-break">{t("plan.dependsOn", { ids: task.depends_on.join(", ") })}</span> });
   return (
     <li
@@ -429,6 +454,7 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
             ))}
           </span>
         ) : null}
+        {pause === undefined && operations.some((op) => op.taskId === task.id) ? <TaskPhase taskId={task.id} operations={operations} /> : null}
         {realStatus !== null ? (
           <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone={STATUS_TONE[realStatus]} data-real-status={realStatus}>
             {statusLabel(realStatus)}
@@ -493,6 +519,30 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
         </span>
       ) : null}
     </li>
+  );
+}
+
+/**
+ * Fase da tarefa durante uma operação longa (spec 123 T02): "testes rodando · 7 min", com o aviso
+ * discreto perto do limite de tempo que o servidor mandou. O relógio é só desta linha: o cartão não
+ * re-renderiza a cada passo.
+ */
+function TaskPhase({ taskId, operations }: { taskId: string; operations: readonly LongOperation[] }) {
+  const { t } = useT();
+  const now = useNowWhile(true, OPERATION_TICK_MS);
+  const op = currentOperation(operations, now, taskId);
+  if (op === null) return null;
+  const near = nearLimit(op, now);
+  return (
+    <span className="nd-board-phase" data-task-phase={op.kind} data-near-limit={near ? "true" : undefined}>
+      {boardOperationText(op, now)}
+      {near ? (
+        <>
+          <span aria-hidden="true"> · </span>
+          <span>{t("board.phase.nearLimit")}</span>
+        </>
+      ) : null}
+    </span>
   );
 }
 
@@ -576,7 +626,7 @@ function LastReview({ projectId, specId, taskId }: { projectId: string; specId: 
   const [open, setOpen] = useState(false);
   const bodyId = useId();
   if (review === null) return null;
-  const line = lastReviewLine(taskId, review.verdict);
+  const line = lastReviewLine(taskId, review.verdict, review);
   return (
     <section className="nd-board-review" aria-label={t("board.lastReview", { task: taskId })} data-last-review={taskId} data-open={open ? "true" : "false"}>
       <button
@@ -597,6 +647,9 @@ function LastReview({ projectId, specId, taskId }: { projectId: string; specId: 
           {review.summary !== "" ? <MarkdownText text={review.summary} keepLineBreaks /> : null}
           <ReviewFindingList findings={review.findings} kind="blocking" />
           <ReviewFindingList findings={review.observations} kind="observation" />
+          <ReviewFindingList findings={review.resolved} kind="resolved" />
+          <ReviewResponseList responses={review.responses} />
+          <ReviewDecisionList decisions={review.decisions} />
           {review.items.length > 0 ? <ReviewerChecklist items={review.items} /> : null}
         </div>
       ) : null}

@@ -639,3 +639,59 @@ describe("Quadro enxuto (095/T05, reference/Main.dc.html)", () => {
     expect(review).not.toMatch(/(?:^|;)\s*border:/);
   });
 });
+
+describe("Quadro: fase da tarefa durante uma operação longa (spec 123 T02)", () => {
+  const activity = (payload: Record<string, unknown>) => ({ event_type: "agent_activity", project_id: "p1", payload: { activity_id: "T02-1-9", ...payload } }) as const;
+
+  it("durante os testes, o cartão mostra 'testes rodando · 7 min' e, perto do limite, o aviso; some no fim", async () => {
+    const view = await mount(spec(TASKS()));
+    const card = () => board().querySelector('[data-task-id="T02"]') as HTMLElement;
+    expect(card().querySelector("[data-task-phase]")).toBeNull();
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", kind: "command", text: "npm test", command_started_at: Date.now() - 420_000, command_limit_ms: 600_000 }));
+    });
+    await settle();
+    const phase = card().querySelector("[data-task-phase]") as HTMLElement;
+    expect(phase.getAttribute("data-task-phase")).toBe("tests");
+    expect(phase.textContent).toBe("testes rodando · 7 min");
+    expect(phase.getAttribute("data-near-limit")).toBeNull();
+    // 9 de 10 min: o aviso discreto aparece no mesmo lugar.
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-10", kind: "command", text: "npm test", command_started_at: Date.now() - 540_000, command_limit_ms: 600_000 }));
+    });
+    await settle();
+    const near = card().querySelector("[data-task-phase]") as HTMLElement;
+    expect(near.textContent).toBe("testes rodando · 9 min · perto do limite de tempo");
+    expect(near.getAttribute("data-near-limit")).toBe("true");
+    expect(findForbiddenGlyphs(near)).toEqual([]);
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "tests", task_id: "T02", activity_id: "T02-1-10", kind: "end" }));
+    });
+    await settle();
+    expect(card().querySelector("[data-task-phase]")).toBeNull();
+  });
+
+  it("comando curto de agente não aparece; longo vira 'comando rodando'; os outros cartões ficam sem fase", async () => {
+    const view = await mount(spec(TASKS()));
+    const card = (id: string) => board().querySelector(`[data-task-id="${id}"]`) as HTMLElement;
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", activity_id: "d1", kind: "command", text: "ls", command_started_at: Date.now() - 2_000 }));
+    });
+    await settle();
+    expect(card("T02").querySelector("[data-task-phase]")).toBeNull();
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", activity_id: "d2", kind: "command", text: "cargo build", command_started_at: Date.now() - 125_000 }));
+    });
+    await settle();
+    expect(card("T02").querySelector("[data-task-phase]")?.textContent).toBe("comando rodando · 2 min");
+    expect(card("T03").querySelector("[data-task-phase]")).toBeNull();
+    // O comando do agente com o limite do servidor (5 min): perto dele, o mesmo aviso dos testes.
+    await act(async () => {
+      view.stream().emit("agent_activity", activity({ agent: "developer", task_id: "T02", activity_id: "d3", kind: "command", text: "cargo build", command_started_at: Date.now() - 250_000, command_limit_ms: 300_000 }));
+    });
+    await settle();
+    const near = card("T02").querySelector("[data-task-phase]") as HTMLElement;
+    expect(near.textContent).toBe("comando rodando · 4 min · perto do limite de tempo");
+    expect(near.getAttribute("data-near-limit")).toBe("true");
+  });
+});

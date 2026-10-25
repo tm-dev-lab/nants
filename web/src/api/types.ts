@@ -256,6 +256,8 @@ interface SpecUsage extends UsageTotals {
 /**
  * Resumo da gestão de contexto (spec 122): chamadas e tokens de entrada, compactações, resumos do
  * histórico e bytes tirados do contexto pelos eventos (`saved_bytes`, soma de antes menos depois).
+ * Spec 123 T03: o cache, as saídas guardadas e as leituras evitadas, e os tokens que deixaram de
+ * ser reenviados (estimativa do servidor); ausentes em servidor antigo.
  */
 export interface ContextSummary {
   calls: number;
@@ -266,6 +268,13 @@ export interface ContextSummary {
   compactions: number;
   summaries: number;
   saved_bytes: number;
+  cached?: number;
+  /** `cached` / `input`, em %, arredondado. */
+  cache_pct?: number;
+  spills?: number;
+  dedups?: number;
+  /** O que cada evento tirou do histórico vezes as chamadas seguintes da mesma sessão, em tokens. */
+  reinjection_avoided_tokens?: number;
 }
 
 /** Orçamento opcional de uma spec. */
@@ -386,12 +395,28 @@ export interface SpecView {
   plan_review?: PlanReviewView;
   /** O que mudou no plano desde a versão anterior (spec 086 T09), só da versão atual; ausente = sem mudanças. */
   plan_changes?: string[];
+  /** Aviso de custo por tarefa (spec 124 T06), só das que passaram do patamar; ausente = nenhuma. */
+  cost_alerts?: Record<string, CostAlertView>;
+}
+
+/**
+ * Aviso de custo de uma tarefa (spec 124 T06): tokens (entrada mais saída) e chamadas até aqui.
+ * `relative`: `ratio` vezes a mediana das concluídas da spec; `absolute`: acima do patamar fixo.
+ * É um sinal: a execução nunca para por ele.
+ */
+export interface CostAlertView {
+  tokens: number;
+  calls: number;
+  basis: "relative" | "absolute" | string;
+  ratio?: number;
+  median_tokens?: number;
+  median_calls?: number;
 }
 
 /** Apontamento objetivo da revisão do plano. `task` null = problema da spec. */
 export interface PlanIssue {
   task: string | null;
-  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | string;
+  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "too_large" | string;
   text: string;
 }
 
@@ -602,7 +627,19 @@ interface RecoveryStartedPayload {
   cycle: number;
 }
 
-type RecoveryDecision = "RETRY" | "ESCALATE";
+/**
+ * Decisão anunciada no `recovery_decided`. `ESCALATE` e `ASK` (spec 124 T03) pausam a execução; as
+ * demais reabrem a tarefa.
+ */
+export type RecoveryDecision =
+  | "RETRY"
+  | "REVISE_TASK"
+  | "REVISE_CONFIG"
+  | "MIGRATE_ENVIRONMENT"
+  | "SPLIT"
+  | "ADJUST"
+  | "ASK"
+  | "ESCALATE";
 
 type RecoveryOptionKind = "config" | "environment" | "guidance" | "revise_task";
 
@@ -777,6 +814,18 @@ export interface AgentActivityPayload {
   model_started_at?: number;
   /** No `heartbeat` da chamada ao modelo: bytes já recebidos da resposta (ausente = nenhum ainda). */
   received_bytes?: number;
+  /**
+   * No `heartbeat` do comando em curso (spec 123 T01): bytes de saída capturados até agora e a
+   * última linha não vazia (redigida pelo servidor). É o sinal de vida real da tela.
+   */
+  output_bytes?: number;
+  last_line?: string;
+  /**
+   * Só no `command` (spec 123 T02): limite de tempo do comando em ms, vindo do servidor (rodada
+   * de testes: o `TEST_TIMEOUT` ou o do executor; comando do agente: o do caminho que o roda).
+   * Ausente = sem limite conhecido.
+   */
+  command_limit_ms?: number;
   /** Rótulo da etapa (ex.: "Atualizando ARCHITECTURE.md"), reserva em pt-BR. */
   stage?: string;
   /** `code`/`params` da etapa e do texto (rótulo de ferramenta, aviso do limitador), spec 102. */
@@ -814,6 +863,13 @@ export interface ActivitySnapshot {
   text_params?: Readonly<Record<string, string | number>> | null;
   /** Tipo da chamada de saída estruturada do passo (spec 121). */
   structured?: string;
+  /** `params` da etapa (rodada de testes: tentativa e checagem), spec 123 T01. */
+  stage_params?: Readonly<Record<string, string | number>>;
+  /** Progresso do comando em curso (spec 123 T01): bytes de saída e a última linha não vazia. */
+  output_bytes?: number;
+  last_line?: string;
+  /** Limite de tempo do comando em curso (spec 123 T02), em ms, quando há. */
+  command_limit_ms?: number;
   age_ms: number;
 }
 

@@ -147,6 +147,23 @@ describe("pílula de execução (095/T07, A-01)", () => {
     const states = cssRules(shellCss).filter((r) => r.selectors.some((s) => /^\.nd-run-pill\[[^\]]*\]$/.test(s)));
     expect(states).toEqual([]);
   });
+
+  it("spec 123 T02: os detalhes encolhem com reticências; o botão e a fase não encolhem (sem 'Continuar' sobre 'Automático')", () => {
+    const details = cssRuleBody(shellCss, ".nd-run-details");
+    expect(details).toContain("min-width: 0;");
+    expect(details).toContain("overflow: hidden;");
+    expect(details).toContain("text-overflow: ellipsis;");
+    expect(details).toContain("flex: 0 1 auto;");
+    // Encaixe como o do título: abaixo de ~10 caracteres os detalhes saem inteiros (nunca "T...").
+    const slot = cssRuleBody(shellCss, ".nd-run-details-slot");
+    expect(slot).toContain("flex-wrap: wrap;");
+    expect(slot).toContain("overflow: hidden;");
+    expect(slot).toContain("min-width: 0;");
+    expect(cssRuleBody(shellCss, ".nd-run-details-slot > .nd-run-details")).toContain("min-width: 10ch;");
+    expect(cssRuleBody(shellCss, ".nd-run-pill")).toContain("min-width: 0;");
+    expect(cssRuleBody(desktopCss, ".nd-pill-btn")).toContain("flex-shrink: 0;");
+    expect(cssRuleBody(shellCss, ".nd-run-op")).toContain("flex-shrink: 0;");
+  });
 });
 
 describe("lançador (Janelas.dc.html)", () => {

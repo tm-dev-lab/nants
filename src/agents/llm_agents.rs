@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 
 use crate::agents::activity::{structured, ActivityRun, ActivityScope, ActivitySink, NullSink};
+use crate::agents::finding_reply;
 use crate::agents::arch_memory;
 use crate::agents::chat::ChatBackend;
 use crate::agents::usage::{cache_key, context_bytes, session_id, ContextChange, ContextKind, UsageBackend, UsageScope, UsageSink};
@@ -46,7 +47,7 @@ use crate::harness::tools::{
 use crate::sdd::images::GenerationStatus;
 use crate::sdd::references::{self, References};
 use crate::sdd::screenshots::{self, Capture};
-use crate::sdd::{Confidence, Finding, Verdict};
+use crate::sdd::{Confidence, Finding, FindingState, Verdict};
 
 /// Passos padrão do Desenvolvedor (pedidos ao modelo por sessão). Spec 081 T01: o orçamento é a
 /// trava de custo; o teto é só rede de segurança, configurável por agente (`max_steps`).
@@ -144,6 +145,13 @@ const GAP_CRITERIA: &str = "falta a seção \"Critérios\" (título em linha pr�
 const GAP_DIFF: &str = "a worktree não tem nenhuma alteração em relação à base";
 /// Item da conferência: nenhum comando rodou na sessão.
 const GAP_COMMAND: &str = "nenhum teste rodou nesta sessão (run_command ou run_browser_tests)";
+/// Item da conferência (spec 124 T02): apontamentos abertos sem resposta (início; seguem os ids).
+const GAP_RESPONSES: &str = "faltam respostas aos apontamentos";
+/// Formato das respostas, repetido na conferência e no briefing.
+const RESPONSES_FORMAT: &str = "na seção \"Respostas aos apontamentos\" (título em linha própria), uma linha por apontamento: \
+`- F-01: fixed: local da correção`, `- F-02: test_added: teste que cobre` ou `- F-03: contested (environment | out_of_scope | incorrect): motivo`";
+/// Item da conferência (spec 124 T02): contestação de apontamento que o Arquiteto já decidiu.
+const GAP_CONTESTED_AGAIN: &str = "o Arquiteto já decidiu a contestação destes apontamentos e eles são obrigatórios; responda fixed ou test_added";
 /// Resumo usado quando a chamada final do Desenvolvedor esgotado falha.
 const DEV_EXHAUSTED_FALLBACK: &str = "A sessão terminou sem resumo final; confira o diff da branch para ver o que já foi feito e continue a partir dele.";
 /// Tamanho máximo da resposta final do Revisor antes da extração do JSON.
@@ -393,6 +401,8 @@ impl LlmDeveloper {
             Some(c) => host.with_compose(Arc::clone(c)),
             None => host,
         };
+        // Spec 124 T05: as rodadas dos comandos de teste do projeto ficam registradas para o runner.
+        let host = host.with_suite_ledger(brief.suite_ledger.clone());
         let host = match &self.browser {
             Some(b) => host.with_browser(Arc::clone(b)),
             None => host,
@@ -988,7 +998,14 @@ pub(crate) async fn run_tool_loop_with(
                     .ok()
                     .and_then(|a| a.get("command").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
-                run.track_command(&cmd, run_call(ctx.host, &call)).await
+                // Spec 123 T01: o heartbeat do comando leva o progresso real da saída.
+                // Spec 123 T02: com largada; o relógio e o limite começam quando o processo vai rodar,
+                // não durante o pedido de aprovação nem o download da imagem do navegador.
+                let progress = Arc::new(crate::harness::progress::CommandProgress::gated());
+                // Na pilha só o ponteiro: o futuro do comando é grande e o laço já é fundo.
+                // Spec 123 T02: o limite de tempo do caminho que vai rodar o comando vai para a tela.
+                let limit = ctx.host.command_limit(&call.name);
+                Box::pin(run.track_command_progress(&cmd, &progress, limit, run_call_progress(ctx.host, &call, &progress))).await
             } else if call.name == ToolName::GenerateImage.name() {
                 // Spec 090 T02: avisos de ritmo/nova tentativa na atividade ao vivo; a parada corta
                 // as esperas do cliente.
@@ -1501,6 +1518,22 @@ impl LoopGuard {
     }
 }
 
+/// Regra das respostas no briefing do Desenvolvedor (spec 124 T02).
+const RESPONSES_RULE: &str = "Antes de concluir, responda a CADA finding pendente: corrigido (fixed), teste adicionado (test_added) \
+ou contestado (contested) com o motivo: inviável no ambiente (environment), fora do escopo (out_of_scope) ou incorreto \
+(incorrect). A contestação vai ao Arquiteto, que decide; cada finding só pode ser contestado uma vez.";
+/// Marca do finding cuja contestação o Arquiteto já decidiu (spec 124 T02).
+const DECIDED_NOTE: &str = "Contestação já decidida pelo Arquiteto: o finding é obrigatório (responda fixed ou test_added).";
+
+/// Marca "aberto há N revisões" do briefing do Desenvolvedor (spec 124 T01); vazia sem apuração.
+fn open_since(recurrence: u32) -> String {
+    match recurrence {
+        0 => String::new(),
+        1 => " (novo)".to_string(),
+        n => format!(" (aberto há {n} revisões)"),
+    }
+}
+
 /// Base do lembrete periódico do Desenvolvedor (spec 087 T03), derivada do briefing: critérios e
 /// findings pendentes, cortados para o lembrete inteiro ficar em ~800 caracteres.
 fn developer_reminder(brief: &DevBrief) -> String {
@@ -1527,26 +1560,41 @@ pub(crate) struct FinalCheck {
     base: String,
     /// Escopo só de `*.md`: a tarefa pode terminar sem diff.
     docs_only: bool,
+    /// Apontamentos abertos do briefing (spec 124 T02): cada um precisa de resposta.
+    findings: Vec<Finding>,
 }
 
 impl FinalCheck {
     fn from_brief(brief: &DevBrief) -> Self {
         let docs_only = !brief.allowed_scope.is_empty()
             && brief.allowed_scope.iter().all(|p| p.trim().to_ascii_lowercase().ends_with(".md"));
-        Self { worktree: brief.worktree.clone(), base: brief.base_branch.trim().to_string(), docs_only }
+        Self { worktree: brief.worktree.clone(), base: brief.base_branch.trim().to_string(), docs_only, findings: brief.findings.clone() }
     }
 
     /// Itens que faltam na resposta final `summary`, com `commands` comandos rodados na sessão.
-    fn gaps(&self, summary: &str, commands: usize) -> Vec<&'static str> {
+    /// Spec 124 T02: todo apontamento aberto tem resposta, e o já decidido pelo Arquiteto não é
+    /// contestado de novo.
+    fn gaps(&self, summary: &str, commands: usize) -> Vec<String> {
         let mut gaps = Vec::new();
         if extract_dev_criteria(summary).is_empty() {
-            gaps.push(GAP_CRITERIA);
+            gaps.push(GAP_CRITERIA.to_string());
         }
         if !self.docs_only && !self.worktree_changed() {
-            gaps.push(GAP_DIFF);
+            gaps.push(GAP_DIFF.to_string());
         }
         if commands == 0 {
-            gaps.push(GAP_COMMAND);
+            gaps.push(GAP_COMMAND.to_string());
+        }
+        if !self.findings.is_empty() {
+            let responses = finding_reply::for_open(finding_reply::extract(summary), &self.findings);
+            let missing = finding_reply::missing(&self.findings, &responses);
+            if !missing.is_empty() {
+                gaps.push(format!("{GAP_RESPONSES} {} {RESPONSES_FORMAT}", missing.join(", ")));
+            }
+            let again = finding_reply::contested_again(&self.findings, &responses);
+            if !again.is_empty() {
+                gaps.push(format!("{GAP_CONTESTED_AGAIN}: {}", again.join(", ")));
+            }
         }
         gaps
     }
@@ -1573,7 +1621,7 @@ impl FinalCheck {
 }
 
 /// Mensagem da conferência antes do fim com os itens que faltam.
-fn final_check_text(gaps: &[&str]) -> String {
+fn final_check_text(gaps: &[String]) -> String {
     format!("{FINAL_CHECK_INTRO} {}. {FINAL_CHECK_OUTRO}", gaps.join("; "))
 }
 
@@ -2205,12 +2253,9 @@ async fn run_call(host: &ToolHost, call: &ToolCall) -> String {
 
 /// Como [`run_call`], com os avisos fixos do provedor (`generate_image`) em `on_notice`.
 async fn run_call_noticed(host: &ToolHost, call: &ToolCall, on_notice: &(dyn Fn(String) + Send + Sync)) -> String {
-    let Some(tool) = ToolName::ALL.iter().chain(ToolName::CONDITIONAL.iter()).copied().find(|t| t.name() == call.name) else {
-        return format!("erro: ferramenta desconhecida `{}`", call.name);
-    };
-    let args = match parse_args(&call.arguments) {
-        Ok(args) => args,
-        Err(e) => return format!("erro: argumentos inválidos (JSON): {e}"),
+    let (tool, args) = match resolve_call(call) {
+        Ok(found) => found,
+        Err(text) => return text,
     };
     // O texto sai inteiro: o corte é a regra única por tamanho do laço (spec 122 T02,
     // [`spill::fit`]), igual para todas as ferramentas.
@@ -2218,6 +2263,28 @@ async fn run_call_noticed(host: &ToolHost, call: &ToolCall, on_notice: &(dyn Fn(
         Ok(output) => output,
         Err(e) => format!("erro: {e}"),
     }
+}
+
+/// Como [`run_call`], copiando a saída do comando em `progress` enquanto roda (spec 123 T01).
+async fn run_call_progress(host: &ToolHost, call: &ToolCall, progress: &Arc<crate::harness::progress::CommandProgress>) -> String {
+    let (tool, args) = match resolve_call(call) {
+        Ok(found) => found,
+        Err(text) => return text,
+    };
+    match host.call_progress(tool, args, progress).await {
+        Ok(output) => output,
+        Err(e) => format!("erro: {e}"),
+    }
+}
+
+/// Ferramenta e argumentos da chamada, ou o texto de erro que volta ao modelo.
+fn resolve_call(call: &ToolCall) -> Result<(ToolName, Value), String> {
+    let Some(tool) = ToolName::ALL.iter().chain(ToolName::CONDITIONAL.iter()).copied().find(|t| t.name() == call.name) else {
+        return Err(format!("erro: ferramenta desconhecida `{}`", call.name));
+    };
+    parse_args(&call.arguments)
+        .map(|args| (tool, args))
+        .map_err(|e| format!("erro: argumentos inválidos (JSON): {e}"))
 }
 
 fn parse_args(arguments: &str) -> Result<Value, serde_json::Error> {
@@ -2334,16 +2401,25 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
         ));
     }
     if !brief.findings.is_empty() {
-        out.push_str("\n## Findings pendentes\n");
+        out.push_str("\n## Findings pendentes (os abertos há mais revisões primeiro; resolva estes antes)\n");
         for f in &brief.findings {
             out.push_str(&format!(
-                "- {} [{}] {}: {}. Recomendação: {}\n",
-                f.id, f.severity, f.location, f.description, f.recommendation
+                "- {} [{}]{} {}: {}. Recomendação: {}\n",
+                f.id,
+                f.severity,
+                open_since(f.recurrence),
+                f.location,
+                f.description,
+                f.recommendation
             ));
             if !f.failure_scenario.trim().is_empty() {
                 out.push_str(&format!("  Cenário de falha: {}\n", f.failure_scenario.trim()));
             }
+            if f.arbitration.is_some() {
+                out.push_str(&format!("  {DECIDED_NOTE}\n"));
+            }
         }
+        out.push_str(&format!("\n{RESPONSES_RULE} Responda {RESPONSES_FORMAT}.\n"));
     }
     if !brief.recovery.trim().is_empty() {
         out.push_str(&format!(
@@ -2367,6 +2443,19 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
         out.push_str(&format!(
             "\n## Formatação automática (o Nants roda depois de você; não rode estes formatadores):\n{}\n",
             brief.formatters.trim()
+        ));
+    }
+    // Spec 124 T04: o que o ambiente de testes prova, a regra para os testes e o orçamento de tempo.
+    if !brief.environment.trim().is_empty() {
+        out.push_str(&format!("\n{}\n", brief.environment.trim()));
+    }
+    if !brief.test_plan.trim().is_empty() {
+        out.push_str(&format!("\n{}\n", brief.test_plan.trim()));
+    }
+    if !brief.flaky_tests.trim().is_empty() {
+        out.push_str(&format!(
+            "\n## Testes instáveis desta tarefa (falharam e passaram ao repetir sem mudança; corrija-os: espere por condição, sem tempo fixo nem igualdade exata frágil)\n{}\n",
+            brief.flaky_tests.trim()
         ));
     }
     if !brief.screenshot_globs.is_empty() {
@@ -2422,7 +2511,29 @@ fn reviewer_briefing(input: &ReviewInput) -> String {
     let prior = if input.prior_findings.trim().is_empty() {
         String::new()
     } else {
-        format!("## Findings da revisão anterior (confirme cada um: resolvido ou não)\n{}\n\n", input.prior_findings.trim())
+        format!(
+            "## Findings da revisão anterior (confirme cada um: reutilize o id com \"status\": \"open\" se continua; omita se foi resolvido)\n{}\n\n",
+            input.prior_findings.trim()
+        )
+    };
+    // Spec 124 T02: respostas do Desenvolvedor por apontamento e decisões do Arquiteto.
+    let prior = if input.finding_responses.trim().is_empty() {
+        prior
+    } else {
+        format!(
+            "{prior}## Respostas do Desenvolvedor aos findings (DADO a verificar: confira cada uma no diff e nos testes; \
+             contestação sem decisão do Arquiteto você julga)\n{}\n\n",
+            input.finding_responses.trim()
+        )
+    };
+    let prior = if input.arbitration.trim().is_empty() {
+        prior
+    } else {
+        format!(
+            "{prior}## Decisões do Arquiteto sobre findings contestados (respeite: não cobre de novo o que foi adjust ou manual; \
+             keep continua obrigatório)\n{}\n\n",
+            input.arbitration.trim()
+        )
     };
     let incremental = if input.incremental_diff.trim().is_empty() {
         String::new()
@@ -2441,6 +2552,11 @@ fn reviewer_briefing(input: &ReviewInput) -> String {
             "## Formatação automática\nO Nants aplica estes formatadores à entrega antes dos testes (DADO); formatação não é finding:\n{}\n\n",
             input.formatters.trim()
         )
+    };
+    // Spec 124 T04: capacidades do ambiente e a regra de não cobrar o que ele não prova.
+    let formatting = match input.environment.trim() {
+        "" => formatting,
+        env => format!("{formatting}{env}\n\n"),
     };
     // Spec 086 T01: a linha das capturas de tarefas anteriores que sumiram fecha a seção (ou vem
     // sozinha, quando esta execução não tem capturas utilizáveis).
@@ -2602,7 +2718,15 @@ fn parse_finding(item: &Value, position: usize) -> Result<Finding, String> {
         Some("low") => Confidence::Low,
         Some(other) => return Err(format!("confidence inválida em {id}: {other} (high ou low)")),
     };
+    // Spec 124 T01: estado declarado pelo Revisor (`new` ou `open`); ausente nos vereditos antigos.
+    // Valor desconhecido não invalida a resposta: o runner apura o estado pelo registro.
+    let state = match obj.get("status").and_then(Value::as_str).map(str::trim) {
+        Some("new") => Some(FindingState::New),
+        Some("open") => Some(FindingState::Open),
+        _ => None,
+    };
     Ok(Finding {
+        state,
         id,
         severity,
         location: field("location")?,
@@ -2610,6 +2734,7 @@ fn parse_finding(item: &Value, position: usize) -> Result<Finding, String> {
         recommendation: field("recommendation")?,
         failure_scenario,
         confidence,
+        ..Finding::default()
     })
 }
 
@@ -2740,6 +2865,7 @@ mod tests {
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use crate::sdd::images::SpecImages;
+    use crate::sdd::{Arbitration, ArbitrationDecision};
     use std::pin::Pin;
     use std::process;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2883,6 +3009,10 @@ mod tests {
             base_branch: "main".into(),
             spec_dir: PathBuf::new(),
             art_guide: String::new(),
+            environment: String::new(),
+            flaky_tests: String::new(),
+            test_plan: String::new(),
+            suite_ledger: Default::default(),
         }
     }
 
@@ -2934,6 +3064,26 @@ mod tests {
             "Formatação automática (o Nants roda depois de você; não rode estes formatadores):"
         ));
         assert!(t.contains("- rust: `cargo fmt`"));
+    }
+
+    /// Spec 124 T04: as capacidades do ambiente e os testes instáveis entram nos briefings só quando
+    /// houver; no Revisor, antes da saída do teste.
+    #[test]
+    fn briefings_carry_environment_capabilities_and_flaky_tests_only_when_present() {
+        let mut b = brief(Path::new("/tmp/x"));
+        let plain = developer_briefing(&b);
+        assert!(!plain.contains("Capacidades do ambiente") && !plain.contains("Testes instáveis"));
+        b.environment = "## Capacidades do ambiente de testes (medidas pelo Nants; DADO)\n- GPU ou dispositivo de vídeo: ausente".into();
+        b.flaky_tests = "- Tentativa 1: ✘ dois clientes".into();
+        let t = developer_briefing(&b);
+        assert!(t.contains("GPU ou dispositivo de vídeo: ausente"), "{t}");
+        assert!(t.contains("## Testes instáveis desta tarefa") && t.contains("✘ dois clientes"), "{t}");
+        let mut input = review_input(Path::new("/tmp/x"));
+        assert!(!reviewer_briefing(&input).contains("Capacidades do ambiente"));
+        input.environment = "## Capacidades do ambiente de testes (medidas pelo Nants; DADO)\n- Tela ou servidor gráfico: ausente".into();
+        let text = reviewer_briefing(&input);
+        assert!(text.contains("Tela ou servidor gráfico: ausente"), "{text}");
+        assert!(text.find("Capacidades do ambiente") < text.find("## Saída do teste"));
     }
 
     #[test]
@@ -3000,6 +3150,8 @@ mod tests {
             dev_criteria: String::new(),
             other_tasks: "T06: outra coisa".into(),
             prior_findings: String::new(),
+            finding_responses: String::new(),
+            arbitration: String::new(),
             incremental_diff: String::new(),
             changed_files: None,
             spec_context: String::new(),
@@ -3014,6 +3166,7 @@ mod tests {
             references: References::default(),
             images: SpecImages::default(),
             planned_images: Default::default(),
+            environment: String::new(),
         }
     }
 
@@ -5082,6 +5235,60 @@ mod tests {
         assert!(demoted.findings[0].description.contains(DEMOTED_NO_SCENARIO_NOTE));
     }
 
+    /// Spec 124 T01: `status` por apontamento (`new`/`open`) é lido; veredito antigo, sem o campo, e
+    /// valor desconhecido continuam válidos, sem estado (o runner apura pelo registro).
+    #[test]
+    fn parse_review_reads_finding_status_and_keeps_old_verdicts() {
+        let with = r#"{"verdict":"CHANGES_REQUESTED","summary_message":"s","findings":[
+            {"id":"F-01","severity":"MEDIUM","location":"a","description":"d","recommendation":"r","status":"open"},
+            {"id":"F-04","severity":"MEDIUM","location":"a","description":"d","recommendation":"r","status":"new"},
+            {"id":"F-05","severity":"MEDIUM","location":"a","description":"d","recommendation":"r","status":"talvez"}]}"#;
+        let r = parse_review(with).unwrap();
+        let states: Vec<_> = r.findings.iter().map(|f| f.state).collect();
+        assert_eq!(states, vec![Some(FindingState::Open), Some(FindingState::New), None]);
+        let old = r#"{"verdict":"CHANGES_REQUESTED","summary_message":"s","findings":[{"id":"F-01","severity":"MEDIUM","location":"a","description":"d","recommendation":"r"}]}"#;
+        let r = parse_review(old).unwrap();
+        assert_eq!((r.findings[0].state, r.findings[0].recurrence), (None, 0));
+    }
+
+    /// Spec 124 T02: o briefing pede a resposta a cada finding e marca o já decidido pelo Arquiteto;
+    /// o Revisor recebe as respostas e as decisões para conferir e respeitar.
+    #[test]
+    fn briefings_carry_responses_and_decisions() {
+        let root = tmp_root("dev-respostas");
+        let mut b = brief(&root);
+        let text = developer_briefing(&b);
+        assert!(text.contains(RESPONSES_RULE) && text.contains(RESPONSES_FORMAT) && !text.contains(DECIDED_NOTE), "{text}");
+        b.findings[0].arbitration = Some(Arbitration { decision: ArbitrationDecision::Keep, reason: "x".into(), review: 1 });
+        assert!(developer_briefing(&b).contains(&format!("Recomendação: adicionar X\n  {DECIDED_NOTE}\n")));
+        b.findings.clear();
+        assert!(!developer_briefing(&b).contains(RESPONSES_RULE), "sem findings, sem a regra");
+        let mut r = review_input(&root);
+        assert!(!reviewer_briefing(&r).contains("Respostas do Desenvolvedor"));
+        r.finding_responses = "- F-01: contested (environment): sem GPU".into();
+        r.arbitration = "- F-01 [manual] Falta WebGPU: sem GPU".into();
+        let rb = reviewer_briefing(&r);
+        let responses = rb.find("## Respostas do Desenvolvedor aos findings").expect("respostas");
+        let decisions = rb.find("## Decisões do Arquiteto sobre findings contestados").expect("decisões");
+        assert!(responses < decisions && decisions < rb.find("## Saída do teste").expect("teste"), "{rb}");
+        assert!(rb.contains("- F-01: contested (environment): sem GPU") && rb.contains("não cobre de novo o que foi adjust ou manual"), "{rb}");
+    }
+
+    /// Spec 124 T01: no briefing, cada pendente traz há quantas revisões está aberto, na ordem recebida.
+    #[test]
+    fn developer_briefing_marks_how_long_each_finding_is_open() {
+        let root = tmp_root("dev-recorrencia");
+        let mut b = brief(&root);
+        let mk = |id: &str, recurrence: u32| Finding { id: id.into(), severity: "HIGH".into(), recurrence, ..b.findings[0].clone() };
+        b.findings = vec![mk("F-02", 3), mk("F-05", 1), mk("F-01", 0)];
+        let text = developer_briefing(&b);
+        let old = text.find("- F-02 [HIGH] (aberto há 3 revisões) src/x.rs:1: falta X").expect("aberto há 3");
+        let new = text.find("- F-05 [HIGH] (novo) src/x.rs:1").expect("novo");
+        assert!(old < new, "a ordem do runner é mantida");
+        assert!(text.contains("- F-01 [HIGH] src/x.rs:1"), "sem apuração, sem marca");
+        assert!(text.contains("os abertos há mais revisões primeiro"));
+    }
+
     #[tokio::test]
     async fn reviewer_high_without_scenario_retries_then_accepts_fixed_reply() {
         let root = tmp_root("rev-sem-cenario-ok");
@@ -6094,7 +6301,7 @@ mod tests {
 
     // ---- Spec 087 T04: conferência antes do fim do Desenvolvedor ----
 
-    const COMPLETE: &str = "feito\n\nCritérios\n1. laço — src/a.rs:1";
+    const COMPLETE: &str = "feito\n\nRespostas aos apontamentos\n- F-01: fixed: src/x.rs:1\n\nCritérios\n1. laço — src/a.rs:1";
 
     fn run_cmd(id: &str) -> Reply {
         calls(&[(id, "run_command", r#"{"command":"cargo test"}"#)])
@@ -6109,11 +6316,48 @@ mod tests {
             .collect()
     }
 
-    /// Brief sem conferência de diff (base vazia): isola os demais itens.
+    /// Brief sem conferência de diff (base vazia) nem findings pendentes: isola os demais itens.
     fn brief_no_base(root: &Path) -> DevBrief {
         let mut b = brief(root);
         b.base_branch = String::new();
+        b.findings.clear();
         b
+    }
+
+    /// Spec 124 T02: a conferência cobra a resposta a cada finding aberto e recusa a 2ª contestação.
+    #[test]
+    fn final_check_requires_a_response_per_finding_and_one_contest() {
+        let root = tmp_root("check-responses");
+        let mut b = brief_no_base(&root);
+        let decided = Arbitration { decision: ArbitrationDecision::Keep, reason: "dá para testar".into(), review: 2 };
+        let open = |id: &str| Finding { id: id.into(), ..brief(&root).findings[0].clone() };
+        b.findings = vec![open("F-01"), Finding { arbitration: Some(decided), ..open("F-02") }];
+        let check = FinalCheck::from_brief(&b);
+        let crit = "\n\nCritérios\n1. a — x.rs:1";
+        let none = check.gaps(&format!("feito{crit}"), 1);
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(none[0].starts_with(&format!("{GAP_RESPONSES} F-01, F-02 ")) && none[0].contains("contested (environment"), "{}", none[0]);
+        let again = check.gaps(&format!("feito\n\n## Respostas aos apontamentos\n- F-01: test_added: tests/a.rs::x\n- F-02: contested (environment): sem GPU{crit}"), 1);
+        assert_eq!(again, vec![format!("{GAP_CONTESTED_AGAIN}: F-02")]);
+        let partial = check.gaps(&format!("feito\n\nRespostas aos apontamentos\n- F-02: fixed: src/b.rs:2{crit}"), 1);
+        assert!(partial[0].starts_with(&format!("{GAP_RESPONSES} F-01 ")), "{partial:?}");
+        assert!(check.gaps(&format!("feito\n\nRespostas aos apontamentos\n- F-01: contested (incorrect): já valida\n- F-02: fixed: src/b.rs:2{crit}"), 1).is_empty());
+    }
+
+    /// Spec 124 T02: sem as respostas, a final volta com o pedido; com elas, é aceita.
+    #[tokio::test]
+    async fn final_without_responses_continues() {
+        let root = tmp_root("check-responses-loop");
+        let mut b = brief_no_base(&root);
+        b.findings = brief(&root).findings;
+        let backend = Scripted::new(vec![run_cmd("c1"), text("feito\n\nCritérios\n1. laço — src/a.rs:1"), text(COMPLETE)]);
+        let report = checked_developer(Arc::clone(&backend)).implement(&b).await.expect("ok");
+        assert_eq!(report.summary, COMPLETE);
+        let reqs = backend.requests();
+        assert_eq!(reqs.len(), 3);
+        let checks = final_checks(&reqs[2]);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].contains(&format!("{GAP_RESPONSES} F-01")) && !checks[0].contains(GAP_CRITERIA), "{}", checks[0]);
     }
 
     /// Roda git em `root` com identidade fixa.
@@ -6213,7 +6457,7 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(checks[0].contains(GAP_COMMAND) && !checks[0].contains(GAP_CRITERIA), "{}", checks[0]);
         let check = FinalCheck::from_brief(&brief_no_base(&root));
-        assert_eq!(check.gaps(COMPLETE, 0), vec![GAP_COMMAND]);
+        assert_eq!(check.gaps(COMPLETE, 0), vec![GAP_COMMAND.to_string()]);
         assert!(check.gaps(COMPLETE, 1).is_empty());
     }
 
@@ -6239,7 +6483,7 @@ mod tests {
         // Escopo com código, ou vazio, exige diff.
         b.allowed_scope = vec!["README.md".into(), "src/**".into()];
         assert!(!FinalCheck::from_brief(&b).docs_only);
-        assert_eq!(FinalCheck::from_brief(&b).gaps(COMPLETE, 1), vec![GAP_DIFF]);
+        assert_eq!(FinalCheck::from_brief(&b).gaps(COMPLETE, 1), vec![GAP_DIFF.to_string()]);
         b.allowed_scope = Vec::new();
         assert!(!FinalCheck::from_brief(&b).docs_only);
     }

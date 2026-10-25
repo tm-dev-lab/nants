@@ -399,3 +399,121 @@ fn current_result_and_running_win_over_pending() {
     let again = view_at(&root, SPEC, &secrets, true, SystemTime::now()).expect("pending");
     assert_eq!(again.status, STATUS_PENDING);
 }
+
+
+/// Spec 124 T04: o plano enviado ao Revisor traz as capacidades medidas do ambiente e a regra de
+/// apontar como untestable o critério que depende de capacidade ausente.
+#[test]
+fn plan_carries_environment_capabilities_with_the_plan_rule() {
+    use crate::sdd::capabilities::{self, Capabilities, Probe};
+    let root = tmp("caps");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    fs::write(root.join(".sdd/settings.yaml"), "base_branch: main\nmerge_strategy: squash\ntest_command: \"true\"\nenvironment: docker\n").expect("settings");
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(!plan.contains(capabilities::SECTION_TITLE), "Docker sem medida: sem seção");
+    let mut caps = Capabilities::default();
+    caps.apply_probe("docker", "h", Probe { gpu: Some(false), display: Some(true), cpus: Some(8), memory_mb: Some(16000) }, "t".into());
+    capabilities::write(&root, &caps).expect("estado");
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(plan.contains("GPU ou dispositivo de vídeo: ausente") && plan.contains("Tela ou servidor gráfico: presente"), "{plan}");
+    assert!(plan.contains("aponte-o como untestable"), "{plan}");
+    // No host sem nada gravado, a medida é feita na hora.
+    fs::write(root.join(".sdd/settings.yaml"), "base_branch: main\nmerge_strategy: squash\ntest_command: \"true\"\n").expect("settings");
+    fs::remove_file(root.join(capabilities::CAPABILITIES_REL)).expect("rm");
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(plan.contains("Onde os testes rodam: host"), "{plan}");
+    assert!(plan_review_system().contains("capacidades do ambiente"));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Tarefa com `n` critérios de aceitação.
+fn big_task(n: usize) -> String {
+    let criteria: Vec<String> = (1..=n).map(|i| format!("{i}. critério {i}")).collect();
+    let head = EXAMPLE_TASK_MD.split("## Critérios de Aceitação").next().unwrap_or_default();
+    format!("{head}## Critérios de Aceitação\n{}\n", criteria.join("\n"))
+}
+
+/// Spec 124 T06: o modelo aprende o tipo `too_large` com a sugestão de divisão, e o plano leva o
+/// tamanho contado de cada tarefa.
+#[test]
+fn too_large_is_a_known_kind_and_the_plan_carries_task_sizes() {
+    let p = plan_review_system();
+    assert!(p.contains("too_large") && p.contains("servidor, cliente e testes ponta a ponta") && p.contains("dividir"), "{p}");
+    assert!(!p.contains("divisão das tarefas) não é problema"), "dividir uma tarefa grande deixou de ser preferência");
+    let raw = json!({"issues": [{"task": "T01", "kind": "too_large", "text": "Mistura servidor e cliente; divida em duas."}]}).to_string();
+    let issues = parse_issues(&raw, &SecretSet::default()).expect("válido");
+    assert_eq!(issues[0].kind, TOO_LARGE);
+    let root = tmp("sizes");
+    write_plan(&root, "AWAITING_APPROVAL", &big_task(7));
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(plan.contains("### Tamanho das tarefas (contado pelo servidor)\n- T01: 7 critérios de aceitação; allowed_scope: src/**"), "{plan}");
+    assert_eq!(task_sizes(&root, SPEC).iter().map(|s| (s.id.as_str(), s.criteria)).collect::<Vec<_>>(), vec![("T01", 7)]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 124 T06: a tarefa com muitos critérios vira apontamento com sugestão de divisão, no idioma
+/// do projeto, sem duplicar o que o modelo já apontou e sem perder vaga para os do modelo.
+#[test]
+fn many_criteria_become_a_too_large_issue_with_a_split_suggestion() {
+    use crate::agents::recovery_plan::MANY_CRITERIA;
+    use crate::i18n::Lang;
+    let size = |id: &str, criteria: usize| TaskSize { id: id.into(), criteria, scope: Vec::new() };
+    let sizes = [size("T01", MANY_CRITERIA - 1), size("T02", MANY_CRITERIA), size("T03", 9)];
+    let model = PlanIssue { task: Some("T03".into()), kind: TOO_LARGE.into(), text: "Mistura servidor e e2e.".into() };
+    let out = with_size_issues(vec![model.clone()], &sizes, Lang::PtBr);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out[0], model, "o do modelo fica, sem duplicar a T03");
+    assert_eq!(out[1].task.as_deref(), Some("T02"));
+    assert_eq!(out[1].kind, TOO_LARGE);
+    assert!(out[1].text.starts_with("6 critérios de aceitação: grande demais para uma revisão. Divida em tarefas menores"), "{}", out[1].text);
+    let en = with_size_issues(Vec::new(), &sizes, Lang::En);
+    assert!(en.iter().all(|i| i.text.contains("Split it into smaller tasks")), "{en:?}");
+    assert_eq!(en.iter().map(|i| i.task.as_deref()).collect::<Vec<_>>(), vec![Some("T02"), Some("T03")]);
+    // Lista cheia do modelo: o do servidor entra e um do modelo cede a vaga.
+    let full: Vec<PlanIssue> = (0..MAX_ISSUES).map(|i| PlanIssue { task: None, kind: "scope".into(), text: format!("p{i}") }).collect();
+    let out = with_size_issues(full, &[size("T02", 8)], Lang::PtBr);
+    assert_eq!(out.len(), MAX_ISSUES);
+    assert_eq!(out.last().map(|i| i.kind.as_str()), Some(TOO_LARGE));
+}
+
+/// Spec 124 T06: critérios detalhados em subitens contam só pelo primeiro nível. Três critérios com
+/// quatro subitens cada não viram `too_large`, nem no plano enviado nem no resultado gravado.
+#[tokio::test]
+async fn detailed_sub_items_do_not_make_a_task_too_large() {
+    let root = tmp("sub-items");
+    let head = EXAMPLE_TASK_MD.split("## Critérios de Aceitação").next().unwrap_or_default();
+    let criteria: Vec<String> = (1..=3)
+        .map(|i| format!("{i}. critério {i}:\n   - detalhe a\n   - detalhe b\n   - detalhe c\n   - detalhe d"))
+        .collect();
+    write_plan(&root, "AWAITING_APPROVAL", &format!("{head}## Critérios de Aceitação\n{}\n", criteria.join("\n")));
+    assert_eq!(task_sizes(&root, SPEC).iter().map(|s| s.criteria).collect::<Vec<_>>(), vec![3]);
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(plan.contains("- T01: 3 critérios de aceitação;"), "{plan}");
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let scripted = Scripted::new(vec![text("{\"issues\": []}")]);
+    let st = state(&root, true, scripted.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.status, STATUS_OK);
+    assert!(rec.issues.is_empty(), "{:?}", rec.issues);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 124 T06: no fluxo inteiro, o resultado gravado traz o apontamento `too_large` do servidor.
+#[tokio::test]
+async fn review_records_the_too_large_issue_for_a_big_task() {
+    let root = tmp("too-large");
+    write_plan(&root, "AWAITING_APPROVAL", &big_task(8));
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let scripted = Scripted::new(vec![text("{\"issues\": []}")]);
+    let st = state(&root, true, scripted.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.status, STATUS_OK);
+    assert_eq!(rec.issues.len(), 1, "{:?}", rec.issues);
+    assert_eq!((rec.issues[0].task.as_deref(), rec.issues[0].kind.as_str()), (Some("T01"), TOO_LARGE));
+    assert!(rec.issues[0].text.starts_with("8 critérios"), "{}", rec.issues[0].text);
+    let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
+    assert_eq!(shown.issues, rec.issues);
+    let _ = fs::remove_dir_all(&root);
+}

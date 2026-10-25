@@ -131,16 +131,40 @@ describe("Custos: em destaque (095/T05)", () => {
     expect(findForbiddenGlyphs(win)).toEqual([]);
   });
 
-  it("efeito da gestão de contexto (spec 122): uma linha à vista, fora dos detalhes; sem efeito, nada", async () => {
-    const context = { calls: 2, input: 1000, avg_input: 500, max_input: 600, max_context_bytes: 2400, compactions: 4, summaries: 1, saved_bytes: 48_000 };
+  it("área Contexto (spec 122; 123/T03): o resumo à vista, o resto em detalhes recolhidos; sem chamadas nem efeito, nada", async () => {
+    const context = { calls: 2, input: 1000, avg_input: 500, max_input: 600, max_context_bytes: 2400, cached: 250, cache_pct: 25, compactions: 4, spills: 3, dedups: 1, summaries: 1, saved_bytes: 48_000, reinjection_avoided_tokens: 30_500 };
     await openCosts({}, { ...PROJECT, context });
     const win = costs();
-    const region = await within(win).findByRole("region", { name: "Efeito da gestão de contexto" });
+    const region = await within(win).findByRole("region", { name: "Contexto" });
     expect(region.closest("details")).toBeNull();
-    expect([...region.querySelectorAll("p")].map((p) => p.textContent)).toEqual(["Gestão de contexto: 4 compactações, 1 resumo, cerca de 12,0 mil tokens evitados (estimativa)"]);
+    // O resumo usa a estimativa do servidor (vezes as chamadas seguintes), não os bytes / 4.
+    expect([...region.querySelectorAll("[data-costs-context-line]")].map((p) => p.textContent)).toEqual(["Gestão de contexto: 4 compactações, 1 resumo, cerca de 30,5 mil tokens evitados (estimativa)"]);
+    const details = await openDetails("[data-costs-context-details]");
+    expect(details.querySelector("summary")?.textContent).toBe("Ver detalhes do contexto");
+    const rows = [...details.querySelectorAll("[data-context-scope='project'] [data-context-row]")].map((r) => `${r.querySelector("dt")?.textContent}: ${r.querySelector("dd")?.textContent}`);
+    expect(rows).toEqual([
+      "Chamadas: 2",
+      "Entrada média por chamada: 500 tokens",
+      "Maior contexto: 600 tokens",
+      "Entrada lida do cache: 25%",
+      "Compactações: 4",
+      "Saídas grandes guardadas em arquivo: 3",
+      "Leituras repetidas evitadas: 1",
+      "Resumos do histórico: 1",
+      "Tokens evitados (estimativa): 30,5 mil tokens",
+    ]);
+    // A spec ativa (sem o resumo do contexto nesta resposta) não ganha detalhes próprios.
+    expect(details.querySelector("[data-context-scope='spec']")).toBeNull();
+    expect(details.querySelector("[data-costs-context-note]")?.textContent).toContain("são uma estimativa");
     expect(findForbiddenGlyphs(region)).toEqual([]);
     cleanup();
-    await openCosts({}, { ...PROJECT, context: { ...context, compactions: 0, summaries: 0, saved_bytes: 0 } });
+    // Com chamadas e sem efeito, a área fica e o resumo diz isso.
+    await openCosts({}, { ...PROJECT, context: { ...context, compactions: 0, spills: 0, dedups: 0, summaries: 0, saved_bytes: 0, reinjection_avoided_tokens: 0 } });
+    const quiet = await within(costs()).findByRole("region", { name: "Contexto" });
+    expect(quiet.querySelector("[data-costs-context-line]")?.textContent).toBe("Gestão de contexto: nenhuma compactação nem resumo até agora");
+    cleanup();
+    // Sem chamadas e sem efeito, nada.
+    await openCosts({}, { ...PROJECT, context: { ...context, calls: 0, compactions: 0, spills: 0, dedups: 0, summaries: 0, saved_bytes: 0, reinjection_avoided_tokens: 0 } });
     await waitFor(() => expect(within(costs()).getByTestId("usage-cost").textContent).toBe("US$ 0,13"));
     expect(costs().querySelector("[data-costs-context]")).toBeNull();
   });

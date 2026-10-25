@@ -280,6 +280,30 @@ pub trait SpecRunner: Send + Sync {
     ) -> Result<usize, RunnerError> {
         Err(RunnerError::Invalid("recuperação não suportada por este runner".into()))
     }
+
+    /// SPLIT (spec 124 T03): grava as tarefas novas e a definição menor da atual, que é reaberta
+    /// (ver `TaskRunner::record_split`). Devolve o ciclo e o texto registrado.
+    fn record_split(
+        &self,
+        _spec_id: &str,
+        _task_id: &str,
+        _split: &crate::agents::recovery_plan::TaskSplit,
+        _text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        Err(RunnerError::Invalid("recuperação não suportada por este runner".into()))
+    }
+
+    /// ADJUST (spec 124 T03): ajusta os critérios pelo caminho da arbitragem e reabre a tarefa (ver
+    /// `TaskRunner::record_adjust`). Devolve o ciclo e o texto registrado.
+    fn record_adjust(
+        &self,
+        _spec_id: &str,
+        _task_id: &str,
+        _adjustment: &crate::agents::recovery_plan::CriteriaAdjustment,
+        _text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        Err(RunnerError::Invalid("recuperação não suportada por este runner".into()))
+    }
 }
 
 impl SpecRunner for TaskRunner {
@@ -309,6 +333,26 @@ impl SpecRunner for TaskRunner {
         text: &str,
     ) -> Result<usize, RunnerError> {
         TaskRunner::record_revision(self, spec_id, task_id, revision, text)
+    }
+
+    fn record_split(
+        &self,
+        spec_id: &str,
+        task_id: &str,
+        split: &crate::agents::recovery_plan::TaskSplit,
+        text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        TaskRunner::record_split(self, spec_id, task_id, split, text)
+    }
+
+    fn record_adjust(
+        &self,
+        spec_id: &str,
+        task_id: &str,
+        adjustment: &crate::agents::recovery_plan::CriteriaAdjustment,
+        text: &str,
+    ) -> Result<(usize, String), RunnerError> {
+        TaskRunner::record_adjust(self, spec_id, task_id, adjustment, text)
     }
 }
 
@@ -349,6 +393,21 @@ impl RunnerFactory for ConfiguredRunnerFactory {
             BusActivitySink::new(job.events.clone(), job.project_id.clone(), Arc::clone(&job.secrets))
                 .with_trail(job.root.clone(), &job.spec_id),
         );
+        // Spec 124 T02: o Arquiteto julga as contestações do Desenvolvedor antes da próxima revisão.
+        let arbiter: Option<Arc<dyn crate::agents::runner::ArbiterPort>> = job.architect.as_ref().map(|a| {
+            Arc::new(super::arbiter::ArchitectArbiter {
+                backend: Arc::clone(&a.backend),
+                model: a.model.clone(),
+                effort: Some(a.effort),
+                policy: job.policy.clone(),
+                approver: approver.clone(),
+                activity: activity.clone(),
+                usage: Some(usage.clone()),
+                secrets: Arc::clone(&job.secrets),
+                lang: job.lang.clone(),
+                stop: Some(job.stop.clone()),
+            }) as Arc<dyn crate::agents::runner::ArbiterPort>
+        });
         // Modo docker (único): testes, checks e run_command no Compose `-test`.
         let compose = job.compose.clone();
         let baselines: crate::agents::runner::SharedBaselines = Default::default();
@@ -469,6 +528,10 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         .with_lang(job.lang);
         let runner = match compose {
             Some(c) => runner.with_compose(c),
+            None => runner,
+        };
+        let runner = match arbiter {
+            Some(a) => runner.with_arbiter(a),
             None => runner,
         };
         Ok(Box::new(runner))
@@ -1089,6 +1152,20 @@ async fn launch(
         };
         (adopt, spec_checks, spec_formatters)
     };
+    // Spec 124 T05: níveis de teste e instalação propostos pela spec, com a mesma regra do docker.
+    let spec_levels = {
+        let fm = &inspected.spec.frontmatter;
+        let docker_err = |_: &str| conflict_reason("test_command_docker", REASON_TEST_COMMAND);
+        let full = match fm.full_test_command.as_deref() {
+            Some(c) => Some(crate::sdd::docker_command::normalize(c).map_err(docker_err)?),
+            None => None,
+        };
+        let install = match fm.install_command.as_deref() {
+            Some(c) => Some(crate::sdd::docker_command::normalize(c).map_err(docker_err)?),
+            None => None,
+        };
+        SpecTestLevels::new(full, install, fm.lockfiles.clone())
+    };
     let spec_failure_artifacts = inspected.spec.frontmatter.failure_artifacts.clone();
     let spec_screenshots = inspected.spec.frontmatter.screenshots.clone();
     let spec_references = inspected.spec.frontmatter.references.clone();
@@ -1203,6 +1280,15 @@ async fn launch(
         Some(globs) if globs != settings.screenshots && !preflight.settings_tracked => {
             let adopt_root = root.clone();
             blocking(move || adopt_spec_screenshots(&adopt_root, &globs)).await?
+        }
+        _ => settings,
+    };
+    // (4b4b) níveis de teste e instalação da spec (spec 124 T05): o campo presente substitui o do
+    // settings; spec sem os campos não mexe.
+    let settings = match spec_levels {
+        Some(levels) if levels.changes(&settings) && !preflight.settings_tracked => {
+            let adopt_root = root.clone();
+            blocking(move || adopt_spec_test_levels(&adopt_root, &levels)).await?
         }
         _ => settings,
     };
@@ -2201,6 +2287,56 @@ fn adopt_spec_formatters(root: &Path, formatters: &[crate::sdd::Formatter]) -> R
         return Ok(settings);
     }
     settings.formatters = valid;
+    let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
+    Ok(settings)
+}
+
+/// Níveis de teste e instalação propostos pela spec (spec 124 T05): cada campo presente substitui o
+/// do settings; ausente não mexe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpecTestLevels {
+    full_test_command: Option<String>,
+    install_command: Option<String>,
+    lockfiles: Option<Vec<String>>,
+}
+
+impl SpecTestLevels {
+    /// `None` quando a spec não traz nenhum dos campos.
+    fn new(full_test_command: Option<String>, install_command: Option<String>, lockfiles: Option<Vec<String>>) -> Option<Self> {
+        let levels = Self { full_test_command, install_command, lockfiles };
+        (levels.full_test_command.is_some() || levels.install_command.is_some() || levels.lockfiles.is_some()).then_some(levels)
+    }
+
+    fn apply(&self, settings: &mut Settings) {
+        if let Some(full) = &self.full_test_command {
+            settings.full_test_command = crate::sdd::valid_optional_command(Some(full));
+        }
+        if let Some(install) = &self.install_command {
+            settings.install_command = crate::sdd::valid_optional_command(Some(install));
+        }
+        if let Some(locks) = &self.lockfiles {
+            settings.lockfiles = crate::sdd::validate_lockfiles(locks);
+        }
+    }
+
+    /// Aplicar muda o settings?
+    fn changes(&self, settings: &Settings) -> bool {
+        let mut next = settings.clone();
+        self.apply(&mut next);
+        next != *settings
+    }
+}
+
+/// Grava os níveis de teste e a instalação da spec em `settings.yaml` (spec 124 T05), sob o
+/// `PERSIST_LOCK`. Devolve as configurações resultantes.
+fn adopt_spec_test_levels(root: &Path, levels: &SpecTestLevels) -> Result<Settings, Rejection> {
+    let _persist = PERSIST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut settings = read_settings_checked(root)?;
+    if !levels.changes(&settings) {
+        return Ok(settings);
+    }
+    levels.apply(&mut settings);
     let rendered = settings.render().map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     replace_atomic(root, SETTINGS_REL, rendered.as_bytes()).map_err(|_| internal(SETTINGS_SAVE_CODE))?;
     Ok(settings)
@@ -3246,6 +3382,19 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    impl FakeRunner {
+        /// Runner real (novo a cada chamada), com os eventos no barramento: o Quadro os recebe.
+        fn real(&self) -> TaskRunner {
+            TaskRunner::new(
+                self.root.clone(),
+                Box::new(NoDev),
+                Box::new(NoRev),
+                Box::new(ShellTestExecutor::new()),
+                Box::new(self.sink.clone()),
+            )
+        }
+    }
+
     impl SpecRunner for FakeRunner {
         fn record_diagnosis(&self, spec_id: &str, task_id: &str, text: &str) -> Result<usize, RunnerError> {
             TaskRunner::new(
@@ -3285,6 +3434,26 @@ mod tests {
                 Box::new(crate::agents::runner::NullSink),
             )
             .record_revision(spec_id, task_id, revision, text)
+        }
+
+        fn record_split(
+            &self,
+            spec_id: &str,
+            task_id: &str,
+            split: &crate::agents::recovery_plan::TaskSplit,
+            text: &str,
+        ) -> Result<(usize, String), RunnerError> {
+            self.real().record_split(spec_id, task_id, split, text)
+        }
+
+        fn record_adjust(
+            &self,
+            spec_id: &str,
+            task_id: &str,
+            adjustment: &crate::agents::recovery_plan::CriteriaAdjustment,
+            text: &str,
+        ) -> Result<(usize, String), RunnerError> {
+            self.real().record_adjust(spec_id, task_id, adjustment, text)
         }
 
         fn run<'a>(&'a self, _spec_id: &'a str) -> Fut<'a, Result<SpecOutcome, RunnerError>> {
@@ -4531,6 +4700,31 @@ mod tests {
         let s = adopt_spec_formatters(&root, &[fmt("Nome Ruim", "x")]).expect("inválida");
         assert_eq!(s.formatters, second);
         assert_eq!(settings_file(&root).formatters, second);
+    }
+
+    /// Spec 124 T05: os níveis de teste e a instalação da spec entram no settings; o campo ausente
+    /// não mexe, e a spec sem nenhum deles deixa tudo como antes.
+    #[test]
+    fn adopt_spec_test_levels_sets_only_the_fields_present() {
+        let root = setup("levels-adopt", false);
+        fs::write(root.join(".sdd/settings.yaml"), SETTINGS_EMPTY_TC).expect("settings");
+        assert!(SpecTestLevels::new(None, None, None).is_none(), "sem os campos, nada muda");
+        let levels = SpecTestLevels::new(
+            Some("make full".into()),
+            Some("make deps".into()),
+            Some(vec!["deps.lock".into(), "../fora".into()]),
+        )
+        .expect("níveis");
+        let s = adopt_spec_test_levels(&root, &levels).expect("adoção");
+        assert_eq!(s.full_test_command.as_deref(), Some("make full"));
+        assert_eq!(s.install_command.as_deref(), Some("make deps"));
+        assert_eq!(s.lockfiles, vec!["deps.lock".to_string()]);
+        assert_eq!(settings_file(&root), s);
+        let only_full = SpecTestLevels::new(Some("make all".into()), None, None).expect("um campo");
+        let s = adopt_spec_test_levels(&root, &only_full).expect("substitui");
+        assert_eq!(s.full_test_command.as_deref(), Some("make all"));
+        assert_eq!(s.install_command.as_deref(), Some("make deps"), "ausente não mexe");
+        assert!(!only_full.changes(&s));
     }
 
     #[test]
@@ -6057,6 +6251,138 @@ mod tests {
         assert!(task.body.contains("## Análise de recuperação #1"));
         assert!(task.body.contains("Decisão: escalar ao humano"));
         assert!(task.body.contains("Proposta: SPLIT: dividir em duas tarefas"));
+    }
+
+    // ----- Recuperação com SPLIT, ADJUST e ASK (spec 124 T03), com o Arquiteto falso -----
+
+    /// Tarefas da spec no Quadro (`GET /state`): `(id, status, depends_on)`.
+    async fn board(state: &AppState) -> Vec<(String, String, Vec<String>)> {
+        let (code, body) = call(state, request(Method::GET, &format!("/api/projects/{PROJECT}/state"), "", None)).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let view = json_of(&body);
+        let spec = view["specs"].as_array().and_then(|s| s.iter().find(|s| s["id"] == SPEC)).cloned().unwrap_or(Value::Null);
+        spec["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .map(|t| {
+                        let deps = t["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                        (t["id"].as_str().unwrap_or_default().to_string(), t["status"].as_str().unwrap_or_default().to_string(), deps)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn read_task_file(root: &Path, id: &str) -> Task {
+        Task::parse(&fs::read_to_string(root.join(".sdd/specs").join(SPEC).join(format!("tasks/{id}.md"))).expect("tarefa")).expect("parse")
+    }
+
+    fn architect_text(events: &[ApiEvent]) -> String {
+        payloads(events, "agent_message")
+            .iter()
+            .filter(|p| p["agent"] == "architect")
+            .filter_map(|p| p["text"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// SPLIT: as tarefas novas vão para o `.sdd` e o Quadro, a T02 passa a depender delas, a T01 fica
+    /// menor (mesma branch) e a execução segue no mesmo run. O Arquiteto recebeu os sinais.
+    #[tokio::test]
+    async fn recovery_split_writes_new_tasks_updates_the_board_and_continues() {
+        use crate::agents::architect::testing::text;
+        let root = setup("rec-split", true);
+        fs::write(root.join(".sdd/specs").join(SPEC).join("tasks/T02.md"), task_md("T02", "T01", "TODO")).expect("T02");
+        let split = r#"{"decision":"SPLIT","root_cause":"a T01 mistura servidor e provas de ponta a ponta","strategy":"manter na branch a validação; as provas saem para a T03","objective":"Validação no servidor","acceptance":"- validação coberta por testes de unidade","new_tasks":[{"title":"Provas de ponta a ponta","objective":"Dois clientes convergem","acceptance":"- dois clientes convergem","allowed_scope":["tests/**"]}]}"#;
+        let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(split)]);
+        let mut rx = state.events().subscribe();
+        let events = run_until(&state, "integrated").await;
+        assert_eq!(
+            payloads(&events, "recovery_decided"),
+            vec![json!({"spec_id": SPEC, "task_id": "T01", "cycle": 1, "decision": "SPLIT"})]
+        );
+        let t01 = read_t01(&root);
+        assert_eq!(t01.frontmatter.status, TaskStatus::Todo);
+        assert_eq!(t01.frontmatter.branch, format!("sdd/{SPEC}/T01"), "o trabalho da branch é aproveitado");
+        assert!(t01.body.contains("- validação coberta por testes de unidade"), "{}", t01.body);
+        assert!(t01.body.contains("- Tarefas novas: T03 (Provas de ponta a ponta)"), "{}", t01.body);
+        let t03 = read_task_file(&root, "T03");
+        assert_eq!((t03.frontmatter.status, t03.frontmatter.depends_on.clone()), (TaskStatus::Todo, vec!["T01".to_string()]));
+        assert_eq!(t03.frontmatter.allowed_scope, vec!["tests/**"]);
+        assert_eq!(read_task_file(&root, "T02").frontmatter.depends_on, vec!["T01", "T03"]);
+        // O Quadro: a tarefa nova aparece com a dependência, e os eventos chegam ao barramento.
+        let tasks = board(&state).await;
+        assert!(tasks.contains(&("T03".into(), "TODO".into(), vec!["T01".into()])), "{tasks:?}");
+        assert!(tasks.contains(&("T02".into(), "TODO".into(), vec!["T01".into(), "T03".into()])), "{tasks:?}");
+        let updated: Vec<Value> = payloads(&events, "task_updated").into_iter().chain(payloads(&drain(&mut rx), "task_updated")).collect();
+        assert!(updated.iter().any(|p| p["task_id"] == "T03" && p["status"] == "TODO"), "{updated:?}");
+        assert!(architect_text(&events).contains("Análise de recuperação #1 (SPLIT)"), "{}", architect_text(&events));
+        assert!(architect_text(&events).contains("Tarefas novas: T03"));
+        let facts = backend.requests()[0].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+        assert!(facts.contains("## Sinais para a decisão") && facts.contains("Critérios de aceitação: 1"), "{facts}");
+    }
+
+    /// ADJUST: critérios ao que o ambiente prova, o apontamento vira verificação manual pelo caminho
+    /// da arbitragem, a decisão fica no spec.md e a execução segue.
+    #[tokio::test]
+    async fn recovery_adjust_records_the_decision_on_the_spec_and_continues() {
+        use crate::agents::architect::testing::text;
+        let root = setup("rec-adjust", true);
+        let adjust = r#"{"decision":"ADJUST","root_cause":"o Docker não tem GPU","strategy":"provar a renderização por software","acceptance":"- renderização por software verificada no Docker","findings":[{"id":"F-01","decision":"manual","reason":"sem GPU no Docker"}]}"#;
+        let (state, _backend) = recovery_state(&root, Script::RecoverFixes, vec![text(adjust)]);
+        let events = run_until(&state, "integrated").await;
+        assert_eq!(payloads(&events, "recovery_decided")[0]["decision"], "ADJUST");
+        let t01 = read_t01(&root);
+        assert_eq!(t01.frontmatter.status, TaskStatus::Todo);
+        let acceptance = crate::agents::runner::section_text(&t01.body, crate::agents::runner::ACCEPTANCE).unwrap_or_default();
+        assert_eq!(acceptance.trim(), "- renderização por software verificada no Docker\n- (manual) F-01: falta validar a entrada (sem GPU no Docker)");
+        assert!(t01.body.contains("- Apontamentos dispensados: F-01 [manual]"), "{}", t01.body);
+        let spec = fs::read_to_string(root.join(".sdd/specs").join(SPEC).join("spec.md")).expect("spec");
+        assert!(spec.contains("## Decisões de Arbitragem"), "{spec}");
+        assert!(spec.contains("Recuperação #1, T01: critérios ajustados ao que o ambiente prova. Motivo: o Docker não tem GPU"), "{spec}");
+        assert!(spec.contains("T01 F-01 (verificação manual)"), "{spec}");
+    }
+
+    /// ADJUST cujos critérios não cabem: nada é dispensado e a tarefa segue com a estratégia (RETRY).
+    #[tokio::test]
+    async fn recovery_adjust_that_cannot_be_written_goes_on_as_retry() {
+        use crate::agents::architect::testing::text;
+        let root = setup("rec-adjust-bad", true);
+        let big = "a".repeat(crate::agents::runner::MAX_REVISION_BYTES - 5);
+        let adjust = format!(r#"{{"decision":"ADJUST","root_cause":"c","strategy":"seguir","acceptance":"{big}","findings":[{{"id":"F-01","decision":"manual","reason":"m"}}]}}"#);
+        let (state, _backend) = recovery_state(&root, Script::RecoverFixes, vec![text(&adjust)]);
+        let events = run_until(&state, "integrated").await;
+        assert_eq!(payloads(&events, "recovery_decided")[0]["decision"], "RETRY");
+        let t01 = read_t01(&root);
+        assert_eq!(t01.frontmatter.status, TaskStatus::Todo);
+        assert!(t01.body.contains(crate::agents::recovery_plan::ADJUST_REFUSED_LINE), "{}", t01.body);
+        assert!(t01.body.contains("falta validar a entrada"), "o apontamento não foi dispensado");
+        assert!(!fs::read_to_string(root.join(".sdd/specs").join(SPEC).join("spec.md")).expect("spec").contains("Decisões de Arbitragem"));
+    }
+
+    /// ASK: a execução pausa com a pergunta no cartão (seção, mensagem, evento e opções no Quadro).
+    #[tokio::test]
+    async fn recovery_ask_pauses_with_the_question_card() {
+        use crate::agents::architect::testing::text;
+        let root = setup("rec-ask", true);
+        let ask = r#"{"decision":"ASK","root_cause":"o critério de capturas em 1920x1080 conflita com o tempo da bateria","question":"As capturas em 1920x1080 podem ficar como verificação manual?","options":[{"id":"manual","label":"Sim, manual","kind":"guidance","text":"capturas em 1920x1080 viram verificação manual"}]}"#;
+        let (state, _backend) = recovery_state(&root, Script::RecoverFixes, vec![text(ask)]);
+        let events = run_until(&state, "blocked").await;
+        let decided = payloads(&events, "recovery_decided");
+        assert_eq!(decided.len(), 1);
+        assert_eq!(decided[0]["decision"], "ASK");
+        assert_eq!(decided[0]["options"][0]["id"], "manual");
+        let t01 = read_t01(&root);
+        assert_eq!(t01.frontmatter.status, TaskStatus::Blocked);
+        assert!(t01.body.contains("- Decisão: pergunta ao humano (ASK)"), "{}", t01.body);
+        assert!(t01.body.contains("- Pergunta ao humano: As capturas em 1920x1080 podem ficar como verificação manual?"));
+        assert!(t01.body.contains("- Contexto:"), "o cartão traz o contexto");
+        let message = architect_text(&events);
+        assert!(message.contains("Análise de recuperação #1 (ASK)") && message.contains("Pergunta ao humano: As capturas"), "{message}");
+        let (_, body) = call(&state, request(Method::GET, &format!("/api/projects/{PROJECT}/state"), "", None)).await;
+        assert!(body.contains("\"recovery_options\"") && body.contains("Sim, manual"), "{body}");
     }
 
     #[tokio::test]

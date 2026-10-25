@@ -425,6 +425,9 @@ async fn live_activity_endpoint_masks_secrets_404s_and_is_cleared_on_remove() {
         text: text.map(String::from),
         code: None,
         received_bytes: None,
+        output_bytes: None,
+        last_line: None,
+        command_limit_ms: None,
         structured: None,
     };
     sink.emit(ev(ActivityKind::Start, None));

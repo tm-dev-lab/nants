@@ -87,6 +87,72 @@ describe("chamada ao modelo em curso (spec 114 T04)", () => {
   });
 });
 
+describe("comando e testes em curso: sinal de vida real (spec 123 T01)", () => {
+  const NOW = 10_000_000;
+  it("comando do agente: há quanto tempo, quanto saiu e a última linha", () => {
+    const live = liveActionOf(entry({ command: "npx playwright test", commandStartedAt: NOW - 185_000, commandBytes: 14_336, commandLine: "  ok 12 cena.spec.ts:40 desenha o voxel (2.1s)" }), NOW);
+    expect(live).toMatchObject({
+      kind: "command",
+      state: "executando",
+      detail: "npx playwright test",
+      progress: "há 3 min · 14 KB de saída",
+      output: "ok 12 cena.spec.ts:40 desenha o voxel (2.1s)",
+    });
+  });
+
+  it("rodada de testes do runner: o mesmo sinal; antes da saída, só o tempo", () => {
+    const live = liveActionOf(entry({ agent: "tests", command: "npm test", commandStartedAt: NOW - 420_000 }), NOW);
+    expect(live).toMatchObject({ kind: "tests", state: "rodando os testes", progress: "há 7 min", output: null });
+    const fed = liveActionOf(entry({ agent: "tests", command: "npm test", commandStartedAt: NOW - 420_000, commandBytes: 900, commandLine: "Tests: 41 passed" }), NOW);
+    expect(fed).toMatchObject({ progress: "há 7 min · 900 B de saída", output: "Tests: 41 passed" });
+  });
+
+  it("fora do comando nada muda; em inglês", () => {
+    expect(liveActionOf(entry({ reasoning: "x" }), NOW)).toMatchObject({ progress: null, output: null });
+    setLanguage("en", { persist: false });
+    try {
+      const live = liveActionOf(entry({ command: "cargo test", commandStartedAt: NOW - 45_000, commandBytes: 2_048, commandLine: "test a::b ... ok" }), NOW);
+      expect(live).toMatchObject({ state: "running", progress: "for 45 s · 2 KB of output", output: "test a::b ... ok" });
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
+  });
+});
+
+describe("rodada de testes com o limite do servidor (spec 123 T02)", () => {
+  const NOW = 10_000_000;
+  const tests = (elapsed: number, limit: number | undefined) =>
+    liveActionOf(entry({ agent: "tests", command: "npm test", commandStartedAt: NOW - elapsed, commandLine: "ok 30 cena", ...(limit !== undefined ? { commandLimitMs: limit } : {}) }), NOW);
+
+  it("'rodando os testes há 7 min (limite de 10 min)', com a última linha; sem aviso longe do limite", () => {
+    expect(tests(420_000, 600_000)).toMatchObject({ state: "rodando os testes", progress: "há 7 min (limite de 10 min)", output: "ok 30 cena", warning: null });
+  });
+
+  it("a partir de 80% do limite, o aviso discreto; o limite é o que veio, não um fixo", () => {
+    expect(tests(479_000, 600_000).warning).toBeNull();
+    expect(tests(480_000, 600_000)).toMatchObject({ progress: "há 8 min (limite de 10 min)", warning: "perto do limite de tempo" });
+    expect(tests(100_000, 120_000)).toMatchObject({ progress: "há 1 min (limite de 2 min)", warning: "perto do limite de tempo" });
+    // Sem limite conhecido: só o tempo, nunca o aviso.
+    expect(tests(3_000_000, undefined)).toMatchObject({ progress: "há 50 min", warning: null });
+  });
+
+  it("comando do agente com o limite do servidor (5 min): o mesmo tempo contra o limite e o aviso", () => {
+    const cmd = (elapsed: number) =>
+      liveActionOf(entry({ command: "npx playwright test", commandStartedAt: NOW - elapsed, commandLimitMs: 300_000, commandLine: "ok 3 cena" }), NOW);
+    expect(cmd(130_000)).toMatchObject({ kind: "command", state: "executando", progress: "há 2 min (limite de 5 min)", warning: null });
+    expect(cmd(250_000)).toMatchObject({ progress: "há 4 min (limite de 5 min)", warning: "perto do limite de tempo" });
+  });
+
+  it("em inglês", () => {
+    setLanguage("en", { persist: false });
+    try {
+      expect(tests(540_000, 600_000)).toMatchObject({ state: "running the tests", progress: "for 9 min (limit 10 min)", warning: "close to the time limit" });
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
+  });
+});
+
 describe("histórico de informativos", () => {
   const msg = (extra: Partial<ChatMessage>): ChatMessage => ({ id: 1, role: "agent", agent: "reviewer", text: "", at: 1000, specId: "s1", ...extra }) as ChatMessage;
   const line = (path: string, task: string, at: string, extra: Record<string, unknown> = {}): string =>

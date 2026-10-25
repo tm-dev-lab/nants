@@ -6,6 +6,7 @@
 pub mod advisor;
 pub mod app;
 pub mod approvals;
+pub mod arbiter;
 pub mod architecture;
 pub mod attention;
 pub mod browser_open;
@@ -13,6 +14,7 @@ pub mod captures;
 pub mod survey;
 pub mod tools_trail;
 pub mod chat;
+pub mod cost_alert;
 pub mod chatgpt;
 pub mod chat_attachments;
 pub mod choices;

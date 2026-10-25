@@ -46,7 +46,7 @@ const ACTIVITY_CODES = [
   "tool.view_screenshot", "tool.images_refused", "tool.generate_image", "tool.image_failed", "tool.other",
   "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry",
 ];
-const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed"];
+const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable"];
 
 describe("códigos novos do servidor (spec 102 T06)", () => {
   it("cada code tem texto nos dois idiomas, e o en não tem português", () => {

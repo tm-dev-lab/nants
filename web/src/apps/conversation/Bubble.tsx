@@ -18,7 +18,15 @@ import type { ChatMessage } from "../../store";
 import { AgentAvatar } from "../shared/AgentAvatar";
 import { CaptureThumbnails } from "../shared/CaptureThumbnails";
 import { MarkdownText } from "../shared/ReportMarkdown";
-import { ReviewerChecklist, ReviewFindingList, ReviewPrefix, ReviewVerdictBadge } from "../shared/ReviewMessage";
+import {
+  ReviewDecisionList,
+  ReviewerChecklist,
+  ReviewFindingList,
+  ReviewPrefix,
+  ReviewResponseList,
+  ReviewStateSummary,
+  ReviewVerdictBadge,
+} from "../shared/ReviewMessage";
 import { YoloBadge } from "../shared/YoloBadge";
 import { ChatImageThumbs } from "./ChatAttachments";
 import { ChatCard, ChatCardHead } from "./ChatCard";
@@ -179,9 +187,13 @@ function BubbleView({ message, grouped, projectId, activeSpecId, onResend, resen
       <div className="nd-chat-card-body nd-bubble">
         {checklist !== null && checklist.prefix !== "" ? <ReviewPrefix prefix={checklist.prefix} /> : null}
         {checklist !== null && checklist.verdict !== null ? <ReviewVerdictBadge verdict={checklist.verdict} /> : null}
+        {checklist !== null ? <ReviewStateSummary review={checklist} /> : null}
         <MarkdownText text={checklist?.summary ?? parsed.text} keepLineBreaks={message.role === "agent"} />
         {checklist !== null ? <ReviewFindingList findings={checklist.findings} kind="blocking" /> : null}
         {checklist !== null ? <ReviewFindingList findings={checklist.observations} kind="observation" /> : null}
+        {checklist !== null ? <ReviewFindingList findings={checklist.resolved} kind="resolved" /> : null}
+        {checklist !== null ? <ReviewResponseList responses={checklist.responses} /> : null}
+        {checklist !== null ? <ReviewDecisionList decisions={checklist.decisions} /> : null}
         {checklist !== null && checklist.captures.length > 0 && captureSpec !== null ? (
           <CaptureThumbnails projectId={projectId} specId={captureSpec} names={checklist.captures} />
         ) : null}

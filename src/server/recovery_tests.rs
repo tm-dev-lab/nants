@@ -102,6 +102,7 @@ fn section_body_flattens_headers_and_redacts() {
         discarded: Vec::new(),
         migrate: None,
         scope_add: Vec::new(),
+        change: None,
     };
     let body = section_body(&secrets, &decision);
     assert!(!body.contains("sk-SEGREDO"));
@@ -1190,4 +1191,154 @@ fn apply_choice_writes_entries_in_the_project_language() {
     assert!(body.contains("I chose the option \"rótulo rev\": the task definition was revised."), "{body}");
     // Em pt-BR, o texto de sempre.
     assert_eq!(crate::i18n::tr(Lang::PtBr, "recovery.choice.option", &[("label", "a"), ("text", "b")]), "Escolhi a opção «a»: b");
+}
+
+const SPLIT_OK: &str = r#"{"decision":"SPLIT","root_cause":"tarefa grande","strategy":"manter o servidor","objective":"Edições no servidor","acceptance":"- validação no servidor","new_tasks":[{"title":"Provas de ponta a ponta","objective":"Dois clientes","acceptance":"- convergem","allowed_scope":["tests/e2e/**"]}],"scope_add":["docs/x.md"]}"#;
+const ADJUST_OK: &str = r#"{"decision":"ADJUST","root_cause":"sem GPU","strategy":"provar por software","acceptance":"- render por software","findings":[{"id":"F-03","decision":"manual","reason":"sem GPU no Docker"}]}"#;
+const ASK_OK: &str = r#"{"decision":"ASK","root_cause":"falta decidir","question":"A T05 pode ficar sem as capturas em 1920x1080?","options":[{"id":"sim","label":"Pode","kind":"guidance","text":"siga sem"}]}"#;
+
+/// Spec 124 T03: SPLIT, ADJUST e ASK com os campos de cada uma; campo de outra decisão é recusado.
+#[test]
+fn parse_split_adjust_and_ask() {
+    let split = parse_decision(SPLIT_OK).expect("split");
+    assert!(split.retry && split.revise.is_none());
+    let Some(Change::Split(s)) = &split.change else { panic!("split: {split:?}") };
+    assert_eq!(s.current.objective, "Edições no servidor");
+    assert_eq!(s.new_tasks[0].allowed_scope, vec!["tests/e2e/**"]);
+    assert_eq!(split.scope_add, vec!["docs/x.md"]);
+    let adjust = parse_decision(ADJUST_OK).expect("adjust");
+    let Some(Change::Adjust(a)) = &adjust.change else { panic!("adjust") };
+    assert!(adjust.retry);
+    assert_eq!(a.findings, vec![("F-03".to_string(), ArbitrationDecision::Manual, "sem GPU no Docker".to_string())]);
+    assert_eq!(a.reason, "sem GPU");
+    let ask = parse_decision(ASK_OK).expect("ask");
+    assert!(!ask.retry && is_escalate(&ask));
+    assert_eq!(ask.change, Some(Change::Ask("A T05 pode ficar sem as capturas em 1920x1080?".into())));
+    assert_eq!(ask.options.len(), 1);
+    let cases = [
+        // SPLIT sem tarefas novas, sem escopo na nova, sem estratégia, com critério forjado ou campo extra.
+        r#"{"decision":"SPLIT","root_cause":"c","strategy":"s","objective":"o","acceptance":"a","new_tasks":[]}"#,
+        r#"{"decision":"SPLIT","root_cause":"c","strategy":"s","objective":"o","acceptance":"a","new_tasks":[{"title":"t","objective":"o","acceptance":"a"}]}"#,
+        r#"{"decision":"SPLIT","root_cause":"c","objective":"o","acceptance":"a","new_tasks":[{"title":"t","objective":"o","acceptance":"a","allowed_scope":["x"]}]}"#,
+        r###"{"decision":"SPLIT","root_cause":"c","strategy":"s","objective":"o","acceptance":"a","new_tasks":[{"title":"t","objective":"o","acceptance":"## x","allowed_scope":["x"]}]}"###,
+        r#"{"decision":"SPLIT","root_cause":"c","strategy":"s","objective":"o","acceptance":"a","new_tasks":[{"title":"t","objective":"o","acceptance":"a","allowed_scope":["x"],"depends_on":["T01"]}]}"#,
+        // ADJUST sem critérios, com keep, com objetivo ou sem estratégia.
+        r#"{"decision":"ADJUST","root_cause":"c","strategy":"s"}"#,
+        r#"{"decision":"ADJUST","root_cause":"c","strategy":"s","acceptance":"a","findings":[{"id":"F-01","decision":"keep"}]}"#,
+        r#"{"decision":"ADJUST","root_cause":"c","strategy":"s","acceptance":"a","objective":"o"}"#,
+        r#"{"decision":"ADJUST","root_cause":"c","acceptance":"a"}"#,
+        // ASK sem pergunta; campos de uma decisão em outra.
+        r#"{"decision":"ASK","root_cause":"c"}"#,
+        r#"{"decision":"RETRY","root_cause":"c","strategy":"s","question":"q"}"#,
+        r#"{"decision":"RETRY","root_cause":"c","strategy":"s","findings":[]}"#,
+        r#"{"decision":"REVISE_TASK","root_cause":"c","strategy":"s","objective":"o","acceptance":"a","new_tasks":[]}"#,
+    ];
+    for case in cases {
+        assert!(parse_decision(case).is_none(), "deveria recusar: {case}");
+    }
+}
+
+#[test]
+fn section_body_for_split_adjust_and_ask() {
+    let secrets = SecretSet::default();
+    let split = section_body(&secrets, &parse_decision(SPLIT_OK).expect("split"));
+    assert!(split.contains(plan::SPLIT_DECISION_LINE) && split.contains("- Estratégia: manter o servidor"), "{split}");
+    assert!(split.contains("- Escopo ampliado: docs/x.md"), "{split}");
+    let adjust = section_body(&secrets, &parse_decision(ADJUST_OK).expect("adjust"));
+    assert!(adjust.contains(plan::ADJUST_DECISION_LINE) && adjust.contains("- Estratégia: provar por software"), "{adjust}");
+    let ask = section_body(&secrets, &parse_decision(ASK_OK).expect("ask"));
+    assert!(ask.contains(plan::ASK_DECISION_LINE), "{ask}");
+    assert!(ask.contains("- Pergunta ao humano: A T05 pode ficar sem as capturas em 1920x1080?"), "{ask}");
+    assert!(ask.contains("- Opções para o humano:") && ask.contains(OPTIONS_OPEN), "{ask}");
+}
+
+/// Falha de ambiente: SPLIT e ADJUST reescrevem a tarefa e, como o REVISE_TASK, escalam.
+#[test]
+fn environmental_failure_refuses_split_and_adjust() {
+    for json in [SPLIT_OK, ADJUST_OK] {
+        let d = restrict_environmental(true, parse_decision(json).expect("decisão"));
+        assert_eq!(d.root_cause, CAUSE_ENV_REVISE);
+        assert!(!d.retry);
+    }
+    assert!(restrict_environmental(false, parse_decision(SPLIT_OK).expect("split")).retry);
+}
+
+/// Em autonomia, um ASK vira RETRY com a pergunta na estratégia (premissa registrada).
+#[test]
+fn yolo_turns_ask_into_a_premise_retry() {
+    let d = premise_retry(Lang::PtBr, parse_decision(ASK_OK).expect("ask"));
+    assert!(d.retry && d.change.is_none());
+    assert!(d.strategy.as_deref().is_some_and(|s| s.contains("capturas em 1920x1080")), "{:?}", d.strategy);
+}
+
+
+/// Spec 124 T04: os FATOS da recuperação trazem as capacidades do ambiente com a regra do
+/// Arquiteto, o aviso de orçamento de tempo e as rodadas instáveis da tarefa.
+#[test]
+fn facts_carry_capabilities_budget_warning_and_flaky_rounds() {
+    use crate::sdd::capabilities::{self, Capabilities, Probe, SuiteRun};
+    use std::time::Duration;
+    let root = choice_root("facts-caps", "BLOCKED", "");
+    let without = load(&root, "s1", "T01", &SecretSet::default()).expect("load");
+    assert!(!without.facts.contains(capabilities::SECTION_TITLE), "sem medida, sem seção");
+    let mut caps = Capabilities::default();
+    caps.apply_probe("docker", "h", Probe { gpu: Some(false), display: Some(false), cpus: Some(2), memory_mb: Some(4000) }, "t".into());
+    caps.push_run(SuiteRun::measured(Duration::from_secs(560), Some(Duration::from_secs(600)), false, false, "t".into()));
+    capabilities::write(&root, &caps).expect("estado");
+    let path = root.join(".sdd/specs/s1/tasks/T01.md");
+    let mut task = Task::parse(&std::fs::read_to_string(&path).expect("T01")).expect("parse");
+    task.body.push_str(&format!("\n## {}\n- Tentativa 1: a rodada falhou e passou na repetição. Falhas: ✘ dois clientes\n", crate::agents::runner::FLAKY_SECTION));
+    std::fs::write(&path, task.render().expect("render")).expect("T01");
+    let facts = load(&root, "s1", "T01", &SecretSet::default()).expect("load").facts;
+    assert!(facts.contains("GPU ou dispositivo de vídeo: ausente") && facts.contains("candidato a ADJUST"), "{facts}");
+    assert!(facts.contains("usou 93% do limite de 600 s") && facts.contains("REVISE_CONFIG ou SPLIT"), "{facts}");
+    assert!(facts.contains("## Rodadas instáveis desta tarefa") && facts.contains("✘ dois clientes"), "{facts}");
+}
+
+/// Linha de `usage.jsonl` da spec `s1`.
+fn usage_line(task: &str, agent: &str, input: u64, output: u64) -> String {
+    format!(
+        "{{\"at\":\"2026-10-24T10:00:00Z\",\"project\":\"p\",\"spec\":\"s1\",\"task\":\"{task}\",\"agent\":\"{agent}\",\"model\":\"m\",\"input\":{input},\"output\":{output}}}\n"
+    )
+}
+
+/// Spec 124 T06 (observação da revisão da T03): o custo da tarefa soma por papel, na ordem em que
+/// os papéis aparecem, só os registros da própria tarefa; sem arquivo, vazio.
+#[test]
+fn task_cost_sums_by_role_only_for_the_task() {
+    let root = choice_root("task-cost", "BLOCKED", "");
+    assert!(task_cost(&root, "s1", "T01").is_empty(), "sem usage.jsonl");
+    let lines = [
+        usage_line("T01", "developer", 100, 10),
+        usage_line("T02", "developer", 9_000, 900),
+        usage_line("T01", "reviewer", 50, 5),
+        usage_line("T01", "developer", 200, 20),
+        "linha inválida\n".to_string(),
+    ];
+    std::fs::write(root.join(".sdd/specs/s1/usage.jsonl"), lines.concat()).expect("uso");
+    let cost = task_cost(&root, "s1", "T01");
+    assert_eq!(
+        cost,
+        vec![
+            plan::RoleCost { agent: "developer".into(), calls: 2, input: 300, output: 30 },
+            plan::RoleCost { agent: "reviewer".into(), calls: 1, input: 50, output: 5 },
+        ]
+    );
+    assert_eq!(super::super::cost_alert::Spend::of(&cost), super::super::cost_alert::Spend { tokens: 385, calls: 3 });
+}
+
+/// Spec 124 T06: acima do patamar, os FATOS da recuperação trazem o aviso de custo; abaixo, não.
+#[test]
+fn recovery_facts_carry_the_cost_alert_only_above_the_threshold() {
+    let root = choice_root("facts-cost", "BLOCKED", "");
+    std::fs::write(root.join(".sdd/specs/s1/usage.jsonl"), usage_line("T01", "developer", 1_000, 10)).expect("uso");
+    let quiet = load(&root, "s1", "T01", &SecretSet::default()).expect("fatos");
+    assert!(!quiet.facts.contains("Aviso de custo"), "{}", quiet.facts);
+    std::fs::write(root.join(".sdd/specs/s1/usage.jsonl"), usage_line("T01", "developer", 8_500_000, 10_000)).expect("uso");
+    let loud = load(&root, "s1", "T01", &SecretSet::default()).expect("fatos");
+    assert!(
+        loud.facts.contains("- Aviso de custo: a tarefa já usou 8510000 tokens em 1 chamada, patamar absoluto: 8000000 tokens ou 400 chamadas. É um sinal, não um limite"),
+        "{}",
+        loud.facts
+    );
 }

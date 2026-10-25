@@ -417,6 +417,31 @@ describe("Execução pausada: natureza do bloqueio e recuperação", () => {
     expect(pre?.querySelector("b")).toBeNull();
   });
 
+  // Spec 124 T03: o ASK pausa com a pergunta do Arquiteto em destaque e as opções clicáveis.
+  it("ASK mostra a pergunta do Arquiteto, as opções e a orientação livre", async () => {
+    await open(stateWith(pausedSpec()));
+    const ask = [
+      "Análise de recuperação #2 (ASK)",
+      "- Causa raiz: o critério das capturas conflita com o tempo da bateria",
+      "- Decisão: pergunta ao humano (ASK)",
+      "- Pergunta ao humano: As capturas em 1920x1080 podem ficar como verificação manual?",
+      "- Opções para o humano:",
+      "  - [guidance] manual: Sim, manual",
+      "- Contexto:",
+      "  - opções: escolha uma das opções propostas acima, escreva uma orientação própria ou use Retomar",
+    ].join("\n");
+    const options = [{ id: "manual", label: "Sim, manual", kind: "guidance", text: "capturas viram verificação manual" }];
+    applyEvent("agent_message", { agent: "architect", text: ask, task_id: "T01", spec_id: "s1", seq: 1 });
+    applyEvent("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 2, decision: "ASK", options, options_analysis: 2 });
+    applyEvent("project_status", { status: "blocked", task_id: "T01", reason: "r", kind: "quality" });
+    const article = card();
+    expect(within(article).getByText("Pergunta do Arquiteto")).toBeTruthy();
+    const question = article.querySelector("[data-recovery-question]");
+    expect(question?.textContent).toBe("As capturas em 1920x1080 podem ficar como verificação manual?");
+    expect(within(article).getByRole("button", { name: "Escolher: Sim, manual" })).toBeTruthy();
+    expect(findForbiddenGlyphs(article)).toEqual([]);
+  });
+
   it("quality com ESCALATE de outra spec mantém o cartão de retomada comum", async () => {
     await open(stateWith(pausedSpec()));
     applyEvent("recovery_decided", { spec_id: "s2", task_id: "T01", cycle: 1, decision: "ESCALATE" });

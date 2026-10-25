@@ -28,7 +28,7 @@ use super::report::wait_shutdown;
 use super::safe_fs;
 use super::spec_result::has_real_git_dir;
 use super::state::{AppState, ReserveError, REPORT_BUSY_CODE, SURVEY_RESERVATION};
-use crate::agents::arch_memory::{read_raw, ARCH_FILE};
+use crate::agents::arch_memory::{parse_heading, read_raw, ARCH_FILE, SECTION_COMMANDS, SECTION_OVERVIEW, SECTION_STACK};
 use crate::agents::architect::{truncate_bytes, ChatTurn, LlmArchitect, TurnRole};
 use crate::agents::chat::ChatBackend;
 use crate::config::Project;
@@ -41,7 +41,8 @@ const SURVEY_COMMIT_PREFIX: &str = "docs: ";
 const TEST_COMMAND_PREFIX: &str = "TEST_COMMAND:";
 const CHECK_PREFIX: &str = "CHECK:";
 const SETTINGS_REL: &str = ".sdd/settings.yaml";
-const SUMMARY_SECTIONS: [&str; 3] = ["## Visão geral", "## Stack", "## Comandos"];
+/// Seções do resumo (visão geral, stack e comandos), reconhecidas pelo título em pt ou en (spec 125).
+const SUMMARY_SECTIONS: [usize; 3] = [SECTION_OVERVIEW, SECTION_STACK, SECTION_COMMANDS];
 const SUMMARY_SECTION_BYTES: usize = 900;
 
 /// `GET /api/projects/:id/architecture`.
@@ -246,7 +247,8 @@ async fn survey(
     let apply_root = root.to_path_buf();
     let apply_secrets = Arc::clone(secrets);
     let md = markdown.to_string();
-    let outcome = tokio::task::spawn_blocking(move || apply_with_message(&apply_root, &msg, &md, &apply_secrets))
+    let lang = state.project_lang(project_id).get();
+    let outcome = tokio::task::spawn_blocking(move || apply_with_message(lang, &apply_root, &msg, &md, &apply_secrets))
         .await
         .map_err(|_| "interno")?
         .map_err(|s| s.0)?;
@@ -311,10 +313,11 @@ fn split_checks(answer: &str) -> (Vec<Check>, &str) {
 /// Resumo (visão geral, stack e comandos) extraído do arquivo.
 fn summarize(content: &str) -> String {
     let mut out = Vec::new();
-    for header in SUMMARY_SECTIONS {
-        let Some(start) = content.lines().position(|l| l.starts_with(header)) else {
+    for section in SUMMARY_SECTIONS {
+        let Some(start) = content.lines().position(|l| parse_heading(l).is_some_and(|(i, _)| i == section)) else {
             continue;
         };
+        let header = content.lines().nth(start).unwrap_or_default().trim_end();
         let body: Vec<&str> = content
             .lines()
             .skip(start + 1)
@@ -340,7 +343,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use crate::agents::arch_memory::ARCH_SECTIONS;
+    use crate::agents::arch_memory::section_headings;
     use crate::agents::architect::testing::{text, Scripted};
     use crate::config::{AgentConfig, Config, Connection, Effort, WireApi};
     use crate::server::events::ApiEvent;
@@ -403,7 +406,7 @@ mod tests {
 
     fn doc() -> String {
         let mut s = String::from("# P\n");
-        for sec in ARCH_SECTIONS {
+        for sec in section_headings(crate::i18n::Lang::PtBr) {
             s.push_str(&format!("\n{sec}\nconteúdo {sec}\n"));
         }
         s
@@ -564,6 +567,16 @@ mod tests {
         let s = summarize(doc);
         assert!(s.contains("App X") && s.contains("Rust") && s.contains("cargo test"));
         assert!(!s.contains("src\n"));
+    }
+
+    /// Spec 125: o resumo acha as seções pelo título em en também, e mostra o título do arquivo.
+    #[test]
+    fn summary_reads_english_headings() {
+        let doc = "# P\n\n## Overview\nApp X\n\n## Stack\nRust\n\n## Structure\nsrc\n\n## Commands (install, test, run)\ncargo test\n";
+        let s = summarize(doc);
+        assert!(s.contains("## Overview\nApp X") && s.contains("## Stack\nRust"), "{s}");
+        assert!(s.contains("## Commands (install, test, run)\ncargo test"), "{s}");
+        assert!(!s.contains("src"), "{s}");
     }
 
     #[test]

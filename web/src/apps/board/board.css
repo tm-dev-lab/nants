@@ -245,6 +245,16 @@
   border-radius: var(--r-sm);
 }
 
+/* Fase da tarefa durante os testes ou um comando longo (spec 123 T02); âmbar perto do limite. */
+.nd-board-phase {
+  font-size: var(--fs-caption);
+  color: var(--pill-cyan-ink);
+}
+
+.nd-board-phase[data-near-limit="true"] {
+  color: var(--pill-amber-ink);
+}
+
 .nd-board-reason {
   display: flex;
   flex-direction: column;
@@ -425,4 +435,9 @@
   min-width: 0;
   white-space: pre-wrap;
   color: var(--ink2);
+}
+
+/* Aviso de custo (spec 124 T06): discreto, na cor de atenção, dentro da linha de metadados. */
+.nd-board-cost-alert {
+  color: var(--pill-amber-ink);
 }

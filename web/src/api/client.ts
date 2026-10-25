@@ -641,6 +641,12 @@ export function getProjectActivity(projectId: string): Promise<ApiResult<Activit
         stage: typeof it.stage === "string" && it.stage !== "" ? it.stage : null,
         ...codedFields(it),
         ...(typeof it.structured === "string" && it.structured !== "" ? { structured: it.structured } : {}),
+        // Spec 123 T01: progresso real do comando em curso e os `params` da etapa.
+        ...(typeof it.output_bytes === "number" && Number.isSafeInteger(it.output_bytes) && it.output_bytes >= 0 ? { output_bytes: it.output_bytes } : {}),
+        ...(typeof it.last_line === "string" && it.last_line.trim() !== "" ? { last_line: it.last_line } : {}),
+        // Spec 123 T02: limite de tempo do comando em curso.
+        ...(typeof it.command_limit_ms === "number" && Number.isSafeInteger(it.command_limit_ms) && it.command_limit_ms > 0 ? { command_limit_ms: it.command_limit_ms } : {}),
+        ...(isMessageCode(it.stage_code) ? stageParams(it.stage_params) : {}),
         age_ms: age,
       });
     }
@@ -928,6 +934,12 @@ interface ToolActionsQuery {
 }
 
 /** `code`/`params` do instantâneo da atividade (spec 102): só os no formato fixo. */
+/** `params` válidos da etapa do instantâneo, quando há. */
+function stageParams(value: unknown): Pick<ActivitySnapshot, "stage_params"> {
+  const params = parseCodeParams(value);
+  return params === null || Object.keys(params).length === 0 ? {} : { stage_params: params };
+}
+
 function codedFields(it: Record<string, unknown>): Pick<ActivitySnapshot, "stage_code" | "tool_code" | "tool_params" | "text_code" | "text_params"> {
   const out: Pick<ActivitySnapshot, "stage_code" | "tool_code" | "tool_params" | "text_code" | "text_params"> = {};
   if (isMessageCode(it.stage_code)) out.stage_code = it.stage_code;

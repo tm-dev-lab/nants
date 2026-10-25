@@ -1,4 +1,5 @@
 /* Regras puras do Quadro (spec 093, T07). */
+import { parseReviewMessage } from "../../reviewMessage";
 import { describe, expect, it } from "vitest";
 import type { TaskStatus } from "../../api/types";
 import { forbiddenGlyphIn } from "../../desktop/glyphs";
@@ -134,6 +135,18 @@ describe("linha recolhida da última revisão (094/T05)", () => {
     expect(lastReviewLine("T02", "approved")).toBe("Última revisão · T02 · Aprovado");
     expect(lastReviewLine("T02", null)).toBe("Última revisão · T02");
     expect(forbiddenGlyphIn(lastReviewLine("T02", "changes"))).toBeNull();
+  });
+
+  it("spec 124 T01: resumo dos estados dos apontamentos depois do veredito", () => {
+    const review = parseReviewMessage(
+      "Pediu ajustes: x\n\nApontamentos:\n- F-02 [HIGH, aberto há 2 revisões] a:1: d\n- F-03 [HIGH, novo] b:1: e\n\nResolvidos:\n- F-01 [HIGH] c:1: f",
+    );
+    expect(review).not.toBeNull();
+    if (review === null) return;
+    expect(lastReviewLine("T02", review.verdict, review)).toBe("Última revisão · T02 · Pediu ajustes · 1 novo · 1 ainda aberto · 1 resolvido");
+    const old = parseReviewMessage("Pediu ajustes: x\n\nApontamentos:\n- F-01 [HIGH] a:1: d");
+    if (old === null) return;
+    expect(lastReviewLine("T02", old.verdict, old)).toBe("Última revisão · T02 · Pediu ajustes");
   });
 });
 

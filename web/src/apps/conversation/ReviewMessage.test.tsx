@@ -85,7 +85,7 @@ describe("parseReviewMessage", () => {
 
   it("omite seções vazias e aceita só o veredito", () => {
     const r = parseReviewMessage("Aprovado — tudo certo");
-    expect(r).toEqual({ prefix: "", verdict: "approved", summary: "tudo certo", findings: [], observations: [], items: [], captures: [] });
+    expect(r).toEqual({ prefix: "", verdict: "approved", summary: "tudo certo", findings: [], observations: [], resolved: [], responses: [], decisions: [], items: [], captures: [] });
     const onlyObs = parseReviewMessage("Aprovado — ok\n\nObservações (não bloqueiam):\n- F-02 [LOW] x.rs:1 — d\n\nCritérios:\n✓ A — e");
     expect(onlyObs?.findings).toEqual([]);
     expect(onlyObs?.observations).toHaveLength(1);
@@ -279,5 +279,107 @@ describe("observação de arquivo inalterado (spec 092 T04)", () => {
     const items = within(screen.getByRole("list", { name: "Observações" })).getAllByRole("listitem");
     expect(items[0]?.textContent).toContain("observação (arquivo não mudou nesta rodada)");
     expect(items[1]?.textContent).not.toContain("arquivo não mudou");
+  });
+});
+
+/* Spec 124 T01: estado dos apontamentos (formato de `render_review_message_tracked`). */
+const TRACKED =
+  "Pediu ajustes: falta pouco\n\nApontamentos:\n" +
+  "- F-02 [HIGH, aberto há 3 revisões] src/b.rs:9: sem teste → adicionar\n" +
+  "- F-04 [MEDIUM, novo] src/c.rs:1: captura cortada\n" +
+  "- F-05 [HIGH, baixa confiança, novo] src/d.rs:2: talvez\n\n" +
+  "Resolvidos:\n- F-01 [HIGH] src/a.rs:1: falta validar\n\n" +
+  "Critérios:\n✓ A: ok";
+
+describe("estado dos apontamentos (spec 124 T01)", () => {
+  it("lê novo, ainda aberto há N revisões e a seção de resolvidos", () => {
+    const r = parseReviewMessage(TRACKED);
+    expect(r?.findings.map((f) => [f.id, f.severity, f.state, f.recurrence])).toEqual([
+      ["F-02", "HIGH", "open", 3],
+      ["F-04", "MEDIUM", "new", undefined],
+      ["F-05", "HIGH", "new", undefined],
+    ]);
+    expect(r?.findings[2]?.lowConfidence).toBe(true);
+    expect(r?.findings[0]?.recommendation).toBe("adicionar");
+    expect(r?.resolved).toEqual([
+      { id: "F-01", severity: "HIGH", location: "src/a.rs:1", description: "falta validar", recommendation: "", state: "resolved" },
+    ]);
+    expect(r?.items).toHaveLength(1);
+  });
+
+  it("mensagem antiga, sem estados, não ganha selo nem resumo", () => {
+    const r = parseReviewMessage(FULL);
+    expect(r?.findings.every((f) => f.state === undefined)).toBe(true);
+    expect(r?.resolved).toEqual([]);
+    renderMessage(FULL);
+    expect(screen.queryAllByTestId("review-finding-state")).toHaveLength(0);
+    expect(screen.queryByTestId("review-state-summary")).toBeNull();
+  });
+
+  it("na Conversa: selos, resumo e resolvidos com o dicionário nos dois idiomas", () => {
+    renderMessage(TRACKED);
+    const states = screen.getAllByTestId("review-finding-state").map((e) => e.textContent);
+    expect(states).toEqual(["ainda aberto há 3 revisões", "novo", "novo", "resolvido"]);
+    expect(screen.getByTestId("review-state-summary").textContent).toBe("2 novos · 1 ainda aberto · 1 resolvido");
+    const resolved = within(screen.getByRole("list", { name: "Apontamentos resolvidos" })).getAllByRole("listitem");
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]?.textContent).toContain("falta validar");
+    cleanup();
+    setLanguage("en", { persist: false });
+    try {
+      renderMessage(TRACKED);
+      const en = screen.getAllByTestId("review-finding-state").map((e) => e.textContent);
+      expect(en).toEqual(["still open for 3 reviews", "new", "new", "resolved"]);
+      expect(screen.getByTestId("review-state-summary").textContent).toBe("2 new · 1 still open · 1 resolved");
+      expect(screen.getByRole("list", { name: "Resolved findings" })).toBeTruthy();
+      expect(screen.queryByText(/aberto há|Resolvidos/)).toBeNull();
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
+  });
+});
+
+/* Spec 124 T02: respostas do Desenvolvedor e decisões do Arquiteto (formato de `render_review_message_tracked`). */
+const ARBITRATED =
+  "Aprovado: tudo certo\n\nObservações (não bloqueiam):\n- F-01 [HIGH] src/gpu.rs:9: ainda sem WebGPU\n\n" +
+  "Respostas do Desenvolvedor:\n- F-01 [contested, environment] o Docker não tem GPU\n- F-02 [fixed] src/a.rs:3\n- F-04 [talvez] x\n\n" +
+  "Decisões do Arquiteto:\n- F-01 [manual] Falta WebGPU nativo: sem GPU no Docker\n\n" +
+  "Critérios:\n✓ A: ok";
+
+describe("respostas e decisões (spec 124 T02)", () => {
+  it("lê as duas seções sem misturar com as observações", () => {
+    const r = parseReviewMessage(ARBITRATED);
+    expect(r?.observations.map((f) => f.id)).toEqual(["F-01"]);
+    expect(r?.responses).toEqual([
+      { id: "F-01", kind: "contested", reason: "environment", detail: "o Docker não tem GPU" },
+      { id: "F-02", kind: "fixed", detail: "src/a.rs:3" },
+      { id: "F-04", kind: "talvez", detail: "x" },
+    ]);
+    expect(r?.decisions).toEqual([{ id: "F-01", decision: "manual", detail: "Falta WebGPU nativo: sem GPU no Docker" }]);
+    expect(r?.items).toHaveLength(1);
+    expect(parseReviewMessage(FULL)?.responses).toEqual([]);
+  });
+
+  it("na Conversa: rótulos do dicionário nos dois idiomas; código desconhecido como veio", () => {
+    renderMessage(ARBITRATED);
+    const kinds = screen.getAllByTestId("review-response-kind").map((e) => e.textContent);
+    expect(kinds).toEqual(["contestado", "corrigido", "talvez"]);
+    expect(screen.getByTestId("review-contest-reason").textContent).toBe("inviável no ambiente");
+    expect(screen.getByTestId("review-decision").textContent).toBe("verificação manual");
+    expect(within(screen.getByRole("list", { name: "Respostas aos apontamentos" })).getAllByRole("listitem")).toHaveLength(3);
+    expect(screen.getByRole("list", { name: "Decisões sobre apontamentos contestados" })).toBeTruthy();
+    cleanup();
+    setLanguage("en", { persist: false });
+    try {
+      renderMessage(ARBITRATED);
+      expect(screen.getAllByTestId("review-response-kind").map((e) => e.textContent)).toEqual(["contested", "fixed", "talvez"]);
+      expect(screen.getByTestId("review-contest-reason").textContent).toBe("not feasible in the environment");
+      expect(screen.getByTestId("review-decision").textContent).toBe("manual check");
+      expect(screen.getByText("Developer responses:")).toBeTruthy();
+      expect(screen.getByText("Architect decisions:")).toBeTruthy();
+      expect(screen.queryByText(/Respostas do Desenvolvedor|Decisões do Arquiteto/)).toBeNull();
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 });

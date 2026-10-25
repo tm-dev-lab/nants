@@ -553,7 +553,7 @@ async fn gitfile_worktree_is_refused_before_model_and_base_stays_clean() {
 async fn completing_a_spec_updates_and_commits_architecture_memory() {
     let root = project("archmem", true);
     let mut doc = String::from("# Proj\n");
-    for sec in crate::agents::arch_memory::ARCH_SECTIONS {
+    for sec in crate::agents::arch_memory::section_headings(crate::i18n::Lang::PtBr) {
         doc.push_str(&format!("\n{sec}\ntexto\n"));
     }
     let backend = Scripted::new(vec![text(GOOD_REPORT), text(&doc)]);

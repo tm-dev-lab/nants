@@ -312,6 +312,48 @@ impl Git {
         }
     }
 
+    /// Diretório Git próprio desta árvore (`git rev-parse --absolute-git-dir`): numa worktree
+    /// ligada é `.git/worktrees/<nome>`, apagado junto com ela; na principal é o `.git`.
+    pub fn private_git_dir(&self) -> Result<PathBuf, GitError> {
+        Ok(PathBuf::from(self.run(["rev-parse", "--absolute-git-dir"])?.trim()))
+    }
+
+    /// Hash da árvore de trabalho como ela está agora (spec 124 T05): o `tree` que o Git gravaria
+    /// com tudo o que está no disco, rastreado ou não, menos os caminhos ignorados pelo
+    /// `.gitignore` e os diretórios de `exclude`. Nada muda no índice real nem no repositório
+    /// além de objetos soltos: o cálculo usa uma cópia temporária do índice no diretório Git
+    /// privado da árvore, apagada no fim.
+    pub fn worktree_tree_hash(&self, exclude: &[&str]) -> Result<String, GitError> {
+        for e in exclude {
+            check_arg("exclude", e)?;
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let git_dir = self.private_git_dir()?;
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tmp = git_dir.join(format!("nants-tree-{}-{seq}.index", std::process::id()));
+        // A cópia do índice real só acelera (o Git reaproveita o cache de `stat`); sem ela, começa vazio.
+        let _ = std::fs::copy(git_dir.join("index"), &tmp);
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_file(self.0.with_extension("index.lock"));
+            }
+        }
+        let _cleanup = Cleanup(tmp.clone());
+        let tmp_text = tmp.to_string_lossy().into_owned();
+        let isolated = Git { root: self.root.clone(), env: self.env.clone() }.with_env("GIT_INDEX_FILE", &tmp_text);
+        let mut add: Vec<String> = ["add", "-A", "--", "."].iter().map(|s| s.to_string()).collect();
+        add.extend(exclude.iter().map(|e| format!(":(exclude){e}")));
+        isolated.run(&add)?;
+        let mut rm: Vec<String> = ["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--"].iter().map(|s| s.to_string()).collect();
+        rm.extend(exclude.iter().map(|e| e.to_string()));
+        if !exclude.is_empty() {
+            isolated.run(&rm)?;
+        }
+        Ok(isolated.run(["write-tree"])?.trim().to_string())
+    }
+
     /// Estado do índice em relação a HEAD: pares `(status, caminho)` com status `A`, `M`, `D`, `T`
     /// ou `U`. Usado para capturar o resultado de um squash e para conferi-lo no rollback.
     pub fn staged_status(&self) -> Result<Vec<(String, String)>, GitError> {
@@ -991,6 +1033,50 @@ mod tests {
         );
         git.branch_delete("feat").unwrap();
         assert!(!git.branches().unwrap().contains(&"feat".to_string()));
+    }
+
+    /// Spec 124 T05: o hash cobre o que está no disco (rastreado ou não), menos o ignorado e os
+    /// diretórios excluídos; não mexe no índice real nem deixa o índice temporário.
+    #[test]
+    fn worktree_tree_hash_covers_the_disk_minus_ignored_and_excluded() {
+        let (_base, repo) = init_repo("tree-hash");
+        let git = Git::new(&repo);
+        fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+        git.run(["add", ".gitignore"]).unwrap();
+        git.commit("chore: ignore").unwrap();
+        let ex = [".sdd", ".nants-outputs"];
+        let h0 = git.worktree_tree_hash(&ex).unwrap();
+        assert_eq!(h0.len(), 40, "{h0}");
+        // Ignorado e excluídos não mudam o hash.
+        fs::create_dir_all(repo.join("node_modules/x")).unwrap();
+        fs::write(repo.join("node_modules/x/i.js"), "1").unwrap();
+        fs::create_dir_all(repo.join(".sdd/specs")).unwrap();
+        fs::write(repo.join(".sdd/specs/t.md"), "estado").unwrap();
+        fs::create_dir_all(repo.join(".nants-outputs/s")).unwrap();
+        fs::write(repo.join(".nants-outputs/s/1.txt"), "saída").unwrap();
+        assert_eq!(git.worktree_tree_hash(&ex).unwrap(), h0);
+        // Arquivo novo não rastreado e edição de rastreado mudam; desfazer volta ao mesmo hash.
+        fs::write(repo.join("novo.txt"), "a").unwrap();
+        let h1 = git.worktree_tree_hash(&ex).unwrap();
+        assert_ne!(h1, h0);
+        fs::write(repo.join("README.md"), "mudou\n").unwrap();
+        let h2 = git.worktree_tree_hash(&ex).unwrap();
+        assert_ne!(h2, h1);
+        fs::write(repo.join("README.md"), "inicial\n").unwrap();
+        assert_eq!(git.worktree_tree_hash(&ex).unwrap(), h1);
+        // Commitar o mesmo conteúdo não muda o hash (é o que o runner faz depois do Desenvolvedor).
+        git.run(["add", "novo.txt"]).unwrap();
+        git.commit("feat: novo").unwrap();
+        assert_eq!(git.worktree_tree_hash(&ex).unwrap(), h1);
+        // `.sdd` rastreado também fica fora.
+        git.run(["add", "-f", ".sdd/specs/t.md"]).unwrap();
+        git.commit("chore: sdd").unwrap();
+        fs::write(repo.join(".sdd/specs/t.md"), "outro estado").unwrap();
+        assert_eq!(git.worktree_tree_hash(&ex).unwrap(), h1);
+        // O índice real segue intocado e o temporário não fica.
+        assert_eq!(git.run(["status", "--porcelain", "--", "README.md", "novo.txt"]).unwrap(), "");
+        let dir = git.private_git_dir().unwrap();
+        assert!(!fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with("nants-tree-")));
     }
 
     #[test]

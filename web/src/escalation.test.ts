@@ -27,6 +27,22 @@ describe("parseEscalation", () => {
     expect(c?.whyStopped).toBe("o erro persistiu");
     expect(c?.options).toEqual(["liberar a porta", "trocar a porta", "abortar"]);
   });
+  it("ASK: a pergunta do Arquiteto vai para o cartão (spec 124 T03)", () => {
+    const c = parseEscalation(
+      [
+        "Análise de recuperação #2 (ASK)",
+        "- Causa raiz: falta decidir",
+        "- Decisão: pergunta ao humano (ASK)",
+        "- Pergunta ao humano: As capturas podem ser manuais?",
+        "  em 1920x1080",
+        "- Contexto:",
+        "  - opções: responda à pergunta acima no campo de orientação; a tarefa volta a executar com a sua resposta",
+      ].join("\n"),
+    );
+    expect(c?.question).toBe("As capturas podem ser manuais?\nem 1920x1080");
+    expect(c?.rootCause).toBe("falta decidir");
+    expect(parseEscalation(FULL_ESCALATION)?.question).toBeNull();
+  });
   it("sem Contexto devolve null", () => {
     expect(parseEscalation("Causa raiz: X. Proposta: Y")).toBeNull();
   });

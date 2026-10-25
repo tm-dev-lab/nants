@@ -517,6 +517,24 @@ pub fn normalize_id_field(secrets: &SecretSet, raw: &str) -> String {
     normalize_id_text(&clean(secrets, raw))
 }
 
+/// Teto da última linha de saída exibida (o mesmo do comando).
+const MAX_LAST_LINE_BYTES: usize = 200;
+
+/// Última linha de saída para a tela (spec 123 T01): redigida, normalizada, numa linha só e
+/// cortada mantendo o FIM, onde costuma estar o que mudou.
+fn shown_line(secrets: &SecretSet, line: &str) -> String {
+    let flat = normalize_text(&clean(secrets, line)).replace(['\n', '\t'], " ");
+    let flat = flat.trim();
+    if flat.len() <= MAX_LAST_LINE_BYTES {
+        return flat.to_string();
+    }
+    let mut start = flat.len() - MAX_LAST_LINE_BYTES;
+    while !flat.is_char_boundary(start) {
+        start += 1;
+    }
+    flat[start..].to_string()
+}
+
 /// Corta `text` em no máximo `max` bytes, em fronteira de caractere.
 pub fn cut_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -566,7 +584,8 @@ pub fn runner_event_to_api(project_id: &str, secrets: &SecretSet, ev: RunnerEven
             ApiEvent::new(EventType::AgentMessage, pid, payload)
         }
         // Atividade ao vivo "Testes": reaproveita `agent_activity` (kind `command` no início,
-        // `end` no fim, mesmo `activity_id`). Efêmera: não entra no registro nem no diálogo.
+        // `end` no fim, mesmo `activity_id`; o sinal de vida é `CommandBeat`). Não entra no diálogo;
+        // o `BusSink` a grava no registro ao vivo (spec 123 T01), para a reidratação.
         RunnerEvent::CommandRun {
             run_id,
             started,
@@ -577,6 +596,7 @@ pub fn runner_event_to_api(project_id: &str, secrets: &SecretSet, ev: RunnerEven
             command,
             task_id,
             attempt,
+            limit,
         } => {
             let mut payload = json!({
                 "agent": "tests",
@@ -593,6 +613,25 @@ pub fn runner_event_to_api(project_id: &str, secrets: &SecretSet, ev: RunnerEven
             if started {
                 payload["text"] = json!(cut_bytes(&normalize_text(&clean(secrets, &command)), 200));
                 payload["command_started_at"] = json!(super::live_activity::epoch_ms());
+                // Spec 123 T02: o limite de tempo da rodada, para a tela medir o tempo contra ele.
+                if let Some(ms) = limit.and_then(|l| u64::try_from(l.as_millis()).ok()).filter(|ms| *ms > 0) {
+                    payload["command_limit_ms"] = json!(ms);
+                }
+            }
+            ApiEvent::new(EventType::AgentActivity, pid, payload)
+        }
+        // Spec 123 T01: sinal de vida da rodada em curso, com o progresso real da saída.
+        RunnerEvent::CommandBeat { run_id, task_id, output_bytes, last_line } => {
+            let mut payload = json!({
+                "agent": "tests",
+                "task_id": normalize_id_field(secrets, &task_id),
+                "spec_id": Value::Null,
+                "activity_id": normalize_id_field(secrets, &run_id),
+                "kind": "heartbeat",
+                "output_bytes": output_bytes,
+            });
+            if let Some(line) = last_line.as_deref().map(|l| shown_line(secrets, l)).filter(|l| !l.is_empty()) {
+                payload["last_line"] = json!(line);
             }
             ApiEvent::new(EventType::AgentActivity, pid, payload)
         }
@@ -656,9 +695,48 @@ impl BusSink {
 impl EventSink for BusSink {
     fn emit(&self, ev: RunnerEvent) {
         let event = runner_event_to_api(&self.project_id, &self.secrets, ev);
+        if event.event_type() == EventType::AgentActivity.as_str() {
+            record_runner_activity(&self.bus, &self.project_id, &event.payload);
+        }
         deliver(&self.bus, self.dialog.as_ref(), event);
     }
 }
+
+/// A rodada de testes do runner também entra no registro ao vivo (spec 123 T01): sem isso, quem
+/// abre a tela ou reconecta durante os testes não vê nada. Grava o payload já redigido.
+fn record_runner_activity(bus: &EventBus, project_id: &str, payload: &Value) {
+    use crate::agents::activity::ActivityKind;
+    let kind = match payload["kind"].as_str() {
+        Some("command") => ActivityKind::Command,
+        Some("heartbeat") => ActivityKind::Heartbeat,
+        Some("end") => ActivityKind::End,
+        _ => return,
+    };
+    let stage_code = payload["stage_code"].as_str().filter(|c| RUNNER_STAGE_CODES.contains(c));
+    bus.live_activity().record(
+        project_id,
+        super::live_activity::Observed {
+            agent: payload["agent"].as_str().unwrap_or_default(),
+            task_id: payload["task_id"].as_str(),
+            spec_id: None,
+            activity_id: payload["activity_id"].as_str().unwrap_or_default(),
+            kind,
+            text: payload["text"].as_str(),
+            stage: payload["stage"].as_str(),
+            stage_code,
+            code: None,
+            received_bytes: None,
+            structured: None,
+            stage_params: payload["stage_params"].as_object(),
+            output_bytes: payload["output_bytes"].as_u64(),
+            last_line: payload["last_line"].as_str(),
+            command_limit_ms: payload["command_limit_ms"].as_u64(),
+        },
+    );
+}
+
+/// Códigos de etapa da rodada do runner (`RunnerEvent::CommandRun::stage_code`).
+const RUNNER_STAGE_CODES: [&str; 4] = ["tests", "tests_base", "check", "check_base"];
 
 /// Teto de `.sdd/specs/<spec>/tools.jsonl`; ao atingir, a trilha para de crescer sem erro.
 pub const MAX_TOOLS_TRAIL_BYTES: u64 = 2 * 1024 * 1024;
@@ -785,6 +863,18 @@ impl ActivitySink for BusActivitySink {
         if let Some(bytes) = ev.received_bytes {
             payload["received_bytes"] = json!(bytes);
         }
+        // Spec 123 T01: o heartbeat do comando leva o progresso real da saída.
+        let last_line = ev.last_line.as_deref().map(|line| shown_line(secrets, line)).filter(|l| !l.is_empty());
+        if let Some(bytes) = ev.output_bytes {
+            payload["output_bytes"] = json!(bytes);
+        }
+        if let Some(line) = &last_line {
+            payload["last_line"] = json!(line);
+        }
+        // Spec 123 T02: o limite de tempo do comando do agente vai no início dele.
+        if let Some(ms) = ev.command_limit_ms {
+            payload["command_limit_ms"] = json!(ms);
+        }
         // Spec 121: o passo pede saída estruturada; a tela mostra o rótulo do código, nunca o JSON.
         let structured = ev
             .structured
@@ -812,6 +902,10 @@ impl ActivitySink for BusActivitySink {
                 code: coded.as_ref().map(|(c, p)| (c.as_str(), p)),
                 received_bytes: ev.received_bytes,
                 structured,
+                stage_params: None,
+                output_bytes: ev.output_bytes,
+                last_line: last_line.as_deref(),
+                command_limit_ms: ev.command_limit_ms,
             },
         );
         self.bus.publish(ApiEvent::new(
@@ -1096,6 +1190,7 @@ mod tests {
             command: format!("TOKEN={key} npm test"),
             task_id: "T01".into(),
             attempt: 1,
+            limit: None,
         };
         sink.emit(run(true));
         sink.emit(run(false));
@@ -1114,6 +1209,7 @@ mod tests {
         assert_eq!(start.payload["stage_code"], "check");
         assert_eq!(start.payload["stage_params"], json!({"attempt": 1, "check": "build"}));
         assert!(start.payload["command_started_at"].as_u64().is_some());
+        assert!(start.payload.get("command_limit_ms").is_none(), "sem limite conhecido, sem o campo");
         assert_eq!(end.payload["kind"], "end");
         assert_eq!(end.payload["activity_id"], start.payload["activity_id"]);
         // Efêmero: não entra no registro de atividade (reidratação só do histórico persistido).
@@ -1361,6 +1457,9 @@ mod tests {
             text: Some("y".repeat(10_000)),
             code: None,
             received_bytes: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             structured: None,
         });
         let ev = rx.try_recv().expect("evento");
@@ -1386,6 +1485,9 @@ mod tests {
             text: None,
             code: None,
             received_bytes: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             structured: None,
         });
         let entries = std::fs::read_dir(&dir).expect("ler").count();
@@ -1409,6 +1511,9 @@ mod tests {
             text: None,
             code: None,
             received_bytes,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             structured: None,
         };
         sink.emit(ev(ActivityKind::Model, None));
@@ -1421,6 +1526,109 @@ mod tests {
         let beat = rx.try_recv().expect("heartbeat");
         assert_eq!((beat.payload["kind"].as_str(), beat.payload["received_bytes"].as_u64()), (Some("heartbeat"), Some(48_000)));
         assert_eq!(rx.try_recv().expect("fim").payload["kind"], "model_end");
+    }
+
+    /// Spec 123 T01: o heartbeat do comando do agente leva os bytes de saída e a última linha,
+    /// redigida e numa linha só, no payload e no instantâneo; o fim do comando limpa o progresso.
+    #[test]
+    fn command_heartbeat_payload_and_snapshot_carry_output_progress() {
+        use crate::agents::activity::{ActivityEvent, ActivityKind, ActivitySink as _};
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let sink = BusActivitySink::new(bus.clone(), "p", Arc::new(SecretSet::new(vec!["segredo-123456".into()])));
+        let ev = |kind, text: Option<&str>, output_bytes, last_line: Option<&str>| ActivityEvent {
+            agent: "developer".into(),
+            spec_id: Some("003".into()),
+            task_id: Some("T02".into()),
+            activity_id: "a1".into(),
+            kind,
+            text: text.map(String::from),
+            code: None,
+            received_bytes: None,
+            output_bytes,
+            last_line: last_line.map(String::from),
+            command_limit_ms: None,
+            structured: None,
+        };
+        sink.emit(ev(ActivityKind::Command, Some("npx playwright test"), None, None));
+        let long = format!("token segredo-123456\tfim {}", "x".repeat(400));
+        sink.emit(ev(ActivityKind::Heartbeat, None, Some(48_000), Some(&long)));
+        let _command = rx.try_recv().expect("command");
+        let beat = rx.try_recv().expect("heartbeat");
+        assert_eq!(beat.payload["kind"], "heartbeat");
+        assert_eq!(beat.payload["output_bytes"], 48_000);
+        let line = beat.payload["last_line"].as_str().unwrap_or_default();
+        assert!(line.len() <= MAX_LAST_LINE_BYTES && line.ends_with("xxx"), "{line}");
+        let snap = bus.live_activity().snapshot("p");
+        assert_eq!((snap[0].output_bytes, snap[0].last_line.as_deref()), (Some(48_000), Some(line)));
+
+        sink.emit(ev(ActivityKind::Heartbeat, None, Some(9), Some("passo 3 com segredo-123456")));
+        let beat = rx.try_recv().expect("heartbeat");
+        assert_eq!(beat.payload["last_line"], "passo 3 com ***");
+        sink.emit(ev(ActivityKind::CommandEnd, None, None, None));
+        let snap = bus.live_activity().snapshot("p");
+        assert_eq!((snap[0].command.as_deref(), snap[0].output_bytes, snap[0].last_line.as_deref()), (None, None, None));
+
+        // Spec 123 T02: o limite do comando do agente vai no `command` e fica no instantâneo até o fim.
+        let _end = rx.try_recv().expect("command_end");
+        sink.emit(ActivityEvent { command_limit_ms: Some(300_000), ..ev(ActivityKind::Command, Some("npm test"), None, None) });
+        let start = rx.try_recv().expect("command");
+        assert_eq!(start.payload["command_limit_ms"], 300_000);
+        assert_eq!(bus.live_activity().snapshot("p")[0].command_limit_ms, Some(300_000));
+        sink.emit(ev(ActivityKind::CommandEnd, None, None, None));
+        assert_eq!(bus.live_activity().snapshot("p")[0].command_limit_ms, None);
+    }
+
+    /// Spec 123 T01: a rodada de testes do runner sai como `agent_activity` do agente `tests`
+    /// (início, sinal de vida com o progresso e fim) e entra no registro ao vivo, com a etapa e os
+    /// `params` dela: quem abre a tela durante os testes vê a rodada. Antes, o registro ficava vazio.
+    #[test]
+    fn runner_tests_run_reaches_live_registry_with_progress() {
+        use crate::agents::runner::{CommandKind, EventSink as _};
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let sink = BusSink::new(bus.clone(), "p", Arc::new(SecretSet::new(vec!["segredo-123456".into()])));
+        let mut params = serde_json::Map::new();
+        params.insert("attempt".into(), json!(2));
+        let run = |started: bool| RunnerEvent::CommandRun {
+            run_id: "T01-2-7".into(),
+            started,
+            kind: CommandKind::Tests,
+            label: "Testes · tentativa 2".into(),
+            stage_code: "tests",
+            stage_params: params.clone(),
+            command: "npx playwright test".into(),
+            task_id: "T01".into(),
+            attempt: 2,
+            limit: Some(std::time::Duration::from_secs(600)),
+        };
+        sink.emit(run(true));
+        let started = rx.try_recv().expect("início");
+        assert_eq!(started.payload["command_limit_ms"], 600_000);
+        sink.emit(RunnerEvent::CommandBeat {
+            run_id: "T01-2-7".into(),
+            task_id: "T01".into(),
+            output_bytes: 1_234,
+            last_line: Some("ok 3 cena com segredo-123456".into()),
+        });
+        let beat = rx.try_recv().expect("sinal");
+        assert_eq!(beat.event_type(), "agent_activity");
+        assert_eq!(
+            (beat.payload["agent"].as_str(), beat.payload["kind"].as_str(), beat.payload["activity_id"].as_str()),
+            (Some("tests"), Some("heartbeat"), Some("T01-2-7"))
+        );
+        assert_eq!((beat.payload["output_bytes"].as_u64(), beat.payload["last_line"].as_str()), (Some(1_234), Some("ok 3 cena com ***")));
+        let snap = bus.live_activity().snapshot("p");
+        assert_eq!(snap.len(), 1, "{snap:?}");
+        let a = &snap[0];
+        assert_eq!((a.agent.as_str(), a.task_id.as_deref(), a.command.as_deref()), ("tests", Some("T01"), Some("npx playwright test")));
+        assert_eq!((a.stage_code.as_deref(), a.stage_params.as_ref().and_then(|p| p["attempt"].as_u64())), (Some("tests"), Some(2)));
+        assert_eq!((a.output_bytes, a.last_line.as_deref()), (Some(1_234), Some("ok 3 cena com ***")));
+        assert!(a.command_started_at.is_some());
+        // Spec 123 T02: o limite da rodada vai no início e fica no instantâneo (reidratação).
+        assert_eq!(a.command_limit_ms, Some(600_000));
+        sink.emit(run(false));
+        assert!(bus.live_activity().snapshot("p").is_empty(), "o fim encerra a rodada no registro");
     }
 
     /// Spec 121: o código da saída estruturada vai no payload e no instantâneo; fora do
@@ -1440,6 +1648,9 @@ mod tests {
             text: text.map(String::from),
             code: None,
             received_bytes: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             structured,
         };
         for code in crate::agents::activity::structured::ALL {
@@ -1695,6 +1906,9 @@ mod tests {
             text: Some(text.into()),
             code: None,
             received_bytes: None,
+            output_bytes: None,
+            last_line: None,
+            command_limit_ms: None,
             structured: None,
         }
     }

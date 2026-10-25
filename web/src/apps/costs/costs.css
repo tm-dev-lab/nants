@@ -136,6 +136,26 @@
   margin: 0;
 }
 
+/* Detalhes da área Contexto (123/T03): rótulo à esquerda, número à direita; estreita, o par quebra. */
+.nd-costs-context-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+}
+
+.nd-costs-context-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sp-1) var(--sp-3);
+}
+
+.nd-costs-context-row dt,
+.nd-costs-context-row dd {
+  margin: 0;
+}
+
 /*
  * "Ver detalhes por tarefa e modelo" e o orçamento: `<details>` sem caixa (o resumo parece um
  * link, como no mockup); aberto, as seções ficam separadas por `--divider`.

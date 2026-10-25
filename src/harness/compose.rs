@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_yaml::{Mapping, Value};
 
 use crate::config::ViewPorts;
+use crate::harness::progress::CommandProgress;
 
 use crate::sdd::environment::{env_hash, COMPOSE_REL, WORKSPACE_SERVICE, WORKTREE_VAR};
 
@@ -52,6 +53,14 @@ impl ComposeOutput {
 /// Executor de chamadas ao compose (trocado por um falso nos testes).
 pub trait ComposeRunner: Send + Sync {
     fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String>;
+
+    /// Como [`Self::run`], copiando cada pedaço da saída em `progress` enquanto o comando roda
+    /// (spec 123 T01: o sinal de vida da tela). O resultado e a captura não mudam. Padrão: sem
+    /// progresso (executores que não leem a saída aos poucos).
+    fn run_watched(&self, call: &ComposeCall, progress: Option<&Arc<CommandProgress>>) -> Result<ComposeOutput, String> {
+        let _ = progress;
+        self.run(call)
+    }
 }
 
 /// Executor real: subprocesso `docker` com ambiente limpo.
@@ -126,14 +135,19 @@ impl HeadTail {
     }
 }
 
-fn read_limited(mut r: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+fn read_limited(mut r: impl Read + Send + 'static, progress: Option<Arc<CommandProgress>>) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut capture = HeadTail::new(MAX_OUTPUT);
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => capture.push(&buf[..n]),
+                Ok(n) => {
+                    capture.push(&buf[..n]);
+                    if let Some(p) = &progress {
+                        p.push(&buf[..n]);
+                    }
+                }
             }
         }
         capture.into_bytes()
@@ -165,6 +179,10 @@ pub(crate) fn refuse_real_docker_in_tests(program: &str) -> Option<String> {
 
 impl ComposeRunner for RealComposeRunner {
     fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+        self.run_watched(call, None)
+    }
+
+    fn run_watched(&self, call: &ComposeCall, progress: Option<&Arc<CommandProgress>>) -> Result<ComposeOutput, String> {
         #[cfg(test)]
         if let Some(reason) = refuse_real_docker_in_tests(&self.program) {
             return Err(reason);
@@ -179,8 +197,8 @@ impl ComposeRunner for RealComposeRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("não foi possível iniciar o docker: {e}"))?;
-        let out = child.stdout.take().map(read_limited);
-        let err = child.stderr.take().map(read_limited);
+        let out = child.stdout.take().map(|r| read_limited(r, progress.cloned()));
+        let err = child.stderr.take().map(|r| read_limited(r, progress.cloned()));
         let deadline = Instant::now() + call.timeout;
         let (mut code, mut timed_out) = (None, false);
         loop {
@@ -506,13 +524,32 @@ impl ComposeEnv {
     /// projeto nunca engole o comando). `Err` = falha do Docker (daemon,
     /// subprocesso); o código de saída do comando vai no resultado.
     pub fn exec(&self, dir: &Path, command: &str, timeout: Duration) -> Result<ComposeOutput, String> {
+        self.exec_watched(dir, command, timeout, None)
+    }
+
+    /// Como [`Self::exec`], com o progresso da saída em `progress` enquanto roda (spec 123 T01).
+    pub fn exec_watched(
+        &self,
+        dir: &Path,
+        command: &str,
+        timeout: Duration,
+        progress: Option<&Arc<CommandProgress>>,
+    ) -> Result<ComposeOutput, String> {
         let (_, ov, _) = self.load(dir)?;
         let call = self.call(dir, &ov, &["run", "--rm", "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command], timeout);
-        let out = self.runner.run(&call)?;
+        let out = self.runner.run_watched(&call, progress)?;
         if !out.success() && is_docker_failure(&out.output) {
             return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&out)));
         }
         Ok(out)
+    }
+
+    /// Medida das capacidades do ambiente (spec 124 T04): `run --rm -T --no-deps --entrypoint sh
+    /// workspace -c <script>`, sem subir os serviços de apoio. `Err` = falha do Docker.
+    pub fn probe(&self, dir: &Path, script: &str, timeout: Duration) -> Result<ComposeOutput, String> {
+        let (_, ov, _) = self.load(dir)?;
+        let call = self.call(dir, &ov, &["run", "--rm", "-T", "--no-deps", "--entrypoint", "sh", WORKSPACE_SERVICE, "-c", script], timeout);
+        self.runner.run(&call)
     }
 
     /// Devolve ao uid do host as entradas de `dir` criadas por outro dono (ex.: root de imagens
@@ -1100,6 +1137,8 @@ pub(crate) mod fake {
         replies: Mutex<Vec<(String, ComposeOutput)>>,
         /// Espera antes de responder (simula comando demorado).
         pub delay: Mutex<Option<Duration>>,
+        /// Linhas escritas aos poucos durante o atraso (no progresso, quando há), spec 123 T01.
+        pub stream: Mutex<Vec<String>>,
     }
 
     impl FakeRunner {
@@ -1146,10 +1185,27 @@ pub(crate) mod fake {
 
     impl ComposeRunner for FakeRunner {
         fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+            self.run_watched(call, None)
+        }
+
+        fn run_watched(&self, call: &ComposeCall, progress: Option<&Arc<CommandProgress>>) -> Result<ComposeOutput, String> {
             self.calls.lock().unwrap_or_else(PoisonError::into_inner).push(call.clone());
             let delay = *self.delay.lock().unwrap_or_else(PoisonError::into_inner);
+            let stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner).clone();
             if let Some(d) = delay {
-                thread::sleep(d);
+                // O atraso é repartido entre as linhas: cada uma sai depois da sua fatia.
+                let slices = u32::try_from(stream.len().max(1)).unwrap_or(u32::MAX);
+                let step = d / slices;
+                for line in &stream {
+                    thread::sleep(step);
+                    if let Some(p) = progress {
+                        p.push(line.as_bytes());
+                        p.push(b"\n");
+                    }
+                }
+                if stream.is_empty() {
+                    thread::sleep(d);
+                }
             }
             let sub = sub_of(&call.args);
             let replies = self.replies.lock().unwrap_or_else(PoisonError::into_inner);

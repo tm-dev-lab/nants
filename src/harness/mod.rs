@@ -4,6 +4,7 @@ pub mod allowlist;
 pub mod browser;
 pub mod compose;
 pub mod git;
+pub mod progress;
 pub mod web;
 pub mod tools;
 

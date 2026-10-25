@@ -230,9 +230,49 @@
   color: var(--ink);
 }
 
+/*
+ * Detalhes ("T02 de 2 · 25 min · US$ 0,29"): encolhem com reticências quando falta espaço (spec 123
+ * T02). Antes, o mínimo deles era o texto inteiro: a pílula transbordava e o "Continuar" ficava
+ * sobre o "Automático" ao lado.
+ */
 .nd-run-details {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted);
+}
+
+/* Encaixe dos detalhes (spec 123 T02): o mesmo do título, com mínimo de 10 caracteres. */
+.nd-run-details-slot {
+  display: flex;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 20px;
+  line-height: 20px;
+  overflow: hidden;
+}
+
+.nd-run-details-slot::before {
+  content: "";
+  width: 0;
+  height: 20px;
+}
+
+.nd-run-details-slot > .nd-run-details {
+  flex: 1 1 10ch;
+  min-width: 10ch;
+}
+
+/* Fase curta da operação longa ("Testes · 7 min", spec 123 T02); âmbar perto do limite de tempo. */
+.nd-run-op {
+  flex-shrink: 0;
+}
+
+.nd-run-pill .nd-run-op[data-near-limit="true"] {
+  color: var(--pill-amber-ink);
 }
 
 /*

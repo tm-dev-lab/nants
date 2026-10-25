@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::llm_client::StreamDelta;
+use crate::harness::progress::{CommandProgress, ProgressSnapshot};
 
 /// Intervalo mínimo entre envios de deltas de uma atividade (~4 eventos/s).
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
@@ -91,6 +92,13 @@ pub struct ActivityEvent {
     pub code: Option<ActivityCode>,
     /// Bytes recebidos da resposta do modelo em curso (só no `heartbeat` da chamada, quando há).
     pub received_bytes: Option<u64>,
+    /// Progresso real do comando em curso (spec 123 T01, só no `heartbeat` do comando): bytes de
+    /// saída capturados até agora e a última linha não vazia, já redigida e cortada.
+    pub output_bytes: Option<u64>,
+    pub last_line: Option<String>,
+    /// Limite de tempo do comando que começa (spec 123 T02, só no `command`), em ms: a tela mede o
+    /// tempo contra ele. `None` quando o caminho não tem limite conhecido.
+    pub command_limit_ms: Option<u64>,
     /// Tipo da chamada de saída estruturada (spec 121), quando o passo pede JSON ao modelo: a
     /// interface mostra um texto do dicionário no lugar do texto cru (ver [`structured`]).
     pub structured: Option<&'static str>,
@@ -112,8 +120,11 @@ pub mod structured {
     /// Resumo do histórico da sessão pelo próprio modelo do papel (spec 122 T04): o retrato é
     /// para o modelo, não texto de pessoa.
     pub const SUMMARY: &str = "summary";
+    /// Decisão do Arquiteto sobre apontamentos contestados pelo Desenvolvedor (spec 124 T02, JSON
+    /// `{"decisions": [...]}`).
+    pub const ARBITRATION: &str = "arbitration";
     /// Todos os códigos (o servidor só publica estes).
-    pub const ALL: [&str; 6] = [PLAN_REVIEW, VERDICT, FINAL_CHECK, DIAGNOSIS, RECOVERY, SUMMARY];
+    pub const ALL: [&str; 7] = [PLAN_REVIEW, VERDICT, FINAL_CHECK, DIAGNOSIS, RECOVERY, SUMMARY, ARBITRATION];
 }
 
 /// Destino dos eventos de atividade.
@@ -246,6 +257,18 @@ impl ActivityRun {
     }
 
     fn send_full(&self, kind: ActivityKind, text: Option<String>, code: Option<ActivityCode>, received_bytes: Option<u64>) {
+        self.send_event(kind, text, code, received_bytes, None, None);
+    }
+
+    fn send_event(
+        &self,
+        kind: ActivityKind,
+        text: Option<String>,
+        code: Option<ActivityCode>,
+        received_bytes: Option<u64>,
+        output: Option<ProgressSnapshot>,
+        command_limit_ms: Option<u64>,
+    ) {
         // Os `params` passam pela mesma redação do texto (o servidor ainda os saneia de novo).
         let code = code.map(|mut c| {
             for value in c.params.values_mut() {
@@ -264,6 +287,9 @@ impl ActivityRun {
             text,
             code,
             received_bytes,
+            output_bytes: output.as_ref().map(|o| o.bytes),
+            last_line: output.and_then(|o| o.last_line),
+            command_limit_ms,
             structured: self.scope.structured,
         });
     }
@@ -386,25 +412,75 @@ impl ActivityRun {
     /// Executa `fut` (um comando longo) emitindo `command` ao iniciar, `heartbeat` a cada
     /// intervalo do escopo e `command_end` ao terminar (também se o futuro for descartado).
     pub async fn track_command<F: std::future::Future>(&self, command: &str, fut: F) -> F::Output {
+        self.track_command_with(command, None, None, fut).await
+    }
+
+    /// Como [`Self::track_command`], com o progresso real da saída (spec 123 T01): cada
+    /// `heartbeat` leva os bytes capturados até agora e a última linha não vazia, redigida e
+    /// cortada como o comando. `limit` é o limite de tempo do caminho que vai rodar o comando
+    /// (spec 123 T02), quando há: vai no `command` para a tela medir o tempo contra ele.
+    pub async fn track_command_progress<F: std::future::Future>(&self, command: &str, progress: &CommandProgress, limit: Option<Duration>, fut: F) -> F::Output {
+        self.track_command_with(command, Some(progress), limit, fut).await
+    }
+
+    async fn track_command_with<F: std::future::Future>(&self, command: &str, progress: Option<&CommandProgress>, limit: Option<Duration>, fut: F) -> F::Output {
         let shown = cut_head(&self.scope.sink.sanitize(command).replace(['\n', '\r'], " "), MAX_COMMAND_BYTES);
-        self.send(ActivityKind::Command, Some(shown));
-        struct EndGuard<'a>(&'a ActivityRun);
+        let limit_ms = limit.and_then(|l| u64::try_from(l.as_millis()).ok()).filter(|ms| *ms > 0);
+        // Só fecha o comando que chegou a abrir (o guarda também cobre o futuro descartado).
+        struct EndGuard<'a>(&'a ActivityRun, bool);
         impl Drop for EndGuard<'_> {
             fn drop(&mut self) {
-                self.0.send(ActivityKind::CommandEnd, None);
+                if self.1 {
+                    self.0.send(ActivityKind::CommandEnd, None);
+                }
             }
         }
-        let _guard = EndGuard(self);
+        let mut guard = EndGuard(self, false);
+        // Spec 123 T02: com largada, o `command` (início do relógio e o limite) só sai quando o
+        // processo vai rodar, depois da aprovação e do download da imagem. Até lá, um heartbeat
+        // simples mantém o passo vivo, sem comando na tela. Recusa ou negação: nenhum `command`.
+        let open = |guard: &mut EndGuard<'_>| {
+            self.send_event(ActivityKind::Command, Some(shown.clone()), None, None, None, limit_ms);
+            guard.1 = true;
+        };
+        if progress.is_none_or(CommandProgress::has_started) {
+            open(&mut guard);
+        }
         let mut ticker = tokio::time::interval(self.scope.heartbeat.max(Duration::from_millis(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         tokio::pin!(fut);
         loop {
+            let waiting = !guard.1;
+            // `biased`: a largada vem antes do fim do futuro. Um comando curto marca a largada e
+            // termina na mesma rodada; sem a ordem, o sorteio do `select!` podia devolver o
+            // resultado sem `command` nem `command_end` (spec 123 T02, F-02).
             tokio::select! {
-                out = &mut fut => return out,
-                _ = ticker.tick() => self.send(ActivityKind::Heartbeat, None),
+                biased;
+                _ = async { if let Some(p) = progress { p.wait_started().await } }, if waiting => open(&mut guard),
+                out = &mut fut => {
+                    // Segunda defesa: o processo largou e o futuro já terminou: abre agora, e o
+                    // guarda fecha com `command_end`.
+                    if !guard.1 && progress.is_some_and(CommandProgress::has_started) {
+                        open(&mut guard);
+                    }
+                    return out;
+                }
+                _ = ticker.tick() => {
+                    let output = if guard.1 { progress.map(|p| self.shown_progress(p.snapshot())) } else { None };
+                    self.send_event(ActivityKind::Heartbeat, None, None, None, output, None);
+                }
             }
         }
+    }
+
+    /// Progresso para a tela: a última linha passa pela mesma redação e corte do comando.
+    fn shown_progress(&self, snap: ProgressSnapshot) -> ProgressSnapshot {
+        let last_line = snap
+            .last_line
+            .map(|line| cut_line_tail(&self.scope.sink.sanitize(&line).replace(['\n', '\r'], " ")))
+            .filter(|line| !line.is_empty());
+        ProgressSnapshot { bytes: snap.bytes, last_line }
     }
 
     /// Executa `fut` (uma chamada ao modelo, spec 114 T04) emitindo `model` ao iniciar, um
@@ -464,6 +540,20 @@ impl Drop for ActivityRun {
     fn drop(&mut self) {
         self.end();
     }
+}
+
+/// Última linha de saída para a tela: o FIM da linha (onde costuma estar o que mudou), até
+/// [`MAX_COMMAND_BYTES`], em fronteira de caractere.
+fn cut_line_tail(text: &str) -> String {
+    let text = text.trim();
+    if text.len() <= MAX_COMMAND_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - MAX_COMMAND_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 /// Primeiros `max` bytes, em fronteira de caractere.
@@ -923,6 +1013,82 @@ mod tests {
         assert!(!leaks(&ev));
         let shown = ev[1].text.as_deref().unwrap_or_default();
         assert!(shown.len() <= MAX_COMMAND_BYTES);
+    }
+
+    /// Spec 123 T02 (F-02): com largada, um comando curto que larga e termina na mesma rodada
+    /// sempre abre e fecha o par `command`/`command_end` (50 vezes, nos dois sabores de runtime,
+    /// para pegar a corrida do `select!`). O que nunca larga (recusa, negação) não abre o par.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gated_command_that_starts_and_ends_in_one_poll_always_opens_and_closes() {
+        for i in 0..50 {
+            let (sink, scope) = redacting();
+            let run = scope.with_heartbeat(Duration::from_millis(5)).begin();
+            let progress = CommandProgress::gated();
+            // Um pouco de espera antes de largar em parte das voltas: o laço já está no `select!`.
+            let pause = i % 2 == 1;
+            let out = run
+                .track_command_progress("ls", &progress, Some(Duration::from_secs(300)), async {
+                    if pause {
+                        tokio::task::yield_now().await;
+                    }
+                    progress.mark_started();
+                    7
+                })
+                .await;
+            assert_eq!(out, 7);
+            let kinds: Vec<_> = sink.0.events().iter().map(|e| e.kind).filter(|k| matches!(k, ActivityKind::Command | ActivityKind::CommandEnd)).collect();
+            assert_eq!(kinds, vec![ActivityKind::Command, ActivityKind::CommandEnd], "volta {i}");
+            let command = sink.0.events().into_iter().find(|e| e.kind == ActivityKind::Command);
+            assert_eq!(command.and_then(|e| e.command_limit_ms), Some(300_000), "volta {i}");
+        }
+        // Largada no meio de uma espera de verdade (o comando roda depois da aprovação).
+        let (sink, scope) = redacting();
+        let run = scope.with_heartbeat(Duration::from_millis(5)).begin();
+        let progress = CommandProgress::gated();
+        run.track_command_progress("npm test", &progress, None, async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            progress.mark_started();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        })
+        .await;
+        let events = sink.0.events();
+        let at = |k: ActivityKind| events.iter().position(|e| e.kind == k);
+        assert!(at(ActivityKind::Heartbeat) < at(ActivityKind::Command), "o passo segue vivo antes da largada");
+        assert!(at(ActivityKind::Command) < at(ActivityKind::CommandEnd));
+        // O que nunca larga não abre o par.
+        let (sink, scope) = redacting();
+        let run = scope.with_heartbeat(Duration::from_millis(5)).begin();
+        let progress = CommandProgress::gated();
+        run.track_command_progress("echo oi", &progress, Some(Duration::from_secs(300)), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        })
+        .await;
+        assert!(sink.0.events().iter().all(|e| !matches!(e.kind, ActivityKind::Command | ActivityKind::CommandEnd)));
+    }
+
+    /// Spec 123 T01: com progresso, cada heartbeat do comando leva os bytes e a última linha,
+    /// redigida e cortada (mantém o fim); sem saída ainda, só os bytes (zero) e nenhuma linha.
+    #[tokio::test]
+    async fn command_progress_heartbeats_carry_bytes_and_redacted_last_line() {
+        let (sink, scope) = redacting();
+        let run = scope.with_heartbeat(Duration::from_millis(20)).begin();
+        let progress = CommandProgress::new();
+        run.track_command_progress("npm test", &progress, Some(Duration::from_secs(300)), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            progress.push(format!("{} chave {SECRET} passo final\n", "y".repeat(300)).as_bytes());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+        let beats: Vec<_> = sink.0.events().into_iter().filter(|e| e.kind == ActivityKind::Heartbeat).collect();
+        assert!(beats.len() >= 3, "{beats:?}");
+        assert_eq!((beats[0].output_bytes, beats[0].last_line.as_deref()), (Some(0), None));
+        let last = beats.last().cloned().unwrap_or_else(|| beats[0].clone());
+        assert!(last.output_bytes.is_some_and(|b| b > 300));
+        let line = last.last_line.unwrap_or_default();
+        assert!(line.len() <= MAX_COMMAND_BYTES && line.ends_with("passo final"), "{line}");
+        assert!(!SECRET.as_bytes().windows(6).any(|w| line.as_bytes().windows(6).any(|x| x == w)), "{line}");
+        // O heartbeat sem progresso (comando sem captura) segue sem campos.
+        assert!(sink.0.events().iter().filter(|e| e.kind != ActivityKind::Heartbeat).all(|e| e.output_bytes.is_none() && e.last_line.is_none()));
     }
 
     /// Spec 114 T04: a chamada longa ao modelo emite `model`, heartbeats no ritmo do escopo (nunca

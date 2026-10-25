@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::compose::{controlled_env, is_docker_failure, ComposeCall, ComposeOutput, ComposeRunner, RealComposeRunner};
+use super::progress::CommandProgress;
 
 /// Timeout padrão de uma execução (a primeira pode baixar a imagem).
 pub const BROWSER_TIMEOUT: Duration = Duration::from_secs(600);
@@ -108,6 +109,11 @@ impl BrowserTests {
         self
     }
 
+    /// Limite de tempo de cada execução dos testes (sem o download da imagem, que tem o próprio).
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn with_pull_timeout(mut self, timeout: Duration) -> Self {
         self.pull_timeout = timeout;
         self
@@ -134,6 +140,12 @@ impl BrowserTests {
     /// Roda `command` no container. Bloqueante: chame em `spawn_blocking`. `Ok(texto)` sempre
     /// que o resultado vai ao modelo (inclusive "indisponível"); `Err` = erro de uso.
     pub fn run(&self, worktree: &Path, command: &str) -> Result<String, String> {
+        self.run_watched(worktree, command, None)
+    }
+
+    /// Como [`Self::run`], com o progresso da saída dos testes em `progress` (spec 123 T01). O
+    /// download da imagem não entra no progresso: só a execução do comando.
+    pub fn run_watched(&self, worktree: &Path, command: &str, progress: Option<&Arc<CommandProgress>>) -> Result<String, String> {
         if command.trim().is_empty() {
             return Err("comando vazio".into());
         }
@@ -171,7 +183,11 @@ impl BrowserTests {
         let me = fs::metadata("/proc/self").ok().map(|m| (m.uid(), m.gid()));
         let args = run_args(&name, worktree, &version, command, me);
         self.active.lock().unwrap_or_else(PoisonError::into_inner).insert(name.clone());
-        let out: ComposeOutput = match self.runner.run(&self.docker_call(args, worktree, self.timeout)) {
+        // Spec 123 T02: imagem pronta (o download tem limite próprio); o relógio dos testes começa.
+        if let Some(p) = progress {
+            p.mark_started();
+        }
+        let out: ComposeOutput = match self.runner.run_watched(&self.docker_call(args, worktree, self.timeout), progress) {
             Ok(o) => o,
             Err(_) => {
                 self.remove(&name, worktree);
@@ -256,6 +272,29 @@ mod tests {
         fs::create_dir_all(&d).expect("tmp");
         fs::write(d.join("package.json"), format!(r#"{{"devDependencies":{{"@playwright/test":"{version}"}}}}"#)).expect("w");
         d
+    }
+
+    /// Spec 123 T02: o relógio do comando (largada do progresso) só começa no `docker run` dos
+    /// testes; a conferência e o download da imagem, com limite próprio, ficam de fora.
+    #[test]
+    fn progress_starts_only_at_the_tests_run_not_during_the_image_pull() {
+        struct Probe(Arc<CommandProgress>, Mutex<Vec<(String, bool)>>);
+        impl ComposeRunner for Probe {
+            fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+                self.1.lock().unwrap_or_else(PoisonError::into_inner).push((call.args[..2].join(" "), self.0.has_started()));
+                // Imagem ausente: a conferência falha e o download acontece.
+                let code = if call.args[..2] == ["image", "inspect"] { 1 } else { 0 };
+                Ok(ComposeOutput { code: Some(code), output: String::new(), timed_out: false })
+            }
+        }
+        let d = tree("1.49.1");
+        let progress = Arc::new(CommandProgress::gated());
+        let probe = Arc::new(Probe(progress.clone(), Mutex::default()));
+        let text = BrowserTests::new("p1", probe.clone()).run_watched(&d, "npx playwright test", Some(&progress)).expect("run");
+        assert!(text.starts_with("exit: 0"), "{text}");
+        let seen = probe.1.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let started = |prefix: &str| seen.iter().find(|(a, _)| a.starts_with(prefix)).map(|(_, s)| *s);
+        assert_eq!((started("image inspect"), started("pull"), started("run --rm")), (Some(false), Some(false), Some(true)), "{seen:?}");
     }
 
     #[test]

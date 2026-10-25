@@ -145,6 +145,145 @@ describe("comando longo (heartbeat)", () => {
   });
 });
 
+describe("sinal de vida real do comando e da rodada de testes (spec 123 T01)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("comando de 9,5 min com heartbeat a cada 20 s: nunca some, e cada sinal traz os bytes e a última linha", () => {
+    const store = createAppStore();
+    const base = { agent: "developer", task_id: "T03", activity_id: "a1" };
+    store.applyEvent(activity({ ...base, kind: "start" }));
+    store.applyEvent(activity({ ...base, kind: "tool", text: "rodando npx playwright test --workers=1" }));
+    store.applyEvent(activity({ ...base, kind: "command", text: "npx playwright test --workers=1", command_started_at: 1_000_000 }));
+    for (let i = 1; i <= 28; i++) {
+      // A tela poda a lista entre os sinais, como o relógio da janela faz.
+      vi.advanceTimersByTime(10_000);
+      store.pruneActivities(P, Date.now());
+      vi.advanceTimersByTime(10_000);
+      store.applyEvent(activity({ ...base, kind: "heartbeat", output_bytes: i * 512, last_line: `ok ${i} cena.spec.ts` }));
+      const a = store.getState().activities[P]?.[0];
+      expect(a?.command).toBe("npx playwright test --workers=1");
+      expect(a).toMatchObject({ commandBytes: i * 512, commandLine: `ok ${i} cena.spec.ts` });
+    }
+    // Um heartbeat sem progresso (servidor antigo) mantém o último conhecido.
+    store.applyEvent(activity({ ...base, kind: "heartbeat" }));
+    expect(store.getState().activities[P]?.[0]).toMatchObject({ commandBytes: 28 * 512, commandLine: "ok 28 cena.spec.ts" });
+    store.applyEvent(activity({ ...base, kind: "command_end" }));
+    const done = store.getState().activities[P]?.[0];
+    expect(done?.command).toBeUndefined();
+    expect(done?.commandBytes).toBeUndefined();
+    expect(done?.commandLine).toBeUndefined();
+  });
+
+  it("sem heartbeat por mais de 60 s o comando some (comportamento de antes, só nesse caso)", () => {
+    const store = createAppStore();
+    const base = { agent: "developer", task_id: "T03", activity_id: "a1" };
+    store.applyEvent(activity({ ...base, kind: "command", text: "npm test", command_started_at: 1_000_000 }));
+    store.applyEvent(activity({ ...base, kind: "heartbeat", output_bytes: 10, last_line: "x" }));
+    vi.advanceTimersByTime(COMMAND_STALE_MS + 1);
+    store.pruneActivities(P, Date.now());
+    expect(store.getState().activities[P]?.[0]?.command).toBeUndefined();
+    expect(store.getState().activities[P]?.[0]?.commandLine).toBeUndefined();
+  });
+
+  it("o heartbeat da rodada de testes atualiza o progresso do agente tests", () => {
+    const store = createAppStore();
+    const base = { agent: "tests", task_id: "T03", activity_id: "T03-1-4" };
+    store.applyEvent(activity({ ...base, kind: "command", text: "npm test", command_started_at: 1_000_000, stage: "Testes · tentativa 1", stage_code: "tests", stage_params: { attempt: 1 } }));
+    vi.advanceTimersByTime(20_000);
+    store.applyEvent(activity({ ...base, kind: "heartbeat", output_bytes: 2048, last_line: "Tests: 3 passed" }));
+    expect(store.getState().activities[P]?.[0]).toMatchObject({ command: "npm test", commandBytes: 2048, commandLine: "Tests: 3 passed", stageCode: { code: "tests", params: { attempt: 1 } } });
+  });
+
+  it("reidratação: a rodada de testes vem do instantâneo com o progresso e a etapa; ausente dele, encerra", () => {
+    const now = 1_000_000;
+    const merged = mergeServerActivities(
+      [],
+      [
+        {
+          agent: "tests",
+          task_id: "T03",
+          spec_id: null,
+          activity_id: "T03-1-4",
+          reasoning: "",
+          text: "",
+          tool: "",
+          command: "npx playwright test",
+          command_started_at: now - 300_000,
+          stage: "Testes · tentativa 1",
+          stage_code: "tests",
+          stage_params: { attempt: 1 },
+          output_bytes: 51_200,
+          last_line: "ok 7 cena.spec.ts",
+          age_ms: 4_000,
+        },
+      ],
+      now,
+    );
+    expect(merged[0]).toMatchObject({
+      agent: "tests",
+      command: "npx playwright test",
+      commandStartedAt: now - 300_000,
+      commandBytes: 51_200,
+      commandLine: "ok 7 cena.spec.ts",
+      stageCode: { code: "tests", params: { attempt: 1 } },
+    });
+    // O servidor é a verdade também para a rodada: sem ela no instantâneo, o comando local encerra.
+    const later = mergeServerActivities(merged, [], now + 60_000);
+    expect(later[0]?.command).toBeUndefined();
+  });
+});
+
+describe("limite de tempo da rodada de testes (spec 123 T02)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("o limite vem no início, segue nos sinais de vida e sai no fim; valor inválido é ignorado", () => {
+    const store = createAppStore();
+    const base = { agent: "tests", task_id: "T03", activity_id: "T03-1-4" };
+    store.applyEvent(activity({ ...base, kind: "command", text: "npx playwright test", command_started_at: 1_000_000, command_limit_ms: 600_000 }));
+    expect(store.getState().activities[P]?.[0]?.commandLimitMs).toBe(600_000);
+    vi.advanceTimersByTime(20_000);
+    store.applyEvent(activity({ ...base, kind: "heartbeat", output_bytes: 10, last_line: "ok 1" }));
+    expect(store.getState().activities[P]?.[0]?.commandLimitMs).toBe(600_000);
+    store.applyEvent(activity({ ...base, kind: "end" }));
+    expect(store.getState().activities[P]?.[0]?.commandLimitMs).toBeUndefined();
+    // Uma rodada nova sem limite (ou com valor inválido) não herda o anterior.
+    store.applyEvent(activity({ ...base, activity_id: "T03-2-5", kind: "command", text: "npm test", command_started_at: 1_020_000, command_limit_ms: -5 }));
+    expect(store.getState().activities[P]?.[0]?.commandLimitMs).toBeUndefined();
+  });
+
+  it("reidratação: o limite vem do instantâneo", () => {
+    const now = 1_000_000;
+    const merged = mergeServerActivities(
+      [],
+      [
+        {
+          agent: "tests",
+          task_id: "T03",
+          spec_id: null,
+          activity_id: "T03-1-4",
+          reasoning: "",
+          text: "",
+          tool: "",
+          command: "npx playwright test",
+          command_started_at: now - 420_000,
+          command_limit_ms: 600_000,
+          age_ms: 4_000,
+        },
+      ],
+      now,
+    );
+    expect(merged[0]).toMatchObject({ command: "npx playwright test", commandLimitMs: 600_000 });
+  });
+});
+
 describe("chamada longa ao modelo (spec 114 T04)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
