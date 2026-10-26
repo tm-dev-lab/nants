@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { en } from "../i18n/en";
 import { looksPortuguese } from "../i18n/ptLeftovers";
 import { ptBR } from "../i18n/ptBR";
-import { deviceAuth, getConfig } from "./client";
+import { MAX_NEXT_BYTES, deviceAuth, entryLocation, getConfig, safeNext } from "./client";
 import { isDeviceEvent, publishDeviceEvent, subscribeDeviceEvents } from "./deviceEvents";
 import {
   closeDeviceCode,
@@ -120,6 +120,43 @@ describe("aparelho sem autorização", () => {
     stub(401, { error: "x" });
     await getConfig();
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  function fakeLocation(pathname: string, search: string, hash: string) {
+    vi.spyOn(deviceAuth, "here").mockReturnValue({ pathname, search, hash });
+    return vi.spyOn(deviceAuth, "go").mockImplementation(() => undefined);
+  }
+
+  it("leva a página atual como next, percent-encodada (spec 128)", () => {
+    const assign = fakeLocation("/projects/abc", "?tab=chat", "#fim");
+    deviceAuth.onDeviceRequired();
+    expect(assign).toHaveBeenCalledWith(`/connect?next=${encodeURIComponent("/projects/abc?tab=chat#fim")}`);
+  });
+
+  it("na raiz, em /connect ou com caminho fora da regra, sem next", () => {
+    let assign = fakeLocation("/", "", "");
+    deviceAuth.onDeviceRequired();
+    expect(assign).toHaveBeenCalledWith("/connect");
+    vi.restoreAllMocks();
+    assign = fakeLocation("/connect", "?next=%2Fx", "");
+    deviceAuth.onDeviceRequired();
+    expect(assign).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+    assign = fakeLocation(`/${"a".repeat(MAX_NEXT_BYTES)}`, "", "");
+    deviceAuth.onDeviceRequired();
+    expect(assign).toHaveBeenCalledWith("/connect");
+  });
+
+  it("safeNext: a mesma regra do servidor", () => {
+    for (const ok of ["/", "/projects/abc", "/x?a=1#sec", "/connectx", "/%2F%2Fevil"]) expect(safeNext(ok)).toBe(ok);
+    for (const bad of ["", "//evil", "http://evil.com", "javascript:alert(1)", "x/y", "\\evil", "/\\evil", "/\t/evil", "/a b", "/connect", "/connect?next=/x", "/connect#x"]) {
+      expect(safeNext(bad)).toBeNull();
+    }
+    expect(safeNext(null)).toBeNull();
+    expect(safeNext(`/${"a".repeat(MAX_NEXT_BYTES - 1)}`)).not.toBeNull();
+    expect(safeNext(`/${"a".repeat(MAX_NEXT_BYTES)}`)).toBeNull();
+    expect(entryLocation("/p?a=1&b=2#h")).toBe("/connect?next=%2Fp%3Fa%3D1%26b%3D2%23h");
+    expect(entryLocation("//evil")).toBe("/connect");
   });
 });
 

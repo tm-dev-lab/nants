@@ -30,6 +30,7 @@ export const APPROVE_REASON_MESSAGES: Readonly<Record<string, string>> = localiz
   docker_unavailable: "approve.dockerUnavailable",
   base_dirty: "approve.reason.base_dirty",
   architect_turn_active: "approve.reason.architect_turn_active",
+  plan_review_running: "approve.reason.plan_review_running",
   plan_without_tasks: "approve.reason.plan_without_tasks",
 });
 

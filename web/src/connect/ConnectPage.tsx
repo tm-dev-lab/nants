@@ -4,14 +4,18 @@
  *
  * - A logo e, logo depois dela, o slogan (regra de identidade); o pedido do código de 6 dígitos,
  *   numérico (`inputmode`), que vai para `POST /api/devices/pair`. Acertou: o servidor grava o
- *   cookie e a página vai para `/`. Errou: a mensagem do caso (código errado com as tentativas que
+ *   cookie e a página vai para o `?next=` validado (spec 128, a página em que o aparelho estava
+ *   quando foi negado), senão para `/`. Errou: a mensagem do caso (código errado com as tentativas que
  *   restam, código invalidado, nenhum código ativo, aguarde um segundo).
  * - `?reason=link_invalid`: o link de entrada do terminal expirou ou já foi usado; a página explica
  *   como obter outro, sem expor nada.
- * - Nenhuma outra chamada à API: sem dispositivo, todas respondem 401.
+ * - Ao abrir, uma única consulta (`GET /api/devices`) confere se o aparelho já está autorizado
+ *   (por exemplo, o cookie voltou depois de um refresh): se estiver, a página vai para o mesmo
+ *   destino, sem pedir código. Nenhuma outra chamada à API: sem dispositivo, todas respondem 401.
  */
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
-import { pairDevice } from "../api/devices";
+import { safeNext } from "../api/client";
+import { listDevices, pairDevice } from "../api/devices";
 import { NantsSymbol } from "../desktop/topbar/BrandMark";
 import { BRAND_NAME, BRAND_SLOGAN } from "../desktop/brand";
 import { Icon } from "../desktop/Icon";
@@ -24,9 +28,14 @@ import "./connect.css";
 
 /** Navegação depois do acerto (substituível nos testes). */
 export const connectEnvironment = {
-  enter: (): void => window.location.assign("/"),
+  enter: (to: string): void => window.location.replace(to),
   search: (): string => window.location.search,
 };
+
+/** Destino depois da entrada: o `?next=` aceito por {@link safeNext}, senão `/`. */
+export function entryTarget(search: string): string {
+  return safeNext(new URLSearchParams(search).get("next")) ?? "/";
+}
 
 /** Motivo vindo do servidor na URL (`?reason=link_invalid`). */
 export function entryReason(search: string): "link_invalid" | null {
@@ -41,11 +50,24 @@ export function ConnectPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const inputId = useId();
   const errorId = useId();
-  const linkInvalid = entryReason(connectEnvironment.search()) === "link_invalid";
+  const search = connectEnvironment.search();
+  const linkInvalid = entryReason(search) === "link_invalid";
+  const target = entryTarget(search);
   // Sem a preferência salva (a API pede dispositivo), o tema segue o sistema.
   const theme = useResolvedTheme("auto");
   const variables = useMemo(() => themeVariables(theme) as CSSProperties, [theme]);
   useEffect(() => applyThemeMeta(theme), [theme]);
+
+  // Já autorizado (o cookie voltou): segue para o destino sem pedir código.
+  useEffect(() => {
+    let alive = true;
+    void listDevices().then((result) => {
+      if (alive && result.ok) connectEnvironment.enter(target);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [target]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -59,7 +81,7 @@ export function ConnectPage() {
     setError(null);
     const result = await pairDevice(code);
     if (result.ok) {
-      connectEnvironment.enter();
+      connectEnvironment.enter(target);
       return;
     }
     setSending(false);

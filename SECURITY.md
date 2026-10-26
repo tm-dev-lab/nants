@@ -58,8 +58,19 @@ authorized device:
 - a device joins with the single-use sign-in link printed in the terminal (10 minutes) or with a
   6-digit code shown on a device that is already authorized (changes every 60 seconds, single use,
   only while the add window is open, up to 10 minutes, 5 wrong attempts per window);
-- the device keeps a long random token in an `HttpOnly`, `SameSite=Strict` cookie; Nants stores
+- the device keeps a long random token in an `HttpOnly`, `SameSite=Lax` cookie; Nants stores
   only its hash, in a file readable only by your user; revoking a device cuts its sessions at once;
+- the cookie is `Lax`, not `Strict`, so that a refresh or a tab opened from another app, the
+  history, a bookmark or a restored tab keeps the device signed in. With `Lax`, the browser sends
+  the cookie only on top-level `GET` navigations; `POST` requests and calls from other sites
+  (`fetch`, forms, images, frames) still go without it. Writes stay protected by the `Host` and
+  `Origin` check, which refuses every `POST`, `PUT`, `PATCH` and `DELETE` from another site, and no
+  `GET` route changes anything without its own secret in the address (`/pair?t=` and
+  `/auth/finish` with `state`). A test lists every `GET` route and fails on a new one that was not
+  classified, or on a route registered in a way it cannot see;
+- when a page is refused, Nants sends you to the sign-in screen and, after you sign in, back to the
+  page you were on (only a path inside Nants is accepted). The terminal logs why the page was
+  refused, without the token or the cookie;
 - on WSL in NAT mode, the Windows port redirect must point to the WSL IP, never to `127.0.0.1`.
   Pointing it to `127.0.0.1` would make other devices reach Nants as loopback, without a device.
   The script shown in Nants always uses the WSL IP.
@@ -86,8 +97,9 @@ A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and ha
   by the terminal entry link (marked `this_computer` in `devices.json` when it is created, never by
   its name); on WSL with NAT, that browser arrives with the Windows address. Devices added by code
   count as remote.
-- **Return page:** the return comes from another site, so the browser does not send the
-  `SameSite=Strict` device cookie with it. `/auth/callback` only answers a pending `state` with a
+- **Return page:** the return comes from another site. With the `SameSite=Lax` device cookie, the
+  browser sends the cookie on this top-level `GET`, but the flow does not depend on it, and the
+  callback stays open without a device. `/auth/callback` only answers a pending `state` with a
   minimal page (no script, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, no external
   resource) that consumes nothing and moves on, from Nants itself, to `/auth/finish`, which gets
   the cookie and checks the device before it uses the `state` and exchanges the code.

@@ -1,26 +1,31 @@
 /*
  * Página de entrada (spec 112, T02): logo e slogan logo depois dela, o campo numérico do código,
- * o acerto (vai para `/`), as mensagens de erro de cada caso e o link expirado.
+ * o acerto (vai para `/` ou para o `next` validado, spec 128), as mensagens de erro de cada caso,
+ * o link expirado e o aparelho que já está autorizado.
  */
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deviceAuth } from "../api/client";
 import { BRAND_NAME, BRAND_SLOGAN } from "../desktop/brand";
 import { findForbiddenGlyphs } from "../desktop/glyphs";
 import { setLanguage } from "../i18n";
 import { installFetch, type RouteReply } from "../test-utils";
-import { ConnectPage, connectEnvironment, entryReason } from "./ConnectPage";
+import { ConnectPage, connectEnvironment, entryReason, entryTarget } from "./ConnectPage";
 
 const original = { ...connectEnvironment };
 
 beforeEach(() => {
   connectEnvironment.enter = vi.fn();
   connectEnvironment.search = () => "";
+  // A consulta de abertura recebe 401 aqui; a navegação do cliente fica de fora.
+  vi.spyOn(deviceAuth, "onDeviceRequired").mockImplementation(() => undefined);
 });
 
 afterEach(() => {
   cleanup();
   Object.assign(connectEnvironment, original);
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   setLanguage("pt-BR", { persist: false, storage: null });
 });
 
@@ -30,12 +35,15 @@ async function flush(): Promise<void> {
   });
 }
 
-function setup(reply: (body: unknown) => RouteReply) {
+function setup(reply: (body: unknown) => RouteReply, authorized = false) {
   const bodies: unknown[] = [];
   const fetchMock = installFetch((method, url, body) => {
     if (method === "POST" && url === "/api/devices/pair") {
       bodies.push(body);
       return reply(body);
+    }
+    if (authorized && method === "GET" && url === "/api/devices") {
+      return { status: 200, body: { devices: [], current: "0011223344556677" } };
     }
     return { status: 401, body: { error: "x", code: "device_required" } };
   });
@@ -56,7 +64,7 @@ async function type(code: string) {
 }
 
 describe("página de entrada (112/T02)", () => {
-  it("logo, slogan logo depois dela e o campo numérico", () => {
+  it("logo, slogan logo depois dela e o campo numérico", async () => {
     const { fetchMock } = setup(() => ({ status: 200 }));
     const main = screen.getByRole("main");
     const brand = main.querySelector("[data-brand]");
@@ -69,8 +77,10 @@ describe("página de entrada (112/T02)", () => {
     expect(input().getAttribute("autocomplete")).toBe("one-time-code");
     expect(main.querySelector("[data-connect-link-invalid]")).toBeNull();
     expect(findForbiddenGlyphs(main)).toEqual([]);
-    // Nenhuma chamada à API só por abrir a página.
-    expect(fetchMock).not.toHaveBeenCalled();
+    // Só a consulta de abertura (já autorizado?); sem dispositivo, a página fica.
+    await flush();
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual(["/api/devices"]);
+    expect(connectEnvironment.enter).not.toHaveBeenCalled();
   });
 
   it("só dígitos (colar com espaço funciona) e acerto vai para /", async () => {
@@ -83,6 +93,29 @@ describe("página de entrada (112/T02)", () => {
     await flush();
     expect(bodies).toEqual([{ code: "123456" }]);
     expect(connectEnvironment.enter).toHaveBeenCalledTimes(1);
+    expect(connectEnvironment.enter).toHaveBeenCalledWith("/");
+  });
+
+  it("acerto volta para o next validado (spec 128)", async () => {
+    connectEnvironment.search = () => `?next=${encodeURIComponent("/projects/abc?tab=chat#fim")}`;
+    setup(() => ({ status: 200, body: { device: { id: "0011223344556677", name: "Safari no iPhone", created_at: 1, last_seen: 1, this_computer: false, current: true } } }));
+    await type("123456");
+    expect(connectEnvironment.enter).toHaveBeenCalledWith("/projects/abc?tab=chat#fim");
+  });
+
+  it("já autorizado: vai para o next sem pedir código", async () => {
+    connectEnvironment.search = () => "?next=%2Fsettings";
+    setup(() => ({ status: 200 }), true);
+    await flush();
+    expect(connectEnvironment.enter).toHaveBeenCalledWith("/settings");
+  });
+
+  it("next fora da regra vira a raiz", () => {
+    for (const bad of ["//evil.com", "http://evil.com", "%5Cevil", "", "%2Fconnect", "javascript:alert(1)", "%2F%09%2Fevil"]) {
+      expect(entryTarget(`?next=${bad}`)).toBe("/");
+    }
+    expect(entryTarget("")).toBe("/");
+    expect(entryTarget("?next=%2Fx%3Fa%3D1")).toBe("/x?a=1");
   });
 
   it("menos de 6 dígitos: pede os 6, sem chamar a API", async () => {

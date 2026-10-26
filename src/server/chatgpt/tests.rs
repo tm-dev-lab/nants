@@ -332,7 +332,7 @@ fn passage_target(html: &str) -> String {
 }
 
 /// O retorno como o navegador faz (spec 118): o `GET /auth/callback` chega SEM cookie (a volta
-/// vem de outro site, e o cookie é `SameSite=Strict`); a página de passagem leva à conclusão, que
+/// vem de outro site, e o navegador pode não mandar o cookie); a página de passagem leva à conclusão, que
 /// chega com o cookie dado. Sem passagem (recusa direta do retorno), devolve a resposta do retorno.
 async fn browser_return(e: &Env, params: &[(&str, &str)], peer: &str, cookie: Option<&str>) -> Response<Body> {
     let resp = send(&e.state, req(Method::GET, &callback_uri(params), peer, None, None)).await;

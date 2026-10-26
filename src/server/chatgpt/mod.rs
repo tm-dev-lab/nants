@@ -9,11 +9,12 @@
 //!   uso único e fica ligada ao dispositivo que a iniciou (quando não veio de loopback). `local` vale
 //!   para o loopback e para o dispositivo do link de entrada do terminal (spec 117).
 //! - **Retorno** (`GET /auth/callback`, spec 118): é uma página de passagem. A volta vem de outro
-//!   site (`auth.openai.com`), e nessa navegação o navegador não manda o cookie `SameSite=Strict`
-//!   do dispositivo. Com um `state` pendente, a rota responde 200 com uma página mínima, sem
+//!   site (`auth.openai.com`); com o cookie `SameSite=Strict` de antes da spec 128, essa navegação
+//!   chegava sem ele, e com o `Lax` de hoje ele pode vir ou não (navegador, extensão, aba nova), por
+//!   isso a passagem continua. Com um `state` pendente, a rota responde 200 com uma página mínima, sem
 //!   consumir nada e sem exigir cookie, que navega na hora (meta refresh, sem script; com o link
 //!   "Continuar" de reserva) para a conclusão na mesma origem. Uma navegação iniciada por uma
-//!   página do próprio site leva o cookie Strict. A página leva `Referrer-Policy: no-referrer`,
+//!   página do próprio site leva o cookie. A página leva `Referrer-Policy: no-referrer`,
 //!   `Cache-Control: no-store`, uma CSP sem script e nenhum recurso de fora.
 //! - **Conclusão** (`GET /auth/finish`): confere quem pode concluir antes de consumir o `state`
 //!   (o dispositivo que iniciou, pelo cookie, ou o loopback), troca o código (form-urlencoded, sem
@@ -893,7 +894,7 @@ fn passage_page(q: &CallbackQuery, lang: crate::i18n::Lang) -> Response {
 }
 
 /// `GET /auth/callback`: página de passagem (spec 118). Não exige cookie, não consome o `state` e
-/// não troca o código: a volta vem de outro site e chega sem o cookie `SameSite=Strict`. Com um
+/// não troca o código: a volta vem de outro site e pode chegar sem o cookie do dispositivo. Com um
 /// `state` pendente, devolve a página que segue para [`FINISH_PATH`] a partir da própria origem;
 /// sem ele, volta para a interface com o erro.
 pub async fn get_callback(

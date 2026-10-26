@@ -134,6 +134,14 @@ const REASON_PLAN_WITHOUT_TASKS: &str = "plan_without_tasks";
 /// Aprovação recusada enquanto o Arquiteto ainda elabora o plano (spec 080 T01).
 const REASON_ARCHITECT_TURN: &str = "architect_turn_active";
 const ARCHITECT_TURN_MSG: &str = "architect_turn_active";
+/// Aprovação recusada enquanto o Revisor revisa o plano (spec 128 T04: a renumeração nunca corre
+/// junto com a revisão).
+const REASON_PLAN_REVIEW_RUNNING: &str = "plan_review_running";
+const PLAN_REVIEW_RUNNING_MSG: &str = "plan_review_running";
+/// Falha ao gravar a renumeração das tarefas (spec 128 T04): tudo é desfeito.
+const RENUMBER_FAILED: &str = "plan_renumber_failed";
+/// Código da linha da renumeração na Conversa (`system.<código>` nos dicionários).
+pub const RENUMBERED_CODE: &str = "plan.renumbered";
 const REASON_INVALID_TASK: &str = "invalid_task";
 const REASON_DEP_MISSING: &str = "dependency_missing";
 const REASON_DEP_CYCLE: &str = "dependency_cycle";
@@ -1048,6 +1056,10 @@ async fn launch(
         return Err(conflict_reason(ARCHITECT_TURN_MSG, REASON_ARCHITECT_TURN));
     }
     let root = PathBuf::from(&project.path);
+    // Spec 128 T04: nem a aprovação nem a renumeração correm junto com a revisão do plano.
+    if mode == Mode::Approve && super::plan_review::review_running(&root, &spec_id) {
+        return Err(conflict_reason(PLAN_REVIEW_RUNNING_MSG, REASON_PLAN_REVIEW_RUNNING));
+    }
     let scan_root = root.clone();
     let sid = spec_id.clone();
     let inspected = blocking(move || inspect(&scan_root, &sid, mode)).await?;
@@ -1094,6 +1106,13 @@ async fn launch(
     let secrets = state.secret_set().await;
     // Idioma dos commits do Nants na base (spec 115 T04, C-09): só o texto depois do prefixo.
     let commit_lang = state.project_lang(&project_id).get();
+    // Spec 128 T04: renumeração na ordem de execução, só calculada aqui (nada gravado ainda).
+    let renumbering = if mode == Mode::Approve {
+        let (plan_root, sid, spec, files) = (root.clone(), spec_id.clone(), inspected.spec.clone(), inspected.files.clone());
+        blocking(move || plan_renumbering(&plan_root, &sid, &spec, &files, commit_lang)).await?
+    } else {
+        None
+    };
     if mode == Mode::Resume {
         // Retomar com o limite ainda atingido só pausaria de novo: exige aumentar ou remover.
         let (budget_root, budget_spec, pricing) = (root.clone(), spec_id.clone(), cfg.pricing.clone());
@@ -1193,21 +1212,57 @@ async fn launch(
     // ([`Restore`]) é armada com o texto original e o gravado de cada arquivo.
     let mut restore = match mode {
         Mode::Approve => {
-            let mut marked = inspected.spec.clone();
+            // Spec 128 T04: com renumeração, a spec já vem com as referências trocadas e a seção.
+            let mut marked = renumbering.as_ref().map_or_else(|| inspected.spec.clone(), |r| r.spec.clone());
             marked.frontmatter.status = SpecStatus::InProgress;
             let marked_text = marked.render().map_err(|_| internal(INTERNAL))?;
-            let original = inspected.raw.clone();
-            let write_root = root.clone();
-            let sid = spec_id.clone();
-            let written = marked_text.clone();
-            // SPEC_CHANGED aqui ainda não tem efeito a desfazer.
-            blocking(move || mark_in_progress(&write_root, &sid, &original, &written)).await?;
+            let renumbered = renumbering.as_ref().map(|r| r.entries.clone()).unwrap_or_default();
+            if !renumbered.is_empty() {
+                // Conferência sem efeito: tarefa ou registro alterado desde a inspeção recusa antes.
+                let (check_root, checked) = (root.clone(), renumbered.clone());
+                blocking(move || check_unchanged_as(&check_root, &checked, SPEC_CHANGED)).await?;
+            }
             let entry = Entry {
                 rel: spec_rel(&spec_id),
                 original: inspected.raw.clone(),
-                marked: marked_text,
+                marked: marked_text.clone(),
             };
-            Restore::new(&root, vec![entry], state.events(), &project_id)
+            let mut entries = vec![entry];
+            entries.extend(renumbered.iter().cloned());
+            // Spec 128 T05 (critério 12): com renumeração, o diário com os originais vai para o disco
+            // antes da primeira escrita; uma queda abrupta no meio é desfeita na subida do servidor.
+            let journal = renumbering.is_some();
+            if journal {
+                let (journal_root, sid, journaled) = (root.clone(), spec_id.clone(), entries.clone());
+                blocking(move || write_renumber_journal(&journal_root, &sid, &journaled)).await?;
+            }
+            let original = inspected.raw.clone();
+            let write_root = root.clone();
+            let sid = spec_id.clone();
+            let written = marked_text;
+            // SPEC_CHANGED aqui ainda não tem efeito a desfazer (só o diário, apagado aqui).
+            let marked_result = blocking(move || mark_in_progress(&write_root, &sid, &original, &written)).await;
+            if let Err(rejection) = marked_result {
+                if journal {
+                    let _ = safe_fs::remove_regular(&root, &renumber_journal_rel(&spec_id));
+                }
+                return Err(rejection);
+            }
+            // Armada antes das escritas da renumeração: a falha em qualquer uma desfaz todas, e a spec.
+            let mut armed = Restore::new(&root, entries, state.events(), &project_id);
+            if journal {
+                armed.journal = Some(renumber_journal_rel(&spec_id));
+                let write_root = root.clone();
+                let sid = spec_id.clone();
+                // O diário só sai depois da última escrita; sem conseguir apagá-lo, a aprovação é
+                // desfeita (um diário esquecido desfaria na próxima subida uma spec em execução).
+                blocking(move || {
+                    write_entries(&write_root, &renumbered, RENUMBER_FAILED)?;
+                    remove_renumber_journal(&write_root, &sid)
+                })
+                .await?;
+            }
+            armed
         }
         Mode::Resume => {
             let entries = inspected.resets.clone();
@@ -1375,7 +1430,84 @@ async fn launch(
         return Err(shutting_down());
     }
     restore.disarm();
+    // Spec 128 T04: a linha da renumeração na Conversa, só com a aprovação concluída.
+    if let Some(r) = renumbering {
+        let mut params = Map::new();
+        params.insert("map".into(), json!(r.map_text));
+        super::chat::system_notice(&state, &project_id, root.clone(), RENUMBERED_CODE, params).await;
+    }
     Ok(())
+}
+
+/// Renumeração calculada na aprovação (spec 128 T04): a spec com as referências trocadas e a
+/// seção "Renumeração", e cada arquivo a regravar (tarefas e registros locais do plano) com o texto
+/// lido e o novo.
+struct Renumbering {
+    spec: Spec,
+    entries: Vec<Entry>,
+    map_text: String,
+}
+
+/// Registros locais do plano traduzidos junto: `issues`, `rounds` e `points` da revisão e as linhas
+/// do resumo de mudanças.
+const RENUMBER_RECORDS: [&str; 2] = [super::plan_review::PLAN_REVIEW_FILE, super::plan_changes::PLAN_CHANGES_FILE];
+
+/// Calcula a renumeração sem gravar nada. `None` quando a ordem de execução já coincide com os ids
+/// (ou os ids não são `T` + 2 dígitos). As tarefas trocam de conteúdo entre os mesmos arquivos (o
+/// conjunto de ids não muda), então "renomear" é regravar cada arquivo com a tarefa que passa a ter
+/// aquele id. Registro local ausente ou com JSON inválido fica como está; registro ilegível
+/// (symlink, não regular) recusa a aprovação.
+fn plan_renumbering(
+    root: &Path,
+    spec_id: &str,
+    spec: &Spec,
+    files: &[TaskFile],
+    lang: crate::i18n::Lang,
+) -> Result<Option<Renumbering>, Rejection> {
+    use crate::sdd::execution_order as order;
+    let plan: Vec<(String, Vec<String>)> =
+        files.iter().map(|f| (f.task.frontmatter.id.clone(), f.task.frontmatter.depends_on.clone())).collect();
+    let Ok(ids) = order::execution_order(&plan) else {
+        return Ok(None);
+    };
+    let Some(map) = order::renumber_map(&ids) else {
+        return Ok(None);
+    };
+    let failed = || internal(RENUMBER_FAILED);
+    let tasks_rel = format!("{SPECS_DIR}/{spec_id}/{TASKS_DIR}");
+    let mut entries = Vec::new();
+    for file in files {
+        let renumbered = order::renumber_task(&file.task, &map);
+        let rel = format!("{tasks_rel}/{}.md", renumbered.frontmatter.id);
+        let target = files.iter().find(|f| f.rel == rel).ok_or_else(failed)?;
+        let marked = renumbered.render().map_err(|_| failed())?;
+        if marked != target.raw {
+            entries.push(Entry { rel, original: target.raw.clone(), marked });
+        }
+    }
+    for name in RENUMBER_RECORDS {
+        let rel = format!("{SPECS_DIR}/{spec_id}/{name}");
+        let raw = match safe_fs::read_regular(root, &rel, MAX_READ_BYTES) {
+            Ok(raw) => raw,
+            Err(SafeFsError::Missing) => continue,
+            Err(_) => return Err(failed()),
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        order::renumber_json(&mut value, &map);
+        let marked = serde_json::to_string_pretty(&value).map_err(|_| failed())?;
+        if marked != raw {
+            entries.push(Entry { rel, original: raw, marked });
+        }
+    }
+    let map_text = order::map_text(&map);
+    let section = format!(
+        "## {}\n\n{}",
+        crate::i18n::tr(lang, "runs.renumber.heading", &[]),
+        crate::i18n::tr(lang, "runs.renumber.body", &[("map", &map_text)])
+    );
+    Ok(Some(Renumbering { spec: order::renumber_spec(spec, &map, &section), entries, map_text }))
 }
 
 /// `true` quando o shutdown já foi acionado.
@@ -1395,11 +1527,130 @@ const RESTORE_ERROR_REASON: &str = "error";
 const RESTORE_FAILED_REASON: &str = "restore_failed";
 
 /// Arquivo gravado na fase B: texto lido na inspeção (`original`) e texto que a execução grava.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
     rel: String,
     original: String,
     marked: String,
+}
+
+/// Diário da renumeração na aprovação (spec 128 T05, critério 12), na pasta da spec. Local (pelo
+/// exclude do Git) e gravado de forma atômica antes da primeira escrita; apagado depois da última.
+pub const RENUMBER_JOURNAL_FILE: &str = ".renumber-journal.json";
+pub const RENUMBER_JOURNAL_EXCLUDE_LINE: &str = ".sdd/specs/*/.renumber-journal.json";
+/// Temporário da escrita atômica (`.<nome>.<pid>.<seq>.tmp`).
+pub const RENUMBER_JOURNAL_TMP_EXCLUDE_LINE: &str = ".sdd/specs/*/..renumber-journal.json.*.tmp";
+/// Teto da leitura do diário: os originais e os textos novos da spec, das tarefas e dos registros.
+const MAX_JOURNAL_BYTES: u64 = 64 * MAX_READ_BYTES;
+
+/// Conteúdo do diário: cada arquivo da renumeração com o texto lido e o que a aprovação grava.
+#[derive(Debug, Serialize, Deserialize)]
+struct RenumberJournal {
+    spec_id: String,
+    entries: Vec<Entry>,
+}
+
+fn renumber_journal_rel(spec_id: &str) -> String {
+    format!("{SPECS_DIR}/{spec_id}/{RENUMBER_JOURNAL_FILE}")
+}
+
+/// Grava o diário (escrita atômica, com o exclude local garantido). Falha recusa a aprovação
+/// antes de qualquer escrita do plano.
+fn write_renumber_journal(root: &Path, spec_id: &str, entries: &[Entry]) -> Result<(), Rejection> {
+    let journal = RenumberJournal { spec_id: spec_id.to_string(), entries: entries.to_vec() };
+    let body = serde_json::to_string(&journal).map_err(|_| internal(RENUMBER_FAILED))?;
+    super::plan_review::write_local_file(root, &renumber_journal_rel(spec_id), RENUMBER_JOURNAL_FILE, &body)
+        .ok_or_else(|| internal(RENUMBER_FAILED))
+}
+
+fn remove_renumber_journal(root: &Path, spec_id: &str) -> Result<(), Rejection> {
+    if forced_journal_remove_failure(root) {
+        return Err(internal(RENUMBER_FAILED));
+    }
+    safe_fs::remove_regular(root, &renumber_journal_rel(spec_id)).map_err(|_| internal(RENUMBER_FAILED))
+}
+
+/// Caminho do diário aceito: dentro da pasta da spec, sem `.`/`..` nem componente vazio.
+fn journal_entry_ok(spec_id: &str, rel: &str) -> bool {
+    rel.strip_prefix(&format!("{SPECS_DIR}/{spec_id}/"))
+        .is_some_and(|rest| rest.split('/').all(|part| !part.is_empty() && part != "." && part != ".."))
+}
+
+/// Desfaz uma renumeração interrompida (spec 128 T05, critério 12): com o diário presente, cada
+/// arquivo que ainda tem o texto novo volta ao original (a spec volta a `AWAITING_APPROVAL`, que é
+/// o texto lido na aprovação) e o diário é apagado. Arquivo já original fica como está. Diário
+/// ilegível ou de outra spec não é tocado. `true` quando um diário foi desfeito.
+pub fn recover_renumber_journal(root: &Path, spec_id: &str) -> bool {
+    let rel = renumber_journal_rel(spec_id);
+    let Ok(raw) = safe_fs::read_regular(root, &rel, MAX_JOURNAL_BYTES) else {
+        return false;
+    };
+    let Ok(journal) = serde_json::from_str::<RenumberJournal>(&raw) else {
+        return false;
+    };
+    if journal.spec_id != spec_id || !journal.entries.iter().all(|e| journal_entry_ok(spec_id, &e.rel)) {
+        return false;
+    }
+    let _lock = SPEC_WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    // Só restaura quando TODA entrada tem hoje o texto original ou o novo. Um arquivo num terceiro
+    // estado (alterado depois, ilegível ou ausente) indica que o plano seguiu adiante: nada é
+    // restaurado, o diário fica e o terminal registra o motivo.
+    if let Some(changed) = journal_unknown_entry(root, &journal.entries) {
+        eprintln!(
+            "{}",
+            crate::i18n::tr(
+                crate::i18n::Lang::from_env(),
+                "cli.renumber_journal_kept",
+                &[("spec", spec_id), ("root", &root.display().to_string()), ("file", changed), ("journal", &rel)],
+            )
+        );
+        return false;
+    }
+    let mut restored = true;
+    for entry in &journal.entries {
+        restored &= restore_entry(root, entry);
+    }
+    restored && journal_unknown_entry(root, &journal.entries).is_none() && safe_fs::remove_regular(root, &rel).is_ok()
+}
+
+/// Primeira entrada do diário cujo arquivo não tem hoje nem o texto original nem o novo.
+fn journal_unknown_entry<'a>(root: &Path, entries: &'a [Entry]) -> Option<&'a str> {
+    entries
+        .iter()
+        .find(|entry| match safe_fs::read_regular(root, &entry.rel, MAX_READ_BYTES) {
+            Ok(text) => text != entry.original && text != entry.marked,
+            Err(_) => true,
+        })
+        .map(|entry| entry.rel.as_str())
+}
+
+/// `true` quando toda entrada tem hoje o texto original (compensação completa).
+fn all_original(root: &Path, entries: &[Entry]) -> bool {
+    entries
+        .iter()
+        .all(|entry| safe_fs::read_regular(root, &entry.rel, MAX_READ_BYTES).is_ok_and(|text| text == entry.original))
+}
+
+/// Na subida do servidor, antes de servir qualquer leitura do plano: desfaz os diários de
+/// renumeração deixados por uma queda abrupta em todos os projetos registrados.
+pub async fn recover_renumber_journals(state: &AppState) {
+    let projects = super::envs::registered_projects(state).await;
+    let job = tokio::task::spawn_blocking(move || {
+        for (_, root) in projects {
+            let Ok(dirs) = fs::read_dir(root.join(SPECS_DIR)) else {
+                continue;
+            };
+            for dir in dirs.flatten() {
+                let Some(spec_id) = dir.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if validate_spec_id(&spec_id).is_ok() && dir.path().join(RENUMBER_JOURNAL_FILE).exists() {
+                    recover_renumber_journal(&root, &spec_id);
+                }
+            }
+        }
+    });
+    let _ = job.await;
 }
 
 /// Desfaz a fase B quando a execução falha depois da primeira gravação. Para cada arquivo,
@@ -1413,6 +1664,8 @@ struct Restore {
     /// `reason` do `idle` publicado ao compensar.
     reason: &'static str,
     armed: bool,
+    /// Diário da renumeração (spec 128 T05): apagado depois de uma compensação completa.
+    journal: Option<String>,
 }
 
 impl Restore {
@@ -1424,6 +1677,7 @@ impl Restore {
             project_id: project_id.to_string(),
             reason: RESTORE_ERROR_REASON,
             armed: true,
+            journal: None,
         }
     }
 
@@ -1454,6 +1708,13 @@ impl Drop for Restore {
         let mut restored = true;
         for entry in &self.entries {
             restored &= restore_entry(&self.root, entry);
+        }
+        // Com tudo desfeito, o diário não tem mais o que restaurar; senão ele fica para a subida.
+        // Só com cada arquivo de volta ao original: um texto diferente fica para a conferência da subida.
+        if let (true, Some(journal)) = (restored, &self.journal) {
+            if all_original(&self.root, &self.entries) {
+                let _ = safe_fs::remove_regular(&self.root, journal);
+            }
         }
         let payload = if restored {
             json!({"status": "idle", "reason": self.reason})
@@ -2079,6 +2340,8 @@ fn spec_rel(spec_id: &str) -> String {
 
 /// Estado lido e validado da spec, usado na escrita de `IN_PROGRESS`.
 struct Inspected {
+    /// Tarefas lidas e validadas (texto exato e interpretado), em ordem de arquivo.
+    files: Vec<TaskFile>,
     /// Texto exato lido; a escrita só ocorre se o arquivo não mudou desde então.
     raw: String,
     spec: Spec,
@@ -2126,6 +2389,7 @@ fn inspect(root: &Path, spec_id: &str, mode: Mode) -> Result<Inspected, Rejectio
         Mode::Resume => reset_plan(root, spec_id, &settings, &files)?,
     };
     Ok(Inspected {
+        files,
         raw,
         spec,
         settings,
@@ -2182,11 +2446,16 @@ fn reset_plan(
 /// Confere, antes de qualquer escrita da retomada, que cada tarefa a reabrir ainda tem o texto lido
 /// na inspeção. Divergência recusa sem efeito.
 fn check_unchanged(root: &Path, entries: &[Entry]) -> Result<(), Rejection> {
+    check_unchanged_as(root, entries, TASKS_CHANGED).map_err(|_| conflict(TASKS_CHANGED))
+}
+
+/// Como [`check_unchanged`], com o código da recusa (`code`).
+fn check_unchanged_as(root: &Path, entries: &[Entry], code: &'static str) -> Result<(), Rejection> {
     for entry in entries {
         let current = safe_fs::read_regular(root, &entry.rel, MAX_READ_BYTES)
-            .map_err(|_| conflict(TASKS_CHANGED))?;
+            .map_err(|_| conflict(code))?;
         if current != entry.original {
-            return Err(conflict(TASKS_CHANGED));
+            return Err(conflict(code));
         }
     }
     Ok(())
@@ -2194,11 +2463,17 @@ fn check_unchanged(root: &Path, entries: &[Entry]) -> Result<(), Rejection> {
 
 /// Grava as tarefas reabertas, em ordem. Falha no meio deixa as já gravadas para o [`Restore`].
 fn write_resets(root: &Path, entries: &[Entry]) -> Result<(), Rejection> {
+    write_entries(root, entries, WRITE_FAILED)
+}
+
+/// Grava cada entrada (escrita atômica, sem seguir symlink), em ordem. A falha devolve `code` e
+/// deixa as já gravadas para o [`Restore`]. Usada na retomada e na renumeração da aprovação.
+fn write_entries(root: &Path, entries: &[Entry], code: &'static str) -> Result<(), Rejection> {
     for (index, entry) in entries.iter().enumerate() {
         if forced_reset_failure(root, index) {
-            return Err(internal(WRITE_FAILED));
+            return Err(internal(code));
         }
-        write_atomic(root, &entry.rel, &entry.marked).map_err(|_| internal(WRITE_FAILED))?;
+        write_atomic(root, &entry.rel, &entry.marked).map_err(|_| internal(code))?;
     }
     Ok(())
 }
@@ -2651,6 +2926,7 @@ fn read_settings_checked(root: &Path) -> Result<Settings, Rejection> {
 }
 
 /// Tarefa lida na inspeção: caminho relativo, texto exato e interpretação.
+#[derive(Clone)]
 struct TaskFile {
     rel: String,
     raw: String,
@@ -2985,6 +3261,29 @@ fn forced_restore_failure(root: &Path) -> bool {
 /// Sem falha forçada fora de testes.
 #[cfg(not(test))]
 fn forced_restore_failure(_root: &Path) -> bool {
+    false
+}
+
+/// Raízes cuja próxima remoção do diário da renumeração deve falhar (spec 128 T05).
+#[cfg(test)]
+static FORCED_JOURNAL_REMOVE_FAILURES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// `true` (uma vez) quando a remoção do diário deste projeto foi marcada para falhar.
+#[cfg(test)]
+fn forced_journal_remove_failure(root: &Path) -> bool {
+    let mut roots = FORCED_JOURNAL_REMOVE_FAILURES.lock().unwrap_or_else(PoisonError::into_inner);
+    match roots.iter().position(|r| r == root) {
+        Some(i) => {
+            roots.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Sem falha forçada fora de testes.
+#[cfg(not(test))]
+fn forced_journal_remove_failure(_root: &Path) -> bool {
     false
 }
 
@@ -5871,6 +6170,299 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         assert_eq!(task_of(&root, TASK_T01).frontmatter.status, TaskStatus::Todo);
         assert_eq!(task_of(&root, TASK_T02).frontmatter.status, TaskStatus::Todo);
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
+    // ---- Spec 128 T04: ordem de execução e renumeração na aprovação.
+
+    /// Pasta da spec de teste.
+    fn spec_dir_of(root: &Path) -> PathBuf {
+        root.join(".sdd/specs").join(SPEC)
+    }
+
+    /// Corpo da spec com referências fora e dentro de código.
+    const RENUMBER_BODY: &str = "\n## Tarefas\n- T08: contas. Depois T10 e T02.\n\n```\nT08 no bloco\n```\n\nVeja `T08` no código.\n";
+
+    /// Plano do Test 6 (cópias das tarefas, TODO e com o `spec_id` da spec de teste), a spec com
+    /// referências e os registros locais do plano.
+    fn write_test6(root: &Path) {
+        use crate::sdd::execution_order::test6::TEST6;
+        let dir = spec_dir_of(root);
+        for entry in fs::read_dir(dir.join("tasks")).expect("tasks") {
+            fs::remove_file(entry.expect("entrada").path()).expect("apagar");
+        }
+        for raw in TEST6 {
+            let mut task = Task::parse(raw).expect("tarefa");
+            let meta = &mut task.frontmatter;
+            meta.spec_id = SPEC.into();
+            meta.status = TaskStatus::Todo;
+            meta.attempts = 0;
+            meta.last_verdict = crate::sdd::Verdict::None;
+            meta.rejected_sha = None;
+            meta.test_evidence = None;
+            let id = meta.id.clone();
+            fs::write(dir.join("tasks").join(format!("{id}.md")), task.render().expect("render")).expect("gravar");
+        }
+        fs::write(dir.join("spec.md"), format!("{}{RENUMBER_BODY}", spec_md(SPEC, "AWAITING_APPROVAL"))).expect("spec");
+        let review = json!({
+            "signature": "abc", "at": "2026-10-26T12:00:00Z", "status": "ok",
+            "issues": [{"id": "P1", "task": "T08", "kind": "scope", "text": "T08 e T10 misturam áreas"}],
+            "rounds": [{"round": 0, "issues": [{"id": "P1", "task": "T08", "kind": "scope", "text": "T08 grande"}]}],
+            "points": [{"id": "P1", "task": "T08", "kind": "scope", "text": "T08 grande"}],
+            "next_point": 2
+        });
+        fs::write(dir.join("plan-review.json"), review.to_string()).expect("revisão");
+        fs::write(dir.join("plan-changes.json"), json!({"signature": "abc", "lines": ["T10 nova, depende da T08"]}).to_string()).expect("mudanças");
+        fs::write(dir.join("usage.jsonl"), "{\"task_id\":\"T08\"}\n").expect("usage");
+    }
+
+    /// Conteúdo de cada arquivo da pasta da spec (e das tarefas).
+    fn snapshot_spec_dir(root: &Path) -> Vec<(PathBuf, String)> {
+        let dir = spec_dir_of(root);
+        let mut out = Vec::new();
+        for base in [dir.clone(), dir.join("tasks")] {
+            for entry in fs::read_dir(&base).expect("pasta") {
+                let path = entry.expect("entrada").path();
+                if path.is_file() {
+                    out.push((path.clone(), fs::read_to_string(&path).expect("ler")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn chat_log(root: &Path) -> String {
+        fs::read_to_string(root.join(".sdd/specs/.chat.jsonl")).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn approval_renumbers_the_test6_plan_once_with_every_reference() {
+        use crate::sdd::execution_order::test6::{TEST6, TEST6_ORDER};
+        let root = setup("renumber-test6", true);
+        write_test6(&root);
+        let state = state(&root, Script::Hang);
+        let lang = state.project_lang(PROJECT).get();
+
+        // Antes da aprovação: o estado expõe a ordem de execução, com os ids como estão.
+        let (status, body) = call(&state, get_req(&format!("/api/projects/{PROJECT}/state"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let spec = json_of(&body)["specs"][0].clone();
+        assert_eq!(spec["execution_order"], json!(TEST6_ORDER), "{spec}");
+        let ids: Vec<String> = spec["tasks"].as_array().expect("tarefas").iter().map(|t| t["id"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(ids, (1..=15).map(|n| format!("T{n:02}")).collect::<Vec<_>>());
+
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
+
+        // Tarefas: cada arquivo tem a tarefa que passou a ter aquele id, com o depends_on traduzido.
+        let dir = spec_dir_of(&root);
+        let old = |id: &str| Task::parse(TEST6[id[1..].parse::<usize>().expect("número") - 1]).expect("tarefa");
+        let t02 = task_of(&root, &format!(".sdd/specs/{SPEC}/tasks/T02.md"));
+        assert_eq!(t02.frontmatter.id, "T02");
+        assert_eq!(t02.frontmatter.title, old("T08").frontmatter.title);
+        assert_eq!(t02.frontmatter.depends_on, ["T01"]);
+        let t04 = task_of(&root, &format!(".sdd/specs/{SPEC}/tasks/T04.md"));
+        assert_eq!(t04.frontmatter.title, old("T02").frontmatter.title);
+        assert_eq!(t04.frontmatter.depends_on, ["T02", "T03"]);
+        assert!(t04.body.contains("before T07."), "{}", t04.body);
+        // A ordem agora coincide com os ids.
+        let now: Vec<(String, Vec<String>)> = (1..=15)
+            .map(|n| task_of(&root, &format!(".sdd/specs/{SPEC}/tasks/T{n:02}.md")).frontmatter)
+            .map(|m| (m.id, m.depends_on))
+            .collect();
+        let order = crate::sdd::execution_order::execution_order(&now).expect("sem ciclo");
+        assert_eq!(order, (1..=15).map(|n| format!("T{n:02}")).collect::<Vec<_>>());
+
+        // spec.md: referências trocadas fora do código, código intacto e a seção com o mapa.
+        let spec_text = fs::read_to_string(dir.join("spec.md")).expect("spec");
+        assert!(spec_text.contains("- T02: contas. Depois T03 e T04."), "{spec_text}");
+        assert!(spec_text.contains("```\nT08 no bloco\n```"), "{spec_text}");
+        assert!(spec_text.contains("Veja `T08` no código."), "{spec_text}");
+        let heading = format!("## {}", crate::i18n::tr(lang, "runs.renumber.heading", &[]));
+        assert!(spec_text.contains(&heading), "{spec_text}");
+        assert!(spec_text.contains("T08→T02, T10→T03, T02→T04"), "{spec_text}");
+
+        // Registros locais traduzidos; os históricos ficam como estão.
+        let review: Value = serde_json::from_str(&fs::read_to_string(dir.join("plan-review.json")).expect("revisão")).expect("json");
+        assert_eq!(review["issues"][0]["task"], "T02");
+        assert_eq!(review["issues"][0]["text"], "T02 e T03 misturam áreas");
+        assert_eq!(review["rounds"][0]["issues"][0]["task"], "T02");
+        assert_eq!(review["points"][0]["task"], "T02");
+        let changes: Value = serde_json::from_str(&fs::read_to_string(dir.join("plan-changes.json")).expect("mudanças")).expect("json");
+        assert_eq!(changes["lines"][0], "T03 nova, depende da T02");
+        assert_eq!(fs::read_to_string(dir.join("usage.jsonl")).expect("usage"), "{\"task_id\":\"T08\"}\n");
+
+        // Uma linha na Conversa, pelo dicionário.
+        let chat = chat_log(&root);
+        assert!(chat.contains(RENUMBERED_CODE), "{chat}");
+        assert!(chat.contains("T08→T02"), "{chat}");
+        // O diário da renumeração sai depois da última escrita, e é local (exclude do Git).
+        assert!(!dir.join(RENUMBER_JOURNAL_FILE).exists());
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
+        assert!(exclude.contains(RENUMBER_JOURNAL_EXCLUDE_LINE) && exclude.contains(RENUMBER_JOURNAL_TMP_EXCLUDE_LINE), "{exclude}");
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
+    /// Spec 128 T05 (critério 12): os arquivos que a aprovação grava com a renumeração (a spec em
+    /// `IN_PROGRESS` primeiro), calculados como em [`launch`].
+    fn renumber_entries(root: &Path) -> Vec<Entry> {
+        let inspected = inspect(root, SPEC, Mode::Approve).expect("inspeção");
+        let renumbering = plan_renumbering(root, SPEC, &inspected.spec, &inspected.files, crate::i18n::Lang::PtBr)
+            .expect("cálculo")
+            .expect("renumera");
+        let mut marked = renumbering.spec.clone();
+        marked.frontmatter.status = SpecStatus::InProgress;
+        let mut entries = vec![Entry { rel: spec_rel(SPEC), original: inspected.raw.clone(), marked: marked.render().expect("render") }];
+        entries.extend(renumbering.entries.iter().cloned());
+        entries
+    }
+
+    #[tokio::test]
+    async fn a_journal_left_mid_renumbering_is_restored_on_startup() {
+        let root = setup("renumber-journal", true);
+        write_test6(&root);
+        let before = snapshot_spec_dir(&root);
+        let entries = renumber_entries(&root);
+        assert!(entries.len() > 4, "{}", entries.len());
+        // Queda abrupta no meio: o diário, a spec e as três primeiras tarefas gravados; o resto não.
+        write_renumber_journal(&root, SPEC, &entries).expect("diário");
+        for entry in entries.iter().take(4) {
+            write_atomic(&root, &entry.rel, &entry.marked).expect("escrita");
+        }
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
+        assert_ne!(snapshot_spec_dir(&root), before);
+
+        // A subida do servidor desfaz tudo antes de qualquer leitura do plano.
+        let state = state(&root, Script::Hang);
+        recover_renumber_journals(&state).await;
+        assert_eq!(snapshot_spec_dir(&root), before, "originais de volta e o diário apagado");
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::AwaitingApproval);
+        // Sem diário, a subida não mexe em nada; e a aprovação seguinte renumera normalmente.
+        recover_renumber_journals(&state).await;
+        assert_eq!(snapshot_spec_dir(&root), before);
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(task_of(&root, &format!(".sdd/specs/{SPEC}/tasks/T02.md")).frontmatter.depends_on, ["T01"]);
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_cannot_be_removed_undoes_the_approval() {
+        let root = setup("renumber-journal-stuck", true);
+        write_test6(&root);
+        let before = snapshot_spec_dir(&root);
+        FORCED_JOURNAL_REMOVE_FAILURES.lock().unwrap_or_else(PoisonError::into_inner).push(root.clone());
+        let state = state(&root, Script::Hang);
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(json_of(&body)["code"], RENUMBER_FAILED, "{body}");
+        assert_eq!(snapshot_spec_dir(&root), before, "tudo desfeito, inclusive o diário");
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::AwaitingApproval);
+        assert!(state.runs().active(PROJECT).is_none());
+    }
+
+    #[test]
+    fn a_journal_with_a_file_in_a_third_state_leaves_everything_as_is() {
+        let root = setup("renumber-journal-third", true);
+        write_test6(&root);
+        let entries = renumber_entries(&root);
+        write_renumber_journal(&root, SPEC, &entries).expect("diário");
+        for entry in &entries {
+            write_atomic(&root, &entry.rel, &entry.marked).expect("escrita");
+        }
+        // A spec seguiu adiante: uma tarefa já tem outro texto (nem o original, nem o da renumeração).
+        let third = &entries[1];
+        write_atomic(&root, &third.rel, &format!("{}\n<!-- seguiu adiante -->\n", third.marked)).expect("terceiro texto");
+        let before = snapshot_spec_dir(&root);
+        assert!(!recover_renumber_journal(&root, SPEC));
+        assert_eq!(snapshot_spec_dir(&root), before, "nada restaurado e o diário mantido");
+        assert!(spec_dir_of(&root).join(RENUMBER_JOURNAL_FILE).exists());
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
+        // Arquivo ausente também é um terceiro estado.
+        fs::remove_file(root.join(&third.rel)).expect("apagar");
+        assert!(!recover_renumber_journal(&root, SPEC));
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
+    }
+
+    #[test]
+    fn a_journal_from_elsewhere_is_not_touched() {
+        let root = setup("renumber-journal-foreign", true);
+        write_test6(&root);
+        let entries = renumber_entries(&root);
+        for (spec_id, rel) in [("outra", entries[0].rel.clone()), (SPEC, "../fora.md".to_string()), (SPEC, format!(".sdd/specs/{SPEC}/../x.md"))] {
+            let mut forged = entries.clone();
+            forged[0].rel = rel;
+            let journal = RenumberJournal { spec_id: spec_id.to_string(), entries: forged };
+            fs::write(spec_dir_of(&root).join(RENUMBER_JOURNAL_FILE), serde_json::to_string(&journal).expect("json")).expect("diário");
+            fs::write(spec_dir_of(&root).join("spec.md"), &entries[0].marked).expect("spec");
+            assert!(!recover_renumber_journal(&root, SPEC));
+            assert!(spec_dir_of(&root).join(RENUMBER_JOURNAL_FILE).exists());
+            assert_eq!(spec_status(&root, SPEC), SpecStatus::InProgress);
+        }
+        assert!(journal_entry_ok(SPEC, &format!(".sdd/specs/{SPEC}/tasks/T01.md")));
+        assert!(!journal_entry_ok(SPEC, &format!(".sdd/specs/{SPEC}//T01.md")));
+    }
+
+    #[tokio::test]
+    async fn approval_rewrites_nothing_when_the_plan_is_already_in_order() {
+        let root = setup("renumber-noop", true);
+        write_sdd(&root, SETTINGS, "AWAITING_APPROVAL", &[("T01", ""), ("T02", "T01"), ("T03", "T01")]);
+        let before = snapshot_spec_dir(&root);
+        let state = state(&root, Script::Hang);
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let after = snapshot_spec_dir(&root);
+        let changed: Vec<&PathBuf> = after.iter().zip(&before).filter(|(a, b)| a != b).map(|(a, _)| &a.0).collect();
+        assert_eq!(changed, [&spec_dir_of(&root).join("spec.md")], "só o status da spec muda");
+        let spec_text = fs::read_to_string(spec_dir_of(&root).join("spec.md")).expect("spec");
+        assert_eq!(spec_text.matches("## ").count(), 1, "sem seção de renumeração: {spec_text}");
+        assert!(!chat_log(&root).contains(RENUMBERED_CODE));
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
+    #[tokio::test]
+    async fn failed_renumbering_changes_nothing_and_returns_a_code() {
+        let root = setup("renumber-fail", true);
+        write_test6(&root);
+        let before = snapshot_spec_dir(&root);
+        fail_reset_write(&root, 3);
+        let state = state(&root, Script::Hang);
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(json_of(&body)["code"], RENUMBER_FAILED, "{body}");
+        assert_eq!(snapshot_spec_dir(&root), before, "tudo ou nada");
+        assert_eq!(spec_status(&root, SPEC), SpecStatus::AwaitingApproval);
+        assert!(state.runs().active(PROJECT).is_none());
+        assert!(!chat_log(&root).contains(RENUMBERED_CODE));
+        // Sem a falha, a mesma aprovação renumera.
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(task_of(&root, &format!(".sdd/specs/{SPEC}/tasks/T02.md")).frontmatter.depends_on, ["T01"]);
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
+    #[tokio::test]
+    async fn approval_waits_for_a_running_plan_review_and_changes_nothing() {
+        let root = setup("renumber-review", true);
+        write_test6(&root);
+        let before = snapshot_spec_dir(&root);
+        let state = state(&root, Script::Hang);
+        let hold = super::super::plan_review::hold_review_for_test(&root, SPEC).expect("vaga");
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(json_of(&body)["reason"], REASON_PLAN_REVIEW_RUNNING, "{body}");
+        assert_eq!(json_of(&body)["code"], PLAN_REVIEW_RUNNING_MSG, "{body}");
+        assert_eq!(snapshot_spec_dir(&root), before);
+        drop(hold);
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         state.trigger_shutdown();
         assert!(wait_idle(&state).await);
     }

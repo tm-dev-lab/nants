@@ -35,6 +35,7 @@ pub mod live_activity;
 pub mod models_api;
 pub mod netinfo;
 pub mod plan_changes;
+pub mod plan_consensus;
 pub mod plan_review;
 pub mod portproxy;
 pub mod price_catalog;
@@ -223,6 +224,8 @@ where
     let apps = state.apps().clone();
     let env_state = state.clone();
     let grace = state.shutdown_grace();
+    // Spec 128 T05: renumeração interrompida por uma queda abrupta é desfeita antes de servir.
+    runs::recover_renumber_journals(&state).await;
     // Com a origem da conexão: a camada de dispositivos reconhece o loopback de verdade.
     let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let result = axum::serve(listener, app)

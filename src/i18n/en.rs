@@ -363,6 +363,16 @@ nants uninstall --purge  also removes the settings and data; never the projects 
         "system.chat.connection_lost_saved",
         "The connection to the provider dropped before the Architect finished this turn. What it had already written was saved in spec {spec}, but the plan may be incomplete. Use Try again to have it continue where it stopped.",
     ),
+    // Spec 128 T02: uma linha por rodada do consenso do plano.
+    (
+        "system.plan.consensus_round",
+        "Plan review, round {round}: the Reviewer raised {issues}; the Architect adjusted {accepted} and kept {kept}.",
+    ),
+    (
+        "system.plan.consensus_round_open",
+        "Plan review, round {round}: the Reviewer raised {issues}; the Architect adjusted {accepted}, kept {kept} and left {open} unanswered.",
+    ),
+    ("system.plan.renumbered", "Tasks renumbered in execution order: {map}."),
     (
         "system.final.still_unmet",
         "Warning: the final verification still points to unmet criteria after the fix round; the spec will be completed anyway.",
@@ -392,6 +402,12 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.arbitration.entry", "- Review {review}, {task} {finding} ({decision}): {title}. Reason: {reason}"),
     ("plan_review.too_large.one", "{count} acceptance criterion: too large for one review. Split it into smaller tasks, one per area (for example server, client and end-to-end tests), each with its own criteria."),
     ("plan_review.too_large.other", "{count} acceptance criteria: too large for one review. Split it into smaller tasks, one per area (for example server, client and end-to-end tests), each with its own criteria."),
+    ("plan_review.too_large_dense.one", "{count} acceptance criterion, which counts as {weight} because of its length (a criterion over {words} words counts as more than one): too large for one review. Write one criterion per observable behavior, in one short sentence, and split the task if it is still large."),
+    ("plan_review.too_large_dense.other", "{count} acceptance criteria, which count as {weight} because of their length (a criterion over {words} words counts as more than one): too large for one review. Write one criterion per observable behavior, in one short sentence, and split the task if it is still large."),
+    // Spec 128 T04: ciclo de dependências e renumeração das tarefas na aprovação.
+    ("plan_review.dependency_cycle", "Tasks {tasks} depend on each other in a cycle through depends_on, so there is no execution order. Break the cycle."),
+    ("runs.renumber.heading", "Renumbering"),
+    ("runs.renumber.body", "On approval, the tasks were renumbered in execution order: {map}. The planning records (usage.jsonl, tools.jsonl, .context.jsonl and .chat.jsonl) keep the old ids, and this map explains the correspondence."),
     ("runner.adjust.entry", "- Recovery #{cycle}, {task}: criteria adjusted to what the environment proves. Reason: {reason}"),
     ("runner.split.origin", "Part of {task}, split off in recovery analysis #{cycle}. It starts after {task} is integrated, building on its work."),
     ("runner.review.low_confidence_demoted", "{summary} (low confidence findings became observations.)"),
@@ -452,6 +468,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("chatgpt.log.revoke_failed", "warning: connection {id}: could not revoke access on the server; the local credentials were deleted"),
     ("chatgpt.log.save_failed", "warning: connection {id}: could not save the ChatGPT plan credentials"),
     ("cli.orphan_envs_removed", "nants: orphan Docker environments removed: {list}"),
+    (
+        "cli.renumber_journal_kept",
+        "nants: the interrupted renumbering of spec {spec} in {root} was not undone, because {file} changed after the approval. Nothing was changed, and the journal was kept at {journal} for review.",
+    ),
     // Free text written to artifacts (spec 115 T04, C-07, C-08 and C-12); the headings read by a
     // parser stay in the code.
     ("runner.final_fix.objective", "Fix the unmet global criteria pointed out by the final verification."),
@@ -707,6 +727,8 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("serverError.spec_not_found", "spec not found"),
     ("serverError.spec_not_in_progress", "spec is not in progress"),
     ("serverError.spec_write_failed", "failed to save the spec state"),
+    ("serverError.plan_review_running", "the Reviewer is still reviewing the plan; wait for the review to end to approve"),
+    ("serverError.plan_renumber_failed", "failed to renumber the tasks in execution order; nothing was changed"),
     ("serverError.survey_busy", "a turn, run or report is already in progress in this project"),
     ("serverError.system_dir_forbidden", "system folders are not allowed"),
     ("serverError.task_id_invalid", "task_id must contain only [a-zA-Z0-9_-] and have 1 to 64 characters"),

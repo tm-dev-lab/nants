@@ -178,6 +178,8 @@ const KNOWN_REASONS: ReadonlySet<string> = new Set([
   "docker_unavailable",
   "architect_turn_active",
   "plan_without_tasks",
+  // Aprovação durante a revisão do plano (spec 128 T04).
+  "plan_review_running",
   // 502 do chat com a queda da conexão gravada no histórico (spec 127 T01).
   "connection_lost",
   "prereq_missing",
@@ -259,15 +261,51 @@ export const LANG_HEADER = "X-Nants-Lang";
 /** Página de entrada do aparelho sem autorização (spec 112). */
 export const ENTRY_PATH = "/connect";
 
+/** Tamanho máximo do caminho de volta (`next`), em bytes (o mesmo do servidor). */
+export const MAX_NEXT_BYTES = 2048;
+
+/**
+ * Caminho de volta aceito em `next` (spec 128), com a mesma regra do servidor (`safe_next`, em
+ * `src/server/devices.rs`): só caminho relativo do próprio Nants. Começa com `/` e não com `//`,
+ * sem `\`, sem espaço nem caractere de controle, com no máximo {@link MAX_NEXT_BYTES} e diferente
+ * da própria entrada. Aceita `?query` e `#hash`. Qualquer outra coisa vira `null` (sem
+ * redirecionamento aberto).
+ */
+export function safeNext(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  if (new TextEncoder().encode(raw).length > MAX_NEXT_BYTES) return null;
+  if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return null;
+  if (/[\s\u0000-\u001f\u007f-\u009f]/u.test(raw)) return null;
+  const path = raw.split(/[?#]/u, 1)[0];
+  if (path === ENTRY_PATH) return null;
+  return raw;
+}
+
+/** Endereço da entrada com o caminho de volta (percent-encodado), se ele for aceito e não for `/`. */
+export function entryLocation(next: string | null | undefined): string {
+  const safe = safeNext(next);
+  return safe === null || safe === "/" ? ENTRY_PATH : `${ENTRY_PATH}?next=${encodeURIComponent(safe)}`;
+}
+
 /**
  * Aparelho sem autorização (spec 112): com a rede local ligada, a API responde 401
  * `device_required` (cookie perdido ou dispositivo revogado). A interface vai para a página de
- * entrada, que pede o código. Substituível nos testes.
+ * entrada, que pede o código, levando a página atual (`pathname + search + hash`) como `next`
+ * (spec 128): depois de entrar, o aparelho volta para ela. Substituível nos testes.
  */
 export const deviceAuth = {
+  /** Página atual (`pathname`, `search`, `hash`); `null` fora do navegador. */
+  here(): Pick<Location, "pathname" | "search" | "hash"> | null {
+    return typeof window === "undefined" ? null : window.location;
+  },
+  /** Navega para a entrada. */
+  go(to: string): void {
+    window.location.assign(to);
+  },
   onDeviceRequired(): void {
-    if (typeof window === "undefined" || window.location.pathname === ENTRY_PATH) return;
-    window.location.assign(ENTRY_PATH);
+    const here = deviceAuth.here();
+    if (here === null || here.pathname === ENTRY_PATH) return;
+    deviceAuth.go(entryLocation(`${here.pathname}${here.search}${here.hash}`));
   },
 };
 

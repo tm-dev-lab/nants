@@ -87,6 +87,13 @@ impl PlanReviewer {
 
     /// Uma revisão: system + bloco do plano + pedido. Resposta vazia é resposta inválida.
     pub async fn review(&self, root: &Path, plan: &str) -> Result<String, ProviderFailure> {
+        self.review_with_memory(root, plan, None).await
+    }
+
+    /// [`Self::review`] com a memória das rodadas do consenso (spec 128 T02): a partir da rodada 1,
+    /// as regras da rodada, os pontos anteriores com a decisão do Arquiteto e o que mudou no plano,
+    /// numa mensagem de sistema própria depois do plano.
+    pub async fn review_with_memory(&self, root: &Path, plan: &str, memory: Option<&str>) -> Result<String, ProviderFailure> {
         let host = ToolHost::new(
             ToolRole::Reviewer,
             root.to_path_buf(),
@@ -114,8 +121,11 @@ impl PlanReviewer {
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, plan_review_system_for(self.lang.get())),
             ChatMessage::text(ChatRole::System, format!("{PLAN_FACTS_LABEL}\n{plan}")),
-            ChatMessage::text(ChatRole::User, PLAN_REVIEW_REQUEST),
         ];
+        if let Some(memory) = memory.filter(|m| !m.trim().is_empty()) {
+            messages.push(ChatMessage::text(ChatRole::System, memory));
+        }
+        messages.push(ChatMessage::text(ChatRole::User, PLAN_REVIEW_REQUEST));
         let text = tool_loop(&ctx, &mut messages, PLAN_REVIEW_MAX_STEPS)
             .await
             .map_err(|err| match err {
@@ -159,6 +169,21 @@ mod tests {
         for n in ["read_file", "list_dir", "search_code"] {
             assert!(names.contains(&n), "{names:?}");
         }
+    }
+
+    /// Spec 128 T02: a memória das rodadas vai numa mensagem de sistema entre o plano e o pedido.
+    #[tokio::test]
+    async fn memory_goes_between_the_plan_and_the_request() {
+        let root = tmp_root("plan-review-memory");
+        let scripted = Scripted::new(vec![text("{\"issues\": []}"), text("{\"issues\": []}")]);
+        let rev = reviewer(scripted.clone());
+        rev.review_with_memory(&root, "p", Some("MEMÓRIA X")).await.expect("ok");
+        rev.review(&root, "p").await.expect("ok");
+        let reqs = scripted.requests();
+        assert_eq!(reqs[0].messages.len(), 4);
+        assert_eq!(reqs[0].messages[2].content, "MEMÓRIA X");
+        assert_eq!(reqs[0].messages[3].content, PLAN_REVIEW_REQUEST);
+        assert_eq!(reqs[1].messages.len(), 3, "sem memória, como antes");
     }
 
     #[tokio::test]
@@ -212,10 +237,12 @@ mod tests {
             assert!(p.contains(kind), "{kind}");
         }
         assert!(p.contains("Preferência") && p.contains("lista vazia") && p.contains("No máximo 8"));
+        // Spec 128 T03: +~550 bytes (ação fora do sandbox no untestable, critérios longos no
+        // too_large, poucos apontamentos importantes e a memória do consenso; teto 2850 -> 3150).
         // Spec 124 T06: +~230 bytes (too_large com sugestão de divisão; teto 2600 -> 2850).
         // Spec 124 T04: +~170 bytes (critério que depende de capacidade ausente é untestable; teto 2400 -> 2600).
         // Spec 122 T05: +~200 bytes (ações independentes na mesma resposta; teto 2200 -> 2400).
         // Spec 122 T02: +~200 bytes (íntegra das saídas cortadas; teto 2000 -> 2200).
-        assert!(p.len() < 2850, "{}", p.len());
+        assert!(p.len() < 3150, "{}", p.len());
     }
 }

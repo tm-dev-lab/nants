@@ -2,8 +2,28 @@
 //!
 //! - **Por que token e não IP:** no WSL modo NAT todas as conexões externas chegam com o mesmo IP
 //!   de origem (o do Windows). A autorização é por dispositivo: um token aleatório de 32 bytes, do
-//!   gerador seguro do sistema, no cookie [`COOKIE_NAME`] (`HttpOnly`, `SameSite=Strict`, `Path=/`,
+//!   gerador seguro do sistema, no cookie [`COOKIE_NAME`] (`HttpOnly`, `SameSite=Lax`, `Path=/`,
 //!   um ano, renovado no uso no máximo uma vez por dia; sem `Secure`, porque é HTTP local).
+//! - **Por que `SameSite=Lax` (spec 128):** com `Strict`, uma navegação que o navegador considera
+//!   entre sites (aba aberta por um link de outro app, histórico, favoritos, restauração de aba)
+//!   chegava sem o cookie, e um refresh no celular caía na entrada. Com `Lax`:
+//!   - um refresh ou uma navegação de nível superior por GET, mesmo vinda de outro site, leva o
+//!     cookie;
+//!   - POST e chamadas de outro site (`fetch`, formulário, imagem, iframe) continuam sem ele;
+//!   - a escrita segue protegida pela guarda de `Host`/`Origin` (`security::guard`), que derruba
+//!     antes desta camada todo POST, PUT, PATCH e DELETE com `Origin` de outro site;
+//!   - o `Lax` é explícito: não tem a exceção de 2 minutos que alguns navegadores dão ao padrão
+//!     implícito (o cookie sem `SameSite`, que vai em POST de outro site logo depois de gravado);
+//!   - um GET de outro site é uma navegação: quem a disparou não lê a resposta;
+//!   - nenhuma rota GET altera estado sem um segredo próprio na URL (`/pair?t=` e `/auth/finish`
+//!     com `state`); o teste `get_routes_with_effect_are_audited` lista as rotas GET e falha se
+//!     surgir uma nova sem classificação.
+//! - **Volta à página de origem:** a negação de uma página redireciona para
+//!   `/connect?next=<caminho>` ([`safe_next`]: só caminho relativo do próprio Nants), e a SPA
+//!   volta para ele depois da entrada.
+//! - **Diagnóstico da negação:** uma linha técnica no terminal por página negada, sem token nem
+//!   cookie (caminho, se veio cookie desconhecido, `Sec-Fetch-Site`), com limite de frequência
+//!   ([`DENIAL_LOG_MAX`] por [`DENIAL_LOG_WINDOW_MS`]).
 //! - **Armazenamento:** `devices.json` na pasta de dados do Nants, 0600, escrita atômica. Cada
 //!   dispositivo guarda id, nome, o SHA-256 do token (nunca o token), `created_at` e `last_seen`
 //!   (gravado no máximo uma vez por minuto). A conferência compara o hash em tempo constante.
@@ -19,7 +39,8 @@
 //!   - `GET /pair?t=...`: o link de entrada de uso único impresso no terminal;
 //!   - `POST /api/devices/pair`: a troca do código de 6 dígitos;
 //!   - `GET /auth/callback`, só com um `state` pendente e válido do login pelo plano ChatGPT
-//!     (spec 116): o retorno vem de outro site e chega sem o cookie Strict. A rota só devolve a
+//!     (spec 116): o retorno vem de outro site (com o cookie `Strict` de antes, chegava sem ele;
+//!     a página de passagem continua). A rota só devolve a
 //!     página de passagem (spec 118), sem consumir nada; a conclusão (`GET /auth/finish`) não é
 //!     aberta, consome o `state` e confere o dispositivo que iniciou a tentativa.
 //! - **Link de entrada:** gerado ao subir em modo rede ([`DeviceStore::issue_entry_link`]), de uso
@@ -86,6 +107,14 @@ pub const PAIR_API_PATH: &str = "/api/devices/pair";
 const OPEN_STATIC_PREFIXES: [&str; 2] = ["/assets/", "/brand/"];
 /// Ícones e manifesto da raiz do bundle.
 const OPEN_STATIC_FILES: [&str; 4] = ["/favicon.ico", "/favicon.svg", "/manifest.webmanifest", "/apple-touch-icon.png"];
+/// Tamanho máximo do caminho de volta (`next`), em bytes.
+pub const MAX_NEXT_BYTES: usize = 2048;
+/// Diagnóstico da negação: no máximo esta quantidade de linhas por janela.
+pub const DENIAL_LOG_MAX: u32 = 10;
+/// Janela do limite do diagnóstico da negação (um minuto).
+pub const DENIAL_LOG_WINDOW_MS: u64 = 60 * 1000;
+/// Teto do caminho registrado no diagnóstico, em caracteres.
+const DENIAL_LOG_PATH_CHARS: usize = 200;
 /// Teto de leitura do arquivo de dispositivos.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// Versão do formato do arquivo.
@@ -200,6 +229,10 @@ struct Inner {
     window: Option<CodeWindow>,
     locked: bool,
     last_attempt: Option<u64>,
+    /// Diagnóstico da negação: início da janela, linhas nela e linhas suprimidas.
+    denial_window_start: u64,
+    denial_logged: u32,
+    denial_suppressed: u32,
 }
 
 /// Dispositivos autorizados, link de entrada e janela de adicionar. Clones de `AppState`
@@ -572,6 +605,25 @@ impl DeviceStore {
         self.create(&mut inner, name, false).map_err(|_| PairError::Store)
     }
 
+    /// Linha do diagnóstico de uma página negada, respeitando o limite de frequência
+    /// ([`DENIAL_LOG_MAX`] por [`DENIAL_LOG_WINDOW_MS`]). `None`: suprimida. A linha seguinte a
+    /// uma supressão conta quantas ficaram de fora. Sem token nem cookie.
+    pub fn denial_line(&self, denial: &Denial<'_>) -> Option<String> {
+        let now = self.now();
+        let mut inner = self.lock();
+        if inner.denial_logged == 0 || now.saturating_sub(inner.denial_window_start) >= DENIAL_LOG_WINDOW_MS {
+            inner.denial_window_start = now;
+            inner.denial_logged = 0;
+        }
+        if inner.denial_logged >= DENIAL_LOG_MAX {
+            inner.denial_suppressed = inner.denial_suppressed.saturating_add(1);
+            return None;
+        }
+        inner.denial_logged += 1;
+        let suppressed = std::mem::take(&mut inner.denial_suppressed);
+        Some(denial.line(suppressed))
+    }
+
     /// Lista dos dispositivos.
     pub fn list(&self) -> Vec<Device> {
         self.lock().devices.clone()
@@ -728,17 +780,103 @@ fn cookie_tokens(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// Cabeçalho `Set-Cookie` do dispositivo.
+/// Cabeçalho `Set-Cookie` do dispositivo (`SameSite=Lax`, ver o comentário do módulo).
 pub fn device_cookie(token: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!(
-        "{COOKIE_NAME}={token}; Max-Age={COOKIE_MAX_AGE_SECS}; Path=/; HttpOnly; SameSite=Strict"
+        "{COOKIE_NAME}={token}; Max-Age={COOKIE_MAX_AGE_SECS}; Path=/; HttpOnly; SameSite=Lax"
     ))
     .ok()
 }
 
-/// Cabeçalho `Set-Cookie` que apaga o cookie do dispositivo.
+/// Cabeçalho `Set-Cookie` que apaga o cookie do dispositivo (os mesmos atributos do que grava).
 pub fn clear_cookie() -> HeaderValue {
-    HeaderValue::from_static("nants_device=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")
+    HeaderValue::from_static("nants_device=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+}
+
+/// Caminho de volta aceito em `next`: só caminho relativo do próprio Nants. Começa com `/` e não
+/// com `//`, sem `\`, sem espaço nem caractere de controle (o navegador remove tabulação e quebra
+/// de linha da URL, e `/<TAB>/x` viraria `//x`), com no máximo [`MAX_NEXT_BYTES`] e diferente da
+/// própria entrada. Aceita `?query` e `#hash`. Qualquer outra coisa é descartada (sem
+/// redirecionamento aberto). A web usa a mesma regra (`safeNext`, em `web/src/api/client.ts`).
+pub fn safe_next(raw: &str) -> Option<&str> {
+    if raw.is_empty() || raw.len() > MAX_NEXT_BYTES || !raw.starts_with('/') || raw.starts_with("//") {
+        return None;
+    }
+    if raw.contains('\\') || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    if path == ENTRY_PATH {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Codifica um valor de parâmetro da URL (tudo fora de `A-Z a-z 0-9 - . _ ~ /` vira `%XX`).
+fn encode_param(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Endereço da entrada com o caminho de volta, se ele for aceito por [`safe_next`] e não for a
+/// raiz (que já é o destino padrão).
+pub fn entry_location(next: Option<&str>) -> String {
+    match next.and_then(safe_next).filter(|n| *n != "/") {
+        Some(next) => format!("{ENTRY_PATH}?next={}", encode_param(next)),
+        None => ENTRY_PATH.to_string(),
+    }
+}
+
+/// O que veio no cookie do dispositivo de uma requisição negada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialCookie {
+    /// Nenhum cookie `nants_device`.
+    Absent,
+    /// Veio um cookie `nants_device`, mas nenhum dispositivo o reconhece (revogado, perdido ou
+    /// mal formado).
+    Unknown,
+}
+
+/// Dados do diagnóstico de uma página negada (nada de token nem de cookie).
+#[derive(Debug, Clone)]
+pub struct Denial<'a> {
+    /// Só o caminho, sem a query.
+    pub path: &'a str,
+    pub cookie: DenialCookie,
+    pub sec_fetch_site: Option<&'a str>,
+}
+
+impl Denial<'_> {
+    /// Linha técnica do terminal (chave=valor, não é texto de pessoa).
+    fn line(&self, suppressed: u32) -> String {
+        let path: String = self.path.chars().filter(|c| !c.is_control()).take(DENIAL_LOG_PATH_CHARS).collect();
+        let cookie = match self.cookie {
+            DenialCookie::Absent => "none",
+            DenialCookie::Unknown => "unknown",
+        };
+        let mut line = format!("nants.device_denied path={path} cookie={cookie}");
+        if let Some(site) = self.sec_fetch_site {
+            let site = match site {
+                "same-origin" | "same-site" | "cross-site" | "none" => site,
+                _ => "other",
+            };
+            line.push_str(" sec_fetch_site=");
+            line.push_str(site);
+        }
+        if suppressed > 0 {
+            line.push_str(" suppressed=");
+            line.push_str(&suppressed.to_string());
+        }
+        line
+    }
 }
 
 /// Rota aberta sem dispositivo (ver o comentário do módulo).
@@ -775,12 +913,23 @@ fn device_required() -> ApiError {
     ApiError::coded(StatusCode::UNAUTHORIZED, CODE_DEVICE_REQUIRED, Map::new())
 }
 
-/// Resposta sem dispositivo: 401 JSON na API e redirecionamento para a entrada nas páginas.
-fn deny(method: &Method, path: &str) -> Response {
-    if is_api(path) || (*method != Method::GET && *method != Method::HEAD) {
+/// A negação é de uma página (GET/HEAD fora da API), que volta pela entrada?
+fn is_page(method: &Method, path: &str) -> bool {
+    !is_api(path) && (*method == Method::GET || *method == Method::HEAD)
+}
+
+/// Resposta sem dispositivo: 401 JSON na API e, nas páginas, redirecionamento para a entrada com
+/// o caminho de volta (`/connect?next=<caminho>`).
+fn deny(method: &Method, uri: &axum::http::Uri) -> Response {
+    if !is_page(method, uri.path()) {
         return device_required().into_response();
     }
-    redirect(ENTRY_PATH)
+    // As rotas com segredo na URL (`/auth/*`: `code` e `state` do login) não viram `next`: o
+    // segredo não passa pela entrada nem fica no histórico.
+    if uri.path().starts_with("/auth/") || uri.path() == PAIR_LINK_PATH {
+        return redirect(ENTRY_PATH);
+    }
+    redirect(&entry_location(uri.path_and_query().map(|pq| pq.as_str())))
 }
 
 /// Corta o corpo (streams SSE) quando o dispositivo for revogado.
@@ -824,15 +973,26 @@ pub async fn require_device(State(state): State<AppState>, mut req: Request, nex
     let loopback = peer_is_loopback(&req);
     let store = Arc::clone(state.devices());
     let mut device = None;
-    for token in cookie_tokens(req.headers()) {
-        if let Some(id) = store.authenticate(&token) {
-            device = Some((id, token));
+    let tokens = cookie_tokens(req.headers());
+    for token in &tokens {
+        if let Some(id) = store.authenticate(token) {
+            device = Some((id, token.clone()));
             break;
         }
     }
     let lan = state.lan_mode();
     if lan && !loopback && device.is_none() && !is_open(req.method(), req.uri().path()) && !chatgpt_callback_pending(&state, &req) {
-        return deny(req.method(), req.uri().path());
+        if is_page(req.method(), req.uri().path()) {
+            let denial = Denial {
+                path: req.uri().path(),
+                cookie: if tokens.is_empty() { DenialCookie::Absent } else { DenialCookie::Unknown },
+                sec_fetch_site: req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+            };
+            if let Some(line) = store.denial_line(&denial) {
+                eprintln!("{line}");
+            }
+        }
+        return deny(req.method(), req.uri());
     }
     req.extensions_mut().insert(Access { device: device.as_ref().map(|(id, _)| id.clone()), loopback });
     let mut resp = next.run(req).await;
@@ -877,10 +1037,13 @@ fn publish_changed(state: &AppState, reason: &str) {
 #[derive(Deserialize)]
 pub struct PairLinkQuery {
     t: Option<String>,
+    /// Caminho de volta opcional (spec 128), aceito só por [`safe_next`].
+    next: Option<String>,
 }
 
-/// `GET /pair?t=...`: link de entrada de uso único. Válido: cria "Este computador", grava o cookie
-/// e volta para `/`. Inválido ou expirado: a página de entrada com o motivo.
+/// `GET /pair?t=...[&next=...]`: link de entrada de uso único. Válido: cria "Este computador",
+/// grava o cookie e volta para o `next` aceito, senão para `/`. Inválido ou expirado: a página de
+/// entrada com o motivo (e o mesmo `next`).
 pub async fn get_pair_link(
     State(state): State<AppState>,
     method: Method,
@@ -895,22 +1058,27 @@ pub async fn get_pair_link(
         return redirect(ENTRY_PATH);
     }
     let token = query.t.unwrap_or_default();
+    let next = query.next.as_deref().and_then(safe_next);
+    let back = next.unwrap_or("/");
     let store = state.devices();
     if access.device.is_some() {
         store.consume_entry_link(&token);
-        return redirect("/");
+        return redirect(back);
     }
     match store.redeem_entry_link(&token) {
         Ok(Some((device, token))) => {
             terminal_notice("devices.log.authorized_link", &[("id", &device.id), ("name", &device.name)]);
             publish_changed(&state, "added");
-            let mut resp = redirect("/");
+            let mut resp = redirect(back);
             if let Some(cookie) = device_cookie(&token) {
                 resp.headers_mut().append(header::SET_COOKIE, cookie);
             }
             resp
         }
-        Ok(None) => redirect(&format!("{ENTRY_PATH}?reason=link_invalid")),
+        Ok(None) => match next.filter(|n| *n != "/") {
+            Some(next) => redirect(&format!("{ENTRY_PATH}?reason=link_invalid&next={}", encode_param(next))),
+            None => redirect(&format!("{ENTRY_PATH}?reason=link_invalid")),
+        },
         Err(_) => store_failed().into_response(),
     }
 }

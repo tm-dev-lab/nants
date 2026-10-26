@@ -19,12 +19,19 @@
  * - plano incompleto (spec 127 T01, `plan_review.status === "incomplete"`: a spec em aprovação sem
  *   nenhuma tarefa): o aviso, "Aprovar" desabilitado e "Pedir ao Arquiteto para terminar", que manda
  *   a continuação interna pelo servidor (`POST /chat/continue`);
+ * - consenso do plano (spec 128 T05, `plan_review.consensus`): durante o ciclo, o progresso ("O
+ *   Revisor está conferindo o plano", "O Arquiteto está avaliando N apontamentos", "Rodada 2 de 3")
+ *   com a aprovação bloqueada; no fim, o resumo (apontamentos, ajustados, mantidos, tamanho do plano
+ *   contra a primeira versão), os mantidos com o motivo recolhidos e, na faixa, só os pontos em
+ *   aberto, reabertos ou em disputa com as duas posições. "Pedir correção" manda só esses pontos.
+ *   Sem nada em aberto, o plano aparece como pronto. A confirmação da aprovação avisa a
+ *   renumeração na ordem de execução da lista;
  * - prontidão (decisão 15): sem `readiness.execute`, o botão fica desabilitado com o que falta;
  *   o 412 `prereq_missing` mostra o que falta com "Configurar".
  */
 import { useId, useState, type ReactNode } from "react";
 import { approveSpec, postChat, postChatContinue } from "../../api/client";
-import type { EnvironmentView, PlanIssue, PlanReviewView, SpecView } from "../../api/types";
+import type { ConsensusView, EnvironmentView, PlanIssue, PlanPointView, PlanReviewView, SpecView } from "../../api/types";
 import { chatFailureMessage } from "../../chatFailure";
 import { loadChatHistory } from "../../chatHistory";
 import { ARCHITECT_COMPLETE_PLAN_MESSAGE } from "../../copy";
@@ -38,23 +45,104 @@ import { appStore, useAppStore } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { MarkdownText } from "../shared/ReportMarkdown";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
+import { renumberMap, tasksInExecutionOrder } from "../shared/executionOrder";
 import { approveProblem, type RunProblem } from "../shared/runProblems";
 import { SPEC_STATUS_LABELS } from "./summary";
 
-/** Mensagem do usuário com todos os itens das checagens, um por linha (no idioma ativo). */
-export function planReviewFixMessage(automatic: readonly string[], issues: readonly PlanIssue[]): string {
-  const lines = [...automatic.map((warning) => `- ${warning}`), ...issues.map((issue) => `- ${issue.task ?? "spec"}: ${issue.text}`)];
+/** Situação de um ponto que pede a decisão do usuário no consenso do plano (spec 128 T05). */
+type PointState = "open" | "reopened" | "disputed";
+
+/**
+ * Item das checagens do Revisor. No consenso (spec 128 T05), só os pontos em aberto, reabertos ou
+ * em disputa, com a posição do Arquiteto (`reason_kind` e `reason`) quando houver.
+ */
+interface CheckIssue extends PlanIssue {
+  state?: PointState;
+  reason_kind?: string;
+  reason?: string;
+}
+
+const REASON_KIND_KEYS: Readonly<Record<string, MessageKey>> = {
+  agree: "plan.consensus.reasonKind.agree",
+  unverifiable_in_sandbox: "plan.consensus.reasonKind.unverifiable_in_sandbox",
+  not_worth_cost: "plan.consensus.reasonKind.not_worth_cost",
+  duplicate: "plan.consensus.reasonKind.duplicate",
+  inflates_criteria: "plan.consensus.reasonKind.inflates_criteria",
+  other: "plan.consensus.reasonKind.other",
+};
+
+const POINT_STATE_KEYS: Readonly<Record<PointState, MessageKey>> = {
+  open: "plan.consensus.state.open",
+  reopened: "plan.consensus.state.reopened",
+  disputed: "plan.consensus.state.disputed",
+};
+
+const OUTCOME_KEYS: Readonly<Record<string, MessageKey>> = {
+  open: "plan.consensus.outcome.open",
+  disputed: "plan.consensus.outcome.disputed",
+  awaiting_user: "plan.consensus.outcome.awaiting_user",
+  unavailable: "plan.consensus.outcome.unavailable",
+  interrupted: "plan.consensus.outcome.interrupted",
+  shutdown: "plan.consensus.outcome.shutdown",
+};
+
+/**
+ * Posição do Arquiteto num ponto (C-02): o motivo pelo `reason_kind`, traduzido, mais a frase dele.
+ * `null` sem nenhum dos dois (o Arquiteto ainda não respondeu).
+ */
+export function architectPosition(point: { reason_kind?: string; reason?: string }): string | null {
+  const key = point.reason_kind !== undefined ? REASON_KIND_KEYS[point.reason_kind] : undefined;
+  const kind = key !== undefined ? t(key) : null;
+  const reason = point.reason?.trim() ?? "";
+  if (kind !== null && reason !== "") return t("plan.consensus.reasonWithText", { kind, reason });
+  if (kind !== null) return kind;
+  return reason !== "" ? reason : null;
+}
+
+/** Pontos do consenso que pedem a decisão do usuário: em aberto, reabertos e em disputa. */
+export function consensusPending(consensus: ConsensusView): CheckIssue[] {
+  const as =
+    (state: PointState) =>
+    (point: PlanPointView): CheckIssue => ({
+      id: point.id,
+      task: point.task,
+      kind: point.kind,
+      text: point.text,
+      state,
+      ...(point.reason_kind !== undefined ? { reason_kind: point.reason_kind } : {}),
+      ...(point.reason !== undefined ? { reason: point.reason } : {}),
+    });
+  return [...consensus.open.map(as("open")), ...(consensus.reopened ?? []).map(as("reopened")), ...consensus.disputed.map(as("disputed"))];
+}
+
+/**
+ * Mensagem do usuário com os itens das checagens, um por linha (no idioma ativo). No consenso, só
+ * os pontos em aberto ou em disputa, cada um com a posição do Arquiteto na linha seguinte.
+ */
+export function planReviewFixMessage(automatic: readonly string[], issues: readonly CheckIssue[]): string {
+  const lines = [
+    ...automatic.map((warning) => `- ${warning}`),
+    ...issues.flatMap((issue) => {
+      const where = issue.task ?? "spec";
+      const head = issue.state !== undefined && issue.id !== undefined ? `- ${where} (${issue.id}): ${issue.text}` : `- ${where}: ${issue.text}`;
+      const position = issue.state !== undefined ? architectPosition(issue) : null;
+      return position === null ? [head] : [head, `  ${t("plan.review.fixPosition", { position })}`];
+    }),
+  ];
   return [t("plan.review.fixPrefix"), ...lines].join("\n");
 }
 
 /** Apontamentos `too_large` com tarefa (spec 126 T03): os que pedem destaque no cartão. */
-export function tooLargeIssues(issues: readonly PlanIssue[]): PlanIssue[] {
+export function tooLargeIssues<T extends PlanIssue>(issues: readonly T[]): T[] {
   return issues.filter((issue) => issue.kind === "too_large" && issue.task !== null);
 }
 
-/** Título da faixa âmbar das checagens ("O Revisor fez 1 apontamento"), no idioma ativo. */
-export function planWarnTitle(reviewer: number, automatic: number): string {
-  const byReviewer = tp("plan.warn.reviewer", reviewer);
+/**
+ * Título da faixa âmbar das checagens ("O Revisor fez 1 apontamento"), no idioma ativo. No
+ * consenso (`consensus`), a parte do Revisor conta os pontos em aberto entre ele e o Arquiteto.
+ */
+export function planWarnTitle(reviewer: number, automatic: number, consensus = false): string {
+  const byReviewer = tp(consensus ? "plan.warn.open" : "plan.warn.reviewer", reviewer);
   const byNants = tp("plan.warn.automatic", automatic);
   if (reviewer > 0 && automatic > 0) return t("plan.warn.both", { reviewer: byReviewer, automatic: byNants });
   if (reviewer > 0) return byReviewer;
@@ -102,10 +190,31 @@ function Pending({ children, id }: { children: ReactNode; id?: string }) {
   );
 }
 
+/**
+ * Progresso da revisão em curso (spec 128 T05): "O Revisor está conferindo o plano", "O Arquiteto
+ * está avaliando N apontamentos" e a rodada de ajuste ("Rodada 2 de 3"). Sem o ciclo, a frase de antes.
+ */
+function ReviewProgress({ review }: { review: PlanReviewView }) {
+  const { t, tp } = useT();
+  const consensus = review.consensus;
+  if (consensus === undefined) return <Pending>{t("plan.review.running")}</Pending>;
+  const text = consensus.phase === "architect" ? tp("plan.consensus.evaluating", consensus.evaluating) : t("plan.consensus.reviewing");
+  return (
+    <Pending>
+      <span data-plan-progress={consensus.phase ?? "review"}>{text}</span>
+      {consensus.round > 0 ? (
+        <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-plan-round="">
+          {t("plan.consensus.round", { round: consensus.round, max: consensus.max_rounds })}
+        </span>
+      ) : null}
+    </Pending>
+  );
+}
+
 function ReviewerStatus({ review }: { review: PlanReviewView }) {
   const { t } = useT();
   if (review.status === "incomplete") return <p className="nd-muted">{t("plan.review.incomplete")}</p>;
-  if (review.status === "running" || review.status === "pending") return <Pending>{t("plan.review.running")}</Pending>;
+  if (review.status === "running" || review.status === "pending") return <ReviewProgress review={review} />;
   if (review.status === "stale") return <p className="nd-muted">{t("plan.review.stale")}</p>;
   if (review.status === "unavailable") return <p className="nd-muted">{t("plan.review.unavailable")}</p>;
   return <p className="nd-muted">{t("plan.review.clean")}</p>;
@@ -124,8 +233,11 @@ function reviewerDetail(review: PlanReviewView, issues: number): string {
 /** Itens das checagens e a situação da revisão (o mesmo cálculo para a vista, o detalhe e o rodapé). */
 interface Checks {
   automatic: readonly string[];
-  issues: readonly PlanIssue[];
+  /** Itens do Revisor; no consenso, só os pontos em aberto, reabertos ou em disputa. */
+  issues: readonly CheckIssue[];
   review: PlanReviewView | undefined;
+  /** Ciclo de consenso concluído (spec 128 T05); ausente nos registros antigos. */
+  consensus: ConsensusView | undefined;
   total: number;
   reviewDone: boolean;
 }
@@ -133,8 +245,129 @@ interface Checks {
 function checksOf(spec: SpecView): Checks {
   const automatic = [...(spec.scope_warnings ?? []), ...(spec.coverage_warnings ?? [])];
   const review = spec.plan_review;
-  const issues = review?.status === "ok" ? review.issues : [];
-  return { automatic, issues, review, total: automatic.length + issues.length, reviewDone: review === undefined || review.status === "ok" };
+  const consensus = review?.status === "ok" ? review.consensus : undefined;
+  const issues = review?.status === "ok" ? (consensus !== undefined ? consensusPending(consensus) : review.issues) : [];
+  return {
+    automatic,
+    issues,
+    review,
+    consensus,
+    total: automatic.length + issues.length,
+    reviewDone: review === undefined || review.status === "ok",
+  };
+}
+
+/** Tamanho do plano (C-10): "N tarefas (eram M na primeira versão)" e os critérios antes e depois. */
+function planSizeText(consensus: ConsensusView): string {
+  const tasks =
+    consensus.tasks === consensus.tasks_first
+      ? tp("plan.consensus.tasksSame", consensus.tasks)
+      : tp("plan.consensus.tasksChanged", consensus.tasks, { first: consensus.tasks_first });
+  const criteria =
+    consensus.criteria === consensus.criteria_first
+      ? tp("plan.consensus.criteriaSame", consensus.criteria)
+      : tp("plan.consensus.criteriaChanged", consensus.criteria, { first: consensus.criteria_first });
+  return t("plan.consensus.size", { tasks, criteria });
+}
+
+/** Pontos que esperam a decisão do usuário: em aberto, reabertos e em disputa. */
+function consensusWaiting(consensus: ConsensusView): number {
+  return consensus.open.length + (consensus.reopened ?? []).length + consensus.disputed.length;
+}
+
+/**
+ * Apontamentos do resumo, por ponto distinto: ajustados + mantidos + à espera. É a regra do
+ * servidor (`total`); sem o campo, a mesma soma.
+ */
+function consensusTotal(consensus: ConsensusView): number {
+  return consensus.total ?? consensus.adjusted + consensus.kept + consensusWaiting(consensus);
+}
+
+/**
+ * Resumo do consenso (spec 128 T05, G1): quantos apontamentos houve, quantos foram ajustados,
+ * mantidos e quantos seguem em aberto (a soma fecha com o total), o tamanho do plano e os mantidos
+ * com o motivo, recolhidos por padrão.
+ */
+function ConsensusFacts({ consensus }: { consensus: ConsensusView }) {
+  const { t, tp } = useT();
+  const total = consensusTotal(consensus);
+  if (total === 0) return null;
+  const kept = consensus.kept_points;
+  const waiting = consensusWaiting(consensus);
+  const parts = {
+    points: tp("plan.consensus.points", total),
+    adjusted: tp("plan.consensus.adjusted", consensus.adjusted),
+    kept: tp("plan.consensus.kept", consensus.kept),
+  };
+  return (
+    <div className="nd-plan-consensus" data-plan-consensus="">
+      <p data-plan-consensus-summary="">
+        {waiting > 0 ? t("plan.consensus.summaryOpen", { ...parts, open: tp("plan.consensus.open", waiting) }) : t("plan.consensus.summary", parts)}
+      </p>
+      {consensus.tasks_first > 0 ? (
+        <p className="nd-muted" data-plan-size="">
+          {planSizeText(consensus)}
+        </p>
+      ) : null}
+      {kept.length > 0 ? (
+        <details className="nd-details" data-plan-kept="">
+          <summary>
+            <Icon name="chevron-right" size={14} className="nd-details-chevron" />
+            {tp("plan.consensus.keptTitle", kept.length)}
+          </summary>
+          <ul className="nd-plan-warn-list">
+            {kept.map((point) => (
+              <li key={point.id} className="nd-break nd-plan-point" data-plan-kept-point={point.id}>
+                <span>
+                  <span className="nd-mono">{point.task ?? "spec"}</span>: {point.text}
+                </span>
+                <span className="nd-plan-point-side">
+                  <span className="nd-plan-point-label">{t("plan.consensus.architect")}:</span> {architectPosition(point) ?? t("plan.consensus.noAnswer")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+/** Um ponto em aberto, reaberto ou em disputa: o apontamento do Revisor e a posição do Arquiteto. */
+function ConsensusPoint({ point }: { point: CheckIssue }) {
+  const { t } = useT();
+  const position = architectPosition(point);
+  return (
+    <li className="nd-break nd-plan-point" data-plan-point={point.state ?? "open"} data-plan-point-id={point.id ?? ""}>
+      <span className="nd-plan-point-head">
+        <span className="nd-mono">{point.task ?? "spec"}</span>
+        <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone="amber">
+          {t(POINT_STATE_KEYS[point.state ?? "open"])}
+        </span>
+      </span>
+      <span>
+        <span className="nd-plan-point-label">{t("plan.consensus.reviewer")}:</span> {point.text}
+      </span>
+      <span className="nd-plan-point-side">
+        <span className="nd-plan-point-label">{t("plan.consensus.architect")}:</span> {position ?? t("plan.consensus.noAnswer")}
+      </span>
+    </li>
+  );
+}
+
+/** Sem ponto em aberto: o plano aparece como pronto, sem aviso de problema (critério 3). */
+function ConsensusReady({ consensus }: { consensus: ConsensusView }) {
+  const { t } = useT();
+  const total = consensusTotal(consensus);
+  return (
+    <section className="nd-plan-consensus" data-plan-ready="">
+      <p className="nd-row">
+        <Icon name="check" size={14} />
+        <span>{total > 0 ? t("plan.consensus.ready") : t("plan.consensus.readyClean")}</span>
+      </p>
+      <ConsensusFacts consensus={consensus} />
+    </section>
+  );
 }
 
 /**
@@ -144,11 +377,12 @@ function checksOf(spec: SpecView): Checks {
 function PlanChecksSummary({ checks }: { checks: Checks }) {
   const { t } = useT();
   const titleId = useId();
-  const { automatic, issues, review, total, reviewDone } = checks;
+  const { automatic, issues, review, consensus, total, reviewDone } = checks;
   if (total === 0) {
     // Plano incompleto (spec 127 T01): o aviso fica no rodapé, junto da ação.
     if (review?.status === "incomplete") return null;
     if (review !== undefined && review.status !== "ok") return <ReviewerStatus review={review} />;
+    if (consensus !== undefined) return <ConsensusReady consensus={consensus} />;
     return (
       <p data-testid="plan-checks-clean" className="nd-muted">
         {t("plan.checks.clean")}
@@ -156,20 +390,30 @@ function PlanChecksSummary({ checks }: { checks: Checks }) {
     );
   }
   const reviewerShown = review !== undefined && (issues.length > 0 || !reviewDone);
-  const big = tooLargeIssues(issues);
+  const big = consensus !== undefined ? [] : tooLargeIssues(issues);
   const others = issues.filter((issue) => !big.includes(issue));
   const both = reviewerShown && automatic.length > 0;
+  const outcomeKey = consensus?.outcome !== undefined ? OUTCOME_KEYS[consensus.outcome] : undefined;
+  const pendingPoints = consensus !== undefined && issues.length > 0;
   return (
+    <>
+    {consensus !== undefined ? <ConsensusFacts consensus={consensus} /> : null}
     <section aria-label={t("plan.checks.title")} aria-describedby={titleId} className="nd-plan-warn" data-plan-warn="">
       <Icon name="alert" size={16} className="nd-plan-warn-icon" />
       <div className="nd-plan-warn-text">
         <h3 id={titleId} className="nd-plan-warn-title">
-          {planWarnTitle(issues.length, automatic.length)}
+          {planWarnTitle(issues.length, automatic.length, consensus !== undefined)}
         </h3>
         {reviewerShown ? (
           <section aria-label={t("role.reviewer")} className="nd-stack-xs">
             {both ? <h4 className="nd-plan-warn-source">{t("role.reviewer")}</h4> : null}
-            {issues.length > 0 ? (
+            {pendingPoints ? (
+              <ul className="nd-plan-warn-list" data-plan-pending="">
+                {issues.map((point, i) => (
+                  <ConsensusPoint key={`${point.id ?? i}-${point.text}`} point={point} />
+                ))}
+              </ul>
+            ) : issues.length > 0 ? (
               <ul className="nd-plan-warn-list">
                 {big.map((issue, i) => (
                   <li key={`big-${i}-${issue.text}`} className="nd-break nd-plan-big" data-plan-too-large={issue.task ?? ""}>
@@ -200,9 +444,17 @@ function PlanChecksSummary({ checks }: { checks: Checks }) {
             </ul>
           </section>
         ) : null}
-        <p className="nd-plan-warn-note">{t("plan.checks.notBlocking")}</p>
+        {pendingPoints ? (
+          <p className="nd-plan-warn-note" data-plan-decide="">
+            {outcomeKey !== undefined ? `${t(outcomeKey, { max: consensus?.max_rounds ?? 0 })} ` : ""}
+            {t("plan.consensus.decide")}
+          </p>
+        ) : (
+          <p className="nd-plan-warn-note">{t("plan.checks.notBlocking")}</p>
+        )}
       </div>
     </section>
+    </>
   );
 }
 
@@ -320,6 +572,10 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
   const incompleteId = useId();
   const blocked = stage === "awaiting" && gateBlocked(shell.readiness, "execute");
   const checks = checksOf(spec);
+  const renumbering = renumberMap(spec)
+    .map(([from, to]) => t("plan.renumberPair", { from, to }))
+    .join(", ");
+  const renumberId = useId();
   const bigTasks = new Set(tooLargeIssues(checks.issues).map((issue) => issue.task));
   const premises = spec.premises ?? [];
   const skills = spec.skills ?? [];
@@ -405,9 +661,15 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
   if (awaiting && drafting && !completing) {
     footer = <Pending>{t("plan.drafting")}</Pending>;
   } else if (awaiting && confirming) {
+    // C-07: a confirmação avisa que as tarefas serão renumeradas na ordem de execução da lista.
     footer = (
-      <div role="group" aria-labelledby={confirmId} className="nd-row nd-wrap">
+      <div role="group" aria-labelledby={confirmId} aria-describedby={renumbering !== "" ? renumberId : undefined} className="nd-row nd-wrap">
         <span id={confirmId}>{t("plan.confirmStart")}</span>
+        {renumbering !== "" ? (
+          <span id={renumberId} className="nd-muted nd-break" data-plan-renumber="">
+            {t("plan.confirmRenumber", { map: renumbering })}
+          </span>
+        ) : null}
         <button type="button" className="nd-btn" data-variant="primary" onClick={() => void approve()} disabled={busy || waiting || blocked} aria-busy={busy}>
           <Icon name="play" size={14} />
           {busy ? t("plan.starting") : t("plan.confirm")}
@@ -485,7 +747,7 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
       </header>
 
       <ol className="nd-plan-tasks" aria-label={t("plan.tasksLabel")}>
-        {spec.tasks.map((task) => (
+        {tasksInExecutionOrder(spec).map((task) => (
           <li key={task.id} className="nd-plan-task">
             {/* Só o id identifica a tarefa (094/T08, A-09): sem numeração redundante. */}
             <span className="nd-mono nd-plan-task-id">{task.id}</span>

@@ -1672,6 +1672,10 @@ impl ToolHost {
             self.plan_write(&kind, &target, content, human_command).map(|_| ())
         })?;
         self.sdd_writes.fetch_add(1, Ordering::SeqCst);
+        // Spec 128 T02 (C-04): o Arquiteto vê na hora quantos critérios o servidor conta na tarefa.
+        if matches!(kind, SddKind::Task { .. }) {
+            return Ok(format!("artefato SDD escrito: {}; {}", scope_key(&rel), task_criteria_note(&final_content)));
+        }
         Ok(format!("artefato SDD escrito: {}", scope_key(&rel)))
     }
 
@@ -2576,6 +2580,28 @@ fn sdd_err(msg: &'static str) -> ToolError {
 enum SddKind {
     Spec { id: String },
     Task { spec_id: String, id: String },
+}
+
+/// Nota da resposta de `write_sdd_artifacts` numa tarefa (spec 128 T02, C-04): os critérios de
+/// aceitação contados pelo servidor (a mesma conta da conferência de tamanho, com o peso da
+/// densidade da spec 128 T03) e o limite. Texto para o modelo, não para a pessoa.
+fn task_criteria_note(content: &str) -> String {
+    use crate::agents::recovery_plan::{count_criteria, criteria_weight, CRITERION_WORDS, MANY_CRITERIA};
+    let body = crate::sdd::Task::parse(content).map(|t| t.body).unwrap_or_default();
+    let acceptance = crate::agents::runner::section_text(&body, crate::agents::runner::ACCEPTANCE).unwrap_or_default();
+    let count = count_criteria(&acceptance);
+    let weight = criteria_weight(&acceptance).max(count);
+    let dense = if weight > count {
+        format!(", que valem {weight} pela densidade (critério com mais de {CRITERION_WORDS} palavras conta como mais de um)")
+    } else {
+        String::new()
+    };
+    let verdict = match (weight >= MANY_CRITERIA, weight > count) {
+        (false, _) => "dentro do limite",
+        (true, true) => "grande demais para uma revisão; escreva um critério por comportamento, numa frase curta, ou divida a tarefa",
+        (true, false) => "grande demais para uma revisão; divida a tarefa",
+    };
+    format!("critérios de aceitação contados pelo servidor: {count}{dense} (a partir de {MANY_CRITERIA}, a tarefa é grande demais): {verdict}")
 }
 
 /// Identificador de spec ou tarefa: `[A-Za-z0-9_-]{1,64}`.
@@ -6082,6 +6108,26 @@ mod tests {
         assert!(!root.join(".nants/compose.yaml").exists());
         let big = format!("{ENV_COMPOSE}# {}\n", "x".repeat(65 * 1024));
         assert!(write_art(&h, ".nants/compose.yaml", &big).await.is_err());
+    }
+
+    /// Spec 128 T02 (C-04): a resposta da escrita de uma tarefa traz os critérios contados pelo
+    /// servidor; a da spec não.
+    #[tokio::test]
+    async fn sdd_task_write_reports_the_counted_criteria() {
+        let root = sdd_root("sdd-criteria");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
+        let spec = write_art(&h, ".sdd/specs/001-exemplo/spec.md", EXAMPLE_SPEC_MD).await.expect("spec");
+        assert!(!spec.contains("critérios"), "{spec}");
+        let one = write_art(&h, ".sdd/specs/001-exemplo/tasks/T01.md", EXAMPLE_TASK_MD).await.expect("tarefa");
+        assert!(one.contains("critérios de aceitação contados pelo servidor: 1 (a partir de 6") && one.ends_with("dentro do limite"), "{one}");
+        let many: String = (1..=7).map(|i| format!("{i}. critério {i}\n")).collect();
+        let big = EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.\n", &many);
+        let out = write_art(&h, ".sdd/specs/001-exemplo/tasks/T01.md", &big).await.expect("tarefa grande");
+        assert!(out.contains("contados pelo servidor: 7") && out.ends_with("divida a tarefa"), "{out}");
+        // Spec 128 T03: critérios longos valem mais de um (exemplo real do Test 6, a T12).
+        let dense = EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.\n", crate::agents::recovery_plan::tests::TEST6_T12_ACCEPTANCE);
+        let out = write_art(&h, ".sdd/specs/001-exemplo/tasks/T01.md", &dense).await.expect("tarefa densa");
+        assert!(out.contains("contados pelo servidor: 3, que valem 6 pela densidade (critério com mais de 60 palavras") && out.ends_with("numa frase curta, ou divida a tarefa"), "{out}");
     }
 
     #[tokio::test]

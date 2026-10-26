@@ -286,6 +286,12 @@ async fn plan_and_run(state: &AppState, root: &Path) -> Vec<ApiEvent> {
     assert_eq!(code, StatusCode::OK, "{body}");
     assert!(root.join(".sdd/specs").join(SPEC).join("tasks/T02.md").exists(), "plano gravado pelo Arquiteto");
     assert_eq!(spec_status(root), SpecStatus::AwaitingApproval);
+    // A aprovação espera a revisão do plano disparada pelo turno (spec 128 T04), como a tela.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while super::plan_review::review_running(root, SPEC) {
+        assert!(std::time::Instant::now() < deadline, "revisão do plano não terminou");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let mut rx = state.events().subscribe();
     let (code, body) = post(state, &format!("/api/projects/{PROJECT}/specs/{SPEC}/approve"), "{}").await;
     assert_eq!(code, StatusCode::ACCEPTED, "{body}");

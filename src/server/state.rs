@@ -152,6 +152,8 @@ pub struct AppState {
     shutdown: Arc<watch::Sender<bool>>,
     /// Projetos com um turno de chat em andamento (um por projeto). Sem I/O sob este lock.
     busy_chats: Arc<Mutex<HashSet<String>>>,
+    /// Consenso do plano (spec 128 T02): mensagens do usuário e turnos internos por projeto.
+    plan_consensus: Arc<super::plan_consensus::Runtime>,
     /// Turno do Arquiteto em andamento por projeto (texto do usuário já redigido).
     architect_turns: Arc<Mutex<std::collections::HashMap<String, ArchitectTurn>>>,
     /// Execuções de spec em andamento, no máximo uma por projeto.
@@ -234,6 +236,7 @@ impl AppState {
             approvals: ApprovalRegistry::new(),
             shutdown: Arc::new(watch::channel(false).0),
             busy_chats: Arc::new(Mutex::new(HashSet::new())),
+            plan_consensus: Arc::new(super::plan_consensus::Runtime::default()),
             architect_turns: Arc::new(Mutex::new(std::collections::HashMap::new())),
             runs: RunRegistry::new(),
             runner_factory: Arc::new(ConfiguredRunnerFactory),
@@ -681,6 +684,11 @@ impl AppState {
             ok: false,
             reservation: None,
         }
+    }
+
+    /// Estado do consenso do plano por projeto (spec 128 T02).
+    pub fn plan_consensus(&self) -> &Arc<super::plan_consensus::Runtime> {
+        &self.plan_consensus
     }
 
     /// Reserva o turno de chat do projeto. `None` se já há um turno em andamento.

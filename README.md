@@ -61,10 +61,22 @@ and you decide at every step.
 - **Recovery with more options.** When a task gets stuck, the Architect can retry with a new
   strategy, split the task into smaller ones (keeping the work already on the branch), adjust the
   criteria to what the environment proves, or ask you a question in the Conversation.
+- **A plan the agents agree on.** Before the plan reaches you, the Reviewer checks it and the
+  Architect answers each finding: it adjusts the plan, or keeps it with a reason (for example, a
+  check the sandbox cannot run, or one that only adds criteria). The Reviewer remembers those
+  answers and does not raise a declined point again without a new argument. They go back and forth
+  for at most 3 rounds. The plan card then shows a summary: how many findings there were, how many
+  were adjusted and kept (with the Architect's reasons, folded), the size of the plan against its
+  first version, and any point still open or in dispute, with both positions. **Ask for a fix**
+  sends only those points to the Architect, or you approve anyway. With nothing open, the plan
+  shows as ready.
+- **Tasks numbered in run order.** The plan lists the tasks in the order they will run. When you
+  approve, they are renumbered in that order (T01 runs first), every reference follows, and the
+  map from old to new ids goes into the spec and the Conversation.
 - **Task size and cost.** The plan review flags tasks that are too large, such as many criteria or
-  server, client and end to end tests in one task, and suggests how to split them. Before the plan
-  reaches you, the Architect gets one turn to split those tasks and the plan is reviewed again; what
-  is still too large shows up highlighted on the approval card, and you can approve anyway. When a task
+  server, client and end to end tests in one task, and suggests how to split them. The Architect
+  splits them during the same back and forth; what is still too large shows up highlighted on the
+  approval card, and you can approve anyway. When a task
   spends far more than the others (3 times the median of the finished tasks of the spec, or a fixed
   threshold of 8 million tokens or 400 calls), the Board and the Activity show a quiet notice and
   the Architect gets the signal in its next decision. It is only a signal: the run never stops for it.
@@ -204,6 +216,10 @@ after 5 wrong attempts, generate another one.
 **Authorized devices.** The list shows each device with when it joined and its last access. You
 can rename or revoke it; revoking cuts its open sessions right away. **Revoke all** is there too.
 If you revoke this computer, sign in again with the terminal link.
+
+**Back where you were.** A refresh, or a tab opened from another app, a bookmark or the history,
+keeps an authorized device signed in. If a page ever lands on the sign-in screen, Nants takes you
+back to that page after you sign in.
 
 To turn it off, switch it off on the same page and, on WSL, run the **Script to undo it on
 Windows**. The device list is kept. `nants --lan` turns it on for a single run, without saving.

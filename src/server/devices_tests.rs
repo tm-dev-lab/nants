@@ -364,10 +364,11 @@ async fn nat_requests_without_device_are_refused_and_pages_go_to_the_entry() {
     }
     let resp = send(&state, req(Method::PUT, "/api/config/network", NAT_PEER, None, Some(json!({"lan": false})))).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    for page in ["/", "/projects/abc", "/settings"] {
+    // As páginas voltam pela entrada com o caminho de origem (spec 128); a raiz não precisa.
+    for (page, to) in [("/", ENTRY_PATH), ("/projects/abc", "/connect?next=/projects/abc"), ("/settings", "/connect?next=/settings")] {
         let resp = send(&state, req(Method::GET, page, NAT_PEER, None, None)).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{page}");
-        assert_eq!(location(&resp), Some(ENTRY_PATH));
+        assert_eq!(location(&resp), Some(to));
     }
     // A página de entrada e os recursos dela abrem (o que não existe dá 404, não 401).
     let resp = send(&state, req(Method::GET, ENTRY_PATH, NAT_PEER, None, None)).await;
@@ -410,7 +411,7 @@ async fn real_loopback_needs_no_device_and_outside_network_mode_nothing_changes(
 }
 
 #[tokio::test]
-async fn entry_link_authorizes_this_computer_with_a_strict_cookie() {
+async fn entry_link_authorizes_this_computer_with_a_lax_cookie() {
     let dir = TempDir::new("pairlink");
     let clock = Clock::new();
     let state = lan_state(&dir, &clock);
@@ -423,9 +424,10 @@ async fn entry_link_authorizes_this_computer_with_a_strict_cookie() {
     let resp = send(&state, req(Method::GET, &format!("/pair?t={t}"), NAT_PEER, None, None)).await;
     assert_eq!((resp.status(), location(&resp)), (StatusCode::SEE_OTHER, Some("/")));
     let cookie = set_cookie(&resp).expect("cookie");
-    for attr in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=31536000"] {
+    for attr in ["HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=31536000"] {
         assert!(cookie.contains(attr), "{cookie}");
     }
+    assert!(!cookie.contains("Strict"), "{cookie}");
     assert!(!cookie.contains("Secure"), "HTTP local: sem Secure");
     let token = token_of(&cookie);
     // Uso único.
@@ -731,4 +733,255 @@ async fn revocation_inside_the_handler_still_ends_the_stream() {
     assert!(set_cookie(&resp).is_none(), "revogado não renova o cookie");
     let ended = tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect()).await;
     assert!(ended.is_ok(), "o stream do dispositivo revogado no handler terminou");
+}
+
+// --- Spec 128 T01: cookie Lax, volta à página de origem e diagnóstico da negação ---------------
+
+#[test]
+fn device_cookie_is_lax_both_when_set_and_when_cleared() {
+    let token = "b".repeat(64);
+    let set = device_cookie(&token).expect("cabeçalho");
+    assert_eq!(
+        set.to_str().expect("ascii"),
+        format!("nants_device={token}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Lax")
+    );
+    assert_eq!(clear_cookie().to_str().expect("ascii"), "nants_device=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+}
+
+#[test]
+fn next_accepts_only_relative_paths_of_nants() {
+    for ok in ["/", "/projects/abc", "/projects/abc?tab=chat", "/x?a=1#sec", "/settings#devices", "/connectx", "/%2F%2Fevil"] {
+        assert_eq!(safe_next(ok), Some(ok), "{ok}");
+    }
+    let long = format!("/{}", "a".repeat(MAX_NEXT_BYTES));
+    for bad in [
+        "", "//evil", "//evil.com/x", "http://evil.com", "https://evil.com/", "javascript:alert(1)", "evil.com", "x/y",
+        "\\evil", "/\\evil", "/a\\b", "/\t/evil", "/a b", "/a\nb", "/connect", "/connect?next=/x", "/connect#x", long.as_str(),
+    ] {
+        assert_eq!(safe_next(bad), None, "{bad:?}");
+    }
+    assert!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_BYTES - 1))).is_some(), "2 KB exatos passam");
+    // A entrada leva o caminho codificado; o recusado e a raiz levam à entrada pura.
+    assert_eq!(entry_location(Some("/p?a=1&b=2#h")), "/connect?next=/p%3Fa%3D1%26b%3D2%23h");
+    assert_eq!(entry_location(Some("//evil")), ENTRY_PATH);
+    assert_eq!(entry_location(Some("/")), ENTRY_PATH);
+    assert_eq!(entry_location(None), ENTRY_PATH);
+}
+
+#[tokio::test]
+async fn denied_page_goes_to_the_entry_with_next_and_the_link_returns_to_it() {
+    let dir = TempDir::new("next");
+    let clock = Clock::new();
+    let state = lan_state(&dir, &clock);
+    let resp = send(&state, req(Method::GET, "/projects/abc?tab=chat", NAT_PEER, None, None)).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&resp), Some("/connect?next=/projects/abc%3Ftab%3Dchat"));
+    let resp = send(&state, req(Method::HEAD, "/settings", NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some("/connect?next=/settings"));
+    // Caminho que começa com `//` não vira destino.
+    let resp = send(&state, req(Method::GET, "//evil.com/x", NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some(ENTRY_PATH));
+    // Rota com segredo na URL não vira `next` (o `code` e o `state` não passam pela entrada).
+    let resp = send(&state, req(Method::GET, "/auth/finish?code=c&state=s", NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some(ENTRY_PATH));
+    // A API continua com 401 JSON, sem redirecionar.
+    let resp = send(&state, req(Method::GET, "/api/config", NAT_PEER, None, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(location(&resp).is_none());
+    // O link de entrada com `next` volta para ele; com um `next` recusado, para a raiz.
+    let t = state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let resp = send(&state, req(Method::GET, &format!("/pair?t={t}&next=%2Fprojects%2Fabc%3Ftab%3Dchat"), NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some("/projects/abc?tab=chat"));
+    assert!(set_cookie(&resp).is_some());
+    let t = state.devices().issue_entry_link(crate::i18n::Lang::PtBr).expect("link");
+    let resp = send(&state, req(Method::GET, &format!("/pair?t={t}&next=%2F%2Fevil.com"), NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some("/"));
+    // Link inválido: a entrada com o motivo e o mesmo `next`.
+    let resp = send(&state, req(Method::GET, "/pair?t=errado&next=%2Fsettings", NAT_PEER, None, None)).await;
+    assert_eq!(location(&resp), Some("/connect?reason=link_invalid&next=/settings"));
+}
+
+#[test]
+fn denial_line_has_no_secret_and_is_rate_limited() {
+    let dir = TempDir::new("denial");
+    let clock = Clock::new();
+    let store = store_in(&dir, &clock);
+    let first = Denial { path: "/projects/abc", cookie: DenialCookie::Absent, sec_fetch_site: Some("cross-site") };
+    assert_eq!(
+        store.denial_line(&first).as_deref(),
+        Some("nants.device_denied path=/projects/abc cookie=none sec_fetch_site=cross-site")
+    );
+    let unknown = Denial { path: "/", cookie: DenialCookie::Unknown, sec_fetch_site: None };
+    assert_eq!(store.denial_line(&unknown).as_deref(), Some("nants.device_denied path=/ cookie=unknown"));
+    let odd = Denial { path: "/x", cookie: DenialCookie::Absent, sec_fetch_site: Some("abc\" injetado") };
+    assert_eq!(store.denial_line(&odd).as_deref(), Some("nants.device_denied path=/x cookie=none sec_fetch_site=other"));
+    // Limite: DENIAL_LOG_MAX linhas por janela; a primeira da janela seguinte conta as suprimidas.
+    for _ in 3..DENIAL_LOG_MAX {
+        assert!(store.denial_line(&unknown).is_some());
+    }
+    assert!(store.denial_line(&unknown).is_none());
+    assert!(store.denial_line(&unknown).is_none());
+    clock.advance(DENIAL_LOG_WINDOW_MS);
+    assert_eq!(store.denial_line(&unknown).as_deref(), Some("nants.device_denied path=/ cookie=unknown suppressed=2"));
+    assert_eq!(store.denial_line(&unknown).as_deref(), Some("nants.device_denied path=/ cookie=unknown"));
+}
+
+/// Efeito de uma rota GET (auditoria da spec 128 T01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetEffect {
+    /// Só lê.
+    Read,
+    /// Renova um cache derivado ou um diagnóstico, sem mudar configuração, projeto nem
+    /// dispositivo; repetir não faz mal e quem dispara de outro site não lê a resposta:
+    /// - `/api/config/pricing/estimate?refresh`: baixa de novo o catálogo público de preços e
+    ///   regrava o cache dele (o preço da configuração só muda no `POST .../autofill`);
+    /// - `/api/config/connections/:id/models?refresh`: consulta a lista de modelos e guarda o
+    ///   cache em memória; com o plano ChatGPT, pode renovar o token de acesso que já existe;
+    /// - `/api/system/prereqs` e `/api/readiness`: rodam o diagnóstico da máquina (só leitura) e
+    ///   guardam o resultado em memória;
+    /// - `/api/devices/code`: troca o código vencido da janela já aberta, como o relógio faria
+    ///   no próximo acesso (não abre janela nem zera erros).
+    Cache,
+    /// Altera estado, só com um segredo próprio na URL.
+    Secret,
+}
+
+/// Toda rota GET do roteador (`src/server/mod.rs`), classificada. Rota nova sem classificação
+/// faz o teste falhar: com o cookie `Lax`, um GET de outro site leva o cookie.
+const GET_ROUTES: &[(&str, GetEffect)] = &[
+    ("/api/config", GetEffect::Read),
+    ("/api/config/pricing/estimate", GetEffect::Cache),
+    ("/api/config/network", GetEffect::Read),
+    ("/api/projects/:id/usage", GetEffect::Read),
+    ("/api/config/connections/:id/models", GetEffect::Cache),
+    ("chatgpt::CALLBACK_PATH", GetEffect::Read),
+    ("chatgpt::FINISH_PATH", GetEffect::Secret),
+    ("/api/connections/:id/chatgpt", GetEffect::Read),
+    ("/api/projects/:id/state", GetEffect::Read),
+    ("/api/projects/:id/activity", GetEffect::Read),
+    ("/api/projects/:id/files", GetEffect::Read),
+    ("/api/projects/:id/file", GetEffect::Read),
+    ("/api/projects/:id/app", GetEffect::Read),
+    ("/api/projects/:id/app/logs", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/result", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/captures/:name", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/dialog", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/tools", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/report", GetEffect::Read),
+    ("/api/projects/:id/architecture", GetEffect::Read),
+    ("/api/projects/:id/chat", GetEffect::Read),
+    ("/api/projects/:id/chat/attachments/:name", GetEffect::Read),
+    ("/api/ui-state", GetEffect::Read),
+    ("/api/projects/:id/ui-state", GetEffect::Read),
+    ("/api/attention", GetEffect::Read),
+    ("/api/system/prereqs", GetEffect::Cache),
+    ("/api/readiness", GetEffect::Cache),
+    ("/api/fs/browse", GetEffect::Read),
+    ("/api/events", GetEffect::Read),
+    ("devices::PAIR_LINK_PATH", GetEffect::Secret),
+    ("/api/devices", GetEffect::Read),
+    ("/api/devices/code", GetEffect::Cache),
+];
+
+/// Rotas GET do roteador, lidas do código de `router` (primeiro argumento de cada `.route(` cujo
+/// método inclui `get(`), mais o `fallback` dos arquivos da interface.
+fn router_get_routes() -> Vec<String> {
+    let body = router_body();
+    let mut out = Vec::new();
+    for chunk in body.split(".route(").skip(1) {
+        // Fecha o `.route(` no parêntese correspondente.
+        let mut depth = 1i32;
+        let mut end = chunk.len();
+        for (i, c) in chunk.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let call = &chunk[..end];
+        let (path, methods) = call.split_once(',').expect("rota com handler");
+        let has_get = methods
+            .match_indices("get(")
+            .any(|(i, _)| !methods[..i].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_'));
+        if has_get {
+            out.push(path.trim().trim_matches('"').to_string());
+        }
+    }
+    if body.contains(".fallback(static_ui::static_handler)") {
+        out.push("fallback".to_string());
+    }
+    out
+}
+
+/// Corpo de `router` em `mod.rs`.
+fn router_body() -> &'static str {
+    let source = include_str!("mod.rs");
+    let body = source.split("pub fn router(").nth(1).expect("router");
+    body.split("\n}\n").next().expect("fim do router")
+}
+
+/// Construções do axum que registram rotas fora de `.route(` e que o analisador de
+/// [`router_get_routes`] não enxerga (spec 128 T05, observação da revisão da T01).
+const UNAUDITED_ROUTER_CALLS: [&str; 5] = ["any(", ".nest(", ".nest_service(", ".merge(", "route_service("];
+
+/// Chamadas de [`UNAUDITED_ROUTER_CALLS`] no código de `body`, sem contar comentários de linha.
+/// `any(` e `route_service(` só contam como nome inteiro (não como fim de outro nome, ex.: `company(`).
+fn unaudited_router_calls(body: &str) -> Vec<&'static str> {
+    let code: String = body.lines().map(|line| line.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+    UNAUDITED_ROUTER_CALLS
+        .into_iter()
+        .filter(|call| {
+            code.match_indices(call).any(|(i, _)| {
+                call.starts_with('.') || !code[..i].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn unaudited_router_calls_detects_each_form() {
+    for call in [
+        ".route(\"/x\", any(h))",
+        ".nest(\"/api\", inner)",
+        ".nest_service(\"/s\", svc)",
+        ".merge(other)",
+        ".route_service(\"/r\", svc)",
+    ] {
+        assert_eq!(unaudited_router_calls(call).len(), 1, "{call}");
+    }
+    assert!(unaudited_router_calls(".route(\"/x\", get(company(h)))").is_empty());
+    assert!(unaudited_router_calls("// .merge(antigo)\n.route(\"/x\", get(h))").is_empty());
+}
+
+#[test]
+fn get_routes_with_effect_are_audited() {
+    // Rota registrada fora de `.route(` escaparia da auditoria abaixo: o roteador não pode usá-las.
+    assert_eq!(
+        unaudited_router_calls(router_body()),
+        Vec::<&str>::new(),
+        "o router usa uma construção que a auditoria das rotas GET não enxerga; registre a rota com .route("
+    );
+    let found = router_get_routes();
+    assert!(found.iter().any(|p| p == "fallback"), "{found:?}");
+    for path in found.iter().filter(|p| *p != "fallback") {
+        assert!(
+            GET_ROUTES.iter().any(|(p, _)| p == path),
+            "rota GET nova sem auditoria: {path}. Classifique em GET_ROUTES (e, se tiver efeito, exija um segredo próprio)"
+        );
+    }
+    for (path, _) in GET_ROUTES {
+        assert!(found.iter().any(|p| p == path), "rota auditada que não existe mais: {path}");
+    }
+    // As únicas rotas GET que alteram estado, cada uma com o próprio segredo na URL.
+    let secret: Vec<&str> = GET_ROUTES.iter().filter(|(_, e)| *e == GetEffect::Secret).map(|(p, _)| *p).collect();
+    assert_eq!(secret, ["chatgpt::FINISH_PATH", "devices::PAIR_LINK_PATH"]);
+    assert_eq!(crate::server::chatgpt::FINISH_PATH, "/auth/finish");
+    assert_eq!(PAIR_LINK_PATH, "/pair");
 }

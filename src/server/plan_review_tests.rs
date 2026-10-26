@@ -97,7 +97,8 @@ async fn reviews_only_awaiting_approval_and_records_issues() {
     let rec = record(&root);
     assert_eq!(rec.status, STATUS_OK);
     assert_eq!(rec.signature, plan_signature(&root, SPEC).expect("sig"));
-    assert_eq!(rec.issues, vec![PlanIssue { task: Some("T01".into()), kind: "untestable".into(), text: "Critério vago.".into() }]);
+    let expected = PlanIssue { id: Some("P1".into()), ..PlanIssue::new(Some("T01".into()), "untestable", "Critério vago.") };
+    assert_eq!(rec.issues, vec![expected]);
     let ev = rx.try_recv().expect("evento");
     let mut seen = vec![ev];
     while let Ok(e) = rx.try_recv() {
@@ -302,7 +303,9 @@ async fn unreadable_plan_after_claim_still_publishes_and_leaves_running() {
     let claim = Claim::take(&root, SPEC).expect("vaga");
     fs::remove_file(root.join(format!(".sdd/specs/{SPEC}/spec.md"))).expect("rm");
     let setup = reviewer_setup(&st).await.expect("setup");
-    assert_eq!(review_once(&st, PROJECT, &root, SPEC, &setup).await, Err(Stop::Failed));
+    let cycle = crate::server::plan_consensus::Cycle::default();
+    let failed = review_once(&st, PROJECT, &root, SPEC, &setup, 0, None, &cycle).await;
+    assert!(matches!(failed, Err(Stop::Failed)));
     drop(claim);
     assert_eq!(gated.calls.load(Ordering::SeqCst), 0);
     assert!(!is_running(&root, SPEC));
@@ -389,7 +392,10 @@ fn current_result_and_running_win_over_pending() {
         status: STATUS_OK.into(),
         issues: Vec::new(),
         detail: None,
-        split_requested: false,
+        rounds: Vec::new(),
+        outcome: None,
+        points: Vec::new(),
+        next_point: 0,
     };
     let body = serde_json::to_string(&record).expect("json");
     fs::write(root.join(format!(".sdd/specs/{SPEC}/{PLAN_REVIEW_FILE}")), body).expect("registro");
@@ -458,9 +464,9 @@ fn too_large_is_a_known_kind_and_the_plan_carries_task_sizes() {
 fn many_criteria_become_a_too_large_issue_with_a_split_suggestion() {
     use crate::agents::recovery_plan::MANY_CRITERIA;
     use crate::i18n::Lang;
-    let size = |id: &str, criteria: usize| TaskSize { id: id.into(), criteria, scope: Vec::new() };
+    let size = |id: &str, criteria: usize| TaskSize { id: id.into(), criteria, weight: criteria, scope: Vec::new() };
     let sizes = [size("T01", MANY_CRITERIA - 1), size("T02", MANY_CRITERIA), size("T03", 9)];
-    let model = PlanIssue { task: Some("T03".into()), kind: TOO_LARGE.into(), text: "Mistura servidor e e2e.".into() };
+    let model = PlanIssue::new(Some("T03".into()), TOO_LARGE, "Mistura servidor e e2e.");
     let out = with_size_issues(vec![model.clone()], &sizes, Lang::PtBr);
     assert_eq!(out.len(), 2, "{out:?}");
     assert_eq!(out[0], model, "o do modelo fica, sem duplicar a T03");
@@ -471,10 +477,41 @@ fn many_criteria_become_a_too_large_issue_with_a_split_suggestion() {
     assert!(en.iter().all(|i| i.text.contains("Split it into smaller tasks")), "{en:?}");
     assert_eq!(en.iter().map(|i| i.task.as_deref()).collect::<Vec<_>>(), vec![Some("T02"), Some("T03")]);
     // Lista cheia do modelo: o do servidor entra e um do modelo cede a vaga.
-    let full: Vec<PlanIssue> = (0..MAX_ISSUES).map(|i| PlanIssue { task: None, kind: "scope".into(), text: format!("p{i}") }).collect();
+    let full: Vec<PlanIssue> = (0..MAX_ISSUES).map(|i| PlanIssue::new(None, "scope", &format!("p{i}"))).collect();
     let out = with_size_issues(full, &[size("T02", 8)], Lang::PtBr);
     assert_eq!(out.len(), MAX_ISSUES);
     assert_eq!(out.last().map(|i| i.kind.as_str()), Some(TOO_LARGE));
+}
+
+/// Spec 128 T03 (C-12): critérios longos valem mais de um. Com os critérios reais da T12 do Test 6
+/// (3 parágrafos de 84 a 94 palavras), a tarefa vale 6 e vira `too_large` com o texto da densidade,
+/// nos dois idiomas; o plano enviado ao Revisor mostra o peso. Não barra nada: só o apontamento.
+#[test]
+fn dense_criteria_become_a_too_large_issue() {
+    use crate::agents::recovery_plan::tests::TEST6_T12_ACCEPTANCE;
+    use crate::i18n::Lang;
+    let root = tmp("dense");
+    let head = EXAMPLE_TASK_MD.split("## Critérios de Aceitação").next().unwrap_or_default();
+    write_plan(&root, "AWAITING_APPROVAL", &format!("{head}## Critérios de Aceitação\n{TEST6_T12_ACCEPTANCE}"));
+    let sizes = task_sizes(&root, SPEC);
+    assert_eq!(sizes.iter().map(|s| (s.criteria, s.weight)).collect::<Vec<_>>(), vec![(3, 6)]);
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    assert!(plan.contains("- T01: 3 critérios de aceitação (valem 6 pela densidade: critério com mais de 60 palavras conta como mais de um); allowed_scope"), "{plan}");
+    let pt = with_size_issues(Vec::new(), &sizes, Lang::PtBr);
+    assert_eq!(pt.len(), 1, "{pt:?}");
+    assert_eq!((pt[0].task.as_deref(), pt[0].kind.as_str()), (Some("T01"), TOO_LARGE));
+    assert!(pt[0].text.starts_with("3 critérios de aceitação, que valem por 6 pelo tamanho do texto (critério com mais de 60 palavras"), "{}", pt[0].text);
+    assert!(pt[0].text.contains("um critério por comportamento observável, numa frase curta"), "{}", pt[0].text);
+    let en = with_size_issues(Vec::new(), &sizes, Lang::En);
+    assert!(en[0].text.starts_with("3 acceptance criteria, which count as 6 because of their length"), "{}", en[0].text);
+    // Um critério só, longo: singular.
+    let one = TaskSize { id: "T02".into(), criteria: 1, weight: 6, scope: Vec::new() };
+    let single = with_size_issues(Vec::new(), &[one], Lang::PtBr);
+    assert!(single[0].text.starts_with("1 critério de aceitação, que vale por 6"), "{}", single[0].text);
+    // Abaixo do limite, mesmo com densidade: nada.
+    let light = TaskSize { id: "T03".into(), criteria: 3, weight: 5, scope: Vec::new() };
+    assert!(with_size_issues(Vec::new(), &[light], Lang::PtBr).is_empty());
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Spec 124 T06: critérios detalhados em subitens contam só pelo primeiro nível. Três critérios com
@@ -519,13 +556,119 @@ async fn review_records_the_too_large_issue_for_a_big_task() {
     let _ = fs::remove_dir_all(&root);
 }
 
-// ---- Spec 126 T03: divisão das tarefas `too_large` antes da aprovação ----
+// ---- Spec 128 T02: ciclo de consenso do plano (Revisor e Arquiteto falsos) ----
 
-/// Estado com o Arquiteto e o Revisor configurados, cada um com o seu fake.
-fn split_state(root: &Path, reviewer: Arc<Scripted>, architect: Arc<Scripted>) -> AppState {
+use crate::agents::prompts::PLAN_CONSENSUS_INTRO;
+use crate::server::plan_consensus::{
+    DECISION_ACCEPT, DECISION_REJECT, MAX_CONSENSUS_ROUNDS, OUTCOME_AWAITING_USER, OUTCOME_CONSENSUS, OUTCOME_DISPUTED,
+    OUTCOME_OPEN, OUTCOME_UNAVAILABLE,
+};
+use std::collections::VecDeque;
+use std::sync::Mutex as StdMutex;
+
+/// Texto da mensagem do usuário nos testes (o Arquiteto falso a reconhece).
+const USER_MESSAGE: &str = "MENSAGEM DO USUÁRIO: siga com o plano.";
+
+/// Arquiteto falso por turno: cada pedido de rodada do consenso carrega o roteiro seguinte; a
+/// mensagem do usuário carrega o roteiro do usuário; o que sobra (a continuação dos avisos do
+/// plano) responde "Plano conferido.". Com `gate`, a primeira chamada de uma rodada espera a
+/// liberação (avisa em `reached`).
+struct Architect {
+    rounds: StdMutex<VecDeque<Vec<Reply>>>,
+    user: StdMutex<VecDeque<Vec<Reply>>>,
+    current: StdMutex<VecDeque<Reply>>,
+    requests: StdMutex<Vec<ChatRequest>>,
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+impl Architect {
+    fn new(rounds: Vec<Vec<Reply>>) -> Arc<Self> {
+        Self::build(rounds, Vec::new(), None)
+    }
+
+    fn build(rounds: Vec<Vec<Reply>>, user: Vec<Vec<Reply>>, gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Arc<Self> {
+        Arc::new(Self {
+            rounds: StdMutex::new(rounds.into()),
+            user: StdMutex::new(user.into()),
+            current: StdMutex::new(VecDeque::new()),
+            requests: StdMutex::new(Vec::new()),
+            gate,
+        })
+    }
+
+    fn requests(&self) -> Vec<ChatRequest> {
+        self.requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+impl ChatBackend for Architect {
+    fn complete<'a>(&'a self, req: &'a ChatRequest) -> Pin<Box<dyn Future<Output = Reply> + Send + 'a>> {
+        Box::pin(async move {
+            self.requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(req.clone());
+            let last = req.messages.last().map(|m| (m.role, m.content.clone()));
+            let mut wait = false;
+            if let Some((crate::agents::llm_client::Role::User, content)) = &last {
+                let next = if content.starts_with(PLAN_CONSENSUS_INTRO) {
+                    wait = self.gate.is_some();
+                    self.rounds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front()
+                } else if content.contains(USER_MESSAGE) {
+                    self.user.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front()
+                } else {
+                    None
+                };
+                if let Some(script) = next {
+                    *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = script.into();
+                }
+            }
+            if let (true, Some((reached, release))) = (wait, &self.gate) {
+                reached.notify_one();
+                release.notified().await;
+            }
+            let reply = self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
+            reply.unwrap_or_else(|| text("Plano conferido."))
+        })
+    }
+}
+
+/// Estado com o Revisor e o Arquiteto falsos.
+fn consensus_state(root: &Path, reviewer: Arc<Scripted>, architect: Arc<Architect>) -> AppState {
     let mut cfg = config_for(root, true);
     cfg.agents.architect = AgentConfig { connection_id: "c".into(), model: "arq".into(), effort: Effort::Low, max_steps: None };
     AppState::new(root.join("config.toml"), cfg, 3000).with_llm_backend(architect).with_report_backend(reviewer)
+}
+
+fn plan_root(tag: &str) -> PathBuf {
+    let root = tmp(tag);
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    root
+}
+
+/// Resposta da revisão: `(tarefa, tipo, texto, ref, new_argument)`.
+fn review(items: &[(&str, &str, &str, Option<&str>, bool)]) -> Reply {
+    let list: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(task, kind, text, reference, new_argument)| {
+            json!({"task": task, "kind": kind, "text": text, "ref": reference, "new_argument": new_argument})
+        })
+        .collect();
+    text(&json!({ "issues": list }).to_string())
+}
+
+fn with_usage(reply: Reply) -> Reply {
+    reply.map(|mut r| {
+        r.usage = Some(Usage::new(100, 10));
+        r
+    })
+}
+
+/// Resposta final do Arquiteto com o bloco das decisões: `(id, decisão, reason_kind, motivo)`.
+fn decided(list: &[(&str, &str, &str, &str)]) -> Reply {
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|(id, decision, kind, reason)| json!({"id": id, "decision": decision, "reason_kind": kind, "reason": reason}))
+        .collect();
+    text(&format!("Respondi aos apontamentos.\n```nants-plan-decisions\n{}\n```\n", json!({ "decisions": items })))
 }
 
 fn write_task_reply(call: &str, id: &str, content: &str) -> Reply {
@@ -533,134 +676,465 @@ fn write_task_reply(call: &str, id: &str, content: &str) -> Reply {
     crate::agents::architect::testing::calls(&[(call, "write_sdd_artifacts", &args.to_string())])
 }
 
-/// Tarefa `id` com `n` critérios, dependendo de `deps`.
-fn task_of(id: &str, n: usize, deps: &str) -> String {
-    big_task(n).replace("id: \"T01\"", &format!("id: \"{id}\"")).replace("depends_on: []", &format!("depends_on: [{deps}]"))
-}
-
-/// Turnos internos gravados na conversa (o pedido do servidor ao Arquiteto).
-fn internal_turns(root: &Path) -> Vec<String> {
+fn chat_lines(root: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(root.join(crate::agents::architect::CHAT_FILE_REL))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["internal"] == true)
+        .collect()
+}
+
+/// Pedidos internos do servidor ao Arquiteto (as rodadas), gravados na conversa.
+fn internal_turns(root: &Path) -> Vec<String> {
+    chat_lines(root)
+        .into_iter()
+        .filter(|v| v["internal"] == true && v["role"] == "user")
         .filter_map(|v| v["text"].as_str().map(str::to_string))
         .collect()
 }
 
-/// A revisão com `too_large` leva ao turno de divisão do Arquiteto, antes da aprovação; o plano
-/// dividido é revisado de novo na mesma volta, e a divisão aprovada some com o apontamento.
+/// Linhas do sistema com `code` (a linha de cada rodada).
+fn round_lines(root: &Path) -> Vec<serde_json::Value> {
+    chat_lines(root).into_iter().filter(|v| v["role"] == "system" && v["notice"]["code"].is_string()).collect()
+}
+
+fn consensus(root: &Path) -> ConsensusView {
+    view(root, SPEC, &SecretSet::default()).and_then(|v| v.consensus).expect("vista do consenso")
+}
+
+/// Consenso na 1ª rodada: o Arquiteto aceita e ajusta, o Revisor revisa a versão nova com a memória
+/// e não aponta mais nada. A resposta do Arquiteto fica fora da Conversa; a linha da rodada entra.
 #[tokio::test]
-async fn too_large_review_asks_the_architect_to_split_and_reviews_again() {
-    let root = tmp("split");
-    write_plan(&root, "AWAITING_APPROVAL", &big_task(8));
-    fs::create_dir_all(root.join(".git/info")).expect("git");
-    let reviewer = Scripted::new(vec![text("{\"issues\": []}"), text("{\"issues\": []}")]);
-    let architect = Scripted::new(vec![
-        write_task_reply("a1", "T01", &task_of("T01", 4, "")),
-        write_task_reply("a2", "T02", &task_of("T02", 4, "\"T01\"")),
-        text("Dividi a T01 em T01 e T02."),
-        text("Plano conferido."),
+async fn consensus_in_the_first_round() {
+    let root = plan_root("consensus-1");
+    let reviewer = Scripted::new(vec![
+        with_usage(review(&[("T01", "untestable", "Critério vago.", None, false)])),
+        with_usage(review(&[])),
     ]);
-    let st = split_state(&root, reviewer.clone(), architect.clone());
+    let adjusted = EXAMPLE_TASK_MD.replace("Critério verificável.", "GET /health responde 200.");
+    let architect = Architect::new(vec![vec![
+        write_task_reply("a1", "T01", &adjusted),
+        with_usage(decided(&[("P1", DECISION_ACCEPT, "agree", "Critério reescrito.")])),
+    ]]);
+    let st = consensus_state(&root, reviewer.clone(), architect.clone());
     assert_eq!(run(&st, &root).await, 1);
-    let request = architect.requests()[0].messages.last().map(|m| m.content.clone()).unwrap_or_default();
-    assert!(request.starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO), "{request}");
-    assert!(request.contains(&format!("Spec: {SPEC}")) && request.contains("- T01: 8 critérios"), "{request}");
+
     let turns = internal_turns(&root);
-    assert_eq!(turns.len(), 1, "um turno de divisão: {turns:?}");
-    assert!(turns[0].starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO));
-    assert!(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")).exists(), "o Arquiteto dividiu");
-    assert_eq!(reviewer.requests().len(), 2, "o plano revisto foi revisado de novo");
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert!(turns[0].starts_with(PLAN_CONSENSUS_INTRO), "{}", turns[0]);
+    let asked = architect.requests()[0].messages.last().map(|m| m.content.clone()).unwrap_or_default();
+    assert_eq!(asked, turns[0], "o pedido gravado é o que o Arquiteto recebe");
+    assert!(turns[0].contains("Rodada 1 de 3") && turns[0].contains("- P1 (T01, untestable): Critério vago."), "{}", turns[0]);
+    assert!(turns[0].contains("nants-plan-decisions") && turns[0].contains("unverifiable_in_sandbox"), "o formato vai no pedido");
+    assert!(chat_lines(&root).iter().all(|l| !l["text"].as_str().unwrap_or_default().contains("Fix these points")));
+
+    // A resposta da rodada fica fora da Conversa e sem o bloco.
+    let replies: Vec<_> = chat_lines(&root).into_iter().filter(|l| l["role"] == "architect").collect();
+    assert!(replies.iter().all(|l| l["internal"] == true), "{replies:?}");
+    assert!(replies.iter().all(|l| !l["text"].as_str().unwrap_or_default().contains("nants-plan-decisions")));
+    assert!(crate::server::chat::read_visible_history(&root).iter().all(|t| t.role != crate::agents::architect::TurnRole::Architect));
+    let lines = round_lines(&root);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["notice"]["code"], ROUND_CODE);
+    assert_eq!(lines[0]["notice"]["params"], json!({"round": 1, "issues": 1, "accepted": 1, "kept": 0}));
+    assert_eq!(lines[0]["text"], "Revisão do plano, rodada 1: o Revisor apontou 1; o Arquiteto ajustou 1 e manteve 0.");
+
+    // O Revisor revisou a versão nova com a memória da rodada anterior.
+    let reqs = reviewer.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].messages.len(), 3, "rodada 0 sem memória");
+    let memory = &reqs[1].messages[2].content;
+    assert!(memory.contains("rodada 1 de 3") && memory.contains("P1 (T01, untestable): Critério vago. | Arquiteto: accept [agree] Critério reescrito."), "{memory}");
+    assert!(memory.contains("O QUE MUDOU") && memory.contains("Tarefas novas: nenhuma"), "{memory}");
+
     let rec = record(&root);
-    assert_eq!(rec.signature, plan_signature(&root, SPEC).expect("sig"), "resultado da versão dividida");
-    assert_eq!(rec.status, STATUS_OK);
-    assert!(rec.issues.is_empty(), "a divisão some com o apontamento: {:?}", rec.issues);
-    assert!(rec.split_requested);
-    assert!(view(&root, SPEC, &SecretSet::default()).expect("vista").issues.is_empty());
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    assert!(rec.issues.is_empty());
+    assert_eq!(rec.rounds.len(), 2);
+    assert_eq!(rec.rounds[0].issues[0].id.as_deref(), Some("P1"));
+    assert_eq!(rec.rounds[1].decisions[0].decision, DECISION_ACCEPT);
+    assert_eq!(rec.rounds[1].accept_rate, Some(100));
+    assert_eq!((rec.rounds[1].tasks, rec.rounds[1].criteria), (1, 1));
+    let view = consensus(&root);
+    assert_eq!((view.outcome.as_deref(), view.adjusted, view.kept, view.round), (Some(OUTCOME_CONSENSUS), 1, 0, 1));
+
+    // Custo: as chamadas do ciclo levam a etapa própria e a rodada.
+    let usage = fs::read_to_string(root.join(".sdd/specs/.usage.jsonl")).expect("uso");
+    let lines: Vec<serde_json::Value> = usage.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let staged = |agent: &str, round: u64| lines.iter().any(|l| l["agent"] == agent && l["stage"] == "plan_consensus" && l["round"] == round);
+    assert!(staged("reviewer", 0) && staged("reviewer", 1) && staged("architect", 1), "{usage}");
     let _ = fs::remove_dir_all(&root);
 }
 
-/// O que resta `too_large` depois da divisão fica no resultado (o cartão mostra); a divisão não
-/// roda de novo, nem na mesma volta nem numa versão posterior do plano.
+/// Recusa respeitada: o Arquiteto mantém o plano com motivo; o Revisor revisa de novo (mesmo sem
+/// mudança no plano), vê a recusa e não repete o ponto.
 #[tokio::test]
-async fn leftover_too_large_stays_in_the_review_and_the_split_runs_once() {
-    let root = tmp("split-left");
-    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
-    fs::create_dir_all(root.join(".git/info")).expect("git");
-    let big = json!({"issues": [{"task": "T01", "kind": "too_large", "text": "Mistura servidor e cliente; divida em duas."}]}).to_string();
-    let reviewer = Scripted::new(vec![text(&big), text(&big), text(&big)]);
-    let architect = Scripted::new(vec![
-        write_task_reply("a1", "T01", &EXAMPLE_TASK_MD.replace("O que implementar.", "Servidor e cliente juntos.")),
-        text("Mantive a T01: as partes dependem uma da outra."),
-        text("Plano conferido."),
-    ]);
-    let st = split_state(&root, reviewer.clone(), architect.clone());
+async fn rejection_is_respected() {
+    let root = plan_root("consensus-reject");
+    let reviewer = Scripted::new(vec![review(&[("T01", "scope", "Precisa de arquivos em docs/.", None, false)]), review(&[])]);
+    let architect = Architect::new(vec![vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "A tarefa não escreve em docs/.")])]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
     assert_eq!(run(&st, &root).await, 1);
-    assert_eq!(reviewer.requests().len(), 2, "revisa a versão revista uma vez");
-    assert_eq!(internal_turns(&root).len(), 1, "um só turno de divisão");
+    let reqs = reviewer.requests();
+    assert_eq!(reqs.len(), 2, "revisa de novo depois da recusa");
+    assert!(reqs[1].messages[2].content.contains("Arquiteto: reject [not_worth_cost] A tarefa não escreve em docs/."));
+    // F-01: o turno não alterou o plano; nada antigo volta como mudança.
+    assert!(reqs[1].messages[2].content.contains("O QUE MUDOU NO PLANO DESDE A RODADA ANTERIOR (DADO):\n- (nada registrado)"), "{}", reqs[1].messages[2].content);
     let rec = record(&root);
-    assert!(rec.split_requested);
-    assert_eq!(too_large_issues(&rec.issues), vec![("T01".to_string(), "Mistura servidor e cliente; divida em duas.".to_string())]);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    let view = consensus(&root);
+    assert_eq!((view.adjusted, view.kept), (0, 1));
+    assert_eq!(view.kept_points.len(), 1);
+    assert_eq!(view.kept_points[0].reason.as_deref(), Some("A tarefa não escreve em docs/."));
+    assert_eq!(view.kept_points[0].reason_kind.as_deref(), Some("not_worth_cost"));
+    assert_eq!(round_lines(&root)[0]["notice"]["params"]["kept"], 1);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Um recusado que volta sem argumento novo vira disputa e não volta ao Arquiteto.
+#[tokio::test]
+async fn repeated_rejection_becomes_a_dispute() {
+    let root = plan_root("consensus-dispute");
+    let issue = ("T01", "untestable", "O teste confere strings literais do README.", None, false);
+    let reviewer = Scripted::new(vec![
+        review(&[issue]),
+        review(&[("T01", "untestable", "Continua conferindo texto literal do README.", Some("P1"), false)]),
+    ]);
+    let architect = Architect::new(vec![vec![decided(&[("P1", DECISION_REJECT, "other", "O texto do README é o entregável.")])]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(internal_turns(&root).len(), 1, "a disputa não volta ao Arquiteto");
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_DISPUTED));
+    assert!(rec.issues[0].disputed && rec.issues[0].id.as_deref() == Some("P1"));
+    let view = consensus(&root);
+    assert_eq!(view.disputed.len(), 1);
+    assert_eq!(view.disputed[0].text, "Continua conferindo texto literal do README.");
+    assert_eq!(view.disputed[0].reason.as_deref(), Some("O texto do README é o entregável."));
+    assert!(view.open.is_empty());
+    // F-01: a disputa conta só como em aberto.
+    assert_eq!((view.total, view.adjusted, view.kept), (1, 0, 0));
+    assert_sums(&view);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Teto: no máximo 3 turnos e 4 revisões; o que resta chega ao usuário em aberto.
+#[tokio::test]
+async fn cycle_stops_at_three_rounds() {
+    let root = plan_root("consensus-cap");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "scope", "Ponto alfa sobre login.", None, false)]),
+        review(&[("T01", "contradiction", "Ponto beta sobre cache.", None, false)]),
+        review(&[("T01", "untestable", "Ponto gama sobre fila.", None, false)]),
+        review(&[("T01", "missing_dependency", "Ponto delta sobre banco.", None, false)]),
+    ]);
+    let architect = Architect::new(vec![
+        vec![decided(&[("P1", DECISION_ACCEPT, "agree", "ok")])],
+        vec![decided(&[("P2", DECISION_ACCEPT, "agree", "ok")])],
+        vec![decided(&[("P3", DECISION_ACCEPT, "agree", "ok")])],
+        vec![decided(&[("P4", DECISION_ACCEPT, "agree", "ok")])],
+    ]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(internal_turns(&root).len(), MAX_CONSENSUS_ROUNDS as usize);
+    assert_eq!(reviewer.requests().len(), 4);
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_OPEN));
+    assert_eq!(rec.rounds.len(), 4);
+    let view = consensus(&root);
+    assert_eq!((view.round, view.open.len()), (3, 1));
+    assert_eq!(view.open[0].id, "P4");
+    assert_eq!((view.total, view.adjusted, view.kept), (4, 3, 0));
+    assert_sums(&view);
+    assert!(view.reopened.is_empty());
+    assert_eq!(round_lines(&root).len(), 3);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 128 T05 (critério 11): um recusado que o Revisor reabre com argumento novo na última
+/// revisão, com o ciclo parado no teto, vem em `reopened` com o texto novo e o motivo da recusa;
+/// o desfecho é `open` com a lista `open` vazia, e o ponto não aparece como mantido.
+#[tokio::test]
+async fn point_reopened_at_the_cap_is_exposed_with_both_positions() {
+    let root = plan_root("consensus-reopened");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "scope", "Ponto alfa sobre login.", None, false)]),
+        review(&[("T01", "contradiction", "Ponto beta sobre cache.", None, false)]),
+        review(&[("T01", "untestable", "Ponto gama sobre fila.", None, false)]),
+        review(&[("T01", "scope", "O login novo exige o teste de sessão: argumento novo.", Some("P1"), true)]),
+    ]);
+    let architect = Architect::new(vec![
+        vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "O login já é coberto.")])],
+        vec![decided(&[("P2", DECISION_ACCEPT, "agree", "ok")])],
+        vec![decided(&[("P3", DECISION_ACCEPT, "agree", "ok")])],
+    ]);
+    let st = consensus_state(&root, reviewer, architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_OPEN));
+    let view = consensus(&root);
+    assert!(view.open.is_empty() && view.disputed.is_empty(), "{view:?}");
+    assert!(view.kept_points.is_empty(), "{view:?}");
+    assert_eq!(view.reopened.len(), 1, "{view:?}");
+    let point = &view.reopened[0];
+    assert_eq!(point.id, "P1");
+    assert_eq!(point.text, "O login novo exige o teste de sessão: argumento novo.");
+    assert_eq!((point.reason_kind.as_deref(), point.reason.as_deref()), (Some("not_worth_cost"), Some("O login já é coberto.")));
+    // F-01: o reaberto conta só como em aberto, nunca também como mantido.
+    assert_eq!((view.total, view.adjusted, view.kept), (3, 2, 0));
+    assert_sums(&view);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// O resumo fecha a conta: total = ajustados + mantidos + em aberto, reabertos e em disputa.
+fn assert_sums(view: &ConsensusView) {
+    let waiting = view.open.len() + view.reopened.len() + view.disputed.len();
+    assert_eq!(view.total as usize, view.adjusted as usize + view.kept as usize + waiting, "{view:?}");
+}
+
+/// F-01: um ponto recusado duas vezes (o Revisor o reabre com argumento novo e o Arquiteto recusa
+/// de novo) conta uma vez como mantido; o aceito conta uma vez como ajustado.
+#[tokio::test]
+async fn summary_counts_each_point_once_by_its_final_decision() {
+    let root = plan_root("consensus-twice");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "scope", "Ponto alfa sobre login.", None, false), ("T01", "contradiction", "Ponto beta sobre cache.", None, false)]),
+        review(&[("T01", "scope", "O login novo exige o teste de sessão: argumento novo.", Some("P1"), true)]),
+        review(&[]),
+    ]);
+    let architect = Architect::new(vec![
+        vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "O login já é coberto."), ("P2", DECISION_ACCEPT, "agree", "ok")])],
+        vec![decided(&[("P1", DECISION_REJECT, "duplicate", "O teste de sessão já está na T01.")])],
+    ]);
+    let st = consensus_state(&root, reviewer, architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    let view = consensus(&root);
+    assert_eq!((view.total, view.adjusted, view.kept), (2, 1, 1), "{view:?}");
+    assert_eq!(view.kept_points.len(), 1);
+    assert_eq!(view.kept_points[0].reason_kind.as_deref(), Some("duplicate"));
+    assert_sums(&view);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// O turno que termina numa pergunta ao usuário para o ciclo e a resposta aparece na Conversa.
+#[tokio::test]
+async fn question_to_the_user_stops_the_cycle() {
+    let root = plan_root("consensus-ask");
+    let reviewer = Scripted::new(vec![review(&[(
+        "T01",
+        "uncovered_criterion",
+        "Falta decidir quem cria o grupo.",
+        None,
+        false,
+    )])]);
+    let choices = json!({"questions": [{"id": "q1", "text": "Quem cria o grupo?", "options": ["Qualquer membro", "Só o dono"]}]});
+    let ask = text(&format!("Preciso da sua decisão.\n```nants-choices\n{choices}\n```\n"));
+    let architect = Architect::new(vec![vec![ask]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(reviewer.requests().len(), 1, "espera o usuário");
+    assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_AWAITING_USER));
+    let reply = chat_lines(&root).into_iter().find(|l| l["role"] == "architect").expect("resposta");
+    assert!(reply.get("internal").is_none_or(|v| v != true), "a pergunta aparece: {reply}");
+    assert!(reply["text"].as_str().unwrap_or_default().contains("nants-choices"));
+    assert_eq!(round_lines(&root)[0]["notice"]["code"], ROUND_OPEN_CODE, "sem decisão, o ponto fica em aberto");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// F-02: o turno que recusa P1 com motivo e pergunta sobre P2 expõe a decisão e o motivo de P1
+/// (mantido, nunca "sem resposta"); P2 segue em aberto, sem decisão.
+#[tokio::test]
+async fn rejected_point_keeps_its_position_when_the_cycle_waits_for_the_user() {
+    let root = plan_root("consensus-ask-kept");
+    let reviewer = Scripted::new(vec![review(&[
+        ("T01", "scope", "Precisa de arquivos em docs/.", None, false),
+        ("T01", "uncovered_criterion", "Falta decidir quem cria o grupo.", None, false),
+    ])]);
+    let choices = json!({"questions": [{"id": "q1", "text": "Quem cria o grupo?", "options": ["Qualquer membro", "Só o dono"]}]});
+    let block = json!({"decisions": [{"id": "P1", "decision": "reject", "reason_kind": "not_worth_cost", "reason": "A tarefa não escreve em docs/."}]});
+    let ask = text(&format!("Preciso da sua decisão.\n```nants-choices\n{choices}\n```\n```nants-plan-decisions\n{block}\n```\n"));
+    let st = consensus_state(&root, reviewer, Architect::new(vec![vec![ask]]));
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_AWAITING_USER));
+    let view = consensus(&root);
+    assert_eq!(view.kept_points.len(), 1, "{view:?}");
+    let kept = &view.kept_points[0];
+    assert_eq!((kept.id.as_str(), kept.decision.as_deref()), ("P1", Some(DECISION_REJECT)));
+    assert_eq!((kept.reason_kind.as_deref(), kept.reason.as_deref()), (Some("not_worth_cost"), Some("A tarefa não escreve em docs/.")));
+    assert_eq!(view.open.len(), 1);
+    assert_eq!((view.open[0].id.as_str(), view.open[0].decision.as_deref()), ("P2", None));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Falha do provedor no turno do Arquiteto: o ciclo termina como indisponível, sem laço.
+#[tokio::test]
+async fn provider_failure_ends_the_cycle_as_unavailable() {
+    let root = plan_root("consensus-fail");
+    let reviewer = Scripted::new(vec![review(&[("T01", "scope", "Fora do escopo.", None, false)])]);
+    let failure = Err(crate::agents::LlmError::Http { status: 400, body_snippet: "x".into(), code: None });
+    let architect = Architect::new(vec![vec![failure]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(reviewer.requests().len(), 1);
+    assert_eq!(internal_turns(&root).len(), 1);
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_UNAVAILABLE));
+    assert_eq!(rec.status, STATUS_OK, "a revisão em si valeu; os pontos chegam ao usuário");
+    assert_eq!(consensus(&root).open.len(), 1);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// O contador só zera com uma mensagem do usuário: depois do teto, outra versão do plano (sem
+/// mensagem do usuário) é revisada sem abrir rodada; com a mensagem, o ciclo recomeça.
+#[tokio::test]
+async fn round_counter_resets_only_with_a_user_message() {
+    let root = plan_root("consensus-reset");
+    let texts = [
+        "Login exige arquivos em auth/.",
+        "Cache grava em tmp/ fora do escopo.",
+        "Fila de mensagens usa worker/.",
+        "Migração do banco mexe em db/.",
+        "Busca textual precisa de search/.",
+        "Paginação altera web/list.",
+    ];
+    let point = |n: usize| review(&[("T01", "scope", texts[n], None, false)]);
+    let reviewer = Scripted::new(vec![point(0), point(1), point(2), point(3), point(4), point(5), review(&[])]);
+    let accept = |id: &str| vec![decided(&[(id, DECISION_ACCEPT, "agree", "ok")])];
+    let architect = Architect::new(vec![accept("P1"), accept("P2"), accept("P3"), accept("P6")]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(internal_turns(&root).len(), 3);
+    assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_OPEN));
+
+    // Outra versão sem mensagem do usuário (ex.: "continuar"): revisa, mas não abre rodada.
+    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("O que implementar.", "Versão dois."));
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(internal_turns(&root).len(), 3, "o contador não zerou");
+    assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_OPEN));
+
+    // Mensagem do usuário que altera o plano: ciclo novo.
+    drop(st.plan_consensus().begin_user_turn(PROJECT));
+    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("O que implementar.", "Versão três."));
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(internal_turns(&root).len(), 4, "o contador zerou");
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    assert_eq!(rec.rounds.len(), 2, "rodadas do ciclo novo");
+    assert_eq!(rec.rounds[0].issues[0].id.as_deref(), Some("P6"), "ids estáveis na spec");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Registro antigo (spec 126 T03, com `split_requested`) continua lido, sem a vista do consenso.
+#[tokio::test]
+async fn old_record_is_still_read() {
+    let root = plan_root("consensus-old");
+    let old = json!({
+        "signature": plan_signature(&root, SPEC).expect("sig"),
+        "at": "2026-10-25T00:00:00Z",
+        "status": "ok",
+        "issues": [{"task": "T01", "kind": "too_large", "text": "Grande."}],
+        "split_requested": true
+    });
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/{PLAN_REVIEW_FILE}")), old.to_string()).expect("registro");
+    let rec = record(&root);
+    assert_eq!((rec.issues.len(), rec.rounds.len(), rec.outcome.clone()), (1, 0, None));
     let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
     assert_eq!(shown.status, STATUS_OK);
-    assert_eq!(shown.issues, rec.issues, "o que resta chega ao cartão");
-
-    // Versão posterior do plano (o usuário pediu outra mudança): revisa, mas não divide de novo.
-    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("O que implementar.", "Outra versão."));
-    assert_eq!(run(&st, &root).await, 1);
-    assert_eq!(reviewer.requests().len(), 3);
-    assert_eq!(internal_turns(&root).len(), 1, "a divisão roda no máximo uma vez por spec");
-    assert!(record(&root).split_requested, "a marca passa para o registro seguinte");
+    assert_eq!(shown.issues[0].id, None);
+    assert!(shown.consensus.is_none());
+    let json = serde_json::to_string(&rec).expect("json");
+    assert!(!json.contains("split_requested") && !json.contains("rounds"), "{json}");
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Sem o Arquiteto configurado o turno nem começa: a marca é desfeita (uma revisão futura pode
-/// pedir de novo) e o apontamento fica no resultado.
+/// C-04: tarefa criada no turno que já nasce grande demais volta ao Arquiteto na mesma rodada, uma
+/// única vez e sem contar como rodada.
 #[tokio::test]
-async fn split_mark_is_undone_when_the_turn_does_not_start() {
-    let root = tmp("split-none");
-    write_plan(&root, "AWAITING_APPROVAL", &big_task(8));
-    fs::create_dir_all(root.join(".git/info")).expect("git");
-    let st = state(&root, true, Scripted::new(vec![text("{\"issues\": []}")]));
+async fn new_task_born_too_large_goes_back_once_in_the_same_round() {
+    let root = plan_root("consensus-size");
+    let reviewer = Scripted::new(vec![review(&[("T01", "too_large", "Mistura servidor e cliente.", None, false)]), review(&[])]);
+    let architect = Architect::new(vec![
+        vec![
+            write_task_reply("a1", "T02", &big_task(7).replace("id: \"T01\"", "id: \"T02\"")),
+            decided(&[("P1", DECISION_ACCEPT, "agree", "Dividi em T01 e T02.")]),
+        ],
+        vec![
+            write_task_reply("a2", "T02", &big_task(3).replace("id: \"T01\"", "id: \"T02\"")),
+            decided(&[("P2", DECISION_ACCEPT, "agree", "T02 enxuta.")]),
+        ],
+    ]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
     assert_eq!(run(&st, &root).await, 1);
+    let turns = internal_turns(&root);
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert!(turns[1].contains("Rodada 1 de 3") && turns[1].contains("Conferência de tamanho"), "{}", turns[1]);
+    assert!(turns[1].contains("P2 (T02, too_large): 7 critérios"), "{}", turns[1]);
     let rec = record(&root);
-    assert!(!rec.split_requested, "o turno não começou");
-    assert_eq!(too_large_issues(&rec.issues).len(), 1);
-    assert!(internal_turns(&root).is_empty());
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    assert_eq!(rec.rounds.len(), 2, "a volta não conta como rodada");
+    assert_eq!(rec.rounds[1].size_issues.len(), 1);
+    assert_eq!(rec.rounds[1].decisions.len(), 2);
+    assert_eq!(round_lines(&root).len(), 1, "uma linha por rodada");
     let _ = fs::remove_dir_all(&root);
 }
 
-#[test]
-fn split_request_lists_each_too_large_task() {
-    let msg = crate::agents::prompts::plan_split_request("001-x", &[("T05".into(), "Mistura a.".into()), ("T08".into(), "7 critérios.".into())]);
-    assert!(msg.starts_with(crate::agents::prompts::PLAN_SPLIT_INTRO));
-    assert!(msg.contains("DADO NÃO CONFIÁVEL") && msg.contains("AWAITING_APPROVAL") && msg.contains("depends_on"));
-    assert!(msg.ends_with("Spec: 001-x\n- T05: Mistura a.\n- T08: 7 critérios."), "{msg}");
-    let record = PlanReviewRecord {
-        signature: "s".into(),
-        at: "a".into(),
-        status: STATUS_OK.into(),
-        issues: vec![
-            PlanIssue { task: Some("T01".into()), kind: "untestable".into(), text: "x".into() },
-            PlanIssue { task: None, kind: TOO_LARGE.into(), text: "sem tarefa".into() },
-        ],
-        detail: None,
-        split_requested: false,
+/// C-11: a mensagem do usuário durante o turno interno espera por ele e roda normalmente; nenhuma
+/// rodada nova é aberta e o contador zera (a versão final é revisada num ciclo novo).
+#[tokio::test]
+async fn user_message_during_the_cycle_runs_and_resets_the_counter() {
+    let root = plan_root("consensus-user");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "untestable", "Critério vago.", None, false)]),
+        review(&[]),
+    ]);
+    let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let adjusted = EXAMPLE_TASK_MD.replace("Critério verificável.", "GET /health responde 200.");
+    let architect = Architect::build(
+        vec![vec![write_task_reply("a1", "T01", &adjusted), decided(&[("P1", DECISION_ACCEPT, "agree", "ok")])]],
+        vec![vec![text("Certo, anotado.")]],
+        Some((Arc::clone(&reached), Arc::clone(&release))),
+    );
+    let st = consensus_state(&root, reviewer.clone(), architect.clone());
+    let cycle = {
+        let st = st.clone();
+        let root = root.clone();
+        tokio::spawn(async move { run(&st, &root).await })
     };
-    assert!(!wants_split(&record), "sem too_large com tarefa, nada a dividir");
-    let with_big = PlanReviewRecord {
-        issues: vec![PlanIssue { task: Some("T02".into()), kind: TOO_LARGE.into(), text: "y".into() }],
-        ..record.clone()
+    reached.notified().await;
+    // Arquiteto falso ocupado no turno interno: a mensagem do usuário espera a vez.
+    let user = {
+        let st = st.clone();
+        let body = json!({ "message": USER_MESSAGE }).to_string();
+        tokio::spawn(async move {
+            crate::server::chat::post_chat(axum::extract::State(st), axum::extract::Path(PROJECT.to_string()), body.into()).await
+        })
     };
-    assert!(wants_split(&with_big));
-    assert!(!wants_split(&PlanReviewRecord { split_requested: true, ..with_big.clone() }));
-    assert!(!wants_split(&PlanReviewRecord { status: STATUS_UNAVAILABLE.into(), ..with_big }));
-    let json = serde_json::to_string(&record).expect("json");
-    assert!(!json.contains("split_requested"), "sem a marca, o arquivo fica como antes: {json}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!user.is_finished(), "espera o turno interno");
+    release.notify_one();
+    let answered = user.await.expect("task").expect("turno do usuário");
+    assert_eq!(answered.status(), axum::http::StatusCode::OK);
+    assert_eq!(cycle.await.expect("ciclo"), 1);
+    // A revisão da versão final roda num ciclo novo, disparada pelo fim do turno do usuário.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let rec = loop {
+        let rec = read_record(&root, SPEC).filter(|r| r.signature == plan_signature(&root, SPEC).unwrap_or_default() && r.outcome.is_some());
+        if let Some(rec) = rec.filter(|_| !is_running(&root, SPEC)) {
+            break rec;
+        }
+        assert!(std::time::Instant::now() < deadline, "a revisão da versão final não rodou");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(internal_turns(&root).len(), 1, "nenhuma rodada nova depois da mensagem do usuário");
+    assert_eq!(reviewer.requests().len(), 2);
+    assert_eq!(rec.rounds.len(), 1, "o contador zerou: ciclo novo só com a rodada 0");
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    let user_line = chat_lines(&root).iter().position(|l| l["role"] == "user" && l["text"] == USER_MESSAGE).expect("mensagem do usuário");
+    let internal_line = chat_lines(&root).iter().position(|l| l["role"] == "user" && l["internal"] == true).expect("pedido interno");
+    assert!(internal_line < user_line, "a mensagem do usuário roda depois do turno interno");
+    let _ = fs::remove_dir_all(&root);
 }
-
 /// Spec 127 T01: a spec em aprovação sem nenhuma tarefa (o turno que escrevia o plano caiu) não é
 /// revisada e não fica "demorando": a vista diz `incomplete` logo, com ou sem Revisor e com
 /// qualquer relógio. Gravada a primeira tarefa, volta o fluxo de sempre.
@@ -690,4 +1164,50 @@ async fn plan_without_tasks_is_incomplete_and_never_reviewed() {
     assert_eq!(view_at(&root, SPEC, &secrets, true, SystemTime::now()).expect("pending").status, STATUS_PENDING);
     assert_eq!(run(&st, &root).await, 1, "com tarefa, a revisão volta a rodar");
     assert_eq!(record(&root).status, STATUS_OK);
+}
+
+/// Spec 128 T04: um ciclo pelo `depends_on` não tem ordem de execução e vira um apontamento
+/// `contradiction` do servidor, no idioma do projeto, que nunca perde a vaga para os do modelo.
+#[test]
+fn a_dependency_cycle_becomes_a_contradiction_issue() {
+    use crate::i18n::Lang;
+    let root = tmp("cycle");
+    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("depends_on: []", "depends_on: [\"T02\"]"));
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"").replace("depends_on: []", "depends_on: [\"T01\"]");
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")), &t02).expect("T02");
+    let t03 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T03\"").replace("depends_on: []", "depends_on: [\"T02\"]");
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T03.md")), &t03).expect("T03");
+    let cycle = plan_cycle(&root, SPEC);
+    assert_eq!(cycle, ["T01", "T02"], "só o ciclo, sem a T03 que depende dele");
+    let pt = with_cycle_issue(Vec::new(), &cycle, Lang::PtBr);
+    assert_eq!(pt.len(), 1);
+    assert_eq!((pt[0].task.as_deref(), pt[0].kind.as_str()), (Some("T01"), "contradiction"));
+    assert!(pt[0].text.starts_with("As tarefas T01, T02 dependem umas das outras em ciclo"), "{}", pt[0].text);
+    let en = with_cycle_issue(Vec::new(), &cycle, Lang::En);
+    assert!(en[0].text.starts_with("Tasks T01, T02 depend on each other in a cycle"), "{}", en[0].text);
+    // Lista cheia do modelo: o do servidor entra e um do modelo cede a vaga.
+    let full: Vec<PlanIssue> = (0..MAX_ISSUES).map(|i| PlanIssue::new(None, "scope", &format!("p{i}"))).collect();
+    let out = with_cycle_issue(full, &cycle, Lang::PtBr);
+    assert_eq!(out.len(), MAX_ISSUES);
+    assert_eq!(out.last().map(|i| i.kind.as_str()), Some(CYCLE_KIND));
+    // Sem ciclo: nada a acrescentar.
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T01.md")), EXAMPLE_TASK_MD).expect("T01");
+    assert!(plan_cycle(&root, SPEC).is_empty());
+    assert!(with_cycle_issue(Vec::new(), &[], Lang::PtBr).is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 128 T04: na revisão, o ciclo chega gravado como apontamento, mesmo sem o modelo apontar.
+#[tokio::test]
+async fn the_review_records_the_dependency_cycle() {
+    let root = tmp("cycle-review");
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    write_plan(&root, "AWAITING_APPROVAL", &EXAMPLE_TASK_MD.replace("depends_on: []", "depends_on: [\"T02\"]"));
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"").replace("depends_on: []", "depends_on: [\"T01\"]");
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")), &t02).expect("T02");
+    let st = state(&root, true, Scripted::new(vec![text(r#"{"issues": []}"#)]));
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert!(rec.issues.iter().any(|i| i.kind == CYCLE_KIND && i.text.contains("T01, T02")), "{:?}", rec.issues);
+    let _ = fs::remove_dir_all(&root);
 }

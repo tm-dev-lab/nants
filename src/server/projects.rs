@@ -144,6 +144,11 @@ pub struct SpecView {
     title: String,
     status: Option<SpecStatus>,
     tasks: Vec<TaskView>,
+    /// Ordem de execução das tarefas (spec 128 T04): topológica pelo `depends_on` e, nos empates,
+    /// pelo id. A lista do plano e o quadro mostram as tarefas nessa ordem, com os ids como estão.
+    /// Omitida com ciclo (não há ordem; a revisão do plano aponta o ciclo) ou sem tarefas.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    execution_order: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'static str>,
     /// Ambiente docker proposto pela spec (modo, serviços, imagem base e arquivos).
@@ -504,6 +509,8 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         super::plan_review::PLAN_REVIEW_TMP_EXCLUDE_LINE,
         super::plan_changes::PLAN_CHANGES_EXCLUDE_LINE,
         super::plan_changes::PLAN_CHANGES_TMP_EXCLUDE_LINE,
+        super::runs::RENUMBER_JOURNAL_EXCLUDE_LINE,
+        super::runs::RENUMBER_JOURNAL_TMP_EXCLUDE_LINE,
         USAGE_EXCLUDE_LINE,
         USAGE_CHAT_EXCLUDE_LINE,
         super::usage::CUTS_EXCLUDE_LINE,
@@ -1399,6 +1406,13 @@ pub(super) fn disk_attention(
     out
 }
 
+/// Ordem de execução das tarefas exibidas (spec 128 T04, [`crate::sdd::execution_order`]); vazia
+/// com ciclo.
+fn execution_order_view(tasks: &[TaskView]) -> Vec<String> {
+    let plan: Vec<(String, Vec<String>)> = tasks.iter().map(|t| (t.id.clone(), t.depends_on.clone())).collect();
+    crate::sdd::execution_order::execution_order(&plan).unwrap_or_default()
+}
+
 /// Lista specs de `.sdd/specs` (caminho inteiro sem symlink). Ausente → vazio.
 fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) -> Vec<SpecView> {
     if safe_fs::check_chain(root, SPECS_REL).is_err() {
@@ -1415,12 +1429,14 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
             let tool_counts = super::tools_trail::counts(root, name, secrets);
             let states: Vec<(String, bool)> = tasks.iter().map(|t| (t.id.clone(), t.status == Some(TaskStatus::Done))).collect();
             let cost_alerts = super::cost_alert::alerts(&super::cost_alert::spend_by_task(root, name), &states);
+            let execution_order = execution_order_view(&tasks);
             match read_spec(root, &format!("{spec_rel}/spec.md")) {
                 Ok(spec) => SpecView {
                     id: id_view(secrets, &spec.frontmatter.id),
                     title: text_field(secrets, "title", &spec.frontmatter.title),
                     status: Some(spec.frontmatter.status),
                     tasks,
+                    execution_order,
                     error: None,
                     environment: env_view(root, &spec, secrets),
                     premises: premises_view(secrets, &spec.body),
@@ -1460,6 +1476,7 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
                     title: String::new(),
                     status: None,
                     tasks,
+                    execution_order,
                     error: Some(INVALID_FILE),
                     environment: None,
                     premises: Vec::new(),

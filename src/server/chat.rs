@@ -80,7 +80,34 @@ struct Incoming {
     message: String,
     internal: bool,
     attachments: Vec<String>,
+    /// Turno interno de uma rodada do consenso do plano (spec 128 T02): o uso vai com a etapa
+    /// `plan_consensus` e a resposta do Arquiteto fica fora da Conversa, salvo uma pergunta ao
+    /// usuário. Nunca vem do corpo do pedido.
+    consensus_round: Option<u32>,
+    /// Marca da mensagem do usuário em andamento (spec 128 T02): o ciclo de consenso não revisa
+    /// versões pela metade nem abre rodada enquanto ela não termina.
+    user_mark: Option<String>,
 }
+
+/// O que o turno deixa para quem o pediu, na extensão da resposta (spec 128 T02): o corpo do
+/// bloco `nants-plan-decisions` (fora do texto mostrado) e se a resposta pergunta algo ao usuário.
+#[derive(Debug, Clone, Default)]
+struct TurnOutcome {
+    decisions: Option<String>,
+    asks_user: bool,
+}
+
+/// Resultado de um turno interno do consenso.
+pub(super) struct ConsensusTurnOutcome {
+    pub status: StatusCode,
+    pub decisions: Option<String>,
+    pub asks_user: bool,
+}
+
+/// Esperas pela reserva do turno ocupado: o turno interno do consenso logo depois do turno do
+/// usuário que terminava, e a mensagem do usuário durante o turno interno (C-11).
+const BUSY_POLL: Duration = Duration::from_millis(250);
+const CONSENSUS_BUSY_TRIES: u32 = 20;
 
 /// Texto de uma mensagem só com imagem (sem texto).
 const IMAGE_ONLY_TEXT: &str = "(imagem)";
@@ -230,23 +257,84 @@ pub async fn post_chat(
     run_turn(&state, &id, &body, CHAT_TIMEOUT, state.llm_backend()).await
 }
 
-/// Turno interno pedido pelo próprio servidor (spec 126 T03: divisão das tarefas `too_large` antes
-/// da aprovação). Passa pelo mesmo caminho do `POST /chat` com `internal: true` (reserva do turno,
-/// prontidão, persistência e eventos) e devolve só o código HTTP. Futuro em caixa: o turno dispara
-/// a revisão do plano, que pode pedir este turno (quebra o ciclo de tipos).
-pub(super) fn internal_turn(state: AppState, project_id: String, message: String) -> Pin<Box<dyn Future<Output = StatusCode> + Send>> {
+/// Turno interno de uma rodada do consenso do plano (spec 128 T02). Passa pelo mesmo caminho do
+/// `POST /chat` com `internal: true` (reserva do turno, prontidão, persistência e eventos). Com o
+/// turno ocupado logo ao fim de um turno do usuário (que ainda solta a reserva), tenta de novo por
+/// alguns segundos, enquanto `gen` (as mensagens do usuário) não muda. Futuro em caixa: o turno
+/// dispara a revisão do plano, que pede este turno (quebra o ciclo de tipos).
+pub(super) fn consensus_turn(
+    state: AppState,
+    project_id: String,
+    message: String,
+    round: u32,
+    gen: u64,
+) -> Pin<Box<dyn Future<Output = ConsensusTurnOutcome> + Send>> {
     Box::pin(async move {
-        match internal_turn_response(&state, &project_id, message).await {
-            Ok(resp) => resp.status(),
-            Err(err) => err.into_response().status(),
+        let _running = state.plan_consensus().begin_consensus_turn(&project_id);
+        let mut tries = 0;
+        loop {
+            let incoming = Incoming { message: message.clone(), internal: true, attachments: Vec::new(), consensus_round: Some(round), user_mark: None };
+            let resp = match run_incoming(&state, &project_id, incoming, CHAT_TIMEOUT.into(), state.llm_backend()).await {
+                Ok(resp) => resp,
+                Err(err) => err.into_response(),
+            };
+            let status = resp.status();
+            let consensus = state.plan_consensus();
+            if status == StatusCode::CONFLICT
+                && tries < CONSENSUS_BUSY_TRIES
+                && consensus.user_gen(&project_id) == gen
+                && !consensus.user_turn_active(&project_id)
+            {
+                tries += 1;
+                tokio::time::sleep(BUSY_POLL).await;
+                continue;
+            }
+            let outcome = resp.extensions().get::<TurnOutcome>().cloned().unwrap_or_default();
+            return ConsensusTurnOutcome { status, decisions: outcome.decisions, asks_user: outcome.asks_user };
         }
     })
 }
 
-/// Núcleo de [`internal_turn`], com a resposta inteira (o `POST /chat/continue` a devolve à tela).
+/// Turno interno "continue de onde parou", com a resposta inteira (o `POST /chat/continue` a
+/// devolve à tela).
 async fn internal_turn_response(state: &AppState, project_id: &str, message: String) -> Result<Response, ApiError> {
     let body = json!({ "message": message, "internal": true }).to_string();
     run_turn(state, project_id, body.as_bytes(), CHAT_TIMEOUT, state.llm_backend()).await
+}
+
+/// Mensagem do sistema na Conversa (spec 128 T02: a linha de cada rodada do consenso): gravada no
+/// histórico com `code` e `params` (o texto de reserva no idioma do projeto, pelo dicionário) e
+/// publicada como `agent_message` do sistema.
+pub(super) async fn system_notice(state: &AppState, project_id: &str, root: PathBuf, code: &str, params: Map<String, serde_json::Value>) {
+    let lang = state.project_lang(project_id).get();
+    let secrets = state.secret_set().await;
+    let pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string)))
+        .collect();
+    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let text = output_text(&secrets, &crate::i18n::tr(lang, &format!("system.{code}"), &refs));
+    let notice = TurnNotice { code: code.to_string(), params: params.clone() };
+    let turn = ChatTurn {
+        role: TurnRole::System,
+        text: text.clone(),
+        ts: unix_now(),
+        turn_id: None,
+        internal: false,
+        attachments: Vec::new(),
+        notice: Some(notice),
+    };
+    let _saved = tokio::task::spawn_blocking(move || append_turns(&root, &[turn])).await;
+    state.events().publish(ApiEvent::new(
+        EventType::AgentMessage,
+        Some(project_id.to_string()),
+        json!({
+            "agent": "system",
+            "text": text,
+            "code": code,
+            "params": super::events::message_params(&secrets, &params),
+        }),
+    ));
 }
 
 /// `GET /api/projects/:id/chat`: últimos turnos do histórico, em ordem cronológica, com texto
@@ -295,6 +383,18 @@ async fn run_turn(
     let timeout: TurnLimits = timeout.into();
     validate_project_id(id)?;
     let incoming = parse_message(body)?;
+    run_incoming(state, id, incoming, timeout, backend).await
+}
+
+/// [`run_turn`] com a mensagem já validada.
+async fn run_incoming(
+    state: &AppState,
+    id: &str,
+    incoming: Incoming,
+    timeout: TurnLimits,
+    backend: Option<Arc<dyn ChatBackend>>,
+) -> Result<Response, ApiError> {
+    validate_project_id(id)?;
     // Prontidão `chat` (spec 093 T02): 412 `prereq_missing` antes do 422 de "não configurado".
     if let Err(resp) = super::readiness::require(state, super::readiness::Gate::Chat).await {
         return Ok(resp);
@@ -320,8 +420,26 @@ async fn run_turn_detached(
     timeout: TurnLimits,
     backend: Option<Arc<dyn ChatBackend>>,
 ) -> Result<Response, ApiError> {
+    // Mensagem do usuário durante o ciclo de consenso do plano (spec 128 T02, C-11): o contador de
+    // rodadas zera e nenhuma rodada nova é aberta; com o turno interno em curso, ela espera por ele
+    // e roda normalmente em seguida.
+    let runtime = Arc::clone(state.plan_consensus());
+    let mut incoming = incoming;
+    let user_turn = (!incoming.internal).then(|| runtime.begin_user_turn(id));
+    incoming.user_mark = user_turn.as_ref().map(|guard| guard.mark().to_string());
+    let mut reserved = state.reserve_chat(id).await;
+    let waited_since = Instant::now();
+    while matches!(reserved, Err(ReserveError::Busy))
+        && !incoming.internal
+        && runtime.consensus_turn_running(id)
+        && waited_since.elapsed() < CHAT_MAX_TURN
+        && !*state.shutdown_signal().borrow()
+    {
+        tokio::time::sleep(BUSY_POLL).await;
+        reserved = state.reserve_chat(id).await;
+    }
     // Projeto e turno na mesma seção sob o read lock da configuração (ver `AppState::reserve_chat`).
-    let (project, reservation) = match state.reserve_chat(id).await {
+    let (project, reservation) = match reserved {
         Ok(reserved) => reserved,
         Err(ReserveError::NotFound) => return Err(ApiError::coded(StatusCode::NOT_FOUND, "project_not_found", Map::new())),
         Err(ReserveError::Busy) => return Err(ApiError::coded(StatusCode::CONFLICT, "chat_active", Map::new())),
@@ -410,10 +528,21 @@ async fn run_turn_body(
         ),
     );
     let internet = internet_setup(state, root.clone(), &secrets).await;
+    // Spec 128 T02: o turno de uma rodada do consenso grava o uso com a etapa própria.
+    let usage = match incoming.consensus_round {
+        Some(round) => super::usage::FileUsageSink::redacting_staged(
+            root.clone(),
+            id,
+            Arc::clone(&secrets),
+            super::plan_consensus::CONSENSUS_STAGE,
+            round,
+        ),
+        None => super::usage::FileUsageSink::redacting(root.clone(), id, Arc::clone(&secrets)),
+    };
     let mut architect = LlmArchitect::new(backend, model, Some(effort), policy, approver)
         .with_lang(state.project_lang(id))
         .with_activity(activity, None, None)
-        .with_usage(super::usage::FileUsageSink::redacting(root.clone(), id, Arc::clone(&secrets)))
+        .with_usage(usage)
         .with_memory(Arc::clone(&secrets))
         .with_docker(docker)
         .with_host_facts(host_facts)
@@ -474,7 +603,17 @@ async fn run_turn_body(
         Some(Ok(reply)) => reply,
         Some(Err(err)) => return Err(failed_turn(state, id, &secrets, root, turn_id, &plans_before, err).await),
     };
-    Ok(finish_turn(state, id, &secrets, root, reply, turn_id, plans_before).await)
+    let kind = TurnKind { consensus: incoming.consensus_round.is_some(), user_mark: incoming.user_mark };
+    Ok(finish_turn(state, id, &secrets, root, reply, turn_id, plans_before, kind).await)
+}
+
+/// Tipo do turno, para o fim dele.
+#[derive(Debug, Clone)]
+struct TurnKind {
+    /// Rodada do consenso do plano (spec 128 T02).
+    consensus: bool,
+    /// Marca da mensagem do usuário (turno do usuário).
+    user_mark: Option<String>,
 }
 
 /// Código da mensagem de sistema gravada quando a conexão caiu no meio do turno (spec 127 T01).
@@ -628,6 +767,11 @@ async fn timeout_response(
 
 /// Redige, publica eventos, persiste o turno e monta a resposta 200.
 /// `turn_id` identifica o turno: vai no `agent_message` publicado e na resposta.
+///
+/// Spec 128 T02: o bloco `nants-plan-decisions` sai do texto mostrado e vai na extensão da resposta
+/// ([`TurnOutcome`]). A resposta de uma rodada do consenso fica fora da Conversa (gravada como
+/// `internal`, sem `agent_message`), salvo quando pergunta algo ao usuário (`nants-choices`).
+#[allow(clippy::too_many_arguments)]
 async fn finish_turn(
     state: &AppState,
     id: &str,
@@ -636,8 +780,12 @@ async fn finish_turn(
     reply: ArchitectReply,
     turn_id: String,
     plans_before: super::plan_changes::Snapshots,
+    kind: TurnKind,
 ) -> Response {
-    let text = output_text(secrets, &reply.text);
+    let (shown, decisions) = super::plan_consensus::split_decisions(&reply.text);
+    let asks_user = super::choices::parse_choices(&shown).is_some();
+    let hidden = kind.consensus && !asks_user;
+    let text = output_text(secrets, &shown);
     let now = unix_now();
     let turns = [
         ChatTurn {
@@ -645,7 +793,7 @@ async fn finish_turn(
             text: text.clone(),
             ts: now,
             turn_id: Some(turn_id.clone()),
-            internal: false,
+            internal: hidden,
             attachments: Vec::new(),
             notice: None,
         },
@@ -656,11 +804,25 @@ async fn finish_turn(
         .await
         .unwrap_or(false);
 
-    state.events().publish(ApiEvent::new(
-        EventType::AgentMessage,
-        Some(id.to_string()),
-        json!({"agent": ARCHITECT_AGENT, "text": text, "turn_id": turn_id}),
-    ));
+    if !hidden {
+        state.events().publish(ApiEvent::new(
+            EventType::AgentMessage,
+            Some(id.to_string()),
+            json!({"agent": ARCHITECT_AGENT, "text": text, "turn_id": turn_id}),
+        ));
+    }
+    // Fim do turno do usuário antes do gatilho da revisão: o ciclo de consenso volta a revisar.
+    let deferred = match &kind.user_mark {
+        Some(mark) => {
+            state.plan_consensus().end_user_turn(id, mark);
+            state.plan_consensus().take_deferred(id)
+        }
+        None => false,
+    };
+    if deferred && !reply.artifacts_touched {
+        // O ciclo parou por causa deste turno: a versão atual ainda precisa da revisão.
+        let _reviews = super::plan_review::after_chat_turn(state, id, review_root.clone()).await;
+    }
     if reply.artifacts_touched {
         // O que mudou no plano (spec 086 T09): gravado antes do evento, para a UI já recarregar com ele.
         let (changes_root, changes_secrets) = (review_root.clone(), Arc::clone(secrets));
@@ -677,12 +839,14 @@ async fn finish_turn(
             json!({"project_id": id}),
         ));
     }
-    Json(json!({
+    let mut response = Json(json!({
         "reply": text,
         "draft_updated": reply.artifacts_touched,
         "turn_id": turn_id,
     }))
-    .into_response()
+    .into_response();
+    response.extensions_mut().insert(TurnOutcome { decisions, asks_user });
+    response
 }
 
 /// Texto de saída: redação de segredos e URLs, depois limite de 8 KiB.
@@ -711,6 +875,8 @@ fn parse_message(body: &[u8]) -> Result<Incoming, ApiError> {
         message,
         internal: input.internal,
         attachments,
+        consensus_round: None,
+        user_mark: None,
     })
 }
 

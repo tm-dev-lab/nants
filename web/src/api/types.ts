@@ -376,6 +376,8 @@ export interface SpecView {
   title: string;
   status: SpecStatus | null;
   tasks: TaskView[];
+  /** Ordem de execução das tarefas (spec 128 T04); ausente com ciclo. A tela lista nessa ordem. */
+  execution_order?: string[];
   error?: string;
   /** Ambiente docker proposto no plano (spec em rascunho); ausente = host. */
   environment?: EnvironmentView;
@@ -415,9 +417,53 @@ export interface CostAlertView {
 
 /** Apontamento objetivo da revisão do plano. `task` null = problema da spec. */
 export interface PlanIssue {
+  /** Id estável do ponto na spec (`P1`, spec 128); ausente nos registros antigos. */
+  id?: string;
   task: string | null;
   kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "too_large" | string;
   text: string;
+  /** Repete um ponto recusado pelo Arquiteto sem argumento novo (spec 128). */
+  disputed?: boolean;
+}
+
+/** Ponto na vista do consenso do plano (spec 128): o texto do Revisor e a posição do Arquiteto. */
+export interface PlanPointView {
+  id: string;
+  task: string | null;
+  kind: string;
+  text: string;
+  /** Última decisão do Arquiteto no ciclo; ausente sem decisão. */
+  decision?: "accept" | "reject" | string;
+  /** Vocabulário fixo do motivo (`agree`, `unverifiable_in_sandbox`, `not_worth_cost`, `duplicate`, `inflates_criteria`, `other`). */
+  reason_kind?: string;
+  /** Frase do Arquiteto. */
+  reason?: string;
+}
+
+/** Ciclo de consenso entre o Revisor e o Arquiteto (spec 128). */
+export interface ConsensusView {
+  /** Rodada de ajuste corrente (0 = revisão inicial). */
+  round: number;
+  max_rounds: number;
+  /** Enquanto roda: `review` (Revisor conferindo) ou `architect` (Arquiteto avaliando). */
+  phase?: "review" | "architect" | string;
+  /** Apontamentos que o Arquiteto avalia agora. */
+  evaluating: number;
+  outcome?: "consensus" | "disputed" | "open" | "awaiting_user" | "unavailable" | "interrupted" | "shutdown" | string;
+  adjusted: number;
+  kept: number;
+  unanswered: number;
+  open: PlanPointView[];
+  disputed: PlanPointView[];
+  kept_points: PlanPointView[];
+  /** Recusados reabertos pelo Revisor com argumento novo, sem nova decisão: em aberto, com as duas posições. */
+  reopened?: PlanPointView[];
+  /** Apontamentos distintos do ciclo. */
+  total?: number;
+  tasks_first: number;
+  criteria_first: number;
+  tasks: number;
+  criteria: number;
 }
 
 export interface PlanReviewView {
@@ -425,6 +471,8 @@ export interface PlanReviewView {
   status: "pending" | "running" | "stale" | "ok" | "unavailable" | string;
   at?: string;
   issues: PlanIssue[];
+  /** Ciclo de consenso (spec 128); ausente nos registros antigos. */
+  consensus?: ConsensusView;
 }
 
 interface SkillProfileView {

@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod coverage;
 pub mod docker_command;
 pub mod environment;
+pub mod execution_order;
 pub mod failure_artifacts;
 pub mod formatting;
 pub mod images;

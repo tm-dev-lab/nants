@@ -1629,6 +1629,48 @@
   color: var(--ink3);
 }
 
+/* Consenso do plano (spec 128 T05): resumo discreto, mantidos recolhidos e pontos em aberto com as
+ * duas posições (o Revisor e o Arquiteto), sem caixas. */
+.nd-plan-consensus {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  font-size: var(--fs-control);
+  color: var(--ink2);
+}
+
+.nd-plan-consensus p {
+  margin: 0;
+}
+
+.nd-plan-consensus .nd-details {
+  padding: 0;
+  border: 0;
+}
+
+.nd-plan-point {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--ink);
+}
+
+.nd-plan-point-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-plan-point-side {
+  color: var(--ink2);
+}
+
+.nd-plan-point-label {
+  font-weight: var(--fw-semibold);
+}
+
 /* Detalhe recolhido: só o resumo com o chevron; dentro, seções com divisória e sem caixas. */
 .nd-plan-more {
   font-size: var(--fs-control);

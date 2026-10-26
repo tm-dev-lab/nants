@@ -90,6 +90,13 @@ pub struct UsageRecord {
     /// totais como qualquer outra.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+    /// Etapa da chamada (spec 128 T02: `plan_consensus`, o ciclo de consenso do plano), para medir
+    /// o custo por etapa; ausente fora dela.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Rodada da etapa (no consenso, 0 = revisão inicial).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 /// Valor de `billing` das chamadas pelo plano ChatGPT.
@@ -126,6 +133,8 @@ pub struct FileUsageSink {
     root: PathBuf,
     project: String,
     secrets: Arc<SecretSet>,
+    /// Etapa e rodada gravadas em cada linha (spec 128 T02); `None` fora de uma etapa.
+    stage: Option<(String, u32)>,
 }
 
 impl FileUsageSink {
@@ -137,7 +146,18 @@ impl FileUsageSink {
 
     /// Como [`Self::new`], com os segredos da configuração para redigir os trechos de corte.
     pub fn redacting(root: impl Into<PathBuf>, project: impl Into<String>, secrets: Arc<SecretSet>) -> Arc<Self> {
-        Arc::new(Self { root: root.into(), project: project.into(), secrets })
+        Arc::new(Self { root: root.into(), project: project.into(), secrets, stage: None })
+    }
+
+    /// [`Self::redacting`] com a etapa e a rodada gravadas em cada linha do uso (spec 128 T02).
+    pub fn redacting_staged(
+        root: impl Into<PathBuf>,
+        project: impl Into<String>,
+        secrets: Arc<SecretSet>,
+        stage: &str,
+        round: u32,
+    ) -> Arc<Self> {
+        Arc::new(Self { root: root.into(), project: project.into(), secrets, stage: Some((stage.to_string(), round)) })
     }
 
     /// Escopo de registro para um agente do projeto.
@@ -184,6 +204,8 @@ impl UsageSink for FileUsageSink {
             step: event.context.as_ref().map(|c| c.step),
             summary: event.context.as_ref().and_then(|c| c.summary.then_some(true)),
             session: event.context.and_then(|c| safe_label(&c.session)),
+            stage: self.stage.as_ref().map(|(stage, _)| stage.clone()),
+            round: self.stage.as_ref().map(|(_, round)| *round),
         };
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_USAGE_BYTES);
@@ -1096,6 +1118,8 @@ mod tests {
             step: None,
             session: None,
             summary: None,
+            stage: None,
+            round: None,
         };
         let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
         let v = aggregate(&[mk(Some(2)), mk(Some(1)), mk(None)], &pr);
@@ -1173,7 +1197,7 @@ mod tests {
     fn cached_without_cached_price_bills_as_input() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
         };
         let c = cost_of(&r, &price(1.0, 1.0, None)).expect("preço");
         assert!((c - 0.001).abs() < 1e-12);
@@ -1186,7 +1210,7 @@ mod tests {
         let img = |n: u64, q: Option<&str>| UsageRecord {
             at: String::new(), project: String::new(), spec: Some("s1".into()), task: Some("T01".into()),
             agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None,
-            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None,
+            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
         };
         // Sem image_per_unit: padrão por qualidade, estimado; soma ao custo dos tokens (US$ 1).
         let pr = price(1.0, 1.0, None);
@@ -1389,6 +1413,8 @@ mod tests {
             step: None,
             session: None,
             summary: None,
+            stage: None,
+            round: None,
         };
         let mut pricing = price(1.0, 1.0, None);
         let c = cost_of(&r, &pricing).expect("preço");
@@ -1503,6 +1529,8 @@ mod tests {
             step: None,
             session: None,
             summary: None,
+            stage: None,
+            round: None,
         }
     }
 
@@ -1864,6 +1892,8 @@ mod tests {
             step: Some(step),
             session: Some(session.into()),
             summary: None,
+            stage: None,
+            round: None,
         }
     }
 

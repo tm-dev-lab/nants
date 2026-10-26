@@ -46,6 +46,7 @@ import { ReviewDecisionList, ReviewerChecklist, ReviewFindingList, ReviewRespons
 import { MarkdownText } from "../shared/ReportMarkdown";
 import { taskUsageOf, useUsageView, type TaskUsageMap } from "../shared/useUsage";
 import { costAlertText } from "../shared/costAlert";
+import { tasksInExecutionOrder } from "../shared/executionOrder";
 import "../shared/apps.css";
 import "./board.css";
 import {
@@ -138,7 +139,11 @@ function Board({ projectId, spec, halted, permissions, size, selectedTask, board
   const recoveries = useAppStore((s) => s.recoveries);
   const shown = useMemo(() => parseBoardColumns(boardColumns), [boardColumns]);
   // Os rótulos das colunas seguem o idioma: ele entra nas dependências.
-  const columns = useMemo(() => buildColumns(spec.tasks, shown), [spec.tasks, shown, lang]);
+  // Spec 128 T04: cada coluna lista as tarefas na ordem de execução, com os ids como estão.
+  const columns = useMemo(
+    () => buildColumns(tasksInExecutionOrder({ tasks: spec.tasks, execution_order: spec.execution_order }), shown),
+    [spec.tasks, spec.execution_order, shown, lang],
+  );
   const placement = useMemo(() => columnIndex(columns), [columns]);
   const activeId = pickActiveTask(spec.tasks)?.id ?? null;
   const focusedId = selectedTask !== null && spec.tasks.some((t) => t.id === selectedTask) ? selectedTask : activeId;

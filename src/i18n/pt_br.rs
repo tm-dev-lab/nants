@@ -379,6 +379,16 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "system.chat.connection_lost_saved",
         "A conexão com o provedor caiu antes de o Arquiteto terminar este turno. O que ele já tinha gravado ficou salvo na spec {spec}, mas o plano pode estar incompleto. Use Tentar de novo para ele continuar de onde parou.",
     ),
+    // Spec 128 T02: uma linha por rodada do consenso do plano.
+    (
+        "system.plan.consensus_round",
+        "Revisão do plano, rodada {round}: o Revisor apontou {issues}; o Arquiteto ajustou {accepted} e manteve {kept}.",
+    ),
+    (
+        "system.plan.consensus_round_open",
+        "Revisão do plano, rodada {round}: o Revisor apontou {issues}; o Arquiteto ajustou {accepted}, manteve {kept} e deixou {open} sem resposta.",
+    ),
+    ("system.plan.renumbered", "Tarefas renumeradas na ordem de execução: {map}."),
     (
         "system.final.still_unmet",
         "AVISO: a verificação final ainda aponta critérios não atendidos após a rodada de correção; a spec será concluída assim mesmo.",
@@ -409,6 +419,12 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.arbitration.entry", "- Revisão {review}, {task} {finding} ({decision}): {title}. Motivo: {reason}"),
     ("plan_review.too_large.one", "{count} critério de aceitação: grande demais para uma revisão. Divida em tarefas menores, uma por área (por exemplo servidor, cliente e testes ponta a ponta), cada uma com os próprios critérios."),
     ("plan_review.too_large.other", "{count} critérios de aceitação: grande demais para uma revisão. Divida em tarefas menores, uma por área (por exemplo servidor, cliente e testes ponta a ponta), cada uma com os próprios critérios."),
+    ("plan_review.too_large_dense.one", "{count} critério de aceitação, que vale por {weight} pelo tamanho do texto (critério com mais de {words} palavras conta como mais de um): grande demais para uma revisão. Escreva um critério por comportamento observável, numa frase curta, e divida a tarefa se ela continuar grande."),
+    ("plan_review.too_large_dense.other", "{count} critérios de aceitação, que valem por {weight} pelo tamanho do texto (critério com mais de {words} palavras conta como mais de um): grande demais para uma revisão. Escreva um critério por comportamento observável, numa frase curta, e divida a tarefa se ela continuar grande."),
+    // Spec 128 T04: ciclo de dependências e renumeração das tarefas na aprovação.
+    ("plan_review.dependency_cycle", "As tarefas {tasks} dependem umas das outras em ciclo pelo depends_on, e assim não há ordem de execução. Desfaça o ciclo."),
+    ("runs.renumber.heading", "Renumeração"),
+    ("runs.renumber.body", "Na aprovação, as tarefas foram renumeradas na ordem de execução: {map}. Os registros do planejamento (usage.jsonl, tools.jsonl, .context.jsonl e .chat.jsonl) mantêm os ids antigos, e este mapa explica a correspondência."),
     ("runner.adjust.entry", "- Recuperação #{cycle}, {task}: critérios ajustados ao que o ambiente prova. Motivo: {reason}"),
     ("runner.split.origin", "Parte da {task}, separada na análise de recuperação #{cycle}. Começa depois que a {task} for integrada, a partir do trabalho dela."),
     ("runner.review.low_confidence_demoted", "{summary} (findings de baixa confiança viraram observações.)"),
@@ -470,6 +486,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("chatgpt.log.revoke_failed", "aviso: conexão {id}: não foi possível revogar o acesso no servidor; as credenciais locais foram apagadas"),
     ("chatgpt.log.save_failed", "aviso: conexão {id}: não foi possível gravar as credenciais do plano ChatGPT"),
     ("cli.orphan_envs_removed", "nants: ambientes Docker órfãos removidos: {list}"),
+    (
+        "cli.renumber_journal_kept",
+        "nants: a renumeração interrompida da spec {spec} em {root} não foi desfeita, porque {file} mudou depois da aprovação. Nada foi alterado, e o diário ficou em {journal} para conferência.",
+    ),
     // Texto livre gravado nos artefatos (spec 115 T04, C-07, C-08 e C-12); os cabeçalhos lidos por
     // parser (`## Objetivo`, `## Critérios de Aceitação`, `## Orientação do humano`) ficam no código.
     ("runner.final_fix.objective", "Corrigir os critérios globais não atendidos apontados pela verificação final."),
@@ -725,6 +745,8 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("serverError.spec_not_found", "spec não encontrada"),
     ("serverError.spec_not_in_progress", "spec não está em andamento"),
     ("serverError.spec_write_failed", "falha ao gravar o estado da spec"),
+    ("serverError.plan_review_running", "o Revisor ainda está revisando o plano; aguarde o fim da revisão para aprovar"),
+    ("serverError.plan_renumber_failed", "falha ao renumerar as tarefas na ordem de execução; nada foi alterado"),
     ("serverError.survey_busy", "já há um turno, execução ou relatório em andamento neste projeto"),
     ("serverError.system_dir_forbidden", "diretório de sistema não é permitido"),
     ("serverError.task_id_invalid", "task_id deve conter apenas [a-zA-Z0-9_-] e ter de 1 a 64 caracteres"),

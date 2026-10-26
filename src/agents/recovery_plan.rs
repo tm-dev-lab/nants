@@ -32,6 +32,17 @@ const MAX_REASON_BYTES: usize = 600;
 pub const RECURRENT_REVIEWS: u32 = 3;
 /// Critérios a partir dos quais a tarefa é grande.
 pub const MANY_CRITERIA: usize = 6;
+/// Spec 128 T03 (C-12): palavras de um critério de aceitação (com os subitens, sem o marcador da
+/// lista) acima das quais ele conta como mais de um na conferência de tamanho: cada bloco de até
+/// `CRITERION_WORDS` palavras vale um critério ([`criteria_weight`]). Medido nos planos reais, por
+/// critério: o Test 5, que executou bem, tem 38 critérios com mediana de 51 palavras, p90 de 66 e
+/// máximo de 93 (3,4 frases em média); o Test 6, o plano inchado, tem 50 critérios com mediana de 58,
+/// p90 de 84 e máximo de 122 (4,5 frases em média, até 10). Com 60, a conferência aponta 3 de 10
+/// tarefas do Test 5 (entre elas a T05, a do alvo móvel) e 6 de 15 do Test 6 (entre elas a T07, que
+/// testa o texto do README, e a T12, que exige reiniciar o container pelo host). Com 70, nenhuma do
+/// Test 5. A medida é em palavras, e não em frases, porque não depende da pontuação. Só gera o
+/// apontamento `too_large`, que passa pelo julgamento do Arquiteto; não barra nada.
+pub const CRITERION_WORDS: usize = 60;
 
 /// Linhas fixas da análise de recuperação (marcadores estruturais lidos pela web, que os traduz em
 /// `web/src/recoveryAnalysis.ts`, como as das outras decisões).
@@ -204,14 +215,48 @@ pub struct RoleCost {
 pub fn count_criteria(acceptance: &str) -> usize {
     acceptance
         .lines()
-        .filter(|l| !l.starts_with([' ', '\t']))
         .map(str::trim_end)
-        .filter(|l| {
-            l.starts_with("- ")
-                || l.starts_with("* ")
-                || l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-        })
+        .filter(|l| is_top_item(l))
         .count()
+}
+
+/// Primeiro nível da lista de critérios: `- `, `* ` ou `1. ` sem recuo.
+fn is_top_item(line: &str) -> bool {
+    !line.starts_with([' ', '\t'])
+        && (line.starts_with("- ")
+            || line.starts_with("* ")
+            || line.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())))
+}
+
+/// Palavras de uma linha da lista sem o marcador (`-`, `*`, `1.`) e sem a caixa `[ ]`/`[x]`.
+fn item_words(line: &str) -> usize {
+    let t = line.trim_start();
+    let rest = match t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+        Some(r) => r,
+        None => match t.split_once(". ") {
+            Some((n, r)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => r,
+            _ => t,
+        },
+    }
+    .trim_start();
+    let rest = ["[ ]", "[x]", "[X]"].iter().find_map(|b| rest.strip_prefix(b)).unwrap_or(rest);
+    rest.split_whitespace().count()
+}
+
+/// Spec 128 T03: critérios de aceitação com o peso da densidade. Cada critério de primeiro nível
+/// (o mesmo de [`count_criteria`]) vale um por bloco de até [`CRITERION_WORDS`] palavras, contando
+/// os subitens e as linhas de continuação dele: um parágrafo que junta várias verificações conta
+/// como mais de um. Determinístico; nunca menor que [`count_criteria`].
+pub fn criteria_weight(acceptance: &str) -> usize {
+    let mut items: Vec<usize> = Vec::new();
+    for line in acceptance.lines().map(str::trim_end) {
+        if is_top_item(line) {
+            items.push(item_words(line));
+        } else if let Some(last) = items.last_mut() {
+            *last += item_words(line);
+        }
+    }
+    items.iter().map(|w| w.div_ceil(CRITERION_WORDS).max(1)).sum()
 }
 
 /// Decisões das análises de recuperação anteriores: `#1 RETRY`, `#2 REVISE_TASK`...
@@ -349,7 +394,7 @@ pub fn signals(task: &Task, cost: &[RoleCost]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn task_with(body: &str) -> Task {
@@ -457,5 +502,39 @@ mod tests {
         assert_eq!(count_criteria("- a\n1. b\n* c\ntexto\n10. d"), 4);
         // Subitens recuados (espaço ou tabulação) detalham o critério de cima: não contam.
         assert_eq!(count_criteria("1. a\n   - detalhe\n   - outro\n2. b\n\t* sub\n  3. recuado\n- c"), 3);
+    }
+
+    /// Critérios da T12 do Test 6 (rc.14), o plano inchado: três parágrafos de 84 a 94 palavras,
+    /// cada um com várias verificações.
+    pub(crate) const TEST6_T12_ACCEPTANCE: &str = r#"- [ ] sh scripts/verify-container-persistence.sh automates build, startup, bounded readiness probes, API creation of a group, members, a game, poll/votes, confirmed night and tied/scoreless play, then docker restart of the same named application container. After readiness it signs in again and verifies identical stored IDs, votes, attendee snapshot, play/history and leaderboard totals via API. It asserts the container mount includes /work and DB_PATH is inside the mounted isolated run directory. A zero exit requires every assertion to pass; any command/probe failure returns nonzero with useful text diagnostics under test-results/persistence/. No development database or host port is used.
+- [ ] The script uses the existing .nants/compose.yaml and workspace image without changing either; fresh dependency installation uses npm ci --no-audit --no-fund inside workspace, and the server build uses current sources. Cleanup traps remove only containers created by this invocation, including on assertion failure; preserve text diagnostics but never print passwords/invite codes. Unique run paths avoid collisions. Readiness uses bounded condition polling, not a fixed startup sleep. The actual restart command is part of the automated scenario, not a README-only instruction or a database close/reopen substitute.
+- [ ] npm test includes tests/unit/container-persistence.test.ts, covering orchestration with a fake Docker executable: restart is issued between seed and verify, probe failure propagates as nonzero, cleanup runs and mount/DB_PATH arguments remain isolated. These tests do not invoke real Docker inside workspace. The agent additionally runs sh scripts/verify-container-persistence.sh from the host using the available Docker toolchain and records its exit status as the G1 container-restart evidence. npm test, npm run typecheck and npm run build stay green. This supplemental host acceptance command is distinct from internal test_command/full_test_command.
+"#;
+
+    /// Critérios da T02 do Test 6: três critérios de 39 a 57 palavras, abaixo do corte.
+    const TEST6_T02_ACCEPTANCE: &str = r#"- [ ] HTTP tests cover list/detail/create/update/delete, signed-out rejection, member ownership, trimmed nonempty titles, integer min/max players and duration, complexity 1 through 5, unknown IDs and minimum greater than maximum. Extend the T08 private-route authorization matrix for game routes. SQL uses parameters and foreign keys; deleting an unplayed game works. The played-game guard is completed with play references in T05.
+- [ ] Collection cards and game detail show title, owner, player range, play time and complexity with stable generated placeholders. Add/edit/delete flows update the displayed canonical collection. Empty collection and failed validation include a clear next action and preserve entered fields.
+- [ ] Fast tests cover placeholder determinism and API validation. Browser coverage at both viewports adds and edits a game, confirms changed metadata, captures collection/detail and visible validation-error states and asserts labeled controls and no horizontal overflow. npm test, typecheck and build remain green.
+"#;
+
+    /// Spec 128 T03 (C-12): critério com mais de [`CRITERION_WORDS`] palavras conta como mais de um;
+    /// o marcador da lista e a caixa não contam; os subitens contam no critério de cima. Com os
+    /// critérios reais do Test 6, a T12 (3 parágrafos) vale 6 e chega ao limite do `too_large`, e a
+    /// T02 continua valendo 3.
+    #[test]
+    fn long_criteria_weigh_more_than_one() {
+        let words = |n: usize| vec!["palavra"; n].join(" ");
+        assert_eq!(criteria_weight(""), 0);
+        assert_eq!(criteria_weight(&format!("- [ ] {}", words(CRITERION_WORDS))), 1);
+        assert_eq!(criteria_weight(&format!("- [x] {}", words(CRITERION_WORDS + 1))), 2);
+        assert_eq!(criteria_weight(&format!("1. {}\n2. curto", words(2 * CRITERION_WORDS + 1))), 4);
+        // Subitens e linhas de continuação somam no critério de cima.
+        let sub = format!("- a\n   - {}\n   - {}", words(CRITERION_WORDS / 2), words(CRITERION_WORDS / 2));
+        assert_eq!((count_criteria(&sub), criteria_weight(&sub)), (1, 2));
+        let short = "1. a\n   - b\n   - c\n2. d\n- e";
+        assert_eq!(criteria_weight(short), count_criteria(short));
+        assert_eq!((count_criteria(TEST6_T12_ACCEPTANCE), criteria_weight(TEST6_T12_ACCEPTANCE)), (3, 6));
+        assert!(criteria_weight(TEST6_T12_ACCEPTANCE) >= MANY_CRITERIA);
+        assert_eq!((count_criteria(TEST6_T02_ACCEPTANCE), criteria_weight(TEST6_T02_ACCEPTANCE)), (3, 3));
     }
 }
