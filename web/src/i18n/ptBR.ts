@@ -508,6 +508,7 @@ export const ptBR = {
   "provider.kind.throttled": "provedor no limite",
   "provider.kind.image_unsupported": "geração de imagens indisponível",
   "provider.kind.image_unreadable": "o provedor não devolveu uma imagem legível (pode ter cobrado)",
+  "provider.kind.transport": "a conexão caiu no meio da resposta",
   "provider.kind.http_code": "código",
 
   // Mensagens do sistema gravadas na conversa, pelo `code` (spec 102).
@@ -544,6 +545,10 @@ export const ptBR = {
     "Aviso: não consegui apagar a worktree {path}: {error}. A tarefa está integrada; remova a pasta manualmente (git worktree remove --force) quando possível",
   "system.final.skipped": "AVISO: verificação final não executada porque o orçamento da spec foi atingido; a spec será concluída sem ela.",
   "system.final.unavailable": "Verificação final indisponível; concluindo sem ela.",
+  "system.chat.connection_lost":
+    "A conexão com o provedor caiu antes de o Arquiteto terminar este turno, e nada foi gravado. Use Tentar de novo para ele continuar de onde parou.",
+  "system.chat.connection_lost_saved":
+    "A conexão com o provedor caiu antes de o Arquiteto terminar este turno. O que ele já tinha gravado ficou salvo na spec {spec}, mas o plano pode estar incompleto. Use Tentar de novo para ele continuar de onde parou.",
   "system.final.still_unmet": "AVISO: a verificação final ainda aponta critérios não atendidos após a rodada de correção; a spec será concluída assim mesmo.",
   "system.final.fix_refused": "AVISO: tarefa de correção recusada; a spec será concluída com critérios não atendidos.",
   "system.final.fix_created": "Verificação final: criada a tarefa {task} ({title}) para os critérios não atendidos.",
@@ -953,6 +958,9 @@ export const ptBR = {
   "plan.footNote": "Code review independente e Squash Merge ativados",
   "plan.drafting": "Plano em elaboração…",
   "plan.architectCompleting": "O Arquiteto está completando o plano.",
+  "plan.incomplete.text":
+    "Plano incompleto: a spec não tem nenhuma tarefa gravada. O turno do Arquiteto provavelmente foi interrompido antes de terminar, e a aprovação fica bloqueada até as tarefas existirem.",
+  "plan.incomplete.finish": "Pedir ao Arquiteto para terminar",
   "plan.readyBadge": "Plano pronto para aprovar",
   "plan.noPlan": "sem plano",
   "plan.stage.planning": "planejando",
@@ -1010,6 +1018,7 @@ export const ptBR = {
   "plan.review.reviewing": "revisando",
   "plan.review.noAnswer": "sem resposta ainda",
   "plan.review.unavailableShort": "indisponível",
+  "plan.review.incomplete": "não revisado: o plano não tem tarefas",
   "plan.review.fixButton": "Pedir correção",
   "plan.review.fixPrefix": "Corrija estes pontos das checagens do plano:",
   "plan.review.waitingReason": "aguardando o Revisor",

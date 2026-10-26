@@ -32,14 +32,14 @@ use super::snapshot::project_snapshot;
 use super::state::{AppState, ArchitectTurn, ReserveError, REPORT_BUSY_CODE};
 use crate::server::events::BusActivitySink;
 use crate::agents::activity::{ActivityEvent, ActivityKind, ActivitySink};
-use crate::agents::llm_client::{ChatRequest, ChatResponse, StreamDelta};
+use crate::agents::llm_client::{BadKind, ChatRequest, ChatResponse, ProviderFailure, StreamDelta};
 use crate::agents::LlmError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Instant;
 use crate::agents::architect::{
-    truncate_bytes, ArchitectError, ArchitectReply, ChatTurn, InternetSetup, LlmArchitect, TurnRole,
+    truncate_bytes, ArchitectError, ArchitectReply, ChatTurn, InternetSetup, LlmArchitect, TurnNotice, TurnRole,
     CHAT_FILE_REL, MAX_HISTORY_TURNS, SDD_SPECS_REL,
 };
 use crate::agents::chat::ChatBackend;
@@ -236,12 +236,17 @@ pub async fn post_chat(
 /// a revisão do plano, que pode pedir este turno (quebra o ciclo de tipos).
 pub(super) fn internal_turn(state: AppState, project_id: String, message: String) -> Pin<Box<dyn Future<Output = StatusCode> + Send>> {
     Box::pin(async move {
-        let body = json!({ "message": message, "internal": true }).to_string();
-        match run_turn(&state, &project_id, body.as_bytes(), CHAT_TIMEOUT, state.llm_backend()).await {
+        match internal_turn_response(&state, &project_id, message).await {
             Ok(resp) => resp.status(),
             Err(err) => err.into_response().status(),
         }
     })
+}
+
+/// Núcleo de [`internal_turn`], com a resposta inteira (o `POST /chat/continue` a devolve à tela).
+async fn internal_turn_response(state: &AppState, project_id: &str, message: String) -> Result<Response, ApiError> {
+    let body = json!({ "message": message, "internal": true }).to_string();
+    run_turn(state, project_id, body.as_bytes(), CHAT_TIMEOUT, state.llm_backend()).await
 }
 
 /// `GET /api/projects/:id/chat`: últimos turnos do histórico, em ordem cronológica, com texto
@@ -265,6 +270,12 @@ pub async fn get_chat(
             });
             if let (Some(id), Some(map)) = (turn.turn_id, view.as_object_mut()) {
                 map.insert("turn_id".into(), json!(id));
+            }
+            // Aviso do sistema (spec 127 T01): `code` válido e `params` saneados, como no evento.
+            let notice = turn.notice.filter(|n| turn.role == TurnRole::System && super::events::valid_message_code(&n.code));
+            if let (Some(notice), Some(map)) = (notice, view.as_object_mut()) {
+                map.insert("code".into(), json!(notice.code));
+                map.insert("params".into(), json!(super::events::message_params(&secrets, &notice.params)));
             }
             view
         })
@@ -420,6 +431,7 @@ async fn run_turn_body(
         turn_id: Some(turn_id.clone()),
         internal: incoming.internal,
         attachments: incoming.attachments.clone(),
+        notice: None,
     };
     let (mark_root, save_root, snap_secrets) = (root.clone(), root.clone(), Arc::clone(&secrets));
     // Retrato do plano antes do turno (spec 086 T09): base do "o que mudou nesta versão".
@@ -459,9 +471,128 @@ async fn run_turn_body(
                 None => return Ok(timeout_response(&secrets, root, turn_id, before).await),
             }
         }
-        Some(result) => result.map_err(architect_error)?,
+        Some(Ok(reply)) => reply,
+        Some(Err(err)) => return Err(failed_turn(state, id, &secrets, root, turn_id, &plans_before, err).await),
     };
     Ok(finish_turn(state, id, &secrets, root, reply, turn_id, plans_before).await)
+}
+
+/// Código da mensagem de sistema gravada quando a conexão caiu no meio do turno (spec 127 T01).
+pub const CONNECTION_LOST_CODE: &str = "chat.connection_lost";
+/// Idem, quando o turno já tinha gravado parte do plano (`params.spec`).
+pub const CONNECTION_LOST_SAVED_CODE: &str = "chat.connection_lost_saved";
+/// `reason` do 502 quando a mensagem de sistema foi gravada: a tela recarrega o histórico.
+pub const CONNECTION_LOST_REASON: &str = "connection_lost";
+
+/// Falha que é queda da conexão com o provedor: conexão perdida (inclusive no meio da resposta,
+/// depois das novas tentativas), tempo esgotado ou transmissão sem evento final.
+fn is_connection_lost(failure: &ProviderFailure) -> bool {
+    match failure {
+        ProviderFailure::ConnectFailed | ProviderFailure::Timeout => true,
+        ProviderFailure::BadResponse(reason) => matches!(reason.kind, BadKind::NoFinal | BadKind::Transport),
+        _ => false,
+    }
+}
+
+/// Specs em plano que o turno gravou: assinatura diferente da de antes do turno, ou spec nova.
+fn saved_specs(root: &Path, before: &std::collections::BTreeMap<String, String>, secrets: &SecretSet) -> Vec<String> {
+    super::plan_changes::snapshots(root, secrets)
+        .into_iter()
+        .filter(|(spec, (sig, _))| before.get(spec) != Some(sig))
+        .map(|(spec, _)| spec)
+        .collect()
+}
+
+/// Turno que falhou pelo provedor (spec 127 T01). Queda da conexão: grava no histórico uma
+/// mensagem de sistema com `code` (o que ficou gravado vai nos `params`; a reserva no idioma do
+/// projeto) e devolve o 502 com `reason: connection_lost`. Outras falhas: só o 502, como antes.
+#[allow(clippy::too_many_arguments)]
+async fn failed_turn(
+    state: &AppState,
+    id: &str,
+    secrets: &Arc<SecretSet>,
+    root: PathBuf,
+    turn_id: String,
+    plans_before: &super::plan_changes::Snapshots,
+    err: ArchitectError,
+) -> ApiError {
+    let ArchitectError::Backend(failure) = &err;
+    let lost = is_connection_lost(failure);
+    let api = architect_error(err);
+    if !lost {
+        return api;
+    }
+    let lang = state.project_lang(id).get();
+    let before: std::collections::BTreeMap<String, String> =
+        plans_before.iter().map(|(spec, (sig, _))| (spec.clone(), sig.clone())).collect();
+    let secrets = Arc::clone(secrets);
+    let saved = tokio::task::spawn_blocking(move || {
+        let spec = saved_specs(&root, &before, &secrets).into_iter().next();
+        let notice = connection_lost_notice(spec.as_deref());
+        let text = output_text(&secrets, &crate::i18n::tr(lang, &format!("system.{}", notice.code), &notice_pairs(&notice)));
+        let turn = ChatTurn {
+            role: TurnRole::System,
+            text,
+            ts: unix_now(),
+            turn_id: Some(turn_id),
+            internal: false,
+            attachments: Vec::new(),
+            notice: Some(notice),
+        };
+        append_turns(&root, &[turn])
+    })
+    .await
+    .unwrap_or(false);
+    if saved {
+        api.with_reason(CONNECTION_LOST_REASON)
+    } else {
+        api
+    }
+}
+
+/// Aviso da queda: com a spec gravada no turno, `connection_lost_saved` com `params.spec`.
+fn connection_lost_notice(spec: Option<&str>) -> TurnNotice {
+    match spec {
+        Some(spec) => TurnNotice {
+            code: CONNECTION_LOST_SAVED_CODE.to_string(),
+            params: [("spec".to_string(), json!(spec))].into_iter().collect(),
+        },
+        None => TurnNotice { code: CONNECTION_LOST_CODE.to_string(), params: Map::new() },
+    }
+}
+
+/// `params` de texto do aviso, para o [`crate::i18n::tr`] da reserva.
+fn notice_pairs(notice: &TurnNotice) -> Vec<(&str, &str)> {
+    notice.params.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.as_str(), v))).collect()
+}
+
+/// Pedido de continuação ao Arquiteto (spec 127 T01): o mesmo turno interno da divisão das
+/// tarefas (`internal_turn`), pelo botão "Tentar de novo" da Conversa ou "Pedir ao Arquiteto para
+/// terminar" do cartão do plano. Corpo opcional `{"spec_id": "..."}` (plano sem tarefas).
+#[derive(Deserialize, Default)]
+struct ContinueInput {
+    #[serde(default)]
+    spec_id: Option<String>,
+}
+
+/// `POST /api/projects/:id/chat/continue`: turno interno "continue de onde parou". Mesma resposta
+/// do `POST /chat` (`reply`, `draft_updated`, `turn_id`).
+pub async fn post_chat_continue(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: ContinueInput = if body.iter().all(u8::is_ascii_whitespace) {
+        ContinueInput::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError::coded(StatusCode::BAD_REQUEST, "json_malformed", Map::new()))?
+    };
+    if let Some(spec) = &input.spec_id {
+        super::spec_result::validate_spec_id(spec)?;
+    }
+    let message = crate::agents::prompts::continue_turn_request(input.spec_id.as_deref());
+    internal_turn_response(&state, &id, message).await
 }
 
 /// Turno cortado: persiste um turno curto do Arquiteto informando o corte e devolve o 504,
@@ -487,6 +618,7 @@ async fn timeout_response(
         turn_id: Some(turn_id),
         internal: false,
         attachments: Vec::new(),
+        notice: None,
     };
     let _saved = tokio::task::spawn_blocking(move || append_turns(&root, &[turn])).await;
     let err = ApiError::coded(StatusCode::GATEWAY_TIMEOUT, TIMEOUT_CODE, Map::new());
@@ -515,6 +647,7 @@ async fn finish_turn(
             turn_id: Some(turn_id.clone()),
             internal: false,
             attachments: Vec::new(),
+            notice: None,
         },
     ];
     // Falha de persistência não derruba o turno: o histórico é melhor esforço.
@@ -720,9 +853,10 @@ async fn load_visible_history(root: PathBuf) -> Vec<ChatTurn> {
         .unwrap_or_default()
 }
 
-/// Contexto do Arquiteto: os turnos mais recentes, inclusive os internos.
+/// Contexto do Arquiteto: os turnos mais recentes, inclusive os internos. Os avisos do sistema
+/// (spec 127 T01) são da pessoa, não do modelo: ficam fora e não ocupam vaga do limite.
 pub fn read_history(root: &Path) -> Vec<ChatTurn> {
-    last_turns(read_turns(root), |_| true)
+    last_turns(read_turns(root), |turn| turn.role != TurnRole::System)
 }
 
 /// Histórico exibido ao usuário: os turnos mais recentes sem os internos (o limite conta só os visíveis).
@@ -1352,7 +1486,9 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let reviewer = Arc::new(GatedReview(Arc::clone(&gate)));
         let state = state_for(&root, cfg).with_report_backend(reviewer);
-        let (_, dynb) = backend(vec![write_spec_call(), text("Plano pronto.")]);
+        // Plano com tarefa: sem nenhuma, a revisão não roda (spec 127 T01).
+        let task = write_task_call(crate::agents::prompts::EXAMPLE_TASK_MD);
+        let (_, dynb) = backend(vec![write_spec_call(), task, text("Plano pronto.")]);
         let (status, body) = turn(&state, PROJECT_ID, "gera o plano", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let secrets = SecretSet::default();
@@ -1468,6 +1604,7 @@ mod tests {
                 turn_id: None,
                 internal: false,
                 attachments: Vec::new(),
+                notice: None,
             };
             long.push_str(&serde_json::to_string(&t).expect("json"));
             long.push('\n');
@@ -1478,6 +1615,27 @@ mod tests {
         let msgs = &third.requests()[0].messages;
         assert_eq!(msgs.len(), 1 + 1 + MAX_HISTORY_TURNS + 1);
         assert_eq!(msgs[1].content, "antigo 10");
+    }
+
+    /// Spec 127 T01: os avisos do sistema ficam fora do contexto do Arquiteto e não ocupam vaga do
+    /// limite; o histórico exibido os mantém.
+    #[test]
+    fn read_history_leaves_system_notices_out_of_the_model_context() {
+        let root = tmp_root("chat-read-system");
+        let mut turns = Vec::new();
+        for i in 0..MAX_HISTORY_TURNS {
+            let role = if i % 2 == 0 { TurnRole::User } else { TurnRole::Architect };
+            turns.push(ChatTurn { role, text: format!("real {i}"), ts: 1, turn_id: None, internal: false, attachments: Vec::new(), notice: None });
+            let notice = Some(connection_lost_notice(None));
+            turns.push(ChatTurn { role: TurnRole::System, text: "aviso".into(), ts: 1, turn_id: None, internal: false, attachments: Vec::new(), notice });
+        }
+        assert!(append_turns(&root, &turns));
+        let context = read_history(&root);
+        assert_eq!(context.len(), MAX_HISTORY_TURNS);
+        assert!(context.iter().all(|t| t.role != TurnRole::System));
+        assert_eq!(context[0].text, "real 0", "o turno real mais antigo continua no contexto");
+        let visible = read_visible_history(&root);
+        assert!(visible.iter().any(|t| t.role == TurnRole::System));
     }
 
     #[test]
@@ -2041,6 +2199,7 @@ mod tests {
                 turn_id: None,
                 internal: false,
                 attachments: Vec::new(),
+                notice: None,
             },
             ChatTurn {
                 role: TurnRole::Architect,
@@ -2049,6 +2208,7 @@ mod tests {
                 turn_id: None,
                 internal: false,
                 attachments: Vec::new(),
+                notice: None,
             },
         ];
         assert!(append_turns(&root, &turns));
@@ -2084,6 +2244,7 @@ mod tests {
                 turn_id: None,
                 internal: false,
                 attachments: Vec::new(),
+                notice: None,
             })
             .collect();
         assert!(append_turns(&root, &turns));
@@ -2114,6 +2275,7 @@ mod tests {
             turn_id: None,
             internal: false,
             attachments: Vec::new(),
+            notice: None,
         }];
         assert!(append_turns(&root, &turns));
         let (status, body) = get_history(&state, PROJECT_ID, HOST).await;
@@ -2224,7 +2386,7 @@ mod tests {
     async fn get_history_with_invalid_host_is_403() {
         let root = tmp_root("chat-get-host");
         let state = state_for(&root, config_for(&root, true));
-        assert!(append_turns(&root, &[ChatTurn { role: TurnRole::User, text: "oi".into(), ts: 1, turn_id: None, internal: false, attachments: Vec::new() }]));
+        assert!(append_turns(&root, &[ChatTurn { role: TurnRole::User, text: "oi".into(), ts: 1, turn_id: None, internal: false, attachments: Vec::new(), notice: None }]));
         let (status, body) = get_history(&state, PROJECT_ID, "evil.example:3000").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(!body.to_string().contains("oi"));
@@ -2654,5 +2816,123 @@ mod tests {
         let retry = reqs[1].messages.last().expect("m");
         assert!(retry.images.is_empty());
         assert!(retry.content.starts_with("veja a tela"), "o texto do usuário é preservado: {}", retry.content);
+    }
+
+    // ---- Queda da conexão no meio do turno (spec 127 T01) ----
+
+    #[tokio::test]
+    async fn connection_lost_records_a_coded_system_notice_in_the_history() {
+        let root = tmp_root("chat-conn-lost");
+        let state = state_for(&root, config_for(&root, true));
+        let (_, dynb) = backend(vec![Err(LlmError::Transport(SECRET.into()))]);
+        let (status, body) = turn(&state, PROJECT_ID, "gera o plano", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["code"], CODE_PROVIDER_FAILED);
+        assert_eq!(body["reason"], CONNECTION_LOST_REASON, "{body}");
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 2, "mensagem do usuário + aviso do sistema");
+        let notice = &lines[1];
+        assert_eq!(notice["role"], "system");
+        assert_eq!(notice["notice"]["code"], CONNECTION_LOST_CODE);
+        assert_eq!(notice["turn_id"], lines[0]["turn_id"]);
+        let lang = state.project_lang(PROJECT_ID).get();
+        assert_eq!(notice["text"], crate::i18n::text(lang, "system.chat.connection_lost"));
+        assert!(!notice.to_string().contains(SECRET));
+        // O GET mostra o aviso com `code` e `params`, para a tela traduzir.
+        let (status, hist) = get_history(&state, PROJECT_ID, HOST).await;
+        assert_eq!(status, StatusCode::OK);
+        let turns = hist["turns"].as_array().expect("turns");
+        let last = turns.last().expect("aviso");
+        assert_eq!(last["role"], "system");
+        assert_eq!(last["code"], CONNECTION_LOST_CODE);
+        assert_eq!(last["params"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn connection_lost_after_the_spec_was_written_names_what_was_saved() {
+        let root = tmp_root("chat-conn-lost-saved");
+        let state = state_for(&root, config_for(&root, true));
+        let (_, dynb) = backend(vec![write_spec_call(), Err(LlmError::Transport("queda".into()))]);
+        let (status, body) = turn(&state, PROJECT_ID, "gera o plano", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        let lines = chat_lines(&root);
+        let notice = lines.last().expect("aviso");
+        assert_eq!(notice["notice"]["code"], CONNECTION_LOST_SAVED_CODE);
+        assert_eq!(notice["notice"]["params"], json!({"spec": "001-exemplo"}));
+        let lang = state.project_lang(PROJECT_ID).get();
+        assert_eq!(notice["text"], crate::i18n::tr(lang, "system.chat.connection_lost_saved", &[("spec", "001-exemplo")]));
+    }
+
+    #[tokio::test]
+    async fn timeout_and_stream_without_final_also_count_as_connection_lost() {
+        use crate::agents::llm_client::BadReason;
+        for (i, reply) in [Err(LlmError::Timeout), Err(LlmError::Parse(BadReason::new(BadKind::NoFinal)))].into_iter().enumerate() {
+            let root = tmp_root(&format!("chat-conn-lost-kind-{i}"));
+            let state = state_for(&root, config_for(&root, true));
+            let (_, dynb) = backend(vec![reply]);
+            let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["reason"], CONNECTION_LOST_REASON, "caso {i}: {body}");
+            assert_eq!(chat_lines(&root).len(), 2, "caso {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_provider_failures_record_no_notice() {
+        let root = tmp_root("chat-conn-other");
+        let state = state_for(&root, config_for(&root, true));
+        let (_, dynb) = backend(vec![Err(LlmError::Http { status: 401, body_snippet: String::new(), code: None })]);
+        let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.get("reason").is_none(), "{body}");
+        assert_eq!(chat_lines(&root).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn continue_runs_an_internal_turn_and_the_notice_never_reaches_the_model() {
+        let root = tmp_root("chat-continue");
+        let state = state_for(&root, config_for(&root, true));
+        let (_, dynb) = backend(vec![Err(LlmError::Transport("queda".into()))]);
+        let (status, _) = turn(&state, PROJECT_ID, "gera o plano", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let scripted = Scripted::new(vec![text("Tarefas gravadas.")]);
+        let state = state.with_llm_backend(scripted.clone());
+        let (status, body) = post_raw(&state, &format!("/api/projects/{PROJECT_ID}/chat/continue"), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["reply"], "Tarefas gravadas.");
+        let reqs = scripted.requests();
+        let messages = &reqs[0].messages;
+        let last = messages.last().expect("pedido");
+        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(None));
+        let lang = state.project_lang(PROJECT_ID).get();
+        let notice_text = crate::i18n::text(lang, "system.chat.connection_lost");
+        assert!(messages.iter().all(|m| !m.content.contains(&notice_text)), "o aviso é da pessoa, não do modelo");
+        assert!(messages.iter().any(|m| m.content == "gera o plano"), "o pedido original segue no contexto");
+        // O pedido de continuação é interno: gravado, mas fora do GET.
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[2]["internal"], true);
+        let (_, hist) = get_history(&state, PROJECT_ID, HOST).await;
+        let roles: Vec<&str> = hist["turns"].as_array().expect("turns").iter().filter_map(|t| t["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "system", "architect"]);
+    }
+
+    #[tokio::test]
+    async fn continue_with_spec_asks_to_finish_that_plan_and_validates_the_body() {
+        let root = tmp_root("chat-continue-spec");
+        let scripted = Scripted::new(vec![text("Plano terminado.")]);
+        let state = state_for(&root, config_for(&root, true)).with_llm_backend(scripted.clone());
+        let uri = format!("/api/projects/{PROJECT_ID}/chat/continue");
+        let (status, _) = post_raw(&state, &uri, r#"{"spec_id": "../fora"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = post_raw(&state, &uri, "{não é json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(scripted.requests().is_empty(), "corpo inválido não chega ao modelo");
+        let (status, body) = post_raw(&state, &uri, r#"{"spec_id": "001-exemplo"}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let last = scripted.requests()[0].messages.last().cloned().expect("pedido");
+        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(Some("001-exemplo")));
+        assert!(last.content.ends_with("Spec: 001-exemplo"));
     }
 }

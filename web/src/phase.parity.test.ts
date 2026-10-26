@@ -30,11 +30,11 @@ interface ParityFixture {
 const fixture = JSON.parse(readFileSync(FIXTURE, "utf8")) as ParityFixture;
 
 describe("planStage: paridade com o /api/attention (fixture compartilhada)", () => {
-  it("a matriz cobre turno × revisão (6) × execução", () => {
+  it("a matriz cobre turno × revisão (7) × execução", () => {
     expect(fixture.spec_status).toBe("AWAITING_APPROVAL");
-    expect(fixture.cases).toHaveLength(24);
+    expect(fixture.cases).toHaveLength(28);
     const reviews = new Set(fixture.cases.map((c) => c.plan_review));
-    expect([...reviews].sort()).toEqual([null, "ok", "pending", "running", "stale", "unavailable"].sort());
+    expect([...reviews].sort()).toEqual([null, "incomplete", "ok", "pending", "running", "stale", "unavailable"].sort());
   });
 
   it.each(fixture.cases.map((c, i) => [i, c] as const))("linha %i", (_i, c) => {

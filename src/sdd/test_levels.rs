@@ -269,8 +269,10 @@ pub fn install_needed(settings: &Settings, command: &str, dir: &Path) -> bool {
 
 /// Spec 126 T01: campos de teste (`test_command`, `full_test_command`) que começam com o próprio
 /// `install_command` (o mesmo texto, seguido de nada, de espaço ou de um operador do shell), ou
-/// seja, que repetem a instalação que o Nants já roda antes. Vazio sem `install_command`.
-pub fn repeated_install(settings: &Settings) -> Vec<(&'static str, String)> {
+/// seja, que repetem a instalação que o Nants já roda antes. Spec 127 T03: a mesma regra vale para
+/// os formatadores e as checagens (`formatters[<nome>].command`, `checks[<nome>].command`). Vazio
+/// sem `install_command`. Cada item é (campo, comando).
+pub fn repeated_install(settings: &Settings) -> Vec<(String, String)> {
     let Some(install) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
         return Vec::new();
     };
@@ -282,12 +284,24 @@ pub fn repeated_install(settings: &Settings) -> Vec<(&'static str, String)> {
     };
     let mut out = Vec::new();
     if starts_with_install(&settings.test_command) {
-        out.push(("test_command", settings.test_command.trim().to_string()));
+        out.push(("test_command".to_string(), settings.test_command.trim().to_string()));
     }
     if let Some(full) = settings.full_test_command.as_deref().filter(|f| starts_with_install(f)) {
-        out.push(("full_test_command", full.trim().to_string()));
+        out.push(("full_test_command".to_string(), full.trim().to_string()));
+    }
+    for f in settings.formatters.iter().filter(|f| starts_with_install(&f.command)) {
+        out.push((format!("formatters[{}].command", f.name), f.command.trim().to_string()));
+    }
+    for c in settings.checks.iter().filter(|c| starts_with_install(&c.command)) {
+        out.push((format!("checks[{}].command", c.name), c.command.trim().to_string()));
     }
     out
+}
+
+/// Spec 127 T03: o campo de [`repeated_install`] é de um comando de teste (e não de um formatador
+/// ou de uma checagem)?
+pub fn is_test_field(field: &str) -> bool {
+    matches!(field, "test_command" | "full_test_command")
 }
 
 /// O runner pode aceitar a rodada do Desenvolvedor deste comando no ambiente do projeto? No
@@ -440,13 +454,35 @@ mod tests {
     #[test]
     fn repeated_install_finds_test_commands_that_start_with_the_install() {
         let s = settings("test_command: \"npm ci --no-audit && npm run test:fast\"\nfull_test_command: \"npm run test:full\"\ninstall_command: \"npm ci --no-audit\"\n");
-        assert_eq!(repeated_install(&s), vec![("test_command", "npm ci --no-audit && npm run test:fast".to_string())]);
+        assert_eq!(repeated_install(&s), vec![("test_command".to_string(), "npm ci --no-audit && npm run test:fast".to_string())]);
         let both = settings("test_command: \"make deps; make fast\"\nfull_test_command: \" make deps \"\ninstall_command: \"make deps\"\n");
-        assert_eq!(repeated_install(&both).iter().map(|r| r.0).collect::<Vec<_>>(), vec!["test_command", "full_test_command"]);
+        assert_eq!(repeated_install(&both).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["test_command", "full_test_command"]);
         // Outro comando com o mesmo começo de palavra não conta; sem instalação, nada.
         let other = settings("test_command: \"make depsx && make test\"\ninstall_command: \"make deps\"\n");
         assert!(repeated_install(&other).is_empty());
         assert!(repeated_install(&settings("test_command: \"make deps && make test\"\n")).is_empty());
+    }
+
+    /// Spec 127 T03: formatadores e checagens seguem a mesma regra dos comandos de teste.
+    #[test]
+    fn repeated_install_also_finds_formatters_and_checks() {
+        let s = settings(
+            "test_command: \"make test\"\ninstall_command: \"npm ci --no-audit --no-fund\"\n\
+             formatters:\n- name: prettier\n  command: \"npm ci --no-audit --no-fund && npm exec -- prettier --write .\"\n\
+             - name: clean\n  command: \"npm exec -- prettier --write .\"\n\
+             checks:\n- name: lint\n  command: \" npm ci --no-audit --no-fund; npm run lint\"\n\
+             - name: typecheck\n  command: \"npm ci --no-audit --no-fundx && tsc\"\n",
+        );
+        let found = repeated_install(&s);
+        assert_eq!(
+            found,
+            vec![
+                ("formatters[prettier].command".to_string(), "npm ci --no-audit --no-fund && npm exec -- prettier --write .".to_string()),
+                ("checks[lint].command".to_string(), "npm ci --no-audit --no-fund; npm run lint".to_string()),
+            ]
+        );
+        assert!(found.iter().all(|(f, _)| !is_test_field(f)));
+        assert!(is_test_field("test_command") && is_test_field("full_test_command"));
     }
 
     #[test]

@@ -27,6 +27,25 @@ pub fn in_scope(path: &str, scope: &[String]) -> bool {
     scope.iter().any(|glob| glob_match_path(glob, path))
 }
 
+/// Pastas do Nants que formatadores e linters nunca alteram (spec 127 T03).
+pub const NANTS_DIRS: [&str; 3] = [".nants/", ".nants-outputs/", ".sdd/"];
+
+/// Spec 127 T03: a saída de um formatador que falhou mostra que ele tentou escrever numa pasta do
+/// Nants montada só para leitura (`read-only` ou `EROFS` e um caminho dentro de [`NANTS_DIRS`])?
+/// Devolve a pasta citada, sem relação com uma ferramenta específica.
+pub fn readonly_nants_dir(output: &str) -> Option<&'static str> {
+    let lower = output.to_lowercase();
+    if !lower.contains("read-only") && !lower.contains("erofs") {
+        return None;
+    }
+    NANTS_DIRS.into_iter().find(|dir| {
+        output.match_indices(dir).any(|(i, _)| {
+            // O caminho começa na pasta: início da saída ou depois de separador, aspas ou espaço.
+            output[..i].chars().next_back().is_none_or(|c| c == '/' || c == '\\' || c.is_whitespace() || "'\"`(".contains(c))
+        })
+    })
+}
+
 /// Aspas simples para o shell.
 pub fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -170,6 +189,18 @@ pub fn finalize(wt: &Path, scope: &[String], message: &str) -> Result<Vec<String
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn readonly_nants_dir_needs_the_error_and_a_path_inside_the_nants_folders() {
+        let test5 = "npm notice To update run: npm install -g npm@11.21.1\n[error] Unable to write file \".nants/compose.yaml\":\n[error] EROFS: read-only file system, open '/work/.nants/compose.yaml'";
+        assert_eq!(readonly_nants_dir(test5), Some(".nants/"));
+        assert_eq!(readonly_nants_dir("Read-only file system: /work/.nants-outputs/x.json"), Some(".nants-outputs/"));
+        assert_eq!(readonly_nants_dir("cannot write .sdd/specs/a.md: read-only"), Some(".sdd/"));
+        // Sem o erro de escrita, ou o erro fora das pastas do Nants, nada.
+        assert_eq!(readonly_nants_dir("[warn] .nants/compose.yaml\nexit 2"), None);
+        assert_eq!(readonly_nants_dir("EROFS: read-only file system, open '/work/src/a.ts'"), None);
+        assert_eq!(readonly_nants_dir("EROFS: read-only, open '/work/my.nants/a'"), None);
+    }
 
     fn fmt(name: &str, workdir: &str, paths: &[&str]) -> Formatter {
         Formatter {

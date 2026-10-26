@@ -1701,6 +1701,19 @@
   font-size: var(--fs-label);
 }
 
+/* Plano incompleto (spec 127 T01): spec em aprovação sem tarefas. */
+.nd-plan-incomplete {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--pill-amber-bg);
+  font-size: var(--fs-control);
+  line-height: 1.5;
+}
+
 /* --- Precisa de você --- */
 .nd-attention {
   position: absolute;

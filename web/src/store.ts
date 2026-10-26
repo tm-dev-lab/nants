@@ -1612,6 +1612,7 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
           origin: "history",
           ...(turn.turn_id === undefined ? {} : { turnId: turn.turn_id }),
           ...(turn.attachments === undefined || turn.attachments.length === 0 ? {} : { attachments: turn.attachments }),
+          ...codeFields(turn.code, turn.params),
         };
       });
       const chatLive = live.filter((m) => m.role !== "agent");

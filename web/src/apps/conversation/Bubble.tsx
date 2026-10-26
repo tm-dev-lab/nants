@@ -4,7 +4,8 @@
  * - Arquiteto e agentes: cartão (`ChatCard`) com cabeçalho (avatar, nome, tarefa, hora) e corpo em
  *   Markdown restrito; o Arquiteto com perguntas com botões e o rodapé de ação opcional; o Revisor
  *   com veredito, apontamentos, observações, capturas e a matriz de critérios;
- * - sistema: cartão com a faixa rosa; pedido aprovado pela aprovação automática: pílula de evento.
+ * - sistema: cartão com a faixa rosa (pelo `code`, no idioma ativo; o aviso da queda da conexão
+ *   com "Tentar de novo", spec 127 T01); pedido aprovado pela aprovação automática: pílula de evento.
  * Consecutivas da mesma fonte (agente, tarefa e tentativa) são agrupadas sem repetir o cabeçalho.
  */
 import { memo, type ReactNode } from "react";
@@ -97,9 +98,26 @@ interface BubbleProps {
   choices?: ChoicesState | undefined;
   /** Rodapé de ação do cartão (o "Plano pronto · Abrir" na última mensagem do Arquiteto). */
   footer?: ReactNode;
+  /**
+   * "Tentar de novo" do aviso da queda da conexão (spec 127 T01): só no aviso mais recente da
+   * Conversa. Ausente = sem botão.
+   */
+  onRetryTurn?: (() => void) | undefined;
+  retryDisabled?: boolean | undefined;
 }
 
-function BubbleView({ message, grouped, projectId, activeSpecId, onResend, resendDisabled = false, choices, footer }: BubbleProps) {
+function BubbleView({
+  message,
+  grouped,
+  projectId,
+  activeSpecId,
+  onResend,
+  resendDisabled = false,
+  choices,
+  footer,
+  onRetryTurn,
+  retryDisabled = false,
+}: BubbleProps) {
   // Assina o idioma: a bolha é `memo` e precisa re-renderizar na troca.
   const { t, lang } = useT();
   if (message.role === "user") {
@@ -128,9 +146,19 @@ function BubbleView({ message, grouped, projectId, activeSpecId, onResend, resen
         <div className="nd-chat-card-body nd-chat-card-row">
           <AgentAvatar kind="system" decorative size="sm" />
           <span className="nd-sr-only">{t("conversation.systemPrefix")}</span>
-          <p role="status" className="nd-system-text">
-            {message.text}
-          </p>
+          <div className="nd-stack-xs">
+            <p role="status" className="nd-system-text">
+              {systemMessageText(message)}
+            </p>
+            {onRetryTurn !== undefined ? (
+              <div className="nd-row">
+                <button type="button" className="nd-btn nd-btn-sm" data-retry-turn="" disabled={retryDisabled} onClick={onRetryTurn}>
+                  <Icon name="refresh" size={14} />
+                  {t("common.tryAgain")}
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
       </ChatCard>
     );

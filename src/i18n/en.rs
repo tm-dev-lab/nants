@@ -260,6 +260,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.install.skipped", "Install skipped: `{command}` did not run again, lockfiles unchanged since {since} ({locks})."),
     ("runner.install.skipped_no_date", "Install skipped: `{command}` did not run again, lockfiles unchanged since the last install in this folder ({locks})."),
     ("runner.install.repeated", "Warning: the {field} (`{command}`) starts with the install_command (`{install}`), which Nants already runs before the tests, so the install repeats on every round. The command was not changed; remove the install from the {field} in .sdd/settings.yaml."),
+    ("runner.install.repeated_step", "Warning: the {field} (`{command}`) starts with the install_command (`{install}`), which Nants already runs before the Developer session and before each check, so the install repeats on every run. The command was not changed; remove the install from the {field} in .sdd/settings.yaml."),
     ("runner.tests.missing_program", "Diagnosis: the command exited with code {code}, which means a missing or non-executable program. This is a dependency missing from the environment, not a code defect: do not change the code because of it; install the missing dependency or fix the environment."),
     ("runner.tests.missing_program_install", "Diagnosis: the command exited with code {code}, which means a missing or non-executable program. This is a dependency missing from the environment, not a code defect: do not change the code because of it. Nants runs the install_command (`{install}`) again before the next round; if it is still missing, the dependency must be declared in the project so that this install brings it."),
     ("runner.reuse.check_entry", "Attempt {attempt}: check `{command}` reused from the Developer's run on the same tree ({tree}); it runs again at integration"),
@@ -290,6 +291,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.format.applied.other", "automatic formatting: {count} files ({names})"),
     ("runner.format.timed_out", "timed out"),
     ("runner.format.exit", "exit {code}: {output}"),
+    ("runner.format.readonly_nants", "the {name} formatter tried to change `{dir}`, which is read-only; configure it to ignore the Nants folders (`.nants/`, `.nants-outputs/`, `.sdd/`) with the tool's own ignore file or explicit paths."),
     ("runner.block.docker", "docker environment: {reason}"),
     ("runner.block.external_edit", "{path} modified externally"),
     ("runner.block.tests_failed.one", "test_command failed {count} time in the same attempt"),
@@ -354,6 +356,14 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ),
     ("system.final.unavailable", "Final verification unavailable; completing without it."),
     (
+        "system.chat.connection_lost",
+        "The connection to the provider dropped before the Architect finished this turn, and nothing was saved. Use Try again to have it continue where it stopped.",
+    ),
+    (
+        "system.chat.connection_lost_saved",
+        "The connection to the provider dropped before the Architect finished this turn. What it had already written was saved in spec {spec}, but the plan may be incomplete. Use Try again to have it continue where it stopped.",
+    ),
+    (
         "system.final.still_unmet",
         "Warning: the final verification still points to unmet criteria after the fix round; the spec will be completed anyway.",
     ),
@@ -388,6 +398,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     (
         "runner.review.unchanged_files_demoted",
         "{summary} (new findings in files that did not change since the previous review became observations.)",
+    ),
+    (
+        "runner.review.late_new_demoted",
+        "{summary} (new MEDIUM or LOW findings from review {review} on became observations and go to the final verification.)",
     ),
     (
         "runner.review.untouched_code_demoted",
@@ -666,6 +680,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("provider.kind.throttled", "provider at its limit"),
     ("provider.kind.image_unsupported", "image generation unavailable"),
     ("provider.kind.image_unreadable", "the provider did not return a readable image (it may have charged)"),
+    ("provider.kind.transport", "the connection dropped mid-response"),
     ("provider.kind.http_code", "code"),
     ("serverError.report_in_progress", "Generating the Architect's final report; try again shortly."),
     ("serverError.report_not_found", "report not found"),

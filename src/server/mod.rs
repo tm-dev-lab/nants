@@ -149,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects/:id/architecture", get(survey::get_architecture))
         .route("/api/projects/:id/architecture/survey", post(survey::post_survey))
         .route("/api/projects/:id/chat", get(chat::get_chat).post(chat::post_chat))
+        .route("/api/projects/:id/chat/continue", post(chat::post_chat_continue))
         // Limite de corpo próprio (5 MiB) só nesta rota; o global continua em `MAX_BODY_BYTES`.
         .route(
             "/api/projects/:id/chat/attachments",

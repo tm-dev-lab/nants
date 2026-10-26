@@ -178,6 +178,8 @@ const KNOWN_REASONS: ReadonlySet<string> = new Set([
   "docker_unavailable",
   "architect_turn_active",
   "plan_without_tasks",
+  // 502 do chat com a queda da conexão gravada no histórico (spec 127 T01).
+  "connection_lost",
   "prereq_missing",
 ]);
 
@@ -822,9 +824,18 @@ const TURN_ID_PATTERN = /^[0-9a-f]{1,64}$/;
 /** Turno válido do histórico; `null` descarta só o item. Um `turn_id` inválido é removido, não o turno. */
 function toChatHistoryTurn(value: unknown): ChatHistoryTurn | null {
   if (!isRecord(value)) return null;
-  if (!((value.role === "user" || value.role === "architect") && typeof value.text === "string")) return null;
+  const role = value.role;
+  if (!((role === "user" || role === "architect" || role === "system") && typeof value.text === "string")) return null;
   if (typeof value.ts !== "number" || !Number.isFinite(value.ts)) return null;
-  const turn: ChatHistoryTurn = { role: value.role, text: value.text, ts: value.ts };
+  const turn: ChatHistoryTurn = { role, text: value.text, ts: value.ts };
+  // Aviso do sistema (spec 127 T01): `code` no formato fixo e `params` saneados.
+  if (role === "system") {
+    const coded = parseCoded(value.code, value.params);
+    if (coded !== undefined) {
+      turn.code = coded.code;
+      turn.params = coded.params;
+    }
+  }
   if (typeof value.turn_id === "string" && TURN_ID_PATTERN.test(value.turn_id)) {
     turn.turn_id = value.turn_id;
   }
@@ -1007,6 +1018,43 @@ export function getToolActions(projectId: string, specId: string, opts: ToolActi
 }
 
 /**
+ * Falha HTTP de um turno do Arquiteto (`POST /chat` e `POST /chat/continue`).
+ * 504 `code: "chat_timeout"`: o servidor cancelou o turno (chat.rs). Kind "timeout" com status 504.
+ * 502 com causa fixa do provedor (chat.rs `architect_error`): mensagem específica + código; com
+ * `reason: "connection_lost"` (spec 127 T01), o aviso da queda já está gravado no histórico.
+ */
+function chatHttpError(status: number, body: unknown): ApiFailure | null {
+  if (status === 504 && serverErrorCode(body) === "chat_timeout") {
+    const saved = serverReason(body) === "draft_saved";
+    return { kind: "timeout", status: 504, ...clientReserve(TIMEOUT_KEY), ...(saved ? { reason: "draft_saved" } : {}) };
+  }
+  // 502 do chat é sempre falha do provedor: código desconhecido (ou legado) vira resposta
+  // inesperada, nunca "falha interna do servidor".
+  // `detail` (spec 088) só vale com código do vocabulário e passa por `providerFailureDetail`.
+  // Spec 119: o motivo vem dos `params` neutros (`kind`, `provider_code`) e sai no idioma ativo;
+  // um `detail` em pt-BR (servidor antigo) é lido de volta pelo dicionário.
+  if (status === 502) {
+    const providerCode = providerCodeOf(body);
+    const reason = providerCode !== null ? providerReasonOf(body) : null;
+    const legacy = providerCode !== null && reason === null && isRecord(body) ? providerFailureDetail(body.detail) : null;
+    const providerDetail = reason?.text ?? (legacy === null ? null : localizeProviderDetail(legacy));
+    return {
+      kind: "http",
+      status: 502,
+      message:
+        providerFailureMessage(providerCode ?? "provider_bad_response", null, providerDetail) ??
+        SERVER_ERROR_MESSAGE,
+      ...(providerCode === null ? {} : { providerCode }),
+      ...(legacy === null ? {} : { providerDetail: legacy }),
+      ...(reason === null ? {} : { providerKind: reason.kind }),
+      ...(reason?.code === undefined ? {} : { providerKindCode: reason.code }),
+      ...(serverReason(body) === "connection_lost" ? { reason: "connection_lost" } : {}),
+    };
+  }
+  return null;
+}
+
+/**
  * POST /api/projects/:id/chat com `{message}`. `internal: true` marca mensagem do sistema
  * (ex.: pedido automático ao Arquiteto): o servidor a omite do histórico exibido. `attachments`
  * (até 4 nomes devolvidos pelo upload) só vai no corpo quando não vazio.
@@ -1025,37 +1073,22 @@ export function postChat(
     body: JSON.stringify(body),
     timeoutMs: CHAT_TIMEOUT_MS,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    // 504 `code: "chat_timeout"`: o servidor cancelou o turno (chat.rs). Kind "timeout" com status 504.
-    // 502 com causa fixa do provedor (chat.rs `architect_error`): mensagem específica + código.
-    onHttpError: (status, body) => {
-      if (status === 504 && serverErrorCode(body) === "chat_timeout") {
-        const saved = serverReason(body) === "draft_saved";
-        return { kind: "timeout", status: 504, ...clientReserve(TIMEOUT_KEY), ...(saved ? { reason: "draft_saved" } : {}) };
-      }
-      // 502 do chat é sempre falha do provedor: código desconhecido (ou legado) vira resposta
-      // inesperada, nunca "falha interna do servidor".
-      // `detail` (spec 088) só vale com código do vocabulário e passa por `providerFailureDetail`.
-      // Spec 119: o motivo vem dos `params` neutros (`kind`, `provider_code`) e sai no idioma ativo;
-      // um `detail` em pt-BR (servidor antigo) é lido de volta pelo dicionário.
-      if (status === 502) {
-        const providerCode = providerCodeOf(body);
-        const reason = providerCode !== null ? providerReasonOf(body) : null;
-        const legacy = providerCode !== null && reason === null && isRecord(body) ? providerFailureDetail(body.detail) : null;
-        const providerDetail = reason?.text ?? (legacy === null ? null : localizeProviderDetail(legacy));
-        return {
-          kind: "http",
-          status: 502,
-          message:
-            providerFailureMessage(providerCode ?? "provider_bad_response", null, providerDetail) ??
-            SERVER_ERROR_MESSAGE,
-          ...(providerCode === null ? {} : { providerCode }),
-          ...(legacy === null ? {} : { providerDetail: legacy }),
-          ...(reason === null ? {} : { providerKind: reason.kind }),
-          ...(reason?.code === undefined ? {} : { providerKindCode: reason.code }),
-        };
-      }
-      return null;
-    },
+    onHttpError: chatHttpError,
+  }).then((r) => asObject<ChatReply>(r));
+}
+
+/**
+ * POST /api/projects/:id/chat/continue (spec 127 T01): turno interno "continue de onde parou",
+ * sem texto do usuário. Com `specId`, pede ao Arquiteto para terminar o plano sem tarefas dessa
+ * spec. Mesma resposta e mesmas falhas do `postChat`.
+ */
+export function postChatContinue(projectId: string, specId: string | null = null): Promise<ApiResult<ChatReply>> {
+  return request<ChatReply>({
+    method: "POST",
+    path: `/api/projects/${enc(projectId)}/chat/continue`,
+    body: JSON.stringify(specId === null ? {} : { spec_id: specId }),
+    timeoutMs: CHAT_TIMEOUT_MS,
+    onHttpError: chatHttpError,
   }).then((r) => asObject<ChatReply>(r));
 }
 

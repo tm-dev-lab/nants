@@ -831,7 +831,10 @@ impl LlmClient {
     /// Resposta ruim que vale repetir ([`BadReason::is_retryable`], spec 088) segue outra regra:
     /// até [`BAD_RESPONSE_RETRIES`] novas tentativas com as esperas iniciais de `retry_delays`,
     /// mesmo com `final_now()` verdadeiro; `on_notice` recebe o aviso antes de cada uma.
-    /// Esgotadas, devolve o erro da última falha.
+    /// Esgotadas, devolve o erro da última falha. A conexão que caiu depois de algo já entregue
+    /// (`Transport` com `final_now()` verdadeiro, spec 127 T01) conta como resposta ruim
+    /// (`transport`): o mesmo pedido é reenviado, com a mesma espera e o mesmo limite. Nada da
+    /// resposta cortada foi executado (as ferramentas só rodam com a resposta completa).
     ///
     /// Provedor no limite (HTTP 429 ou `throttled`, spec 089) segue o cronograma `throttle_delays`,
     /// também com `final_now()` verdadeiro: o `Retry-After` (teto [`THROTTLE_RETRY_AFTER_CAP`])
@@ -877,13 +880,18 @@ impl LlmClient {
                 first = Some(failed.err);
                 continue;
             }
-            if let LlmError::Parse(reason) = &failed.err {
+            let bad = match &failed.err {
+                LlmError::Parse(reason) => Some(*reason),
+                LlmError::Transport(_) if final_now() => Some(BadReason::new(BadKind::Transport)),
+                _ => None,
+            };
+            if let Some(reason) = bad {
                 let delay = self.retry_delays.get(bad_retries).copied();
                 let Some(delay) = delay.filter(|_| reason.is_retryable() && bad_retries < BAD_RESPONSE_RETRIES) else {
                     return Err(failed.err);
                 };
                 bad_retries += 1;
-                on_notice(retry_notice(reason, bad_retries));
+                on_notice(retry_notice(&reason, bad_retries));
                 if self.pause(delay, cancel).await {
                     return Err(failed.err);
                 }
@@ -1250,9 +1258,9 @@ impl LlmClient {
     /// devolve o mesmo objeto final do modo não-streaming. Recusas do provedor a `stream`,
     /// `stream_options` ou `summary` (HTTP 400) são repetidas sem o campo (cada um uma vez);
     /// resposta JSON comum (não-SSE) é aceita. Falhas transitórias são repetidas como em `chat`,
-    /// mas só enquanto nenhum delta foi entregue; depois do primeiro delta o erro sobe. Resposta
-    /// ruim que vale repetir (spec 088) e provedor no limite (spec 089) repetem mesmo depois de
-    /// deltas: antes (e, no limite, durante a espera), `on_delta` recebe [`StreamDelta::Retry`]
+    /// mas só enquanto nenhum delta foi entregue; depois do primeiro delta o erro sobe, menos a
+    /// conexão que caiu no meio (spec 127 T01). Resposta ruim que vale repetir (spec 088), a
+    /// conexão que caiu no meio e provedor no limite (spec 089) repetem mesmo depois de deltas: antes (e, no limite, durante a espera), `on_delta` recebe [`StreamDelta::Retry`]
     /// com o aviso. A espera do limitador de ritmo ([`Self::paced`]) avisa pelo mesmo caminho.
     pub async fn chat_stream(
         &self,

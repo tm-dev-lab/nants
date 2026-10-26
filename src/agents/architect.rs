@@ -88,6 +88,19 @@ pub type AttachmentLoader<'a> = &'a (dyn Fn(&str) -> Option<ImageInput> + Sync);
 pub enum TurnRole {
     User,
     Architect,
+    /// Aviso do sistema na Conversa (spec 127 T01: a conexão caiu no meio do turno). Mostrado ao
+    /// usuário pelo `notice`; não vai ao modelo.
+    System,
+}
+
+/// Aviso do sistema gravado num turno [`TurnRole::System`]: `code` estável e `params` neutros; a
+/// tela traduz pelo dicionário (`system.<code>`), e o `text` do turno é a reserva no idioma do
+/// projeto.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnNotice {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Turno do histórico de chat (uma linha JSON em `.sdd/specs/.chat.jsonl`).
@@ -110,6 +123,9 @@ pub struct ChatTurn {
     /// Linhas antigas não têm o campo e carregam vazias; omitido quando vazio.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Aviso do sistema (só em [`TurnRole::System`], spec 127 T01). Omitido quando ausente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<TurnNotice>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -961,8 +977,10 @@ fn build_messages(
     lang: crate::i18n::Lang,
 ) -> Vec<ChatMessage> {
     let mut messages = vec![ChatMessage::text(ChatRole::System, architect_system_for(lang))];
-    let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
-    let window = &history[start..];
+    // Avisos do sistema (spec 127 T01) não vão ao modelo nem ocupam vaga da janela.
+    let real: Vec<&ChatTurn> = history.iter().filter(|t| t.role != TurnRole::System).collect();
+    let start = real.len().saturating_sub(MAX_HISTORY_TURNS);
+    let window = &real[start..];
     // As imagens anteriores em ordem; só as `MAX_HISTORY_IMAGES` últimas vão como imagem.
     let total: usize = window
         .iter()
@@ -981,6 +999,8 @@ fn build_messages(
             }
             TurnRole::User => messages.push(ChatMessage::text(ChatRole::User, text)),
             TurnRole::Architect => messages.push(ChatMessage::text(ChatRole::Assistant, text)),
+            // O aviso é para a pessoa; o modelo vê o estado do projeto e o pedido de continuação.
+            TurnRole::System => {}
         }
     }
     // Spec 122 T05: o estado muda a cada turno (inclusive a data e a hora), então vai no fim, logo
@@ -1174,6 +1194,7 @@ mod tests {
             turn_id: None,
             internal: false,
             attachments: Vec::new(),
+            notice: None,
         }
     }
 
@@ -1366,6 +1387,30 @@ mod tests {
         assert_eq!(last_history.role, ChatRole::Assistant);
         assert!(last_history.content.len() <= MAX_TURN_BYTES);
         assert!(last_history.content.chars().all(|c| c == 'á'));
+    }
+
+    /// Spec 127 T01: avisos do sistema não vão ao modelo nem tiram vaga da janela: com 40 turnos
+    /// reais e avisos no meio e no fim, o pedido leva os 40 reais, inclusive o mais antigo.
+    #[tokio::test]
+    async fn system_notices_take_no_slot_in_the_history_window() {
+        let root = tmp_root("arch-history-system");
+        let mut history: Vec<ChatTurn> = Vec::new();
+        for i in 0..MAX_HISTORY_TURNS {
+            history.push(turn(if i % 2 == 0 { TurnRole::User } else { TurnRole::Architect }, &format!("turno {i}")));
+            if i % 10 == 5 {
+                history.push(turn(TurnRole::System, "aviso da queda"));
+            }
+        }
+        history.push(turn(TurnRole::System, "aviso da queda"));
+        let backend = Scripted::new(vec![text("ok")]);
+        architect(backend.clone())
+            .reply(&root, &history, "continue", SNAPSHOT)
+            .await
+            .expect("resposta");
+        let msgs = &backend.requests()[0].messages;
+        assert_eq!(msgs.len(), 1 + 1 + MAX_HISTORY_TURNS + 1);
+        assert_eq!(msgs[1].content, "turno 0", "o turno real mais antigo continua na janela");
+        assert!(msgs.iter().all(|m| !m.content.contains("aviso da queda")));
     }
 
     /// Turno com tantas ações que o histórico passa do teto e é cortado: o pedido seguinte ao corte

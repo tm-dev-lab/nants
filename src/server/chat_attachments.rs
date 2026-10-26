@@ -344,6 +344,7 @@ mod sweep_tests {
             turn_id: None,
             internal: false,
             attachments: attachments.iter().map(|s| s.to_string()).collect(),
+            notice: None,
         }
     }
 

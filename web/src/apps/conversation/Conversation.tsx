@@ -27,7 +27,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
-import { postChat, type ApiFailure } from "../../api/client";
+import { postChat, postChatContinue, type ApiFailure } from "../../api/client";
 import type { SpecView } from "../../api/types";
 import { chatFailureMessage } from "../../chatFailure";
 import { loadChatHistory } from "../../chatHistory";
@@ -89,6 +89,14 @@ function isConnectionLost(error: ApiFailure): boolean {
 
 function isTurnBusy(error: ApiFailure): boolean {
   return error.status === 409 && error.reason === undefined;
+}
+
+/** Avisos da queda da conexão no meio do turno (spec 127 T01): ganham "Tentar de novo". */
+const CONNECTION_LOST_CODES: ReadonlySet<string> = new Set(["chat.connection_lost", "chat.connection_lost_saved"]);
+
+/** Turno que caiu com o aviso já gravado no histórico: a tela o lê de lá, sem repetir aqui. */
+function noticeRecorded(error: ApiFailure): boolean {
+  return error.reason === "connection_lost";
 }
 
 interface PendingSend {
@@ -245,6 +253,12 @@ export function Conversation({
   const entries = permissionEntries(pending, resolved, (entry) => entry.taskId === null || taskIds.has(entry.taskId));
   const timeline = interleave(shown, entries);
   const lastArchitectId = [...shown].reverse().find((m) => m.role === "architect")?.id ?? null;
+  // "Tentar de novo" só no aviso da queda que ainda é a última mensagem do chat (spec 127 T01).
+  const lastChat = [...shown].reverse().find((m) => m.role !== "agent");
+  const retryNoticeId =
+    lastChat !== undefined && lastChat.role === "system" && lastChat.code !== undefined && CONNECTION_LOST_CODES.has(lastChat.code)
+      ? lastChat.id
+      : null;
 
   const reportScope = `${projectId}:${specId ?? ""}`;
   const [knownReport, setKnownReport] = useState<{ scope: string; at: number } | null>(null);
@@ -300,6 +314,10 @@ export function Conversation({
     void refreshProjectState(projectId);
     if (!result.ok) {
       if (lost || isTurnBusy(result.error)) return;
+      if (noticeRecorded(result.error)) {
+        void loadChatHistory(projectId);
+        return;
+      }
       if (result.error.status === 409 && result.error.reason === "report_in_progress") {
         appStore.setUserMessageUnsent(projectId, messageId, translateNow("chat.reportBusy"));
         return;
@@ -316,6 +334,31 @@ export function Conversation({
   }
   const submitRef = useRef(submit);
   submitRef.current = submit;
+
+  /**
+   * "Tentar de novo" do aviso da queda (spec 127 T01): o servidor manda ao Arquiteto a
+   * continuação interna ("continue de onde parou"); nada é digitado nem aparece como mensagem.
+   */
+  async function continueTurn(): Promise<void> {
+    if (sending || chatBlocked) return;
+    setTurnEndedWhileSending(false);
+    setSending(true);
+    const result = await postChatContinue(projectId);
+    setSending(false);
+    void refreshProjectState(projectId);
+    if (!result.ok) {
+      // Queda do POST: o turno segue no servidor e o fim dele recarrega o histórico.
+      if (isConnectionLost(result.error)) return;
+      if (noticeRecorded(result.error)) {
+        void loadChatHistory(projectId);
+        return;
+      }
+      appStore.appendMessage(projectId, { role: "system", text: chatFailureMessage(result.error, architectWire) });
+      return;
+    }
+    appStore.showArchitectReply(projectId, result.data.reply, result.data.turn_id);
+    if (result.data.draft_updated) await onDraftUpdated();
+  }
 
   // Pedidos de outras janelas (o "Pedir correção ao Arquiteto" do Plano), um por vez.
   const queued = useChatRequestCount(projectId);
@@ -450,6 +493,8 @@ export function Conversation({
             if (!chatBlocked) void submit(m.text, m.id, false, m.attachments ?? []);
           }}
           resendDisabled={sending || chatBlocked}
+          onRetryTurn={message.id === retryNoticeId ? () => void continueTurn() : undefined}
+          retryDisabled={sending || chatBlocked || thinking}
           choices={
             message.role === "architect"
               ? {

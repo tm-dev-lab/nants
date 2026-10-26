@@ -269,6 +269,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.install.skipped", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde {since} ({locks})."),
     ("runner.install.skipped_no_date", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde a última instalação nesta pasta ({locks})."),
     ("runner.install.repeated", "Aviso: o {field} (`{command}`) começa com o install_command (`{install}`), que o Nants já roda antes dos testes, então a instalação se repete a cada rodada. O comando não foi alterado; tire a instalação do {field} em .sdd/settings.yaml."),
+    ("runner.install.repeated_step", "Aviso: o {field} (`{command}`) começa com o install_command (`{install}`), que o Nants já roda antes da sessão do Desenvolvedor e de cada checagem, então a instalação se repete a cada execução. O comando não foi alterado; tire a instalação do {field} em .sdd/settings.yaml."),
     ("runner.tests.missing_program", "Diagnóstico: o comando saiu com o código {code}, que indica programa ausente ou não executável. É dependência ausente no ambiente, não defeito de código: não mude o código por causa disso; instale a dependência que falta ou ajuste o ambiente."),
     ("runner.tests.missing_program_install", "Diagnóstico: o comando saiu com o código {code}, que indica programa ausente ou não executável. É dependência ausente no ambiente, não defeito de código: não mude o código por causa disso. O Nants roda de novo o install_command (`{install}`) antes da próxima rodada; se a falta continuar, a dependência precisa estar declarada no projeto para essa instalação trazê-la."),
     ("runner.reuse.check_entry", "Tentativa {attempt}: checagem `{command}` reaproveitada da rodada do Desenvolvedor sobre a mesma árvore ({tree}); roda de novo na integração"),
@@ -299,6 +300,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.format.applied.other", "formatação automática: {count} arquivos ({names})"),
     ("runner.format.timed_out", "tempo esgotado"),
     ("runner.format.exit", "saída {code}: {output}"),
+    ("runner.format.readonly_nants", "o formatador {name} tentou alterar `{dir}`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`) pelo arquivo de ignorar da própria ferramenta ou com caminhos explícitos."),
     // Runner: motivos de bloqueio gravados em `next_action` (spec 114 T02), no idioma do projeto;
     // o código estável vai em `next_action_code` (ver `agents::runner::BLOCK_CODES`).
     ("runner.block.docker", "ambiente docker: {reason}"),
@@ -370,6 +372,14 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ),
     ("system.final.unavailable", "Verificação final indisponível; concluindo sem ela."),
     (
+        "system.chat.connection_lost",
+        "A conexão com o provedor caiu antes de o Arquiteto terminar este turno, e nada foi gravado. Use Tentar de novo para ele continuar de onde parou.",
+    ),
+    (
+        "system.chat.connection_lost_saved",
+        "A conexão com o provedor caiu antes de o Arquiteto terminar este turno. O que ele já tinha gravado ficou salvo na spec {spec}, mas o plano pode estar incompleto. Use Tentar de novo para ele continuar de onde parou.",
+    ),
+    (
         "system.final.still_unmet",
         "AVISO: a verificação final ainda aponta critérios não atendidos após a rodada de correção; a spec será concluída assim mesmo.",
     ),
@@ -405,6 +415,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     (
         "runner.review.unchanged_files_demoted",
         "{summary} (findings novos em arquivos que não mudaram desde a revisão anterior viraram observações.)",
+    ),
+    (
+        "runner.review.late_new_demoted",
+        "{summary} (apontamentos MEDIUM ou LOW novos a partir da revisão {review} viraram observações e seguem para a verificação final.)",
     ),
     (
         "runner.review.untouched_code_demoted",
@@ -684,6 +698,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("provider.kind.throttled", "provedor no limite"),
     ("provider.kind.image_unsupported", "geração de imagens indisponível"),
     ("provider.kind.image_unreadable", "o provedor não devolveu uma imagem legível (pode ter cobrado)"),
+    ("provider.kind.transport", "a conexão caiu no meio da resposta"),
     ("provider.kind.http_code", "código"),
     ("serverError.report_in_progress", "Gerando o relatório final do Arquiteto; tente de novo em instantes."),
     ("serverError.report_not_found", "relatório não encontrado"),

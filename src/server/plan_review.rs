@@ -78,6 +78,9 @@ pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_PENDING: &str = "pending";
 /// Versão atual sem resultado depois de [`PENDING_WINDOW`]: a aprovação libera com aviso.
 pub const STATUS_STALE: &str = "stale";
+/// Spec em aprovação sem nenhuma tarefa (spec 127 T01: o turno que escrevia o plano caiu): a
+/// revisão não roda e a UI oferece pedir ao Arquiteto para terminar. A aprovação segue bloqueada.
+pub const STATUS_INCOMPLETE: &str = "incomplete";
 /// Quanto a UI espera a revisão da versão atual antes de liberar a aprovação.
 pub const PENDING_WINDOW: Duration = Duration::from_secs(180);
 /// `detail` do `unavailable` quando a revisão estourou o tempo ou a resposta não era o JSON.
@@ -437,7 +440,8 @@ fn awaiting(root: &Path, spec_id: &str) -> bool {
 /// inseguro (symlink na cadeia, ou não é arquivo regular) devolve `false` (spec 087 T06): o
 /// resultado nunca seria gravado, e cada turno pagaria uma revisão descartada.
 fn needs_review(root: &Path, spec_id: &str) -> bool {
-    if !record_path_safe(root, spec_id) {
+    // Plano sem tarefas (spec 127 T01): nada a revisar; a vista diz `incomplete`.
+    if !record_path_safe(root, spec_id) || task_names(root, spec_id).is_empty() {
         return false;
     }
     match plan_signature(root, spec_id) {
@@ -688,9 +692,13 @@ pub(super) fn write_local_file(root: &Path, rel: &str, file_name: &str, body: &s
         .ok()
 }
 
-/// `plan_review` de uma spec aguardando aprovação: `running` enquanto a revisão roda; senão o
+/// `plan_review` de uma spec aguardando aprovação: `incomplete` sem nenhuma tarefa (spec 127
+/// T01); `running` enquanto a revisão roda; senão o
 /// resultado gravado, só se a assinatura bate com o conteúdo atual (redigido de novo na leitura).
 pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<PlanReviewView> {
+    if task_names(root, spec_id).is_empty() {
+        return Some(PlanReviewView { status: STATUS_INCOMPLETE, at: None, issues: Vec::new() });
+    }
     if is_running(root, spec_id) {
         return Some(PlanReviewView { status: STATUS_RUNNING, at: None, issues: Vec::new() });
     }

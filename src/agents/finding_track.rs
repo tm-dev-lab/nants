@@ -171,6 +171,23 @@ pub fn by_recurrence(findings: &mut [Finding]) {
     });
 }
 
+/// Número da próxima revisão da tarefa: a seguinte à maior `last_review` do registro (1 sem
+/// registro). É o mesmo número que [`track`] grava; não zera nas recuperações.
+pub fn next_review(registry: &[Finding]) -> u32 {
+    registry.iter().map(|f| f.last_review).max().unwrap_or(0) + 1
+}
+
+/// Spec 127 T02: o apontamento é novo para a tarefa, nada parecido no registro (aberto ou
+/// resolvido). Não é novo: o id de um apontamento do registro reutilizado sem `"status": "new"`, ou um
+/// apontamento parecido com um do registro ([`similar`]: mesmo arquivo, linha ignorada, e títulos
+/// próximos), inclusive o resolvido que volta com id novo e outra redação. Na dúvida, não é novo.
+pub fn is_new(registry: &[Finding], f: &Finding) -> bool {
+    let id = f.id.trim();
+    !registry
+        .iter()
+        .any(|e| (f.state != Some(FindingState::New) && !id.is_empty() && e.id == id) || similar(e, f))
+}
+
 /// Aplica a revisão (`current`, os bloqueantes depois da convergência) ao registro. `attempt` é a
 /// tentativa que está sendo revisada; a revisão é a seguinte à maior `last_review` do registro.
 pub fn track(registry: &[Finding], previous_open: &[Finding], current: Vec<Finding>, attempt: u32) -> Tracked {
@@ -190,7 +207,7 @@ pub fn track_with_observations(
     attempt: u32,
 ) -> Tracked {
     let mut reg = seed(registry, previous_open);
-    let review = reg.iter().map(|f| f.last_review).max().unwrap_or(0) + 1;
+    let review = next_review(&reg);
     let reserved: HashSet<String> =
         observations.iter().map(|f| f.id.trim().to_string()).filter(|id| !id.is_empty()).collect();
     let mut next = reg
@@ -342,6 +359,29 @@ mod tests {
         let mut waived = old;
         waived.arbitration = Some(crate::sdd::Arbitration { decision: crate::sdd::ArbitrationDecision::Manual, reason: String::new(), review: 2 });
         assert!(returned_like_resolved(&[waived, back]).is_empty());
+    }
+
+    /// Spec 127 T02: novo é o que o registro nunca viu; id reutilizado ou o mesmo problema não é.
+    #[test]
+    fn is_new_ignores_reused_ids_and_same_problems() {
+        let r1 = track(&[], &[], vec![f("F-01", "src/a.rs:1", "falta X")], 1);
+        let r2 = track(&r1.registry, &r1.open, vec![f("F-02", "src/b.rs:2", "falta Y")], 2);
+        assert_eq!(next_review(&[]), 1);
+        assert_eq!(next_review(&r2.registry), 3);
+        // F-01 está resolvido: reutilizar o id (sem "new") ou repetir o problema não é novo.
+        assert!(!is_new(&r2.registry, &f("F-01", "src/z.rs:9", "outro texto")));
+        assert!(!is_new(&r2.registry, &with_state(f("F-09", "src/a.rs:1", "falta X"), FindingState::New)));
+        assert!(!is_new(&r2.registry, &with_state(f("F-02", "src/b.rs:2", "ainda falta Y"), FindingState::Open)));
+        // Declarado novo com um id antigo, mas outro problema: é novo.
+        assert!(is_new(&r2.registry, &with_state(f("F-01", "src/c.rs:3", "terceiro problema"), FindingState::New)));
+        assert!(is_new(&r2.registry, &f("F-03", "src/c.rs:3", "terceiro problema")));
+        // Resolvido que volta com "new", id novo, outra linha do mesmo arquivo e título reescrito: não é novo.
+        let r1 = track(&[], &[], vec![f("F-01", "tests/api/plays.test.ts:65", "Falha de validação não confere o evento SSE. Detalhe.")], 1);
+        let r2 = track(&r1.registry, &r1.open, vec![], 2);
+        let back = with_state(f("F-07", "tests/api/plays.test.ts:120", "A validação que falha não confere o evento SSE"), FindingState::New);
+        assert!(!is_new(&r2.registry, &back));
+        // No mesmo arquivo, mas outro assunto: é novo.
+        assert!(is_new(&r2.registry, &with_state(f("F-08", "tests/api/plays.test.ts:200", "Ordem do histórico sem desempate"), FindingState::New)));
     }
 
     #[test]

@@ -660,3 +660,34 @@ fn split_request_lists_each_too_large_task() {
     let json = serde_json::to_string(&record).expect("json");
     assert!(!json.contains("split_requested"), "sem a marca, o arquivo fica como antes: {json}");
 }
+
+/// Spec 127 T01: a spec em aprovação sem nenhuma tarefa (o turno que escrevia o plano caiu) não é
+/// revisada e não fica "demorando": a vista diz `incomplete` logo, com ou sem Revisor e com
+/// qualquer relógio. Gravada a primeira tarefa, volta o fluxo de sempre.
+#[tokio::test]
+async fn plan_without_tasks_is_incomplete_and_never_reviewed() {
+    let root = tmp("incomplete");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    fs::remove_file(root.join(format!(".sdd/specs/{SPEC}/tasks/T01.md"))).expect("sem tarefas");
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let scripted = Scripted::new(vec![text(r#"{"issues": []}"#)]);
+    let st = state(&root, true, scripted.clone());
+    assert_eq!(run(&st, &root).await, 0, "plano sem tarefas não dispara a revisão");
+    assert!(scripted.requests().is_empty());
+    assert!(read_record(&root, SPEC).is_none());
+    let secrets = SecretSet::default();
+    let now = SystemTime::now();
+    for reviewer in [true, false] {
+        for later in [0u64, 181, 3600] {
+            let view = view_at(&root, SPEC, &secrets, reviewer, now + Duration::from_secs(later)).expect("incomplete");
+            assert_eq!(view.status, STATUS_INCOMPLETE, "revisor {reviewer}, +{later} s");
+            assert!(view.issues.is_empty() && view.at.is_none());
+        }
+    }
+    assert_eq!(view(&root, SPEC, &secrets).expect("incomplete").status, STATUS_INCOMPLETE);
+
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T01.md")), EXAMPLE_TASK_MD).expect("tarefa");
+    assert_eq!(view_at(&root, SPEC, &secrets, true, SystemTime::now()).expect("pending").status, STATUS_PENDING);
+    assert_eq!(run(&st, &root).await, 1, "com tarefa, a revisão volta a rodar");
+    assert_eq!(record(&root).status, STATUS_OK);
+}

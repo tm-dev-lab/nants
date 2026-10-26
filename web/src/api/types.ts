@@ -561,7 +561,8 @@ export interface ChatReply {
 
 /** Turno do histórico do chat (`GET /api/projects/:id/chat`), texto já redigido pelo servidor. */
 export interface ChatHistoryTurn {
-  role: "user" | "architect";
+  /** `system`: aviso do sistema gravado no histórico (spec 127 T01: a conexão caiu no turno). */
+  role: "user" | "architect" | "system";
   text: string;
   /** Segundos desde a época Unix. */
   ts: number;
@@ -569,6 +570,9 @@ export interface ChatHistoryTurn {
   turn_id?: string;
   /** Imagens anexadas pelo usuário (spec 082 T05); ausente ou vazio sem imagens. */
   attachments?: string[];
+  /** Aviso do sistema: `code` estável (`system.<code>` no dicionário) e `params`. */
+  code?: string;
+  params?: Record<string, string | number>;
 }
 
 /** Resposta de `POST /api/projects/:id/chat/attachments` (201). */

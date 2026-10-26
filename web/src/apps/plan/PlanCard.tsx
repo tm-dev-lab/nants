@@ -16,13 +16,17 @@
  * - tarefa grande demais (spec 126 T03): o `too_large` que restou depois da divisão pelo Arquiteto
  *   vem primeiro na faixa, com a tarefa em destaque e a sugestão de divisão, e a tarefa ganha a
  *   marca "grande demais" na lista; a aprovação continua possível;
+ * - plano incompleto (spec 127 T01, `plan_review.status === "incomplete"`: a spec em aprovação sem
+ *   nenhuma tarefa): o aviso, "Aprovar" desabilitado e "Pedir ao Arquiteto para terminar", que manda
+ *   a continuação interna pelo servidor (`POST /chat/continue`);
  * - prontidão (decisão 15): sem `readiness.execute`, o botão fica desabilitado com o que falta;
  *   o 412 `prereq_missing` mostra o que falta com "Configurar".
  */
 import { useId, useState, type ReactNode } from "react";
-import { approveSpec, postChat } from "../../api/client";
+import { approveSpec, postChat, postChatContinue } from "../../api/client";
 import type { EnvironmentView, PlanIssue, PlanReviewView, SpecView } from "../../api/types";
 import { chatFailureMessage } from "../../chatFailure";
+import { loadChatHistory } from "../../chatHistory";
 import { ARCHITECT_COMPLETE_PLAN_MESSAGE } from "../../copy";
 import { Icon } from "../../desktop/Icon";
 import { t, tp, type MessageKey } from "../../i18n";
@@ -100,6 +104,7 @@ function Pending({ children, id }: { children: ReactNode; id?: string }) {
 
 function ReviewerStatus({ review }: { review: PlanReviewView }) {
   const { t } = useT();
+  if (review.status === "incomplete") return <p className="nd-muted">{t("plan.review.incomplete")}</p>;
   if (review.status === "running" || review.status === "pending") return <Pending>{t("plan.review.running")}</Pending>;
   if (review.status === "stale") return <p className="nd-muted">{t("plan.review.stale")}</p>;
   if (review.status === "unavailable") return <p className="nd-muted">{t("plan.review.unavailable")}</p>;
@@ -110,6 +115,7 @@ function ReviewerStatus({ review }: { review: PlanReviewView }) {
 function reviewerDetail(review: PlanReviewView, issues: number): string {
   if (issues > 0) return tp("plan.review.issuesAbove", issues);
   if (review.status === "running" || review.status === "pending") return t("plan.review.reviewing");
+  if (review.status === "incomplete") return t("plan.review.incomplete");
   if (review.status === "stale") return t("plan.review.noAnswer");
   if (review.status === "unavailable") return t("plan.review.unavailableShort");
   return t("plan.review.clean");
@@ -140,6 +146,8 @@ function PlanChecksSummary({ checks }: { checks: Checks }) {
   const titleId = useId();
   const { automatic, issues, review, total, reviewDone } = checks;
   if (total === 0) {
+    // Plano incompleto (spec 127 T01): o aviso fica no rodapé, junto da ação.
+    if (review?.status === "incomplete") return null;
     if (review !== undefined && review.status !== "ok") return <ReviewerStatus review={review} />;
     return (
       <p data-testid="plan-checks-clean" className="nd-muted">
@@ -308,6 +316,8 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
   const waiting = stage === "reviewing";
   const awaiting = spec.status === "AWAITING_APPROVAL" && stage !== null;
   const stale = spec.plan_review?.status === "stale";
+  const incomplete = spec.plan_review?.status === "incomplete";
+  const incompleteId = useId();
   const blocked = stage === "awaiting" && gateBlocked(shell.readiness, "execute");
   const checks = checksOf(spec);
   const bigTasks = new Set(tooLargeIssues(checks.issues).map((issue) => issue.task));
@@ -336,8 +346,26 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
     await onApproved();
   }
 
+  /** "Pedir ao Arquiteto para terminar" (spec 127 T01): continuação interna do plano sem tarefas. */
+  async function askArchitectToFinish(): Promise<void> {
+    if (completing) return;
+    setCompleting(true);
+    setProblem(null);
+    const result = await postChatContinue(projectId, spec.id);
+    setCompleting(false);
+    if (!result.ok) {
+      // Queda da conexão de novo: o aviso fica gravado na Conversa.
+      if (result.error.reason === "connection_lost") void loadChatHistory(projectId);
+      setProblem({ message: chatFailureMessage(result.error, architectWireApi(config)), missing: null });
+      await onApproved();
+      return;
+    }
+    appStore.showArchitectReply(projectId, result.data.reply, result.data.turn_id);
+    await onApproved();
+  }
+
   async function approve(): Promise<void> {
-    if (busy || completing || blocked) return;
+    if (busy || completing || blocked || incomplete) return;
     setBusy(true);
     setProblem(null);
     const result = await approveSpec(projectId, spec.id);
@@ -391,6 +419,24 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
     );
   } else if (awaiting && completing) {
     footer = <Pending>{t("plan.architectCompleting")}</Pending>;
+  } else if (awaiting && incomplete) {
+    footer = (
+      <>
+        <p id={incompleteId} role="status" className="nd-plan-incomplete" data-plan-incomplete="">
+          <Icon name="alert" size={14} />
+          <span>{t("plan.incomplete.text")}</span>
+        </p>
+        <div className="nd-row nd-wrap nd-plan-actions">
+          <button type="button" className="nd-btn nd-plan-action" data-variant="primary" data-plan-finish="" onClick={() => void askArchitectToFinish()}>
+            <Icon name="conversation" size={14} />
+            {t("plan.incomplete.finish")}
+          </button>
+          <button type="button" className="nd-btn nd-plan-action" data-approve="" disabled aria-describedby={incompleteId}>
+            {t("plan.approve")}
+          </button>
+        </div>
+      </>
+    );
   } else if (awaiting) {
     footer = (
       <>

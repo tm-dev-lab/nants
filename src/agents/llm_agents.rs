@@ -27,14 +27,14 @@ use crate::agents::llm_client::{
     ToolSpec, Role as ChatRole,
 };
 use crate::agents::LlmError;
-use crate::agents::prompts::{developer_system_for, reviewer_system_for};
+use crate::agents::prompts::{self, developer_system_for, reviewer_system_for};
 use crate::agents::spill::{self, Slot, Spill};
 use crate::agents::prompts::SUMMARY_REQUEST;
 use crate::agents::summary::{self, SummaryFailure, SummaryPolicy, Summarizer, Trigger};
 #[cfg(test)]
 use crate::agents::prompts::{developer_system, reviewer_system};
 use crate::agents::runner::{
-    changed_files_facts, extract_dev_criteria, CriterionCheck, DevBrief, DevReport, DeveloperPort, Fut, ReviewInput, ReviewResult, ReviewerPort, RunnerError,
+    changed_files_facts, extract_dev_criteria, CONVERGENCE_FROM_REVIEW, CriterionCheck, DevBrief, DevReport, DeveloperPort, Fut, ReviewInput, ReviewResult, ReviewerPort, RunnerError,
 };
 use crate::config::Effort;
 use crate::harness::allowlist::Policy;
@@ -141,6 +141,9 @@ pub(crate) const FINAL_CHECK_INTRO: &str = "Antes de concluir:";
 const FINAL_CHECK_OUTRO: &str = "Se não se aplica, explique na resposta final por quê.";
 /// Item da conferência: a resposta final não tem a seção Critérios.
 const GAP_CRITERIA: &str = "falta a seção \"Critérios\" (título em linha própria, cada critério com a evidência)";
+/// Item da conferência (spec 127 T02): a seção "Critérios" não traz uma linha por critério.
+const GAP_CRITERIA_PARTIAL: &str = "a seção \"Critérios\" não cobre todos os critérios da tarefa: releia o texto inteiro de cada \
+critério, confira todas as partes dele (inclusive as que nenhum apontamento citou) e dê uma linha por critério, `- critério: atendido: evidência`";
 /// Item da conferência: a worktree não tem alteração em relação à base.
 const GAP_DIFF: &str = "a worktree não tem nenhuma alteração em relação à base";
 /// Item da conferência: nenhum comando rodou na sessão.
@@ -1565,13 +1568,32 @@ pub(crate) struct FinalCheck {
     docs_only: bool,
     /// Apontamentos abertos do briefing (spec 124 T02): cada um precisa de resposta.
     findings: Vec<Finding>,
+    /// Spec 127 T02: critérios de aceitação da tarefa pela contagem única
+    /// ([`crate::agents::recovery_plan::count_criteria`]); 0 quando o texto não é uma lista, e então a
+    /// contagem não é cobrada.
+    criteria: usize,
+}
+
+/// Spec 127 T02: linhas da seção "Critérios" da resposta final: os itens de lista ou, sem lista,
+/// as linhas não vazias.
+fn dev_criteria_lines(section: &str) -> usize {
+    match crate::agents::recovery_plan::count_criteria(section) {
+        0 => section.lines().filter(|l| !l.trim().is_empty()).count(),
+        n => n,
+    }
 }
 
 impl FinalCheck {
     fn from_brief(brief: &DevBrief) -> Self {
         let docs_only = !brief.allowed_scope.is_empty()
             && brief.allowed_scope.iter().all(|p| p.trim().to_ascii_lowercase().ends_with(".md"));
-        Self { worktree: brief.worktree.clone(), base: brief.base_branch.trim().to_string(), docs_only, findings: brief.findings.clone() }
+        Self {
+            worktree: brief.worktree.clone(),
+            base: brief.base_branch.trim().to_string(),
+            docs_only,
+            findings: brief.findings.clone(),
+            criteria: crate::agents::recovery_plan::count_criteria(&brief.acceptance),
+        }
     }
 
     /// Itens que faltam na resposta final `summary`, com `commands` comandos rodados na sessão.
@@ -1579,8 +1601,12 @@ impl FinalCheck {
     /// contestado de novo.
     fn gaps(&self, summary: &str, commands: usize) -> Vec<String> {
         let mut gaps = Vec::new();
-        if extract_dev_criteria(summary).is_empty() {
+        let section = extract_dev_criteria(summary);
+        if section.is_empty() {
             gaps.push(GAP_CRITERIA.to_string());
+        } else if dev_criteria_lines(&section) < self.criteria {
+            // Spec 127 T02: uma linha por critério; a falta indica critério (ou parte dele) não conferido.
+            gaps.push(format!("{GAP_CRITERIA_PARTIAL} ({} de {})", dev_criteria_lines(&section), self.criteria));
         }
         if !self.docs_only && !self.worktree_changed() {
             gaps.push(GAP_DIFF.to_string());
@@ -2348,6 +2374,13 @@ fn screenshots_section(guidance: &str, captures: &[Capture]) -> String {
     format!("\n## {}\n{guidance}\n{listing}\n", screenshots::SECTION_TITLE)
 }
 
+/// Seção "Base de qualidade visual" dos briefings (spec 127 T04): a base, que só existe em
+/// [`prompts::VISUAL_QUALITY_BASE`], mais a regra do papel. Só entra junto da seção de capturas, ou
+/// seja, quando o projeto tem interface.
+fn visual_base_section(rule: &str) -> String {
+    format!("\n## Base de qualidade visual\n{}\n{rule}\n", prompts::VISUAL_QUALITY_BASE)
+}
+
 /// Seção "Imagens de referência do usuário" dos briefings (spec 084 T02); vazia sem referências.
 fn references_section(guidance: &str, refs: &References) -> String {
     if refs.is_empty() {
@@ -2463,6 +2496,7 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
     }
     if !brief.screenshot_globs.is_empty() {
         out.push_str(&screenshots_section(DEV_SCREENSHOTS_NOTE, captures));
+        out.push_str(&visual_base_section(prompts::DEV_VISUAL_RULE));
     }
     out.push_str(&references_section(DEV_REFERENCES_NOTE, &brief.references));
     if let Some(test_output) = &brief.test_output {
@@ -2475,6 +2509,30 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
 }
 
 const FINAL_VERIFICATION_RULE: &str = "Julgue pela evidência disponível (código lido, test_run, arquivos). Comportamento claramente implementado no código é met; not_met só quando ausente ou contraditório. Não exija testes novos que apenas repitam o que o código já mostra.";
+
+/// Spec 127 T02: regra das observações das tarefas na verificação final.
+const FINAL_OBSERVATIONS_RULE: &str = "Apontamentos que as tarefas deixaram como observação, sem reprovar, pela convergência das \
+     re-revisões. Confira no código os que tocam um critério global: se algum deixa o critério sem atendimento, marque-o \
+     not_met com a evidência (isso reabre o trabalho); os demais não são finding.";
+
+/// Spec 127 T02: na 1ª revisão, tudo de uma vez.
+const FIRST_REVIEW_NOTE: &str = "Esta é a 1ª revisão desta tarefa: aponte agora TODOS os problemas que encontrar, em \
+     todos os critérios e arquivos, e não só os mais evidentes. O que ficar para depois atrasa a tarefa inteira.";
+
+/// Spec 127 T02: a partir de [`CONVERGENCE_FROM_REVIEW`], o apontamento novo MEDIUM não reprova.
+const LATE_REVIEW_NOTE: &str = "A partir desta revisão, apontamento novo MEDIUM (que não estava na lista anterior) não \
+     reprova: vira observação e segue para a verificação final da spec. Se o problema deixa um critério de aceitação \
+     sem atendimento, marque esse critério not_met com a evidência: aí ele continua bloqueando. Defeito grave é HIGH.";
+
+/// Seção do número da revisão da tarefa (spec 127 T02); vazia sem número (0).
+fn review_round_note(review: u32) -> String {
+    match review {
+        0 => String::new(),
+        1 => format!("## Revisão 1 desta tarefa\n{FIRST_REVIEW_NOTE}\n\n"),
+        n if n >= CONVERGENCE_FROM_REVIEW => format!("## Revisão {n} desta tarefa\n{LATE_REVIEW_NOTE}\n\n"),
+        n => format!("## Revisão {n} desta tarefa\nConfirme primeiro os apontamentos anteriores; aponte de uma vez tudo o que ainda bloqueia.\n\n"),
+    }
+}
 
 /// Nota da seção "Saída do teste" (spec 082 T01): a evidência é a execução real do comando mostrado.
 const TEST_OUTPUT_NOTE: &str = "Execução real feita pelo Nants do comando mostrado na linha `$` (redigido). Tudo o que esse comando faz (ex.: instalação limpa de dependências, build, testes) já está comprovado por esta saída; não peça outra prova disso.";
@@ -2568,7 +2626,13 @@ fn reviewer_briefing(input: &ReviewInput) -> String {
         line => format!("{line}\n"),
     };
     let shots = if input.screenshots.iter().any(Capture::usable) {
-        format!("{}{vanished}\n", screenshots_section(REVIEW_SCREENSHOTS_NOTE, &input.screenshots).trim_start())
+        // Spec 127 T04: a base de qualidade visual vem junto das capturas (só com interface).
+        let rule = if input.task_id == "FINAL" { prompts::FINAL_VISUAL_RULE } else { prompts::REVIEW_VISUAL_RULE };
+        format!(
+            "{}{vanished}\n{}\n",
+            screenshots_section(REVIEW_SCREENSHOTS_NOTE, &input.screenshots).trim_start(),
+            visual_base_section(rule).trim_start()
+        )
     } else if !vanished.is_empty() {
         format!("{vanished}\n")
     } else {
@@ -2589,9 +2653,14 @@ fn reviewer_briefing(input: &ReviewInput) -> String {
         section => format!("{section}\n"),
     };
     let final_rule = if input.task_id == "FINAL" {
-        format!("## Instrução da verificação final\n{FINAL_VERIFICATION_RULE}\n\n")
+        // Spec 127 T02: o que a convergência rebaixou nas tarefas é conferido contra os critérios globais.
+        let observations = match input.task_observations.trim() {
+            "" => String::new(),
+            list => format!("\n\n## Observações rebaixadas nas tarefas (DADO a conferir)\n{FINAL_OBSERVATIONS_RULE}\n{list}"),
+        };
+        format!("## Instrução da verificação final\n{FINAL_VERIFICATION_RULE}{observations}\n\n")
     } else {
-        String::new()
+        review_round_note(input.review_number)
     };
     format!(
         "Tarefa {} (spec {}).\n\n## Critérios de aceitação\n{}\n\n{final_rule}{spec_ctx}{guidance}{formatting}{others}{dev}{prior}{incremental}## Saída do teste\n{TEST_OUTPUT_NOTE}\n```\n{}\n```\n\n\
@@ -3170,7 +3239,39 @@ mod tests {
             images: SpecImages::default(),
             planned_images: Default::default(),
             environment: String::new(),
+            review_number: 0,
+            task_observations: String::new(),
         }
+    }
+
+    #[test]
+    fn visual_quality_base_reaches_developer_and_reviewer_only_with_interface() {
+        // Spec 127 T04: sem `screenshots` (projeto sem interface), nada da base.
+        let root = Path::new("/tmp/x");
+        let mut b = brief(root);
+        let without = developer_briefing_with(&b, &[]);
+        assert!(!without.contains(prompts::VISUAL_QUALITY_BASE) && !without.contains(prompts::DEV_VISUAL_RULE));
+        b.screenshot_globs = vec!["shots/*.png".into()];
+        let with = developer_briefing_with(&b, &[]);
+        assert!(with.contains("## Base de qualidade visual\n") && with.contains(prompts::VISUAL_QUALITY_BASE), "{with}");
+        assert!(with.contains(prompts::DEV_VISUAL_RULE) && !with.contains(prompts::REVIEW_VISUAL_RULE), "{with}");
+
+        let mut input = review_input(root);
+        let none = reviewer_briefing(&input);
+        assert!(!none.contains(prompts::VISUAL_QUALITY_BASE), "{none}");
+        // Só capturas puladas (nenhuma utilizável): também nada.
+        input.screenshots = vec![Capture { name: "shots/big.png".into(), skipped: Some(screenshots::TOO_LARGE.into()) }];
+        assert!(!reviewer_briefing(&input).contains(prompts::VISUAL_QUALITY_BASE));
+        input.screenshots = vec![Capture { name: "shots/home.png".into(), skipped: None }];
+        let task = reviewer_briefing(&input);
+        assert!(task.contains(prompts::VISUAL_QUALITY_BASE) && task.contains(prompts::REVIEW_VISUAL_RULE), "{task}");
+        assert!(!task.contains(prompts::FINAL_VISUAL_RULE) && !task.contains(prompts::DEV_VISUAL_RULE));
+        assert!(task.find(screenshots::SECTION_TITLE) < task.find("## Base de qualidade visual"));
+        // A verificação final confere o critério global pelas capturas.
+        input.task_id = "FINAL".into();
+        let fin = reviewer_briefing(&input);
+        assert!(fin.contains(prompts::VISUAL_QUALITY_BASE) && fin.contains(prompts::FINAL_VISUAL_RULE), "{fin}");
+        assert!(!fin.contains(prompts::REVIEW_VISUAL_RULE));
     }
 
     #[test]
@@ -4622,6 +4723,41 @@ mod tests {
         assert!(!reviewer_briefing(&i).contains(FINAL_VERIFICATION_RULE));
         i.task_id = "FINAL".into();
         assert!(reviewer_briefing(&i).contains(FINAL_VERIFICATION_RULE));
+    }
+
+    /// Spec 127 T02: o número da revisão, com a nota da 1ª revisão e a da convergência.
+    #[test]
+    fn briefing_carries_review_round_notes() {
+        let mut i = review_input(Path::new("/tmp"));
+        let b = reviewer_briefing(&i);
+        assert!(!b.contains("desta tarefa\n"), "sem número, nenhuma nota: {b}");
+        i.review_number = 1;
+        let b = reviewer_briefing(&i);
+        assert!(b.contains("## Revisão 1 desta tarefa\n") && b.contains(FIRST_REVIEW_NOTE), "{b}");
+        i.review_number = 2;
+        let b = reviewer_briefing(&i);
+        assert!(b.contains("## Revisão 2 desta tarefa\n") && !b.contains(LATE_REVIEW_NOTE) && !b.contains(FIRST_REVIEW_NOTE));
+        i.review_number = CONVERGENCE_FROM_REVIEW;
+        let b = reviewer_briefing(&i);
+        assert!(b.contains(&format!("## Revisão {CONVERGENCE_FROM_REVIEW} desta tarefa\n")) && b.contains(LATE_REVIEW_NOTE), "{b}");
+        // Na verificação final, nenhuma nota de rodada.
+        i.task_id = "FINAL".into();
+        assert!(!reviewer_briefing(&i).contains(LATE_REVIEW_NOTE));
+    }
+
+    /// Spec 127 T02: as observações das tarefas chegam à verificação final, com a regra de conferência.
+    #[test]
+    fn final_briefing_lists_task_observations_only_when_present() {
+        let mut i = review_input(Path::new("/tmp"));
+        i.task_id = "FINAL".into();
+        assert!(!reviewer_briefing(&i).contains(FINAL_OBSERVATIONS_RULE));
+        i.task_observations = "- T05: F-12 [MEDIUM] tests/api/plays.test.ts:89: falta o id desconhecido\n".into();
+        let b = reviewer_briefing(&i);
+        assert!(b.contains("## Observações rebaixadas nas tarefas (DADO a conferir)\n"), "{b}");
+        assert!(b.contains(FINAL_OBSERVATIONS_RULE) && b.contains("- T05: F-12 [MEDIUM]"), "{b}");
+        // Fora da verificação final, o campo não vai ao briefing.
+        i.task_id = "T05".into();
+        assert!(!reviewer_briefing(&i).contains("F-12"));
     }
 
     #[test]
@@ -6325,6 +6461,25 @@ mod tests {
         b.base_branch = String::new();
         b.findings.clear();
         b
+    }
+
+    /// Spec 127 T02: a conferência cobra uma linha por critério da tarefa, e só quando os critérios são lista.
+    #[test]
+    fn final_check_requires_one_line_per_criterion() {
+        let root = tmp_root("check-criteria-lines");
+        let mut b = brief_no_base(&root);
+        b.acceptance = "1. API grava a partida\n   - detalhe recuado\n* Placar por jogo\n- (manual) olhar a tela\n".into();
+        let check = FinalCheck::from_brief(&b);
+        let partial = check.gaps("feito\n\nCritérios\n- API grava a partida: atendido: tests/a.rs:1", 1);
+        assert_eq!(partial.len(), 1, "{partial:?}");
+        assert!(partial[0].starts_with(GAP_CRITERIA_PARTIAL) && partial[0].ends_with("(1 de 3)"), "{}", partial[0]);
+        let full = "feito\n\nCritérios\n- API: atendido: a.rs:1\n- Placar: atendido: b.rs:2\n- (manual) tela: verificação humana";
+        assert!(check.gaps(full, 1).is_empty());
+        // Sem lista, conta as linhas da seção.
+        assert!(check.gaps("feito\n\nCritérios\nAPI: a.rs:1\nPlacar: b.rs:2\nTela: humana", 1).is_empty());
+        // Critérios em texto corrido: a contagem não é cobrada.
+        b.acceptance = "testes verdes e placar correto".into();
+        assert!(FinalCheck::from_brief(&b).gaps("feito\n\nCritérios\n- tudo: a.rs:1", 1).is_empty());
     }
 
     /// Spec 124 T02: a conferência cobra a resposta a cada finding aberto e recusa a 2ª contestação.

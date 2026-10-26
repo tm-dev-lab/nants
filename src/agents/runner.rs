@@ -207,6 +207,8 @@ pub const DEV_CRITERIA_MARK: &str = "\n\n## Critérios do Desenvolvedor\n";
 const DEV_CRITERIA_MAX_BYTES: usize = 4096;
 /// Cauda máxima (bytes) guardada por checagem.
 const CHECK_TAIL_BYTES: usize = 4 * 1024;
+/// Começo da saída de um formatador que falhou, na mensagem da conversa (spec 127 T03).
+const FORMATTER_HEAD_BYTES: usize = 400;
 /// Cauda da saída de um formatador que falhou, na mensagem da conversa.
 const FORMATTER_TAIL_BYTES: usize = 300;
 
@@ -235,6 +237,30 @@ fn tail_bytes(text: &str, max: usize) -> &str {
         start += 1;
     }
     &text[start..]
+}
+
+/// Lista dos formatadores para o Desenvolvedor, seguida dos avisos da seção [`FORMAT_SECTION`]
+/// da tarefa (spec 127 T03), para ele corrigir a configuração. Vazia sem formatadores.
+fn formatters_brief(formatters: &[Formatter], body: &str) -> String {
+    let list = formatting::briefing_list(formatters);
+    let warnings = section_text(body, FORMAT_SECTION).unwrap_or_default();
+    if list.is_empty() || warnings.trim().is_empty() {
+        return list;
+    }
+    format!("{list}\n{}", warnings.trim())
+}
+
+/// Spec 127 T03: o começo (até `head` bytes) e o fim (até `tail` bytes) da saída, com `[…]` no
+/// meio, cortados em limite de caractere; a saída curta fica inteira.
+fn head_tail_bytes(text: &str, head: usize, tail: usize) -> String {
+    if text.len() <= head + tail {
+        return text.to_string();
+    }
+    let mut end = head;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[…]\n{}", text[..end].trim_end(), tail_bytes(text, tail).trim_start())
 }
 
 /// Resumo da saída dos testes: primeira e últimas linhas não vazias, até `TEST_SUMMARY_MAX_BYTES`.
@@ -411,6 +437,9 @@ const FLAKY_MAX_LINES: usize = 10;
 pub const DEV_REUSED_MARK: &str = "Resultado reaproveitado da rodada do Desenvolvedor, mesmo comando sobre a mesma árvore:";
 /// Seção do corpo da tarefa com as rodadas reaproveitadas do Desenvolvedor (spec 124 T05).
 pub const REUSE_SECTION: &str = "Testes reaproveitados";
+/// Seção do corpo da tarefa com os diagnósticos da formatação automática (spec 127 T03): vai ao
+/// Desenvolvedor junto com a lista dos formatadores.
+pub const FORMAT_SECTION: &str = "Avisos da formatação";
 /// Seção do corpo da tarefa com os avisos sobre a instalação das dependências (spec 126 T01).
 pub const INSTALL_SECTION: &str = "Instalação das dependências";
 /// Nome da etapa de instalação das dependências nos eventos da rodada (spec 124 T05).
@@ -721,6 +750,12 @@ pub struct ReviewInput {
     /// Capacidades do ambiente de testes (spec 124 T04, seção curta com a regra do Revisor); vazia
     /// sem nada medido.
     pub environment: String,
+    /// Spec 127 T02: número desta revisão da tarefa ([`finding_track::next_review`]); 0 na
+    /// verificação final.
+    pub review_number: u32,
+    /// Spec 127 T02: só na verificação final, as observações rebaixadas nas tarefas pela convergência
+    /// ([`final_observations_facts`], já redigidas); vazio nas revisões de tarefa e sem observações.
+    pub task_observations: String,
 }
 
 /// Época da tentativa corrente da tarefa: muda a cada tentativa nova e a cada análise de recuperação
@@ -1220,6 +1255,164 @@ pub fn demote_waived(lang: Lang, mut result: ReviewResult, waived: &[Finding]) -
         }
     }
     (result, dispensed)
+}
+
+/// O `location` marca um apontamento de visual ([`crate::agents::prompts::VISUAL_FINDING_PREFIX`], spec 127 T04)?
+fn is_visual_finding(f: &Finding) -> bool {
+    let prefix = crate::agents::prompts::VISUAL_FINDING_PREFIX;
+    f.location.trim_start().get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
+/// Spec 127 T04: no máximo um apontamento de visual por revisão. Os que trazem o marcador
+/// [`crate::agents::prompts::VISUAL_FINDING_PREFIX`] viram um só, no lugar do primeiro. Fica o id do
+/// que já estava aberto, para o registro seguir o mesmo problema: 1) o que traz `status` open; 2) senão,
+/// o que não se declara novo e reutiliza o id de um aberto do registro (`open_ids`; o `status` é
+/// opcional); 3) senão, o primeiro. Os locais, as descrições e
+/// as recomendações se juntam; a severidade e a confiança são as maiores entre eles. Um só (ou
+/// nenhum) não muda nada. Como o resultado é um apontamento comum, a convergência
+/// ([`demote_late_new`]) vale para ele.
+pub fn consolidate_visual(mut result: ReviewResult, open_ids: &[String]) -> ReviewResult {
+    if result.findings.iter().filter(|f| is_visual_finding(f)).count() < 2 {
+        return result;
+    }
+    let Some(first) = result.findings.iter().position(is_visual_finding) else {
+        return result;
+    };
+    let (visual, mut others): (Vec<Finding>, Vec<Finding>) =
+        std::mem::take(&mut result.findings).into_iter().partition(is_visual_finding);
+    let reuses_open = |f: &Finding| f.state != Some(FindingState::New) && open_ids.iter().any(|id| id == f.id.trim());
+    let base = visual
+        .iter()
+        .position(|f| f.state == Some(FindingState::Open))
+        .or_else(|| visual.iter().position(reuses_open))
+        .unwrap_or(0);
+    let mut merged = visual[base].clone();
+    let join = |field: fn(&Finding) -> &str, sep: &str| {
+        visual.iter().map(field).map(str::trim).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(sep)
+    };
+    let places: Vec<&str> = visual
+        .iter()
+        .flat_map(|f| f.location.trim_start().get(crate::agents::prompts::VISUAL_FINDING_PREFIX.len()..).unwrap_or_default().split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut unique: Vec<&str> = Vec::new();
+    for p in places {
+        if !unique.contains(&p) {
+            unique.push(p);
+        }
+    }
+    merged.location = format!("{} {}", crate::agents::prompts::VISUAL_FINDING_PREFIX, unique.join(", "));
+    merged.description = join(|f| f.description.as_str(), " ");
+    merged.recommendation = join(|f| f.recommendation.as_str(), " ");
+    let any = |level: &str| visual.iter().any(|f| f.severity.trim().eq_ignore_ascii_case(level));
+    if any("HIGH") {
+        merged.severity = "HIGH".into();
+        merged.failure_scenario = join(|f| f.failure_scenario.as_str(), " ");
+    } else if any("MEDIUM") {
+        merged.severity = "MEDIUM".into();
+    }
+    if visual.iter().any(|f| f.confidence == Confidence::High) {
+        merged.confidence = Confidence::High;
+    }
+    others.insert(first.min(others.len()), merged);
+    result.findings = others;
+    result
+}
+
+/// Spec 127 T02: revisão da tarefa a partir da qual um apontamento novo MEDIUM ou LOW vira
+/// observação em vez de reprovar ([`demote_late_new`]). Ponto de calibração da convergência.
+pub const CONVERGENCE_FROM_REVIEW: u32 = 3;
+
+/// Seção do corpo da tarefa com as observações rebaixadas por [`demote_late_new`]: além de entrarem
+/// em [`OBSERVATIONS`], seguem para a verificação final da spec, que pode reabrir trabalho.
+pub const FINAL_OBSERVATIONS: &str = "Observações para a verificação final";
+/// Teto das observações das tarefas nos FATOS da verificação final.
+const FINAL_OBSERVATIONS_MAX_BYTES: usize = 6 * 1024;
+
+/// Spec 127 T02: convergência contra o "alvo móvel". A partir da revisão [`CONVERGENCE_FROM_REVIEW`]
+/// da tarefa (`review`, ver [`finding_track::next_review`]), um apontamento NOVO para a tarefa
+/// ([`finding_track::is_new`]) de severidade MEDIUM ou LOW vira observação, mesmo que outro continue
+/// bloqueando. Nunca é rebaixado: HIGH; o aberto ou resolvido que volta; e nada é rebaixado quando
+/// algum critério não manual está `not_met` ou quando o Revisor não devolveu a matriz de critérios
+/// (sem ela não há como saber se o apontamento está ligado a um critério não atendido). Sem
+/// bloqueante restante, o veredito vira APPROVED. Um id que colide com o registro ou com um
+/// bloqueante desta revisão ganha o próximo número livre.
+pub fn demote_late_new(lang: Lang, mut result: ReviewResult, registry: &[Finding], review: u32) -> (ReviewResult, Vec<Finding>) {
+    if review < CONVERGENCE_FROM_REVIEW || result.verdict != Verdict::ChangesRequested {
+        return (result, Vec::new());
+    }
+    let all_met = !result.criteria.is_empty() && result.criteria.iter().all(|c| c.met || is_manual_criterion(&c.criterion));
+    if !all_met {
+        return (result, Vec::new());
+    }
+    let demotable = |f: &Finding| {
+        let severity = f.severity.trim();
+        (severity.eq_ignore_ascii_case("MEDIUM") || severity.eq_ignore_ascii_case("LOW")) && finding_track::is_new(registry, f)
+    };
+    if !result.findings.iter().any(demotable) {
+        return (result, Vec::new());
+    }
+    let (demoted, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut result.findings).into_iter().partition(demotable);
+    result.findings = kept;
+    let number = |id: &str| id.trim().strip_prefix("F-").and_then(|n| n.parse::<u32>().ok());
+    let mut used: HashSet<String> =
+        registry.iter().chain(result.findings.iter()).map(|f| f.id.trim().to_string()).collect();
+    let mut next = registry
+        .iter()
+        .chain(result.findings.iter())
+        .chain(demoted.iter())
+        .filter_map(|f| number(&f.id))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let demoted = demoted
+        .into_iter()
+        .map(|mut f| {
+            let id = f.id.trim().to_string();
+            if used.contains(&id) || number(&id).is_none() {
+                while used.contains(&format!("F-{next:02}")) {
+                    next += 1;
+                }
+                f.id = format!("F-{next:02}");
+                next += 1;
+            } else {
+                f.id = id;
+            }
+            used.insert(f.id.clone());
+            f
+        })
+        .collect();
+    if result.findings.is_empty() {
+        result.verdict = Verdict::Approved;
+        result.summary =
+            i18n::tr(lang, "runner.review.late_new_demoted", &[("summary", result.summary.trim_end()), ("review", &CONVERGENCE_FROM_REVIEW.to_string())]);
+        // Todos os critérios estão atendidos (conferido acima); o enforce fica como garantia.
+        result = enforce_criteria(lang, result);
+    }
+    (result, demoted)
+}
+
+/// Spec 127 T02: FATOS da verificação final com as observações das tarefas ([`FINAL_OBSERVATIONS`]),
+/// `- Txx: linha`, até [`FINAL_OBSERVATIONS_MAX_BYTES`]; vazio sem nenhuma.
+pub fn final_observations_facts(tasks: &[Task]) -> String {
+    let mut out = String::new();
+    let mut omitted = 0usize;
+    for t in tasks {
+        let section = section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default();
+        for line in section.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let item = format!("- {}: {}\n", t.frontmatter.id, line.trim_start_matches("- "));
+            if out.len() + item.len() > FINAL_OBSERVATIONS_MAX_BYTES {
+                omitted += 1;
+            } else {
+                out.push_str(&item);
+            }
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("… e mais {omitted}\n"));
+    }
+    out
 }
 
 /// Spec 092 T04: rótulo, junto da severidade, da observação rebaixada porque o arquivo não mudou
@@ -2371,7 +2564,7 @@ impl TaskRunner {
     async fn format_delivery(
         &self,
         settings: &Settings,
-        task: &Task,
+        task: &mut Task,
         wt: &Path,
         attempt: u32,
     ) -> Result<(), RunnerError> {
@@ -2411,7 +2604,7 @@ impl TaskRunner {
     async fn run_formatters(
         &self,
         settings: &Settings,
-        task: &Task,
+        task: &mut Task,
         wt: &Path,
         attempt: u32,
         selected: &[&Formatter],
@@ -2437,8 +2630,19 @@ impl TaskRunner {
                 Ok(r) if r.timed_out => Some(i18n::text(lang, "runner.format.timed_out")),
                 Ok(r) => {
                     let code = r.exit_code.map_or_else(|| "?".to_string(), |c| c.to_string());
-                    let output = tail_bytes(r.output.trim_end(), FORMATTER_TAIL_BYTES);
-                    Some(i18n::tr(lang, "runner.format.exit", &[("code", &code), ("output", output)]))
+                    // Spec 127 T03: o começo (o erro real) e o fim, e não só a cauda cheia de avisos.
+                    let output = head_tail_bytes(r.output.trim(), FORMATTER_HEAD_BYTES, FORMATTER_TAIL_BYTES);
+                    let exit = i18n::tr(lang, "runner.format.exit", &[("code", &code), ("output", &output)]);
+                    // Spec 127 T03: escrita recusada numa pasta do Nants (só leitura): diz isso
+                    // claramente, na conversa e na tarefa, para o Desenvolvedor configurar o ignorar.
+                    match formatting::readonly_nants_dir(&r.output) {
+                        Some(dir) => {
+                            let diagnosis = i18n::tr(lang, "runner.format.readonly_nants", &[("name", &f.name), ("dir", dir)]);
+                            self.record_format_warning(task, &diagnosis);
+                            Some(format!("{diagnosis}\n{exit}"))
+                        }
+                        None => Some(exit),
+                    }
                 }
                 Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
                 Err(e) => Some(e.to_string()),
@@ -3208,6 +3412,7 @@ impl TaskRunner {
     /// Spec 126 T01: o `test_command` ou o `full_test_command` que começa com o próprio
     /// `install_command` repete a instalação que o Nants já roda antes. O Nants avisa, sem alterar o
     /// comando aprovado, na tarefa (seção [`INSTALL_SECTION`], uma vez por comando) e na conversa.
+    /// Spec 127 T03: o mesmo vale para os formatadores e as checagens.
     fn warn_repeated_install(&self, settings: &Settings, task: &mut Task, attempt: u32) {
         let repeated = test_levels::repeated_install(settings);
         let Some(install) = settings.install_command.as_deref().map(|c| self.scrub(c.trim())) else { return };
@@ -3216,7 +3421,10 @@ impl TaskRunner {
         let mut changed = false;
         for (field, command) in repeated {
             let command = self.scrub(&command);
-            let entry = i18n::tr(lang, "runner.install.repeated", &[("field", field), ("command", &command), ("install", &install)]);
+            // Spec 127 T03: formatadores e checagens têm o mesmo aviso, com o momento em que a
+            // instalação já roda para eles.
+            let key = if test_levels::is_test_field(&field) { "runner.install.repeated" } else { "runner.install.repeated_step" };
+            let entry = i18n::tr(lang, key, &[("field", &field), ("command", &command), ("install", &install)]);
             if log.lines().any(|l| l.trim_start_matches("- ") == entry) {
                 continue;
             }
@@ -3230,6 +3438,21 @@ impl TaskRunner {
         if changed {
             task.body = replace_section(&task.body, INSTALL_SECTION, Some(log));
         }
+    }
+
+    /// Spec 127 T03: acrescenta o diagnóstico à seção [`FORMAT_SECTION`] da tarefa, uma vez por
+    /// texto (gravada com ela). O Desenvolvedor a recebe com a lista dos formatadores.
+    fn record_format_warning(&self, task: &mut Task, entry: &str) {
+        let entry = self.scrub(entry);
+        let mut log = section_text(&task.body, FORMAT_SECTION).unwrap_or_default().trim_end().to_string();
+        if log.lines().any(|l| l.trim_start_matches("- ") == entry) {
+            return;
+        }
+        if !log.is_empty() {
+            log.push('\n');
+        }
+        log.push_str(&format!("- {entry}"));
+        task.body = replace_section(&task.body, FORMAT_SECTION, Some(log));
     }
 
     /// Spec 124 T05: acrescenta uma linha à seção [`REUSE_SECTION`] da tarefa (gravada com ela).
@@ -3633,6 +3856,8 @@ impl TaskRunner {
             images: crate::sdd::images::SpecImages::load(&self.spec_dir(&task.frontmatter.spec_id)),
             planned_images: self.planned_images(task),
             environment: self.capabilities_section(capabilities::Audience::Reviewer),
+            review_number: finding_track::next_review(&registry),
+            task_observations: String::new(),
         };
         if let Some(step) = self.budget_stop(task)? {
             return Ok(step);
@@ -3649,7 +3874,14 @@ impl TaskRunner {
         // Sem base do diff (`rejected_sha` ausente, p.ex. após recuperação, revisão ou retomada humana, que
         // limpam o sha sem apagar os findings) ou com falha ao ler os hunks, nada é rebaixado, como na 1ª revisão.
         let hunks = task.frontmatter.rejected_sha.as_deref().and_then(|sha| changed_hunks(&root, sha, &branch).ok());
-        let enforced = enforce_criteria(self.lang.get(), reviewed);
+        // Spec 127 T04: no máximo um apontamento de visual por revisão.
+        // O id de um aberto do registro vale mesmo sem `status` (o campo é opcional).
+        let open_ids: Vec<String> = registry
+            .iter()
+            .filter(|f| f.state != Some(FindingState::Resolved))
+            .map(|f| f.id.trim().to_string())
+            .collect();
+        let enforced = enforce_criteria(self.lang.get(), consolidate_visual(reviewed, &open_ids));
         // Spec 092 T04: na re-revisão, finding novo MEDIUM/LOW em arquivo que não mudou (e que existe na
         // worktree da branch revisada) vira observação.
         let exists = |path: &str| file_in_worktree(&input.worktree, path);
@@ -3659,8 +3891,11 @@ impl TaskRunner {
         };
         // Spec 124 T02: o que o Arquiteto ajustou ou tornou manual não bloqueia mais.
         let (result, dispensed) = demote_waived(self.lang.get(), result, &waived);
+        // Spec 127 T02: a partir da 3ª revisão, MEDIUM/LOW novo vira observação (sem critério não atendido).
+        let (result, late) = demote_late_new(self.lang.get(), result, &registry, input.review_number);
         let mut observations = observations;
         observations.extend(dispensed);
+        observations.extend(late.iter().cloned());
         // Spec 124 T01: identidade, estado e recorrência dos apontamentos (aprovação resolve todos).
         // Spec 126 T04: o id de uma observação desta revisão não vai para nenhum bloqueante.
         let mut tracked =
@@ -3693,6 +3928,10 @@ impl TaskRunner {
         if !observations.is_empty() {
             let existing = section_text(&task.body, OBSERVATIONS).unwrap_or_default();
             task.body = replace_section(&task.body, OBSERVATIONS, append_observations(&existing, &observations, &|t| self.scrub(t)));
+        }
+        if !late.is_empty() {
+            let existing = section_text(&task.body, FINAL_OBSERVATIONS).unwrap_or_default();
+            task.body = replace_section(&task.body, FINAL_OBSERVATIONS, append_observations(&existing, &late, &|t| self.scrub(t)));
         }
         if result.verdict != Verdict::None {
             task.body = replace_section(&task.body, REGISTRY, render_findings(&tracked.registry)?);
@@ -4300,7 +4539,7 @@ impl TaskRunner {
             )),
             ask_epoch: ask_epoch(task),
             previous_progress: String::new(),
-            formatters: self.scrub(&formatting::briefing_list(&settings.formatters)),
+            formatters: self.scrub(&formatters_brief(&settings.formatters, &task.body)),
             screenshot_globs: settings.screenshots.clone(),
             references: self.references(&task.frontmatter.spec_id),
             base_branch: settings.base_branch.clone(),
@@ -4464,6 +4703,9 @@ impl TaskRunner {
             images: crate::sdd::images::SpecImages::load(&self.spec_dir(spec_id)),
             planned_images: crate::sdd::images::PlannedImages::default(),
             environment: self.capabilities_section(capabilities::Audience::Reviewer),
+            review_number: 0,
+            // Spec 127 T02: o que a convergência rebaixou nas tarefas chega à verificação final.
+            task_observations: self.scrub(&final_observations_facts(tasks)),
         };
         let reviewed = self.reviewer.review(&input).await;
         drop(live);
@@ -4473,7 +4715,7 @@ impl TaskRunner {
                 // sobrescrever as cópias da 1ª.
                 let round = if tasks.iter().any(is_final_fix) { 2 } else { 1 };
                 let captures = self.copy_captures(&input, "FINAL", round, &r.screenshots_viewed);
-                (converge(self.lang.get(), enforce_criteria(self.lang.get(), r), &[], &[]), captures)
+                (converge(self.lang.get(), enforce_criteria(self.lang.get(), consolidate_visual(r, &[])), &[], &[]), captures)
             }
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
             Err(e) => {
@@ -7729,6 +7971,314 @@ mod tests {
         assert!(texts[1].contains(&format!("- F-07 [MEDIUM, {UNCHANGED_FILE_LABEL}] out-T01-1.txt:1: descrição")), "{}", texts[1]);
         let obs = section_text(&fx.read_task("T01").body, OBSERVATIONS).unwrap_or_default();
         assert!(obs.contains(UNCHANGED_FILE_LABEL), "{obs}");
+    }
+
+    /// Spec 127 T02: critérios atendidos da tarefa de teste (o `task` tem um só).
+    fn all_met() -> Vec<CriterionCheck> {
+        vec![met("arquivo criado", true)]
+    }
+
+    #[test]
+    fn late_new_medium_becomes_observation_only_from_the_calibrated_review() {
+        let registry = finding_track::track(&[], &[], vec![medium("F-01", "src/a.rs:1")], 1).registry;
+        let review = || ReviewResult { criteria: all_met(), ..rejected(vec![medium("F-02", "src/b.rs:2")]) };
+        // Antes da revisão de calibração, nada muda.
+        let (result, obs) = demote_late_new(Lang::PtBr, review(), &registry, CONVERGENCE_FROM_REVIEW - 1);
+        assert_eq!((result.verdict, result.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 0));
+        // A partir dela, o MEDIUM novo vira observação e a tarefa é aprovada.
+        let (result, obs) = demote_late_new(Lang::PtBr, review(), &registry, CONVERGENCE_FROM_REVIEW);
+        assert_eq!(result.verdict, Verdict::Approved);
+        assert!(result.findings.is_empty());
+        assert_eq!(obs.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02"]);
+        assert!(result.summary.contains("a partir da revisão 3"), "{}", result.summary);
+        let (en, _) = demote_late_new(Lang::En, review(), &registry, CONVERGENCE_FROM_REVIEW);
+        assert!(en.summary.contains("from review 3 on"), "{}", en.summary);
+        // LOW novo também.
+        let low = Finding { severity: "LOW".into(), ..medium("F-03", "src/c.rs:1") };
+        let (result, obs) =
+            demote_late_new(Lang::PtBr, ReviewResult { criteria: all_met(), ..rejected(vec![low]) }, &registry, 4);
+        assert_eq!((result.verdict, obs.len()), (Verdict::Approved, 1));
+    }
+
+    #[test]
+    fn late_new_rule_never_hides_high_unmet_criterion_or_recurring_finding() {
+        let registry = finding_track::track(&[], &[], vec![medium("F-01", "src/a.rs:1")], 1).registry;
+        // HIGH novo continua reprovando; o MEDIUM novo da mesma revisão vira observação.
+        let mixed = ReviewResult { criteria: all_met(), ..rejected(vec![finding("F-02"), medium("F-03", "src/b.rs:2")]) };
+        let (result, obs) = demote_late_new(Lang::PtBr, mixed, &registry, 3);
+        assert_eq!(result.verdict, Verdict::ChangesRequested);
+        assert_eq!(result.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02"]);
+        assert_eq!(obs.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-03"]);
+        // Critério não atendido: nada é rebaixado.
+        let unmet = ReviewResult { criteria: vec![met("arquivo criado", false)], ..rejected(vec![medium("F-02", "src/b.rs:2")]) };
+        let (result, obs) = demote_late_new(Lang::PtBr, unmet, &registry, 5);
+        assert_eq!((result.verdict, result.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 0));
+        // Sem a matriz de critérios não há como saber: nada é rebaixado.
+        let (result, obs) = demote_late_new(Lang::PtBr, rejected(vec![medium("F-02", "src/b.rs:2")]), &registry, 5);
+        assert_eq!((result.verdict, obs.len()), (Verdict::ChangesRequested, 0));
+        // Critério (manual) pendente não impede.
+        let manual = ReviewResult {
+            criteria: vec![met("arquivo criado", true), met("(manual) olhar a tela", false)],
+            ..rejected(vec![medium("F-02", "src/b.rs:2")])
+        };
+        assert_eq!(demote_late_new(Lang::PtBr, manual, &registry, 3).0.verdict, Verdict::Approved);
+        // O aberto que continua (mesmo id) não é novo: continua reprovando.
+        let again = Finding { state: Some(FindingState::Open), ..medium("F-01", "src/a.rs:9") };
+        let (result, obs) = demote_late_new(Lang::PtBr, ReviewResult { criteria: all_met(), ..rejected(vec![again]) }, &registry, 3);
+        assert_eq!((result.verdict, obs.len()), (Verdict::ChangesRequested, 0));
+        // APPROVED com critério not_met passa pelo enforce_criteria, que reprova sempre.
+        let enforced = enforce_criteria(Lang::PtBr, ReviewResult { criteria: vec![met("arquivo criado", false)], ..approved(vec![]) });
+        let (result, obs) = demote_late_new(Lang::PtBr, enforced, &registry, 6);
+        assert_eq!((result.verdict, obs.len()), (Verdict::ChangesRequested, 0));
+        assert_eq!(result.findings[0].severity, "HIGH");
+    }
+
+    fn visual(id: &str, shot: &str, text: &str) -> Finding {
+        Finding { description: text.into(), recommendation: format!("ajustar {shot}"), ..medium(id, &format!("visual: captura {shot}")) }
+    }
+
+    #[test]
+    fn visual_findings_become_one_per_review() {
+        // Spec 127 T04: vários apontamentos de visual viram um só, no lugar do primeiro.
+        let review = rejected(vec![
+            finding("F-01"),
+            visual("F-02", "home-desktop", "coluna estreita no meio."),
+            medium("F-03", "src/a.rs:1"),
+            visual("F-04", "home-mobile, captura home-desktop", "campos sem estilo."),
+            Finding { location: "Visual: captura vazio".into(), ..visual("F-05", "x", "estado vazio cru.") },
+        ]);
+        let out = consolidate_visual(review, &[]);
+        assert_eq!(out.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-01", "F-02", "F-03"]);
+        let v = &out.findings[1];
+        assert_eq!(v.location, "visual: captura home-desktop, captura home-mobile, captura vazio");
+        assert_eq!(v.description, "coluna estreita no meio. campos sem estilo. estado vazio cru.");
+        assert_eq!(v.severity, "MEDIUM");
+        assert!(v.recommendation.contains("ajustar home-desktop") && v.recommendation.contains("ajustar x"));
+        // O que já estava aberto empresta o id; HIGH (algo quebrado) prevalece com o cenário.
+        let open = Finding { state: Some(FindingState::Open), ..visual("F-07", "a", "texto cortado.") };
+        let high = Finding { severity: "HIGH".into(), failure_scenario: "390px → botão cortado".into(), ..visual("F-09", "b", "sobreposição.") };
+        let out = consolidate_visual(rejected(vec![visual("F-08", "c", "contraste."), open, high]), &[]);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!((out.findings[0].id.as_str(), out.findings[0].severity.as_str()), ("F-07", "HIGH"));
+        assert_eq!(out.findings[0].failure_scenario, "390px → botão cortado");
+        // Um só, ou nenhum, não muda nada.
+        let one = rejected(vec![visual("F-01", "a", "x."), medium("F-02", "visual.css:1")]);
+        assert_eq!(consolidate_visual(one.clone(), &[]), one);
+    }
+
+    #[test]
+    fn visual_finding_follows_the_convergence() {
+        // Spec 127 T04: o apontamento de visual novo na revisão 3 vira observação (critérios atendidos)...
+        let registry = finding_track::track(&[], &[], vec![medium("F-01", "src/a.rs:1")], 1).registry;
+        let late = || ReviewResult {
+            criteria: all_met(),
+            ..rejected(vec![visual("F-02", "home", "coluna estreita."), visual("F-03", "form", "select cru.")])
+        };
+        let (result, obs) = demote_late_new(Lang::PtBr, consolidate_visual(late(), &[]), &registry, CONVERGENCE_FROM_REVIEW);
+        assert_eq!((result.verdict, obs.len()), (Verdict::Approved, 1));
+        assert!(obs[0].location.starts_with("visual: captura home, captura form"), "{:?}", obs[0]);
+        // ...antes dela, reprova (um só);
+        let (result, _) = demote_late_new(Lang::PtBr, consolidate_visual(late(), &[]), &registry, CONVERGENCE_FROM_REVIEW - 1);
+        assert_eq!((result.verdict, result.findings.len()), (Verdict::ChangesRequested, 1));
+        // ...e, se deixa o critério global de visual sem atendimento, continua reprovando.
+        let unmet = ReviewResult { criteria: vec![met("qualidade visual", false)], ..late() };
+        let (result, obs) = demote_late_new(Lang::PtBr, consolidate_visual(unmet, &[]), &registry, CONVERGENCE_FROM_REVIEW);
+        assert_eq!((result.verdict, obs.len()), (Verdict::ChangesRequested, 0));
+        // O aberto de antes também segue bloqueando.
+        let open = Finding { state: Some(FindingState::Open), ..visual("F-01", "home", "coluna estreita.") };
+        let registry = finding_track::track(&[], &[], vec![visual("F-01", "home", "coluna estreita.")], 1).registry;
+        let again = ReviewResult { criteria: all_met(), ..rejected(vec![open]) };
+        assert_eq!(demote_late_new(Lang::PtBr, consolidate_visual(again, &[]), &registry, 4).0.verdict, Verdict::ChangesRequested);
+    }
+
+    #[test]
+    fn visual_finding_keeps_the_registry_id_without_status() {
+        // Revisão da 127/T04 (F-01): o Revisor reutiliza o id do visual aberto sem `status`, depois de
+        // um visual novo. O juntado fica com o id do registro e continua reprovando na revisão 3.
+        let registry = finding_track::track(&[], &[], vec![visual("F-01", "home", "coluna estreita.")], 1).registry;
+        let open_ids = vec!["F-01".to_string()];
+        let fresh = Finding { state: Some(FindingState::New), ..visual("F-04", "form", "select cru.") };
+        let reused = Finding { state: None, ..visual("F-01", "home", "coluna estreita ainda.") };
+        let review = ReviewResult { criteria: all_met(), ..rejected(vec![fresh, reused]) };
+        let merged = consolidate_visual(review, &open_ids);
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(merged.findings[0].id, "F-01");
+        let (result, obs) = demote_late_new(Lang::PtBr, merged, &registry, CONVERGENCE_FROM_REVIEW);
+        assert_eq!((result.verdict, obs.len()), (Verdict::ChangesRequested, 0));
+        assert_eq!(result.findings[0].id, "F-01");
+        // Um novo declarado (`status` new) não empresta o id, mesmo que coincida.
+        let declared = Finding { state: Some(FindingState::New), ..visual("F-01", "a", "x.") };
+        let other = visual("F-05", "b", "y.");
+        let out = consolidate_visual(rejected(vec![other, declared]), &open_ids);
+        assert_eq!(out.findings[0].id, "F-05");
+    }
+
+    #[tokio::test]
+    async fn task_review_keeps_a_single_visual_finding() {
+        // Spec 127 T04: o runner junta os apontamentos de visual antes de registrar a revisão.
+        let fx = Fixture::new("visual-um", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|n, _| {
+            if n == 0 {
+                rejected(vec![visual("F-01", "home", "coluna estreita."), visual("F-02", "form", "select cru."), visual("F-03", "vazio", "vazio cru.")])
+            } else {
+                approved(vec![])
+            }
+        });
+        let rec = Recorder::default();
+        let outcome = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        let prior = rev.inputs()[1].prior_findings.clone();
+        assert!(prior.contains("F-01") && !prior.contains("F-02") && !prior.contains("F-03"), "{prior}");
+        assert!(prior.contains("visual: captura home, captura form, captura vazio"), "{prior}");
+    }
+
+    /// Revisão da 127/T02 (F-01): a regressão de um resolvido, com id novo, outra linha e outra
+    /// redação, continua reprovando na revisão 3.
+    #[test]
+    fn late_new_rule_keeps_blocking_a_resolved_finding_that_returns_rewritten() {
+        let old = Finding { description: "Falha de validação não confere o evento SSE. Detalhe.".into(), ..medium("F-01", "tests/api/plays.test.ts:65") };
+        let r1 = finding_track::track(&[], &[], vec![old], 1);
+        let r2 = finding_track::track(&r1.registry, &r1.open, vec![finding("F-02")], 2);
+        assert_eq!(finding_track::next_review(&r2.registry), 3);
+        let back = Finding {
+            state: Some(FindingState::New),
+            description: "A validação que falha não confere o evento SSE".into(),
+            ..medium("F-07", "tests/api/plays.test.ts:120")
+        };
+        let review = ReviewResult { criteria: all_met(), ..rejected(vec![back]) };
+        let (result, obs) = demote_late_new(Lang::PtBr, review, &r2.registry, 3);
+        assert_eq!((result.verdict, result.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 0));
+    }
+
+    #[test]
+    fn late_new_observation_with_a_taken_id_gets_a_free_number() {
+        let registry = finding_track::track(&[], &[], vec![medium("F-01", "src/a.rs:1")], 1).registry;
+        let reused = Finding { state: Some(FindingState::New), ..medium("F-01", "src/z.rs:3") };
+        let review = ReviewResult { criteria: all_met(), ..rejected(vec![finding("F-02"), reused]) };
+        let (_, obs) = demote_late_new(Lang::PtBr, review, &registry, 3);
+        assert_eq!(obs.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-03"]);
+    }
+
+    #[test]
+    fn final_observations_facts_list_tasks_and_are_bounded() {
+        let mut a = task("T01", TaskStatus::Done, &[]);
+        a.body = replace_section(&a.body, FINAL_OBSERVATIONS, Some("- F-05 [MEDIUM] src/a.rs:1: falta X".into()));
+        let b = task("T02", TaskStatus::Done, &[]);
+        assert_eq!(final_observations_facts(&[a.clone(), b]), "- T01: F-05 [MEDIUM] src/a.rs:1: falta X\n");
+        assert_eq!(final_observations_facts(&[task("T03", TaskStatus::Done, &[])]), "");
+        let many = (0..200).map(|i| format!("- F-{i:02} [MEDIUM] src/a.rs:1: {}", "x".repeat(60))).collect::<Vec<_>>().join("\n");
+        a.body = replace_section(&a.body, FINAL_OBSERVATIONS, Some(many));
+        let facts = final_observations_facts(&[a]);
+        assert!(facts.len() <= FINAL_OBSERVATIONS_MAX_BYTES + 32, "{}", facts.len());
+        assert!(facts.contains("… e mais "), "{facts}");
+    }
+
+    /// Spec 127 T02: a sequência da T05 do Test 5. Cada revisão traz MEDIUM novos nos arquivos que o
+    /// Desenvolvedor acabou de mudar; a partir da 3ª, eles viram observação, a tarefa é aprovada e as
+    /// observações chegam à verificação final da spec.
+    #[tokio::test]
+    async fn moving_target_converges_from_third_review_and_reaches_final_verification() {
+        let fx = Fixture::new("alvo-movel", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, i| {
+            if i.task_id == "FINAL" {
+                return matrix(true);
+            }
+            let n = i.review_number;
+            let pair = vec![
+                medium(&format!("F-{:02}", 2 * n - 1), &format!("out-T01-{n}.txt:1")),
+                medium(&format!("F-{:02}", 2 * n), &format!("out-T01-{n}.txt:2")),
+            ];
+            ReviewResult { criteria: all_met(), ..rejected(pair) }
+        });
+        let rec = Recorder::default();
+        let out = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_spec(SPEC).await.unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        let inputs = rev.inputs();
+        let numbers: Vec<u32> = inputs.iter().filter(|i| i.task_id == "T01").map(|i| i.review_number).collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+        let texts = reviewer_texts(&rec);
+        assert!(texts[0].starts_with("Pediu ajustes: ") && texts[1].starts_with("Pediu ajustes: "), "{texts:?}");
+        assert!(texts[2].starts_with("Aprovado: "), "{}", texts[2]);
+        assert!(texts[2].contains(&format!("{OBSERVATIONS_HEADER}\n- F-05 [MEDIUM] out-T01-3.txt:1")), "{}", texts[2]);
+        assert!(!texts[2].contains(FINDINGS_HEADER), "o id aparece só como observação: {}", texts[2]);
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Done);
+        assert!(section_text(&t.body, OBSERVATIONS).unwrap_or_default().contains("F-06"));
+        let kept = section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default();
+        assert!(kept.contains("F-05") && kept.contains("F-06") && !kept.contains("F-04"), "{kept}");
+        let last = inputs.last().unwrap();
+        assert_eq!((last.task_id.as_str(), last.review_number), ("FINAL", 0));
+        assert!(last.task_observations.contains("- T01: F-05 [MEDIUM] out-T01-3.txt:1"), "{}", last.task_observations);
+        assert!(inputs.iter().filter(|i| i.task_id == "T01").all(|i| i.task_observations.is_empty()));
+    }
+
+    /// Spec 127 T02: a verificação final que acha importante uma observação rebaixada reabre o trabalho.
+    #[tokio::test]
+    async fn final_verification_can_reopen_work_from_a_demoted_observation() {
+        let fx = Fixture::new("alvo-movel-reabre", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, i| match i.task_id.as_str() {
+            // A 1ª rodada da verificação final vê a observação e marca o critério global not_met.
+            "FINAL" => matrix(!i.task_observations.contains("F-05") || i.other_tasks.contains("T02")),
+            "T01" => {
+                let n = i.review_number;
+                let pair = vec![
+                    medium(&format!("F-{:02}", 2 * n - 1), &format!("out-T01-{n}.txt:1")),
+                    medium(&format!("F-{:02}", 2 * n), &format!("out-T01-{n}.txt:2")),
+                ];
+                ReviewResult { criteria: all_met(), ..rejected(pair) }
+            }
+            _ => approved(vec![]),
+        });
+        let gate = Arc::new(Gate(true, Default::default()));
+        let rec = Recorder::default();
+        let out = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_final_gate(gate).run_spec(SPEC).await.unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        assert_eq!(fx.read_task("T02").frontmatter.title, "Correção da verificação final");
+        assert_eq!(fx.read_task("T02").frontmatter.status, TaskStatus::Done);
+    }
+
+    /// Spec 127 T02: a partir da 3ª revisão, HIGH novo e critério não atendido continuam reprovando.
+    #[tokio::test]
+    async fn moving_target_with_high_or_unmet_criterion_keeps_rejecting() {
+        for case in ["high", "unmet"] {
+            let fx = Fixture::new(&format!("alvo-movel-{case}"), "true");
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let dev = FakeDev::default();
+            let rev = FakeReviewer::new(move |_, i| {
+                let n = i.review_number;
+                let mut list = vec![medium(&format!("F-{:02}", 2 * n - 1), &format!("out-T01-{n}.txt:1"))];
+                let mut criteria = all_met();
+                if case == "high" {
+                    list.push(Finding { location: format!("out-T01-{n}.txt:5"), ..finding(&format!("F-{:02}", 2 * n)) });
+                } else {
+                    criteria = vec![met("arquivo criado", false)];
+                }
+                ReviewResult { criteria, ..rejected(list) }
+            });
+            let rec = Recorder::default();
+            let outcome = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+            assert!(matches!(outcome, Outcome::Blocked { .. }), "{case}: {outcome:?}");
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.attempts, 3, "{case}");
+            let texts = reviewer_texts(&rec);
+            assert!(texts[2].starts_with("Pediu ajustes: "), "{case}: {}", texts[2]);
+            if case == "unmet" {
+                assert!(texts[2].contains("- F-05 [MEDIUM"), "{}", texts[2]);
+                assert!(section_text(&t.body, FINAL_OBSERVATIONS).is_none());
+            } else {
+                assert!(texts[2].contains("- F-06 [HIGH"), "{}", texts[2]);
+                // O MEDIUM novo da 3ª revisão vira observação mesmo com o HIGH bloqueando.
+                assert!(section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default().contains("F-05"));
+            }
+        }
     }
 
     #[test]
@@ -12834,6 +13384,142 @@ mod tests {
         assert!(log.starts_with(&format!("- {expected}")), "{log}");
         assert_eq!(tests.count_in(&fx.worktree("T01"), "make deps && make test"), 2, "o comando roda como foi aprovado");
         assert_eq!(read_settings(&fx.settings_path()).unwrap().test_command, "make deps && make test");
+    }
+
+    /// Spec 127 T03: o formatador e a checagem que começam com o `install_command` têm o mesmo aviso,
+    /// na tarefa e na conversa, uma vez por comando, e os comandos aprovados não mudam.
+    #[tokio::test]
+    async fn formatter_and_check_repeating_the_install_are_warned_once_and_left_unchanged() {
+        let fx = Fixture::new("install-repeated-steps", "make test");
+        edit_settings(&fx, |s| {
+            s.install_command = Some("make deps".into());
+            s.formatters = vec![formatter("fmt", "make deps && make fmt", ".", &["**"])];
+            s.checks = vec![check("lint", "make deps; make lint", true)];
+        });
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let tests = CmdTests::default();
+        let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let fmt = "Aviso: o formatters[fmt].command (`make deps && make fmt`) começa com o install_command (`make deps`), que o Nants já roda antes da sessão do Desenvolvedor e de cada checagem";
+        let lint = "Aviso: o checks[lint].command (`make deps; make lint`) começa com o install_command (`make deps`)";
+        let texts = tests_texts(&rec);
+        for expected in [fmt, lint] {
+            assert_eq!(texts.iter().filter(|t| t.starts_with(expected)).count(), 1, "uma vez, mesmo com duas tentativas: {texts:?}");
+        }
+        assert!(texts.iter().all(|t| !t.starts_with("Aviso: o test_command")), "{texts:?}");
+        let log = section_text(&fx.read_task("T01").body, INSTALL_SECTION).expect("aviso na tarefa");
+        let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].starts_with(&format!("- {fmt}")) && lines[1].starts_with(&format!("- {lint}")), "{log}");
+        assert!(tests.commands().iter().any(|c| c == "make deps; make lint"), "a checagem roda como foi aprovada");
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        assert_eq!(settings.formatters[0].command, "make deps && make fmt");
+        assert_eq!(settings.checks[0].command, "make deps; make lint");
+    }
+
+    /// Executor falso em que o formatador sai com 2 e uma saída longa: o erro real no começo e uma
+    /// cauda cheia de avisos do gerenciador de pacotes (o caso do Test 5). O resto passa.
+    struct NoisyFormatter;
+
+    impl TestExecutor for NoisyFormatter {
+        fn run<'a>(&'a self, _dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                if command.contains("prettier") {
+                    let mut output = String::from("[error] Unable to write file \"x.yaml\": EROFS read-only\n");
+                    for i in 0..60 {
+                        output.push_str(&format!("npm notice New minor version of npm available! line {i}\n"));
+                    }
+                    output.push_str("npm notice To update run: npm install -g npm@11.21.1\n");
+                    return Ok(TestResult { passed: false, output, exit_code: Some(2), timed_out: false });
+                }
+                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false })
+            })
+        }
+    }
+
+    /// Spec 127 T03: a falha do formatador mostra o começo da saída (o erro real) e o fim, e não só a
+    /// cauda dos avisos; a saída curta continua inteira.
+    #[tokio::test]
+    async fn failing_formatter_message_keeps_the_start_and_the_end_of_the_output() {
+        let fx = Fixture::new("fmt-head-tail", "true");
+        set_formatters(&fx, vec![formatter("prettier", "npm exec -- prettier --write .", ".", &["**"])]);
+        fx.add_task(&module_task());
+        let rec = Recorder::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(FilesDev(vec![("web/a.txt", "abc\n")])),
+            Box::new(FakeReviewer::new(|_, _| approved(vec![]))),
+            Box::new(NoisyFormatter),
+            Box::new(rec.clone()),
+        );
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let texts = tests_texts(&rec);
+        let failed: Vec<&String> = texts.iter().filter(|t| t.starts_with("formatação automática (prettier) falhou (não bloqueia): saída 2: ")).collect();
+        assert_eq!(failed.len(), 1, "{texts:?}");
+        let text = failed[0];
+        assert!(text.contains("saída 2: [error] Unable to write file \"x.yaml\": EROFS read-only"), "o erro real no começo: {text}");
+        assert!(text.contains("\n[…]\n"), "{text}");
+        assert!(text.ends_with("npm notice To update run: npm install -g npm@11.21.1"), "o fim da saída: {text}");
+        assert!(text.len() < 900, "{}", text.len());
+    }
+
+    /// Executor falso com o erro do Test 5: o formatador tenta escrever em `.nants/` (só leitura),
+    /// e a saída começa com os avisos do npm. O resto passa.
+    struct ReadonlyFormatter;
+
+    impl TestExecutor for ReadonlyFormatter {
+        fn run<'a>(&'a self, _dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                if command.contains("prettier") {
+                    let output = "npm notice\nnpm notice New minor version of npm available! 11.6.1 -> 11.21.1\n\
+                                  npm notice To update run: npm install -g npm@11.21.1\nnpm notice\n\
+                                  [error] Unable to write file \".nants/compose.yaml\":\n\
+                                  [error] EROFS: read-only file system, open '/work/.nants/compose.yaml'\n";
+                    return Ok(TestResult { passed: false, output: output.into(), exit_code: Some(2), timed_out: false });
+                }
+                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false })
+            })
+        }
+    }
+
+    /// Spec 127 T03: o formatador que falha por escrever numa pasta do Nants só leitura tem o
+    /// diagnóstico claro na conversa e na tarefa, e o Desenvolvedor o recebe na tentativa seguinte.
+    #[tokio::test]
+    async fn formatter_writing_into_a_readonly_nants_folder_is_diagnosed_for_the_developer() {
+        let fx = Fixture::new("fmt-readonly-nants", "true");
+        set_formatters(&fx, vec![formatter("prettier", "npm exec -- prettier --write .", ".", &["**"])]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, ReadonlyFormatter, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let diagnosis = "o formatador prettier tentou alterar `.nants/`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`)";
+        let texts = tests_texts(&rec);
+        let failed: Vec<&String> = texts.iter().filter(|t| t.starts_with("formatação automática (prettier) falhou (não bloqueia): ")).collect();
+        assert_eq!(failed.len(), 1, "{texts:?}");
+        assert!(failed[0].starts_with(&format!("formatação automática (prettier) falhou (não bloqueia): {diagnosis}")), "{}", failed[0]);
+        assert!(failed[0].contains("saída 2: npm notice") && failed[0].contains("EROFS"), "{}", failed[0]);
+        let log = section_text(&fx.read_task("T01").body, FORMAT_SECTION).expect("diagnóstico na tarefa");
+        assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 1, "uma vez, com duas tentativas: {log}");
+        assert!(log.starts_with(&format!("- {diagnosis}")), "{log}");
+        let briefs = dev.briefs();
+        assert!(!briefs[0].formatters.contains("tentou alterar"), "{}", briefs[0].formatters);
+        assert!(briefs[1].formatters.starts_with("- prettier: `npm exec -- prettier --write .`"), "{}", briefs[1].formatters);
+        assert!(briefs[1].formatters.contains(diagnosis), "{}", briefs[1].formatters);
+    }
+
+    #[test]
+    fn readonly_diagnosis_is_written_by_hand_in_english_too() {
+        let en = i18n::tr(crate::i18n::Lang::En, "runner.format.readonly_nants", &[("name", "prettier"), ("dir", ".nants/")]);
+        assert!(en.starts_with("the prettier formatter tried to change `.nants/`, which is read-only;"), "{en}");
+    }
+
+    #[test]
+    fn head_tail_bytes_keeps_short_output_and_cuts_at_char_boundaries() {
+        assert_eq!(head_tail_bytes("curto", 3, 3), "curto");
+        let text = format!("início{}fim", "é".repeat(50));
+        let out = head_tail_bytes(&text, 8, 6);
+        assert!(out.starts_with("início") && out.ends_with("éfim") && out.contains("\n[…]\n"), "{out}");
     }
 
     /// Executor em que os comandos de `needs` saem com 127 (`tsc: not found`) na pasta em que o

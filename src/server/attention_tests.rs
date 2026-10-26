@@ -432,7 +432,7 @@ async fn plan_stage_parity_fixture_matches_the_server_rule() {
     let fixture: Value = serde_json::from_str(PARITY_FIXTURE).expect("fixture");
     assert_eq!(fixture["spec_status"], "AWAITING_APPROVAL");
     let cases = fixture["cases"].as_array().expect("cases");
-    assert_eq!(cases.len(), 24, "turno (2) × revisão (6) × execução (2)");
+    assert_eq!(cases.len(), 28, "turno (2) × revisão (7) × execução (2)");
     for (i, case) in cases.iter().enumerate() {
         let running = case["running"].as_bool().expect("running");
         let turn_open = case["turn_open"].as_bool().expect("turn_open");
@@ -446,7 +446,9 @@ async fn plan_stage_parity_fixture_matches_the_server_rule() {
         let base = if review.is_some() { state_with_reviewer(&dir, &["p"]) } else { state_with(&dir, &["p"]) };
         let state = base.with_report_backend(gated.clone());
         let root = dir.join("p");
-        sdd_project(&root, "AWAITING_APPROVAL", &[("T01", "TODO", "")]);
+        // `incomplete` (spec 127 T01): a spec em aprovação sem nenhuma tarefa.
+        let tasks: &[(&str, &str, &str)] = if review == Some("incomplete") { &[] } else { &[("T01", "TODO", "")] };
+        sdd_project(&root, "AWAITING_APPROVAL", tasks);
         let mut reviews = Vec::new();
         match review {
             Some(status @ ("ok" | "unavailable")) => write_review(&root, status),

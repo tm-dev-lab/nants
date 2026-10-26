@@ -60,6 +60,9 @@ pub enum BadKind {
     /// Resposta `completed` da geração de imagem sem imagem legível (spec 094). Não se repete: a
     /// geração pode ter sido cobrada.
     ImageUnreadable,
+    /// Conexão que caiu no meio da resposta, depois de algo já entregue (spec 127 T01). Só nomeia
+    /// a nova tentativa: o erro final continua sendo o de transporte.
+    Transport,
 }
 
 impl BadKind {
@@ -77,11 +80,12 @@ impl BadKind {
             BadKind::Throttled => "throttled",
             BadKind::ImageUnsupported => "image_unsupported",
             BadKind::ImageUnreadable => "image_unreadable",
+            BadKind::Transport => "transport",
         }
     }
 
     /// Todos os tipos, na ordem da declaração.
-    pub const ALL: [BadKind; 11] = [
+    pub const ALL: [BadKind; 12] = [
         BadKind::InvalidJson,
         BadKind::ProviderError,
         BadKind::Incomplete,
@@ -93,6 +97,7 @@ impl BadKind {
         BadKind::Throttled,
         BadKind::ImageUnsupported,
         BadKind::ImageUnreadable,
+        BadKind::Transport,
     ];
 
     /// Rótulo curto no idioma `lang`, do dicionário (`provider.kind.<kind>`, spec 119).
@@ -248,7 +253,7 @@ impl BadReason {
     }
 
     /// Motivo que vale repetir: lado do provedor, possivelmente passageiro (`throttled` também, mas
-    /// com o cronograma próprio de limite). `too_large`,
+    /// com o cronograma próprio de limite; `transport`, a conexão que caiu no meio, spec 127 T01). `too_large`,
     /// `unsupported_status`, `steps_exhausted`, `image_unsupported` e `image_unreadable` (spec 094:
     /// nunca repetir uma geração possivelmente cobrada) não se repetem; `max_output_tokens` nem chega aqui
     /// (vira resposta truncada).
@@ -261,6 +266,7 @@ impl BadReason {
                 | BadKind::NoFinal
                 | BadKind::InvalidJson
                 | BadKind::Throttled
+                | BadKind::Transport
         )
     }
 }

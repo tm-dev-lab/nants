@@ -478,6 +478,7 @@ export const en: Record<MessageKey, string> = {
   "provider.kind.throttled": "provider at its limit",
   "provider.kind.image_unsupported": "image generation unavailable",
   "provider.kind.image_unreadable": "the provider did not return a readable image (it may have charged)",
+  "provider.kind.transport": "the connection dropped mid-response",
   "provider.kind.http_code": "code",
 
   "system.run.stopped": "Run stopped by the user. Use Continue to resume.",
@@ -512,6 +513,10 @@ export const en: Record<MessageKey, string> = {
     "Warning: could not delete the worktree {path}: {error}. The task is integrated; remove the folder manually (git worktree remove --force) when possible",
   "system.final.skipped": "Warning: the final verification was not run because the spec budget was reached; the spec will be completed without it.",
   "system.final.unavailable": "Final verification unavailable; completing without it.",
+  "system.chat.connection_lost":
+    "The connection to the provider dropped before the Architect finished this turn, and nothing was saved. Use Try again to have it continue where it stopped.",
+  "system.chat.connection_lost_saved":
+    "The connection to the provider dropped before the Architect finished this turn. What it had already written was saved in spec {spec}, but the plan may be incomplete. Use Try again to have it continue where it stopped.",
   "system.final.still_unmet": "Warning: the final verification still points to unmet criteria after the fix round; the spec will be completed anyway.",
   "system.final.fix_refused": "Warning: fix task refused; the spec will be completed with unmet criteria.",
   "system.final.fix_created": "Final verification: created task {task} ({title}) for the unmet criteria.",
@@ -908,6 +913,9 @@ export const en: Record<MessageKey, string> = {
   "plan.footNote": "Independent code review and Squash Merge enabled",
   "plan.drafting": "Plan in progress…",
   "plan.architectCompleting": "The Architect is completing the plan.",
+  "plan.incomplete.text":
+    "Incomplete plan: the spec has no tasks saved. The Architect's turn was probably interrupted before it finished, and approval stays blocked until the tasks exist.",
+  "plan.incomplete.finish": "Ask the Architect to finish",
   "plan.readyBadge": "Plan ready to approve",
   "plan.noPlan": "no plan",
   "plan.stage.planning": "planning",
@@ -965,6 +973,7 @@ export const en: Record<MessageKey, string> = {
   "plan.review.reviewing": "reviewing",
   "plan.review.noAnswer": "no answer yet",
   "plan.review.unavailableShort": "unavailable",
+  "plan.review.incomplete": "not reviewed: the plan has no tasks",
   "plan.review.fixButton": "Ask for a fix",
   "plan.review.fixPrefix": "Fix these points from the plan checks:",
   "plan.review.waitingReason": "waiting for the Reviewer",

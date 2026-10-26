@@ -89,6 +89,14 @@ and you decide at every step.
   always installs from scratch, and the evidence says how the install went.
 - **Browser testing.** The generated app is opened in a real browser, with screenshots that you
   and the Reviewer can see.
+- **Visual quality.** Projects with an interface follow a short visual baseline (use of the desktop
+  width, styled form controls, clear type and spacing, finished empty and error states, contrast,
+  nothing cut off on mobile): the Architect adds it to the plan as a global criterion, the
+  Developer checks its screenshots against it, and the Reviewer raises at most one consolidated
+  visual finding per review.
+- **Dropped connections.** If the connection to the provider drops before the Architect finishes a
+  turn, the Conversation says so with a **Try again** button, and a plan left with no tasks shows
+  as **Incomplete plan** on its card, with a button that asks the Architect to finish it.
 - **Cost per task.** Token usage and an estimated cost in dollars for each spec, task and agent.
   Nants also trims and summarizes the agents' history on its own, so they spend less without
   losing what matters, and the Context area of the Costs window shows the effect, with an

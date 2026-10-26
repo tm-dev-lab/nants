@@ -213,25 +213,70 @@ async fn stream_503_before_any_delta_is_retried() {
     assert_eq!(deltas.lock().expect("lock").len(), 1);
 }
 
-#[tokio::test]
-async fn stream_failure_after_delta_is_not_retried() {
-    // Corpo chunked interrompido depois do primeiro delta: erro de transporte sem nova tentativa.
-    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"ol\"}}]}\n\n";
-    let broken = format!(
+/// Corpo chunked que entrega `chunk` e cai (sem o pedaço final): erro de transporte no meio.
+fn cut_after(chunk: &str) -> String {
+    format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk}\r\n",
         chunk.len()
-    );
-    let (base, count) = server(vec![broken, http(200, "", "application/json", OK_CHAT)]).await;
+    )
+}
+
+/// Spec 127 T01: a conexão que cai depois do primeiro delta conta como resposta ruim (`transport`):
+/// o mesmo pedido é reenviado, com a espera das respostas ruins e o aviso de nova tentativa.
+#[tokio::test]
+async fn stream_failure_after_delta_is_retried_as_bad_response() {
+    let broken = cut_after("data: {\"choices\":[{\"delta\":{\"content\":\"ol\"}}]}\n\n");
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"olá\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (base, count) = server(vec![broken, http(200, "", "text/event-stream", sse)]).await;
     let (sleep, waits) = recorder();
     let deltas = Mutex::new(Vec::new());
-    let err = client(base, sleep)
+    let got = client(base, sleep)
         .chat_stream(&req(), &|d| deltas.lock().expect("lock").extend(super::not_size(d)))
         .await
-        .expect_err("erro sobe");
+        .expect("sucesso na nova tentativa");
+    assert_eq!(got.message.content, "olá");
+    assert_eq!(*count.lock().expect("lock"), 2);
+    assert_eq!(*waits.lock().expect("lock"), secs(&[2]));
+    let notice = retry_notice(&BadReason::new(BadKind::Transport), 1);
+    assert_eq!(
+        *deltas.lock().expect("lock"),
+        vec![StreamDelta::Text("ol".into()), StreamDelta::Retry(notice), StreamDelta::Text("olá".into())]
+    );
+}
+
+/// Spec 127 T01: o limite é o das respostas ruins ([`BAD_RESPONSE_RETRIES`]); esgotado, o erro de
+/// transporte sobe.
+#[tokio::test]
+async fn stream_failure_after_delta_stops_at_the_bad_response_limit() {
+    let broken = cut_after("data: {\"choices\":[{\"delta\":{\"content\":\"ol\"}}]}\n\n");
+    let (base, count) = server(vec![broken.clone(), broken.clone(), broken, http(200, "", "application/json", OK_CHAT)]).await;
+    let (sleep, waits) = recorder();
+    let err = client(base, sleep).chat_stream(&req(), &|_| {}).await.expect_err("esgotado");
     assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
-    assert_eq!(*count.lock().expect("lock"), 1);
-    assert!(waits.lock().expect("lock").is_empty());
-    assert_eq!(*deltas.lock().expect("lock"), vec![StreamDelta::Text("ol".into())]);
+    assert_eq!(*count.lock().expect("lock"), 1 + BAD_RESPONSE_RETRIES);
+    assert_eq!(*waits.lock().expect("lock"), secs(&[2, 8]));
+}
+
+/// Spec 127 T01: a chamada de ferramenta que veio pela metade na resposta cortada não sobra: a
+/// resposta final tem só a da nova tentativa (nada se duplica).
+#[tokio::test]
+async fn stream_cut_mid_tool_call_does_not_duplicate_the_call() {
+    let broken = cut_after(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"vou\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_sdd_artifacts\",\"arguments\":\"{\\\"a\"}}]}}]}\n\n",
+    );
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"vou\",\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"write_sdd_artifacts\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base, count) = server(vec![broken, http(200, "", "text/event-stream", sse)]).await;
+    let (sleep, _) = recorder();
+    let got = client(base, sleep).chat_stream(&req(), &|_| {}).await.expect("ok");
+    assert_eq!(*count.lock().expect("lock"), 2);
+    assert_eq!(got.message.content, "vou");
+    assert_eq!(got.message.tool_calls.len(), 1, "sem duplicar a chamada");
+    assert_eq!(got.message.tool_calls[0].id, "c2");
+    assert_eq!(got.message.tool_calls[0].arguments, "{}");
 }
 
 #[tokio::test]
