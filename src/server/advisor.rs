@@ -20,7 +20,7 @@ use super::projects::scrub_text;
 use crate::agents::arch_memory;
 use crate::agents::architect::truncate_bytes;
 use crate::agents::chat::ChatBackend;
-use crate::agents::llm_client::{ChatMessage, ChatRequest, Role as ChatRole};
+use crate::agents::llm_client::{log_provider_failure, provider_failure, ChatMessage, ChatRequest, ProviderFailure, Role as ChatRole};
 use crate::agents::prompts::{output_language_rule, with_writing_style, ADVICE_RECOVERY_RULE};
 use crate::agents::runner::{
     latest_recovery, section_text, validate_text_block, ADVICE_SECTION, EventSink, RunnerEvent, TaskEditor, ACCEPTANCE, OBJECTIVE,
@@ -171,7 +171,9 @@ impl ArchitectAdvisor {
         )
     }
 
-    async fn call_model(&self, ctx: &AskContext, briefing: String) -> Result<String, String> {
+    /// Resposta do modelo, ou a causa fixa da falha (spec 129 T03): o erro do provedor vira o código
+    /// da 088/119 (nunca texto remoto) e vai ao log técnico; o tempo esgotado é `provider_timeout`.
+    async fn call_model(&self, ctx: &AskContext, briefing: String) -> Result<String, ProviderFailure> {
         let metered = UsageBackend::new(
             self.backend.as_ref(),
             self.usage.as_ref().map(|sink| {
@@ -193,9 +195,39 @@ impl ArchitectAdvisor {
         };
         match tokio::time::timeout(ASK_TIMEOUT, metered.complete(&req)).await {
             Ok(Ok(resp)) => Ok(resp.message.content),
-            Ok(Err(_)) => Err("falha ao consultar o modelo".to_string()),
-            Err(_) => Err("tempo esgotado".to_string()),
+            Ok(Err(err)) => {
+                let failure = provider_failure(&err);
+                log_provider_failure("architect", &self.model, &failure);
+                Err(failure)
+            }
+            Err(_) => {
+                log_provider_failure("architect", &self.model, &ProviderFailure::Timeout);
+                Err(ProviderFailure::Timeout)
+            }
         }
+    }
+
+    /// Falha da pergunta (spec 129 T03): a linha do Arquiteto na conversa e o registro na tarefa
+    /// ("Orientações do Arquiteto"), com o código do erro do provedor no idioma do projeto. Devolve
+    /// o motivo para a ferramenta.
+    fn report_failure(&self, ctx: &AskContext, who: &str, shown_question: &str, failure: &ProviderFailure) -> String {
+        let lang = self.lang.get();
+        let line = tr(lang, "advisor.failed", &[("reason", &failure_reason(lang, failure))]);
+        let entry = format!("### Pergunta ({who})\n{}\n\nResposta: {}", flatten(shown_question), flatten(&line));
+        if let Err(e) = self.editor.apply_advice_report(&ctx.spec_id, &ctx.task_id, &entry, &[], None) {
+            eprintln!("nants: registro da falha do Arquiteto não gravado: {e}");
+        }
+        self.say("architect", &ctx.task_id, line);
+        failure.describe()
+    }
+}
+
+/// Motivo da falha no idioma `lang`: o código fixo (`provider_http_400`) e, quando houver, o detalhe
+/// do dicionário entre parênteses (`provider_bad_response (incompleta: content_filter)`).
+fn failure_reason(lang: crate::i18n::Lang, failure: &ProviderFailure) -> String {
+    match failure.detail_in(lang) {
+        Some(detail) => format!("{failure} ({detail})"),
+        None => failure.to_string(),
     }
 }
 
@@ -292,8 +324,15 @@ impl Advisor for ArchitectAdvisor {
             let shown_question = scrub_text(&self.secrets, question);
             self.say(who, &ctx.task_id, tr(self.lang.get(), "advisor.question", &[("question", &shown_question)]));
             let raw = tokio::select! {
-                raw = self.call_model(ctx, self.briefing(ctx, question)) => raw?,
-                () = super::approvals::wait_stop(self.stop.clone()) => return Err(ASK_CANCELLED.to_string()),
+                raw = self.call_model(ctx, self.briefing(ctx, question)) => match raw {
+                    Ok(raw) => raw,
+                    Err(failure) => return Err(self.report_failure(ctx, who, &shown_question, &failure)),
+                },
+                () = super::approvals::wait_stop(self.stop.clone()) => {
+                    // Parada pedida: a pergunta mostrada ganha a linha de falha; nada vai à tarefa.
+                    self.say("architect", &ctx.task_id, crate::i18n::text(self.lang.get(), "advisor.stopped"));
+                    return Err(ASK_CANCELLED.to_string());
+                }
             };
             let parsed = parse_reply(&raw);
             let answer = truncate_bytes(&scrub_text(&self.secrets, &parsed.answer), MAX_ANSWER_BYTES).to_string();
@@ -610,6 +649,67 @@ mod tests {
         assert_eq!(crate::i18n::text(Lang::PtBr, "advisor.scope_limit_notice"), crate::harness::tools::SCOPE_LIMIT_NOTICE);
         assert_eq!(refusal_text(Lang::En, &covered), "`src/a.rs` already covered by `src/**`");
         assert_eq!(refusal_text(Lang::En, &limit), "`deps.edn` not added: limit of 32 entries in allowed_scope");
+    }
+
+    /// Falha fixa do provedor (HTTP 400, como a recusa do `json_object` sem "json" no input).
+    struct Failing;
+
+    impl ChatBackend for Failing {
+        fn complete<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::agents::llm_client::ChatResponse, crate::agents::LlmError>> + Send + 'a>> {
+            Box::pin(async {
+                Err(crate::agents::LlmError::Http { status: 400, body_snippet: "texto remoto qualquer".into(), code: None })
+            })
+        }
+    }
+
+    /// Spec 129 T03: a falha do modelo aparece na conversa e na tarefa com o código do erro do
+    /// provedor, sem texto remoto, no idioma do projeto; a ferramenta recebe o motivo.
+    #[tokio::test]
+    async fn failure_is_shown_in_conversation_and_task_with_the_code() {
+        let settings = "base_branch: main\nmerge_strategy: squash\ntest_command: cargo test\n";
+        let ctx = AskContext { spec_id: "s".into(), task_id: "T01".into(), asker: Role::Developer };
+        for (lang, tag, line) in [
+            (crate::i18n::Lang::PtBr, "falha-pt", "architect: Não consegui responder: provider_http_400"),
+            (crate::i18n::Lang::En, "falha-en", "architect: I could not answer: provider_http_400"),
+        ] {
+            let root = advisor_root(tag, settings);
+            let events = Arc::new(Mem::default());
+            let advisor = ArchitectAdvisor::new(
+                Arc::new(Failing),
+                "arq",
+                None,
+                root.clone(),
+                Arc::new(SecretSet::new(Vec::<String>::new())),
+                TaskEditor::new(root.clone(), Default::default()),
+                events.clone(),
+            )
+            .with_lang(crate::i18n::SharedLang::new(lang));
+            let err = advisor.ask(&ctx, "posso usar pip?").await.expect_err("falha");
+            assert_eq!(err, "provider_http_400");
+            let said = events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            assert_eq!(said.len(), 2, "{said:?}");
+            assert_eq!(said[1], line);
+            assert!(!said.iter().any(|t| t.contains("texto remoto")), "{said:?}");
+            let task = read_task(&root.join(".sdd/specs/s/tasks/T01.md")).expect("T01");
+            let history = section_text(&task.body, ADVICE_SECTION).expect("histórico");
+            let reason = line.trim_start_matches("architect: ");
+            assert!(history.contains(&format!("### Pergunta (developer)\nposso usar pip?\n\nResposta: {reason}")), "{history}");
+            assert!(history.contains("Resposta: mantenha o lock"), "o registro anterior fica: {history}");
+            assert!(!history.contains("texto remoto"), "{history}");
+        }
+    }
+
+    #[test]
+    fn failure_reason_uses_the_dictionary_detail() {
+        use crate::agents::llm_client::{BadKind, BadReason};
+        use crate::i18n::Lang;
+        let bad = ProviderFailure::BadResponse(BadReason::with_code(BadKind::Incomplete, Some("content_filter")));
+        assert_eq!(failure_reason(Lang::PtBr, &bad), bad.describe());
+        assert!(failure_reason(Lang::En, &bad).starts_with("provider_bad_response ("));
+        assert_eq!(failure_reason(Lang::En, &ProviderFailure::Timeout), "provider_timeout");
     }
 
     #[test]

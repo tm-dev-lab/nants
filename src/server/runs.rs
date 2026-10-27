@@ -3969,7 +3969,7 @@ mod tests {
             .expect("projeto docker");
         state
             .apps()
-            .launch_docker(PROJECT, &root, "outra", compose, "npm run dev")
+            .launch_docker(PROJECT, &root, "outra", compose, "npm run dev", 3000)
             .await
             .expect("app de teste");
         assert!(state.apps().is_running(PROJECT));
@@ -8108,7 +8108,9 @@ mod tests {
                 for entry in fs::read_dir(&dir).expect("dir").flatten() {
                     let path = entry.path();
                     let rel = path.strip_prefix(root).expect("rel").display().to_string();
-                    if rel == ".git" || rel.ends_with("dialog.jsonl") || rel.ends_with("report.md") {
+                    // A pasta pessoal do workspace (129/T01) é do Nants, fora do escopo das tarefas, e
+                    // nasce no primeiro comando, em paralelo com a foto "antes".
+                    if rel == ".git" || crate::harness::home::is_home_path(&rel) || rel.ends_with("dialog.jsonl") || rel.ends_with("report.md") {
                         continue;
                     }
                     if path.is_dir() {

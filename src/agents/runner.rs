@@ -52,6 +52,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::agents::finding_reply::{self, FindingResponse, ARBITRATION_LOG, RESPONSES, SPEC_DECISIONS};
+use crate::agents::markers;
 use crate::agents::finding_track::{self, REGISTRY};
 use crate::agents::llm_client::ProviderFailure;
 use crate::agents::usage::BudgetGuard;
@@ -442,6 +443,47 @@ pub const REUSE_SECTION: &str = "Testes reaproveitados";
 pub const FORMAT_SECTION: &str = "Avisos da formatação";
 /// Seção do corpo da tarefa com os avisos sobre a instalação das dependências (spec 126 T01).
 pub const INSTALL_SECTION: &str = "Instalação das dependências";
+/// Seção do spec.md (do Arquiteto) com a conferência da persistência da instalação (spec 129 T02):
+/// a linha do registro (resultado e tempo) e, acima do limite, o aviso com os caminhos principais.
+/// A presença dela marca a conferência como feita: roda uma vez por spec.
+pub const INSTALL_FOOTPRINT_SECTION: &str = "Persistência da instalação";
+/// Spec 129 T02: entradas gravadas fora de `/work` (`A` ou `C` do `docker diff`) acima das quais a
+/// instalação gera o aviso. Medido em 2026-10-27, com o uid do host e um container por comando:
+/// - Test 8 (`pip install pytest==8.3.5`, imagem Python): com `HOME=/tmp`, o caso que falhava,
+///   377 entradas fora de `/work` (288 em `/tmp/.local/lib`, 83 em `/tmp/.cache/pip`, 3 em
+///   `/tmp/.local/bin`); com `HOME=/work/.nants-home` (T01), 0;
+/// - Node (`npm install` de dois pacotes pequenos, imagem do Test 5): com `HOME=/work/.nants-home`,
+///   0; com `HOME=/tmp`, 34 (o cache do npm).
+///
+/// O caso normal dá 0; uma instalação de um único pacote pequeno fora de `/work` já passa de 10.
+pub const INSTALL_FOOTPRINT_LIMIT: usize = 10;
+/// Profundidade (componentes do caminho) dos grupos de caminhos principais do aviso.
+const INSTALL_FOOTPRINT_DEPTH: usize = 3;
+/// Quantos grupos de caminhos o aviso mostra.
+const INSTALL_FOOTPRINT_PATHS: usize = 5;
+
+/// `true` se a seção [`INSTALL_FOOTPRINT_SECTION`] traz o aviso (em qualquer idioma do projeto).
+fn footprint_warned(section: &str) -> bool {
+    [Lang::PtBr, Lang::En].iter().any(|lang| {
+        let lead = i18n::tr(*lang, "runner.install_footprint.warning", &[("paths", "")]);
+        let lead = lead.split(';').next().unwrap_or_default().trim();
+        !lead.is_empty() && section.contains(lead)
+    })
+}
+
+/// Spec 129 T02: bloco do aviso da persistência da instalação para os prompts (Desenvolvedor e
+/// recuperação do Arquiteto), com a regra; vazio quando o spec.md não traz o aviso.
+pub fn install_footprint_prompt(spec_md: &str) -> String {
+    let Some(section) = section_text(spec_md, INSTALL_FOOTPRINT_SECTION).filter(|s| footprint_warned(s)) else {
+        return String::new();
+    };
+    format!(
+        "## Persistência da instalação (cada comando roda num container novo: só o que fica em /work persiste, inclusive a pasta pessoal $HOME={}; o que um comando grava fora de /work se perde no comando seguinte. Faça a instalação gravar dentro de /work, por configuração do projeto, sem regra por ferramenta)\n{}",
+        crate::harness::home::CONTAINER_HOME,
+        section.trim()
+    )
+}
+
 /// Nome da etapa de instalação das dependências nos eventos da rodada (spec 124 T05).
 const INSTALL_STEP: &str = "install";
 /// Primeira linha da saída quando a instalação falha (marcador lido por modelo).
@@ -673,6 +715,9 @@ pub struct DevBrief {
     /// Seção "Testes do projeto" (spec 124 T05): os comandos de teste, de instalação e das
     /// checagens bloqueantes, com a regra do reaproveitamento; vazia sem `test_command`.
     pub test_plan: String,
+    /// Aviso da persistência da instalação da spec (spec 129 T02), com a regra de que o gravado fora
+    /// de `/work` se perde; vazio sem aviso.
+    pub install_footprint: String,
     /// Registro das rodadas dos comandos de teste do projeto feitas pelo Desenvolvedor (spec 124
     /// T05), consultado pelo runner na entrega.
     pub suite_ledger: crate::sdd::test_levels::SuiteLedger,
@@ -931,14 +976,11 @@ pub struct CriterionCheck {
 }
 
 /// Extrai (limitada) a seção "Critérios" da resposta final do Desenvolvedor: do título até o
-/// próximo título markdown. Sem a seção, devolve vazio.
+/// próximo título markdown. Sem a seção, devolve vazio. Spec 129 T04: o título vale em qualquer
+/// idioma do dicionário ([`markers::CRITERIA`]), pela linha inteira.
 pub fn extract_dev_criteria(summary: &str) -> String {
-    let is_title = |l: &str| {
-        let t = l.trim().trim_start_matches('#').trim().trim_matches('*').trim().trim_end_matches(':').trim();
-        t.eq_ignore_ascii_case("critérios") || t.eq_ignore_ascii_case("criterios")
-    };
     let mut lines = summary.lines();
-    if !lines.by_ref().any(is_title) {
+    if !lines.by_ref().any(|l| markers::is_heading(l, markers::CRITERIA)) {
         return String::new();
     }
     let mut out = String::new();
@@ -980,12 +1022,8 @@ pub fn render_criteria(criteria: &[CriterionCheck]) -> String {
         .join("\n")
 }
 
-/// Marca que separa o resumo da matriz na mensagem do Revisor (a UI renderiza o checklist).
-pub const CRITERIA_HEADER: &str = "Critérios:";
-
-/// Marca que o runner acrescenta aos critérios `(manual)` enviados ao Revisor.
-pub const HUMAN_CHECK_MARK: &str = "verificação humana, não bloqueia";
-/// Marca antiga (antes da 095/T08), ainda reconhecida nos critérios já gravados.
+/// Marca antiga da verificação humana (antes da 095/T08, com travessão), ainda reconhecida nos
+/// critérios já gravados. A atual sai do dicionário ([`markers::HUMAN_CHECK`]).
 const LEGACY_HUMAN_CHECK_MARK: &str = "verificação humana — não bloqueia";
 
 /// `true` se o critério (linha de checklist) começa com `(manual)`, sem diferenciar maiúsculas,
@@ -1014,7 +1052,7 @@ pub fn is_manual_criterion(line: &str) -> bool {
     }
     let end = line.trim_end();
     t.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("(manual)"))
-        || end.ends_with(&format!("[{HUMAN_CHECK_MARK}]"))
+        || markers::ends_with_bracketed(end, markers::HUMAN_CHECK)
         || end.ends_with(&format!("[{LEGACY_HUMAN_CHECK_MARK}]"))
 }
 
@@ -1027,13 +1065,14 @@ pub fn manual_criteria(acceptance: &str) -> Vec<String> {
         .collect()
 }
 
-/// Critérios de aceitação para o Revisor: itens `(manual)` ganham a marca de verificação humana.
-pub fn mark_manual_criteria(acceptance: &str) -> String {
+/// Critérios de aceitação para o Revisor: itens `(manual)` ganham a marca de verificação humana,
+/// no idioma do projeto (o Revisor a repete na matriz, que aparece na tela).
+pub fn mark_manual_criteria(lang: Lang, acceptance: &str) -> String {
     acceptance
         .lines()
         .map(|l| {
-            if is_manual_criterion(l) && !l.contains(HUMAN_CHECK_MARK) && !l.contains(LEGACY_HUMAN_CHECK_MARK) {
-                format!("{l} [{HUMAN_CHECK_MARK}]")
+            if is_manual_criterion(l) && !markers::contains_any(l, markers::HUMAN_CHECK) && !l.contains(LEGACY_HUMAN_CHECK_MARK) {
+                format!("{l} [{}]", markers::text(lang, markers::HUMAN_CHECK))
             } else {
                 l.to_string()
             }
@@ -1073,41 +1112,20 @@ pub fn enforce_criteria(lang: Lang, mut result: ReviewResult) -> ReviewResult {
     result
 }
 
-/// Rótulo do veredito na primeira linha da mensagem do Revisor (spec 078).
-pub const VERDICT_APPROVED_LABEL: &str = "Aprovado";
-pub const VERDICT_CHANGES_LABEL: &str = "Pediu ajustes";
-/// Seção dos findings bloqueantes na mensagem do Revisor; vem antes de [`CRITERIA_HEADER`].
-pub const FINDINGS_HEADER: &str = "Apontamentos:";
-/// Linha das capturas de tela vistas pelo Revisor (spec 082 T03); vem antes de [`CRITERIA_HEADER`].
-pub const CAPTURES_HEADER: &str = "Capturas avaliadas:";
-/// Seção dos findings que não bloqueiam (MEDIUM sobre código inalterado, ou findings de uma aprovação).
-pub const OBSERVATIONS_HEADER: &str = "Observações (não bloqueiam):";
 /// Seção do corpo da tarefa com as observações rebaixadas (não contam como reprovação).
 pub const OBSERVATIONS: &str = "Observações da revisão";
 const OBSERVATIONS_MAX_BYTES: usize = 3 * 1024;
-/// Prefixo da linha do cenário de falha (spec 087 T05), recuada logo abaixo do finding.
-pub const SCENARIO_PREFIX: &str = "Cenário de falha:";
-/// Marca, junto da severidade, do finding de baixa confiança (spec 087 T05).
-pub const LOW_CONFIDENCE_LABEL: &str = "baixa confiança";
 /// Limite de bytes de cada linha de finding na mensagem do Revisor.
 const FINDING_LINE_BYTES: usize = 400;
-/// Spec 124 T01: marca, junto da severidade, do apontamento que apareceu nesta revisão. Marcador
-/// estrutural (sempre em pt-BR, como os demais): a tela mostra `review.stateNew` no idioma ativo.
-pub const STATE_NEW_LABEL: &str = "novo";
-/// Spec 124 T01: início da marca do apontamento ainda aberto: `aberto há N revisões`.
-pub const STATE_OPEN_PREFIX: &str = "aberto há";
-/// Spec 124 T01: seção da mensagem do Revisor com os apontamentos anteriores resolvidos nesta revisão;
-/// vem depois das observações e antes de [`CAPTURES_HEADER`].
-pub const RESOLVED_HEADER: &str = "Resolvidos:";
 
-/// Marca de estado de um apontamento apurado pelo runner; vazia sem apuração (`recurrence` 0).
-fn state_mark(f: &Finding) -> Option<String> {
+/// Marca de estado de um apontamento apurado pelo runner (spec 124 T01), no idioma do projeto:
+/// `novo` ou `aberto há N revisões` ([`markers::STATE_NEW`], [`markers::STATE_OPEN`]); vazia sem
+/// apuração (`recurrence` 0).
+fn state_mark(lang: Lang, f: &Finding) -> Option<String> {
     match (f.state, f.recurrence) {
         (_, 0) => None,
-        (Some(FindingState::Open), n) if n > 1 => {
-            Some(format!("{STATE_OPEN_PREFIX} {n} revisões"))
-        }
-        (Some(FindingState::New), _) | (Some(FindingState::Open), _) => Some(STATE_NEW_LABEL.to_string()),
+        (Some(FindingState::Open), n) if n > 1 => Some(i18n::tr_plural(lang, markers::STATE_OPEN, u64::from(n), &[])),
+        (Some(FindingState::New), _) | (Some(FindingState::Open), _) => Some(markers::text(lang, markers::STATE_NEW)),
         _ => None,
     }
 }
@@ -1415,16 +1433,13 @@ pub fn final_observations_facts(tasks: &[Task]) -> String {
     out
 }
 
-/// Spec 092 T04: rótulo, junto da severidade, da observação rebaixada porque o arquivo não mudou
-/// desde a revisão anterior (a UI o mostra como selo).
-pub const UNCHANGED_FILE_LABEL: &str = "observação (arquivo não mudou nesta rodada)";
 /// Teto da lista de arquivos alterados desde a revisão anterior nos FATOS da re-revisão.
 pub const CHANGED_FILES_MAX: usize = 50;
 
 /// Convergência com a lista de arquivos alterados desde a revisão anterior (spec 092 T04).
 /// `changed_files` é `Some` só na re-revisão (há `rejected_sha` e o git respondeu): então um finding
 /// NOVO (não reaberto, ver [`is_reopened`]), MEDIUM ou LOW, cuja `location` aponta só para arquivos
-/// fora dessa lista vira observação com [`UNCHANGED_FILE_LABEL`] na severidade, mesmo que outro
+/// fora dessa lista vira observação com [`markers::UNCHANGED_FILE`] na severidade, mesmo que outro
 /// finding continue bloqueando. Nunca são rebaixados: HIGH; location sem caminho ou de
 /// captura/imagem; finding cujo texto cita um arquivo alterado ([`cites_changed_file`], regressão
 /// induzida); location cujo arquivo não existe na branch (`exists` devolve `false`, inclusive quando
@@ -1483,9 +1498,15 @@ fn demote_unchanged_files(
     }
     let labeled = demoted
         .into_iter()
-        .map(|f| Finding { severity: format!("{}, {UNCHANGED_FILE_LABEL}", f.severity.trim()), ..f })
+        .map(|f| Finding { severity: with_unchanged_mark(lang, &f.severity), ..f })
         .collect();
     (result, labeled)
+}
+
+/// Severidade com a marca da observação rebaixada porque o arquivo não mudou (spec 092 T04), no
+/// idioma do projeto (spec 129 T04): `MEDIUM, observação (arquivo não mudou nesta rodada)`.
+fn with_unchanged_mark(lang: Lang, severity: &str) -> String {
+    format!("{}, {}", severity.trim(), markers::text(lang, markers::UNCHANGED_FILE))
 }
 
 /// O arquivo `path` (relativo, sem `..`) existe na worktree da tarefa. Qualquer falha na checagem
@@ -1594,13 +1615,13 @@ fn converge_findings(lang: Lang, mut result: ReviewResult, previous: &[Finding],
     Converged { result, observations }
 }
 
-fn finding_line(f: &Finding, with_recommendation: bool, redact: &dyn Fn(&str) -> String) -> String {
+fn finding_line(lang: Lang, f: &Finding, with_recommendation: bool, redact: &dyn Fn(&str) -> String) -> String {
     let flat = |t: &str| redact(t).split_whitespace().collect::<Vec<_>>().join(" ");
     let mut severity = match f.confidence {
         Confidence::High => flat(&f.severity),
-        Confidence::Low => format!("{}, {LOW_CONFIDENCE_LABEL}", flat(&f.severity)),
+        Confidence::Low => format!("{}, {}", flat(&f.severity), markers::text(lang, markers::LOW_CONFIDENCE)),
     };
-    if let Some(mark) = state_mark(f) {
+    if let Some(mark) = state_mark(lang, f) {
         severity.push_str(&format!(", {mark}"));
     }
     let mut line = format!("{} [{severity}] {}: {}", flat(&f.id), flat(&f.location), flat(&f.description));
@@ -1613,7 +1634,7 @@ fn finding_line(f: &Finding, with_recommendation: bool, redact: &dyn Fn(&str) ->
     // Spec 087 T05: o cenário de falha vai numa linha própria, recuada, logo abaixo do finding.
     let scenario = flat(&f.failure_scenario);
     if !scenario.is_empty() {
-        line.push_str(&format!("\n  {}", clip_line(format!("{SCENARIO_PREFIX} {scenario}"))));
+        line.push_str(&format!("\n  {}", clip_line(format!("{} {scenario}", markers::text(lang, markers::SCENARIO)))));
     }
     line
 }
@@ -1634,8 +1655,11 @@ fn clip_line(mut line: String) -> String {
 /// Mensagem do Revisor na conversa (spec 078): veredito e resumo; `Apontamentos:`; `Observações
 /// (não bloqueiam):`; `Capturas avaliadas:` (spec 082 T03: uma linha com os nomes das cópias em
 /// `.sdd/specs/<spec>/captures/`, separados por vírgula); por último `Critérios:` (a UI só lê o
-/// checklist depois dessa marca).
+/// checklist depois dessa marca). Spec 129 T04: os marcadores saem no idioma do projeto (`lang`),
+/// do dicionário ([`markers`]); a web lê as formas de todos os idiomas.
+#[allow(clippy::too_many_arguments)]
 pub fn render_review_message(
+    lang: Lang,
     verdict: Verdict,
     summary: &str,
     findings: &[Finding],
@@ -1644,7 +1668,7 @@ pub fn render_review_message(
     criteria: &[CriterionCheck],
     redact: &dyn Fn(&str) -> String,
 ) -> String {
-    render_review_message_tracked(verdict, summary, findings, observations, &TrackedSections::default(), captures, criteria, redact)
+    render_review_message_tracked(lang, verdict, summary, findings, observations, &TrackedSections::default(), captures, criteria, redact)
 }
 
 /// Seções da mensagem do Revisor que vêm do registro dos apontamentos (spec 124 T01 e T02).
@@ -1664,6 +1688,7 @@ pub struct TrackedSections<'a> {
 /// Arquiteto:` (`- F-03 [manual] título: motivo`), marcadores estruturais lidos pela web.
 #[allow(clippy::too_many_arguments)]
 pub fn render_review_message_tracked(
+    lang: Lang,
     verdict: Verdict,
     summary: &str,
     findings: &[Finding],
@@ -1673,57 +1698,58 @@ pub fn render_review_message_tracked(
     criteria: &[CriterionCheck],
     redact: &dyn Fn(&str) -> String,
 ) -> String {
-    let label = if verdict == Verdict::Approved { VERDICT_APPROVED_LABEL } else { VERDICT_CHANGES_LABEL };
+    let marker = |key: &str| markers::text(lang, key);
+    let label = marker(if verdict == Verdict::Approved { markers::VERDICT_APPROVED } else { markers::VERDICT_CHANGES });
     let mut out = format!("{label}: {}", summary.trim());
     if !findings.is_empty() {
-        out.push_str(&format!("\n\n{FINDINGS_HEADER}"));
+        out.push_str(&format!("\n\n{}", marker(markers::FINDINGS)));
         for f in findings {
-            out.push_str(&format!("\n- {}", finding_line(f, true, redact)));
+            out.push_str(&format!("\n- {}", finding_line(lang, f, true, redact)));
         }
     }
     if !observations.is_empty() {
-        out.push_str(&format!("\n\n{OBSERVATIONS_HEADER}"));
+        out.push_str(&format!("\n\n{}", marker(markers::OBSERVATIONS)));
         for f in observations {
-            out.push_str(&format!("\n- {}", finding_line(f, false, redact)));
+            out.push_str(&format!("\n- {}", finding_line(lang, f, false, redact)));
         }
     }
     if !sections.resolved.is_empty() {
-        out.push_str(&format!("\n\n{RESOLVED_HEADER}"));
+        out.push_str(&format!("\n\n{}", marker(markers::RESOLVED)));
         for f in sections.resolved {
             // Só a primeira linha (sem cenário) e sem marca de estado: o cabeçalho já diz "resolvido".
             let plain = Finding { state: None, recurrence: 0, failure_scenario: String::new(), ..f.clone() };
-            out.push_str(&format!("\n- {}", finding_line(&plain, false, redact)));
+            out.push_str(&format!("\n- {}", finding_line(lang, &plain, false, redact)));
         }
     }
     let flat = |t: &str| redact(t).split_whitespace().collect::<Vec<_>>().join(" ");
     if !sections.responses.is_empty() {
-        out.push_str(&format!("\n\n{}", finding_reply::RESPONSES_HEADER));
+        out.push_str(&format!("\n\n{}", marker(markers::RESPONSES)));
         for r in sections.responses {
             out.push_str(&format!("\n- {}", clip_line(flat(&r.message_line()))));
         }
     }
     if !sections.decisions.is_empty() {
-        out.push_str(&format!("\n\n{}", finding_reply::DECISIONS_HEADER));
+        out.push_str(&format!("\n\n{}", marker(markers::DECISIONS)));
         for line in sections.decisions {
             out.push_str(&format!("\n- {}", clip_line(flat(line))));
         }
     }
     if !captures.is_empty() {
-        out.push_str(&format!("\n\n{CAPTURES_HEADER} {}", captures.join(", ")));
+        out.push_str(&format!("\n\n{} {}", marker(markers::CAPTURES), captures.join(", ")));
     }
     if !criteria.is_empty() {
-        out.push_str(&format!("\n\n{CRITERIA_HEADER}\n{}", render_criteria(criteria)));
+        out.push_str(&format!("\n\n{}:\n{}", marker(markers::CRITERIA), render_criteria(criteria)));
     }
     out
 }
 
 /// Acrescenta as observações à seção "Observações da revisão" (uma linha por finding, sem repetição,
 /// mantendo as mais recentes dentro do teto). `None` quando não há nada a registrar nem seção existente.
-fn append_observations(existing: &str, observations: &[Finding], redact: &dyn Fn(&str) -> String) -> Option<String> {
+fn append_observations(lang: Lang, existing: &str, observations: &[Finding], redact: &dyn Fn(&str) -> String) -> Option<String> {
     let mut lines: Vec<String> = existing.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
     for f in observations {
         // Uma linha por finding: o cenário de falha (linha recuada) fica só na conversa.
-        let full = finding_line(f, false, redact);
+        let full = finding_line(lang, f, false, redact);
         let line = format!("- {}", full.lines().next().unwrap_or_default());
         if !lines.contains(&line) {
             lines.push(line);
@@ -2828,6 +2854,8 @@ impl TaskRunner {
         validate_id("spec_id", spec_id)?;
         let settings = read_settings(&sdd_dir(&self.repo_root).join("settings.yaml"))?;
         self.remember(&self.spec_dir(spec_id).join("spec.md"))?;
+        // Spec 129 T02: antes da primeira tarefa, onde a instalação grava (uma vez por spec).
+        self.check_install_footprint(&settings, spec_id).await?;
         loop {
             self.check_cancel()?;
             let tasks = self.load_tasks(spec_id)?;
@@ -3364,12 +3392,14 @@ impl TaskRunner {
         attempt: u32,
         clean: bool,
     ) -> Result<Install, RunnerError> {
-        let Some(command) = settings.install_command.as_deref().filter(|c| !c.trim().is_empty()) else {
-            return Ok(Install::Absent);
-        };
+        // Spec 129 T01: a rodada limpa começa sem a pasta pessoal (menos o cache de download),
+        // com ou sem `install_command`.
         if clean {
             test_levels::forget_install(dir);
         }
+        let Some(command) = settings.install_command.as_deref().filter(|c| !c.trim().is_empty()) else {
+            return Ok(Install::Absent);
+        };
         if !test_levels::install_needed(settings, command, dir) {
             return Ok(Install::Current { since: test_levels::installed_at(dir) });
         }
@@ -3738,6 +3768,85 @@ impl TaskRunner {
         }
     }
 
+    /// Spec 129 T02: antes da primeira tarefa, na base e com o ambiente Docker aprovado, roda o
+    /// `install_command` num container mantido até o `docker diff` e confere o que ele gravou fora
+    /// de `/work` (o que se perde entre comandos). Uma vez por spec: a seção
+    /// [`INSTALL_FOOTPRINT_SECTION`] do spec.md guarda o registro (resultado e tempo) e, acima de
+    /// [`INSTALL_FOOTPRINT_LIMIT`], o aviso com os caminhos principais, que também vai à Conversa e,
+    /// pelo spec.md, ao briefing do Desenvolvedor e à recuperação. Sinal, nunca trava: falha do
+    /// Docker ou do ambiente não aprovado só deixa a conferência para a próxima execução. Sem
+    /// `install_command`, nada roda.
+    async fn check_install_footprint(&self, settings: &Settings, spec_id: &str) -> Result<(), RunnerError> {
+        let Some(command) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+            return Ok(());
+        };
+        if settings.environment != Environment::Docker {
+            return Ok(());
+        }
+        let Some(compose) = self.compose.clone() else { return Ok(()) };
+        let path = self.spec_dir(spec_id).join("spec.md");
+        let mut spec = read_spec(&path)?;
+        if section_text(&spec.body, INSTALL_FOOTPRINT_SECTION).is_some_and(|s| !s.trim().is_empty()) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let (dir, cmd) = (self.repo_root.clone(), command.to_string());
+        let joined = tokio::task::spawn_blocking(move || {
+            compose.prepare(&dir)?;
+            let kept = compose.run_kept(&dir, &cmd, TEST_TIMEOUT);
+            let _ = compose.repair_ownership(&dir);
+            kept
+        })
+        .await;
+        let Ok(Ok(kept)) = joined else { return Ok(()) };
+        let secs = started.elapsed().as_secs();
+        if kept.output.success() {
+            // A base ficou instalada: a próxima instalação nela só roda se a trava mudar.
+            let at = rfc3339_of(std::time::SystemTime::now());
+            test_levels::remember_install(&self.repo_root, &test_levels::install_key(settings, command, &self.repo_root), &at);
+        } else {
+            // A mesma regra do `ensure_installed`: a instalação que falhou ou estourou o tempo pode
+            // ter deixado as dependências pela metade, então a próxima instala de novo.
+            test_levels::forget_install(&self.repo_root);
+        }
+        let outside = crate::harness::compose::written_outside_work(&kept.diff);
+        let lang = self.lang.get();
+        let code = kept.output.code.map_or_else(|| "-".to_string(), |c| c.to_string());
+        let (secs, limit) = (secs.to_string(), INSTALL_FOOTPRINT_LIMIT.to_string());
+        let scrubbed = self.scrub(command);
+        let mut lines = vec![i18n::tr_plural(
+            lang,
+            "runner.install_footprint.record",
+            outside.len() as u64,
+            &[("command", &scrubbed), ("code", &code), ("secs", &secs), ("limit", &limit)],
+        )];
+        if outside.len() > INSTALL_FOOTPRINT_LIMIT {
+            let paths = crate::harness::compose::main_paths(&outside, INSTALL_FOOTPRINT_DEPTH, INSTALL_FOOTPRINT_PATHS)
+                .into_iter()
+                .map(|(p, n)| format!("{} ({n})", self.scrub(&p)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(i18n::tr(lang, "runner.install_footprint.warning", &[("paths", &paths)]));
+            let pairs = [("paths", paths.as_str())];
+            self.events.emit(RunnerEvent::SystemNotice {
+                text: system_text(lang, "install.outside_work", &pairs),
+                code: "install.outside_work".to_string(),
+                params: notice_params(&pairs),
+                task_id: None,
+            });
+        }
+        if let Some(error) = &kept.cleanup_error {
+            let error = self.scrub(error);
+            lines.push(i18n::tr(lang, "runner.install_footprint.cleanup_failed", &[("name", &kept.container), ("error", &error)]));
+        }
+        let text = lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n");
+        spec.body = replace_section(&spec.body, INSTALL_FOOTPRINT_SECTION, Some(text));
+        match self.write_guarded(&path, &spec.render()?) {
+            Err(RunnerError::ExternalEdit { .. }) => Ok(()),
+            other => other,
+        }
+    }
+
     /// Mensagem do sistema com `code` (spec 102) ligada à tarefa; `params` neutros ou do modelo.
     fn notice(&self, task_id: &str, code: &str, pairs: &[(&str, &str)]) {
         self.events.emit(RunnerEvent::SystemNotice {
@@ -3839,7 +3948,7 @@ impl TaskRunner {
             changed_files: changed_files.as_ref().map(|list| list.iter().map(|p| self.scrub(p)).collect()),
             spec_id: task.frontmatter.spec_id.clone(),
             task_id: task.frontmatter.id.clone(),
-            acceptance: mark_manual_criteria(&acceptance_of(&task.body)),
+            acceptance: mark_manual_criteria(self.lang.get(), &acceptance_of(&task.body)),
             diff,
             base: settings.base_branch.clone(),
             branch: branch.clone(),
@@ -3910,6 +4019,7 @@ impl TaskRunner {
         let result = ReviewResult { findings: tracked.open.clone(), ..result };
         let sections = TrackedSections { resolved: &tracked.resolved, responses: &responses, decisions: &decision_lines };
         let text = render_review_message_tracked(
+            self.lang.get(),
             result.verdict,
             &result.summary,
             &result.findings,
@@ -3927,11 +4037,11 @@ impl TaskRunner {
         });
         if !observations.is_empty() {
             let existing = section_text(&task.body, OBSERVATIONS).unwrap_or_default();
-            task.body = replace_section(&task.body, OBSERVATIONS, append_observations(&existing, &observations, &|t| self.scrub(t)));
+            task.body = replace_section(&task.body, OBSERVATIONS, append_observations(self.lang.get(), &existing, &observations, &|t| self.scrub(t)));
         }
         if !late.is_empty() {
             let existing = section_text(&task.body, FINAL_OBSERVATIONS).unwrap_or_default();
-            task.body = replace_section(&task.body, FINAL_OBSERVATIONS, append_observations(&existing, &late, &|t| self.scrub(t)));
+            task.body = replace_section(&task.body, FINAL_OBSERVATIONS, append_observations(self.lang.get(), &existing, &late, &|t| self.scrub(t)));
         }
         if result.verdict != Verdict::None {
             task.body = replace_section(&task.body, REGISTRY, render_findings(&tracked.registry)?);
@@ -4485,6 +4595,12 @@ impl TaskRunner {
         crate::sdd::role_guidance::role_guidance_of(&self.scrub(&text), role)
     }
 
+    /// Aviso da persistência da instalação da spec (spec 129 T02), redigido; vazio sem aviso.
+    fn install_footprint(&self, spec_id: &str) -> String {
+        let text = fs::read_to_string(self.spec_dir(spec_id).join("spec.md")).unwrap_or_default();
+        self.scrub(&install_footprint_prompt(&text))
+    }
+
     /// Guia de arte da spec (spec 090 T02), redigido antes do corte; vazio sem a seção.
     fn art_guide(&self, spec_id: &str) -> String {
         let text = fs::read_to_string(self.spec_dir(spec_id).join("spec.md")).unwrap_or_default();
@@ -4548,6 +4664,7 @@ impl TaskRunner {
             environment: self.capabilities_section(capabilities::Audience::Developer),
             flaky_tests: section_text(&task.body, FLAKY_SECTION).unwrap_or_default().trim().to_string(),
             test_plan: self.scrub(&test_plan(settings)),
+            install_footprint: self.install_footprint(&task.frontmatter.spec_id),
             suite_ledger: self.suite_ledger.clone(),
         })
     }
@@ -4673,7 +4790,7 @@ impl TaskRunner {
         let input = ReviewInput {
             spec_id: spec_id.to_string(),
             task_id: "FINAL".into(),
-            acceptance: mark_manual_criteria(&criteria),
+            acceptance: mark_manual_criteria(self.lang.get(), &criteria),
             diff: "(verificação final dos critérios globais: sem diff; inspecione a árvore integrada da base com as ferramentas de leitura)".into(),
             base: settings.base_branch.clone(),
             branch: settings.base_branch.clone(),
@@ -4731,7 +4848,9 @@ impl TaskRunner {
         } else {
             result.criteria.iter().filter(|c| c.met || is_manual_criterion(&c.criterion)).count()
         };
+        let lang = self.lang.get();
         let matrix = render_review_message(
+            lang,
             result.verdict,
             &result.summary,
             &result.findings,
@@ -4740,7 +4859,9 @@ impl TaskRunner {
             &result.criteria,
             &|t| self.scrub(t),
         );
-        self.say(format!("Verificação final: {met} de {total} critérios atendidos\n\n{matrix}"));
+        let (met_text, total_text) = (met.to_string(), total.to_string());
+        let heading = i18n::tr(lang, markers::FINAL_VERIFICATION, &[("met", &met_text), ("total", &total_text)]);
+        self.say(format!("{heading}\n\n{matrix}"));
         if passed {
             return Ok(FinalStep::Complete);
         }
@@ -5700,6 +5821,7 @@ pub fn validate_scope(scope: &[String]) -> Result<(), String> {
             || first == "**"
             || first.eq_ignore_ascii_case(".sdd")
             || first.eq_ignore_ascii_case(".git")
+            || first.eq_ignore_ascii_case(crate::harness::home::HOME_DIR)
         {
             return Err(format!("glob de escopo inválido: {glob}"));
         }
@@ -6225,6 +6347,28 @@ fn read_findings(body: &str) -> Result<Vec<Finding>, RunnerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Spec 129 T04: formas pt-BR dos marcadores; os testes antigos leem as mensagens em pt
+    // (`pt_marker_constants_match_the_dictionary` confere com o dicionário).
+    const CRITERIA_HEADER: &str = "Critérios:";
+    const FINDINGS_HEADER: &str = "Apontamentos:";
+    const OBSERVATIONS_HEADER: &str = "Observações (não bloqueiam):";
+    const CAPTURES_HEADER: &str = "Capturas avaliadas:";
+    const SCENARIO_PREFIX: &str = "Cenário de falha:";
+    const UNCHANGED_FILE_LABEL: &str = "observação (arquivo não mudou nesta rodada)";
+    const HUMAN_CHECK_MARK: &str = "verificação humana, não bloqueia";
+
+    #[test]
+    fn pt_marker_constants_match_the_dictionary() {
+        let pt = |key: &str| markers::text(Lang::PtBr, key);
+        assert_eq!(format!("{}:", pt(markers::CRITERIA)), CRITERIA_HEADER);
+        assert_eq!(pt(markers::FINDINGS), FINDINGS_HEADER);
+        assert_eq!(pt(markers::OBSERVATIONS), OBSERVATIONS_HEADER);
+        assert_eq!(pt(markers::CAPTURES), CAPTURES_HEADER);
+        assert_eq!(pt(markers::SCENARIO), SCENARIO_PREFIX);
+        assert_eq!(pt(markers::UNCHANGED_FILE), UNCHANGED_FILE_LABEL);
+        assert_eq!(pt(markers::HUMAN_CHECK), HUMAN_CHECK_MARK);
+    }
     use crate::sdd::{Arbitration, ArbitrationDecision};
 
     #[test]
@@ -6591,6 +6735,7 @@ mod tests {
                         screenshots: None,
                         references: None,
                         environment: None,
+                        not_in_sandbox: None,
                     },
                     body: "## Contexto\nteste\n".into(),
                 },
@@ -6950,7 +7095,7 @@ mod tests {
         let mut r = approved(vec![]);
         r.criteria = vec![CriterionCheck { criterion: "(manual) olhar no navegador".into(), met: false, evidence: String::new() }];
         assert_eq!(enforce_criteria(Lang::PtBr, r).verdict, Verdict::Approved);
-        let marked = mark_manual_criteria("1. teste verde\n- [ ] (manual) ver no navegador");
+        let marked = mark_manual_criteria(Lang::PtBr, "1. teste verde\n- [ ] (manual) ver no navegador");
         assert!(marked.contains(&format!("(manual) ver no navegador [{HUMAN_CHECK_MARK}]")), "{marked}");
         assert!(!marked.lines().next().unwrap_or("").contains(HUMAN_CHECK_MARK));
         assert_eq!(manual_criteria("1. a\n- [ ] (manual) b"), vec!["[ ] (manual) b".to_string()]);
@@ -6958,7 +7103,7 @@ mod tests {
         assert!(!HUMAN_CHECK_MARK.contains('\u{2014}'));
         let legacy = format!("- tudo funciona [{LEGACY_HUMAN_CHECK_MARK}]");
         assert!(is_manual_criterion(&legacy));
-        assert_eq!(mark_manual_criteria(&legacy), legacy);
+        assert_eq!(mark_manual_criteria(Lang::PtBr, &legacy), legacy);
     }
 
     #[tokio::test]
@@ -7013,15 +7158,16 @@ mod tests {
 
     #[test]
     fn review_message_approved_without_findings_has_label_and_criteria_only() {
-        let text = render_review_message(Verdict::Approved, "tudo certo", &[], &[], &[], &[met("c1", true)], &no_redact);
+        let text = render_review_message(Lang::PtBr, Verdict::Approved, "tudo certo", &[], &[], &[], &[met("c1", true)], &no_redact);
         assert_eq!(text, "Aprovado: tudo certo\n\nCritérios:\n✓ c1: e");
-        let bare = render_review_message(Verdict::Approved, "ok", &[], &[], &[], &[], &no_redact);
+        let bare = render_review_message(Lang::PtBr, Verdict::Approved, "ok", &[], &[], &[], &[], &no_redact);
         assert_eq!(bare, "Aprovado: ok");
     }
 
     #[test]
     fn review_message_changes_lists_findings_before_criteria() {
         let text = render_review_message(
+            Lang::PtBr,
             Verdict::ChangesRequested,
             "faltam coisas",
             &[medium("F-01", "src/a.rs:10")],
@@ -7040,6 +7186,7 @@ mod tests {
     #[test]
     fn review_message_with_observations_omits_empty_sections_and_scrubs() {
         let text = render_review_message(
+            Lang::PtBr,
             Verdict::Approved,
             "ok",
             &[],
@@ -7060,6 +7207,7 @@ mod tests {
         // Spec 082 T03: "Capturas avaliadas:" depois das observações e antes de "Critérios:" (sempre por último).
         let captures = vec!["t01-1-shots-home.png".to_string(), "t01-1-shots-menu.png".to_string()];
         let text = render_review_message(
+            Lang::PtBr,
             Verdict::Approved,
             "ok",
             &[],
@@ -7072,15 +7220,89 @@ mod tests {
             text,
             "Aprovado: ok\n\nObservações (não bloqueiam):\n- F-02 [MEDIUM] src/b.rs:3: descrição\n\nCapturas avaliadas: t01-1-shots-home.png, t01-1-shots-menu.png\n\nCritérios:\n✓ c1: e"
         );
-        let bare = render_review_message(Verdict::Approved, "ok", &[], &[], &captures, &[], &no_redact);
+        let bare = render_review_message(Lang::PtBr, Verdict::Approved, "ok", &[], &[], &captures, &[], &no_redact);
         assert!(bare.ends_with("\n\nCapturas avaliadas: t01-1-shots-home.png, t01-1-shots-menu.png"), "{bare}");
+    }
+
+    /// Spec 129 T04: num projeto em inglês, todos os marcadores da mensagem do Revisor saem do
+    /// dicionário en (nenhum rótulo em pt), na mesma ordem e no mesmo formato.
+    #[test]
+    fn review_message_in_english_uses_the_english_markers() {
+        let mut new = medium("F-01", "src/a.rs:10");
+        new.state = Some(FindingState::New);
+        new.recurrence = 1;
+        new.failure_scenario = "empty list → crash".into();
+        let mut open = finding("F-02");
+        open.state = Some(FindingState::Open);
+        open.recurrence = 3;
+        open.confidence = Confidence::Low;
+        let mut unchanged = medium("F-04", "src/d.rs:1");
+        unchanged.severity = format!("MEDIUM, {}", markers::text(Lang::En, markers::UNCHANGED_FILE));
+        let resolved = vec![finding("F-03")];
+        let responses = vec![finding_reply::parse_line("- F-03: fixed: src/c.rs:2").expect("resposta")];
+        let decisions = vec!["F-05 [manual] title: reason".to_string()];
+        let sections = TrackedSections { resolved: &resolved, responses: &responses, decisions: &decisions };
+        let text = render_review_message_tracked(
+            Lang::En,
+            Verdict::ChangesRequested,
+            "needs work",
+            &[new, open],
+            &[unchanged],
+            &sections,
+            &["t01-1-home.png".to_string()],
+            &[met("c1", false)],
+            &no_redact,
+        );
+        assert_eq!(
+            text,
+            "Changes requested: needs work\n\n\
+             Findings:\n- F-01 [MEDIUM, new] src/a.rs:10: descrição → recomendação\n  Failure scenario: empty list → crash\n\
+             - F-02 [HIGH, low confidence, open for 3 reviews] src/lib.rs:1: descrição → recomendação\n\n\
+             Observations (non-blocking):\n- F-04 [MEDIUM, observation (file did not change in this round)] src/d.rs:1: descrição\n\n\
+             Resolved:\n- F-03 [HIGH] src/lib.rs:1: descrição\n\n\
+             Developer responses:\n- F-03 [fixed] src/c.rs:2\n\n\
+             Architect decisions:\n- F-05 [manual] title: reason\n\n\
+             Screenshots reviewed: t01-1-home.png\n\n\
+             Criteria:\n✗ c1: e"
+        );
+        let approved = render_review_message(Lang::En, Verdict::Approved, "ok", &[], &[], &[], &[], &no_redact);
+        assert_eq!(approved, "Approved: ok");
+        for pt in ["Apontamentos", "Resolvidos", "Critérios", "Capturas", "Pediu ajustes", "novo", "aberto há", "Cenário"] {
+            assert!(!text.contains(pt), "{pt} em: {text}");
+        }
+    }
+
+    /// Spec 129 T04: a seção de critérios do Desenvolvedor vale nas duas formas (pt e en), pela
+    /// linha inteira; a prosa que cita a palavra não abre a seção.
+    #[test]
+    fn dev_criteria_section_is_read_in_both_languages() {
+        for title in ["## Critérios", "Criteria", "**Criteria:**", "### CRITERIA", "criterios"] {
+            let s = format!("done\n\n{title}\n- a: met: x.rs:1\n\n## Notes\nzz");
+            assert_eq!(extract_dev_criteria(&s), "- a: met: x.rs:1", "{title}");
+        }
+        assert_eq!(extract_dev_criteria("All criteria are met.\n- a: met: x.rs:1"), "");
+        assert_eq!(extract_dev_criteria("## Acceptance Criteria\n- a"), "");
+    }
+
+    /// Spec 129 T04: a marca da verificação humana sai no idioma do projeto e é reconhecida nas duas
+    /// formas (e na antiga, com travessão), sem ser acrescentada de novo.
+    #[test]
+    fn human_check_mark_follows_the_project_language_and_reads_both() {
+        let en = mark_manual_criteria(Lang::En, "1. green tests\n- (manual) open in the browser");
+        assert!(en.ends_with("(manual) open in the browser [human check, does not block]"), "{en}");
+        assert_eq!(mark_manual_criteria(Lang::PtBr, &en), en, "a marca em en não se repete num projeto em pt");
+        let pt = mark_manual_criteria(Lang::PtBr, "- (manual) abrir");
+        assert_eq!(mark_manual_criteria(Lang::En, &pt), pt);
+        assert!(is_manual_criterion("everything works [human check, does not block]"));
+        assert!(is_manual_criterion("tudo funciona [verificação humana, não bloqueia]"));
+        assert!(!is_manual_criterion("everything works"));
     }
 
     #[test]
     fn review_message_both_sections_and_long_lines_are_truncated() {
         let mut long = medium("F-03", "src/c.rs:1");
         long.description = "palavra ".repeat(200);
-        let text = render_review_message(Verdict::ChangesRequested, "s", &[long.clone()], &[long], &[], &[], &no_redact);
+        let text = render_review_message(Lang::PtBr, Verdict::ChangesRequested, "s", &[long.clone()], &[long], &[], &[], &no_redact);
         assert!(text.contains(FINDINGS_HEADER) && text.contains(OBSERVATIONS_HEADER));
         assert!(text.lines().all(|l| l.len() <= FINDING_LINE_BYTES + 6), "{text}");
         assert!(text.contains('…'));
@@ -7267,6 +7489,7 @@ mod tests {
         assert!(t.registry.iter().all(|e| e.id != "F-14" && e.id != "F-15"), "observação não entra no registro");
         let sections = TrackedSections { resolved: &t.resolved, responses: &[], decisions: &[] };
         let text = render_review_message_tracked(
+            Lang::PtBr,
             out.result.verdict,
             &out.result.summary,
             &t.open,
@@ -7484,13 +7707,13 @@ mod tests {
 
     #[test]
     fn observations_are_appended_deduplicated_and_bounded() {
-        let first = append_observations("", &[medium("F-02", "src/b.rs:3")], &no_redact).expect("seção");
+        let first = append_observations(Lang::PtBr, "", &[medium("F-02", "src/b.rs:3")], &no_redact).expect("seção");
         assert_eq!(first, "- F-02 [MEDIUM] src/b.rs:3: descrição");
-        let again = append_observations(&first, &[medium("F-02", "src/b.rs:3"), medium("F-03", "src/c.rs:1")], &no_redact).expect("seção");
+        let again = append_observations(Lang::PtBr, &first, &[medium("F-02", "src/b.rs:3"), medium("F-03", "src/c.rs:1")], &no_redact).expect("seção");
         assert_eq!(again.lines().count(), 2, "{again}");
-        assert_eq!(append_observations("", &[], &no_redact), None);
+        assert_eq!(append_observations(Lang::PtBr, "", &[], &no_redact), None);
         let many: Vec<Finding> = (0..100).map(|n| medium(&format!("F-{n:02}"), "src/d.rs:1")).collect();
-        let bounded = append_observations("", &many, &no_redact).expect("seção");
+        let bounded = append_observations(Lang::PtBr, "", &many, &no_redact).expect("seção");
         assert!(bounded.len() <= OBSERVATIONS_MAX_BYTES + 120 && bounded.contains("F-99"), "{}", bounded.len());
     }
 
@@ -7871,17 +8094,17 @@ mod tests {
     fn review_message_shows_failure_scenario_and_low_confidence() {
         let high = Finding { failure_scenario: "lista vazia → pânico\nno índice 0".into(), ..finding("F-01") };
         let low = Finding { confidence: Confidence::Low, ..finding("F-02") };
-        let text = render_review_message(Verdict::ChangesRequested, "r", &[high.clone()], &[low.clone()], &[], &[], &no_redact);
+        let text = render_review_message(Lang::PtBr, Verdict::ChangesRequested, "r", &[high.clone()], &[low.clone()], &[], &[], &no_redact);
         assert!(
             text.contains("\n- F-01 [HIGH] src/lib.rs:1: descrição → recomendação\n  Cenário de falha: lista vazia → pânico no índice 0"),
             "{text}"
         );
         assert!(text.contains("- F-02 [HIGH, baixa confiança] src/lib.rs:1: descrição"), "{text}");
         // Sem cenário, nenhuma linha extra.
-        let plain = render_review_message(Verdict::ChangesRequested, "r", &[finding("F-03")], &[], &[], &[], &no_redact);
+        let plain = render_review_message(Lang::PtBr, Verdict::ChangesRequested, "r", &[finding("F-03")], &[], &[], &[], &no_redact);
         assert!(!plain.contains(SCENARIO_PREFIX), "{plain}");
         // A seção de observações da tarefa guarda uma linha por finding, sem o cenário.
-        let section = append_observations("", &[high], &no_redact).unwrap();
+        let section = append_observations(Lang::PtBr, "", &[high], &no_redact).unwrap();
         assert_eq!(section.lines().count(), 1, "{section}");
     }
 
@@ -11478,6 +11701,35 @@ mod tests {
         assert!(pt.starts_with("Verificação final: 0 de 1 critérios atendidos. Criar tarefa de correção?\n"), "{pt}");
     }
 
+    /// Spec 129 T04: a mensagem da verificação final num projeto em inglês sai com a linha da
+    /// contagem e os marcadores do Revisor em inglês.
+    #[tokio::test]
+    async fn final_verification_message_follows_project_language() {
+        let fx = Fixture::new("final-msg-en", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = FakeReviewer::new(|_, i| if i.task_id == "FINAL" { matrix(false) } else { approved(vec![]) });
+        fx.runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_lang(crate::i18n::SharedLang::new(Lang::En))
+            .with_final_gate(Arc::new(AskedGate::default()))
+            .run_spec(SPEC)
+            .await
+            .unwrap();
+        let texts: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                RunnerEvent::AgentMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        let finals: Vec<&String> = texts.iter().filter(|t| t.starts_with("Final verification: 0 of 1 criteria met\n\n")).collect();
+        assert_eq!(finals.len(), 1, "{texts:?}");
+        assert!(finals[0].contains("\n\nChanges requested: ") && finals[0].contains("\n\nFindings:\n- F-01 [HIGH] ") && finals[0].contains("\n\nCriteria:\n✗ tudo funciona: visto"), "{}", finals[0]);
+        assert!(!texts.iter().any(|t| t.starts_with("Verificação final") || t.starts_with("Aprovado: ") || t.contains("\n\nCritérios:\n")), "{texts:?}");
+    }
+
     /// Spec 114 T02 (achado 8): o motivo do bloqueio grava o código estável e o texto no idioma
     /// do projeto, nos dois idiomas.
     #[tokio::test]
@@ -12937,6 +13189,133 @@ mod tests {
     }
 
 
+    /// Spec 129 T02: `docker diff` com `n` arquivos gravados fora de `/work` (mais os diretórios `C`
+    /// e `A` deles), uma entrada `D` e uma em `/work`.
+    fn footprint_diff(n: usize) -> String {
+        let mut out = String::from("C /tmp\nA /tmp/.local\nA /tmp/.local/lib\nD /tmp/apagado\nA /work/fica\n");
+        for i in 0..n {
+            out.push_str(&format!("A /tmp/.local/lib/pkg{i}.py\n"));
+        }
+        out
+    }
+
+    /// Spec 129 T02: projeto Docker com `install_command`, runner com o Compose falso.
+    fn footprint_fixture(tag: &str, install: Option<&str>) -> (Fixture, Arc<crate::harness::compose::fake::FakeRunner>, FakeDev, Recorder, TaskRunner) {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new(tag, "make test");
+        enable_docker(&fx);
+        if let Some(install) = install.map(str::to_string) {
+            edit_settings(&fx, |s| s.install_command = Some(install));
+        }
+        let fake = Arc::new(FakeRunner::default());
+        let (dev, rev, rec) = (FakeDev::default(), base_moving_reviewer(fx.repo.clone()), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env(tag, fake.clone())));
+        (fx, fake, dev, rec, runner)
+    }
+
+    fn footprint_section(fx: &Fixture) -> Option<String> {
+        let text = fs::read_to_string(fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
+        section_text(&text, INSTALL_FOOTPRINT_SECTION)
+    }
+
+    fn outside_work_notices(rec: &Recorder) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        rec.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RunnerEvent::SystemNotice { text, code, params, task_id: None } if code == "install.outside_work" => Some((text, params)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Spec 129 T02: acima do limite, a conferência roda a instalação na base num container mantido
+    /// (sem `--rm`), lê o `docker diff`, remove o container e avisa na Conversa, no spec.md e no
+    /// briefing do Desenvolvedor; roda uma vez por spec.
+    #[tokio::test]
+    async fn install_footprint_above_the_limit_warns_everywhere_once_per_spec() {
+        let (fx, fake, dev, rec, runner) = footprint_fixture("footprint-above", Some("make deps"));
+        fake.reply("diff", 0, &footprint_diff(INSTALL_FOOTPRINT_LIMIT + 5));
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        runner.remember(&fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
+        runner.check_install_footprint(&settings, SPEC).await.unwrap();
+        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "prepare, instalação, diff e remoção");
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(!calls[2].args.iter().any(|a| a == "--rm") && calls[2].args.ends_with(&["-lc".into(), "make deps".into()]), "{:?}", calls[2].args);
+        assert!(calls[2].args.contains(&"nants.project=footprint-above".to_string()));
+        assert_eq!(calls[2].cwd, fx.repo, "na base");
+        // spec.md: o registro (com o tempo) e o aviso com os caminhos principais, sem conteúdo.
+        let section = footprint_section(&fx).expect("seção do Arquiteto");
+        let count = INSTALL_FOOTPRINT_LIMIT + 8;
+        assert!(section.contains(&format!("código 0): {count} entradas gravadas fora de /work, em ")), "{section}");
+        assert!(section.contains("A instalação gravou fora da pasta do projeto; isso se perde entre comandos"), "{section}");
+        assert!(section.contains(&format!("/tmp/.local/lib ({})", INSTALL_FOOTPRINT_LIMIT + 6)) && !section.contains("/work/fica"), "{section}");
+        // Conversa, pelo código do dicionário.
+        let notices = outside_work_notices(&rec);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].0.starts_with("Aviso: a instalação gravou fora da pasta do projeto"), "{}", notices[0].0);
+        assert!(notices[0].1.get("paths").and_then(|v| v.as_str()).is_some_and(|p| p.starts_with("/tmp/.local/lib (")));
+        // Uma vez por spec: a seção gravada dispensa a próxima conferência.
+        runner.check_install_footprint(&settings, SPEC).await.unwrap();
+        assert_eq!(fake.subcommands().len(), 5, "não roda de novo");
+        assert_eq!(outside_work_notices(&rec).len(), 1);
+        // A base ficou instalada: a instalação dela só roda de novo se a trava mudar.
+        assert!(test_levels::installed_key(&fx.repo).is_some());
+        // Briefing do Desenvolvedor, com a regra.
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let _ = runner.run_task(SPEC, "T01").await.unwrap();
+        let brief = &dev.briefs()[0].install_footprint;
+        assert!(brief.contains("só o que fica em /work persiste") && brief.contains("/tmp/.local/lib ("), "{brief}");
+    }
+
+    /// Spec 129 T02: abaixo do limite, só o registro (resultado e tempo); nada na Conversa nem no
+    /// briefing. A instalação que falha também é conferida, e o container sai do mesmo jeito.
+    #[tokio::test]
+    async fn install_footprint_below_the_limit_only_records_and_a_failed_install_is_still_cleaned() {
+        let (fx, fake, _dev, rec, runner) = footprint_fixture("footprint-below", Some("make deps"));
+        fake.reply("run", 2, "erro na instalação");
+        fake.reply("diff", 0, &footprint_diff(2));
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        // Uma instalação antiga lembrada na base é esquecida quando a da conferência falha.
+        test_levels::remember_install(&fx.repo, "chave-antiga", "2026-10-26T10:00:00Z");
+        assert!(test_levels::installed_key(&fx.repo).is_some());
+        runner.remember(&fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
+        runner.check_install_footprint(&settings, SPEC).await.unwrap();
+        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"]);
+        let section = footprint_section(&fx).expect("registro");
+        assert!(section.contains("código 2): 5 entradas gravadas fora de /work") && !section.contains("Caminhos principais"), "{section}");
+        assert!(outside_work_notices(&rec).is_empty());
+        assert!(install_footprint_prompt(&fs::read_to_string(fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap()).is_empty());
+        assert!(test_levels::installed_key(&fx.repo).is_none(), "instalação que falhou não fica lembrada");
+    }
+
+    /// Spec 129 T02: sem `install_command`, nada roda; a conferência é a primeira coisa do
+    /// `run_spec`, antes de qualquer tarefa.
+    #[tokio::test]
+    async fn install_footprint_needs_install_command_and_runs_before_the_first_task() {
+        let (fx, fake, _dev, _rec, runner) = footprint_fixture("footprint-none", None);
+        assert!(runner.run_spec(SPEC).await.is_err(), "spec sem tarefas");
+        assert!(fake.subcommands().is_empty() && footprint_section(&fx).is_none());
+        let (fx, fake, _dev, _rec, runner) = footprint_fixture("footprint-first", Some("make deps"));
+        assert!(runner.run_spec(SPEC).await.is_err(), "spec sem tarefas");
+        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"]);
+        assert!(footprint_section(&fx).is_some_and(|s| s.contains("0 entradas gravadas fora de /work")));
+    }
+
+    /// Spec 129 T02: o bloco dos prompts sai do aviso em qualquer idioma do projeto e some sem ele.
+    #[test]
+    fn install_footprint_prompt_reads_the_warning_in_both_languages() {
+        for lang in [Lang::PtBr, Lang::En] {
+            let warning = i18n::tr(lang, "runner.install_footprint.warning", &[("paths", "/tmp/.local/lib (12)")]);
+            let spec = format!("## Contexto\nx\n\n## {INSTALL_FOOTPRINT_SECTION}\n- registro\n- {warning}\n");
+            let block = install_footprint_prompt(&spec);
+            assert!(block.contains("/tmp/.local/lib (12)") && block.contains("se perde no comando seguinte"), "{block}");
+        }
+        assert!(install_footprint_prompt(&format!("## {INSTALL_FOOTPRINT_SECTION}\n- registro\n")).is_empty());
+        assert!(install_footprint_prompt("## Contexto\nx\n").is_empty());
+    }
+
     /// Spec 124 T05: executor que registra cada rodada (pasta, comando) e responde por comando:
     /// as falhas roteirizadas de cada um saem em ordem; o resto passa.
     #[derive(Clone, Default)]
@@ -13493,7 +13872,7 @@ mod tests {
         let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
         let (dev, rec) = (FakeDev::default(), Recorder::default());
         assert_eq!(fx.runner(&dev, &rev, ReadonlyFormatter, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
-        let diagnosis = "o formatador prettier tentou alterar `.nants/`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`)";
+        let diagnosis = "o formatador prettier tentou alterar `.nants/`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`, `.nants-home/`)";
         let texts = tests_texts(&rec);
         let failed: Vec<&String> = texts.iter().filter(|t| t.starts_with("formatação automática (prettier) falhou (não bloqueia): ")).collect();
         assert_eq!(failed.len(), 1, "{texts:?}");
@@ -13580,6 +13959,53 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Executor que anota, a cada comando, o que existe na pasta pessoal da pasta em que roda.
+    #[derive(Clone, Default)]
+    struct HomeProbe {
+        seen: Arc<Mutex<Vec<(String, bool, bool)>>>,
+    }
+
+    impl TestExecutor for HomeProbe {
+        fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                let home = dir.join(crate::harness::home::HOME_DIR);
+                let installed = home.join(".local/bin/tool").exists();
+                let cached = home.join(".cache/pkg").exists();
+                self.seen.lock().unwrap().push((command.to_string(), installed, cached));
+                Ok(TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false })
+            })
+        }
+    }
+
+    /// Spec 129 T01: a rodada limpa final começa sem a pasta pessoal (o que o Desenvolvedor instalou
+    /// nela some), menos o cache de download; vale também sem `install_command`.
+    #[tokio::test]
+    async fn clean_round_starts_without_the_personal_folder_but_keeps_the_cache() {
+        let fx = Fixture::new("home-clean", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, brief: &DevBrief| {
+                let home = crate::harness::home::ensure(&brief.worktree).unwrap();
+                fs::create_dir_all(home.join(".local/bin")).unwrap();
+                fs::write(home.join(".local/bin/tool"), "#!/bin/sh\n").unwrap();
+                fs::create_dir_all(home.join(".cache")).unwrap();
+                fs::write(home.join(".cache/pkg"), "bytes").unwrap();
+                format!("dev {n}")
+            })),
+            ..FakeDev::default()
+        };
+        let probe = HomeProbe::default();
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, probe.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let seen = probe.seen.lock().unwrap().clone();
+        let first = seen.first().expect("rodada");
+        assert_eq!(first, &("make test".to_string(), false, true), "{seen:?}");
+        // A pasta é da área de trabalho: nunca vai para a base pelo commit da tarefa, e a remoção da
+        // worktree a leva junto.
+        assert!(!fx.repo.join(crate::harness::home::HOME_DIR).exists());
+        assert!(!fx.worktree("T01").join(crate::harness::home::HOME_DIR).exists());
     }
 }
 

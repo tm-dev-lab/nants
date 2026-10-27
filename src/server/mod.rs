@@ -5,6 +5,7 @@
 
 pub mod advisor;
 pub mod app;
+pub mod app_guide;
 pub mod approvals;
 pub mod arbiter;
 pub mod architecture;
@@ -19,6 +20,7 @@ pub mod chatgpt;
 pub mod chat_attachments;
 pub mod choices;
 pub mod config_api;
+pub mod console;
 pub mod devices;
 pub mod dialog;
 pub mod doctor;
@@ -100,10 +102,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects/:id/activity", get(live_activity::get_activity))
         .route("/api/projects/:id/files", get(file_explorer::list_files))
         .route("/api/projects/:id/file", get(file_explorer::get_file))
-        .route("/api/projects/:id/app", get(app::get_app))
-        .route("/api/projects/:id/app/start", post(app::start_app))
-        .route("/api/projects/:id/app/stop", post(app::stop_app))
-        .route("/api/projects/:id/app/logs", get(app::get_logs))
+        // Janela de execução: todo erro leva o próximo passo (`action`, spec 130 T04).
+        .route("/api/projects/:id/app", get(app::get_app).layer(from_fn(app_guide::attach_action)))
+        .route("/api/projects/:id/app/start", post(app::start_app).layer(from_fn(app_guide::attach_action)))
+        .route("/api/projects/:id/app/stop", post(app::stop_app).layer(from_fn(app_guide::attach_action)))
+        .route("/api/projects/:id/app/logs", get(app::get_logs).layer(from_fn(app_guide::attach_action)))
+        // Console do projeto (spec 130 T03).
+        .route(
+            "/api/projects/:id/app/exec",
+            get(console::get_exec).post(console::exec_app).layer(from_fn(app_guide::attach_action)),
+        )
+        .route("/api/projects/:id/app/exec/stop", post(console::stop_exec).layer(from_fn(app_guide::attach_action)))
+        // Conteúdo da janela e "Pedir ao Arquiteto para corrigir" (spec 130 T04).
+        .route("/api/projects/:id/app/guide/:spec_id", get(app_guide::get_guide).layer(from_fn(app_guide::attach_action)))
+        .route("/api/projects/:id/app/fix", post(app_guide::post_fix).layer(from_fn(app_guide::attach_action)))
         .route("/api/projects/:id/settings", put(projects::put_settings))
         .route("/api/projects/:id/yolo", put(projects::put_yolo))
         .route("/api/projects/:id/internet", put(projects::put_internet))

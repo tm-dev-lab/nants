@@ -59,6 +59,10 @@ export const KNOWN_EVENT_TYPES: readonly ApiEventType[] = [
   "recovery_decided",
   "app_started",
   "app_exited",
+  "app_mode_changed",
+  "app_exec_started",
+  "app_exec_output",
+  "app_exec_finished",
   "devices_changed",
   "device_code_locked",
 ];
@@ -131,6 +135,8 @@ const TASK_STATUSES: readonly string[] = [
   "BLOCKED",
 ];
 
+/** Formas da execução do app (spec 130). */
+const APP_MODES: readonly string[] = ["page", "running", "finished"];
 const ACTIVITY_KINDS: readonly string[] = ["start", "reasoning", "text", "tool", "command", "heartbeat", "command_end", "model", "model_end", "end"];
 
 function isStr(value: unknown): value is string {
@@ -287,6 +293,23 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
       return (
         optionalOrNull(p.code, (v) => typeof v === "number" && Number.isSafeInteger(v)) && optionalOrNull(p.reason, isStr)
       );
+    case "app_mode_changed":
+      return (
+        isStr(p.spec_id) &&
+        isStr(p.mode) &&
+        APP_MODES.includes(p.mode) &&
+        optionalOrNull(p.exit_code, (v) => typeof v === "number" && Number.isSafeInteger(v))
+      );
+    case "app_exec_started":
+      return isStr(p.exec_id) && isStr(p.spec_id) && isStr(p.command) && isStr(p.started_at);
+    case "app_exec_output":
+      return isStr(p.exec_id) && isSafeSeq(p.seq) && isStr(p.text) && typeof p.truncated === "boolean";
+    case "app_exec_finished":
+      return (
+        isStr(p.exec_id) &&
+        isStr(p.status) &&
+        optionalOrNull(p.exit_code, (v) => typeof v === "number" && Number.isSafeInteger(v))
+      );
     case "devices_changed":
     case "device_code_locked":
       return p.reason === undefined || isStr(p.reason);
@@ -315,6 +338,13 @@ export function parseApiEvent(raw: unknown): ApiEvent | null {
                 code: typeof payload.code === "number" ? payload.code : null,
                 reason: isStr(payload.reason) ? payload.reason : "exited",
               }
+            : event_type === "app_mode_changed"
+              ? {
+                  spec_id: payload.spec_id,
+                  mode: payload.mode,
+                  previous: isStr(payload.previous) && APP_MODES.includes(payload.previous) ? payload.previous : null,
+                  exit_code: typeof payload.exit_code === "number" ? payload.exit_code : null,
+                }
             : event_type === "devices_changed" || event_type === "device_code_locked"
               ? { reason: isStr(payload.reason) ? payload.reason : "" }
               : payload;

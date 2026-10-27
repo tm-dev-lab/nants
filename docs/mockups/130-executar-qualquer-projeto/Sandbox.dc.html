@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Execução: não roda no sandbox</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#C4B5FD}a:hover{color:#DDD6FE}
+</style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; background: #050508; padding: 20px; font-family: Inter, sans-serif; color: #F4F4F6">
+<div style="height: 100%; display: flex; flex-direction: column; background: #0D0D15; border-radius: 14px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.55)">
+<div style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #11111B">
+<span style="font-weight: 600; font-size: 14px">App</span>
+<span style="font-size: 13px; color: #AEAEB8">photo-organizer</span>
+<span style="font-size: 12px; padding: 3px 10px; border-radius: 999px; background: rgba(252,211,77,0.12); color: #FCD34D">Não roda aqui</span>
+</div>
+<div style="display: flex; gap: 16px; flex-grow: 1; padding: 20px 16px; min-height: 0">
+<div style="flex: 3 1 0; display: flex; flex-direction: column; gap: 14px">
+<div style="padding: 16px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 16px; font-weight: 600">Este app abre uma janela nativa de desktop</span>
+<span style="font-size: 13px; color: #D4D4D8; line-height: 1.5">O ambiente do Nants não tem tela, então ele não abre aqui. O Arquiteto registrou isso no plano, e a entrega foi provada pelos testes e pelas capturas geradas em modo sem tela.</span>
+</div>
+<div style="padding: 16px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">COMO RODAR NO SEU COMPUTADOR</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #D4D4D8">pip install -e . &amp;&amp; photo-organizer</span>
+<a href="#" style="font-size: 12px">Ver o relatório final</a>
+</div>
+<button style="align-self: flex-start; font: inherit; font-size: 13px; padding: 9px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.11); background: transparent; color: #F4F4F6">Abrir o Console do projeto</button>
+</div>
+<div style="flex: 2 1 0; padding: 14px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 10px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">O QUE FOI PROVADO</span>
+<span style="font-size: 13px; color: #86EFAC">5 de 5 tarefas concluídas</span>
+<span style="font-size: 13px; color: #86EFAC">Verificação final: 5 de 5 critérios</span>
+<div style="display: flex; gap: 8px">
+<div style="flex: 1 1 0; height: 90px; border-radius: 6px; background: #2B2B35"></div>
+<div style="flex: 1 1 0; height: 90px; border-radius: 6px; background: #2B2B35"></div>
+</div>
+<span style="font-size: 12px; color: #AEAEB8">Capturas da janela principal e da tela de importação</span>
+</div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

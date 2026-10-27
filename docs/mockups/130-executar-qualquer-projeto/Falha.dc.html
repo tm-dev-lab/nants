@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Execução: ambiente não subiu</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#C4B5FD}a:hover{color:#DDD6FE}
+</style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; background: #050508; padding: 20px; font-family: Inter, sans-serif; color: #F4F4F6">
+<div style="height: 100%; display: flex; flex-direction: column; background: #0D0D15; border-radius: 14px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.55)">
+<div style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #11111B">
+<span style="font-weight: 600; font-size: 14px">App</span>
+<span style="font-size: 13px; color: #AEAEB8">household-ledger</span>
+<span style="font-size: 12px; padding: 3px 10px; border-radius: 999px; background: rgba(254,205,211,0.12); color: #FECDD3">O ambiente não subiu</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 14px; padding: 20px 16px; flex-grow: 1; min-height: 0">
+<div style="padding: 16px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 16px; font-weight: 600">A imagem do ambiente não foi construída</span>
+<span style="font-size: 13px; color: #D4D4D8; line-height: 1.5">O Docker parou no passo de instalação do sistema. O projeto em si não foi alterado; os testes que passaram continuam valendo.</span>
+<div style="display: flex; gap: 10px; margin-top: 6px">
+<button style="font: inherit; font-size: 13px; padding: 9px 16px; border-radius: 8px; border: none; background: #7C3AED; color: #FFFFFF">Pedir ao Arquiteto para corrigir</button>
+<button style="font: inherit; font-size: 13px; padding: 9px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.11); background: transparent; color: #F4F4F6">Tentar de novo</button>
+</div>
+</div>
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">FIM DO LOG</span>
+<div style="flex-grow: 1; padding: 14px 16px; border-radius: 10px; background: #08080D; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7; color: #D4D4D8; overflow: hidden">
+<div>#5 [2/3] RUN apt-get install -y libpq-dev</div>
+<div>#5 E: Unable to locate package libpq-dev</div>
+<div style="color: #FECDD3">failed to solve: process exited with code 100</div>
+</div>
+<span style="font-size: 12px; color: #AEAEB8">O Arquiteto recebe este diagnóstico. Se ele propuser mudar o ambiente, a mudança passa pela sua aprovação.</span>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

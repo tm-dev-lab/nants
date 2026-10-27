@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::agents::chat::ChatBackend;
 use crate::agents::prompts::with_writing_style;
-use crate::agents::llm_client::{ChatMessage, ChatRequest, Role as ChatRole};
+use crate::agents::llm_client::{log_provider_failure, provider_failure, ChatMessage, ChatRequest, ProviderFailure, Role as ChatRole};
 use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
 use crate::config::Effort;
 
@@ -82,6 +82,12 @@ impl ArchitectJudge {
         self.usage = Some(sink);
         self
     }
+
+    /// Registra a falha no log técnico (papel, modelo e código) e devolve o motivo com o código.
+    fn failure(&self, failure: &ProviderFailure) -> String {
+        log_provider_failure("architect_judge", &self.model, failure);
+        failure.describe()
+    }
 }
 
 impl CommandJudge for ArchitectJudge {
@@ -108,8 +114,10 @@ impl CommandJudge for ArchitectJudge {
             };
             match tokio::time::timeout(JUDGE_TIMEOUT, metered.complete(&req)).await {
                 Ok(Ok(resp)) => parse_verdict(&resp.message.content).ok_or_else(|| "resposta inválida do juiz".to_string()),
-                Ok(Err(_)) => Err("falha ao consultar o modelo".to_string()),
-                Err(_) => Err("tempo esgotado".to_string()),
+                // Spec 129 T03: o erro do provedor não é engolido; o código fixo (088/119) vai ao
+                // log técnico e ao motivo devolvido, sem texto remoto.
+                Ok(Err(err)) => Err(self.failure(&provider_failure(&err))),
+                Err(_) => Err(self.failure(&ProviderFailure::Timeout)),
             }
         })
     }
@@ -175,6 +183,27 @@ mod tests {
         drop(used);
         let bad = judge_with("não sei", Arc::new(Default::default()));
         assert!(bad.judge("x", Path::new("/tmp"), "y").await.is_err());
+    }
+
+    struct Failing;
+
+    impl ChatBackend for Failing {
+        fn complete<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, crate::agents::LlmError>> + Send + 'a>> {
+            Box::pin(async {
+                Err(crate::agents::LlmError::Http { status: 400, body_snippet: "texto remoto qualquer".into(), code: None })
+            })
+        }
+    }
+
+    /// Spec 129 T03: a falha do modelo leva o código do erro do provedor ao motivo, sem texto remoto.
+    #[tokio::test]
+    async fn judge_failure_carries_the_provider_code() {
+        let judge = ArchitectJudge::new(Arc::new(Failing), "arq", None, Arc::new(SecretSet::new(Vec::<String>::new())));
+        let err = judge.judge("echo $(date)", Path::new("/tmp"), "expansão").await.expect_err("falha");
+        assert_eq!(err, "provider_http_400");
     }
 
     #[test]

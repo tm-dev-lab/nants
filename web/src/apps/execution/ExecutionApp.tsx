@@ -14,6 +14,9 @@
  * - a dica "Quando a porta responder, a janela App mostra a página sozinha.";
  * - quando o app passa a responder (uma vez por partida), o aviso "App no ar" e, se a janela App
  *   estiver fechada, ela abre com a página.
+ * - spec 130: a pílula diz a forma (no ar com página, rodando sem página, terminou com o código);
+ *   "Abrir o Console" mostra o Console do projeto na janela App; com a falha do ambiente guardada no
+ *   servidor, "Pedir ao Arquiteto para corrigir" leva à Conversa.
  * Todo texto do servidor é renderizado como texto React.
  */
 import "./execution.css";
@@ -26,7 +29,21 @@ import { useShell, useSpace } from "../../desktop/shellContext";
 import { useWindowVisibility, WindowLayoutContext } from "../../desktop/useWindowVisibility";
 import { AutoScrollBox, type ScrollItem } from "../conversation/AutoScrollBox";
 import { copyText } from "../conversation/ResultMessage";
-import { DOCKER_RUN_COMMAND, firstPort, hostPort, runStateLabel, safeHref, reachPortNote, reachRangeNote, showAppLiveToast, urlPort, type RunPhase } from "../app/appModel";
+import {
+  DOCKER_RUN_COMMAND,
+  finishedRun,
+  firstPort,
+  hostPort,
+  liveMode,
+  runStateLabel,
+  safeHref,
+  reachPortNote,
+  reachRangeNote,
+  showAppLiveToast,
+  urlPort,
+  type RunPhase,
+} from "../app/appModel";
+import { FixButton } from "../app/RunViews";
 import { rangeReleased } from "../../desktop/network";
 import { useNetworkView } from "../../desktop/useNetwork";
 import type { AppPort } from "../../api/client";
@@ -48,10 +65,24 @@ const PHASE_TONE: Readonly<Record<RunPhase["kind"], string | undefined>> = {
   exited: "rose",
 };
 
+/** Tom da pílula: rodando sem página em ciano; "terminou" em verde (código 0) ou rosa. */
+function phaseTone(phase: RunPhase): string | undefined {
+  if (liveMode(phase) === "running") return "cyan";
+  const finished = finishedRun(phase);
+  if (finished !== null) return finished.exit_code === 0 ? "green" : "rose";
+  return PHASE_TONE[phase.kind];
+}
+
 /** Pílula de estado: ponto (decorativo) + rótulo; o pulso respeita `prefers-reduced-motion`. */
 function StatePill({ phase }: { phase: RunPhase }) {
   return (
-    <span role="status" className="nd-pill nd-exec-pill" data-tone={PHASE_TONE[phase.kind]} data-app-state={phase.kind}>
+    <span
+      role="status"
+      className="nd-pill nd-exec-pill"
+      data-tone={phaseTone(phase)}
+      data-app-state={phase.kind}
+      data-app-mode={liveMode(phase) ?? (finishedRun(phase) !== null ? "finished" : undefined)}
+    >
       <span aria-hidden="true" className="nd-exec-dot" data-pulse={phase.kind === "starting" ? "true" : undefined} />
       {runStateLabel(phase)}
     </span>
@@ -147,7 +178,7 @@ export function ExecutionPanel({ projectId, specId, projectPath, size }: PanelPr
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
   const visible = useWindowVisibility("execution");
-  const { snap, actions } = useRunSession(projectId, specId, {
+  const run = useRunSession(projectId, specId, {
     visible,
     logs: true,
     onLive: () => {
@@ -156,7 +187,13 @@ export function ExecutionPanel({ projectId, specId, projectPath, size }: PanelPr
       if (layoutRef.current !== null && layoutRef.current.windows.app?.open !== true) shell.openWindow("app");
     },
   });
+  const { snap, actions } = run;
   const { phase, logs } = snap;
+  const askable =
+    snap.failure !== null &&
+    snap.failure.action === "ask_architect_fix" &&
+    (specId === null || snap.failure.spec_id === specId) &&
+    (phase.kind === "stopped" || phase.kind === "exited");
   const [copied, setCopied] = useState(false);
   const reasonId = useId();
 
@@ -219,6 +256,21 @@ export function ExecutionPanel({ projectId, specId, projectPath, size }: PanelPr
             {t(snap.stopping ? "run.stopping" : "run.stop")}
           </button>
         ) : null}
+        {specId !== null ? (
+          <button
+            type="button"
+            className="nd-btn"
+            data-variant="ghost"
+            data-open-console=""
+            onClick={() => {
+              actions.openConsole();
+              shell.openWindow("app");
+            }}
+          >
+            <Icon name="terminal" size={14} />
+            {t("app.openConsole")}
+          </button>
+        ) : null}
       </section>
       {ports.length > 0 ? (
         <ul aria-label={t("exec.ports")} className="nd-exec-ports">
@@ -244,6 +296,11 @@ export function ExecutionPanel({ projectId, specId, projectPath, size }: PanelPr
         <ReadinessNotice title={t("exec.blockedTitle")} missing={shell.readiness.execute.missing} />
       ) : null}
       {snap.problem !== null ? <ProblemNotice message={runProblemText(snap.problem)} missing={snap.problem.missing} prereq={snap.problem.prereq} /> : null}
+      {askable ? (
+        <div className="nd-exec-fix" data-exec-fix="">
+          <FixButton run={run} primary={false} />
+        </div>
+      ) : null}
       {snap.problem !== null && snap.errorDetail !== null ? (
         <details className="nd-details nd-exec-detail">
           <summary>

@@ -33,7 +33,7 @@ const PAGE = { hostname: "192.168.0.68", origin: "http://192.168.0.68:3000" };
 const PORT: AppPort = { service: "web", target: 80, published: 18080, url: "http://192.168.0.68:18080", embeddable: true };
 
 function status(extra: Partial<AppStatus> = {}): AppStatus {
-  return { state: "running", spec_id: "s1", url: null, started_at: "x", exit_code: null, ports: [PORT], notices: [], embeddable: true, network: null, ...extra };
+  return { state: "running", spec_id: "s1", url: null, started_at: "x", exit_code: null, ports: [PORT], notices: [], embeddable: true, network: null, mode: null, command: null, finished: null, failure: null, ...extra };
 }
 
 describe("embedDecision (guardas do iframe)", () => {
@@ -138,10 +138,12 @@ describe("tamanhos da tela", () => {
 
 describe("fase da execução", () => {
   it("no ar da própria especificação, de outra, encerrado e parado", () => {
-    expect(phaseFromStatus(status(), "s1")).toEqual({ kind: "running", ports: [PORT], embeddable: true });
+    expect(phaseFromStatus(status(), "s1")).toEqual({ kind: "running", ports: [PORT], embeddable: true, mode: "page", command: null, startedAt: "x" });
+    // Spec 130: rodando sem página e o comando do servidor.
+    expect(phaseFromStatus(status({ mode: "running", command: "python -m worker" }), "s1")).toMatchObject({ kind: "running", mode: "running", command: "python -m worker" });
     expect(phaseFromStatus(status({ spec_id: "s0" }), "s1")).toEqual({ kind: "other" });
     expect(phaseFromStatus(status({ spec_id: "s0" }), null).kind).toBe("running");
-    expect(phaseFromStatus(status({ state: "exited", exit_code: 1 }), "s1")).toEqual({ kind: "exited", code: 1, reason: null });
+    expect(phaseFromStatus(status({ state: "exited", exit_code: 1 }), "s1")).toEqual({ kind: "exited", code: 1, reason: null, finished: null, command: null });
     expect(phaseFromStatus(status({ state: "exited" }), null)).toEqual({ kind: "stopped" });
     expect(phaseFromStatus(status({ state: "stopped" }), "s1")).toEqual({ kind: "stopped" });
   });
@@ -151,6 +153,9 @@ describe("fase da execução", () => {
     expect(mergeStatus({ kind: "stopped" }, next)).toBe(next);
     const bare = { kind: "running" as const, ports: [], embeddable: null };
     expect(mergeStatus(bare, next)).toEqual(next);
+    // A releitura troca o modo (running vira page) e completa o comando.
+    const live = phaseFromStatus(status({ mode: "running", command: "w" }), "s1");
+    expect(mergeStatus(live, next)).toMatchObject({ kind: "running", mode: "page", command: "w" });
     expect(mergeStatus(next, { kind: "running", ports: [], embeddable: null })).toBe(next);
     expect(mergeStatus({ kind: "starting" }, next)).toEqual({ kind: "starting" });
     expect(mergeStatus({ kind: "exited", code: 0, reason: "exited" }, next).kind).toBe("exited");
@@ -161,7 +166,7 @@ describe("fase da execução", () => {
     const stopped = phaseFromStatus(status({ state: "stopped" }), "s1");
     const exited = phaseFromStatus(status({ state: "exited", exit_code: 137 }), "s1");
     expect(mergeStatus(running, stopped)).toEqual({ kind: "stopped" });
-    expect(mergeStatus(running, exited)).toEqual({ kind: "exited", code: 137, reason: null });
+    expect(mergeStatus(running, exited)).toEqual({ kind: "exited", code: 137, reason: null, finished: null, command: null });
     // Sem portas ainda (logo depois do `app_started`), também.
     expect(mergeStatus({ kind: "running", ports: [], embeddable: null }, stopped)).toEqual({ kind: "stopped" });
     // Partida em curso continua protegida contra uma resposta antiga.

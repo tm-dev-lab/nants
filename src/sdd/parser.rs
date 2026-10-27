@@ -103,6 +103,7 @@ impl Spec {
             .as_deref()
             .map(|e| e.trim().to_ascii_lowercase())
             .filter(|e| e == "docker" || e == "host");
+        frontmatter.not_in_sandbox = super::schema::valid_sandbox_note(frontmatter.not_in_sandbox.as_deref());
         Ok(Self { frontmatter, body })
     }
 
@@ -868,6 +869,21 @@ denied_commands:
         assert!(Spec::parse(&mk("screenshots: [\"/abs\"]\n")).expect("válida").frontmatter.screenshots.is_none());
         assert!(Spec::parse(&mk("screenshots: []\n")).expect("vazia").frontmatter.screenshots.is_none());
         assert!(Spec::parse(&mk("")).expect("sem").frontmatter.screenshots.is_none());
+    }
+
+    #[test]
+    fn not_in_sandbox_is_one_short_line_or_absent() {
+        // Spec 130 T04: a frase do Arquiteto sobre o que não roda no sandbox; inválida é ignorada.
+        let mk = |f: &str| format!("---\nid: s\ntitle: t\nstatus: DRAFT\nbase_branch: main\ncreated_at: x\n{f}---\ncorpo\n");
+        let ok = Spec::parse(&mk("not_in_sandbox: \"  A janela nativa de desktop não abre aqui.  \"\n")).expect("ok");
+        assert_eq!(ok.frontmatter.not_in_sandbox.as_deref(), Some("A janela nativa de desktop não abre aqui."));
+        assert_eq!(Spec::parse(&ok.render().expect("render")).expect("rt"), ok);
+        assert!(Spec::parse(&mk("")).expect("sem").frontmatter.not_in_sandbox.is_none());
+        assert!(!Spec::parse(&mk("")).expect("sem").render().expect("render").contains("not_in_sandbox"));
+        for bad in ["\"\"", "\"a\\nb\"", &format!("\"{}\"", "x".repeat(301))] {
+            let spec = Spec::parse(&mk(&format!("not_in_sandbox: {bad}\n"))).expect("válida");
+            assert!(spec.frontmatter.not_in_sandbox.is_none(), "{bad}");
+        }
     }
 
     #[test]

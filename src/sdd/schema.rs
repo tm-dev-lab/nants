@@ -266,6 +266,17 @@ pub fn valid_optional_command(raw: Option<&str>) -> Option<String> {
     raw.filter(|r| !r.trim().is_empty()).and_then(|r| check_test_command_shape(r).ok())
 }
 
+/// Tamanho máximo de `not_in_sandbox` (caracteres).
+pub const MAX_SANDBOX_NOTE_CHARS: usize = 300;
+
+/// `not_in_sandbox` (spec 130 T04): uma frase, sem caractere de controle, até
+/// [`MAX_SANDBOX_NOTE_CHARS`]; vazio ou inválido = ausente.
+pub fn valid_sandbox_note(raw: Option<&str>) -> Option<String> {
+    let note = raw?.trim();
+    let ok = !note.is_empty() && note.chars().count() <= MAX_SANDBOX_NOTE_CHARS && !note.chars().any(char::is_control);
+    ok.then(|| note.to_string())
+}
+
 /// Normaliza `workdir`: relativo, sem `..` (vazio = `.`).
 pub fn normalize_workdir(raw: &str) -> Option<String> {
     normalize_rel(raw).map(|p| if p.is_empty() { ".".to_string() } else { p })
@@ -424,6 +435,10 @@ pub struct SpecMeta {
     /// Arquivos de trava propostos pelo Arquiteto (spec 124 T05); inválidos são ignorados.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lockfiles: Option<Vec<String>>,
+    /// O que não roda no sandbox (spec 130 T04), numa frase do Arquiteto (ex.: a janela nativa de
+    /// desktop): a janela de execução explica isso em vez de falhar. Inválido é ignorado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_in_sandbox: Option<String>,
 }
 
 /// Valida `run_url`: só `http://localhost`, `http://127.0.0.1` ou `http://[::1]`, porta explícita

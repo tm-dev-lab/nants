@@ -49,6 +49,62 @@ worktree; like any file the agent reads, only the parts it reads go to your mode
 the session ends. Command output may contain whatever the command printed, so treat the folder like
 the project itself.
 
+## Workspace home folder
+
+Each command in the `workspace` container runs with your user id and a home folder inside the
+task folder (`.nants-home/`), so what a tool installs there is still there for the next command.
+
+- The folder is persistent and lives on the project disk, inside the task's worktree. It is kept
+  out of Git and deleted with the worktree.
+- Nants never writes credentials to it: API keys, ChatGPT plan tokens and the other secrets stay
+  in Nants' own configuration, outside the project.
+- Like any command output, what comes out of that folder into logs, events and agent context goes
+  through the same secret redaction (`SecretSet`).
+- Do not point credentials (for example a token file or a credential helper of your own) at the
+  workspace or its home folder: anything there can be read by the agents' commands.
+
+## Running the app
+
+The App window starts the project with one click and a confirmation, in the project's `-run`
+Docker Compose project (the same isolation as the tasks: your user id, `.git` and `.nants` mounted
+read-only). The way it shows the program comes from what the program does: a page when a port
+answers HTTP, the live log when it keeps running without a page, and the output, the exit code and
+the files it created or changed when it ends.
+
+- A program that ended keeps its stopped container only to show the result: closing the window,
+  stopping the app or starting it again removes it. The paths it wrote outside the project folder
+  are listed, and they go away with the container.
+- The output, the command and the failure log shown in the window go through the same secret
+  redaction (`SecretSet`) and are limited in size.
+- **Ask the Architect to fix it** sends the Architect only the diagnosis Nants itself kept (the end
+  of the log, redacted and limited), never text from the request. If the Architect proposes a
+  change to the environment, it goes through the plan approval as always.
+
+## Project Console
+
+The Console runs a command you type inside the project's approved `workspace` container. It is
+as powerful as a shell in that container: the command can read and change any file of the project
+folder (except `.git` and `.nants`, mounted read-only), use the network and spend resources until
+it ends. It never runs on your computer directly.
+
+- One command per click, with the same checks as starting the app: a confirmation in the request,
+  the `Host` and `Origin` check, an authorized device in local network mode and the `execute`
+  readiness. Only one command runs per project at a time.
+- Each command runs in a new container (`compose run --rm -T`) with your user id and the home
+  folder of the workspace. There is no terminal (TTY) and the input is closed: a program that waits
+  for what you type gets nothing and is stopped at the time limit (5 minutes). The live output is
+  limited too.
+- A command that calls `docker`, `docker compose` or `podman` is refused: the Console cannot reach
+  the Docker daemon of your computer.
+- The container network is not restricted (that would be a limit without evidence of need): treat
+  a command typed in the Console like one you would type in the project's own container.
+- The stop button ends the command at once (the container is removed). Removing the project, a new
+  run of it and shutting Nants down also end it.
+- Nants keeps a local history of the last 50 commands of each project, in its own data folder
+  (readable only by your user), with the device and the time of each command. Commands and output
+  go through the same secret redaction (`SecretSet`); repeating a command from the history asks for
+  confirmation again. The history is deleted when the project is removed from Nants.
+
 ## Local network access
 
 With local network access on (or any address outside loopback, such as `--host` with

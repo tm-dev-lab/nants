@@ -47,7 +47,6 @@ const EXCEPTIONS: readonly Exception[] = [
   { file: "api/types.ts", text: "needs_login", why: "estado fixo do login pelo plano ChatGPT (`PlanStatus::NeedsLogin`, spec 116); a palavra `login` vem do dicionário pt, mas o estado não é texto de pessoa (a tela mostra `chatgpt.state.needsLogin`)" },
   { file: "apps/plan/PlanCard.tsx", text: "reaproveitado", why: "vocabulário fixo do servidor (situação do perfil); a tela mostra `plan.skillStatus.*`" },
   { file: "apps/conversation/Bubble.tsx", text: /^(aprovada automaticamente|aprovado automaticamente \(YOLO\)|\[rodada autônoma( YOLO)?\])$/, why: SERVER_FORMAT },
-  { file: "apps/conversation/PausedRunCard.tsx", text: "Análise de recuperação", why: SERVER_FORMAT },
   { file: "apps/shared/activityText.ts", text: "repetindo (", why: `aviso de nova tentativa (\`llm_client::retry_notice\`); ${SERVER_FORMAT} (\`activity.retry.detail\`)` },
   { file: "copy.ts", text: "Defina a stack e o comando de testes (test_command) da spec e atualize-a para aprovação.", why: "mensagem interna enviada ao Arquiteto (`internal: true`), nunca exibida; prompts internos ficam em português (decisão 3)" },
   { file: "copy.ts", text: "provedor no limite", why: `prefixo do detalhe da falha por limite do provedor; ${SERVER_FORMAT}` },
@@ -59,40 +58,9 @@ const EXCEPTIONS: readonly Exception[] = [
   { file: "imageResize.ts", text: /^(canvas indisponível|falha ao converter a imagem)$/, why: "erro interno capturado pelo anexo; a tela mostra `attachments.readFailed`" },
   { file: "main.tsx", text: "elemento #root ausente", why: "falha de inicialização da página (sem `#root` não há interface para mostrar texto)" },
   {
-    file: "recoveryAnalysis.ts",
-    text: /^- (Causa raiz|Estratégia sugerida|Estratégia|Novo test_command|Novos checks|Novo allowed_scope|Escopo ampliado|Escopo não ampliado|Escopo recusado|Proposta|Opções descartadas|comando|código|por que não resolveu|Contexto|trecho do erro|Opções para o humano):$/,
-    why: `rótulos das linhas da análise de recuperação; ${SERVER_FORMAT} (\`recoveryText.*\`)`,
-  },
-  {
-    file: "recoveryAnalysis.ts",
-    text: /^- (Decisão: (configuração de testes revisada \(REVISE_CONFIG\)|tarefa revisada \(REVISE_TASK\)|nova estratégia \(RETRY\)|escalar ao humano)|Configuração de testes corrigida e aplicada pelo servidor|Contagem: não conta como ciclo \(escalada determinística\))$/,
-    why: `linhas fixas de decisão e contagem da análise de recuperação; ${SERVER_FORMAT}`,
-  },
-  {
-    file: "recoveryAnalysis.ts",
-    text: /^- (Pergunta ao humano|Tarefas novas|Apontamentos dispensados):$|^- Decisão: (tarefa dividida \(SPLIT\)|critérios ajustados ao que o ambiente prova \(ADJUST\)|pergunta ao humano \(ASK\))$|^- Ajuste não aplicado: os critérios não puderam ser gravados; a tarefa segue com a estratégia \(RETRY\)$/,
-    why: `rótulos e linhas fixas do SPLIT, ADJUST e ASK (spec 124 T03, \`recovery_plan.rs\`); ${SERVER_FORMAT} (\`recoveryText.*\`)`,
-  },
-  { file: "recoveryAnalysis.ts", text: /^- opções: /, why: `linhas fixas de opções da escalada (\`recovery.rs\`); ${SERVER_FORMAT} (\`recoveryText.options.*\`)` },
-  {
-    file: "recoveryAnalysis.ts",
-    text: /^(Ambiente docker ajustado: o run será relançado com o ambiente novo\.|\(sem saída registrada\)|\(citada pelo modelo\))$/,
-    why: `linhas fixas avulsas da análise de recuperação; ${SERVER_FORMAT}`,
-  },
-  {
-    file: "recoveryAnalysis.ts",
-    text: /^(proposta de configuração de testes inválida|correção da configuração de testes não aprovada|falha ao gravar a configuração de testes|análise indisponível|ambiente: o comando de testes não executou|ambiente: reescrever a tarefa não resolve falha de ambiente \(a verificação não pode ser rebaixada\)|a proposta removeria verificação|a proposta repetiria o comando de testes|ambiente: limite de rodadas autônomas atingido sem resolver a falha|limite de ciclos de recuperação atingido|ajuste do ambiente docker não aplicado|aprovação do ambiente negada pelo humano|docker indisponível)$/,
-    why: `causas fixas do servidor na análise de recuperação; ${SERVER_FORMAT} (\`recoveryText.cause.*\`)`,
-  },
-  {
     file: "reportMarkdown.ts",
     text: /^(como( testar| parar| usar| instalar)?|executar|rodar|iniciar|subir|pr[ée][ -]requisitos|requisitos|instalação|instalacao|instalar|decisões|decisoes|limitações|limitacoes|próximos passos|proximos passos)$/,
     why: "títulos de seção do relatório em pt-BR (o relatório segue o idioma de quando foi gerado), só para achar a seção de execução",
-  },
-  {
-    file: "reviewMessage.ts",
-    text: /^(Critérios:|Apontamentos:|Observações \(não bloqueiam\):|Cenário de falha:|observação \(arquivo não mudou nesta rodada\)|baixa confiança|Capturas avaliadas:|Aprovado|Pediu ajustes|Verificação final:|novo|Resolvidos:|Respostas do Desenvolvedor:|Decisões do Arquiteto:)$/,
-    why: `cabeçalhos e vereditos da mensagem do Revisor; ${SERVER_FORMAT} (\`review.*\`)`,
   },
 ];
 

@@ -13,6 +13,7 @@ import type {
   ActivitySnapshot,
   AgentActivityPayload,
   ApiEvent,
+  AppMode,
   BlockKind,
   ChatHistoryTurn,
   ConfigView,
@@ -629,7 +630,9 @@ export function reportKey(projectId: string, specId: string): string {
 
 type AppSignal =
   | { kind: "started"; specId: string; url: string | null }
-  | { kind: "exited"; code: number | null; reason: string };
+  | { kind: "exited"; code: number | null; reason: string }
+  /** `app_mode_changed` (spec 130): `running` virou `page`, ou o app vivo terminou. */
+  | { kind: "mode"; specId: string; mode: AppMode; exitCode: number | null };
 
 type ReportSignal =
   | { specId: string; kind: "ready" }
@@ -1349,13 +1352,15 @@ export function createAppStore(initial: Partial<AppState> = {}): AppStore {
         }
         return;
       }
-      if (event.event_type === "app_started" || event.event_type === "app_exited") {
+      if (event.event_type === "app_started" || event.event_type === "app_exited" || event.event_type === "app_mode_changed") {
         const projectId = event.project_id;
         if (projectId !== null) {
           const signal: AppSignal =
             event.event_type === "app_started"
               ? { kind: "started", specId: event.payload.spec_id, url: event.payload.url }
-              : { kind: "exited", code: event.payload.code, reason: event.payload.reason };
+              : event.event_type === "app_mode_changed"
+                ? { kind: "mode", specId: event.payload.spec_id, mode: event.payload.mode, exitCode: event.payload.exit_code }
+                : { kind: "exited", code: event.payload.code, reason: event.payload.reason };
           setState((s) => ({ appSignals: { ...s.appSignals, [projectId]: signal } }));
         }
         return;

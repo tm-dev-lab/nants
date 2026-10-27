@@ -863,6 +863,8 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/projects/:id/file", GetEffect::Read),
     ("/api/projects/:id/app", GetEffect::Read),
     ("/api/projects/:id/app/logs", GetEffect::Read),
+    ("/api/projects/:id/app/exec", GetEffect::Read),
+    ("/api/projects/:id/app/guide/:spec_id", GetEffect::Read),
     ("/api/projects/:id/specs/:spec_id/result", GetEffect::Read),
     ("/api/projects/:id/specs/:spec_id/captures/:name", GetEffect::Read),
     ("/api/projects/:id/specs/:spec_id/dialog", GetEffect::Read),

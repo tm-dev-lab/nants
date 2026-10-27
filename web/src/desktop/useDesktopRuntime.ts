@@ -10,6 +10,7 @@
  * - `/api/readiness`: na abertura, na ressincronização e quando o shell pede.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isConsoleEvent, publishConsoleEvent } from "../api/consoleEvents";
 import { isDeviceEvent, publishDeviceEvent } from "../api/deviceEvents";
 import type { ApiEvent } from "../api/types";
 import { loadConfig } from "../configLoader";
@@ -93,6 +94,7 @@ export function useDesktopRuntime(options: DesktopRuntimeOptions = {}): DesktopR
       // Remoção: o shell fecha o espaço e avisa (nada de rota); o resto vai para o store.
       if (event.event_type === "project_removed") handleSpaceRemovedEvent(event.payload.project_id);
       else if (isDeviceEvent(event)) publishDeviceEvent(event);
+      else if (isConsoleEvent(event)) publishConsoleEvent(event);
       else handleLiveEvent(event);
       if (isAttentionEvent(event)) feedRef.current?.request();
     },

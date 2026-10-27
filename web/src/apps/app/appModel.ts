@@ -6,7 +6,7 @@
  * Todo projeto do Nants é Docker (spec 074; o modo processo saiu na T02): o app sobe o Compose
  * `-run` do projeto, e os links são as portas publicadas, com o MESMO host da página.
  */
-import type { AppPort, AppStatus } from "../../api/client";
+import type { AppFinished, AppPort, AppStatus } from "../../api/client";
 import type { LanRange } from "../../api/types";
 import { rangeLabel } from "../../desktop/network";
 import type { IconName } from "../../desktop/Icon";
@@ -18,17 +18,38 @@ import type { AppSummary, AppSummaryInput } from "../registry";
 export const LOGS_POLL_MS = 2_000;
 
 /** Comando exato mostrado na confirmação (o servidor sobe o Compose `-run` do projeto). */
-export const DOCKER_RUN_COMMAND = "docker compose up -d --build --wait";
+export const DOCKER_RUN_COMMAND = "docker compose up -d --build";
 
 /** `sandbox` do iframe do app (decisão 12). */
 export const IFRAME_SANDBOX = "allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox";
 
+/**
+ * Forma do app vivo (spec 130): `page` abre uma porta HTTP (o navegador); `running` segue rodando
+ * sem página (o registro ao vivo). Servidor antigo, sem `mode`: `page`.
+ */
+type LiveMode = "page" | "running";
+
 export type RunPhase =
   | { kind: "stopped" }
   | { kind: "starting" }
-  | { kind: "running"; ports: AppPort[]; embeddable: boolean | null }
+  | {
+      kind: "running";
+      ports: AppPort[];
+      embeddable: boolean | null;
+      mode?: LiveMode;
+      /** Comando que roda (redigido); ausente quando ainda não veio do servidor. */
+      command?: string | null;
+      startedAt?: string | null;
+    }
   | { kind: "other" }
-  | { kind: "exited"; code: number | null; reason: string | null };
+  | {
+      kind: "exited";
+      code: number | null;
+      reason: string | null;
+      /** O programa rodou e terminou (spec 130): a saída e os arquivos; `null` = parado ou sem dados. */
+      finished?: AppFinished | null;
+      command?: string | null;
+    };
 
 /**
  * Fase a partir do `GET .../app`. Com `specId` (a especificação concluída do espaço), um app de
@@ -37,12 +58,30 @@ export type RunPhase =
 export function phaseFromStatus(status: AppStatus, specId: string | null): RunPhase {
   if (status.state === "running") {
     const mine = specId === null || status.spec_id === null || status.spec_id === specId;
-    return mine ? { kind: "running", ports: status.ports, embeddable: status.embeddable } : { kind: "other" };
+    if (!mine) return { kind: "other" };
+    return {
+      kind: "running",
+      ports: status.ports,
+      embeddable: status.embeddable,
+      mode: status.mode === "running" ? "running" : "page",
+      command: status.command,
+      startedAt: status.started_at,
+    };
   }
   if (status.state === "exited" && specId !== null && status.spec_id === specId) {
-    return { kind: "exited", code: status.exit_code, reason: null };
+    return { kind: "exited", code: status.exit_code, reason: null, finished: status.finished, command: status.command };
   }
   return { kind: "stopped" };
+}
+
+/** Forma do app vivo (`page` quando o servidor não disse). */
+export function liveMode(phase: RunPhase): LiveMode | null {
+  return phase.kind === "running" ? (phase.mode ?? "page") : null;
+}
+
+/** O programa rodou e terminou com o resultado (saída e arquivos) para mostrar. */
+export function finishedRun(phase: RunPhase): AppFinished | null {
+  return phase.kind === "exited" ? (phase.finished ?? null) : null;
 }
 
 /**
@@ -58,8 +97,23 @@ export function mergeStatus(current: RunPhase, next: RunPhase): RunPhase {
   if (current.kind === "running" && next.kind === "running") {
     const ports = next.ports.length > 0 ? next.ports : current.ports;
     const embeddable = next.ports.length > 0 ? next.embeddable : current.embeddable;
-    if (ports === current.ports && embeddable === current.embeddable) return current;
-    return { kind: "running", ports, embeddable };
+    const mode = next.mode ?? current.mode;
+    const command = next.command ?? current.command ?? null;
+    const startedAt = next.startedAt ?? current.startedAt ?? null;
+    if (
+      ports === current.ports &&
+      embeddable === current.embeddable &&
+      mode === current.mode &&
+      command === current.command &&
+      startedAt === current.startedAt
+    ) {
+      return current;
+    }
+    return { kind: "running", ports, embeddable, mode, command, startedAt };
+  }
+  // O `app_exited` chegou antes do resultado (spec 130): a releitura traz a saída e os arquivos.
+  if (current.kind === "exited" && next.kind === "exited" && finishedRun(current) === null && finishedRun(next) !== null) {
+    return { ...next, reason: current.reason ?? next.reason };
   }
   return current;
 }
@@ -98,17 +152,22 @@ export function createStatusSequence(): StatusSequence {
   };
 }
 
-/** Primeira porta publicada com link (o que o iframe mostra), ou `null`. */
+/** Primeira porta publicada com link, ou `null`. */
 export function firstPort(phase: RunPhase): AppPort | null {
   return phase.kind === "running" ? (phase.ports[0] ?? null) : null;
 }
 
+/** Primeira porta com página (modo `page`, spec 130): o que o iframe mostra; `null` sem página. */
+export function pagePort(phase: RunPhase): AppPort | null {
+  return liveMode(phase) === "page" ? firstPort(phase) : null;
+}
+
 /**
  * Porta que o App mostra (095/T07, portas na Execução): a escolhida em "Abrir no App" (pela URL),
- * se ainda está publicada; senão a primeira.
+ * se ainda está publicada; senão a primeira. Só no modo `page` (spec 130).
  */
 export function shownPort(phase: RunPhase, chosenUrl: string | null): AppPort | null {
-  if (phase.kind !== "running") return null;
+  if (phase.kind !== "running" || liveMode(phase) !== "page") return null;
   const chosen = chosenUrl === null ? undefined : phase.ports.find((p) => p.url === chosenUrl);
   return chosen ?? firstPort(phase);
 }
@@ -187,7 +246,7 @@ export const EMBED_RETRY_LIMIT = 36;
 
 /** O iframe mostrado precisa da conferência de novo: no ar, com porta e veredito indeterminado. */
 export function embedProbePending(phase: RunPhase): boolean {
-  const port = firstPort(phase);
+  const port = pagePort(phase);
   return port !== null && portEmbeddable(phase, port) === null;
 }
 
@@ -384,9 +443,17 @@ const RUN_STATE_KEYS: Readonly<Record<RunPhase["kind"], MessageKey>> = {
   exited: "app.state.exited",
 };
 
-/** Pílula de estado da Execução. */
+/** Pílula de estado da Execução: no ar sem página e "terminou" têm rótulo próprio (spec 130). */
 export function runStateLabel(phase: RunPhase): string {
+  if (liveMode(phase) === "running") return t("app.state.runningNoPage");
+  const finished = finishedRun(phase);
+  if (finished !== null) return finishedLabel(finished.exit_code);
   return t(RUN_STATE_KEYS[phase.kind]);
+}
+
+/** "Terminou · código N" (sem código: só "Terminou"). */
+export function finishedLabel(code: number | null): string {
+  return code === null ? t("app.state.finished") : t("app.state.finishedCode", { code });
 }
 
 // --- Resumo ---

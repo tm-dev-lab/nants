@@ -18,6 +18,8 @@ use serde_json::{json, Map, Value};
 
 use crate::agents::activity::{structured, ActivityRun, ActivityScope, ActivitySink, NullSink};
 use crate::agents::finding_reply;
+use crate::agents::markers;
+use crate::i18n::Lang;
 use crate::agents::arch_memory;
 use crate::agents::chat::ChatBackend;
 use crate::agents::usage::{cache_key, context_bytes, session_id, ContextChange, ContextKind, UsageBackend, UsageScope, UsageSink};
@@ -129,9 +131,14 @@ const REMINDER_CRITERIA_BYTES: usize = 400;
 const REMINDER_FINDINGS_BYTES: usize = 200;
 /// Abertura do lembrete periódico.
 const REMINDER_INTRO: &str = "Lembrete (DADO)";
-/// Regra fixa do lembrete periódico.
-const REMINDER_RULE: &str =
-    "Atenção: teste verde não conclui a tarefa: cumpra os critérios e termine com a seção Critérios.";
+/// Regra fixa do lembrete periódico, com o título da seção de critérios no idioma do projeto
+/// (spec 129 T04).
+fn reminder_rule(lang: Lang) -> String {
+    format!(
+        "Atenção: teste verde não conclui a tarefa: cumpra os critérios e termine com a seção {}.",
+        markers::text(lang, markers::CRITERIA)
+    )
+}
 /// Continuações pedidas pela conferência antes do fim, por sessão (spec 087 T04); depois disso a
 /// resposta final é aceita como está.
 const FINAL_CHECK_MAX: usize = 2;
@@ -139,20 +146,38 @@ const FINAL_CHECK_MAX: usize = 2;
 pub(crate) const FINAL_CHECK_INTRO: &str = "Antes de concluir:";
 /// Fecho da mensagem da conferência antes do fim.
 const FINAL_CHECK_OUTRO: &str = "Se não se aplica, explique na resposta final por quê.";
-/// Item da conferência: a resposta final não tem a seção Critérios.
-const GAP_CRITERIA: &str = "falta a seção \"Critérios\" (título em linha própria, cada critério com a evidência)";
+/// Item da conferência: a resposta final não tem a seção Critérios (título no idioma do projeto,
+/// spec 129 T04).
+fn gap_criteria(lang: Lang) -> String {
+    format!(
+        "falta a seção \"{}\" (título em linha própria, cada critério com a evidência)",
+        markers::text(lang, markers::CRITERIA)
+    )
+}
 /// Item da conferência (spec 127 T02): a seção "Critérios" não traz uma linha por critério.
-const GAP_CRITERIA_PARTIAL: &str = "a seção \"Critérios\" não cobre todos os critérios da tarefa: releia o texto inteiro de cada \
-critério, confira todas as partes dele (inclusive as que nenhum apontamento citou) e dê uma linha por critério, `- critério: atendido: evidência`";
+fn gap_criteria_partial(lang: Lang) -> String {
+    format!(
+        "a seção \"{}\" não cobre todos os critérios da tarefa: releia o texto inteiro de cada critério, confira todas as \
+         partes dele (inclusive as que nenhum apontamento citou) e dê uma linha por critério, `- critério: {}: evidência`",
+        markers::text(lang, markers::CRITERIA),
+        markers::text(lang, markers::MET)
+    )
+}
 /// Item da conferência: a worktree não tem alteração em relação à base.
 const GAP_DIFF: &str = "a worktree não tem nenhuma alteração em relação à base";
 /// Item da conferência: nenhum comando rodou na sessão.
 const GAP_COMMAND: &str = "nenhum teste rodou nesta sessão (run_command ou run_browser_tests)";
 /// Item da conferência (spec 124 T02): apontamentos abertos sem resposta (início; seguem os ids).
 const GAP_RESPONSES: &str = "faltam respostas aos apontamentos";
-/// Formato das respostas, repetido na conferência e no briefing.
-const RESPONSES_FORMAT: &str = "na seção \"Respostas aos apontamentos\" (título em linha própria), uma linha por apontamento: \
-`- F-01: fixed: local da correção`, `- F-02: test_added: teste que cobre` ou `- F-03: contested (environment | out_of_scope | incorrect): motivo`";
+/// Formato das respostas, repetido na conferência e no briefing; o título da seção sai no idioma
+/// do projeto (spec 129 T04), e os códigos (`fixed`...) são fixos.
+fn responses_format(lang: Lang) -> String {
+    format!(
+        "na seção \"{}\" (título em linha própria), uma linha por apontamento: `- F-01: fixed: local da correção`, \
+         `- F-02: test_added: teste que cobre` ou `- F-03: contested (environment | out_of_scope | incorrect): motivo`",
+        markers::text(lang, markers::DEV_RESPONSES)
+    )
+}
 /// Item da conferência (spec 124 T02): contestação de apontamento que o Arquiteto já decidiu.
 const GAP_CONTESTED_AGAIN: &str = "o Arquiteto já decidiu a contestação destes apontamentos e eles são obrigatórios; responda fixed ou test_added";
 /// Resumo usado quando a chamada final do Desenvolvedor esgotado falha.
@@ -476,9 +501,10 @@ impl LlmDeveloper {
                 .and_then(|s| arch_memory::message(&brief.worktree, s)),
         );
         let initial = screenshots::list(&brief.worktree, &brief.screenshot_globs, shots_since);
-        messages.push(ChatMessage::text(ChatRole::User, developer_briefing_with(brief, &initial)));
-        let reminder = developer_reminder(brief);
-        let check = FinalCheck::from_brief(brief);
+        let lang = self.lang.get();
+        messages.push(ChatMessage::text(ChatRole::User, developer_briefing_with(brief, &initial, lang)));
+        let reminder = developer_reminder(brief, lang);
+        let check = FinalCheck::from_brief(brief, lang);
         let dev = DevLoop { reminder: &reminder, final_check: self.final_check.then_some(&check) };
         let outcome = run_tool_loop_with(&ctx, &mut messages, self.max_steps, NearLimit::Summary, Some(dev)).await;
         // Spec 092 T03: a falha final da geração nesta sessão fica para os FATOS da revisão.
@@ -496,9 +522,9 @@ impl LlmDeveloper {
             LoopOutcome::Exhausted(why) => {
                 // Spec 081 T01: estouro não derruba a execução; o runner segue o fluxo normal.
                 ctx.check_cancel()?;
-                let summary = exhausted_dev_summary(&ctx, &mut messages, &why).await;
+                let summary = exhausted_dev_summary(&ctx, &mut messages, &why, self.lang.get()).await;
                 Ok(DevReport {
-                    summary: format!("Limite de passos atingido ({}).\n\n{summary}", why.reason()),
+                    summary: format!("{}\n\n{summary}", step_limit_line(self.lang.get(), &why)),
                     exhausted: true,
                 })
             }
@@ -703,7 +729,7 @@ impl LlmReviewer {
             // Spec 081 T01: veredito com o que já foi verificado (vale para a verificação final).
             LoopOutcome::Exhausted(why) => {
                 ctx.check_cancel()?;
-                exhausted_review_reply(&ctx, &mut messages, &base, &why).await?
+                exhausted_review_reply(&ctx, &mut messages, &base, &why, self.lang.get()).await?
             }
         };
         // Recusa de imagens pelo provedor: o modelo não viu as capturas, então nenhuma conta como vista.
@@ -781,7 +807,19 @@ pub(crate) enum Exhaustion {
 }
 
 impl Exhaustion {
-    /// Motivo curto, entre parênteses em "Limite de passos atingido (motivo)."
+    /// Motivo curto no idioma do projeto, entre parênteses na primeira linha da resposta do
+    /// Desenvolvedor esgotado, que aparece na tela (spec 129 T04).
+    fn reason_in(&self, lang: Lang) -> String {
+        match self {
+            Self::Steps(n) => crate::i18n::tr_plural(lang, "runner.step_limit.steps", *n as u64, &[]),
+            Self::Repeated => crate::i18n::text(lang, "runner.step_limit.repeated"),
+            Self::Stalled => crate::i18n::text(lang, "runner.step_limit.stalled"),
+            Self::Denials => crate::i18n::text(lang, "runner.step_limit.denials"),
+        }
+    }
+
+    /// Motivo curto, entre parênteses em "Limite de passos atingido (motivo)." do pedido final ao
+    /// modelo (prompt, em português).
     pub(crate) fn reason(&self) -> String {
         match self {
             Self::Steps(n) => format!("{n} passos"),
@@ -1542,7 +1580,7 @@ fn open_since(recurrence: u32) -> String {
 
 /// Base do lembrete periódico do Desenvolvedor (spec 087 T03), derivada do briefing: critérios e
 /// findings pendentes, cortados para o lembrete inteiro ficar em ~800 caracteres.
-fn developer_reminder(brief: &DevBrief) -> String {
+fn developer_reminder(brief: &DevBrief, lang: Lang) -> String {
     let criteria = clip(&one_line(&brief.acceptance), REMINDER_CRITERIA_BYTES);
     let findings = if brief.findings.is_empty() {
         "nenhum".to_string()
@@ -1554,7 +1592,7 @@ fn developer_reminder(brief: &DevBrief) -> String {
             .collect();
         clip(&one_line(&list.join("; ")), REMINDER_FINDINGS_BYTES)
     };
-    format!("Critérios da tarefa: {criteria}\nFindings pendentes: {findings}\n{REMINDER_RULE}")
+    format!("Critérios da tarefa: {criteria}\nFindings pendentes: {findings}\n{}", reminder_rule(lang))
 }
 
 /// Conferência antes do fim do Desenvolvedor (spec 087 T04), local e sem modelo: a resposta final
@@ -1572,6 +1610,8 @@ pub(crate) struct FinalCheck {
     /// ([`crate::agents::recovery_plan::count_criteria`]); 0 quando o texto não é uma lista, e então a
     /// contagem não é cobrada.
     criteria: usize,
+    /// Idioma do projeto: os títulos citados nos itens da conferência (spec 129 T04).
+    lang: Lang,
 }
 
 /// Spec 127 T02: linhas da seção "Critérios" da resposta final: os itens de lista ou, sem lista,
@@ -1584,7 +1624,7 @@ fn dev_criteria_lines(section: &str) -> usize {
 }
 
 impl FinalCheck {
-    fn from_brief(brief: &DevBrief) -> Self {
+    fn from_brief(brief: &DevBrief, lang: Lang) -> Self {
         let docs_only = !brief.allowed_scope.is_empty()
             && brief.allowed_scope.iter().all(|p| p.trim().to_ascii_lowercase().ends_with(".md"));
         Self {
@@ -1593,6 +1633,7 @@ impl FinalCheck {
             docs_only,
             findings: brief.findings.clone(),
             criteria: crate::agents::recovery_plan::count_criteria(&brief.acceptance),
+            lang,
         }
     }
 
@@ -1603,10 +1644,10 @@ impl FinalCheck {
         let mut gaps = Vec::new();
         let section = extract_dev_criteria(summary);
         if section.is_empty() {
-            gaps.push(GAP_CRITERIA.to_string());
+            gaps.push(gap_criteria(self.lang));
         } else if dev_criteria_lines(&section) < self.criteria {
             // Spec 127 T02: uma linha por critério; a falta indica critério (ou parte dele) não conferido.
-            gaps.push(format!("{GAP_CRITERIA_PARTIAL} ({} de {})", dev_criteria_lines(&section), self.criteria));
+            gaps.push(format!("{} ({} de {})", gap_criteria_partial(self.lang), dev_criteria_lines(&section), self.criteria));
         }
         if !self.docs_only && !self.worktree_changed() {
             gaps.push(GAP_DIFF.to_string());
@@ -1618,7 +1659,7 @@ impl FinalCheck {
             let responses = finding_reply::for_open(finding_reply::extract(summary), &self.findings);
             let missing = finding_reply::missing(&self.findings, &responses);
             if !missing.is_empty() {
-                gaps.push(format!("{GAP_RESPONSES} {} {RESPONSES_FORMAT}", missing.join(", ")));
+                gaps.push(format!("{GAP_RESPONSES} {} {}", missing.join(", "), responses_format(self.lang)));
             }
             let again = finding_reply::contested_again(&self.findings, &responses);
             if !again.is_empty() {
@@ -1647,6 +1688,11 @@ impl FinalCheck {
             Err(_) => true,
         }
     }
+}
+
+/// Primeira linha da resposta do Desenvolvedor que esgotou os passos, no idioma do projeto.
+fn step_limit_line(lang: Lang, why: &Exhaustion) -> String {
+    crate::i18n::tr(lang, markers::STEP_LIMIT, &[("reason", &why.reason_in(lang))])
 }
 
 /// Mensagem da conferência antes do fim com os itens que faltam.
@@ -1679,14 +1725,17 @@ fn final_request(ctx: &AgentCtx<'_>, messages: &mut Vec<ChatMessage>, prompt: St
 
 /// Desenvolvedor esgotado: pede, sem ferramentas, o resumo do que foi feito e do que falta.
 /// Falha do provedor ou resposta vazia viram [`DEV_EXHAUSTED_FALLBACK`] (nunca `Err`).
-async fn exhausted_dev_summary(ctx: &AgentCtx<'_>, messages: &mut Vec<ChatMessage>, why: &Exhaustion) -> String {
+/// Spec 129 T04: o título da seção de critérios sai no idioma do projeto (`lang`), porque a resposta
+/// aparece na Conversa.
+async fn exhausted_dev_summary(ctx: &AgentCtx<'_>, messages: &mut Vec<ChatMessage>, why: &Exhaustion, lang: Lang) -> String {
     let req = final_request(
         ctx,
         messages,
         format!(
             "Limite de passos atingido ({}). Não chame ferramentas: responda agora com o resumo do \
-             que foi feito e do que falta, incluindo a seção \"Critérios\" com o estado de cada critério.",
-            why.reason()
+             que foi feito e do que falta, incluindo a seção \"{}\" com o estado de cada critério.",
+            why.reason(),
+            markers::text(lang, markers::CRITERIA)
         ),
         false,
     );
@@ -1714,12 +1763,15 @@ async fn exhausted_review_reply(
     messages: &mut Vec<ChatMessage>,
     base: &[ChatMessage],
     why: &Exhaustion,
+    lang: Lang,
 ) -> Result<String, RunnerError> {
+    // Spec 129 T04: a evidência do critério não verificado vai à matriz na tela, no idioma do projeto.
     let prompt = format!(
         "Limite de passos atingido ({}). Não chame ferramentas: responda agora apenas com o objeto \
          JSON do contrato, com o veredito baseado no que você já verificou. Critério que você não \
-         chegou a verificar fica com status \"not_met\" e evidence \"não verificado (limite de passos)\".",
-        why.reason()
+         chegou a verificar fica com status \"not_met\" e evidence \"{}\".",
+        why.reason(),
+        markers::text(lang, markers::UNVERIFIED_STEP_LIMIT)
     );
     let req = final_request(ctx, messages, prompt.clone(), true);
     let content = match verdict_call(ctx, messages, req).await {
@@ -2402,12 +2454,12 @@ const REVIEW_SCREENSHOTS_NOTE: &str = "Gravadas pelos testes da execução que g
 
 #[cfg(test)]
 fn developer_briefing(brief: &DevBrief) -> String {
-    developer_briefing_with(brief, &[])
+    developer_briefing_with(brief, &[], Lang::PtBr)
 }
 
 /// Briefing do Desenvolvedor; `captures` são as capturas já existentes no início da sessão (a seção
 /// só aparece com `screenshots` configurado).
-fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
+fn developer_briefing_with(brief: &DevBrief, captures: &[Capture], lang: Lang) -> String {
     let mut out = format!(
         "Tarefa {} (spec {}): {}\nBranch: {}\n\n## Objetivo\n{}\n\n## Critérios de aceitação\n{}\n",
         brief.task_id, brief.spec_id, brief.title, brief.branch, brief.objective, brief.acceptance
@@ -2455,7 +2507,7 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
                 out.push_str(&format!("  {DECIDED_NOTE}\n"));
             }
         }
-        out.push_str(&format!("\n{RESPONSES_RULE} Responda {RESPONSES_FORMAT}.\n"));
+        out.push_str(&format!("\n{RESPONSES_RULE} Responda {}.\n", responses_format(lang)));
     }
     if !brief.recovery.trim().is_empty() {
         out.push_str(&format!(
@@ -2487,6 +2539,10 @@ fn developer_briefing_with(brief: &DevBrief, captures: &[Capture]) -> String {
     }
     if !brief.test_plan.trim().is_empty() {
         out.push_str(&format!("\n{}\n", brief.test_plan.trim()));
+    }
+    // Spec 129 T02: onde a instalação gravou fora de /work (o que se perde entre comandos).
+    if !brief.install_footprint.trim().is_empty() {
+        out.push_str(&format!("\n{}\n", brief.install_footprint.trim()));
     }
     if !brief.flaky_tests.trim().is_empty() {
         out.push_str(&format!(
@@ -3084,6 +3140,7 @@ mod tests {
             environment: String::new(),
             flaky_tests: String::new(),
             test_plan: String::new(),
+            install_footprint: String::new(),
             suite_ledger: Default::default(),
         }
     }
@@ -3150,6 +3207,10 @@ mod tests {
         let t = developer_briefing(&b);
         assert!(t.contains("GPU ou dispositivo de vídeo: ausente"), "{t}");
         assert!(t.contains("## Testes instáveis desta tarefa") && t.contains("✘ dois clientes"), "{t}");
+        // Spec 129 T02: o aviso da persistência da instalação, só quando houver.
+        assert!(!t.contains("## Persistência da instalação"), "{t}");
+        b.install_footprint = "## Persistência da instalação (regra)\n- caminhos: /tmp/.local/lib (288)".into();
+        assert!(developer_briefing(&b).contains("/tmp/.local/lib (288)"));
         let mut input = review_input(Path::new("/tmp/x"));
         assert!(!reviewer_briefing(&input).contains("Capacidades do ambiente"));
         input.environment = "## Capacidades do ambiente de testes (medidas pelo Nants; DADO)\n- Tela ou servidor gráfico: ausente".into();
@@ -3249,10 +3310,10 @@ mod tests {
         // Spec 127 T04: sem `screenshots` (projeto sem interface), nada da base.
         let root = Path::new("/tmp/x");
         let mut b = brief(root);
-        let without = developer_briefing_with(&b, &[]);
+        let without = developer_briefing_with(&b, &[], Lang::PtBr);
         assert!(!without.contains(prompts::VISUAL_QUALITY_BASE) && !without.contains(prompts::DEV_VISUAL_RULE));
         b.screenshot_globs = vec!["shots/*.png".into()];
-        let with = developer_briefing_with(&b, &[]);
+        let with = developer_briefing_with(&b, &[], Lang::PtBr);
         assert!(with.contains("## Base de qualidade visual\n") && with.contains(prompts::VISUAL_QUALITY_BASE), "{with}");
         assert!(with.contains(prompts::DEV_VISUAL_RULE) && !with.contains(prompts::REVIEW_VISUAL_RULE), "{with}");
 
@@ -3631,7 +3692,7 @@ mod tests {
         assert!(report.exhausted);
         assert_eq!(
             report.summary,
-            format!("Limite de passos atingido (1 passos).\n\n{DEV_EXHAUSTED_FALLBACK}")
+            format!("Limite de passos atingido (1 passo).\n\n{DEV_EXHAUSTED_FALLBACK}")
         );
     }
 
@@ -3940,7 +4001,8 @@ mod tests {
             last.content,
             format!(
                 "Lembrete (DADO): restam 125 passos.\nCritérios da tarefa: testes verdes\n\
-                 Findings pendentes: F-01 [MEDIUM] src/x.rs:1: falta X\n{REMINDER_RULE}"
+                 Findings pendentes: F-01 [MEDIUM] src/x.rs:1: falta X\n{}",
+                reminder_rule(Lang::PtBr)
             )
         );
         assert!(last.content.contains("teste verde não conclui a tarefa: cumpra os critérios e termine com a seção Critérios"));
@@ -4113,12 +4175,12 @@ mod tests {
                 ..Finding::default()
             })
             .collect();
-        let text = reminder_text(&developer_reminder(&b), 150);
+        let text = reminder_text(&developer_reminder(&b, Lang::PtBr), 150);
         assert!(text.chars().count() <= 800, "{} caracteres", text.chars().count());
-        assert!(text.ends_with(REMINDER_RULE));
+        assert!(text.ends_with(&reminder_rule(Lang::PtBr)));
         assert!(text.contains("F-00 [HIGH]"));
         b.findings.clear();
-        assert!(developer_reminder(&b).contains("Findings pendentes: nenhum"));
+        assert!(developer_reminder(&b, Lang::PtBr).contains("Findings pendentes: nenhum"));
     }
 
     #[tokio::test]
@@ -5397,7 +5459,7 @@ mod tests {
         let root = tmp_root("dev-respostas");
         let mut b = brief(&root);
         let text = developer_briefing(&b);
-        assert!(text.contains(RESPONSES_RULE) && text.contains(RESPONSES_FORMAT) && !text.contains(DECIDED_NOTE), "{text}");
+        assert!(text.contains(RESPONSES_RULE) && text.contains(&responses_format(Lang::PtBr)) && !text.contains(DECIDED_NOTE), "{text}");
         b.findings[0].arbitration = Some(Arbitration { decision: ArbitrationDecision::Keep, reason: "x".into(), review: 1 });
         assert!(developer_briefing(&b).contains(&format!("Recomendação: adicionar X\n  {DECIDED_NOTE}\n")));
         b.findings.clear();
@@ -5738,6 +5800,31 @@ mod tests {
         let ask = last.messages.last().expect("pedido").content.clone();
         assert!(ask.contains("Limite de passos atingido (1 passos)") && ask.contains("não verificado (limite de passos)"), "{ask}");
         assert!(has_tool_msg(last, "r1", ""), "o que já verificou segue no histórico");
+    }
+
+    /// Spec 129 T04: num projeto em inglês, o pedido final do Revisor esgotado pede a evidência em
+    /// inglês (ela vai à matriz na tela), e o do Desenvolvedor esgotado cita o título em inglês.
+    #[tokio::test]
+    async fn exhausted_requests_follow_the_project_language() {
+        let root = tmp_root("rev-steps-en");
+        let verdict = r#"{"verdict":"APPROVED","summary_message":"partial","findings":[]}"#;
+        let backend = Scripted::new(vec![calls(&[("r1", "list_dir", "{}")]), text(verdict)]);
+        reviewer(Arc::clone(&backend))
+            .with_lang(crate::i18n::SharedLang::new(Lang::En))
+            .with_max_steps(1)
+            .review(&review_input(&root))
+            .await
+            .expect("veredito");
+        let ask = backend.requests()[1].messages.last().expect("pedido").content.clone();
+        assert!(ask.contains("evidence \"not verified (step limit)\"") && !ask.contains("não verificado"), "{ask}");
+
+        let backend = Scripted::new(vec![text("summary")]);
+        let host = image_host(&root);
+        let ctx = image_ctx(&backend, &host, ActivityScope::null("developer"));
+        let mut messages = start_messages();
+        assert_eq!(exhausted_dev_summary(&ctx, &mut messages, &Exhaustion::Steps(3), Lang::En).await, "summary");
+        let ask = backend.requests()[0].messages.last().expect("pedido").content.clone();
+        assert!(ask.contains("seção \"Criteria\"") && !ask.contains("Critérios"), "{ask}");
     }
 
     #[tokio::test]
@@ -6377,14 +6464,14 @@ mod tests {
         let backend = Scripted::new(vec![text("resumo")]);
         let ctx = image_ctx(&backend, &host, ActivityScope::null("developer"));
         let mut messages = with_image();
-        assert_eq!(exhausted_dev_summary(&ctx, &mut messages, &Exhaustion::Steps(3)).await, "resumo");
+        assert_eq!(exhausted_dev_summary(&ctx, &mut messages, &Exhaustion::Steps(3), Lang::PtBr).await, "resumo");
         assert_eq!(image_count(&backend.requests()[0]), 1);
 
         // Developer: recusa, repete sem a imagem.
         let backend = Scripted::new(vec![http(400), text("resumo 2")]);
         let ctx = image_ctx(&backend, &host, ActivityScope::null("developer"));
         let mut messages = with_image();
-        assert_eq!(exhausted_dev_summary(&ctx, &mut messages, &Exhaustion::Steps(3)).await, "resumo 2");
+        assert_eq!(exhausted_dev_summary(&ctx, &mut messages, &Exhaustion::Steps(3), Lang::PtBr).await, "resumo 2");
         let reqs = backend.requests();
         assert_eq!((image_count(&reqs[0]), image_count(&reqs[1])), (1, 0));
 
@@ -6393,7 +6480,7 @@ mod tests {
         let ctx = image_ctx(&backend, &host, ActivityScope::null("reviewer"));
         let mut messages = with_image();
         let base = start_messages();
-        let reply = exhausted_review_reply(&ctx, &mut messages, &base, &Exhaustion::Steps(3))
+        let reply = exhausted_review_reply(&ctx, &mut messages, &base, &Exhaustion::Steps(3), Lang::PtBr)
             .await
             .expect("veredito");
         assert_eq!(reply, approved_json());
@@ -6469,17 +6556,17 @@ mod tests {
         let root = tmp_root("check-criteria-lines");
         let mut b = brief_no_base(&root);
         b.acceptance = "1. API grava a partida\n   - detalhe recuado\n* Placar por jogo\n- (manual) olhar a tela\n".into();
-        let check = FinalCheck::from_brief(&b);
+        let check = FinalCheck::from_brief(&b, Lang::PtBr);
         let partial = check.gaps("feito\n\nCritérios\n- API grava a partida: atendido: tests/a.rs:1", 1);
         assert_eq!(partial.len(), 1, "{partial:?}");
-        assert!(partial[0].starts_with(GAP_CRITERIA_PARTIAL) && partial[0].ends_with("(1 de 3)"), "{}", partial[0]);
+        assert!(partial[0].starts_with(&gap_criteria_partial(Lang::PtBr)) && partial[0].ends_with("(1 de 3)"), "{}", partial[0]);
         let full = "feito\n\nCritérios\n- API: atendido: a.rs:1\n- Placar: atendido: b.rs:2\n- (manual) tela: verificação humana";
         assert!(check.gaps(full, 1).is_empty());
         // Sem lista, conta as linhas da seção.
         assert!(check.gaps("feito\n\nCritérios\nAPI: a.rs:1\nPlacar: b.rs:2\nTela: humana", 1).is_empty());
         // Critérios em texto corrido: a contagem não é cobrada.
         b.acceptance = "testes verdes e placar correto".into();
-        assert!(FinalCheck::from_brief(&b).gaps("feito\n\nCritérios\n- tudo: a.rs:1", 1).is_empty());
+        assert!(FinalCheck::from_brief(&b, Lang::PtBr).gaps("feito\n\nCritérios\n- tudo: a.rs:1", 1).is_empty());
     }
 
     /// Spec 124 T02: a conferência cobra a resposta a cada finding aberto e recusa a 2ª contestação.
@@ -6490,7 +6577,7 @@ mod tests {
         let decided = Arbitration { decision: ArbitrationDecision::Keep, reason: "dá para testar".into(), review: 2 };
         let open = |id: &str| Finding { id: id.into(), ..brief(&root).findings[0].clone() };
         b.findings = vec![open("F-01"), Finding { arbitration: Some(decided), ..open("F-02") }];
-        let check = FinalCheck::from_brief(&b);
+        let check = FinalCheck::from_brief(&b, Lang::PtBr);
         let crit = "\n\nCritérios\n1. a — x.rs:1";
         let none = check.gaps(&format!("feito{crit}"), 1);
         assert_eq!(none.len(), 1, "{none:?}");
@@ -6500,6 +6587,38 @@ mod tests {
         let partial = check.gaps(&format!("feito\n\nRespostas aos apontamentos\n- F-02: fixed: src/b.rs:2{crit}"), 1);
         assert!(partial[0].starts_with(&format!("{GAP_RESPONSES} F-01 ")), "{partial:?}");
         assert!(check.gaps(&format!("feito\n\nRespostas aos apontamentos\n- F-01: contested (incorrect): já valida\n- F-02: fixed: src/b.rs:2{crit}"), 1).is_empty());
+    }
+
+    /// Spec 129 T04: num projeto em inglês, a conferência cita os títulos em inglês e lê a resposta
+    /// do Desenvolvedor nas duas formas (en e a antiga, em pt).
+    #[test]
+    fn final_check_reads_both_languages_and_cites_the_project_language() {
+        let root = tmp_root("check-lang");
+        let mut b = brief_no_base(&root);
+        b.acceptance = "1. API saves the play\n2. Board per game\n".into();
+        b.findings = vec![Finding { id: "F-01".into(), ..brief(&root).findings[0].clone() }];
+        let check = FinalCheck::from_brief(&b, Lang::En);
+        let missing = check.gaps("done", 1);
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing[0].contains("\"Criteria\"") && missing[1].contains("\"Responses to findings\""), "{missing:?}");
+        assert!(!missing.iter().any(|g| g.contains("\"Critérios\"") || g.contains("Respostas aos apontamentos")), "{missing:?}");
+        let en = "done\n\n## Criteria\n- API: met: a.rs:1\n- Board: met: b.rs:2\n\n## Responses to findings\n- F-01: fixed: a.rs:1";
+        assert!(check.gaps(en, 1).is_empty(), "{:?}", check.gaps(en, 1));
+        let pt = "feito\n\n## Critérios\n- API: atendido: a.rs:1\n- Placar: atendido: b.rs:2\n\n## Respostas aos apontamentos\n- F-01: fixed: a.rs:1";
+        assert!(check.gaps(pt, 1).is_empty(), "{:?}", check.gaps(pt, 1));
+        assert!(FinalCheck::from_brief(&b, Lang::PtBr).gaps(en, 1).is_empty());
+        assert!(gap_criteria_partial(Lang::En).contains("`- critério: met: evidência`"));
+        assert!(reminder_rule(Lang::En).ends_with("termine com a seção Criteria."));
+    }
+
+    /// Spec 129 T04: a linha do esgotamento, que aparece na tela, sai no idioma do projeto.
+    #[test]
+    fn step_limit_line_follows_the_project_language() {
+        assert_eq!(step_limit_line(Lang::En, &Exhaustion::Steps(1)), "Step limit reached (1 step).");
+        assert_eq!(step_limit_line(Lang::En, &Exhaustion::Steps(40)), "Step limit reached (40 steps).");
+        assert_eq!(step_limit_line(Lang::En, &Exhaustion::Repeated), "Step limit reached (no progress: repeated call).");
+        assert_eq!(step_limit_line(Lang::PtBr, &Exhaustion::Stalled), "Limite de passos atingido (sem progresso: repetição depois de 2/3 do limite).");
+        assert_eq!(step_limit_line(Lang::PtBr, &Exhaustion::Denials), "Limite de passos atingido (negações repetidas).");
     }
 
     /// Spec 124 T02: sem as respostas, a final volta com o pedido; com elas, é aceita.
@@ -6515,7 +6634,7 @@ mod tests {
         assert_eq!(reqs.len(), 3);
         let checks = final_checks(&reqs[2]);
         assert_eq!(checks.len(), 1);
-        assert!(checks[0].contains(&format!("{GAP_RESPONSES} F-01")) && !checks[0].contains(GAP_CRITERIA), "{}", checks[0]);
+        assert!(checks[0].contains(&format!("{GAP_RESPONSES} F-01")) && !checks[0].contains(&gap_criteria(Lang::PtBr)), "{}", checks[0]);
     }
 
     /// Roda git em `root` com identidade fixa.
@@ -6552,7 +6671,7 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(
             checks[0],
-            format!("Antes de concluir: {GAP_CRITERIA}. Se não se aplica, explique na resposta final por quê.")
+            format!("Antes de concluir: {}. Se não se aplica, explique na resposta final por quê.", gap_criteria(Lang::PtBr))
         );
         // A mensagem entra logo depois da final recusada, no fim do histórico.
         let msgs = &reqs[2].messages;
@@ -6576,7 +6695,7 @@ mod tests {
         let checks = final_checks(&reqs[2]);
         assert_eq!(checks.len(), 1);
         assert!(
-            checks[0].contains(GAP_DIFF) && !checks[0].contains(GAP_CRITERIA) && !checks[0].contains(GAP_COMMAND),
+            checks[0].contains(GAP_DIFF) && !checks[0].contains(&gap_criteria(Lang::PtBr)) && !checks[0].contains(GAP_COMMAND),
             "{}",
             checks[0]
         );
@@ -6586,7 +6705,7 @@ mod tests {
     #[test]
     fn diff_counts_commits_since_base_and_ignores_sdd() {
         let root = git_repo("check-commits");
-        let check = FinalCheck::from_brief(&brief(&root));
+        let check = FinalCheck::from_brief(&brief(&root), Lang::PtBr);
         assert!(!check.worktree_changed());
         std::fs::create_dir_all(root.join(".sdd")).expect("criar .sdd");
         std::fs::write(root.join(".sdd/estado.md"), "x\n").expect("escrever");
@@ -6597,10 +6716,10 @@ mod tests {
         git_in(&root, &["commit", "-q", "-am", "mudou"]);
         assert!(check.worktree_changed(), "commit na branch desde a base conta");
         // Sem base, ou com erro do git, não insiste.
-        assert!(FinalCheck::from_brief(&brief_no_base(&root)).worktree_changed());
+        assert!(FinalCheck::from_brief(&brief_no_base(&root), Lang::PtBr).worktree_changed());
         let mut b = brief(&root);
         b.base_branch = "inexistente".into();
-        assert!(FinalCheck::from_brief(&b).worktree_changed(), "erro do git conta como alterada");
+        assert!(FinalCheck::from_brief(&b, Lang::PtBr).worktree_changed(), "erro do git conta como alterada");
     }
 
     #[tokio::test]
@@ -6613,8 +6732,8 @@ mod tests {
         assert_eq!(reqs.len(), 3);
         let checks = final_checks(&reqs[1]);
         assert_eq!(checks.len(), 1);
-        assert!(checks[0].contains(GAP_COMMAND) && !checks[0].contains(GAP_CRITERIA), "{}", checks[0]);
-        let check = FinalCheck::from_brief(&brief_no_base(&root));
+        assert!(checks[0].contains(GAP_COMMAND) && !checks[0].contains(&gap_criteria(Lang::PtBr)), "{}", checks[0]);
+        let check = FinalCheck::from_brief(&brief_no_base(&root), Lang::PtBr);
         assert_eq!(check.gaps(COMPLETE, 0), vec![GAP_COMMAND.to_string()]);
         assert!(check.gaps(COMPLETE, 1).is_empty());
     }
@@ -6637,13 +6756,13 @@ mod tests {
         let report = checked_developer(Arc::clone(&backend)).implement(&b).await.expect("ok");
         assert_eq!(report.summary, COMPLETE);
         assert_eq!(backend.requests().len(), 2, "aceita sem diff");
-        assert!(FinalCheck::from_brief(&b).docs_only);
+        assert!(FinalCheck::from_brief(&b, Lang::PtBr).docs_only);
         // Escopo com código, ou vazio, exige diff.
         b.allowed_scope = vec!["README.md".into(), "src/**".into()];
-        assert!(!FinalCheck::from_brief(&b).docs_only);
-        assert_eq!(FinalCheck::from_brief(&b).gaps(COMPLETE, 1), vec![GAP_DIFF.to_string()]);
+        assert!(!FinalCheck::from_brief(&b, Lang::PtBr).docs_only);
+        assert_eq!(FinalCheck::from_brief(&b, Lang::PtBr).gaps(COMPLETE, 1), vec![GAP_DIFF.to_string()]);
         b.allowed_scope = Vec::new();
-        assert!(!FinalCheck::from_brief(&b).docs_only);
+        assert!(!FinalCheck::from_brief(&b, Lang::PtBr).docs_only);
     }
 
     #[tokio::test]
@@ -6657,7 +6776,7 @@ mod tests {
         assert_eq!(reqs.len(), 3, "2 continuações e a 3ª final aceita");
         let checks = final_checks(&reqs[2]);
         assert_eq!(checks.len(), 2);
-        assert!(checks.iter().all(|c| c.contains(GAP_CRITERIA) && c.contains(GAP_COMMAND)));
+        assert!(checks.iter().all(|c| c.contains(&gap_criteria(Lang::PtBr)) && c.contains(GAP_COMMAND)));
     }
 
     #[tokio::test]

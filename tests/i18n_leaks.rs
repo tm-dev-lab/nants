@@ -62,6 +62,9 @@ enum Kind {
     Terminal,
     /// Spec 119: corpo das funções que montam o motivo de uma falha do provedor.
     ProviderReason,
+    /// Spec 129 T04: corpo das funções que escrevem ou leem os marcadores estruturais que chegam à
+    /// tela (mensagens do Revisor e do Desenvolvedor).
+    Marker,
 }
 
 /// Spec 119: funções (arquivo, nome) que montam o motivo de uma falha do provedor, o detalhe entre
@@ -83,16 +86,49 @@ const PROVIDER_REASON_FNS: &[(&str, &str)] = &[
     ("server/chat.rs", "architect_error"),
 ];
 
-/// Regiões (corpo) das funções de [`PROVIDER_REASON_FNS`] em `file`.
+/// Spec 129 T04: funções (arquivo, nome) que escrevem ou leem os marcadores estruturais que chegam
+/// à tela: o veredito e as seções da mensagem do Revisor, as marcas junto da severidade, a linha da
+/// verificação final, a marca da verificação humana, a linha do esgotamento do Desenvolvedor e os
+/// títulos que ele escreve ("Critérios", "Respostas aos apontamentos"). O marcador sai do
+/// dicionário (`runner.marker.*`, no idioma do projeto) e o leitor aceita as formas de todos os
+/// idiomas (`i18n::forms`): nenhum literal com texto de pessoa no corpo delas, nem em constante.
+const MARKER_FNS: &[(&str, &str)] = &[
+    ("agents/runner.rs", "render_review_message"),
+    ("agents/runner.rs", "render_review_message_tracked"),
+    ("agents/runner.rs", "finding_line"),
+    ("agents/runner.rs", "state_mark"),
+    ("agents/runner.rs", "render_criteria"),
+    ("agents/runner.rs", "with_unchanged_mark"),
+    ("agents/runner.rs", "mark_manual_criteria"),
+    ("agents/runner.rs", "is_manual_criterion"),
+    ("agents/runner.rs", "extract_dev_criteria"),
+    ("agents/finding_reply.rs", "extract"),
+    ("agents/finding_reply.rs", "message_line"),
+    ("agents/finding_reply.rs", "decision_lines"),
+    ("agents/llm_agents.rs", "step_limit_line"),
+    ("agents/llm_agents.rs", "reason_in"),
+    ("agents/markers.rs", "is_heading"),
+    ("agents/markers.rs", "ends_with_bracketed"),
+    ("agents/markers.rs", "contains_any"),
+];
+
+/// Regiões (corpo) das funções de [`PROVIDER_REASON_FNS`] e de [`MARKER_FNS`] em `file`.
 fn provider_reason_regions(file: &str, toks: &[Token]) -> Vec<(usize, usize, Kind)> {
+    let mut out = fn_regions(PROVIDER_REASON_FNS, Kind::ProviderReason, file, toks);
+    out.extend(fn_regions(MARKER_FNS, Kind::Marker, file, toks));
+    out
+}
+
+/// Regiões (corpo) das funções de `list` em `file`, com o caminho `kind`.
+fn fn_regions(list: &[(&str, &str)], kind: Kind, file: &str, toks: &[Token]) -> Vec<(usize, usize, Kind)> {
     let mut out = Vec::new();
-    for (_, name) in PROVIDER_REASON_FNS.iter().filter(|(f, _)| *f == file) {
+    for (_, name) in list.iter().filter(|(f, _)| *f == file) {
         for i in 0..toks.len() {
             if !(toks[i].is_ident("fn") && toks.get(i + 1).is_some_and(|t| t.is_ident(name))) {
                 continue;
             }
             let Some(open) = toks[i..].iter().position(|t| t.is_punct('{')).map(|p| i + p) else { continue };
-            out.push((open + 1, matching(toks, open), Kind::ProviderReason));
+            out.push((open + 1, matching(toks, open), kind));
         }
     }
     out
@@ -115,9 +151,6 @@ struct Exception {
     why: &'static str,
 }
 
-/// Linha da mensagem do Revisor que a web lê (`reviewMessage.ts`, `FINAL_COUNTS`) e mostra no idioma
-/// ativo pelo dicionário (`review.finalPrefix`).
-const REVIEW_MARKER: &str = "marcador estrutural da mensagem do Revisor, lido pela web (`reviewMessage.ts`) e mostrado no idioma ativo pelo dicionário; igual em todos os idiomas (spec 115 T03)";
 /// `next_action` de tarefa fora de BLOCKED: a web só mostra o de tarefa BLOCKED (quadro e card).
 const INTERNAL_NOTE: &str = "nota interna da tarefa fora de BLOCKED: a web só mostra o next_action de tarefa BLOCKED, e o bloqueio grava o motivo no idioma do projeto (spec 114 T02 e 115 T03)";
 /// Log técnico do servidor no terminal: falha interna de limpeza, gravação, varredura ou provedor.
@@ -132,8 +165,9 @@ const fn ex(file: &'static str, kind: Kind, snippet: &'static str, why: &'static
 }
 
 /// Lista inicial (spec 115 T01): a T02 eliminou as de `ApiError` (todas com código), a T03 as das
-/// mensagens da conversa e a T04 as mensagens do terminal que a pessoa lê. Ficam só as legítimas:
-/// marcadores estruturais lidos por parser (`REVIEW_MARKER`, `MAIN`), a nota interna da tarefa fora
+/// mensagens da conversa e a T04 as mensagens do terminal que a pessoa lê; a spec 129 T04 levou ao
+/// dicionário os marcadores da mensagem do Revisor. Ficam só as legítimas: a linha estrutural lida
+/// pelos testes e scripts (`MAIN`), a nota interna da tarefa fora
 /// de BLOCKED (`INTERNAL_NOTE`) e os logs técnicos de depuração (`LOG`).
 const EXCEPTIONS: &[Exception] = &[
     ex("agents/architect.rs", Kind::Terminal, "nants: checagem do plano: continuação", LOG),
@@ -145,11 +179,20 @@ const EXCEPTIONS: &[Exception] = &[
         "rótulo técnico do status HTTP no aviso de limite, igual em todos os idiomas; a frase em volta vem do dicionário pelo code `pace.throttled` (spec 119)",
     ),
     ex("agents/llm_client/pace.rs", Kind::Terminal, "nants: ritmo conexão={} modelo={}", LOG),
+    ex(
+        "agents/runner.rs",
+        Kind::Marker,
+        "verificação humana — não bloqueia",
+        "forma antiga da marca da verificação humana (antes da 095/T08, com travessão), só lida para reconhecer os critérios já gravados; a marca escrita hoje sai do dicionário (spec 129 T04)",
+    ),
     ex("agents/spill.rs", Kind::Terminal, "nants: saida de ferramenta sem arquivo", LOG),
+    ex("sdd/test_levels.rs", Kind::Terminal, "nants: pasta pessoal sem limpeza", LOG),
     ex("agents/runner.rs", Kind::NextAction, "aguardando developer", INTERNAL_NOTE),
-    ex("agents/runner.rs", Kind::Say, "Verificação final: {met} de {total}", REVIEW_MARKER),
     ex("main.rs", Kind::Terminal, "nants listening on http://{addr}", MAIN),
+    ex("server/advisor.rs", Kind::Terminal, "nants: registro da falha do Arquiteto", LOG),
     ex("server/app.rs", Kind::Terminal, "aviso: down do -run de {project_id}", LOG),
+    ex("server/app.rs", Kind::Terminal, "aviso: saída do -run indisponível", LOG),
+    ex("server/app.rs", Kind::Terminal, "aviso: docker diff do -run indisponível", LOG),
     ex("server/architecture.rs", Kind::Terminal, "aviso: ARCHITECTURE.md não atualizado", LOG),
     ex("server/architecture.rs", Kind::Terminal, "aviso: lições do perfil {role}", LOG),
     ex("server/architecture.rs", Kind::Terminal, "aviso: lições dos perfis não", LOG),
@@ -208,14 +251,18 @@ fn is_person_text(text: &str) -> bool {
     words.len() == 1 && (trimmed.contains(": ") || trimmed.ends_with(':') || trimmed.chars().next().is_some_and(char::is_uppercase))
 }
 
-/// Literais e constantes de texto de `toks[from..to]`.
+/// Literais e constantes de texto de `toks[from..to]`. Constante por caminho (`markers::FINDINGS`)
+/// vem de outro módulo: é pedida como `::NOME` e só se resolve pela definição única do projeto,
+/// nunca pela constante de mesmo nome do arquivo (spec 129 T04).
 fn texts_in(toks: &[Token], from: usize, to: usize, consts: &dyn Fn(&str) -> Option<String>) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     for (k, t) in toks.iter().enumerate().take(to.min(toks.len())).skip(from) {
         match &t.tok {
             Tok::Str(s) => out.push((k, t.line, s.clone())),
             Tok::Ident(name) if name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') => {
-                if let Some(text) = consts(name) {
+                let qualified = k >= 2 && toks[k - 1].is_punct(':') && toks[k - 2].is_punct(':');
+                let lookup = if qualified { format!("::{name}") } else { name.clone() };
+                if let Some(text) = consts(&lookup) {
                     out.push((k, t.line, text));
                 }
             }
@@ -388,10 +435,14 @@ fn scan_sources(sources: &[(String, String)]) -> Vec<Hit> {
         }
         let local: HashMap<String, String> = str_consts(toks).into_iter().collect();
         let consts = |name: &str| {
-            local.get(name).cloned().or_else(|| match global.get(name).map(Vec::as_slice) {
+            let unique = |name: &str| match global.get(name).map(Vec::as_slice) {
                 Some([only]) => Some(only.clone()),
                 _ => None,
-            })
+            };
+            match name.strip_prefix("::") {
+                Some(path) => unique(path),
+                None => local.get(name).cloned().or_else(|| unique(name)),
+            }
         };
         out.extend(scan_file(rel, toks, &consts));
     }
@@ -484,15 +535,38 @@ fn other() -> &'static str { "fora da lista não conta aqui" }
     let hits = scan_file("agents/llm_client/bad_reason.rs", &toks, &|_| None);
     let got: Vec<(Kind, &str)> = hits.iter().map(|h| (h.kind, h.text.as_str())).collect();
     assert_eq!(got, vec![(Kind::ProviderReason, "transmissão sem evento final")]);
-    // Toda função da lista existe: a trava não fica sem alvo.
+    // Toda função das listas existe: a trava não fica sem alvo.
     let sources = production_sources();
-    for (file, name) in PROVIDER_REASON_FNS {
+    for (file, name) in PROVIDER_REASON_FNS.iter().chain(MARKER_FNS) {
         let (_, text) = sources.iter().find(|(rel, _)| rel == file).unwrap_or_else(|| panic!("{file} não existe"));
         let toks = production_tokens(text);
         assert!(!provider_reason_regions(file, &toks).is_empty(), "{file}: fn {name} não existe");
         let found = toks.windows(2).any(|w| w[0].is_ident("fn") && w[1].is_ident(name));
         assert!(found, "{file}: fn {name} não existe");
     }
+}
+
+/// Spec 129 T04: a trava dos marcadores pega o rótulo fixo (literal ou constante) no corpo das
+/// funções da lista e deixa passar o texto vindo do dicionário.
+#[test]
+fn marker_sweep_catches_fixed_labels() {
+    let source = r#"
+const FINDINGS_HEADER: &str = "Apontamentos:";
+fn render_review_message_tracked(lang: Lang) -> String {
+    let label = markers::text(lang, markers::VERDICT_APPROVED);
+    format!("{label}: x {}", FINDINGS_HEADER)
+}
+fn state_mark() -> String { "aberto há 2 revisões".into() }
+fn other() -> &'static str { "Critérios fora da lista" }
+"#;
+    let toks = production_tokens(source);
+    let consts: HashMap<String, String> = str_consts(&toks).into_iter().collect();
+    let hits = scan_file("agents/runner.rs", &toks, &|n| consts.get(n).cloned());
+    let got: Vec<(Kind, &str)> = hits.iter().map(|h| (h.kind, h.text.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![(Kind::Marker, "Apontamentos:"), (Kind::Marker, "aberto há 2 revisões")]
+    );
 }
 
 #[test]

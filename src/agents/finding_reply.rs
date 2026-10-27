@@ -1,7 +1,7 @@
 //! Resposta por apontamento e contestação com o Arquiteto como juiz (spec 124 T02).
 //!
 //! Antes de entregar, o Desenvolvedor responde a cada apontamento aberto numa seção própria da
-//! resposta final ([`RESPONSES_TITLE`]), uma linha por apontamento:
+//! resposta final (título [`markers::DEV_RESPONSES`], no idioma do projeto), uma linha por apontamento:
 //!
 //! ```text
 //! - F-01: fixed: src/a.rs:42
@@ -22,23 +22,15 @@
 use serde_json::Value;
 
 use crate::agents::finding_track::short_title;
+use crate::agents::markers;
 use crate::sdd::{Arbitration, ArbitrationDecision, Finding, FindingState};
 
-/// Título da seção da resposta final do Desenvolvedor (em pt-BR; a forma em inglês também vale).
-pub const RESPONSES_TITLE: &str = "Respostas aos apontamentos";
-/// Títulos aceitos para a seção (comparação sem maiúsculas, sem `#`, `*` e `:`).
-const RESPONSES_TITLES: [&str; 3] = ["respostas aos apontamentos", "responses to findings", "finding responses"];
 /// Seção do corpo da tarefa com as respostas da última entrega (linhas no formato do Desenvolvedor).
 pub const RESPONSES: &str = "Respostas aos Apontamentos";
 /// Seção do corpo da tarefa com o histórico das decisões do Arquiteto.
 pub const ARBITRATION_LOG: &str = "Arbitragem do Arquiteto";
 /// Seção do spec.md com as decisões de arbitragem de todas as tarefas.
 pub const SPEC_DECISIONS: &str = "Decisões de Arbitragem";
-/// Marcador estrutural da mensagem do Revisor (lido pela web, como "Apontamentos:"): as respostas
-/// do Desenvolvedor que o Revisor conferiu, `- F-01 [fixed] detalhe`.
-pub const RESPONSES_HEADER: &str = "Respostas do Desenvolvedor:";
-/// Marcador estrutural da mensagem do Revisor: as decisões do Arquiteto, `- F-03 [manual] motivo`.
-pub const DECISIONS_HEADER: &str = "Decisões do Arquiteto:";
 /// Teto do detalhe de uma resposta e do motivo de uma decisão.
 const DETAIL_MAX_BYTES: usize = 600;
 
@@ -197,17 +189,13 @@ pub fn parse_line(line: &str) -> Option<FindingResponse> {
     }
 }
 
-/// Título de seção normalizado (sem `#`, `*`, `_` e `:` nas pontas), em minúsculas.
-fn title_of(line: &str) -> String {
-    line.trim().trim_start_matches('#').trim().trim_matches(['*', '_']).trim().trim_end_matches(':').trim().to_lowercase()
-}
-
-/// Respostas da seção [`RESPONSES_TITLE`] da resposta final do Desenvolvedor, na ordem; a primeira
+/// Respostas da seção [`markers::DEV_RESPONSES`] da resposta final do Desenvolvedor (título em
+/// qualquer idioma do dicionário, pela linha inteira; spec 129 T04), na ordem; a primeira
 /// resposta de cada id vale. A seção vai até o próximo título (linha com `#`, em negrito ou
 /// terminada em `:` fora de lista). Sem a seção, nenhuma.
 pub fn extract(summary: &str) -> Vec<FindingResponse> {
     let mut lines = summary.lines();
-    if !lines.by_ref().any(|l| RESPONSES_TITLES.contains(&title_of(l).as_str())) {
+    if !lines.by_ref().any(|l| markers::is_heading(l, markers::DEV_RESPONSES)) {
         return Vec::new();
     }
     let mut out: Vec<FindingResponse> = Vec::new();
@@ -560,6 +548,20 @@ mod tests {
         assert_eq!(r[0].detail, "src/a.rs:1", "a primeira resposta de cada id vale");
         assert!(extract("sem seção\n- F-01: fixed: x").is_empty());
         assert_eq!(extract("Responses to findings:\n- F-01: fixed: a.rs").len(), 1);
+    }
+
+    /// Spec 129 T04: o título vale nas formas do dicionário (pt e en), pela linha inteira; uma frase
+    /// da prosa que cite as palavras não abre a seção.
+    #[test]
+    fn title_in_both_languages_and_never_from_prose() {
+        for title in ["## Respostas aos apontamentos", "**Responses to findings**", "### RESPONSES TO FINDINGS:", "respostas aos apontamentos"] {
+            let r = extract(&format!("Done.\n\n{title}\n- F-01: fixed: src/a.rs:1"));
+            assert_eq!(r.len(), 1, "{title}");
+        }
+        let prose = "I wrote the responses to findings below.\n- F-01: fixed: src/a.rs:1";
+        assert!(extract(prose).is_empty());
+        let both = format!("## {}\n- F-01: fixed: a.rs\n\n## {}\n- x", crate::i18n::text(crate::i18n::Lang::En, markers::DEV_RESPONSES), "Criteria");
+        assert_eq!(extract(&both).len(), 1);
     }
 
     #[test]

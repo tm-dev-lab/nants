@@ -207,21 +207,24 @@ describe("remontagem por projeto e especificação", () => {
     const rendered = render(both("s1"));
     await settle();
     // Uma sessão, um GET para as duas janelas.
-    expect(held.map((h) => h.url)).toEqual(["/api/projects/p1/app"]);
+    // Spec 130: o "Como usar" e as provas (`/app/guide/<spec>`) são outra leitura.
+    const statusUrls = (): string[] => held.map((h) => h.url).filter((u) => u.endsWith("/app"));
+    expect(statusUrls()).toEqual(["/api/projects/p1/app"]);
     expect(liveSessionCount()).toBe(1);
     rendered.rerender(both("s2"));
     await settle();
-    expect(held.map((h) => h.url)).toEqual(["/api/projects/p1/app", "/api/projects/p1/app"]);
+    expect(statusUrls()).toEqual(["/api/projects/p1/app", "/api/projects/p1/app"]);
     expect(liveSessionCount()).toBe(1);
     // A resposta da sessão s1 chega depois da troca: descartada pelas duas janelas.
+    const statusHeld = held.filter((h) => h.url.endsWith("/app"));
     await act(async () => {
-      held[0]?.release();
+      statusHeld[0]?.release();
     });
     await settle();
     expect(rendered.container.querySelector("iframe")).toBeNull();
     expect(rendered.container.querySelector("[data-app-state]")?.getAttribute("data-app-state")).toBe("stopped");
     await act(async () => {
-      held[1]?.release();
+      statusHeld[1]?.release();
     });
     await settle();
     // A da s2 vale; a s2 não é a do app no ar (`running()` é da s1): outra especificação.

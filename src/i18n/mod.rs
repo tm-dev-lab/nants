@@ -23,6 +23,9 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// Todos os idiomas suportados (spec 129 T04: os leitores de marcadores aceitam a forma de cada um).
+    pub const ALL: [Lang; 2] = [Lang::PtBr, Lang::En];
+
     /// Etiqueta usada pela interface e pela API: `pt-BR` ou `en`.
     pub fn tag(self) -> &'static str {
         match self {
@@ -117,6 +120,21 @@ impl SharedLang {
 /// Texto da chave no idioma, ou `None` se a chave não existe.
 pub fn lookup(lang: Lang, key: &str) -> Option<&'static str> {
     lang.dictionary().iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+/// Formas da chave em todos os idiomas ([`Lang::ALL`]), sem repetição (spec 129 T04): quem lê um
+/// marcador estrutural aceita qualquer uma, para os registros gravados em outro idioma continuarem
+/// legíveis.
+pub fn forms(key: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for lang in Lang::ALL {
+        if let Some(text) = lookup(lang, key) {
+            if !out.contains(&text) {
+                out.push(text);
+            }
+        }
+    }
+    out
 }
 
 /// Texto da chave no idioma; chave ausente devolve a própria chave (a paridade é testada).

@@ -596,6 +596,18 @@ impl AppState {
         self
     }
 
+    /// Intervalo da sondagem leve do modo do app (spec 130 T02; testes usam zero ou prazo curto).
+    pub fn with_app_watch_interval(mut self, interval: Duration) -> Self {
+        self.apps = self.apps.with_watch_interval(interval);
+        self
+    }
+
+    /// Limites do Console do projeto (spec 130 T03; testes usam prazos curtos).
+    pub fn with_console_limits(mut self, limits: super::console::ConsoleLimits) -> Self {
+        self.apps = self.apps.with_console_limits(limits);
+        self
+    }
+
     /// Fábrica usada para montar o runner de cada aprovação.
     pub fn runner_factory(&self) -> &Arc<dyn RunnerFactory> {
         &self.runner_factory

@@ -654,20 +654,23 @@ describe("App: respostas atrasadas", () => {
     );
     const rendered = render(runner("p1"));
     await settle();
-    expect(urls).toEqual(["/api/projects/p1/app"]);
+    // Spec 130: o "Como usar" e as provas (`/app/guide/<spec>`) são outra leitura.
+    const statusUrls = (): string[] => urls.filter((u) => u.endsWith("/app"));
+    const heldOf = (url: string): (() => void) | undefined => held[urls.indexOf(url)];
+    expect(statusUrls()).toEqual(["/api/projects/p1/app"]);
     rendered.rerender(runner("p2"));
     await settle();
-    expect(urls).toEqual(["/api/projects/p1/app", "/api/projects/p2/app"]);
+    expect(statusUrls()).toEqual(["/api/projects/p1/app", "/api/projects/p2/app"]);
     // Só a resposta da montagem antiga (p1) é liberada; a de p2 continua segurada.
     await act(async () => {
-      held[0]?.();
+      heldOf("/api/projects/p1/app")?.();
     });
     await settle();
     expect(rendered.container.querySelector("iframe")).toBeNull();
     expect(rendered.container.querySelector("[data-app-empty]")?.getAttribute("data-app-empty")).toBe("stopped");
     // A resposta atual (p2) vale.
     await act(async () => {
-      held[1]?.();
+      heldOf("/api/projects/p2/app")?.();
     });
     await settle();
     expect(rendered.container.querySelector("iframe")?.getAttribute("src")).toBe(APP_URL);

@@ -1802,6 +1802,9 @@ fn build_responses_body(req: &ChatRequest, effort: Option<Effort>) -> Result<Val
     for msg in req.messages.iter().filter(|m| m.role != Role::System) {
         responses_input(msg, &mut input)?;
     }
+    if req.response_json && !input_mentions_json(req) {
+        append_json_hint(&mut input);
+    }
     let mut body = json!({ "model": req.model, "input": input, "store": false });
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions.join("\n\n"));
@@ -1823,6 +1826,41 @@ fn build_responses_body(req: &ChatRequest, effort: Option<Effort>) -> Result<Val
         body[PROMPT_CACHE_KEY_FIELD] = json!(key);
     }
     Ok(body)
+}
+
+/// Linha fixa acrescentada ao pedido JSON da API Responses quando o `input` não cita "json" (spec
+/// 129 T03). Texto para o modelo, fora do dicionário: a API recusa `text.format: json_object` com
+/// 400 se nenhuma mensagem do `input` tiver a palavra (as `instructions` não contam).
+const RESPONSES_JSON_HINT: &str = "Responda em JSON.";
+
+/// Alguma mensagem que não é `system` (todo o `input`) cita "json", sem diferenciar maiúsculas?
+fn input_mentions_json(req: &ChatRequest) -> bool {
+    req.messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .any(|m| m.content.to_ascii_lowercase().contains("json"))
+}
+
+/// Acrescenta [`RESPONSES_JSON_HINT`] à última mensagem do usuário em `input` (no texto da mensagem
+/// ou na parte `input_text` dela); sem mensagem do usuário, acrescenta uma só com a linha.
+fn append_json_hint(input: &mut Vec<Value>) {
+    let last_user = input.iter_mut().rev().find(|item| item.get("role").and_then(Value::as_str) == Some("user"));
+    let Some(item) = last_user else {
+        input.push(json!({ "role": "user", "content": RESPONSES_JSON_HINT }));
+        return;
+    };
+    let content = &mut item["content"];
+    if let Some(text) = content.as_str() {
+        *content = Value::String(format!("{text}\n\n{RESPONSES_JSON_HINT}"));
+        return;
+    }
+    let part = content.as_array_mut().and_then(|parts| {
+        parts.iter_mut().find(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
+    });
+    if let Some(text) = part.and_then(|p| p.get_mut("text")) {
+        let joined = format!("{}\n\n{RESPONSES_JSON_HINT}", text.as_str().unwrap_or_default());
+        *text = Value::String(joined);
+    }
 }
 
 /// Campo da chave de cache no corpo Responses (spec 122 T05).
@@ -3177,6 +3215,8 @@ pub(crate) mod tests {
         assert_eq!(plain["store"], false);
         let with_json = body_of(&captured[1]);
         assert_eq!(with_json["text"]["format"]["type"], "json_object");
+        assert_eq!(with_json["input"][0]["content"], format!("oi\n\n{RESPONSES_JSON_HINT}"));
+        assert_eq!(plain["input"][0]["content"], "oi");
     }
 
     #[tokio::test]
@@ -3743,6 +3783,64 @@ pub(crate) mod tests {
         );
         let resp = build_responses_body(&req, None).expect("corpo");
         assert_eq!(resp["input"], json!([{ "role": "user", "content": "oi" }]));
+    }
+
+    /// Spec 129 T03: com `response_json` e sem "json" no `input`, a linha fixa vai ao fim da última
+    /// mensagem do usuário; o SYSTEM com "JSON" (vai em `instructions`) não conta.
+    #[test]
+    fn responses_json_adds_hint_only_when_input_lacks_the_word() {
+        let mut req = request(None);
+        req.messages[0] = ChatMessage::text(Role::System, "Responda APENAS com um objeto JSON.");
+        req.messages.push(ChatMessage::text(Role::Assistant, "ok"));
+        req.messages.push(ChatMessage::text(Role::User, "e agora?"));
+        req.response_json = true;
+        let body = build_responses_body(&req, None).expect("corpo");
+        assert_eq!(
+            body["input"],
+            json!([
+                { "role": "user", "content": "oi" },
+                { "role": "assistant", "content": "ok" },
+                { "role": "user", "content": format!("e agora?\n\n{RESPONSES_JSON_HINT}") },
+            ])
+        );
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert!(RESPONSES_JSON_HINT.to_ascii_lowercase().contains("json"));
+
+        // A palavra em qualquer mensagem do `input` (sem diferenciar maiúsculas): nada muda.
+        for (at, word) in [(1, "devolva Json"), (2, "um json"), (3, "o JSON")] {
+            let mut with_word = req.clone();
+            with_word.messages[at].content = word.into();
+            let body = build_responses_body(&with_word, None).expect("corpo");
+            let plain: Vec<String> = with_word.messages[1..].iter().map(|m| m.content.clone()).collect();
+            let sent: Vec<String> = body["input"].as_array().expect("input").iter().map(|i| i["content"].as_str().unwrap_or_default().to_string()).collect();
+            assert_eq!(sent, plain, "{word}");
+        }
+
+        // Sem `response_json`: nada muda.
+        req.response_json = false;
+        let body = build_responses_body(&req, None).expect("corpo");
+        assert_eq!(body["input"][2]["content"], "e agora?");
+        assert!(body.get("text").is_none());
+
+        // Mensagem com imagens: a linha entra na parte `input_text`.
+        let mut images = image_request();
+        images.response_json = true;
+        let body = build_responses_body(&images, None).expect("corpo");
+        assert_eq!(body["input"][1]["content"][0]["text"], format!("Capturas pedidas\n\n{RESPONSES_JSON_HINT}"));
+        assert_eq!(body["input"][0]["content"], "oi");
+    }
+
+    /// Spec 129 T03: o wire `chat` não muda com `response_json` (o SYSTEM vai nas `messages`).
+    #[test]
+    fn chat_wire_json_request_is_unchanged() {
+        let mut req = request(None);
+        req.response_json = true;
+        let body = build_body(&req, None);
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "system", "content": "seja breve" }, { "role": "user", "content": "oi" }])
+        );
+        assert_eq!(body["response_format"]["type"], "json_object");
     }
 
     #[test]

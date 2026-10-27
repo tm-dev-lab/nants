@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Execução: página web</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#C4B5FD}a:hover{color:#DDD6FE}
+</style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; background: #050508; padding: 20px; font-family: Inter, sans-serif; color: #F4F4F6">
+<div style="height: 100%; display: flex; flex-direction: column; background: #0D0D15; border-radius: 14px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.55)">
+<div style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #11111B">
+<span style="font-weight: 600; font-size: 14px">App</span>
+<span style="font-size: 13px; color: #AEAEB8">board-game-night</span>
+<span style="font-size: 12px; padding: 3px 10px; border-radius: 999px; background: rgba(134,239,172,0.12); color: #86EFAC">Página</span>
+<div style="flex-grow: 1; margin: 0 12px; padding: 6px 12px; border-radius: 8px; background: #151522; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #AEAEB8">http://192.168.0.68:3001</div>
+<button style="font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.11); background: transparent; color: #F4F4F6">Parar</button>
+</div>
+<div style="flex-grow: 1; margin: 16px; border-radius: 10px; background: #F5F3EE; display: flex; flex-direction: column; overflow: hidden">
+<div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; background: #2F4A3A; color: #FFFFFF">
+<span style="font-weight: 600; letter-spacing: 0.08em; font-size: 13px">TABLETOP CLUB</span>
+<span style="font-size: 13px">Alice</span>
+</div>
+<div style="padding: 28px 24px; display: flex; flex-direction: column; gap: 14px; color: #1F2A24">
+<span style="font-size: 26px; font-weight: 600">Availability polls</span>
+<div style="height: 64px; border-radius: 10px; background: #FFFFFF; border: 1px solid #DAD6CC"></div>
+<div style="height: 64px; border-radius: 10px; background: #FFFFFF; border: 1px solid #DAD6CC"></div>
+<div style="height: 40px; width: 40%; border-radius: 10px; background: #E7EFE9"></div>
+</div>
+</div>
+<div style="padding: 0 16px 14px; font-size: 12px; color: #AEAEB8">Como hoje: o app abre uma porta web e aparece aqui, como num navegador.</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

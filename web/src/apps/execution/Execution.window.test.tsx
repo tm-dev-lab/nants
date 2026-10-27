@@ -96,7 +96,8 @@ describe("Execução: controle", () => {
     const win = execWindow();
     fireEvent.click(within(win).getByRole("button", { name: "Iniciar" }));
     const dialog = screen.getByRole("dialog", { name: "Iniciar o app?" });
-    expect(dialog.textContent).toContain("docker compose up -d --build --wait");
+    expect(dialog.textContent).toContain("docker compose up -d --build");
+    expect(dialog.textContent).not.toContain("--wait");
     expect(dialog.textContent).toContain("ambiente Docker");
     expect(dialog.textContent).toContain("/home/dev/Loja");
     expect(document.activeElement?.textContent).toBe("Cancelar");

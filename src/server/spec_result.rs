@@ -313,7 +313,7 @@ fn test_command_view(secrets: &SecretSet, raw: &str) -> Option<String> {
 
 /// Trecho do README: lido com limite, redigido antes do corte, texto puro, até 60 linhas e 8 KiB.
 /// Ausente, symlink, especial, grande ou não UTF-8 → `None`.
-fn readme_view(root: &Path, secrets: &SecretSet) -> Option<ReadmeView> {
+pub(super) fn readme_view(root: &Path, secrets: &SecretSet) -> Option<ReadmeView> {
     let text = safe_fs::read_regular(root, README_REL, README_MAX_READ_BYTES).ok()?;
     let scrubbed = scrub_text(secrets, &text);
     let plain: String = scrubbed

@@ -26,9 +26,16 @@
  * - ciclo: o iframe nunca é remontado ao focar, mover, maximizar ou minimizar a janela (o `src`
  *   não muda); durante os gestos de janela fica com `pointer-events: none`. Montada já invisível
  *   (minimizada), a janela não faz nem a consulta inicial do estado: só quando fica visível.
+ * - spec 130 (mockup aprovado na T01): a forma segue o que o programa faz. Página: o navegador
+ *   acima. Rodando sem página: o registro ao vivo, a porta e o Parar. Terminou: a saída, o código e
+ *   os arquivos criados ou mudados. O ambiente não subiu: o fim do registro e "Pedir ao Arquiteto
+ *   para corrigir". Não roda no sandbox: a explicação, o "Como usar" e as provas. O Console do
+ *   projeto (padrão para qualquer projeto) abre pelo "Abrir o Console" e pelo próximo passo
+ *   `open_console` do servidor (`RunViews.tsx`, `ConsolePanel.tsx`).
  * Todo texto do servidor é renderizado como texto React.
  */
 import "./app.css";
+import "./run.css";
 import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { appExitedText } from "../../copy";
 import type { LanRange } from "../../api/types";
@@ -71,7 +78,11 @@ import {
   urlPort,
   type AppEmptyKind,
 } from "./appModel";
-import { reachEnvironment, runProblemText, useRunSession } from "./runSession";
+import { canStart, reachEnvironment, runProblemText, useRunSession } from "./runSession";
+import { ConsolePanel } from "./ConsolePanel";
+import { FailureView, FinishedView, RunningView, SandboxView } from "./RunViews";
+import { useAppGuide } from "./useAppGuide";
+import { finishedRun, liveMode } from "./appModel";
 
 const defaultObserver: ResizeObserverFactory | null =
   typeof ResizeObserver === "function" ? (callback) => new ResizeObserver((entries) => callback(entries)) : null;
@@ -312,10 +323,12 @@ interface AppEmptyProps {
   /** Atributo `data-embed-blocked` (o motivo da guarda). */
   embedBlocked?: string;
   extra?: ReactNode;
+  /** Ação secundária ao lado das outras (spec 130: "Abrir o Console"). */
+  secondary?: ReactNode;
 }
 
 /** Estado vazio do App: ícone, título 17/600, uma frase, a ação primária e "Abrir Execução". */
-function AppEmpty({ kind, text, action, progress = false, embedBlocked, extra }: AppEmptyProps) {
+function AppEmpty({ kind, text, action, progress = false, embedBlocked, extra, secondary }: AppEmptyProps) {
   const shell = useShell();
   const { t } = useT();
   const textId = useId();
@@ -373,6 +386,7 @@ function AppEmpty({ kind, text, action, progress = false, embedBlocked, extra }:
       <div className="nd-app-empty-actions">
         {primary}
         {openExecution}
+        {secondary}
       </div>
     </section>
   );
@@ -543,11 +557,18 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
   const shell = useShell();
   const { t } = useT();
   const visible = useWindowVisibility("app");
-  const { snap, actions } = useRunSession(projectId, specId, {
+  // O registro ao vivo só é lido quando o App o mostra (rodando sem página, spec 130).
+  const [wantLogs, setWantLogs] = useState(false);
+  const run = useRunSession(projectId, specId, {
     visible,
+    logs: wantLogs,
     onLive: () => showAppLiveToast(shell.showToast),
   });
+  const { snap, actions } = run;
   const { phase } = snap;
+  const mode = liveMode(phase);
+  useEffect(() => setWantLogs(mode === "running" && !snap.consoleOpen), [mode, snap.consoleOpen]);
+  const guide = useAppGuide(projectId, specId, visible);
   const network = useNetworkView(snap.network);
   const [reloadKey, setReloadKey] = useState(0);
   const port = shownPort(phase, snap.shownUrl);
@@ -576,6 +597,13 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
   const missing = shell.readiness?.execute.missing ?? [];
   const decision = port === null ? null : embedDecision(port.url, portEmbeddable(phase, port), { hostname: window.location.hostname, origin: window.location.origin });
 
+  const openConsoleButton =
+    specId !== null ? (
+      <button type="button" className="nd-btn" data-open-console="" onClick={actions.openConsole}>
+        <Icon name="terminal" size={14} />
+        {t("app.openConsole")}
+      </button>
+    ) : null;
   const kind = appEmptyKind({ phase, confirming: snap.confirming, specId, blocked, embed: decision });
 
   let empty: ReactNode = null;
@@ -585,6 +613,7 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
         kind="stopped"
         text={snap.problem === null ? t("app.text.stopped") : runProblemText(snap.problem)}
         action={{ label: t("app.start"), icon: "play", onClick: requestStart }}
+        secondary={openConsoleButton}
       />
     );
   } else if (kind === "starting") {
@@ -624,6 +653,7 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
         kind="exited"
         text={appExitedText(phase.code, phase.reason)}
         action={{ label: t("app.runAgain"), icon: "play", onClick: requestStart, disabled: blocked || specId === null }}
+        secondary={openConsoleButton}
       />
     );
   } else if (kind === "no_address") {
@@ -641,20 +671,64 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
       <ReachHint port={hintPort} range={range} onReload={reload} onReleased={() => shell.setLanReleased(range)} />
     ) : null;
 
-  return (
-    <div className="nd-app nd-app-scroll" data-app="" data-size={size}>
-      <AppBrowser
-        url={port?.url ?? null}
-        embeddable={port === null ? null : portEmbeddable(phase, port)}
-        viewport={viewport}
-        onViewport={(next) => setSelection({ appViewport: next })}
-        reloadKey={reloadKey}
-        onReload={reload}
+  // Spec 130: as formas além da página, pelo comportamento do programa.
+  const startable = specId !== null && !blocked && canStart(snap);
+  const finished = finishedRun(phase);
+  const failure =
+    snap.failure !== null && snap.failure.code !== "app_exec_docker_failed" && (specId === null || snap.failure.spec_id === specId) ? snap.failure : null;
+  const idle = (phase.kind === "stopped" || (phase.kind === "exited" && finished === null)) && !snap.confirming;
+  const sandbox = guide?.status === "ok" && !guide.guide.runsHere;
+  let view: ReactNode = null;
+  if (snap.consoleOpen && specId !== null) {
+    view = (
+      <ConsolePanel
+        projectId={projectId}
+        specId={specId}
         compact={size === "narrow"}
-        probing={probing}
-        empty={empty}
-        hint={hint}
+        visible={visible}
+        guide={guide}
+        run={run}
+        headAction={
+          <>
+            {phase.kind === "stopped" && startable ? (
+              <button type="button" className="nd-btn" data-console-start="" onClick={requestStart}>
+                <Icon name="play" size={14} />
+                {t("app.start")}
+              </button>
+            ) : null}
+            <button type="button" className="nd-btn" data-variant="ghost" data-console-back="" onClick={actions.closeConsole}>
+              <Icon name="arrow-left" size={14} />
+              {t(phase.kind === "running" ? "console.backToApp" : "console.back")}
+            </button>
+          </>
+        }
       />
+    );
+  } else if (phase.kind === "running" && mode === "running") {
+    view = <RunningView phase={phase} logs={snap.logs} stopping={snap.stopping} onStop={actions.stop} />;
+  } else if (phase.kind === "exited" && finished !== null) {
+    view = <FinishedView projectId={projectId} phase={phase} canRun={startable} onRunAgain={requestStart} onOpenConsole={actions.openConsole} />;
+  } else if (failure !== null && idle) {
+    view = <FailureView failure={failure} run={run} canRetry={startable} onRetry={requestStart} />;
+  } else if (sandbox && phase.kind === "stopped" && !snap.confirming) {
+    view = <SandboxView projectId={projectId} specId={specId} guide={guide} onOpenConsole={actions.openConsole} />;
+  }
+  return (
+    <div className="nd-app nd-app-scroll" data-app="" data-size={size} data-app-view={view === null ? undefined : snap.consoleOpen ? "console" : "run"}>
+      {view ?? (
+        <AppBrowser
+          url={port?.url ?? null}
+          embeddable={port === null ? null : portEmbeddable(phase, port)}
+          viewport={viewport}
+          onViewport={(next) => setSelection({ appViewport: next })}
+          reloadKey={reloadKey}
+          onReload={reload}
+          compact={size === "narrow"}
+          probing={probing}
+          empty={empty}
+          hint={hint}
+        />
+      )}
     </div>
   );
 }

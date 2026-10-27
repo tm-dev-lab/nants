@@ -302,6 +302,13 @@ async fn internal_turn_response(state: &AppState, project_id: &str, message: Str
     run_turn(state, project_id, body.as_bytes(), CHAT_TIMEOUT, state.llm_backend()).await
 }
 
+/// Turno interno do Arquiteto pedido por outra tela (spec 130 T04: "Pedir ao Arquiteto para
+/// corrigir" da janela de execução). Mesmo caminho do `POST /chat` com `internal: true` (reserva do
+/// turno, prontidão, ferramentas e aprovações de sempre); a mensagem não aparece no histórico.
+pub(super) async fn internal_turn(state: &AppState, project_id: &str, message: String) -> Result<Response, ApiError> {
+    internal_turn_response(state, project_id, message).await
+}
+
 /// Mensagem do sistema na Conversa (spec 128 T02: a linha de cada rodada do consenso): gravada no
 /// histórico com `code` e `params` (o texto de reserva no idioma do projeto, pelo dicionário) e
 /// publicada como `agent_message` do sistema.

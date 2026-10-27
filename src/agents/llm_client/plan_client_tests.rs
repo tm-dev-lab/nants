@@ -600,7 +600,7 @@ impl PlanTokens for LiveToken {
     }
 }
 
-/// Spec 120: verificação real contra a API do plano, com o cliente do Nants (texto, ferramenta e o
+/// Spec 120: verificação real contra a API do plano, com o cliente do Nants (texto, JSON, ferramenta e o
 /// segundo turno com os itens reenviados, sem esforço e com esforço `low`). Só roda à mão:
 /// `NANTS_PLAN_LIVE_FILE=<chatgpt-conn-*.json> scripts/test.sh cargo test --lib plan_live_text_and_tool -- --ignored --nocapture`.
 /// Lê o `access_token` do arquivo; com menos de 2 minutos de validade, não chama nem renova. Nunca
@@ -641,6 +641,25 @@ async fn plan_live_text_and_tool() {
     let resp = client.chat_stream(&text_req, &|_| {}).await.unwrap_or_else(|e| panic!("texto: {e:?}"));
     eprintln!("texto: {:?} usage={:?}", resp.message.content, resp.usage);
     assert!(!resp.message.content.trim().is_empty(), "texto vazio");
+
+    // Spec 129 T03: resposta em JSON com a palavra só no SYSTEM (vai em `instructions`) e o usuário
+    // sem ela, como o `ask_architect`. Sem a linha acrescentada pelo cliente, a API dá 400.
+    let json_req = ChatRequest {
+        model: model.clone(),
+        messages: vec![
+            ChatMessage::text(Role::System, "Reply ONLY with a JSON object: {\"ok\": true}."),
+            ChatMessage::text(Role::User, "Are you there?"),
+        ],
+        tools: Vec::new(),
+        effort: None,
+        response_json: true,
+        web_search: false,
+        cache_key: None,
+    };
+    let resp = client.chat_stream(&json_req, &|_| {}).await.unwrap_or_else(|e| panic!("json: {e:?}"));
+    eprintln!("json: {:?} usage={:?}", resp.message.content, resp.usage);
+    let parsed: Value = serde_json::from_str(resp.message.content.trim()).unwrap_or_else(|e| panic!("json inválido: {e}"));
+    assert!(parsed.is_object(), "json sem objeto: {parsed}");
 
     // Ferramenta (`tool_choice` obrigatório) e o segundo turno, que reenvia os itens devolvidos
     // (`provider_items`) e o resultado da ferramenta: sem esforço e com esforço `low` (como o

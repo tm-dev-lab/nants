@@ -28,6 +28,7 @@ import type { UiSelection } from "../../desktop/uiState";
 import { useWindowVisibility } from "../../desktop/useWindowVisibility";
 import { WindowTools } from "../../desktop/Window";
 import { useT } from "../../i18n/react";
+import { consumeOpenFile, useOpenFileRequest } from "./openRequest";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { useAppStore } from "../../store";
 import { useFileTree } from "../../useFileTree";
@@ -104,6 +105,9 @@ interface BodyProps {
   /** `source=task` respondeu 409 (sem tarefa ativa): o seletor volta para a base. */
   onNoActiveTask: () => void;
   refreshKey: number;
+  /** Arquivo pedido por outra janela (spec 130); aberto na hora e marcado como atendido. */
+  openRequest?: { id: number; path: string } | null;
+  onOpened?: (id: number) => void;
 }
 
 /** Divisória entre a árvore e o visualizador: ponteiro e teclado; grava ao soltar. */
@@ -175,7 +179,7 @@ function SplitHandle({
   );
 }
 
-function FilesBody({ projectId, source, stacked, initialPath, split, setSelection, onNoActiveTask, refreshKey }: BodyProps) {
+function FilesBody({ projectId, source, stacked, initialPath, split, setSelection, onNoActiveTask, refreshKey, openRequest = null, onOpened }: BodyProps) {
   const { t } = useT();
   const model = useFileTree(projectId, source, refreshKey);
   const [selected, setSelected] = useState<string | null>(null);
@@ -190,6 +194,7 @@ function FilesBody({ projectId, source, stacked, initialPath, split, setSelectio
   const remember = useCallback((path: string | null) => setSelection({ filePath: path, fileSource: source }), [setSelection, source]);
 
   const [restoreFocus, setRestoreFocus] = useState<string | null>(null);
+
   // Ao fechar o arquivo o foco volta para o item dele na árvore.
   useEffect(() => {
     if (restoreFocus === null || selected !== null) return;
@@ -230,6 +235,15 @@ function FilesBody({ projectId, source, stacked, initialPath, split, setSelectio
     setShowFile(true);
     remember(path);
   };
+  // Pedido de outra janela (spec 130: arquivo criado por um programa): abre direto, sem esperar a
+  // lista (o arquivo pode ser novo ou ignorado pelo git).
+  const openRef = useRef(open);
+  openRef.current = open;
+  useEffect(() => {
+    if (openRequest === null) return;
+    openRef.current(openRequest.path);
+    onOpened?.(openRequest.id);
+  }, [openRequest, onOpened]);
   // Estreita: "Voltar" à árvore também deixa de contar como arquivo aberto.
   const backToTree = (): void => {
     setShowFile(false);
@@ -346,6 +360,11 @@ const FilesExplorer = memo(function FilesExplorer({ projectId, size, savedSource
   const reasonId = useId();
   // Valores salvos na montagem: o corpo só os lê ao montar (a seleção muda a cada arquivo aberto).
   const saved = useRef({ source: savedSource, path: savedPath });
+  // Arquivo pedido por outra janela (spec 130): sempre na base, onde o programa gravou.
+  const openRequest = useOpenFileRequest(projectId);
+  useEffect(() => {
+    if (openRequest !== null) setSource("base");
+  }, [openRequest]);
 
   // Sonda a fonte da tarefa na abertura (já visível) e a cada atualização (evento, polling ou
   // "Atualizar"). Montada invisível, só sonda quando fica visível pela primeira vez.
@@ -432,6 +451,8 @@ const FilesExplorer = memo(function FilesExplorer({ projectId, size, savedSource
           setSelection={setSelection}
           onNoActiveTask={goBase}
           refreshKey={tick}
+          openRequest={source === "base" ? openRequest : null}
+          onOpened={consumeOpenFile}
         />
       ) : null}
     </div>

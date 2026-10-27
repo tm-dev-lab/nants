@@ -11,8 +11,11 @@ use super::*;
 use crate::harness::compose::{ComposeOutput, PublishedPort};
 use crate::sdd::environment::env_hash;
 
-/// Saída de `compose ps --format json` com uma porta publicada (IPv4 e IPv6) e uma interna.
+/// Saída de `compose ps --format json` com uma porta publicada (IPv4 e IPv6) e uma interna, e o
+/// `workspace` no ar (spec 130 T02: o modo do `-run` vem dele).
 pub(crate) const PS_JSON: &str = concat!(
+    r#"{"Service":"workspace","Name":"nants-p-run-workspace-1","State":"running","ExitCode":0,"Publishers":[]}"#,
+    "\n",
     r#"{"Service":"web","Publishers":[{"URL":"0.0.0.0","TargetPort":8080,"PublishedPort":18080,"Protocol":"tcp"},"#,
     r#"{"URL":"::","TargetPort":8080,"PublishedPort":18080,"Protocol":"tcp"},"#,
     r#"{"URL":"","TargetPort":5432,"PublishedPort":0,"Protocol":"tcp"}]}"#,
@@ -32,6 +35,10 @@ pub(crate) struct Rec {
     pub up_override: Mutex<String>,
     /// Dorme antes de responder a este subcomando (bloqueio do daemon).
     pub delay_sub: Mutex<Option<(String, Duration)>>,
+    /// Resposta do `compose logs` (padrão: uma linha fixa).
+    pub logs_output: Mutex<Option<String>>,
+    /// Resposta do `docker diff`.
+    pub diff_output: Mutex<String>,
 }
 
 impl Rec {
@@ -96,7 +103,13 @@ impl ComposeRunner for Rec {
         }
         let output = match (call.args.first().map(String::as_str), sub.as_str()) {
             (Some("compose"), "ps") => self.ps_output.lock().unwrap_or_else(PoisonError::into_inner).clone(),
-            (Some("compose"), "logs") => "web-1  | servidor no ar\n".to_string(),
+            (Some("compose"), "logs") => self
+                .logs_output
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| "web-1  | servidor no ar\n".to_string()),
+            (Some("diff"), _) => self.diff_output.lock().unwrap_or_else(PoisonError::into_inner).clone(),
             (Some("ps"), _) => self.docker_ps.lock().unwrap_or_else(PoisonError::into_inner).clone(),
             _ => String::new(),
         };
@@ -223,7 +236,7 @@ fn run_env_up_ps_and_logs_use_run_project() {
     assert!(env.logs(&root).expect("logs").contains("no ar"));
     let calls = rec.compose_calls();
     assert!(calls.iter().all(|(p, _)| p == "nants-p-run"));
-    assert_eq!(calls[0].1, ["up", "-d", "--build", "--wait"]);
+    assert_eq!(calls[0].1, ["up", "-d", "--build"]);
     assert_eq!(calls[1].1, ["ps", "--format", "json"]);
     assert_eq!(calls[2].1, ["logs", "--no-color", "--tail", "200"]);
     let _ = Duration::from_secs(0);
@@ -286,11 +299,11 @@ async fn concurrent_docker_starts_are_refused() {
     let apps = crate::server::app::AppManager::new(events).with_observe_window(Duration::ZERO);
     let env = || provider(&rec).for_project(&root, "p", ComposeKind::Run).expect("docker");
     let (a, b) = tokio::join!(
-        apps.launch_docker("p", &root, "s", env(), "npm run dev"),
+        apps.launch_docker("p", &root, "s", env(), "npm run dev", 3000),
         async {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(apps.is_busy("p"));
-            apps.launch_docker("p", &root, "s", env(), "npm run dev").await
+            apps.launch_docker("p", &root, "s", env(), "npm run dev", 3000).await
         }
     );
     assert!(a.is_ok(), "{a:?}");
@@ -309,23 +322,25 @@ fn sweep_removes_leftover_browser_containers_of_inactive_registered_projects() {
     assert!(rms.iter().any(|c| c.contains(&"b1".to_string()) && !c.contains(&"b2".to_string())), "{rms:?}");
 }
 
+/// Spec 130 T02: o container que sai logo depois do `up` não é falha: vira "terminou", com o código
+/// real, e fica (sem `down`) até o app ser parado ou subir de novo.
 #[tokio::test]
-async fn container_that_exits_after_up_fails_with_logs_and_is_downed() {
+async fn container_that_exits_after_up_is_finished_and_kept() {
     let root = tmp("early-exit");
     docker_project(&root);
     let rec = Rec::with_ports();
-    *rec.ps_output.lock().expect("lock") = r#"{"Service":"workspace","State":"exited","ExitCode":3,"Publishers":[]}"#.into();
+    *rec.ps_output.lock().expect("lock") = r#"{"Service":"workspace","Name":"nants-p-run-workspace-1","State":"exited","ExitCode":3,"Publishers":[]}"#.into();
     let events = crate::server::events::EventBus::new();
     let apps = crate::server::app::AppManager::new(events).with_observe_window(Duration::from_secs(2));
     let env = provider(&rec).for_project(&root, "p", ComposeKind::Run).expect("docker");
-    let r = apps.launch_docker("p", &root, "s", env, "npm ci").await;
-    match r {
-        Err(crate::server::app::LaunchError::Docker(m)) => assert!(m.contains("código 3"), "{m}"),
-        other => panic!("esperava Docker, veio {other:?}"),
-    }
+    let view = apps.launch_docker("p", &root, "s", env, "npm ci", 3000).await.expect("terminou não é falha");
+    assert_eq!(view["mode"], "finished");
+    assert_eq!(view["state"], "exited");
+    assert_eq!(view["exit_code"], 3);
     let calls = rec.compose_calls();
-    assert!(calls.iter().any(|(_, a)| a[0] == "down"), "{calls:?}");
+    assert!(calls.iter().all(|(_, a)| a[0] != "down"), "{calls:?}");
     assert!(!apps.is_running("p"));
+    assert!(apps.is_docker_running("p"), "o container encerrado fica");
 }
 
 /// Sentinela (spec 113 T01): o provider sem executor injetado nunca alcança o docker real nos

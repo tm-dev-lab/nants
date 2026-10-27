@@ -431,6 +431,14 @@ pub async fn recover(
     };
     let migrated = migrated.filter(|_| decision.retry && decision.migrate.is_some());
     let mut text = section_body(scope.secrets, &decision);
+    // Spec 129 T05: REVISE_CONFIG aplicada que repete a instalação: o aviso da spec 126, com a regra,
+    // entra na própria análise (o Arquiteto o vê junto da decisão) e o comando fica como aprovado.
+    if let (true, Some(config)) = (decision.retry, &decision.config) {
+        let lang = scope.state.project_lang(scope.project_id).get();
+        for line in repeated_install_warnings(scope.root, config, lang) {
+            text.push_str(&format!("\n- {}", clean(scope.secrets, &line)));
+        }
+    }
     if decision.retry {
         // Spec 094 T07: a linha "Escopo ampliado" mostra só o que vai entrar (mesmas regras do
         // runner ao registrar), e a conversa vê o mesmo registro do corpo da tarefa.
@@ -1192,14 +1200,38 @@ fn escalation_context(secrets: &SecretSet, loaded: &Loaded, decision: &Decision)
     format!("\n{}", lines.join("\n"))
 }
 
+/// Spec 129 T05: linha dos FATOS da recuperação com o `install_command` e a regra de que o Nants já
+/// o roda antes (o REVISE_CONFIG não o repete). Vazio sem instalação. Texto para o modelo.
+fn install_rule(install: Option<&str>) -> String {
+    match install.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(install) => format!(
+            "\ninstall_command: {install} (o Nants já a roda antes do test_command e dos checks, em toda worktree nova; \
+             o test_command e os checks de um REVISE_CONFIG NÃO repetem a instalação: nada de `{install} && <testes>`)"
+        ),
+        None => String::new(),
+    }
+}
+
 /// Fatos extras da falha de ambiente enviados ao Arquiteto (comando, código, cauda do erro e regras).
-fn env_note(command: &str, exit_code: &str, error_tail: &str) -> String {
+/// Spec 129 T05: com `install_command`, o conselho é a instalação já declarada (que o Nants roda
+/// antes), nunca embuti-la no `test_command`.
+fn env_note(command: &str, exit_code: &str, error_tail: &str, install: Option<&str>) -> String {
+    let worktree = match install.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(install) => format!(
+            "O `test_command` e os checks rodam numa worktree NOVA, e o Nants roda antes deles o install_command \
+             (`{install}`): NÃO repita a instalação no `test_command`. Se falta dependência, ela precisa estar \
+             declarada no projeto para essa instalação trazê-la, ou a imagem precisa fornecê-la (ambiente docker). \
+             Decida: RETRY com estratégia, REVISE_CONFIG (sem a instalação no comando) ou ESCALATE com a causa."
+        ),
+        None => "O `test_command` e os checks rodam numa worktree NOVA, sem dependências instaladas. Decida: \
+                 RETRY com estratégia, REVISE_CONFIG (torne o comando autossuficiente, mantendo o comando original \
+                 como etapa: ex. `npm ci && npm test`) ou ESCALATE com a causa."
+            .to_string(),
+    };
     format!(
         "\n## Falha de ambiente: o comando de testes NÃO executou\n\
          comando: {command}\ncódigo: {exit_code}\ncauda do erro:\n{error_tail}\n\
-         O `test_command` e os checks rodam numa worktree NOVA, sem dependências instaladas. Decida: \
-         RETRY com estratégia, REVISE_CONFIG (torne o comando autossuficiente, mantendo o comando original \
-         como etapa: ex. `npm ci && npm test`) ou ESCALATE com a causa. Limitação de ambiente se resolve \
+         {worktree} Limitação de ambiente se resolve \
          mudando o ambiente ou a configuração, NUNCA a verificação: não tire testes do `test_command`, não \
          troque por verificação manual, não afrouxe os critérios globais. REVISE_TASK não é aceito aqui.\n"
     )
@@ -1348,6 +1380,33 @@ fn validate_config(root: &Path, proposal: &ConfigProposal, secrets: &SecretSet) 
     );
     let commands = std::iter::once(new_test).chain(new_checks.iter().map(|c| c.command.clone())).collect();
     Ok(ConfigChange { test_command, checks, diff, commands })
+}
+
+/// Spec 129 T05: avisos (pelo dicionário, no idioma do projeto) dos campos que a proposta
+/// REVISE_CONFIG mudou e que, nas settings gravadas, começam com o `install_command`. As mesmas
+/// chaves do aviso da spec 126 (`runner.install.repeated*`), que dizem que o Nants já roda a
+/// instalação antes. Vazio sem `install_command`, sem repetição ou com settings ilegível.
+fn repeated_install_warnings(root: &Path, config: &ConfigProposal, lang: crate::i18n::Lang) -> Vec<String> {
+    let Some(settings) = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES)
+        .ok()
+        .and_then(|text| Settings::parse(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(install) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        return Vec::new();
+    };
+    crate::sdd::test_levels::repeated_install(&settings)
+        .into_iter()
+        .filter(|(field, _)| match field.as_str() {
+            "test_command" => config.test_command.is_some(),
+            f => f.starts_with("checks[") && config.checks.is_some(),
+        })
+        .map(|(field, command)| {
+            let key = if crate::sdd::test_levels::is_test_field(&field) { "runner.install.repeated" } else { "runner.install.repeated_step" };
+            crate::i18n::tr(lang, key, &[("field", &field), ("command", &command), ("install", install)])
+        })
+        .collect()
 }
 
 /// Grava a correção (releitura sob o `PERSIST_LOCK`, escrita atômica); preserva os demais campos.
@@ -2268,6 +2327,16 @@ fn validate_option(
             }
             out.text = Some(option_text(secrets, option.text.as_ref(), "texto", MAX_OPTION_TEXT_BYTES)?);
             if let Some(files) = option.files {
+                // Spec 129 T05: o compose proposto ganha `${NANTS_WORKTREE:-..}` (roda sem variável fora do Nants).
+                let files: Vec<EnvFile> = files
+                    .into_iter()
+                    .map(|mut f| {
+                        if f.path == crate::sdd::environment::COMPOSE_REL {
+                            f.content = crate::sdd::environment::with_worktree_default(&f.content);
+                        }
+                        f
+                    })
+                    .collect();
                 if files.is_empty() || files.len() > MAX_OPTION_FILES {
                     return Err(format!("files deve ter de 1 a {MAX_OPTION_FILES} itens"));
                 }
@@ -2497,13 +2566,15 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
     let yolo = parsed.as_ref().is_some_and(|s| s.yolo);
     let config_facts = parsed.as_ref().map(|s| {
         format!(
-            "ambiente: {}\ntest_command: {}\n{}",
+            "ambiente: {}\ntest_command: {}\n{}{}",
             "docker (test_command e checks rodam DENTRO do serviço workspace)",
             s.test_command,
-            render_checks(&s.checks)
+            render_checks(&s.checks),
+            install_rule(s.install_command.as_deref())
         )
     });
     let command = parsed.as_ref().map(|s| s.test_command.clone()).unwrap_or_default();
+    let install = parsed.as_ref().and_then(|s| s.install_command.clone());
     let base = parsed.map(|s| s.base_branch);
     let environmental = command_did_not_run(&evidence);
     let first_line = evidence.lines().next().unwrap_or("").trim();
@@ -2565,10 +2636,14 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
     if let Some(config) = config_facts {
         out.push_str(&format!("\n## Configuração de testes atual (REVISE_CONFIG pode corrigi-la)\n{}\n", cap(config, MAX_SECTION_BYTES)));
     }
-    let criteria = safe_fs::read_regular(root, &format!(".sdd/specs/{spec_id}/spec.md"), MAX_READ_BYTES)
-        .ok()
-        .map(|t| global_criteria(&t))
-        .unwrap_or_default();
+    let spec_md = safe_fs::read_regular(root, &format!(".sdd/specs/{spec_id}/spec.md"), MAX_READ_BYTES).ok();
+    // Spec 129 T02: o diagnóstico da persistência da instalação, com a regra de que o gravado fora
+    // de /work se perde entre comandos.
+    let footprint = spec_md.as_deref().map(crate::agents::runner::install_footprint_prompt).unwrap_or_default();
+    if !footprint.is_empty() {
+        out.push_str(&format!("\n{}\n", cap(footprint, MAX_SECTION_BYTES)));
+    }
+    let criteria = spec_md.as_deref().map(global_criteria).unwrap_or_default();
     if !criteria.trim().is_empty() {
         out.push_str(&format!(
             "\n## Critérios globais da spec (a verificação nunca pode ser rebaixada)\n{}\n",
@@ -2592,7 +2667,7 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
         cycles: recovery_cycles(&task.body),
         // Config docker que invoca docker/podman é falha de CONFIGURAÇÃO (corrigível), não de ambiente.
         environmental,
-        env_note: if environmental { env_note(&command, &exit_code, &error_tail) } else { String::new() },
+        env_note: if environmental { env_note(&command, &exit_code, &error_tail, install.as_deref()) } else { String::new() },
         command,
         exit_code,
         error_tail,

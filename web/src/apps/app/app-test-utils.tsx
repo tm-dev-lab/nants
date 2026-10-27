@@ -37,8 +37,30 @@ export function running(extra: Record<string, unknown> = {}) {
 
 export const STOPPED = { state: "stopped", spec_id: null, url: null, started_at: null, exit_code: null };
 
+/** "Como usar" e provas padrão (spec 130): roda aqui, com relatório. */
+export function guide(extra: Record<string, unknown> = {}) {
+  return {
+    spec_id: S,
+    how_to_use: { source: "report", markdown: "## Como executar\nRode `ledger report --month 2026-09`.", truncated: false },
+    proofs: { tasks_done: 7, tasks_total: 7, final_verification: { passed: true, text: "6 de 6 critérios" }, captures: [], captures_total: 0 },
+    sandbox: { runs_here: true, note: null },
+    ...extra,
+  };
+}
+
+/** Console vazio (spec 130). */
+export const CONSOLE_EMPTY = { active: null, last: null, history: [], limits: { timeout_secs: 300, output_bytes: 262144 } };
+
 interface AppServer {
   status: Record<string, unknown>;
+  /** `GET .../app/guide/:spec` (spec 130). */
+  guide: { status: number; body: unknown };
+  /** `GET .../app/exec` (spec 130). */
+  console: unknown;
+  /** `POST .../app/exec` (spec 130). */
+  exec: { status: number; body: unknown };
+  /** `POST .../app/fix` (spec 130). */
+  fix: { status: number; body: unknown };
   start: { status: number; body: unknown };
   stop: { status: number; body: unknown };
   logs: string;
@@ -81,6 +103,10 @@ export async function mountRun({ app = {}, status = "COMPLETED", ui = DONE_ONLY_
     status: STOPPED,
     start: { status: 200, body: running() },
     stop: { status: 200, body: { state: "stopped" } },
+    guide: { status: 200, body: guide() },
+    console: CONSOLE_EMPTY,
+    exec: { status: 202, body: { exec_id: "e1", spec_id: S, command: "ls", status: "running", started_at: "2026-10-27T12:00:00Z", timeout_secs: 300, origin: { device: null, loopback: true } } },
+    fix: { status: 200, body: { reply: "Vou ajustar o Dockerfile.", draft_updated: true, turn_id: "t-fix" } },
     logs: "listening",
     holdStatus: false,
     held: [],
@@ -99,6 +125,10 @@ export async function mountRun({ app = {}, status = "COMPLETED", ui = DONE_ONLY_
       view.server.calls.push({ method, url, body });
       const json = (data: unknown, code = 200) => new Response(JSON.stringify(data), { status: code, headers: { "Content-Type": "application/json" } });
       if (url.endsWith("/app/logs")) return new Response(server.logs, { status: 200 });
+      if (url.includes("/app/guide/")) return json(server.guide.body, server.guide.status);
+      if (url.endsWith("/app/exec/stop")) return json(server.console);
+      if (url.endsWith("/app/exec")) return method === "POST" ? json(server.exec.body, server.exec.status) : json(server.console);
+      if (url.endsWith("/app/fix")) return json(server.fix.body, server.fix.status);
       if (url.endsWith("/app/start")) {
         if (!server.holdStart) return json(server.start.body, server.start.status);
         return new Promise<Response>((resolve) => {

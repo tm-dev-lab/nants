@@ -9,6 +9,7 @@
 import type {
   ActivitySnapshot,
   Agents,
+  AppMode,
   ApproveResult,
   RecoveryChoiceBody,
   RecoveryChoiceResult,
@@ -95,6 +96,11 @@ export interface ApiFailure {
   /** Parâmetros do `code` (textos e números). */
   params?: CodeParams;
   /**
+   * Próximo passo que o servidor sugere para o erro (spec 130 T04, rotas da janela de execução):
+   * `ask_architect_fix`, `open_console`, `retry`... Só valores do vocabulário (`APP_ACTIONS`).
+   */
+  action?: AppAction;
+  /**
    * Chave do texto de reserva do cliente (status HTTP, rede, tempo limite), quando `message` é um
    * deles: resolvida no idioma ativo na hora de exibir (`apiFailureText`). `message` fica em pt-BR.
    */
@@ -149,7 +155,28 @@ function withCodes(failure: ApiFailure, body: unknown): ApiFailure {
     const params = parseCodeParams(body.params);
     if (params !== null) out.params = params;
   }
+  if (isRecord(body) && isAppAction(body.action)) out.action = body.action;
   return out;
+}
+
+/** Próximos passos da janela de execução (spec 130 T04, `app_guide::error_action`). */
+const APP_ACTIONS = [
+  "ask_architect_fix",
+  "open_console",
+  "retry",
+  "wait",
+  "confirm",
+  "reload",
+  "open_setup",
+  "show_app",
+  "stop_command",
+  "edit_command",
+] as const;
+
+type AppAction = (typeof APP_ACTIONS)[number];
+
+function isAppAction(value: unknown): value is AppAction {
+  return typeof value === "string" && (APP_ACTIONS as readonly string[]).includes(value);
 }
 
 /** Código do erro da API no corpo (`code`, spec 115 T02), ou `null`. */
@@ -1290,7 +1317,88 @@ export interface AppStatus {
    * em servidores antigos.
    */
   network: NetworkView | null;
+  /** Forma da execução (spec 130): `page`, `running` ou `finished`; `null` parado ou servidor antigo. */
+  mode: AppMode | null;
+  /** Comando que roda no ambiente (o `run_command`, redigido); `null` sem app. */
+  command: string | null;
+  /** O que o programa que terminou deixou (spec 130, modo `finished`). */
+  finished: AppFinished | null;
+  /** Última falha que pede o Arquiteto (spec 130 T04), com o próximo passo. */
+  failure: AppFailureView | null;
 }
+
+/** Arquivo da pasta do projeto criado (`added`) ou mudado (`changed`) por um programa. */
+export interface ChangedFile {
+  path: string;
+  change: "added" | "changed";
+}
+
+/** Resultado de um programa que rodou e terminou (spec 130 T02, C-09 e C-10). */
+export interface AppFinished {
+  exit_code: number | null;
+  /** Saída (o fim dela), redigida pelo servidor. */
+  output: string | null;
+  files: ChangedFile[];
+  files_total: number;
+  files_truncated: boolean;
+  /** Caminhos gravados fora da pasta do projeto (dentro do container). */
+  outside_work: string[];
+  outside_work_total: number;
+}
+
+/** Falha guardada que pede o Arquiteto (spec 130 T04): o fim do log, redigido, com a hora. */
+export interface AppFailureView {
+  spec_id: string;
+  code: string;
+  detail: string;
+  /** Hora da falha (UTC, ISO 8601). */
+  at: string;
+  action: AppAction | null;
+}
+
+const MAX_CHANGED_FILES = 200;
+
+/** Arquivos criados ou mudados, no formato fixo (o resto é ignorado). */
+function toChangedFiles(value: unknown): ChangedFile[] {
+  if (!Array.isArray(value)) return [];
+  const out: ChangedFile[] = [];
+  for (const item of value.slice(0, MAX_CHANGED_FILES)) {
+    if (!isRecord(item) || !isString(item.path) || item.path === "" || item.path.length > 4096) continue;
+    if (item.change !== "added" && item.change !== "changed") continue;
+    out.push({ path: item.path, change: item.change });
+  }
+  return out;
+}
+
+const nonNegative = (v: unknown): number => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+
+function toAppFinished(value: unknown): AppFinished | null {
+  if (!isRecord(value)) return null;
+  const files = toChangedFiles(value.files);
+  const outside = Array.isArray(value.outside_work) ? value.outside_work.filter((p): p is string => isString(p)).slice(0, 100) : [];
+  return {
+    exit_code: typeof value.exit_code === "number" && Number.isSafeInteger(value.exit_code) ? value.exit_code : null,
+    output: isString(value.output) ? value.output.slice(-MAX_APP_OUTPUT) : null,
+    files,
+    files_total: Math.max(nonNegative(value.files_total), files.length),
+    files_truncated: value.files_truncated === true,
+    outside_work: outside,
+    outside_work_total: Math.max(nonNegative(value.outside_work_total), outside.length),
+  };
+}
+
+function toAppFailure(value: unknown): AppFailureView | null {
+  if (!isRecord(value) || !isString(value.spec_id) || !isMessageCode(value.code)) return null;
+  return {
+    spec_id: value.spec_id,
+    code: value.code,
+    detail: isString(value.detail) ? value.detail.slice(-MAX_APP_DETAIL) : "",
+    at: isString(value.at) ? value.at : "",
+    action: isAppAction(value.action) ? value.action : null,
+  };
+}
+
+const APP_MODES: ReadonlySet<string> = new Set(["page", "running", "finished"]);
 
 /** Aviso do app: texto de reserva (pt-BR) e, opcionalmente, `code`/`params` (spec 102). */
 export interface AppNotice {
@@ -1337,6 +1445,8 @@ const APP_ERROR_REASONS: ReadonlySet<string> = new Set([
 
 /** Limite do detalhe técnico mostrado na UI. */
 const MAX_APP_DETAIL = 4000;
+/** Limite da saída de um programa que terminou (o servidor já corta em 16 Ki caracteres). */
+const MAX_APP_OUTPUT = 20_000;
 
 function appReasonOnly(status: number, body: unknown): ApiFailure | null {
   // 412 `prereq_missing` (spec 093 T02): segue o caminho comum, que guarda os ids do que falta.
@@ -1364,6 +1474,10 @@ function toAppStatus(value: unknown): AppStatus | null {
     notices: toAppNotices(value.notices, value.notice_codes),
     embeddable: toEmbeddable(value.embeddable),
     network: parseNetworkView(value),
+    mode: isString(value.mode) && APP_MODES.has(value.mode) ? (value.mode as AppMode) : null,
+    command: isString(value.command) && value.command !== "" ? value.command.slice(0, 4000) : null,
+    finished: toAppFinished(value.finished),
+    failure: toAppFailure(value.failure),
   };
 }
 
@@ -1444,6 +1558,257 @@ export async function getAppLogs(projectId: string): Promise<ApiResult<string>> 
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ---------- Console do projeto e conteúdo da janela de execução (spec 130) ----------
+
+/** Origem de um comando do Console (C-12): o dispositivo autorizado e se veio deste computador. */
+interface ExecOrigin {
+  deviceName: string | null;
+  loopback: boolean;
+}
+
+type ExecStatus = "running" | "exited" | "timed_out" | "stopped" | "failed";
+
+const EXEC_STATUSES: ReadonlySet<string> = new Set(["running", "exited", "timed_out", "stopped", "failed"]);
+
+/** Aviso do resultado de um comando (tempo estourado, falha do Docker), com o próximo passo. */
+interface ExecNotice {
+  code: string;
+  params?: CodeParams;
+  action: AppAction | null;
+}
+
+/** Um comando do Console: em curso ou o último resultado. Textos já redigidos pelo servidor. */
+export interface ExecView {
+  exec_id: string;
+  spec_id: string;
+  command: string;
+  /** A redação mudou o texto: repetir não reproduz o comando original. */
+  redacted: boolean;
+  started_at: string;
+  status: ExecStatus;
+  timeout_secs: number;
+  origin: ExecOrigin;
+  exit_code: number | null;
+  duration_ms: number | null;
+  /** Saída do resultado (o fim dela); `null` enquanto roda. */
+  output: string | null;
+  output_truncated: boolean;
+  files: ChangedFile[];
+  files_total: number;
+  files_truncated: boolean;
+  notice: ExecNotice | null;
+  detail: string | null;
+  /** Fim do comando (UTC, ISO 8601); `null` enquanto roda. */
+  finished_at: string | null;
+}
+
+/** Entrada do histórico do Console (comandos redigidos, com a origem e a hora). */
+export interface ExecHistoryEntry {
+  exec_id: string;
+  command: string;
+  redacted: boolean;
+  at: string;
+  status: ExecStatus;
+  exit_code: number | null;
+  origin: ExecOrigin;
+}
+
+/** `GET .../app/exec`: o comando em curso, o último resultado, o histórico e os limites. */
+interface ConsoleView {
+  active: ExecView | null;
+  last: ExecView | null;
+  history: ExecHistoryEntry[];
+  timeoutSecs: number;
+}
+
+const MAX_EXEC_TEXT = 20_000;
+const MAX_HISTORY = 50;
+
+function toOrigin(value: unknown): ExecOrigin {
+  if (!isRecord(value)) return { deviceName: null, loopback: false };
+  const device = isRecord(value.device) ? value.device : null;
+  const name = device !== null && isString(device.name) && device.name !== "" ? device.name.slice(0, 80) : null;
+  return { deviceName: name, loopback: value.loopback === true };
+}
+
+function toExecStatus(value: unknown): ExecStatus {
+  return isString(value) && EXEC_STATUSES.has(value) ? (value as ExecStatus) : "failed";
+}
+
+function safeInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+function toExecNotice(value: unknown): ExecNotice | null {
+  if (!isRecord(value) || !isMessageCode(value.code)) return null;
+  const params = parseCodeParams(value.params);
+  return { code: value.code, ...(params === null ? {} : { params }), action: isAppAction(value.action) ? value.action : null };
+}
+
+/** Valida um comando do Console (a visão do em curso, o resultado ou o resumo do evento final). */
+export function toExecView(value: unknown): ExecView | null {
+  if (!isRecord(value) || !isString(value.exec_id) || value.exec_id === "") return null;
+  const files = toChangedFiles(value.files);
+  return {
+    exec_id: value.exec_id,
+    spec_id: isString(value.spec_id) ? value.spec_id : "",
+    command: isString(value.command) ? value.command.slice(0, 4000) : "",
+    redacted: value.redacted === true,
+    started_at: isString(value.started_at) ? value.started_at : "",
+    status: toExecStatus(value.status),
+    timeout_secs: safeInt(value.timeout_secs) ?? 0,
+    origin: toOrigin(value.origin),
+    exit_code: safeInt(value.exit_code),
+    duration_ms: safeInt(value.duration_ms),
+    output: isString(value.output) ? value.output.slice(-MAX_EXEC_TEXT) : null,
+    output_truncated: value.output_truncated === true,
+    files,
+    files_total: Math.max(nonNegative(value.files_total), files.length),
+    files_truncated: value.files_truncated === true,
+    notice: toExecNotice(value.notice),
+    detail: isString(value.detail) && value.detail.trim() !== "" ? value.detail.slice(-MAX_APP_DETAIL) : null,
+    finished_at: isString(value.finished_at) ? value.finished_at : null,
+  };
+}
+
+function toHistory(value: unknown): ExecHistoryEntry[] {
+  if (!Array.isArray(value)) return [];
+  const out: ExecHistoryEntry[] = [];
+  for (const item of value.slice(0, MAX_HISTORY)) {
+    if (!isRecord(item) || !isString(item.exec_id) || !isString(item.command)) continue;
+    out.push({
+      exec_id: item.exec_id,
+      command: item.command.slice(0, 4000),
+      redacted: item.redacted === true,
+      at: isString(item.at) ? item.at : "",
+      status: toExecStatus(item.status),
+      exit_code: safeInt(item.exit_code),
+      origin: toOrigin(item.origin),
+    });
+  }
+  return out;
+}
+
+function toConsoleView(value: unknown): ConsoleView | null {
+  if (!isRecord(value)) return null;
+  const limits = isRecord(value.limits) ? value.limits : {};
+  return {
+    active: toExecView(value.active),
+    last: toExecView(value.last),
+    history: toHistory(value.history),
+    timeoutSecs: safeInt(limits.timeout_secs) ?? 0,
+  };
+}
+
+/** GET /api/projects/:id/app/exec. */
+export function getConsole(projectId: string): Promise<ApiResult<ConsoleView>> {
+  return request<unknown>({ method: "GET", path: `/api/projects/${enc(projectId)}/app/exec` }).then((r) => {
+    if (!r.ok) return r;
+    const view = toConsoleView(r.data);
+    return view === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: view };
+  });
+}
+
+/**
+ * POST /api/projects/:id/app/exec com `{confirm: true, spec_id, command}` (202, assíncrono): só
+ * depois do clique humano na confirmação. A saída chega pelos eventos `app_exec_*`.
+ */
+export function runConsoleCommand(projectId: string, specId: string, command: string): Promise<ApiResult<ExecView>> {
+  return request<unknown>({
+    method: "POST",
+    path: `/api/projects/${enc(projectId)}/app/exec`,
+    body: JSON.stringify({ confirm: true, spec_id: specId, command }),
+    timeoutMs: APP_LIFECYCLE_TIMEOUT_MS,
+  }).then((r) => {
+    if (!r.ok) return r;
+    const view = toExecView(r.data);
+    return view === null ? fail("invalid_response", 202, INVALID_RESPONSE_KEY) : { ok: true, data: view };
+  });
+}
+
+/** POST /api/projects/:id/app/exec/stop: para o comando em curso (sem comando, nada muda). */
+export function stopConsoleCommand(projectId: string): Promise<ApiResult<ConsoleView>> {
+  return request<unknown>({
+    method: "POST",
+    path: `/api/projects/${enc(projectId)}/app/exec/stop`,
+    body: "{}",
+    timeoutMs: APP_LIFECYCLE_TIMEOUT_MS,
+  }).then((r) => {
+    if (!r.ok) return r;
+    const view = toConsoleView(r.data);
+    return view === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: view };
+  });
+}
+
+/** `GET .../app/guide/:spec_id` (spec 130 T04): o "Como usar", as provas e o sandbox. */
+export interface AppGuide {
+  /** "Como usar" do relatório final (ou o README), em Markdown restrito; `null` sem nenhum. */
+  howToUse: { source: "report" | "readme"; markdown: string; truncated: boolean } | null;
+  tasksDone: number;
+  tasksTotal: number;
+  /** Verificação final na base: `passed` `null` = sem marca de resultado. */
+  finalVerification: { passed: boolean | null; text: string } | null;
+  /** Nomes das capturas geradas na verificação da spec. */
+  captures: string[];
+  capturesTotal: number;
+  /** `false` quando o Arquiteto declarou no plano que o app não roda no sandbox. */
+  runsHere: boolean;
+  /** O que o Arquiteto escreveu sobre isso (redigido). */
+  sandboxNote: string | null;
+}
+
+function toGuide(value: unknown): AppGuide | null {
+  if (!isRecord(value)) return null;
+  const how = isRecord(value.how_to_use) && isString(value.how_to_use.markdown) && value.how_to_use.markdown.trim() !== "" ? value.how_to_use : null;
+  const proofs = isRecord(value.proofs) ? value.proofs : {};
+  const fv = isRecord(proofs.final_verification) && isString(proofs.final_verification.text) ? proofs.final_verification : null;
+  const captures: string[] = [];
+  if (Array.isArray(proofs.captures)) {
+    for (const c of proofs.captures.slice(0, 12)) {
+      if (isRecord(c) && isString(c.name) && c.name !== "") captures.push(c.name.slice(0, 200));
+    }
+  }
+  const sandbox = isRecord(value.sandbox) ? value.sandbox : {};
+  return {
+    howToUse:
+      how === null
+        ? null
+        : { source: how.source === "readme" ? "readme" : "report", markdown: String(how.markdown).slice(0, 16_000), truncated: how.truncated === true },
+    tasksDone: nonNegative(proofs.tasks_done),
+    tasksTotal: nonNegative(proofs.tasks_total),
+    finalVerification:
+      fv === null ? null : { passed: fv.passed === true ? true : fv.passed === false ? false : null, text: String(fv.text).slice(0, 4000) },
+    captures,
+    capturesTotal: Math.max(nonNegative(proofs.captures_total), captures.length),
+    runsHere: sandbox.runs_here !== false,
+    sandboxNote: isString(sandbox.note) && sandbox.note.trim() !== "" ? sandbox.note.slice(0, 4000) : null,
+  };
+}
+
+/** GET /api/projects/:id/app/guide/:spec_id. */
+export function getAppGuide(projectId: string, specId: string): Promise<ApiResult<AppGuide>> {
+  return request<unknown>({ method: "GET", path: `/api/projects/${enc(projectId)}/app/guide/${enc(specId)}` }).then((r) => {
+    if (!r.ok) return r;
+    const guide = toGuide(r.data);
+    return guide === null ? fail("invalid_response", 200, INVALID_RESPONSE_KEY) : { ok: true, data: guide };
+  });
+}
+
+/**
+ * POST /api/projects/:id/app/fix com `{confirm: true, spec_id}` ("Pedir ao Arquiteto para
+ * corrigir"): um turno interno do Arquiteto com o diagnóstico guardado pelo servidor. Síncrono, como
+ * o `/chat/continue`: mesma resposta e mesmas falhas do `postChat`.
+ */
+export function askArchitectFix(projectId: string, specId: string): Promise<ApiResult<ChatReply>> {
+  return request<ChatReply>({
+    method: "POST",
+    path: `/api/projects/${enc(projectId)}/app/fix`,
+    body: JSON.stringify({ confirm: true, spec_id: specId }),
+    timeoutMs: CHAT_TIMEOUT_MS,
+    onHttpError: chatHttpError,
+  }).then((r) => asObject<ChatReply>(r));
 }
 
 // ---------- Explorador de arquivos (spec 066, somente leitura) ----------

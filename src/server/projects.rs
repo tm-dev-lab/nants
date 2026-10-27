@@ -519,6 +519,7 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         super::usage::CONTEXT_CHAT_EXCLUDE_LINE,
         CAPTURES_EXCLUDE_LINE,
         OUTPUTS_EXCLUDE_LINE,
+        crate::harness::home::EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
         crate::sdd::capabilities::CAPABILITIES_EXCLUDE_LINE,
@@ -932,6 +933,8 @@ pub async fn remove_project(
 
     // O app de teste não sobrevive ao projeto (a reserva `__remove__` segue valendo).
     state.apps().stop(&id, super::app::REASON_PROJECT_REMOVED).await;
+    // Console (spec 130 T03): o último resultado e o histórico do projeto removido somem.
+    state.apps().console().forget(state.data_dir().map(Path::to_path_buf), &id).await;
     // Ambiente Docker: derruba -test e -run (volumes do -run só com a confirmação do usuário).
     {
         let (provider, root, pid) = (state.compose().clone(), project_root.clone(), id.clone());
@@ -2122,6 +2125,8 @@ Texto.
         assert_eq!(exclude.lines().filter(|l| *l == CAPTURES_EXCLUDE_LINE).count(), 1, "{exclude}");
         // Spec 122 T02: as íntegras das saídas de ferramenta também.
         assert_eq!(exclude.lines().filter(|l| *l == OUTPUTS_EXCLUDE_LINE).count(), 1, "{exclude}");
+        // Spec 129 T01: a pasta pessoal do workspace fica fora do Git.
+        assert_eq!(exclude.lines().filter(|l| *l == crate::harness::home::EXCLUDE_LINE).count(), 1, "{exclude}");
         assert_eq!(fs::read_to_string(proj.join(".gitignore")).expect("gi"), "target/\n");
     }
 

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Execução: Console do projeto</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#C4B5FD}a:hover{color:#DDD6FE}
+</style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; background: #050508; padding: 20px; font-family: Inter, sans-serif; color: #F4F4F6">
+<div style="height: 100%; display: flex; flex-direction: column; background: #0D0D15; border-radius: 14px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.55)">
+<div style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #11111B">
+<span style="font-weight: 600; font-size: 14px">Console</span>
+<span style="font-size: 13px; color: #AEAEB8">household-ledger · container do ambiente aprovado</span>
+</div>
+<div style="display: flex; gap: 16px; flex-grow: 1; padding: 16px; min-height: 0">
+<div style="flex: 3 1 0; display: flex; flex-direction: column; gap: 10px; min-width: 0">
+<div style="flex-grow: 1; padding: 14px 16px; border-radius: 10px; background: #08080D; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7; color: #D4D4D8; overflow: hidden">
+<div style="color: #A78BFA">$ ledger import samples/bank-a.csv --account checking</div>
+<div>Imported 148 transactions (0 duplicates)</div>
+<div style="color: #A78BFA">$ ledger import samples/card.csv --account card</div>
+<div>Imported 93 transactions (4 duplicates skipped)</div>
+<div style="color: #AEAEB8">código 0 · 0,9 s</div>
+</div>
+<div style="display: flex; gap: 8px">
+<label for="cmd" style="position: absolute; left: -9999px">Comando</label>
+<input id="cmd" value="ledger report --month 2026-09" style="flex-grow: 1; font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 11px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.11); background: #151522; color: #F4F4F6">
+<button style="font: inherit; font-size: 13px; padding: 0 18px; border-radius: 8px; border: none; background: #7C3AED; color: #FFFFFF">Rodar</button>
+</div>
+<span style="font-size: 12px; color: #AEAEB8">Um comando por vez, sem entrada interativa, até 10 min. Tudo roda dentro do container do projeto.</span>
+</div>
+<div style="flex: 2 1 0; display: flex; flex-direction: column; gap: 12px; min-width: 0">
+<div style="padding: 14px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">COMO USAR</span>
+<span style="font-size: 13px; line-height: 1.5">Importe cada extrato com a conta e gere o relatório do mês. Exemplos prontos em samples/.</span>
+<a href="#" style="font-size: 12px">Ver o relatório final</a>
+</div>
+<div style="padding: 14px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">O QUE FOI PROVADO</span>
+<span style="font-size: 13px; color: #86EFAC">7 de 7 tarefas concluídas</span>
+<span style="font-size: 13px; color: #86EFAC">Verificação final: 6 de 6 critérios</span>
+<span style="font-size: 13px">68 testes passando</span>
+</div>
+<div style="padding: 14px; border-radius: 10px; background: #151522; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">HISTÓRICO</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px">ledger import samples/card.csv …</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px">ledger import samples/bank-a.csv …</span>
+</div>
+</div>
+</div>
+<div style="padding: 0 16px 14px; font-size: 12px; color: #AEAEB8">Padrão para qualquer projeto: quando não há página nem processo rodando, a janela vira o Console.</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

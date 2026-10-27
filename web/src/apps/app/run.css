@@ -1,0 +1,401 @@
+/*
+ * Formas da janela App além da página (spec 130, mockup aprovado na T01): rodando sem página,
+ * terminou, o ambiente não subiu, não roda no sandbox e o Console do projeto. Só variáveis dos
+ * tokens e as classes do projeto (`nd-btn`, `nd-pill`, `nd-app-log`).
+ */
+.nd-runview {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+/* Cabeçalho: selo do modo, informação curta e as ações à direita. */
+.nd-runview-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  flex-shrink: 0;
+}
+
+.nd-runview-badge {
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-label);
+}
+
+.nd-runview-spacer {
+  flex: 1;
+}
+
+.nd-runview-actions,
+.nd-runview-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-runview-title {
+  margin: 0;
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-runview-text {
+  margin: 0;
+  color: var(--ink2);
+  line-height: var(--lh-body);
+}
+
+.nd-runview-label {
+  margin: 0;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.nd-runview-label-sm {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-runview-muted {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-runview-small {
+  font-size: var(--fs-label);
+}
+
+.nd-runview-value {
+  font-size: var(--fs-control);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.nd-runview-error {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--pill-rose-ink);
+}
+
+.nd-runview-foot {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+/* Cartões (porta, comando, Como usar, provas, histórico). */
+.nd-runview-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+  min-width: 0;
+}
+
+.nd-runview-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  flex-shrink: 0;
+}
+
+.nd-runview-cards > .nd-runview-card {
+  flex: 1 1 14rem;
+}
+
+.nd-runview-link {
+  align-self: flex-start;
+}
+
+.nd-runview-start {
+  align-self: flex-start;
+}
+
+.nd-runview-md {
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+/* Duas colunas: o principal (saída, registro) e o lado (arquivos, provas). Estreita: empilha. */
+.nd-runview-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: var(--sp-4);
+}
+
+.nd-runview-main {
+  flex: 3 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-runview-side {
+  flex: 2 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-runview-stack {
+  gap: var(--sp-3);
+}
+
+[data-size="narrow"] .nd-runview-split {
+  flex-direction: column;
+}
+
+.nd-runview-main .nd-scroll-wrap {
+  flex: 1;
+  min-height: 10rem;
+}
+
+.nd-runview-command {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* Registro ao vivo do "rodando sem página". */
+.nd-runview-log {
+  flex: 1;
+  min-height: 10rem;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-runview-log .nd-scroll-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.nd-runview-live {
+  align-self: flex-start;
+  font-size: var(--fs-label);
+  color: var(--pill-violet-ink);
+}
+
+/* Arquivos criados ou mudados. */
+.nd-runview-files {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-runview-file-list,
+.nd-runview-plain,
+.nd-runview-proofs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-runview-file {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 44px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+  min-width: 0;
+}
+
+.nd-runview-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-label);
+  color: var(--ink);
+}
+
+.nd-runview-proofs li {
+  font-size: var(--fs-control);
+  color: var(--ink2);
+}
+
+.nd-runview-proofs li[data-tone="green"] {
+  color: var(--pill-green-ink);
+}
+
+.nd-runview-proofs li[data-tone="amber"] {
+  color: var(--pill-amber-ink);
+}
+
+/* O ambiente não subiu. */
+.nd-runview-failure {
+  flex-shrink: 0;
+}
+
+.nd-runview-faillog {
+  height: auto;
+  max-height: 16rem;
+  margin: 0;
+}
+
+.nd-runview-failure-inline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* Console. */
+.nd-console-title {
+  font-size: var(--fs-control);
+}
+
+.nd-console-sub {
+  overflow-wrap: anywhere;
+}
+
+.nd-console-main {
+  gap: var(--sp-2);
+}
+
+.nd-console-out {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-console-out .nd-scroll-wrap {
+  flex: 1;
+  min-height: 12rem;
+}
+
+.nd-console-entry + .nd-console-entry {
+  margin-top: var(--sp-2);
+}
+
+.nd-console-cmd {
+  color: var(--pill-violet-ink);
+}
+
+.nd-console-text {
+  white-space: pre-wrap;
+}
+
+.nd-console-result {
+  color: var(--muted);
+}
+
+.nd-console-result[data-tone="rose"] {
+  color: var(--pill-rose-ink);
+}
+
+.nd-console-notice {
+  color: var(--pill-amber-ink);
+  white-space: normal;
+}
+
+.nd-console-empty {
+  color: var(--muted);
+  white-space: normal;
+}
+
+.nd-console-form {
+  display: flex;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
+.nd-console-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  font-size: var(--fs-control);
+}
+
+.nd-console-form .nd-btn {
+  min-height: 44px;
+}
+
+.nd-console-limits {
+  flex-shrink: 0;
+}
+
+.nd-console-history li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-console-history-btn {
+  justify-content: flex-start;
+  max-width: 100%;
+}
+
+.nd-console-history-cmd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-label);
+}
+
+.nd-console-tabs {
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+
+/* Aba do Console no celular (spec 130 T06): a aba rola por inteiro quando a saída, os arquivos e o
+ * histórico passam da altura; o campo e o limite ficam abaixo dela e nunca são cobertos. Nada dentro
+ * da aba encolhe: a saída mantém a altura mínima (12rem) e rola sozinha. */
+.nd-console-pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-console-pane > * {
+  flex-shrink: 0;
+}
+
+.nd-console-pane > .nd-console-out {
+  flex: 1 0 auto;
+}
+
+.nd-console-pane > .nd-console-out .nd-scroll-wrap {
+  flex: 1 0 12rem;
+}
+
+/* Celular: o campo fica no fim, com espaço para o polegar. */
+.nd-console[data-compact="true"] {
+  padding: var(--sp-3);
+}

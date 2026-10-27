@@ -121,6 +121,8 @@ struct Emitted {
 const CODE_CONST_FAMILIES: &[(&str, &str)] = &[
     ("server/security.rs", "serverError"),
     ("server/app.rs", "serverError"),
+    ("server/console.rs", "serverError"),
+    ("server/app_guide.rs", "serverError"),
     ("server/devices.rs", "serverError"),
     ("server/chat.rs", "serverError"),
     ("server/runs.rs", "system"),
@@ -371,6 +373,11 @@ const SAME_TEXT_FAMILIES: &[(&str, &str, &str)] = &[
         "system.",
         "system.",
         "texto de reserva da mensagem do sistema com code (spec 115 T03): o servidor grava o mesmo texto que a web monta pelo código",
+    ),
+    (
+        "runner.marker.",
+        "marker.",
+        "marcador estrutural da mensagem do Revisor (spec 129 T04): o servidor o escreve no idioma do projeto e a web o lê em qualquer idioma pelas mesmas formas",
     ),
 ];
 

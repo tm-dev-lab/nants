@@ -220,6 +220,15 @@
   flex-shrink: 0;
 }
 
+/* Spec 130: "Pedir ao Arquiteto para corrigir" junto da falha guardada. */
+.nd-exec-fix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
 /* Página do Nants aberta pela rede (095/T09): ajuda curta na linha da porta, discreta. */
 .nd-exec-port-hint {
   margin: 0;

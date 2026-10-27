@@ -820,6 +820,47 @@ export interface SpecReport {
 interface AppStartedPayload {
   spec_id: string;
   url: string | null;
+  /** Forma da execução observada (spec 130); ausente em servidores antigos. */
+  mode?: AppMode;
+}
+
+/**
+ * Forma da execução, decidida pelo comportamento do programa (spec 130): abre uma porta HTTP
+ * (`page`), fica rodando sem página (`running`) ou roda e termina (`finished`).
+ */
+export type AppMode = "page" | "running" | "finished";
+
+/** `app_mode_changed` (spec 130): `running` virou `page`, ou o app vivo terminou (`finished`). */
+interface AppModeChangedPayload {
+  spec_id: string;
+  mode: AppMode;
+  previous: AppMode | null;
+  exit_code: number | null;
+}
+
+/** `app_exec_started` (spec 130): um comando do Console começou (texto já redigido). */
+interface AppExecStartedPayload {
+  exec_id: string;
+  spec_id: string;
+  command: string;
+  started_at: string;
+  timeout_secs: number;
+}
+
+/** `app_exec_output` (spec 130): um pedaço da saída ao vivo (linhas inteiras, redigidas). */
+interface AppExecOutputPayload {
+  exec_id: string;
+  seq: number;
+  text: string;
+  truncated: boolean;
+}
+
+/** `app_exec_finished` (spec 130): o fim de um comando do Console, com o resumo. */
+interface AppExecFinishedPayload {
+  exec_id: string;
+  status: string;
+  exit_code: number | null;
+  [key: string]: unknown;
 }
 
 /** `app_exited`: o app de teste terminou (`code` nulo quando morto por sinal). */
@@ -943,6 +984,10 @@ export type ApiEvent =
   | ApiEventEnvelope<"recovery_decided", RecoveryDecidedPayload>
   | ApiEventEnvelope<"app_started", AppStartedPayload>
   | ApiEventEnvelope<"app_exited", AppExitedPayload>
+  | ApiEventEnvelope<"app_mode_changed", AppModeChangedPayload>
+  | ApiEventEnvelope<"app_exec_started", AppExecStartedPayload>
+  | ApiEventEnvelope<"app_exec_output", AppExecOutputPayload>
+  | ApiEventEnvelope<"app_exec_finished", AppExecFinishedPayload>
   | ApiEventEnvelope<"devices_changed", DevicesChangedPayload>
   | ApiEventEnvelope<"device_code_locked", DeviceCodeLockedPayload>;
 

@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde_yaml::{Mapping, Value};
 
 use crate::config::ViewPorts;
+use crate::harness::home;
 use crate::harness::progress::CommandProgress;
 
 use crate::sdd::environment::{env_hash, COMPOSE_REL, WORKSPACE_SERVICE, WORKTREE_VAR};
@@ -50,6 +52,15 @@ impl ComposeOutput {
     }
 }
 
+/// Destino de cada pedaço da saída enquanto o comando roda (spec 130 T03: a saída ao vivo do
+/// Console). Recebe o fluxo ([`STDOUT`] ou [`STDERR`]) e os bytes crus; quem mostra decide o corte
+/// e a redação (por fluxo: as linhas de um não se misturam com as do outro).
+pub type OutputSink = Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
+/// Fluxo da saída padrão no [`OutputSink`].
+pub const STDOUT: usize = 0;
+/// Fluxo da saída de erro no [`OutputSink`].
+pub const STDERR: usize = 1;
+
 /// Executor de chamadas ao compose (trocado por um falso nos testes).
 pub trait ComposeRunner: Send + Sync {
     fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String>;
@@ -60,6 +71,16 @@ pub trait ComposeRunner: Send + Sync {
     fn run_watched(&self, call: &ComposeCall, progress: Option<&Arc<CommandProgress>>) -> Result<ComposeOutput, String> {
         let _ = progress;
         self.run(call)
+    }
+
+    /// Spec 130 T03: como [`Self::run`], copiando cada pedaço da saída em `sink` e encerrando o
+    /// processo quando `cancel` vira `true` (o resultado vem sem código e sem `timed_out`).
+    /// Padrão: roda inteiro e entrega a saída de uma vez (executores que não leem aos poucos).
+    fn run_streamed(&self, call: &ComposeCall, sink: OutputSink, cancel: Arc<AtomicBool>) -> Result<ComposeOutput, String> {
+        let _ = cancel;
+        let out = self.run(call)?;
+        sink(STDOUT, out.output.as_bytes());
+        Ok(out)
     }
 }
 
@@ -135,7 +156,11 @@ impl HeadTail {
     }
 }
 
-fn read_limited(mut r: impl Read + Send + 'static, progress: Option<Arc<CommandProgress>>) -> thread::JoinHandle<Vec<u8>> {
+fn read_limited(
+    mut r: impl Read + Send + 'static,
+    progress: Option<Arc<CommandProgress>>,
+    sink: Option<(usize, OutputSink)>,
+) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut capture = HeadTail::new(MAX_OUTPUT);
         let mut buf = [0u8; 8192];
@@ -146,6 +171,9 @@ fn read_limited(mut r: impl Read + Send + 'static, progress: Option<Arc<CommandP
                     capture.push(&buf[..n]);
                     if let Some(p) = &progress {
                         p.push(&buf[..n]);
+                    }
+                    if let Some((stream, s)) = &sink {
+                        s(*stream, &buf[..n]);
                     }
                 }
             }
@@ -183,6 +211,24 @@ impl ComposeRunner for RealComposeRunner {
     }
 
     fn run_watched(&self, call: &ComposeCall, progress: Option<&Arc<CommandProgress>>) -> Result<ComposeOutput, String> {
+        self.spawn_and_wait(call, progress.cloned(), None, None)
+    }
+
+    fn run_streamed(&self, call: &ComposeCall, sink: OutputSink, cancel: Arc<AtomicBool>) -> Result<ComposeOutput, String> {
+        self.spawn_and_wait(call, None, Some(sink), Some(cancel))
+    }
+}
+
+impl RealComposeRunner {
+    /// Roda o `docker` com ambiente limpo e stdin fechado, captura a saída limitada (copiando-a em
+    /// `progress` e `sink`) e mata o processo no tempo limite ou quando `cancel` vira `true`.
+    fn spawn_and_wait(
+        &self,
+        call: &ComposeCall,
+        progress: Option<Arc<CommandProgress>>,
+        sink: Option<OutputSink>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<ComposeOutput, String> {
         #[cfg(test)]
         if let Some(reason) = refuse_real_docker_in_tests(&self.program) {
             return Err(reason);
@@ -197,8 +243,8 @@ impl ComposeRunner for RealComposeRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("não foi possível iniciar o docker: {e}"))?;
-        let out = child.stdout.take().map(|r| read_limited(r, progress.cloned()));
-        let err = child.stderr.take().map(|r| read_limited(r, progress.cloned()));
+        let out = child.stdout.take().map(|r| read_limited(r, progress.clone(), sink.clone().map(|s| (STDOUT, s))));
+        let err = child.stderr.take().map(|r| read_limited(r, progress, sink.map(|s| (STDERR, s))));
         let deadline = Instant::now() + call.timeout;
         let (mut code, mut timed_out) = (None, false);
         loop {
@@ -209,6 +255,11 @@ impl ComposeRunner for RealComposeRunner {
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("falha ao aguardar o docker: {e}")),
+            }
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
             }
             if Instant::now() >= deadline {
                 timed_out = true;
@@ -481,6 +532,8 @@ impl ComposeEnv {
         }
         let text = fs::read_to_string(dir.join(COMPOSE_REL)).map_err(|e| format!("compose.yaml ilegível: {e}"))?;
         let doc: Value = serde_yaml::from_str(&text).map_err(|_| "compose.yaml inválido".to_string())?;
+        // Spec 129 T01: a pasta pessoal persistente existe antes de qualquer comando do workspace.
+        home::ensure(dir).map_err(|e| format!("pasta pessoal ({}) indisponível: {e}", home::HOME_DIR))?;
         let mut remaps = Vec::new();
         let ov = write_override(
             &self.override_dir()?,
@@ -544,6 +597,88 @@ impl ComposeEnv {
         Ok(out)
     }
 
+    /// Spec 129 T02: roda `command` no `workspace` num container que NÃO é removido ao fim (`run`
+    /// sem `--rm`, nome do Nants e rótulo `nants.project`), lista com [`Self::container_diff`] o que
+    /// ele gravou e remove o container logo depois, também quando a execução ou a listagem falham.
+    /// `Err` = falha do Docker (o código de saída do comando vai no resultado).
+    pub fn run_kept(&self, dir: &Path, command: &str, timeout: Duration) -> Result<KeptRun, String> {
+        let (_, ov, _) = self.load(dir)?;
+        let name = kept_container_name(&self.project_name());
+        let label = format!("nants.project={}", self.project_id);
+        let tail = ["run", "--name", name.as_str(), "--label", label.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
+        let ran = self.runner.run(&self.call(dir, &ov, &tail, timeout));
+        let diff = match &ran {
+            Ok(_) => self.container_diff(dir, &name),
+            Err(e) => Err(e.clone()),
+        };
+        let cleanup_error = self.remove_container(dir, &name).err();
+        let output = ran?;
+        if !output.success() && is_docker_failure(&output.output) {
+            return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&output)));
+        }
+        Ok(KeptRun { output, diff: diff?, container: name, cleanup_error })
+    }
+
+    /// Spec 130 T03 (Console): roda o comando digitado pelo usuário no `workspace` num container
+    /// efêmero (`run --rm -T`, sem TTY, stdin fechado), com o mesmo override de sempre (`.git` e
+    /// `.nants` só leitura, uid do host, pasta pessoal da 129), o nome `container` e o rótulo
+    /// `nants.project`. A saída vai a `sink` enquanto roda; `cancel` ou o tempo limite encerram o
+    /// cliente, e quem chama remove o container pelo nome ([`Self::remove_container`]). `Err` =
+    /// falha do Docker (o código de saída do comando vai no resultado).
+    pub fn console_run(
+        &self,
+        dir: &Path,
+        container: &str,
+        command: &str,
+        timeout: Duration,
+        sink: OutputSink,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ComposeOutput, String> {
+        let (_, ov, _) = self.load(dir)?;
+        let label = format!("nants.project={}", self.project_id);
+        let tail = ["run", "--rm", "--name", container, "--label", label.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
+        let out = self.runner.run_streamed(&self.call(dir, &ov, &tail, timeout), sink, cancel)?;
+        if !out.success() && is_docker_failure(&out.output) {
+            return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&out)));
+        }
+        Ok(out)
+    }
+
+    /// Nome do container de um comando do Console (spec 130 T03): `<projeto Compose>-console-<exec>`.
+    pub fn console_container_name(&self, exec_id: &str) -> String {
+        format!("{}-console-{exec_id}", self.project_name())
+    }
+
+    /// Spec 129 T02 (C-09): `docker diff <container>`, a função única do Nants para saber o que um
+    /// container que terminou gravou fora das montagens (as montagens, como `/work`, não aparecem).
+    pub fn container_diff(&self, dir: &Path, container: &str) -> Result<Vec<DiffEntry>, String> {
+        let out = self.runner.run(&self.docker_call(dir, &["diff", container]))?;
+        if !out.success() {
+            return Err(format!("docker diff falhou: {}", diagnose(&out)));
+        }
+        Ok(parse_docker_diff(&out.output))
+    }
+
+    /// `docker rm -f <container>` (idempotente para o chamador: o container some mesmo parado).
+    pub fn remove_container(&self, dir: &Path, container: &str) -> Result<(), String> {
+        let out = self.runner.run(&self.docker_call(dir, &["rm", "-f", container]))?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(format!("docker rm falhou: {}", diagnose(&out)))
+        }
+    }
+
+    /// Chamada direta ao `docker` (sem o prefixo do Compose), com o mesmo ambiente controlado.
+    fn docker_call(&self, dir: &Path, args: &[&str]) -> ComposeCall {
+        ComposeCall {
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: dir.to_path_buf(),
+            env: controlled_env(std::env::vars(), dir),
+            timeout: QUERY_TIMEOUT,
+        }
+    }
+
     /// Medida das capacidades do ambiente (spec 124 T04): `run --rm -T --no-deps --entrypoint sh
     /// workspace -c <script>`, sem subir os serviços de apoio. `Err` = falha do Docker.
     pub fn probe(&self, dir: &Path, script: &str, timeout: Duration) -> Result<ComposeOutput, String> {
@@ -594,37 +729,59 @@ impl ComposeEnv {
         self.step(&self.call(dir, &ov, &tail, PREPARE_TIMEOUT), "down")
     }
 
-    /// Sobe o projeto de execução: `up -d --build --wait` (todos os serviços). `run_command` é o
-    /// comando INTERNO que o `workspace` executa (`sh -lc <run_command>`), já normalizado (039).
+    /// Sobe o projeto de execução: `up -d --build` (todos os serviços). `run_command` é o comando
+    /// INTERNO que o `workspace` executa (`sh -lc <run_command>`), já normalizado (039). Sem `--wait`
+    /// (spec 130 T02): um comando que roda e termina não é falha; quem decide o modo é
+    /// [`Self::observe_run`].
     pub fn up_run(&self, dir: &Path, run_command: &str) -> Result<(), String> {
         let (_, ov, _) = self.load_with(dir, Some(run_command))?;
-        self.step(&self.call(dir, &ov, &["up", "-d", "--build", "--wait"], PREPARE_TIMEOUT), "up")
+        self.step(&self.call(dir, &ov, &["up", "-d", "--build"], PREPARE_TIMEOUT), "up")
     }
 
-    /// Observa o `workspace` após o `up` por até `window`: devolve `Err` se o container saiu
-    /// (o `--wait` só garante "running" no instante). Encerra antes se uma porta publicada responder
-    /// (ao menos 1 byte a um GET); porta muda com container vivo é ok (apps lentos). Janela zero = sem observação.
-    pub fn observe_run(&self, dir: &Path, window: Duration) -> Result<(), String> {
-        if window.is_zero() {
-            return Ok(());
-        }
+    /// Estado do `-run` pelo `ps --all --format json`: o `workspace` (vivo ou encerrado, com o
+    /// código e o nome do container) e as portas publicadas.
+    pub fn run_state(&self, dir: &Path) -> Result<RunState, String> {
         let (_, ov, _) = self.load(dir)?;
+        let out = self.runner.run(&self.call(dir, &ov, &["ps", "--all", "--format", "json"], QUERY_TIMEOUT))?;
+        if !out.success() {
+            return Err(format!("docker compose ps falhou: {}", diagnose(&out)));
+        }
+        Ok(parse_run_state(&out.output))
+    }
+
+    /// Spec 130 T02: observa o `workspace` depois do `up` por até `window` e classifica pelo
+    /// comportamento, nunca pela tecnologia: saiu → [`RunMode::Finished`] (com o código); uma porta
+    /// publicada responde HTTP → [`RunMode::Page`]; vivo ao fim da janela → [`RunMode::Running`].
+    /// Janela zero: uma consulta só, sem sondar portas. As portas em `ignore` (a do Nants) nunca são
+    /// sondadas.
+    pub fn observe_run(&self, dir: &Path, window: Duration, ignore: &[u16]) -> Result<Observed, String> {
         let start = Instant::now();
         loop {
-            let out = self.runner.run(&self.call(dir, &ov, &["ps", "--all", "--format", "json"], QUERY_TIMEOUT))?;
-            if out.success() {
-                if let Some(state) = workspace_exit(&out.output) {
-                    return Err(format!("o app encerrou logo após subir ({state})"));
-                }
-                if parse_ps_ports(&out.output).iter().any(|p| port_responds(p.published)) {
-                    return Ok(());
-                }
+            let state = self.run_state(dir)?;
+            if state.workspace_exited() {
+                return Ok(Observed { mode: RunMode::Finished, state });
+            }
+            if !window.is_zero() && state.ports.iter().any(|p| !ignore.contains(&p.published) && port_speaks_http(p.published)) {
+                return Ok(Observed { mode: RunMode::Page, state });
             }
             if start.elapsed() >= window {
-                return Ok(());
+                return Ok(Observed { mode: RunMode::Running, state });
             }
             thread::sleep(OBSERVE_POLL.min(window.saturating_sub(start.elapsed())));
         }
+    }
+
+    /// Saída do `workspace` sem o prefixo do serviço (`logs --no-color --no-log-prefix --tail`), para
+    /// o modo "terminou" (spec 130 T02).
+    pub fn workspace_output(&self, dir: &Path, lines: u32) -> Result<String, String> {
+        let (_, ov, _) = self.load(dir)?;
+        let n = lines.to_string();
+        let tail = ["logs", "--no-color", "--no-log-prefix", "--tail", n.as_str(), WORKSPACE_SERVICE];
+        let out = self.runner.run(&self.call(dir, &ov, &tail, QUERY_TIMEOUT))?;
+        if !out.success() {
+            return Err(format!("docker compose logs falhou: {}", diagnose(&out)));
+        }
+        Ok(out.output)
     }
 
     /// Portas TCP publicadas no host (`ps --format json`), sem duplicatas (IPv4/IPv6).
@@ -660,34 +817,185 @@ impl ComposeEnv {
     }
 }
 
+/// Resultado de [`ComposeEnv::run_kept`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptRun {
+    pub output: ComposeOutput,
+    /// O que o container gravou, pelo `docker diff`.
+    pub diff: Vec<DiffEntry>,
+    /// Nome do container (já removido, salvo `cleanup_error`).
+    pub container: String,
+    /// Motivo, quando a remoção do container falhou.
+    pub cleanup_error: Option<String>,
+}
+
+/// Tipo de uma linha do `docker diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Added,
+    Changed,
+    Deleted,
+}
+
+/// Uma linha do `docker diff` (`A /caminho`, `C /caminho` ou `D /caminho`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffEntry {
+    pub kind: DiffKind,
+    pub path: String,
+}
+
+/// Lê a saída do `docker diff`; linhas fora do formato são ignoradas.
+pub fn parse_docker_diff(text: &str) -> Vec<DiffEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let (kind, path) = line.trim_end().split_once(' ')?;
+            let kind = match kind {
+                "A" => DiffKind::Added,
+                "C" => DiffKind::Changed,
+                "D" => DiffKind::Deleted,
+                _ => return None,
+            };
+            let path = path.trim();
+            path.starts_with('/').then(|| DiffEntry { kind, path: path.to_string() })
+        })
+        .collect()
+}
+
+/// Spec 129 T02 (C-02): caminhos gravados fora de `/work` que ainda existem ao fim (entradas `A` ou
+/// `C`; as `D` são ignoradas). O `docker diff` de um container encerrado já é o estado final.
+pub fn written_outside_work(entries: &[DiffEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.kind != DiffKind::Deleted)
+        .filter(|e| e.path != "/work" && !e.path.starts_with("/work/"))
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+/// Spec 129 T02: os caminhos principais de uma lista, agrupados pelos `depth` primeiros
+/// componentes, com a contagem de cada grupo, do maior para o menor (até `max`). Grupo que é só o
+/// ancestral de outro (`/tmp` diante de `/tmp/.local/lib`) não entra: ele não diz onde foi gravado.
+pub fn main_paths(paths: &[String], depth: usize, max: usize) -> Vec<(String, usize)> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for p in paths {
+        let key: String = p.split('/').filter(|c| !c.is_empty()).take(depth.max(1)).fold(String::new(), |mut acc, c| {
+            acc.push('/');
+            acc.push_str(c);
+            acc
+        });
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => groups.push((key, 1)),
+        }
+    }
+    let keys: Vec<String> = groups.iter().map(|(k, _)| k.clone()).collect();
+    groups.retain(|(k, _)| !keys.iter().any(|other| other.len() > k.len() && other.starts_with(&format!("{k}/"))));
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    groups.truncate(max);
+    groups
+}
+
+/// Nome do container mantido por [`ComposeEnv::run_kept`]: `<projeto>-kept-<pid>-<seq>`, único no
+/// processo e com o prefixo do projeto do Nants.
+fn kept_container_name(project: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    format!("{project}-kept-{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst))
+}
+
 /// Intervalo entre consultas durante a observação pós-`up`.
 const OBSERVE_POLL: Duration = Duration::from_millis(1000);
 
-/// `Some(descrição)` se o serviço `workspace` consta como encerrado no `ps --all --format json`.
-fn workspace_exit(text: &str) -> Option<String> {
+/// Modo de execução observado (spec 130 T02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// Uma porta publicada responde HTTP: o navegador com o app.
+    Page,
+    /// Segue vivo sem página: log ao vivo, portas e o botão de parar.
+    Running,
+    /// Rodou e terminou: saída, código e arquivos.
+    Finished,
+}
+
+impl RunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Running => "running",
+            Self::Finished => "finished",
+        }
+    }
+}
+
+/// O `workspace` no `ps --all`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceState {
+    /// Nome do container (para o `docker diff`).
+    pub container: Option<String>,
+    /// `State` do Compose (`running`, `exited`, `dead`, `restarting`...).
+    pub state: String,
+    /// `ExitCode` (só tem sentido encerrado).
+    pub exit_code: Option<i64>,
+}
+
+/// Estado do projeto `-run` ([`ComposeEnv::run_state`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunState {
+    /// `None` quando o `workspace` não aparece (container removido): conta como encerrado.
+    pub workspace: Option<WorkspaceState>,
+    pub ports: Vec<PublishedPort>,
+}
+
+impl RunState {
+    /// O `workspace` saiu (ou sumiu).
+    pub fn workspace_exited(&self) -> bool {
+        self.workspace.as_ref().is_none_or(|w| w.state == "exited" || w.state == "dead")
+    }
+
+    /// Código de saída do `workspace` encerrado.
+    pub fn exit_code(&self) -> Option<i64> {
+        self.workspace.as_ref().and_then(|w| w.exit_code)
+    }
+
+    /// Nome do container do `workspace`.
+    pub fn container(&self) -> Option<&str> {
+        self.workspace.as_ref().and_then(|w| w.container.as_deref())
+    }
+}
+
+/// Resultado de [`ComposeEnv::observe_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    pub mode: RunMode,
+    pub state: RunState,
+}
+
+/// Itens do `ps --format json` (array JSON ou uma linha JSON por container, conforme a versão).
+fn ps_items(text: &str) -> Vec<serde_json::Value> {
     let trimmed = text.trim();
-    let items: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(trimmed) {
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(serde_json::Value::Array(a)) => a,
         Ok(v @ serde_json::Value::Object(_)) => vec![v],
         _ => trimmed.lines().filter_map(|l| serde_json::from_str(l.trim()).ok()).collect(),
-    };
-    items.iter().find_map(|i| {
-        if i.get("Service").and_then(|v| v.as_str()) != Some(WORKSPACE_SERVICE) {
-            return None;
-        }
-        let state = i.get("State").and_then(|v| v.as_str())?;
-        if state == "exited" || state == "dead" {
-            let code = i.get("ExitCode").and_then(|v| v.as_i64()).map_or(String::new(), |c| format!(", código {c}"));
-            Some(format!("{state}{code}"))
-        } else {
-            None
-        }
-    })
+    }
 }
 
-/// A porta publicada responde de verdade? O docker-proxy aceita o connect mesmo com o backend
-/// morto, então exige ao menos 1 byte de resposta a um GET (fechada sem bytes = não pronta).
-fn port_responds(port: u16) -> bool {
+/// Lê o `ps --all --format json` do `-run`.
+pub fn parse_run_state(text: &str) -> RunState {
+    let items = ps_items(text);
+    let workspace = items.iter().find(|i| i.get("Service").and_then(|v| v.as_str()) == Some(WORKSPACE_SERVICE)).map(|i| WorkspaceState {
+        container: i.get("Name").and_then(|v| v.as_str()).filter(|n| !n.is_empty()).map(str::to_string),
+        state: i.get("State").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        exit_code: i.get("ExitCode").and_then(|v| v.as_i64()),
+    });
+    RunState { workspace, ports: parse_ps_ports(text) }
+}
+
+/// A porta publicada responde HTTP de verdade? O docker-proxy aceita o connect mesmo com o backend
+/// morto, e um serviço que não é HTTP pode responder outra coisa: exige que a resposta a um GET
+/// comece por `HTTP/`.
+pub fn port_speaks_http(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
         return false;
@@ -697,19 +1005,21 @@ fn port_responds(port: u16) -> bool {
     if s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
         return false;
     }
-    let mut b = [0u8; 1];
-    matches!(s.read(&mut b), Ok(n) if n > 0)
+    let mut got = Vec::new();
+    let mut b = [0u8; 5];
+    while got.len() < 5 {
+        match s.read(&mut b[..5 - got.len()]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    got == b"HTTP/"
 }
 
 /// Extrai as portas publicadas da saída de `compose ps --format json` (array JSON ou uma linha
 /// JSON por container, conforme a versão do Compose).
 pub fn parse_ps_ports(text: &str) -> Vec<PublishedPort> {
-    let trimmed = text.trim();
-    let items: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(serde_json::Value::Array(a)) => a,
-        Ok(v @ serde_json::Value::Object(_)) => vec![v],
-        _ => trimmed.lines().filter_map(|l| serde_json::from_str(l.trim()).ok()).collect(),
-    };
+    let items = ps_items(text);
     let mut ports: Vec<PublishedPort> = Vec::new();
     for item in &items {
         let service = item.get("Service").and_then(|v| v.as_str()).unwrap_or("");
@@ -1047,8 +1357,10 @@ fn override_yaml_with(
             // Runtime com o uid do host: arquivos criados na worktree não ficam como root.
             let (uid, gid) = host_ids()?;
             svc.insert("user".into(), Value::String(format!("{uid}:{gid}")));
+            // Spec 129 T01: `HOME` dentro de `/work` (persiste entre os containers, um por comando).
+            // O `.profile` dela põe `$HOME/.local/bin` na frente do `PATH` nos shells de login.
             let mut env = Mapping::new();
-            env.insert("HOME".into(), "/tmp".into());
+            env.insert("HOME".into(), home::CONTAINER_HOME.into());
             svc.insert("environment".into(), Value::Mapping(env));
             if run_command.is_some() {
                 // `init: true` repassa SIGTERM ao processo (senão o `down` espera 10 s).
@@ -1177,8 +1489,12 @@ pub(crate) mod fake {
         ComposeEnv::new(id, runner).with_base_dir(base)
     }
 
-    /// Token após o segundo `-f <arquivo>`.
+    /// Token após o segundo `-f <arquivo>`; numa chamada direta ao `docker` (sem `compose`), o
+    /// primeiro argumento (`diff`, `rm`).
     pub fn sub_of(args: &[String]) -> &str {
+        if args.first().is_some_and(|a| a != "compose") {
+            return args[0].as_str();
+        }
         let last_f = args.iter().rposition(|a| a == "-f").unwrap_or(0);
         args.get(last_f + 2).map_or("", String::as_str)
     }
@@ -1279,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn override_runs_workspace_with_host_uid_and_home_tmp() {
+    fn override_runs_workspace_with_host_uid_and_persistent_home() {
         let dir = project("uid", COMPOSE);
         let doc: Value = serde_yaml::from_str(COMPOSE).expect("yaml");
         let text = override_yaml("p1", &dir, &doc, None, None).expect("override");
@@ -1287,8 +1603,76 @@ mod tests {
         let (uid, gid) = host_ids().expect("ids");
         let ws = &v["services"]["workspace"];
         assert_eq!(ws["user"].as_str(), Some(format!("{uid}:{gid}").as_str()));
-        assert_eq!(ws["environment"]["HOME"].as_str(), Some("/tmp"));
+        assert_eq!(ws["environment"]["HOME"].as_str(), Some("/work/.nants-home"));
+        // O `PATH` da imagem não é tocado pelo override.
+        assert!(ws["environment"].get("PATH").is_none());
         assert!(v["services"]["db"].get("user").is_none());
+    }
+
+    /// Executor falso que simula cada `run --rm` do workspace como um container novo: um processo
+    /// `sh -lc` próprio, só com o `HOME` do override (com `/work` trocado pela pasta montada) e um
+    /// `PATH` mínimo, sem nada herdado do comando anterior.
+    #[derive(Default)]
+    struct ShellRunner {
+        calls: Mutex<Vec<ComposeCall>>,
+    }
+
+    impl ComposeRunner for ShellRunner {
+        fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+            self.calls.lock().unwrap_or_else(PoisonError::into_inner).push(call.clone());
+            let ok = ComposeOutput { code: Some(0), output: String::new(), timed_out: false };
+            if fake::sub_of(&call.args) != "run" {
+                return Ok(ok);
+            }
+            let ov: Value = serde_yaml::from_str(&fs::read_to_string(&call.args[6]).expect("override")).expect("yaml");
+            let home = ov["services"][WORKSPACE_SERVICE]["environment"]["HOME"].as_str().expect("HOME").to_string();
+            let root = call.cwd.canonicalize().expect("raiz");
+            let host_home = match home.strip_prefix("/work") {
+                Some(rest) => format!("{}{rest}", root.display()),
+                None => home,
+            };
+            let script = call.args.last().expect("comando");
+            let out = Command::new("sh")
+                .args(["-lc", script])
+                .env_clear()
+                .env("HOME", host_home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&root)
+                .output()
+                .expect("sh");
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok(ComposeOutput { code: out.status.code(), output: text, timed_out: false })
+        }
+    }
+
+    /// Spec 129 T01: o que um comando grava em `$HOME` (um arquivo e um executável em
+    /// `$HOME/.local/bin`) está no comando seguinte, em outro container, sem regra por linguagem.
+    #[test]
+    fn personal_folder_persists_between_commands_and_its_bin_is_on_the_path() {
+        let dir = project("home", COMPOSE);
+        let runner = Arc::new(ShellRunner::default());
+        let env = super::fake::test_env("p1", runner.clone());
+        // A pasta não existe antes; nasce com o primeiro comando, do uid do host e fora do Git.
+        assert!(!dir.join(home::HOME_DIR).exists());
+        env.prepare(&dir).expect("prepare");
+        let h = dir.join(home::HOME_DIR);
+        let uid = fs::metadata("/proc/self").expect("self").uid();
+        assert_eq!(fs::metadata(&h).expect("pasta").uid(), uid);
+        assert_eq!(fs::read_to_string(h.join(".gitignore")).expect("gi"), "*\n");
+        let write = "echo gravado > \"$HOME/estado.txt\" && mkdir -p \"$HOME/.local/bin\" \
+                     && printf '#!/bin/sh\\necho ferramenta-ok\\n' > \"$HOME/.local/bin/nants-probe-tool\" \
+                     && chmod +x \"$HOME/.local/bin/nants-probe-tool\"";
+        let first = env.exec(&dir, write, Duration::from_secs(20)).expect("exec");
+        assert!(first.success(), "{}", first.output);
+        let second = env.exec(&dir, "cat \"$HOME/estado.txt\" && nants-probe-tool", Duration::from_secs(20)).expect("exec");
+        assert!(second.success(), "{}", second.output);
+        assert!(second.output.contains("gravado") && second.output.contains("ferramenta-ok"), "{}", second.output);
+        // O que o comando gravou ficou na área de trabalho, dentro da pasta pessoal.
+        assert!(h.join("estado.txt").exists() && h.join(".local/bin/nants-probe-tool").exists());
+        // A remoção da área de trabalho leva a pasta junto.
+        fs::remove_dir_all(&dir).expect("apagável sem sudo");
+        assert!(!h.exists());
     }
 
     #[test]
@@ -1521,6 +1905,25 @@ mod tests {
         assert_eq!(v["volumes"]["data"]["labels"][0].as_str(), Some("nants.project=p1"));
     }
 
+    /// Spec 129 T05 (C-14): o padrão `${NANTS_WORKTREE:-..}` vale só para o uso manual; no Nants, o
+    /// override monta o caminho absoluto da worktree em /work e o subprocesso recebe a variável.
+    #[test]
+    fn worktree_default_is_manual_only_and_override_mounts_the_absolute_path() {
+        let compose = COMPOSE.replace("${NANTS_WORKTREE}", "${NANTS_WORKTREE:-..}");
+        assert_eq!(crate::sdd::environment::validate_compose(&compose), Ok(()));
+        let dir = project("ov-default", &compose);
+        let doc: Value = serde_yaml::from_str(&compose).expect("yaml");
+        let text = override_yaml("p1", &dir, &doc, None, None).expect("ov");
+        let v: Value = serde_yaml::from_str(&text).expect("parse");
+        let ws = &v["services"]["workspace"];
+        let abs = dir.canonicalize().expect("c");
+        assert_eq!(ws["volumes"][0]["target"].as_str(), Some("/work"));
+        assert_eq!(ws["volumes"][0]["source"].as_str(), abs.to_str());
+        assert!(!text.contains("NANTS_WORKTREE"), "o override nunca depende da variável: {text}");
+        let env = controlled_env(Vec::new(), &abs);
+        assert_eq!(env.iter().find(|(k, _)| k == WORKTREE_VAR).map(|(_, v)| v.as_str()), abs.to_str());
+    }
+
     #[test]
     fn override_run_command_is_a_safe_exec_list_only_on_workspace() {
         let dir = project("cmd", COMPOSE);
@@ -1703,6 +2106,83 @@ mod tests {
         assert!(!ov.contains("override"), "{ov}");
     }
 
+    /// Linha do `ps --all --format json` do `workspace`, com uma porta publicada opcional.
+    fn ps_workspace(state: &str, code: i64, port: Option<u16>) -> String {
+        let pubs = port.map_or(String::new(), |p| format!(r#"{{"URL":"127.0.0.1","TargetPort":8080,"PublishedPort":{p},"Protocol":"tcp"}}"#));
+        format!(r#"{{"Service":"workspace","Name":"nants-p1-run-workspace-1","State":"{state}","ExitCode":{code},"Publishers":[{pubs}]}}"#)
+    }
+
+    /// Spec 130 T02: o `ps --all` diz se o `workspace` saiu, com o código e o nome do container.
+    #[test]
+    fn run_state_reads_workspace_exit_code_and_container() {
+        let text = format!("{}\n{}\n", ps_workspace("exited", 2, None), r#"{"Service":"db","State":"running","Publishers":[]}"#);
+        let state = parse_run_state(&text);
+        assert!(state.workspace_exited());
+        assert_eq!(state.exit_code(), Some(2));
+        assert_eq!(state.container(), Some("nants-p1-run-workspace-1"));
+        let live = parse_run_state(&ps_workspace("running", 0, Some(18080)));
+        assert!(!live.workspace_exited());
+        assert_eq!(live.ports.len(), 1);
+        // Sem o `workspace` (container removido): conta como encerrado, sem código.
+        let gone = parse_run_state(r#"[{"Service":"db","State":"running"}]"#);
+        assert!(gone.workspace_exited());
+        assert_eq!(gone.exit_code(), None);
+    }
+
+    /// Spec 130 T02: a observação classifica pelo comportamento: saiu, porta HTTP, vivo sem página.
+    #[test]
+    fn observe_run_classifies_finished_page_and_running() {
+        let dir = project("observe", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("ps", 0, &ps_workspace("exited", 0, None));
+        let env = env_with(&fake).with_kind(ComposeKind::Run);
+        let seen = env.observe_run(&dir, Duration::ZERO, &[]).expect("observe");
+        assert_eq!(seen.mode, RunMode::Finished);
+        assert_eq!(seen.state.exit_code(), Some(0));
+        assert_eq!(&fake.calls.lock().expect("lock")[0].args[7..], ["ps", "--all", "--format", "json"]);
+
+        // Porta que responde HTTP: página.
+        let http = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = http.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for mut s in http.incoming().flatten() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\nok");
+            }
+        });
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("ps", 0, &ps_workspace("running", 0, Some(port)));
+        let env = env_with(&fake).with_kind(ComposeKind::Run);
+        assert_eq!(env.observe_run(&dir, Duration::from_secs(2), &[]).expect("observe").mode, RunMode::Page);
+        // A porta do Nants nunca é sondada; janela zero também não sonda.
+        assert_eq!(env.observe_run(&dir, Duration::from_millis(50), &[port]).expect("observe").mode, RunMode::Running);
+        assert_eq!(env.observe_run(&dir, Duration::ZERO, &[]).expect("observe").mode, RunMode::Running);
+
+        // Porta que responde outra coisa (não HTTP): segue "rodando" ao fim da janela.
+        let other = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = other.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for mut s in other.incoming().flatten() {
+                let _ = s.write_all(b"-ERR protocolo\r\n");
+            }
+        });
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("ps", 0, &ps_workspace("running", 0, Some(port)));
+        let env = env_with(&fake).with_kind(ComposeKind::Run);
+        assert_eq!(env.observe_run(&dir, Duration::from_millis(300), &[]).expect("observe").mode, RunMode::Running);
+    }
+
+    #[test]
+    fn workspace_output_has_no_service_prefix() {
+        let dir = project("output", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        let env = env_with(&fake).with_kind(ComposeKind::Run);
+        env.workspace_output(&dir, 400).expect("logs");
+        let calls = fake.calls.lock().expect("lock");
+        assert_eq!(&calls[0].args[7..], ["logs", "--no-color", "--no-log-prefix", "--tail", "400", "workspace"]);
+    }
+
     #[test]
     fn up_run_writes_command_into_override_and_workspace_logs_target_workspace() {
         let dir = project("uprun", COMPOSE);
@@ -1711,7 +2191,7 @@ mod tests {
         env.up_run(&dir, "npm run dev -- --host 0.0.0.0").expect("up");
         let ov = {
             let calls = fake.calls.lock().expect("lock");
-            assert_eq!(&calls[0].args[7..], ["up", "-d", "--build", "--wait"]);
+            assert_eq!(&calls[0].args[7..], ["up", "-d", "--build"]);
             fs::read_to_string(calls[0].args[6].clone()).expect("override")
         };
         assert!(ov.contains("npm run dev -- --host 0.0.0.0"), "{ov}");
@@ -1899,7 +2379,8 @@ mod tests {
         assert_eq!(fail.code, Some(3), "{}", fail.output);
     }
 
-    /// Teste real do 053: o comando sai com 3 logo após subir; a observação detecta e há logs.
+    /// Teste real do 053 (130 T02): o comando sai com 3 logo após subir; a observação classifica
+    /// como "terminou", com o código e a saída.
     #[test]
     #[ignore]
     fn real_run_early_exit_is_detected() {
@@ -1907,17 +2388,18 @@ mod tests {
         let dir = project("realexit", compose);
         let env = ComposeEnv::real(format!("itestexit{}", std::process::id())).with_kind(ComposeKind::Run);
         let env = env.with_approved_hashes(vec![env_hash(&dir).expect("hash")]);
-        let result = env.up_run(&dir, "sleep 3; echo falhou-cedo; exit 3").and_then(|()| env.observe_run(&dir, Duration::from_secs(8)));
-        let logs = env.workspace_logs(&dir, 50);
+        let result = env.up_run(&dir, "sleep 3; echo falhou-cedo; exit 3").and_then(|()| env.observe_run(&dir, Duration::from_secs(8), &[]));
+        let logs = env.workspace_output(&dir, 50);
         let down = env.down_with(&dir, true);
         down.expect("down");
-        let err = result.expect_err("deveria detectar a saída");
-        assert!(err.contains("código 3"), "{err}");
+        let seen = result.expect("observação");
+        assert_eq!(seen.mode, RunMode::Finished, "{seen:?}");
+        assert_eq!(seen.state.exit_code(), Some(3));
         assert!(logs.expect("logs").contains("falhou-cedo"));
     }
 
-    /// Teste real do 053: com porta publicada (docker-proxy aceita o connect), o app que morre
-    /// depois do `up` ainda é detectado.
+    /// Teste real do 053 (130 T02): com porta publicada (docker-proxy aceita o connect), o app que
+    /// morre depois do `up` ainda é "terminou", e não "página".
     #[test]
     #[ignore]
     fn real_run_early_exit_with_published_port_is_detected() {
@@ -1925,11 +2407,12 @@ mod tests {
         let dir = project("realexitport", compose);
         let env = ComposeEnv::real(format!("itestexitp{}", std::process::id())).with_kind(ComposeKind::Run);
         let env = env.with_approved_hashes(vec![env_hash(&dir).expect("hash")]);
-        let result = env.up_run(&dir, "sleep 3; exit 3").and_then(|()| env.observe_run(&dir, Duration::from_secs(8)));
+        let result = env.up_run(&dir, "sleep 3; exit 3").and_then(|()| env.observe_run(&dir, Duration::from_secs(8), &[]));
         let down = env.down_with(&dir, true);
         down.expect("down");
-        let err = result.expect_err("deveria detectar a saída");
-        assert!(err.contains("código 3") || err.contains("exited"), "{err}");
+        let seen = result.expect("observação");
+        assert_eq!(seen.mode, RunMode::Finished, "{seen:?}");
+        assert_eq!(seen.state.exit_code(), Some(3));
     }
 
     /// Teste real do 050: com `init: true` o `down` do run para `sh -lc 'sleep 300'` em < 7 s.
@@ -1981,7 +2464,7 @@ mod tests {
     }
 
     /// Teste real do 048: o `run_command` vira o command do workspace, que serve a porta
-    /// publicada (sem healthcheck; `--wait` basta com o container rodando).
+    /// publicada (sem healthcheck).
     #[test]
     #[ignore]
     fn real_run_command_serves_published_port() {
@@ -2013,5 +2496,85 @@ mod tests {
         assert!(ports.iter().any(|p| p.service == "workspace" && p.target == 8080 && p.published > 0), "{ports:?}");
         assert!(logs.contains("iniciando"), "{logs}");
         assert!(body.is_some_and(|b| b.contains("nants-048-ok")), "porta não serviu o arquivo");
+    }
+
+    /// Diff do Test 8 (pip com `HOME=/tmp`, resumido): diretórios `C`, entradas `A` e uma `D`.
+    const DIFF_TEST8: &str = "C /tmp\nA /tmp/.cache\nA /tmp/.cache/pip\nA /tmp/.cache/pip/x.body\nA /tmp/.local\nA /tmp/.local/lib\nA /tmp/.local/lib/python3.12\nA /tmp/.local/lib/python3.12/site-packages\nA /tmp/.local/lib/python3.12/site-packages/pytest.py\nA /tmp/.local/bin\nA /tmp/.local/bin/pytest\nD /tmp/apagado\nA /work/fica.txt\nlixo sem formato\n";
+
+    #[test]
+    fn docker_diff_is_parsed_and_only_live_entries_outside_work_count() {
+        let entries = parse_docker_diff(DIFF_TEST8);
+        assert_eq!(entries.len(), 13, "a linha fora do formato some");
+        assert_eq!(entries[0], DiffEntry { kind: DiffKind::Changed, path: "/tmp".into() });
+        let outside = written_outside_work(&entries);
+        assert_eq!(outside.len(), 11, "sem a D e sem o que está em /work: {outside:?}");
+        assert!(!outside.iter().any(|p| p == "/tmp/apagado" || p.starts_with("/work")));
+        let main = main_paths(&outside, 3, 5);
+        assert_eq!(main[0], ("/tmp/.local/lib".to_string(), 4));
+        assert!(main.contains(&("/tmp/.cache/pip".to_string(), 2)) && main.contains(&("/tmp/.local/bin".to_string(), 2)), "{main:?}");
+        assert!(!main.iter().any(|(k, _)| k == "/tmp" || k == "/tmp/.local" || k == "/tmp/.cache"), "ancestral não entra: {main:?}");
+        assert_eq!(main_paths(&outside, 3, 1).len(), 1);
+        assert!(written_outside_work(&parse_docker_diff("")).is_empty());
+    }
+
+    #[test]
+    fn run_kept_runs_without_rm_lists_the_diff_and_removes_the_container() {
+        let dir = project("kept", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "instalado");
+        fake.reply("diff", 0, DIFF_TEST8);
+        let env = env_with(&fake);
+        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        assert!(kept.output.success() && kept.cleanup_error.is_none());
+        assert_eq!(kept.diff.len(), 13);
+        assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
+        let calls = fake.calls.lock().expect("lock");
+        let run = &calls[0].args[7..];
+        assert!(!run.iter().any(|a| a == "--rm"), "{run:?}");
+        assert_eq!(&run[..2], ["run", "--name"]);
+        assert_eq!(run[2], kept.container);
+        assert!(kept.container.starts_with("nants-p1-test-kept-"), "{}", kept.container);
+        assert_eq!(&run[3..], ["--label", "nants.project=p1", "-T", "--entrypoint", "sh", "workspace", "-lc", "make deps"]);
+        assert_eq!(calls[1].args, ["diff", kept.container.as_str()]);
+        assert_eq!(calls[2].args, ["rm", "-f", kept.container.as_str()]);
+    }
+
+    #[test]
+    fn run_kept_removes_the_container_even_when_the_command_or_docker_fails() {
+        let dir = project("keptfail", COMPOSE);
+        // O comando falha: o diff e a remoção acontecem igual.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 1, "erro da instalação");
+        let env = env_with(&fake);
+        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        assert_eq!(kept.output.code, Some(1));
+        assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
+        // O diff falha: o container é removido e o erro volta.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("diff", 1, "No such container");
+        assert!(env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5)).is_err());
+        assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
+        // O docker não sobe o comando (erro do executor): a remoção ainda é tentada.
+        struct FailRun(Mutex<Vec<String>>);
+        impl ComposeRunner for FailRun {
+            fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+                let sub = super::fake::sub_of(&call.args).to_string();
+                self.0.lock().unwrap_or_else(PoisonError::into_inner).push(sub.clone());
+                if sub == "run" {
+                    return Err("docker ausente".into());
+                }
+                Ok(ComposeOutput { code: Some(0), output: String::new(), timed_out: false })
+            }
+        }
+        let failing = Arc::new(FailRun(Mutex::new(Vec::new())));
+        let env = super::fake::test_env("p1", failing.clone());
+        assert!(env.run_kept(&dir, "make deps", Duration::from_secs(5)).is_err());
+        assert_eq!(*failing.0.lock().expect("lock"), vec!["run".to_string(), "rm".to_string()]);
+        // A remoção falha: o resultado volta com o motivo, para o registro.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("rm", 1, "device busy");
+        let kept = env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        assert!(kept.cleanup_error.is_some_and(|e| e.contains("device busy")));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

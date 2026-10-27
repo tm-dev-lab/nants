@@ -80,6 +80,7 @@ use crate::agents::spill;
 use crate::harness::allowlist::{evaluate, Decision, Policy};
 use crate::harness::browser::BrowserTests;
 use crate::harness::compose::{ComposeEnv, HeadTail};
+use crate::harness::home;
 use crate::harness::progress::CommandProgress;
 use crate::harness::web::WebClient;
 use crate::server::events::SecretSet;
@@ -1565,6 +1566,10 @@ impl ToolHost {
             if self.report && !self.report_entry_visible(&dir_rel.join(entry.file_name()), &entry.path()) {
                 continue;
             }
+            // Spec 129 T01: a pasta pessoal do workspace fica fora da listagem, como as do Nants.
+            if dir_rel.as_os_str().is_empty() && entry.file_name() == home::HOME_DIR {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
                 name.push('/');
             }
@@ -1676,6 +1681,10 @@ impl ToolHost {
         if matches!(kind, SddKind::Task { .. }) {
             return Ok(format!("artefato SDD escrito: {}; {}", scope_key(&rel), task_criteria_note(&final_content)));
         }
+        // Spec 129 T05: comando do plano que repete a instalação; o Arquiteto recebe a regra agora.
+        if let Some(note) = self.spec_install_note(&final_content) {
+            return Ok(format!("artefato SDD escrito: {}; {note}", scope_key(&rel)));
+        }
         Ok(format!("artefato SDD escrito: {}", scope_key(&rel)))
     }
 
@@ -1760,7 +1769,10 @@ impl ToolHost {
                 "ambiente só pode ser alterado enquanto a spec está em rascunho (DRAFT/AWAITING_APPROVAL)",
             ));
         }
-        environment::validate_env_file(&key, content).map_err(ToolError::InvalidArgs)?;
+        // Spec 129 T05: o compose novo ganha `${NANTS_WORKTREE:-..}` (roda sem variável fora do Nants).
+        let raw = content;
+        let prepared = environment::prepare_env_file(&key, raw).map_err(ToolError::InvalidArgs)?;
+        let content = prepared.as_str();
         let target = self.check_write_target(rel, WriteScope::Env)?;
         if fs::symlink_metadata(self.root.join(rel)).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(sdd_err("destino é um symlink"));
@@ -1779,6 +1791,13 @@ impl ToolHost {
             }
         })?;
         self.sdd_writes.fetch_add(1, Ordering::SeqCst);
+        if prepared != raw {
+            return Ok(format!(
+                "arquivo de ambiente escrito: {key}; a origem da worktree foi gravada como `{}`, que roda fora do \
+                 Nants sem nenhuma variável (o README nunca manda exportar NANTS_WORKTREE)",
+                environment::WORKTREE_SOURCE
+            ));
+        }
         Ok(format!("arquivo de ambiente escrito: {key}"))
     }
 
@@ -1807,7 +1826,6 @@ impl ToolHost {
         let mut changes = Vec::new();
         for item in items {
             let key = scope_key(&normalize_rel(arg(item, "path")?)?);
-            let content = arg(item, "content")?;
             if !environment::is_env_file(&key) {
                 return Err(ToolError::InvalidArgs(format!(
                     "{key}: só .nants/compose.yaml e .nants/Dockerfile* podem ser alterados"
@@ -1816,7 +1834,9 @@ impl ToolHost {
             if plan.iter().any(|(k, ..)| *k == key) {
                 return Err(ToolError::InvalidArgs(format!("{key}: arquivo repetido")));
             }
-            environment::validate_env_file(&key, content).map_err(ToolError::InvalidArgs)?;
+            // Spec 129 T05: o humano aprova o arquivo já ajustado (o diff mostra o valor padrão).
+            let prepared = environment::prepare_env_file(&key, arg(item, "content")?).map_err(ToolError::InvalidArgs)?;
+            let content = prepared.as_str();
             let rel = PathBuf::from(&key);
             let target = self.check_write_target(&rel, WriteScope::Env)?;
             let old = read_optional_regular(&target)?;
@@ -2021,6 +2041,48 @@ impl ToolHost {
 
     /// `true` quando `.sdd/settings.yaml` (definido pelo humano) tem `test_command` não vazio.
     /// Ausente, ilegível ou symlink conta como `false`: a spec então precisa trazer o comando.
+    /// Spec 129 T05: aviso ao Arquiteto, no mesmo turno, quando um comando do spec.md (test,
+    /// full_test, checagem ou formatador) começa com o `install_command` (o do spec.md ou, sem ele, o
+    /// das settings), com a regra de que o Nants já roda a instalação antes. O plano não muda: o
+    /// runner mantém o aviso da spec 126 a cada rodada. Texto para o modelo.
+    fn spec_install_note(&self, content: &str) -> Option<String> {
+        let fm = Spec::parse(content).ok()?.frontmatter;
+        let inner = |c: &str| crate::sdd::docker_command::normalize(c).unwrap_or_else(|_| c.trim().to_string());
+        let install = match fm.install_command.as_deref() {
+            Some(c) => Some(c.to_string()),
+            None => read_optional_regular(&self.root.join(".sdd/settings.yaml"))
+                .ok()
+                .flatten()
+                .and_then(|text| Settings::parse(&text).ok())
+                .and_then(|s| s.install_command),
+        }
+        .map(|c| inner(&c))?;
+        let mut fields: Vec<(String, String)> = Vec::new();
+        if let Some(t) = &fm.test_command {
+            fields.push(("test_command".into(), inner(t)));
+        }
+        if let Some(t) = &fm.full_test_command {
+            fields.push(("full_test_command".into(), inner(t)));
+        }
+        for c in fm.checks.iter().flatten() {
+            fields.push((format!("checks[{}].command", c.name), inner(&c.command)));
+        }
+        for f in fm.formatters.iter().flatten() {
+            fields.push((format!("formatters[{}].command", f.name), inner(&f.command)));
+        }
+        let repeated = crate::sdd::test_levels::repeated_install_in(Some(&install), fields);
+        if repeated.is_empty() {
+            return None;
+        }
+        let list = repeated.iter().map(|(field, command)| format!("{field} (`{command}`)")).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "aviso: {list} começa com o install_command (`{}`), que o Nants já roda antes dos testes, das \
+             checagens e dos formatadores, então a instalação se repetiria a cada rodada. Regra: esses comandos \
+             NÃO repetem a instalação (nada de `<instalação> && <testes>`); regrave o spec.md sem ela",
+            install.trim()
+        ))
+    }
+
     fn settings_has_test_command(&self) -> bool {
         let path = self.root.join(".sdd/settings.yaml");
         read_optional_regular(&path)
@@ -2517,7 +2579,9 @@ fn check_scope_key(scope: WriteScope, allowed: &[String], key: &str) -> Result<(
     // `.nants/**` (ambiente aprovado) nunca é escrito pelo escopo da tarefa; mudança de ambiente
     // passa só pelo fluxo de permissão (spec 030, T04).
     let env_dir = scope == WriteScope::Allowed && key.split('/').next() == Some(environment::ENV_DIR);
-    let excluded = env_dir || key == FIXED_EXCLUDED_FILE || key.split('/').any(|c| c == ".git");
+    // Spec 129 T01: a pasta pessoal do workspace nunca é escrita pelas tarefas.
+    let home_dir = scope == WriteScope::Allowed && home::is_home_path(key);
+    let excluded = env_dir || home_dir || key == FIXED_EXCLUDED_FILE || key.split('/').any(|c| c == ".git");
     if in_scope && !excluded {
         Ok(())
     } else if env_dir {
@@ -3573,7 +3637,8 @@ fn walk(
         if file_type.is_dir() {
             let name = entry.file_name();
             // As íntegras guardadas (spec 122 T02) repetiriam saídas antigas na busca.
-            let outputs = rel == Path::new(spill::OUTPUTS_DIR);
+            // Spec 129 T01: nem a pasta pessoal do workspace (instalações e caches).
+            let outputs = rel == Path::new(spill::OUTPUTS_DIR) || rel == Path::new(home::HOME_DIR);
             if name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)) || outputs || !filter(rel, true) {
                 continue;
             }
@@ -5049,6 +5114,26 @@ mod tests {
         assert_eq!(none, "nenhum resultado");
     }
 
+    /// Spec 129 T01: a pasta pessoal do workspace fica fora da listagem, da busca e da escrita das
+    /// tarefas, mesmo com escopo largo.
+    #[tokio::test]
+    async fn personal_folder_is_out_of_listing_search_and_writes() {
+        let root = tmp_dir("home-dir");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/a.rs"), "needle\n").expect("a");
+        let h = home::ensure(&root).expect("home");
+        fs::create_dir_all(h.join(".local/lib")).expect("mk");
+        fs::write(h.join(".local/lib/pkg.py"), "needle\n").expect("pkg");
+        let dev = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Deny);
+        let list = dev.call(ToolName::ListDir, json!({"path": "."})).await.expect("listar");
+        assert_eq!(list, "src/");
+        let found = dev.call(ToolName::SearchCode, json!({"pattern": "needle"})).await.expect("buscar");
+        assert_eq!(found, "src/a.rs:1: needle");
+        let write = dev.call(ToolName::WriteFile, json!({"path": ".nants-home/.profile", "content": "x"})).await;
+        assert!(matches!(write, Err(ToolError::OutOfScope(_))), "{write:?}");
+        assert!(!write_scope_allows(&["**".to_string()], ".nants-home/x"));
+    }
+
     /// Spec 122 T02: acima de 1 MiB (a íntegra guardada de uma saída), a leitura por faixas lê o
     /// arquivo aos poucos, no mesmo formato; acima do teto, recusa sem ler.
     #[tokio::test]
@@ -5997,6 +6082,23 @@ mod tests {
         assert!(write_art(&h, ".nants/compose.yaml", ENV_COMPOSE).await.is_err());
     }
 
+    /// Spec 129 T05: o compose escrito pelo Arquiteto ganha `${NANTS_WORKTREE:-..}`, e o resultado
+    /// diz isso; o que já tem o padrão é gravado como veio; outra forma da variável é recusada.
+    #[tokio::test]
+    async fn env_compose_gets_the_worktree_default() {
+        let root = sdd_root("env-default");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
+        write_art(&h, ".sdd/specs/001-exemplo/spec.md", EXAMPLE_SPEC_MD).await.expect("spec");
+        let out = write_art(&h, ".nants/compose.yaml", ENV_COMPOSE).await.expect("compose");
+        assert!(out.contains("`${NANTS_WORKTREE:-..}`") && out.contains("nunca manda exportar NANTS_WORKTREE"), "{out}");
+        let saved = fs::read_to_string(root.join(".nants/compose.yaml")).expect("lido");
+        assert_eq!(saved, ENV_COMPOSE.replace("${NANTS_WORKTREE}", "${NANTS_WORKTREE:-..}"));
+        let again = write_art(&h, ".nants/compose.yaml", &saved).await.expect("já com o padrão");
+        assert_eq!(again, "arquivo de ambiente escrito: .nants/compose.yaml");
+        let other = ENV_COMPOSE.replace("${NANTS_WORKTREE}", "${NANTS_WORKTREE:-/etc}");
+        assert!(matches!(write_art(&h, ".nants/compose.yaml", &other).await, Err(ToolError::InvalidArgs(m)) if m.contains("${NANTS_WORKTREE:-..}")));
+    }
+
     const ARCH_DOC: &str = "# P\n\n## Visão geral\nx\n\n## Stack\nx\n\n## Estrutura\nx\n\n## Comandos\nx\n\n## Padrões e convenções\nx\n\n## Decisões\nx\n\n## Restrições\nx\n";
 
     #[tokio::test]
@@ -6224,6 +6326,36 @@ mod tests {
         let wrapped = "docker compose -f .nants/compose.yaml run --rm workspace sh -lc 'npm test'";
         write_art(&h, SPEC_PATH, &docker(wrapped)).await.expect("embrulhado exato");
         write_art(&h, SPEC_PATH, &awaiting_spec(Some("docker compose run app npm test"))).await.expect("host");
+    }
+
+    /// Spec 129 T05: o spec.md cujo test_command começa com o install_command é gravado como está, e o
+    /// Arquiteto recebe no mesmo resultado a regra de que a instalação já roda antes; sem repetição
+    /// (ou sem install_command), nada.
+    #[tokio::test]
+    async fn sdd_spec_with_repeated_install_gets_the_rule_in_the_same_turn() {
+        let root = sdd_root("sdd-repeated-install");
+        write_settings_command(&root, "");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
+        let with_install = |tc: &str| {
+            awaiting_spec(Some(tc)).replace("created_at", "install_command: \"pip install -e .[dev]\"\ncreated_at")
+        };
+        let out = write_art(&h, SPEC_PATH, &with_install("pip install -e .[dev] && python -m pytest")).await.expect("gravado");
+        assert!(out.contains("aviso: test_command (`pip install -e .[dev] && python -m pytest`) começa com o install_command (`pip install -e .[dev]`)"), "{out}");
+        assert!(out.contains("já roda antes dos testes") && out.contains("NÃO repetem a instalação"), "{out}");
+        let saved = fs::read_to_string(root.join(SPEC_PATH)).expect("lida");
+        assert!(saved.contains("pip install -e .[dev] && python -m pytest"), "o plano não muda: {saved}");
+        let clean = write_art(&h, SPEC_PATH, &with_install("python -m pytest")).await.expect("gravado");
+        assert!(!clean.contains("aviso"), "{clean}");
+        let no_install = write_art(&h, SPEC_PATH, &awaiting_spec(Some("pip install -e . && python -m pytest"))).await.expect("gravado");
+        assert!(!no_install.contains("aviso"), "sem install_command, nada: {no_install}");
+        // O install_command das settings também vale quando o spec.md não traz o seu.
+        fs::write(
+            root.join(".sdd/settings.yaml"),
+            "base_branch: \"main\"\nmerge_strategy: \"squash\"\ntest_command: \"\"\ninstall_command: \"pip install -e .\"\n",
+        )
+        .expect("settings");
+        let from_settings = write_art(&h, SPEC_PATH, &awaiting_spec(Some("pip install -e . && python -m pytest"))).await.expect("gravado");
+        assert!(from_settings.contains("começa com o install_command (`pip install -e .`)"), "{from_settings}");
     }
 
     #[tokio::test]

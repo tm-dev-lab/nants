@@ -27,6 +27,23 @@ fn facts_carry_block_reason_text_and_stable_code() {
     );
 }
 
+/// Spec 129 T02: o aviso da persistência da instalação do spec.md chega aos FATOS da recuperação,
+/// com a regra de que o gravado fora de /work se perde; sem aviso, nada.
+#[test]
+fn facts_carry_the_install_footprint_warning_with_the_rule() {
+    let root = choice_root("facts-footprint", "BLOCKED", "");
+    let spec = root.join(".sdd/specs/s1/spec.md");
+    let section = crate::agents::runner::INSTALL_FOOTPRINT_SECTION;
+    std::fs::write(&spec, format!("---\nid: s1\n---\n## Contexto\nx\n\n## {section}\n- registro\n")).expect("spec");
+    let quiet = load(&root, "s1", "T01", &SecretSet::default()).expect("sem aviso");
+    assert!(!quiet.facts.contains(section), "{}", quiet.facts);
+    let warning = crate::i18n::tr(Lang::PtBr, "runner.install_footprint.warning", &[("paths", "/tmp/.local/lib (288)")]);
+    std::fs::write(&spec, format!("---\nid: s1\n---\n## Contexto\nx\n\n## {section}\n- registro\n- {warning}\n")).expect("spec");
+    let loaded = load(&root, "s1", "T01", &SecretSet::default()).expect("com aviso");
+    assert!(loaded.facts.contains("/tmp/.local/lib (288)"), "{}", loaded.facts);
+    assert!(loaded.facts.contains("o que um comando grava fora de /work se perde no comando seguinte"), "{}", loaded.facts);
+}
+
 #[test]
 fn parse_accepts_valid_retry_and_escalate() {
     let retry = parse_decision(r#"{"decision":"RETRY","root_cause":"c","strategy":"s"}"#).expect("retry");
@@ -1341,4 +1358,65 @@ fn recovery_facts_carry_the_cost_alert_only_above_the_threshold() {
         "{}",
         loud.facts
     );
+}
+
+/// Spec 129 T05: a opção `environment` com o compose sem valor padrão chega ao humano já com
+/// `${NANTS_WORKTREE:-..}` (no arquivo guardado e no diff).
+#[test]
+fn environment_option_compose_gets_the_worktree_default() {
+    let root = config_root("env-default", OPT_SETTINGS);
+    let compose = "services:\n  workspace:\n    image: node:20\n    volumes:\n      - ${NANTS_WORKTREE}:/work\n";
+    let option = env_option("ok", vec![(".nants/compose.yaml", compose)]);
+    let (valid, discarded) = validate_options(&root, &SecretSet::default(), vec![option], false, &|| true);
+    assert_eq!(valid.len(), 1, "{discarded:?}");
+    let files = valid[0].files.clone().unwrap_or_default();
+    assert_eq!(files[0].content, compose.replace("${NANTS_WORKTREE}", "${NANTS_WORKTREE:-..}"));
+    assert!(valid[0].diff.clone().unwrap_or_default().contains("+      - ${NANTS_WORKTREE:-..}:/work"));
+}
+
+const INSTALL_SETTINGS: &str = "base_branch: main\nmerge_strategy: squash\ntest_command: python -m pytest\ninstall_command: pip install -e .\nenvironment: docker\nchecks:\n  - name: lint\n    command: ruff check .\n    blocking: true\n";
+
+/// Spec 129 T05: o REVISE_CONFIG que repete a instalação é aceito como veio (o aviso da spec 126 é
+/// mantido, sem mudar o comando aprovado), e a análise ganha o aviso com a regra no idioma do
+/// projeto, só para os campos que a proposta mudou.
+#[test]
+fn revise_config_with_repeated_install_keeps_the_command_and_warns() {
+    let root = config_root("repeated-install", INSTALL_SETTINGS);
+    let secrets = SecretSet::default();
+    let proposal = ConfigProposal { test_command: Some("pip install -e . && python -m pytest".into()), checks: None };
+    let change = validate_config(&root, &proposal, &secrets).expect("aceita");
+    assert_eq!(change.test_command.as_deref(), Some("pip install -e . && python -m pytest"));
+    write_config(&root, &change, &secrets).expect("grava");
+    let warnings = repeated_install_warnings(&root, &proposal, Lang::PtBr);
+    assert_eq!(
+        warnings,
+        vec![crate::i18n::tr(
+            Lang::PtBr,
+            "runner.install.repeated",
+            &[("field", "test_command"), ("command", "pip install -e . && python -m pytest"), ("install", "pip install -e .")]
+        )]
+    );
+    assert!(warnings[0].contains("que o Nants já roda antes dos testes"), "{}", warnings[0]);
+    let en = repeated_install_warnings(&root, &proposal, Lang::En);
+    assert!(en[0].contains("which Nants already runs before the tests"), "{}", en[0]);
+    // A proposta só de checks não reclama do test_command que ela não mudou.
+    let only_checks = ConfigProposal { test_command: None, checks: Some(vec![]) };
+    assert!(repeated_install_warnings(&root, &only_checks, Lang::PtBr).is_empty());
+    // Sem install_command, nada.
+    let plain = config_root("repeated-install-none", DOCKER_SETTINGS);
+    assert!(repeated_install_warnings(&plain, &proposal, Lang::PtBr).is_empty());
+}
+
+/// Spec 129 T05: os FATOS da recuperação trazem o install_command com a regra, e a nota da falha de
+/// ambiente deixa de sugerir embutir a instalação quando ela já existe.
+#[test]
+fn recovery_facts_carry_the_install_rule_and_env_note_follows_it() {
+    let rule = install_rule(Some("pip install -e ."));
+    assert!(rule.contains("install_command: pip install -e .") && rule.contains("NÃO repetem a instalação"), "{rule}");
+    assert!(install_rule(None).is_empty() && install_rule(Some("  ")).is_empty());
+    let with = env_note("python -m pytest", "127", "pytest: not found", Some("pip install -e ."));
+    assert!(with.contains("o Nants roda antes deles o install_command (`pip install -e .`)") && with.contains("NÃO repita a instalação"), "{with}");
+    assert!(!with.contains("autossuficiente"), "{with}");
+    let without = env_note("npm test", "127", "x", None);
+    assert!(without.contains("autossuficiente"), "{without}");
 }

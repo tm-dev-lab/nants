@@ -10,6 +10,8 @@ import { ptBR } from "./i18n/ptBR";
 import { MAX_CHAT_ATTACHMENTS } from "./chatImages";
 import type { AppState } from "./store";
 import { appStore } from "./store";
+import { clearGuideCache } from "./apps/app/useAppGuide";
+import { resetConsoleSessions } from "./apps/app/consoleSession";
 import type {
   ConfigView,
   ProjectState,
@@ -82,6 +84,9 @@ export function installFetch(handler: FetchHandler) {
 
 /** Restaura o store global para um estado limpo (mais os campos informados). */
 export function resetStore(initial: Partial<AppState> = {}): void {
+  // Spec 130: as leituras guardadas da janela de execução não atravessam testes.
+  clearGuideCache();
+  resetConsoleSessions();
   appStore.setState({
     config: null,
     configError: null,

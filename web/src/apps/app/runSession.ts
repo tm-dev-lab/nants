@@ -23,7 +23,17 @@
  *   pelas janelas (que chama `shell.showToast`). A carga inicial com o app já no ar não avisa.
  */
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { getAppLogs, getAppStatus, startApp, stopApp, type ApiFailure, type AppNotice, type AppStatus } from "../../api/client";
+import {
+  askArchitectFix,
+  getAppLogs,
+  getAppStatus,
+  startApp,
+  stopApp,
+  type ApiFailure,
+  type AppFailureView,
+  type AppNotice,
+  type AppStatus,
+} from "../../api/client";
 import type { NetworkView } from "../../api/types";
 import { appErrorMessage } from "../../copy";
 import type { Readiness, ReadinessItem } from "../../desktop/api";
@@ -37,8 +47,9 @@ import {
   LOGS_POLL_MS,
   createStatusSequence,
   embedProbePending,
-  firstPort,
+  finishedRun,
   mergeStatus,
+  pagePort,
   phaseFromStatus,
   type RunPhase,
 } from "./appModel";
@@ -90,6 +101,14 @@ interface RunSnapshot {
   shownUrl: string | null;
   /** Porta do Nants, faixa de visualização e WSL da última resposta do app (spec 097); `null` = ainda não veio. */
   network: NetworkView | null;
+  /** Última falha que pede o Arquiteto (spec 130 T04), da última leitura do estado. */
+  failure: AppFailureView | null;
+  /** O App mostra o Console do projeto (spec 130): pedido pelo usuário ou pelo próximo passo `open_console`. */
+  consoleOpen: boolean;
+  /** "Pedir ao Arquiteto para corrigir" em curso. */
+  fixing: boolean;
+  /** Falha do pedido ao Arquiteto (mostrada junto do botão). */
+  fixProblem: ApiFailure | null;
 }
 
 /**
@@ -153,6 +172,10 @@ function createSession(projectId: string, specId: string | null): Session {
       embedRetries: 0,
       shownUrl: null,
       network: null,
+      failure: null,
+      consoleOpen: false,
+      fixing: false,
+      fixProblem: null,
     },
     listeners: new Set(),
     mounts: 0,
@@ -185,7 +208,7 @@ function sessionFor(projectId: string, specId: string | null): Session {
   return created;
 }
 
-const hasUrl = (phase: RunPhase): boolean => firstPort(phase) !== null;
+const hasUrl = (phase: RunPhase): boolean => pagePort(phase) !== null;
 
 function update(s: Session, patch: Partial<RunSnapshot> | ((snap: RunSnapshot) => Partial<RunSnapshot>)): void {
   if (!s.alive) return;
@@ -216,6 +239,11 @@ function sameNetwork(a: NetworkView | null, b: NetworkView): boolean {
   );
 }
 
+function sameFailure(a: AppFailureView | null, b: AppFailureView | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.code === b.code && a.at === b.at && a.spec_id === b.spec_id && a.detail === b.detail;
+}
+
 // --- Estado do servidor: um GET por vez, só com alguma janela visível ---
 
 function applyStatus(s: Session, status: AppStatus, issued: number): void {
@@ -225,6 +253,7 @@ function applyStatus(s: Session, status: AppStatus, issued: number): void {
     ...(next.kind === "running" ? { notices: status.notices } : {}),
     ...(status.network !== null ? { network: sameNetwork(snap.network, status.network) ? snap.network : status.network } : {}),
     phase: mergeStatus(snap.phase, next),
+    failure: sameFailure(snap.failure, status.failure) ? snap.failure : status.failure,
   }));
 }
 
@@ -318,11 +347,30 @@ function applySignal(s: Session, signal: AppSignal): void {
     }
     // As portas publicadas (com o host desta página) e o `embeddable` vêm do estado do app.
     requestStatus(s);
+  } else if (signal.kind === "mode") {
+    // Spec 130: `running` virou `page`, ou o app vivo terminou. A releitura traz as portas, o
+    // `embeddable` ou a saída e os arquivos.
+    if (s.snap.specId === null || signal.specId === s.snap.specId) {
+      update(s, (snap) => {
+        const p = snap.phase;
+        if (signal.mode === "finished") {
+          if (p.kind === "exited") return {};
+          return { phase: { kind: "exited", code: signal.exitCode, reason: "exited", finished: null, command: p.kind === "running" ? p.command : null } };
+        }
+        return p.kind === "running" ? { phase: { ...p, mode: signal.mode === "running" ? "running" : "page" } } : {};
+      });
+    }
+    requestStatus(s);
   } else {
     update(s, (snap) => ({
-      phase: snap.phase.kind === "stopped" ? snap.phase : { kind: "exited", code: signal.code, reason: signal.reason },
+      phase:
+        snap.phase.kind === "stopped" || finishedRun(snap.phase) !== null
+          ? snap.phase
+          : { kind: "exited", code: signal.code, reason: signal.reason, finished: null, command: snap.phase.kind === "running" ? snap.phase.command : null },
       stopping: false,
     }));
+    // Um programa que terminou sozinho: a saída e os arquivos vêm da releitura.
+    if (signal.reason === "exited") requestStatus(s);
   }
   refreshLogs(s);
 }
@@ -347,6 +395,9 @@ function attach(s: Session): void {
 function detach(s: Session): void {
   s.mounts -= 1;
   if (s.mounts > 0) return;
+  // Spec 130 (pendência da T02): fechar a janela de um "terminou" para o app, e o container
+  // encerrado que o servidor mantinha para mostrar o resultado sai.
+  if (finishedRun(s.snap.phase) !== null) void stopApp(s.snap.projectId);
   s.alive = false;
   s.unsubscribe?.();
   s.unsubscribe = null;
@@ -374,6 +425,8 @@ function start(s: Session, deps: StartDeps): void {
     phase: { kind: "starting" },
     launch: snap.launch + 1,
     shownUrl: null,
+    consoleOpen: false,
+    fixProblem: null,
   }));
   void startApp(s.snap.projectId, specId).then(async (r) => {
     s.busy = false;
@@ -388,19 +441,37 @@ function start(s: Session, deps: StartDeps): void {
         update(s, { problem: { message: prereqMessage(missing), missing, prereq: true } });
         return;
       }
-      update(s, { problem: { message: appErrorMessage(r.error.status, r.error.reason), failure: r.error, missing: null, prereq: false }, errorDetail: typeof r.error.detail === "string" ? cleanComposeLog(r.error.detail) : null });
+      update(s, {
+        problem: { message: appErrorMessage(r.error.status, r.error.reason), failure: r.error, missing: null, prereq: false },
+        errorDetail: typeof r.error.detail === "string" ? cleanComposeLog(r.error.detail) : null,
+        // Sem como executar (sem `run_command`): o padrão é o Console do projeto (G2).
+        ...(r.error.action === "open_console" ? { consoleOpen: true } : {}),
+      });
+      // A falha que pede o Arquiteto fica guardada no servidor (`failure`, com o log).
+      if (r.error.action === "ask_architect_fix") requestStatus(s);
       return;
     }
     // O evento `app_started` pode já ter chegado; a resposta só completa o que faltar.
     const data = r.data;
     update(s, (snap) => {
       const ports = data?.ports ?? [];
-      const embeddable = data?.embeddable ?? null;
       const p = snap.phase;
-      const phase: RunPhase =
-        p.kind === "starting" || (p.kind === "running" && p.ports.length === 0 && ports.length > 0) ? { kind: "running", ports, embeddable } : p;
+      const parsed = data === null ? null : phaseFromStatus(data, specId);
+      const fromData: RunPhase =
+        data === null || parsed === null
+          ? { kind: "running", ports: [], embeddable: null }
+          : parsed.kind === "stopped" || parsed.kind === "other"
+            ? { kind: "running", ports, embeddable: data.embeddable }
+            : parsed;
+      let phase: RunPhase = p;
+      if (p.kind === "starting" || (p.kind === "running" && p.ports.length === 0 && ports.length > 0)) phase = fromData;
+      else if (p.kind === "running" && fromData.kind === "running" && p.mode === undefined) {
+        phase = { ...p, mode: fromData.mode, command: fromData.command, startedAt: fromData.startedAt };
+      } else if (p.kind === "exited" && fromData.kind === "exited" && finishedRun(p) === null) {
+        phase = { ...fromData, reason: p.reason ?? fromData.reason };
+      }
       const network = data !== null && data.network !== null && !sameNetwork(snap.network, data.network) ? { network: data.network } : {};
-      return { phase, ...(data !== null ? { notices: data.notices } : {}), ...network };
+      return { phase, ...(data !== null ? { notices: data.notices, failure: null } : {}), ...network };
     });
     refreshLogs(s);
   });
@@ -415,6 +486,27 @@ function stop(s: Session): void {
       stopping: false,
       ...(r.ok ? {} : { problem: { message: appErrorMessage(r.error.status, r.error.reason), failure: r.error, missing: null, prereq: false } }),
     });
+  });
+}
+
+/**
+ * "Pedir ao Arquiteto para corrigir" (spec 130 T04): o servidor manda o diagnóstico guardado ao
+ * Arquiteto num turno interno. A Conversa abre na hora (`onOpen`), e a resposta aparece lá.
+ */
+function askFix(s: Session, onOpen: () => void): void {
+  const specId = s.snap.failure?.spec_id ?? s.snap.specId;
+  if (s.snap.fixing || specId === null) return;
+  update(s, { fixing: true, fixProblem: null });
+  onOpen();
+  void askArchitectFix(s.snap.projectId, specId).then((r) => {
+    if (!s.alive) return;
+    if (r.ok) {
+      appStore.showArchitectReply(s.snap.projectId, r.data.reply, r.data.turn_id);
+      update(s, { fixing: false });
+      requestStatus(s);
+      return;
+    }
+    update(s, { fixing: false, fixProblem: r.error });
   });
 }
 
@@ -434,6 +526,13 @@ interface RunActions {
   stop: () => void;
   /** Relê o estado do servidor (Recarregar); zera as releituras do veredito. */
   reload: () => void;
+  /** Relê o estado do app (a falha guardada muda com um comando do Console), sem zerar o veredito. */
+  refresh: () => void;
+  /** Mostra (ou esconde) o Console do projeto na janela App (spec 130). */
+  openConsole: () => void;
+  closeConsole: () => void;
+  /** "Pedir ao Arquiteto para corrigir"; `onOpen` leva o usuário à Conversa. */
+  askFix: (onOpen: () => void) => void;
 }
 
 interface UseRunOptions {
@@ -511,7 +610,10 @@ export function useRunSession(projectId: string, specId: string | null, options:
           update(s, { embedRetries: 0 });
           requestStatus(s);
         },
-
+        refresh: () => requestStatus(s),
+        openConsole: () => update(s, { consoleOpen: true }),
+        closeConsole: () => update(s, { consoleOpen: false }),
+        askFix: (onOpen) => askFix(s, onOpen),
       },
     };
   }

@@ -630,7 +630,7 @@ fn skills_facts(root: &Path, settings: Option<&Settings>, secrets: &SecretSet) -
 /// Spec 077 T02: texto da última mensagem `tests` sem tarefa que começa com "verificação final na base"
 /// (grava o runner em `dialog.jsonl`), sem o prefixo, redigido e truncado. `None` se não houver.
 /// O prefixo vale em qualquer idioma suportado (spec 113 T04: a linha sai no idioma do projeto).
-fn final_base_fact(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<String> {
+pub(super) fn final_base_fact(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<String> {
     let prefixes: Vec<String> = std::iter::once(FINAL_BASE_PREFIX.to_string())
         .chain([Lang::PtBr, Lang::En].into_iter().map(final_base_prefix))
         .collect();

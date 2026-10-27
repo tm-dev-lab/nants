@@ -333,7 +333,9 @@ fn nants_texts_have_no_dashes_emoji_yolo_or_old_button_name() {
         ("i18n/pt_br.rs", "diagnóstico do ambiente"),
         ("i18n/en.rs", "no task declared"),
         ("i18n/en.rs", "environment check"),
-        ("agents/runner.rs", "verificação humana, não bloqueia"),
+        // Spec 129 T04: a marca da verificação humana saiu do runner para o dicionário.
+        ("i18n/pt_br.rs", "verificação humana, não bloqueia"),
+        ("i18n/en.rs", "human check, does not block"),
         ("agents/prompts.rs", "ESTILO DA ESCRITA"),
         // Spec 113 T04: o nome do botão vem do dicionário (idioma do relatório).
         ("agents/prompts.rs", "START_APP_LABEL"),

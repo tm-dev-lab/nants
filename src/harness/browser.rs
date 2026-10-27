@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::compose::{controlled_env, is_docker_failure, ComposeCall, ComposeOutput, ComposeRunner, RealComposeRunner};
+use super::home;
 use super::progress::CommandProgress;
 
 /// Timeout padrão de uma execução (a primeira pode baixar a imagem).
@@ -66,7 +67,8 @@ pub fn run_args(name: &str, worktree: &Path, version: &str, command: &str, user:
         a.extend(["--user".into(), format!("{uid}:{gid}")]);
     }
     a.extend(["-v".into(), format!("{}:/work", worktree.to_string_lossy()), "-w".into(), "/work".into()]);
-    a.extend(["-e", "CI=1", "-e", "HOME=/tmp"].map(String::from));
+    // Spec 129 T01: a mesma pasta pessoal persistente dos comandos do workspace.
+    a.extend(["-e".into(), "CI=1".into(), "-e".into(), format!("HOME={}", home::CONTAINER_HOME)]);
     a.push(image_name(version));
     a.extend(["sh".into(), "-c".into(), command.into()]);
     a
@@ -177,6 +179,9 @@ impl BrowserTests {
                     Ok(_) => {}
                 }
             }
+        }
+        if let Err(e) = home::ensure(worktree) {
+            return Err(format!("pasta pessoal ({}) indisponível: {e}", home::HOME_DIR));
         }
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let name = format!("{}{n}", container_prefix(&self.project_id));
@@ -327,6 +332,8 @@ mod tests {
         assert_eq!(mounts[0][1], format!("{}:/work", d.display()));
         assert!(a.contains(&"mcr.microsoft.com/playwright:v1.49.1-noble".to_string()));
         assert_eq!(&a[a.len() - 3..], ["sh", "-c", "npx playwright test"]);
+        assert!(a.contains(&"HOME=/work/.nants-home".to_string()));
+        assert!(d.join(".nants-home/.gitignore").exists());
         assert!(run.env.iter().all(|(k, _)| k == "PATH" || k == "HOME" || k.starts_with("DOCKER_") || k == "NANTS_WORKTREE"));
     }
 

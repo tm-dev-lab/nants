@@ -80,6 +80,7 @@ fn state_rec(root: &Path, rec: &Arc<Rec>) -> AppState {
         .with_compose_provider(provider(rec))
         .with_app_observe_window(Duration::ZERO)
         .with_app_probe_timeout(Duration::from_millis(300))
+        .with_app_watch_interval(Duration::ZERO)
 }
 
 fn state_for(root: &Path) -> AppState {
@@ -140,10 +141,16 @@ fn drain(rx: &mut broadcast::Receiver<crate::server::events::ApiEvent>) -> Vec<(
     out
 }
 
-/// Saída de `compose ps` com uma porta publicada (`web`, alvo 8080).
+/// Linha do `ps --all` do `workspace` no estado dado.
+fn ps_workspace(state: &str, code: i64) -> String {
+    json!({"Service": "workspace", "Name": "nants-proj-app-run-workspace-1", "State": state, "ExitCode": code, "Publishers": []}).to_string()
+}
+
+/// Saída de `compose ps` com o `workspace` no ar e uma porta publicada (`web`, alvo 8080).
 fn ps_with_port(published: u16) -> String {
     format!(
-        "{}\n",
+        "{}\n{}\n",
+        ps_workspace("running", 0),
         json!({"Service": "web", "Publishers": [{"URL": "0.0.0.0", "TargetPort": 8080, "PublishedPort": published, "Protocol": "tcp"}]})
     )
 }
@@ -321,15 +328,15 @@ async fn start_brings_up_run_project_and_links_follow_the_request_host() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let view: Value = serde_json::from_str(&text).expect("json");
     assert_eq!(view["state"], "running");
-    assert_eq!(view["mode"], "docker");
+    assert_eq!(view["mode"], "running", "vivo e sem porta respondendo");
     assert_eq!(view["ports"][0]["url"], "http://192.168.1.50:18080");
     assert_eq!(view["ports"][0]["service"], "web");
     assert!(view["ports"][0].get("hint").is_none());
     assert_eq!(view["ports"].as_array().map(Vec::len), Some(1), "porta duplicada IPv6 e interna não entram");
     let calls = rec.compose_calls();
     assert_eq!(calls[0].0, "nants-proj-app-run");
-    assert_eq!(calls[0].1, ["up", "-d", "--build", "--wait"]);
-    assert_eq!(calls[1].1, ["ps", "--format", "json"]);
+    assert_eq!(calls[0].1, ["up", "-d", "--build"], "sem --wait (spec 130 T02)");
+    assert_eq!(calls[1].1, ["ps", "--all", "--format", "json"]);
 
     // Cada consulta usa o Host da própria requisição.
     let (_, text) = call(&state, req_host(Method::GET, &uri(""), "localhost:3000", "")).await;
@@ -338,7 +345,10 @@ async fn start_brings_up_run_project_and_links_follow_the_request_host() {
     assert!(text.contains("http://127.0.0.1:18080"), "{text}");
 
     let started = drain(&mut rx);
-    assert!(started.iter().any(|(t, p)| t == "app_started" && p["ports"][0]["published"] == 18080), "{started:?}");
+    assert!(
+        started.iter().any(|(t, p)| t == "app_started" && p["ports"][0]["published"] == 18080 && p["mode"] == "running"),
+        "{started:?}"
+    );
 }
 
 #[tokio::test]
@@ -373,7 +383,11 @@ async fn logs_come_from_compose_redacted_and_stop_downs_without_volumes() {
     let last = rec.compose_calls().pop().expect("down");
     assert_eq!(last.1, ["down", "--timeout", "5", "--remove-orphans"], "Parar nunca usa -v");
     let events = drain(&mut rx);
-    assert!(events.iter().any(|(t, p)| t == "app_exited" && p["reason"] == "stopped"), "{events:?}");
+    // Parado pelo usuário: sem código próprio (o processo não terminou sozinho).
+    assert!(
+        events.iter().any(|(t, p)| t == "app_exited" && p["reason"] == "stopped" && p["code"].is_null() && p["mode"] == "running"),
+        "{events:?}"
+    );
     // Idempotente.
     stop(&state).await;
 }
@@ -492,6 +506,10 @@ struct FakeApp {
 
 async fn fake_app(headers: Option<&'static str>) -> FakeApp {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    fake_app_on(listener, headers)
+}
+
+fn fake_app_on(listener: tokio::net::TcpListener, headers: Option<&'static str>) -> FakeApp {
     let port = listener.local_addr().expect("addr").port();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
@@ -723,7 +741,316 @@ async fn start_without_execute_readiness_is_412_and_nothing_starts() {
     state.config().write().await.agents.reviewer = AgentConfig::default();
     let (status, body) = start(&state).await;
     assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
-    assert_eq!(body, json!({"error": "prereq_missing", "missing": ["agent_reviewer"], "code": "prereq_missing", "params": {"count": 1}}));
+    assert_eq!(body, json!({"error": "prereq_missing", "missing": ["agent_reviewer"], "code": "prereq_missing", "params": {"count": 1}, "action": "open_setup"}));
     assert!(rec.compose_calls().is_empty());
     assert!(!state.apps().is_running(PROJECT));
+}
+
+// ---------- Modo pelo comportamento (spec 130 T02) ----------
+
+/// Projeto docker com `run_command` e o `ps --all` dado.
+fn finished_state(tag: &str, ps: &str) -> (AppState, Arc<Rec>, PathBuf) {
+    let rec = Rec::with_ports();
+    *rec.ps_output.lock().expect("lock") = format!("{ps}\n");
+    let root = root_with(tag, "COMPLETED", &run_cmd("python -m ledger report data/sample.csv"));
+    (state_rec(&root, &rec), rec, root)
+}
+
+/// Um CLI que roda e sai com 0 não é falha: "terminou", com o código, a saída redigida e o que
+/// foi gravado fora de `/work`; o container encerrado fica (sem `down`) até subir de novo.
+#[tokio::test]
+async fn cli_that_exits_zero_is_finished_not_a_failure() {
+    let (state, rec, _root) = finished_state("m-zero", &ps_workspace("exited", 0));
+    *rec.logs_output.lock().expect("lock") = Some(format!("Saldo: 42\nchave={SECRET}\n"));
+    *rec.diff_output.lock().expect("lock") =
+        "C /tmp\nA /tmp/cache.db\nC /work\nA /work/out.csv\nD /etc/motd\nC /usr\nC /usr/sbin\nA /usr/sbin/docker-init\nA /root/.config\n".into();
+    let mut rx = state.events().subscribe();
+    let (status, view) = start(&state).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["state"], "exited");
+    assert_eq!(view["mode"], "finished");
+    assert_eq!(view["exit_code"], 0);
+    let finished = &view["finished"];
+    let output = finished["output"].as_str().expect("saída");
+    assert!(output.contains("Saldo: 42"), "{output}");
+    assert!(!output.contains(SECRET), "saída redigida: {output}");
+    // Só onde o app gravou: sem as pastas ancestrais e sem o init que o Docker injeta.
+    assert_eq!(finished["outside_work"], json!(["/root/.config", "/tmp/cache.db"]));
+    assert_eq!(finished["outside_work_total"], 2);
+    assert!(rec.calls.lock().expect("lock").iter().any(|a| a == &["diff", "nants-proj-app-run-workspace-1"]));
+    let logs_call = ["logs", "--no-color", "--no-log-prefix", "--tail", "400", "workspace"];
+    assert!(rec.compose_calls().iter().any(|(_, a)| a == &logs_call), "{:?}", rec.compose_calls());
+    assert!(rec.compose_calls().iter().all(|(_, a)| a[0] != "down"), "o container encerrado fica");
+    assert!(!state.apps().is_running(PROJECT), "terminou não é app vivo");
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|(t, p)| t == "app_started" && p["mode"] == "finished"), "{events:?}");
+    assert!(
+        events.iter().any(|(t, p)| t == "app_exited" && p["code"] == 0 && p["reason"] == "exited" && p["mode"] == "finished"),
+        "{events:?}"
+    );
+    // O estado relido continua "terminou" (sem nova sonda nem evento).
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    let again: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(again["mode"], "finished");
+    assert!(!text.contains(SECRET));
+    assert!(drain(&mut rx).is_empty());
+    // Subir de novo derruba o container encerrado antes, sem repetir o `app_exited`.
+    let (status, _) = start(&state).await;
+    assert_eq!(status, StatusCode::OK);
+    let calls = rec.compose_calls();
+    let down = calls.iter().position(|(_, a)| a[0] == "down").expect("down antes de subir de novo");
+    assert!(calls.iter().skip(down).any(|(_, a)| a[0] == "up"), "{calls:?}");
+    let events = drain(&mut rx);
+    assert_eq!(events.iter().filter(|(t, _)| t == "app_exited").count(), 1, "{events:?}");
+    // Fechar (parar) um "terminou" derruba o container sem novo `app_exited`.
+    assert_eq!(stop(&state).await["state"], "stopped");
+    assert!(!state.apps().is_docker_running(PROJECT));
+    assert!(drain(&mut rx).iter().all(|(t, _)| t != "app_exited"));
+}
+
+#[tokio::test]
+async fn nonzero_exit_code_is_reported_as_finished() {
+    let (state, _rec, _root) = finished_state("m-code", &ps_workspace("exited", 2));
+    let mut rx = state.events().subscribe();
+    let (status, view) = start(&state).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["mode"], "finished");
+    assert_eq!(view["exit_code"], 2);
+    // Spec 130 T05: a janela mostra o comando que rodou ("$ ...").
+    assert_eq!(view["command"], "python -m ledger report data/sample.csv");
+    assert_eq!(view["finished"]["exit_code"], 2);
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|(t, p)| t == "app_exited" && p["code"] == 2), "{events:?}");
+}
+
+/// C-08 e C-10: o app vivo que sai depois vira "terminou" na consulta seguinte, com o código real
+/// e os arquivos criados ou mudados na pasta (inclusive ignorados), sem as pastas do Nants.
+#[tokio::test]
+async fn running_app_that_exits_turns_finished_with_code_and_files() {
+    let rec = Rec::with_ports();
+    let root = root_with("m-files", "COMPLETED", &run_cmd("python -m worker"));
+    fs::write(root.join(".gitignore"), "out/\n").expect("w");
+    fs::write(root.join("data.csv"), "a\n").expect("w");
+    let state = state_rec(&root, &rec);
+    let mut rx = state.events().subscribe();
+    let (status, view) = start(&state).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["mode"], "running");
+    // O programa grava e sai.
+    fs::create_dir_all(root.join("out")).expect("d");
+    fs::write(root.join("out/report.txt"), "pronto").expect("w");
+    fs::write(root.join("data.csv"), "a\nb\n").expect("w");
+    fs::write(root.join(".nants-home/.cache-x"), "x").expect("w");
+    fs::write(root.join(".sdd/extra.md"), "x").expect("w");
+    *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 0));
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    let now: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(now["state"], "exited", "{now}");
+    assert_eq!(now["mode"], "finished");
+    assert_eq!(now["exit_code"], 0);
+    assert_eq!(
+        now["finished"]["files"],
+        json!([{"path": "data.csv", "change": "changed"}, {"path": "out/report.txt", "change": "added"}]),
+        "{now}"
+    );
+    assert_eq!(now["finished"]["files_total"], 2);
+    assert_eq!(now["finished"]["files_truncated"], false);
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|(t, p)| t == "app_mode_changed" && p["mode"] == "finished" && p["previous"] == "running" && p["exit_code"] == 0),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|(t, p)| t == "app_exited" && p["code"] == 0 && p["mode"] == "finished"), "{events:?}");
+}
+
+/// C-08: `running` vira `page` quando uma porta passa a responder HTTP.
+#[tokio::test]
+async fn running_app_turns_page_when_a_port_answers() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let rec = rec_with_port(port);
+    let root = root_with("m-page", "COMPLETED", &run_cmd("npm run dev"));
+    let state = state_rec(&root, &rec);
+    let mut rx = state.events().subscribe();
+    let (status, view) = start(&state).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["mode"], "running", "{view}");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("rebind");
+    let _app = fake_app_on(listener, Some(""));
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    let now: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(now["mode"], "page", "{now}");
+    assert_eq!(now["state"], "running");
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|(t, p)| t == "app_mode_changed" && p["mode"] == "page" && p["previous"] == "running"), "{events:?}");
+    stop(&state).await;
+}
+
+/// C-08: a sondagem leve leva o app vivo a "terminou" sem ninguém consultar.
+#[tokio::test]
+async fn light_watch_detects_the_exit_without_a_query() {
+    let rec = Rec::with_ports();
+    let root = root_with("m-watch", "COMPLETED", &run_cmd("python -m worker"));
+    let state = state_rec(&root, &rec).with_app_watch_interval(Duration::from_millis(30));
+    let mut rx = state.events().subscribe();
+    assert_eq!(start(&state).await.0, StatusCode::OK);
+    *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 7));
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(ev) if ev.event_type() == "app_exited" => return ev.payload.clone(),
+                Ok(_) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .expect("app_exited pela sondagem");
+    assert_eq!(got["code"], 7);
+    assert_eq!(got["mode"], "finished");
+    assert!(!state.apps().is_running(PROJECT));
+    stop(&state).await;
+}
+
+/// Parar durante a sondagem: o container sai (143) no meio do `down`, mas a consulta e a sondagem
+/// desse intervalo não viram "terminou"; sai um único `app_exited` com o motivo da parada.
+#[tokio::test]
+async fn stopping_is_never_turned_into_finished_by_the_watch_or_a_query() {
+    let rec = Rec::with_ports();
+    let root = root_with("m-stopping", "COMPLETED", &run_cmd("python -m worker"));
+    let state = state_rec(&root, &rec).with_app_watch_interval(Duration::from_millis(30));
+    let mut rx = state.events().subscribe();
+    assert_eq!(start(&state).await.0, StatusCode::OK);
+    *rec.delay_sub.lock().expect("lock") = Some(("down".into(), Duration::from_millis(400)));
+    let stopper = {
+        let state = state.clone();
+        tokio::spawn(async move { state.apps().stop(PROJECT, REASON_STOPPED).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 143));
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    let during: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(during["mode"], "running", "{during}");
+    assert!(during["finished"].is_null(), "{during}");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    stopper.await.expect("parou");
+    assert!(!state.apps().is_docker_running(PROJECT));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events = drain(&mut rx);
+    let exited: Vec<_> = events.iter().filter(|(t, _)| t == "app_exited").collect();
+    assert_eq!(exited.len(), 1, "{events:?}");
+    assert_eq!(exited[0].1["reason"], "stopped");
+    assert!(exited[0].1["code"].is_null(), "{events:?}");
+    assert!(events.iter().all(|(t, _)| t != "app_mode_changed"), "{events:?}");
+}
+
+/// `down` que falha desfaz a marca de parada: o app segue registrado e volta a ser observado.
+#[tokio::test]
+async fn failed_down_clears_the_stopping_mark() {
+    let rec = Rec::with_ports();
+    let root = root_with("m-downfail", "COMPLETED", &run_cmd("python -m worker"));
+    let state = state_rec(&root, &rec);
+    assert_eq!(start(&state).await.0, StatusCode::OK);
+    *rec.fail_sub.lock().expect("lock") = Some("down".into());
+    state.apps().stop(PROJECT, REASON_STOPPED).await;
+    assert!(state.apps().is_running(PROJECT));
+    *rec.fail_sub.lock().expect("lock") = None;
+    *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 1));
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    let now: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(now["mode"], "finished", "{now}");
+    assert_eq!(now["exit_code"], 1);
+}
+
+/// Diff grande (cache de ferramenta): o filtro dos ancestrais é rápido e não confunde irmãos
+/// (`/a-b`, `/a.txt`) com descendentes.
+#[test]
+fn outside_leaves_is_fast_and_exact() {
+    let got = outside_leaves(
+        ["/a", "/a-b", "/a.txt", "/a/c", "/usr", "/usr/sbin", "/usr/sbin/docker-init", "/x", "/a/c"].map(String::from).to_vec(),
+    );
+    assert_eq!(got, ["/a/c", "/a-b", "/a.txt", "/x"]);
+    let mut many: Vec<String> = Vec::new();
+    for i in 0..300 {
+        many.push(format!("/root/.cache/pkg{i}"));
+        for j in 0..200 {
+            many.push(format!("/root/.cache/pkg{i}/f{j}"));
+        }
+    }
+    many.push("/root".into());
+    many.push("/root/.cache".into());
+    let started = std::time::Instant::now();
+    let leaves = outside_leaves(many);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(leaves.len(), 300 * 200);
+}
+
+/// Teste real (spec 130 T02): os três modos com o Docker de verdade, numa pasta temporária, com o
+/// rótulo `nants.project` e tudo removido no fim. Imagem por `NANTS_TEST_RUN_IMAGE` (padrão
+/// `alpine:3`); a página usa `python3 -m http.server` ou o `httpd` do busybox, o que houver.
+/// Rodar: `NANTS_TEST_REAL_DOCKER=1 scripts/test.sh cargo test --lib real_app_modes -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn real_app_modes_by_behavior() {
+    use crate::harness::compose::{ComposeEnv, ComposeKind};
+    let image = env::var("NANTS_TEST_RUN_IMAGE").unwrap_or_else(|_| "alpine:3".into());
+    let cases = [
+        ("finished", "mkdir -p out && echo resultado > out/r.txt && echo pronto-130 && exit 0", None),
+        ("running", "while true; do echo tick-130; sleep 1; done", None),
+        (
+            "page",
+            "if command -v python3 >/dev/null; then exec python3 -m http.server 8080; else exec httpd -f -p 8080 -h /work; fi",
+            Some("    ports:\n      - \"127.0.0.1::8080\"\n"),
+        ),
+    ];
+    for (expected, command, ports) in cases {
+        let root = plain_root(&format!("real-{expected}"), "COMPLETED", "");
+        fs::create_dir_all(root.join(".nants")).expect("nants");
+        let compose = format!("services:\n  workspace:\n    image: {image}\n{}", ports.unwrap_or(""));
+        fs::write(root.join(".nants/compose.yaml"), compose).expect("compose");
+        let id = format!("itest130{expected}{}", process::id());
+        let env = ComposeEnv::real(id.clone()).with_kind(ComposeKind::Run);
+        let env = Arc::new(env.with_approved_hashes(vec![crate::sdd::environment::env_hash(&root).expect("hash")]));
+        let events = crate::server::events::EventBus::new();
+        let mut rx = events.subscribe();
+        let apps = AppManager::new(events).with_watch_interval(Duration::ZERO);
+        let view = apps.launch_docker(&id, &root, SPEC, Arc::clone(&env), command, 3000).await;
+        let logs = apps.docker_logs(&id).await.unwrap_or_default();
+        apps.stop(&id, REASON_STOPPED).await;
+        let _ = env.down_with(&root, true);
+        let view = view.expect("subiu");
+        eprintln!("[{expected}] mode={} exit_code={} finished={}", view["mode"], view["exit_code"], view["finished"]);
+        assert_eq!(view["mode"], expected, "{view}");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|(t, p)| t == "app_started" && p["mode"] == expected), "{events:?}");
+        match expected {
+            "finished" => {
+                assert_eq!(view["exit_code"], 0);
+                assert!(view["finished"]["output"].as_str().unwrap_or("").contains("pronto-130"), "{view}");
+                assert_eq!(view["finished"]["files"], json!([{"path": "out/r.txt", "change": "added"}]), "{view}");
+                assert!(!view["finished"]["outside_work"].to_string().contains("docker-init"), "{view}");
+            }
+            "running" => assert!(logs.contains("tick-130"), "{logs}"),
+            _ => assert!(view["ports"][0]["published"].as_u64().is_some_and(|p| p > 0), "{view}"),
+        }
+        assert!(!apps.is_docker_running(&id));
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// Spec 130 T05: o comando mostrado pela janela sai redigido.
+#[tokio::test]
+async fn app_view_command_is_redacted() {
+    let rec = Rec::with_ports();
+    *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 0));
+    let root = root_with("m-cmd-secret", "COMPLETED", &run_cmd(&format!("python -m app --token {SECRET}")));
+    let state = state_rec(&root, &rec);
+    let (status, view) = start(&state).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let command = view["command"].as_str().expect("comando");
+    assert!(command.starts_with("python -m app --token"), "{command}");
+    assert!(!command.contains(SECRET), "{command}");
+    let (_, text) = call(&state, req(Method::GET, &uri(""), "")).await;
+    assert!(!text.contains(SECRET), "{text}");
 }

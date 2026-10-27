@@ -40,7 +40,8 @@ and you decide at every step.
 3. **You approve.** Nothing is written until you approve the plan.
 4. **The Developer builds and the Reviewer checks.** Each task is built in an isolated worktree,
    tested and reviewed; only approved work reaches your project.
-5. **Run the app.** The Architect writes a final report and Nants runs the result so you can try it.
+5. **Run the app.** The Architect writes a final report and Nants runs the result so you can try it,
+   whatever kind of program it is: a web app, a service, a command line tool or a script.
 
 <p align="center">
   <img src="docs/images/conversation-en.webp" width="640" alt="The Architect asking questions with suggested answers">
@@ -51,7 +52,14 @@ and you decide at every step.
 - **Agents with roles.** Architect, Developer and Reviewer work from a specification with
   acceptance criteria, and every task runs in an isolated Git worktree.
 - **Docker for every project.** Tests, checks and the running app live in containers, with
-  nothing installed on your system and no `sudo`.
+  nothing installed on your system and no `sudo`. Each command runs in a fresh container, and the
+  home folder lives inside the task folder (`.nants-home/`, with `~/.local/bin` on the `PATH`), so
+  whatever a tool installs there is still there for the next command, in any language. It stays
+  out of Git, of the formatters and of the task's files, starts empty in the final clean run
+  (only the download cache is kept) and goes away with the task folder. Before the first task of
+  a spec, Nants runs the install command once and lists what it wrote outside the project folder;
+  if that goes past a small limit, the conversation, the spec and every Developer briefing get a
+  warning with the main paths, since those files are lost between commands.
 - **Review findings with a history.** Each Reviewer finding keeps its id from one review to the
   next and shows as new, still open (for how many reviews) or resolved, and the Developer gets the
   oldest open ones first. Before delivering, the Developer answers each one: fixed, test added or
@@ -101,11 +109,39 @@ and you decide at every step.
   always installs from scratch, and the evidence says how the install went.
 - **Browser testing.** The generated app is opened in a real browser, with screenshots that you
   and the Reviewer can see.
+- **Any kind of project runs.** The App window follows what the program does, never the language
+  or framework. If it opens a web port, you see the page. If it keeps running without a page (a
+  worker, a service, an API with no screen), you see the live log, the port and a stop button. If
+  it runs and ends (a command line tool, a script, a job), you see the command, the exit code, the
+  output and the files it created or changed, each one with **Open** (in Files) and **Copy**. A
+  program that ends with code 0 is not a failure. For anything else there is the project
+  **Console**: you type a project command and it runs inside the approved `workspace` container,
+  one command at a time, after a confirmation, with no interactive input, a time limit, live output
+  and a local history. The window is never just an error: it shows the final report's "How to use"
+  and what was proven (tasks, final check and screenshots). When the environment does not start,
+  it shows the end of the log and **Ask the Architect to fix it**, which sends that diagnosis to
+  the Architect in the Conversation; any environment change still goes through your approval. An
+  app that cannot run in the sandbox (a native desktop window, a native mobile app) is declared in
+  the plan, and the window explains it and shows how to run it on your computer. See
+  [SECURITY.md](SECURITY.md#project-console) for the Console's protections.
 - **Visual quality.** Projects with an interface follow a short visual baseline (use of the desktop
   width, styled form controls, clear type and spacing, finished empty and error states, contrast,
   nothing cut off on mobile): the Architect adds it to the plan as a global criterion, the
   Developer checks its screenshots against it, and the Reviewer raises at most one consolidated
   visual finding per review.
+- **Questions to the Architect.** When the Developer asks the Architect something during a task,
+  the answer shows in the Conversation. If the Architect cannot answer (for example, the provider
+  refused the request), the Conversation shows the reason, and the task record notes it too.
+- **The project's language.** The labels the agents and Nants write in messages (criteria, met or
+  not met, findings, resolved, screenshots reviewed) follow the project's language. Older records,
+  in Portuguese or English, are still read.
+- **A project that runs without Nants.** The generated `.nants/compose.yaml` mounts the project
+  with `${NANTS_WORKTREE:-..}`, so from the project root
+  `docker compose -f .nants/compose.yaml run --rm workspace sh -lc '<command>'` works with no
+  Nants variable to export. Inside Nants, the full path of the task folder is always mounted. The
+  test command does not repeat the install command, which Nants already runs before it: when a
+  plan or a recovery proposes one that does, the Architect gets the rule right away and the run
+  shows a warning.
 - **Dropped connections.** If the connection to the provider drops before the Architect finishes a
   turn, the Conversation says so with a **Try again** button, and a plan left with no tasks shows
   as **Incomplete plan** on its card, with a button that asks the Architect to finish it.

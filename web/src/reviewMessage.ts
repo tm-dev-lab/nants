@@ -4,76 +4,107 @@
  * mostra (setas e marcas de critério): aqui eles são só texto de entrada, e a tela os troca por
  * ícones.
  *
- *   [Verificação final: N de M critérios atendidos\n\n]
- *   Aprovado|Pediu ajustes: resumo
- *   [\n\nApontamentos:\n- F-01 [MEDIUM] local: descrição (seta) recomendação]
- *   [\n  Cenário de falha: gatilho (seta) resultado errado]
- *   [\n\nObservações (não bloqueiam):\n- F-02 [LOW] local: descrição]
- *   [\n\nResolvidos:\n- F-03 [HIGH] local: descrição]
- *   [\n\nRespostas do Desenvolvedor:\n- F-01 [fixed] local | F-03 [contested, environment] motivo]
- *   [\n\nDecisões do Arquiteto:\n- F-03 [manual] título: motivo]
- *   [\n\nCapturas avaliadas: t01-1-a.png, t01-1-b.png]
- *   [\n\nCritérios:\n(marca) critério: evidência]
+ *   [<verificação final: N de M>\n\n]
+ *   <aprovado>|<pediu ajustes>: resumo
+ *   [\n\n<apontamentos>\n- F-01 [MEDIUM] local: descrição (seta) recomendação]
+ *   [\n  <cenário de falha> gatilho (seta) resultado errado]
+ *   [\n\n<observações>\n- F-02 [LOW] local: descrição]
+ *   [\n\n<resolvidos>\n- F-03 [HIGH] local: descrição]
+ *   [\n\n<respostas do Desenvolvedor>\n- F-01 [fixed] local | F-03 [contested, environment] motivo]
+ *   [\n\n<decisões do Arquiteto>\n- F-03 [manual] título: motivo]
+ *   [\n\n<capturas avaliadas> t01-1-a.png, t01-1-b.png]
+ *   [\n\n<critérios>:\n(marca) critério: evidência]
+ *
+ * Spec 129 T04: o servidor escreve as marcas no idioma do projeto (`runner.marker.*`). Aqui elas
+ * vêm das chaves `marker.*` do dicionário, e o parser aceita a forma de TODOS os idiomas (iterando
+ * `DICTIONARIES`), pela linha inteira e sem diferenciar maiúsculas: as mensagens já gravadas em pt
+ * continuam legíveis num projeto em inglês e vice-versa. A tela mostra os rótulos `review.*` no
+ * idioma ativo.
  *
  * Desde a 095/T08 o separador é ": " (sem travessão). As mensagens gravadas antes usam o
  * travessão entre espaços, e o parser aceita os dois.
  */
-const CRITERIA_HEADER = "Critérios:";
-/*
- * Marcas do formato gravado pelo servidor (sempre em pt-BR): só servem para ler a mensagem; a tela
- * mostra os rótulos do dicionário no idioma ativo.
- */
-const FINDINGS_HEADER = "Apontamentos:";
-const OBSERVATIONS_HEADER = "Observações (não bloqueiam):";
-/** Linha recuada do cenário de falha (`runner::SCENARIO_PREFIX`), logo abaixo do finding. */
-const SCENARIO_PREFIX = "Cenário de falha:";
+import { DICTIONARIES, type MessageKey } from "./i18n";
+
+/** Formas da marca em todos os idiomas do dicionário, sem repetição. */
+export function markerForms(key: MessageKey): string[] {
+  const out: string[] = [];
+  for (const dictionary of Object.values(DICTIONARIES)) {
+    const form = dictionary[key];
+    if (!out.includes(form)) out.push(form);
+  }
+  return out;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Alternativas (escapadas) das formas da marca, com `suffix` em cada uma. */
+function alternatives(key: MessageKey, suffix = ""): string {
+  return markerForms(key)
+    .map((form) => escapeRegExp(form + suffix))
+    .join("|");
+}
+
+/** Linha inteira de uma marca de seção, depois de uma linha em branco: `\n\n<marca>\n`. */
+function sectionMark(key: MessageKey, suffix = ""): RegExp {
+  return new RegExp(`\\n\\n(?:${alternatives(key, suffix)})\\n`, "i");
+}
+
+/** Igualdade sem diferenciar maiúsculas com alguma forma da marca. */
+function isForm(text: string, key: MessageKey): boolean {
+  const lower = text.toLowerCase();
+  return markerForms(key).some((form) => form.toLowerCase() === lower);
+}
+
+/** Molde do dicionário (`... {met} ... {total} ...`) como expressão, com cada parâmetro em `(\d+)`. */
+function templateRegExp(template: string): RegExp {
+  const source = escapeRegExp(template).replace(/\\\{[a-z]+\\\}/gi, "(\\d+)");
+  return new RegExp(`^${source}$`, "i");
+}
+
+const CRITERIA_MARK = sectionMark("marker.criteria", ":");
+/** Cabeçalhos das seções da mensagem, na ordem de `ReviewMessage` (cada um em linha própria). */
+const SECTION_MARKS: readonly RegExp[] = [
+  sectionMark("marker.findings"),
+  sectionMark("marker.observations"),
+  sectionMark("marker.resolved"),
+  sectionMark("marker.responses"),
+  sectionMark("marker.decisions"),
+];
+/** Linha recuada do cenário de falha, logo abaixo do finding. */
+const SCENARIO_MARK = new RegExp(`^  (?:${alternatives("marker.scenario")}) `, "i");
+/** Linha das capturas vistas pelo Revisor, a última antes dos critérios. */
+const CAPTURES_MARK = new RegExp(`\\n\\n(?:${alternatives("marker.captures")}) `, "gi");
 /**
- * Rótulo, junto da severidade, da observação rebaixada porque o arquivo não mudou desde a revisão
- * anterior (`runner::UNCHANGED_FILE_LABEL`, spec 092 T04): `[MEDIUM, observação (arquivo não mudou nesta rodada)]`.
+ * Marcas junto da severidade, depois de ", ": observação rebaixada porque o arquivo não mudou
+ * (spec 092 T04), baixa confiança (spec 087 T05) e os estados `novo` e `aberto há N revisões`
+ * (spec 124 T01). A tela mostra `review.unchangedFile`, `review.lowConfidence`, `review.stateNew`
+ * e `review.stateOpen` no idioma ativo.
  */
-const UNCHANGED_FILE_LABEL = "observação (arquivo não mudou nesta rodada)";
-/**
- * Rótulo, junto da severidade, do finding de baixa confiança (`runner::LOW_CONFIDENCE_LABEL`, spec
- * 087 T05): `[HIGH, baixa confiança]`. A tela mostra `review.lowConfidence` no idioma ativo (spec 115 T03).
- */
-const LOW_CONFIDENCE_LABEL = "baixa confiança";
-/**
- * Spec 124 T01: marcas de estado junto da severidade (`runner::STATE_NEW_LABEL` e
- * `runner::STATE_OPEN_PREFIX`): `[HIGH, novo]` e `[HIGH, aberto há 3 revisões]`. A tela mostra
- * `review.stateNew` e `review.stateOpen` no idioma ativo.
- */
-const STATE_NEW_LABEL = "novo";
-const STATE_OPEN_MARK = /, aberto há (\d+) revis(?:ão|ões)/;
-/** Seção dos apontamentos anteriores resolvidos nesta revisão (`runner::RESOLVED_HEADER`). */
-const RESOLVED_HEADER = "Resolvidos:";
-/**
- * Spec 124 T02: respostas do Desenvolvedor por apontamento (`finding_reply::RESPONSES_HEADER`) e
- * decisões do Arquiteto sobre as contestações (`finding_reply::DECISIONS_HEADER`). Os tipos entre
- * colchetes são códigos (`fixed`, `contested, environment`, `manual`); a tela mostra o dicionário.
- */
-const RESPONSES_HEADER = "Respostas do Desenvolvedor:";
-const DECISIONS_HEADER = "Decisões do Arquiteto:";
-/** Linha das capturas vistas pelo Revisor (`runner::CAPTURES_HEADER`), última antes dos critérios. */
-const CAPTURES_HEADER = "Capturas avaliadas:";
+const UNCHANGED_FILE_MARK = new RegExp(`, (?:${alternatives("marker.unchanged_file")})(?=,|$)`, "i");
+const LOW_CONFIDENCE_MARK = new RegExp(`, (?:${alternatives("marker.low_confidence")})(?=,|$)`, "i");
+const STATE_OPEN_MARKS: readonly RegExp[] = [...markerForms("marker.state_open.other"), ...markerForms("marker.state_open.one")].map(
+  (template) => new RegExp(`, ${templateRegExp(template).source.slice(1, -1)}(?=,|$)`, "i"),
+);
 /** Nome de captura servido por `/captures/:name` (`sdd::screenshots::copy_name`). */
 const CAPTURE_NAME = /^[a-z0-9_-][a-z0-9._-]{0,119}$/;
 const CAPTURE_EXT = /\.(png|jpe?g)$/;
-/** Vereditos do formato gravado (marcas de leitura; a tela usa `review.approved`/`review.changes`). */
-const VERDICT_APPROVED_LABEL = "Aprovado";
-const VERDICT_CHANGES_LABEL = "Pediu ajustes";
-const FINAL_VERIFICATION_PREFIX = "Verificação final:";
 /** Separador atual (095/T08) e o antigo, com travessão (U+2014), das mensagens já gravadas. */
 const SEPARATOR = ": ";
-const LEGACY_SEPARATOR = " \u2014 ";
+const LEGACY_SEPARATOR = " — ";
 
-/** "Verificação final: N de M critérios atendidos" (linha do servidor) em números, ou `null`. */
-const FINAL_COUNTS = /^Verificação final: (\d+) de (\d+) critérios atendidos$/;
+/** Linha da verificação final (`marker.final_verification`) em qualquer idioma. */
+const FINAL_COUNTS: readonly RegExp[] = markerForms("marker.final_verification").map(templateRegExp);
 
 /** Contagem da linha da verificação final que precede o veredito (para exibir no idioma ativo). */
 export function finalVerificationCounts(prefix: string): { met: number; total: number } | null {
-  const match = FINAL_COUNTS.exec(prefix.trim());
-  if (match === null) return null;
-  return { met: Number(match[1]), total: Number(match[2]) };
+  for (const pattern of FINAL_COUNTS) {
+    const match = pattern.exec(prefix.trim());
+    if (match !== null) return { met: Number(match[1]), total: Number(match[2]) };
+  }
+  return null;
 }
 
 export interface ChecklistItem {
@@ -83,17 +114,16 @@ export interface ChecklistItem {
 
 /** Separa o resumo do checklist; `null` quando a mensagem não traz matriz. */
 export function splitChecklist(text: string): { summary: string; items: ChecklistItem[] } | null {
-  const marker = `\n\n${CRITERIA_HEADER}\n`;
-  const at = text.indexOf(marker);
-  if (at < 0) return null;
+  const found = CRITERIA_MARK.exec(text);
+  if (found === null) return null;
   const items: ChecklistItem[] = [];
-  for (const line of text.slice(at + marker.length).split("\n")) {
+  for (const line of text.slice(found.index + found[0].length).split("\n")) {
     const mark = line[0];
     if (mark !== "✓" && mark !== "✗") continue;
     items.push({ met: mark === "✓", text: line.slice(1).trim() });
   }
   if (items.length === 0) return null;
-  return { summary: text.slice(0, at), items };
+  return { summary: text.slice(0, found.index), items };
 }
 
 export type ReviewVerdict = "approved" | "changes";
@@ -137,7 +167,7 @@ export interface ReviewDecision {
 }
 
 export interface ReviewMessage {
-  /** Linha "Verificação final: N de M critérios atendidos" que precede o veredito, quando houver. */
+  /** Linha da verificação final ("N de M critérios atendidos") que precede o veredito, quando houver. */
   prefix: string;
   /** `null` em mensagens antigas (sem veredito na primeira linha). */
   verdict: ReviewVerdict | null;
@@ -151,7 +181,7 @@ export interface ReviewMessage {
   /** Spec 124 T02: decisões do Arquiteto sobre contestações; vazio sem a seção. */
   decisions: ReviewDecision[];
   items: ChecklistItem[];
-  /** Nomes das capturas avaliadas (linha `Capturas avaliadas:`), na ordem; vazio sem a linha. */
+  /** Nomes das capturas avaliadas (linha das capturas), na ordem; vazio sem a linha. */
   captures: string[];
 }
 
@@ -161,14 +191,16 @@ function isCaptureName(name: string): boolean {
 }
 
 /**
- * Tira a linha `Capturas avaliadas: a, b` do fim de `head` (ela vem por último, antes dos
- * critérios). Só reconhece a linha final, para um resumo que cite o rótulo não ser cortado.
+ * Tira a linha das capturas (`<capturas avaliadas> a, b`, em qualquer idioma) do fim de `head`
+ * (ela vem por último, antes dos critérios). Só reconhece a linha final, para um resumo que cite o
+ * rótulo não ser cortado.
  */
 export function splitCaptures(head: string): { rest: string; captures: string[] } {
-  const marker = `\n\n${CAPTURES_HEADER} `;
-  const at = head.lastIndexOf(marker);
-  if (at < 0) return { rest: head, captures: [] };
-  const line = head.slice(at + marker.length).trimEnd();
+  let last: RegExpExecArray | null = null;
+  for (const match of head.matchAll(CAPTURES_MARK)) last = match as RegExpExecArray;
+  if (last === null) return { rest: head, captures: [] };
+  const at = last.index;
+  const line = head.slice(at + last[0].length).trimEnd();
   if (line.includes("\n")) return { rest: head, captures: [] };
   const captures = line.split(", ").map((n) => n.trim()).filter(isCaptureName);
   return { rest: head.slice(0, at), captures };
@@ -193,18 +225,19 @@ function parseFindingLine(line: string): ReviewFinding {
   const { location, tail } = splitLocation(head[3] ?? "");
   const arrow = tail.indexOf(" → ");
   const rawSeverity = head[2] ?? "";
-  const unchangedMark = `, ${UNCHANGED_FILE_LABEL}`;
-  const lowMark = `, ${LOW_CONFIDENCE_LABEL}`;
   // Os rótulos podem vir juntos (`, observação (...), baixa confiança`): tira cada um, onde estiver.
-  const unchangedFile = rawSeverity.includes(unchangedMark);
-  const lowConfidence = rawSeverity.includes(lowMark);
-  const openMatch = STATE_OPEN_MARK.exec(rawSeverity);
+  const unchangedFile = UNCHANGED_FILE_MARK.test(rawSeverity);
+  const lowConfidence = LOW_CONFIDENCE_MARK.test(rawSeverity);
+  const openPattern = STATE_OPEN_MARKS.find((pattern) => pattern.test(rawSeverity));
+  const openMatch = openPattern === undefined ? null : openPattern.exec(rawSeverity);
   // Depois da severidade, as marcas vêm separadas por ", "; "novo" é uma delas.
-  const parts = rawSeverity.replace(unchangedMark, "").replace(lowMark, "").replace(STATE_OPEN_MARK, "").split(", ");
-  const isNew = parts.slice(1).includes(STATE_NEW_LABEL);
+  let rest = rawSeverity.replace(UNCHANGED_FILE_MARK, "").replace(LOW_CONFIDENCE_MARK, "");
+  if (openPattern !== undefined) rest = rest.replace(openPattern, "");
+  const parts = rest.split(", ");
+  const isNew = parts.slice(1).some((p) => isForm(p, "marker.state_new"));
   const finding: ReviewFinding = {
     id: head[1] ?? "",
-    severity: parts.filter((p, i) => i === 0 || p !== STATE_NEW_LABEL).join(", "),
+    severity: parts.filter((p, i) => i === 0 || !isForm(p, "marker.state_new")).join(", "),
     location,
     description: arrow < 0 ? tail : tail.slice(0, arrow),
     recommendation: arrow < 0 ? "" : tail.slice(arrow + 3),
@@ -222,15 +255,15 @@ function parseFindingLine(line: string): ReviewFinding {
 
 function parseFindingList(body: string): ReviewFinding[] {
   const out: ReviewFinding[] = [];
-  const scenarioMark = `  ${SCENARIO_PREFIX} `;
   for (const line of body.split("\n")) {
     if (line.startsWith("- ")) {
       out.push(parseFindingLine(line.slice(2).trim()));
       continue;
     }
     const last = out[out.length - 1];
-    if (last !== undefined && line.startsWith(scenarioMark)) {
-      const scenario = line.slice(scenarioMark.length).trim();
+    const scenarioMark = SCENARIO_MARK.exec(line);
+    if (last !== undefined && scenarioMark !== null) {
+      const scenario = line.slice(scenarioMark[0].length).trim();
       if (scenario !== "") last.scenario = scenario;
     }
   }
@@ -262,17 +295,18 @@ function parseDecisions(body: string): ReviewDecision[] {
 
 function parseVerdictHead(head: string): { prefix: string; verdict: ReviewVerdict; rest: string } | null {
   const candidates: [string, ReviewVerdict][] = [
-    [VERDICT_APPROVED_LABEL, "approved"],
-    [VERDICT_CHANGES_LABEL, "changes"],
+    ...markerForms("marker.verdict_approved").map((label): [string, ReviewVerdict] => [label, "approved"]),
+    ...markerForms("marker.verdict_changes").map((label): [string, ReviewVerdict] => [label, "changes"]),
   ];
+  const lower = head.toLowerCase();
   for (const [label, verdict] of candidates) {
     for (const separator of [SEPARATOR, LEGACY_SEPARATOR]) {
-      const start = `${label}${separator}`;
-      if (head.startsWith(start)) return { prefix: "", verdict, rest: head.slice(start.length) };
-      const at = head.indexOf(`\n\n${start}`);
+      const start = `${label}${separator}`.toLowerCase();
+      if (lower.startsWith(start)) return { prefix: "", verdict, rest: head.slice(start.length) };
+      const at = lower.indexOf(`\n\n${start}`);
       if (at < 0) continue;
       const prefix = head.slice(0, at).trim();
-      if (!prefix.startsWith(FINAL_VERIFICATION_PREFIX) || prefix.includes("\n")) continue;
+      if (finalVerificationCounts(prefix) === null) continue;
       return { prefix, verdict, rest: head.slice(at + 2 + start.length) };
     }
   }
@@ -284,8 +318,8 @@ function parseVerdictHead(head: string): { prefix: string; verdict: ReviewVerdic
  * (texto comum, renderizado como qualquer mensagem de agente).
  */
 export function parseReviewMessage(text: string): ReviewMessage | null {
-  const marker = `\n\n${CRITERIA_HEADER}\n`;
-  const at = text.indexOf(marker);
+  const criteria = CRITERIA_MARK.exec(text);
+  const at = criteria === null ? -1 : criteria.index;
   const items = at < 0 ? [] : (splitChecklist(text)?.items ?? []);
   const { rest: head, captures } = splitCaptures(at < 0 ? text : text.slice(0, at));
   const parsed = parseVerdictHead(head);
@@ -294,15 +328,15 @@ export function parseReviewMessage(text: string): ReviewMessage | null {
     return { prefix: "", verdict: null, summary: head, findings: [], observations: [], resolved: [], responses: [], decisions: [], items, captures };
   }
   // Cada seção vai do seu cabeçalho até o próximo cabeçalho encontrado (em qualquer ordem).
-  const marks = [FINDINGS_HEADER, OBSERVATIONS_HEADER, RESOLVED_HEADER, RESPONSES_HEADER, DECISIONS_HEADER].map((h) => `\n\n${h}\n`);
-  const starts = marks.map((m) => parsed.rest.indexOf(m));
+  const matches = SECTION_MARKS.map((mark) => mark.exec(parsed.rest));
+  const starts = matches.map((m) => (m === null ? -1 : m.index));
   const found = starts.filter((n) => n >= 0);
   const summaryEnd = found.length === 0 ? parsed.rest.length : Math.min(...found);
   const bodyOf = (i: number): string => {
-    const at = starts[i] ?? -1;
-    if (at < 0) return "";
-    const next = found.filter((n) => n > at);
-    return parsed.rest.slice(at + (marks[i] ?? "").length, next.length === 0 ? undefined : Math.min(...next));
+    const match = matches[i] ?? null;
+    if (match === null) return "";
+    const next = found.filter((n) => n > match.index);
+    return parsed.rest.slice(match.index + match[0].length, next.length === 0 ? undefined : Math.min(...next));
   };
   const resolved = parseFindingList(bodyOf(2)).map((f): ReviewFinding => ({ ...f, state: "resolved" }));
   return {

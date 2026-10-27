@@ -268,6 +268,11 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.install.always", "Instalação: `{command}` rodou antes desta rodada (sem arquivos de trava, ela roda sempre) e passou."),
     ("runner.install.skipped", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde {since} ({locks})."),
     ("runner.install.skipped_no_date", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde a última instalação nesta pasta ({locks})."),
+    // Spec 129 T02: conferência da persistência da instalação, na seção do Arquiteto do spec.md.
+    ("runner.install_footprint.record.one", "Conferência da instalação na base (`{command}`, código {code}): {count} entrada gravada fora de /work, em {secs} s (limite do aviso: {limit})."),
+    ("runner.install_footprint.record.other", "Conferência da instalação na base (`{command}`, código {code}): {count} entradas gravadas fora de /work, em {secs} s (limite do aviso: {limit})."),
+    ("runner.install_footprint.warning", "A instalação gravou fora da pasta do projeto; isso se perde entre comandos. Caminhos principais: {paths}."),
+    ("runner.install_footprint.cleanup_failed", "O container da conferência ({name}) não foi removido: {error}"),
     ("runner.install.repeated", "Aviso: o {field} (`{command}`) começa com o install_command (`{install}`), que o Nants já roda antes dos testes, então a instalação se repete a cada rodada. O comando não foi alterado; tire a instalação do {field} em .sdd/settings.yaml."),
     ("runner.install.repeated_step", "Aviso: o {field} (`{command}`) começa com o install_command (`{install}`), que o Nants já roda antes da sessão do Desenvolvedor e de cada checagem, então a instalação se repete a cada execução. O comando não foi alterado; tire a instalação do {field} em .sdd/settings.yaml."),
     ("runner.tests.missing_program", "Diagnóstico: o comando saiu com o código {code}, que indica programa ausente ou não executável. É dependência ausente no ambiente, não defeito de código: não mude o código por causa disso; instale a dependência que falta ou ajuste o ambiente."),
@@ -288,6 +293,9 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("advisor.answer", "Resposta ao {who}: {answer}"),
     ("advisor.scope_added", "allowed_scope ampliado: {globs}"),
     ("advisor.criteria_rewritten", "Critérios de aceitação reescritos."),
+    // Spec 129 T03: a pergunta sem resposta mostra a falha, com o código do erro do provedor.
+    ("advisor.failed", "Não consegui responder: {reason}"),
+    ("advisor.stopped", "Não consegui responder: a execução foi parada."),
     // Levantamento da arquitetura: aviso de falha na conversa.
     ("survey.failed", "Não consegui concluir o levantamento da arquitetura ({code}). O projeto segue normalmente: ao planejar a primeira especificação com o Arquiteto na conversa, ele lê o código e cria o ARCHITECTURE.md junto com o plano."),
     // Rótulos da interface citados ao modelo (o mesmo texto do botão na interface).
@@ -300,7 +308,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.format.applied.other", "formatação automática: {count} arquivos ({names})"),
     ("runner.format.timed_out", "tempo esgotado"),
     ("runner.format.exit", "saída {code}: {output}"),
-    ("runner.format.readonly_nants", "o formatador {name} tentou alterar `{dir}`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`) pelo arquivo de ignorar da própria ferramenta ou com caminhos explícitos."),
+    ("runner.format.readonly_nants", "o formatador {name} tentou alterar `{dir}`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`, `.nants-home/`) pelo arquivo de ignorar da própria ferramenta ou com caminhos explícitos."),
     // Runner: motivos de bloqueio gravados em `next_action` (spec 114 T02), no idioma do projeto;
     // o código estável vai em `next_action_code` (ver `agents::runner::BLOCK_CODES`).
     ("runner.block.docker", "ambiente docker: {reason}"),
@@ -394,6 +402,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "AVISO: a verificação final ainda aponta critérios não atendidos após a rodada de correção; a spec será concluída assim mesmo.",
     ),
     ("system.final.fix_refused", "AVISO: tarefa de correção recusada; a spec será concluída com critérios não atendidos."),
+    ("system.install.outside_work", "Aviso: a instalação gravou fora da pasta do projeto; isso se perde entre comandos. Caminhos principais: {paths}."),
     ("system.final.fix_created", "Verificação final: criada a tarefa {task} ({title}) para os critérios não atendidos."),
     (
         "system.run.yolo_ignored",
@@ -401,6 +410,35 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ),
     // Runner: findings gerados e notas da convergência na mensagem do Revisor (spec 115 T03), no
     // idioma do projeto (o Desenvolvedor também lê, no corpo da tarefa).
+    // Spec 129 T04: marcadores estruturais das mensagens do Desenvolvedor e do Revisor, escritos no
+    // idioma do projeto; quem os lê aceita a forma de todos os idiomas (`i18n::forms`).
+    ("runner.marker.criteria", "Critérios"),
+    ("runner.marker.met", "atendido"),
+    ("runner.marker.not_met", "não atendido"),
+    ("runner.marker.dev_responses", "Respostas aos apontamentos"),
+    ("runner.marker.verdict_approved", "Aprovado"),
+    ("runner.marker.verdict_changes", "Pediu ajustes"),
+    ("runner.marker.findings", "Apontamentos:"),
+    ("runner.marker.observations", "Observações (não bloqueiam):"),
+    ("runner.marker.resolved", "Resolvidos:"),
+    ("runner.marker.responses", "Respostas do Desenvolvedor:"),
+    ("runner.marker.decisions", "Decisões do Arquiteto:"),
+    ("runner.marker.captures", "Capturas avaliadas:"),
+    ("runner.marker.scenario", "Cenário de falha:"),
+    ("runner.marker.low_confidence", "baixa confiança"),
+    ("runner.marker.unchanged_file", "observação (arquivo não mudou nesta rodada)"),
+    ("runner.marker.state_new", "novo"),
+    ("runner.marker.state_open.one", "aberto há {count} revisão"),
+    ("runner.marker.state_open.other", "aberto há {count} revisões"),
+    ("runner.marker.final_verification", "Verificação final: {met} de {total} critérios atendidos"),
+    ("runner.marker.human_check", "verificação humana, não bloqueia"),
+    ("runner.marker.unverified_step_limit", "não verificado (limite de passos)"),
+    ("runner.marker.step_limit", "Limite de passos atingido ({reason})."),
+    ("runner.step_limit.steps.one", "{count} passo"),
+    ("runner.step_limit.steps.other", "{count} passos"),
+    ("runner.step_limit.repeated", "sem progresso: chamada repetida"),
+    ("runner.step_limit.stalled", "sem progresso: repetição depois de 2/3 do limite"),
+    ("runner.step_limit.denials", "negações repetidas"),
     ("runner.review.unmet_location", "critérios de aceitação"),
     ("runner.review.unmet_description", "Critério não atendido: {criterion}. Evidência: {evidence}"),
     ("runner.review.no_evidence", "(nenhuma)"),
@@ -552,6 +590,12 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("serverError.app_confirm_required", "confirmação humana necessária para executar o sistema"),
     ("serverError.app_docker_down_failed", "não foi possível derrubar o ambiente Docker do projeto"),
     ("serverError.app_docker_up_failed", "não foi possível subir o ambiente Docker do projeto"),
+    ("serverError.app_exec_busy", "já há um comando rodando no Console deste projeto; espere o fim dele ou pare-o"),
+    ("serverError.app_exec_command_docker", "o Console já roda DENTRO do serviço workspace: não invoque docker, docker compose nem podman; escreva o comando interno (por exemplo: python -m app --help)"),
+    ("serverError.app_exec_command_invalid", "o comando precisa ter uma linha só, sem caracteres de controle, com até {max} caracteres"),
+    ("serverError.app_exec_docker_failed", "não foi possível rodar o comando no ambiente Docker do projeto"),
+    ("serverError.app_exec_timeout", "O comando passou de {seconds} s e foi encerrado. O Console não tem entrada: um programa que espera o que você escreve (uma pergunta, um REPL) não recebe nada aqui. Passe os dados por argumento ou por arquivo."),
+    ("serverError.app_fix_no_failure", "não há falha recente desta spec para o Arquiteto corrigir; inicie a execução de novo para ver o erro atual"),
     ("serverError.app_no_run_command", "A especificação não declara como executar"),
     ("serverError.app_port_in_use", "uma porta publicada pelo ambiente Docker já está em uso no host"),
     ("serverError.app_port_remapped", "porta {wanted} ocupada; usando {used}"),

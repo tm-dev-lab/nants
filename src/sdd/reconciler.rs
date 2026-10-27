@@ -336,6 +336,7 @@ mod tests {
                 screenshots: None,
                 references: None,
                 environment: None,
+                not_in_sandbox: None,
             },
             body: String::new(),
         }

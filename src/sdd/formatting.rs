@@ -17,18 +17,20 @@ pub fn select<'a>(formatters: &'a [Formatter], changed: &[String]) -> Vec<&'a Fo
         .collect()
 }
 
-/// `true` quando `path` cabe em `allowed_scope`. Nunca cabem `.git`, `.nants/**` (ambiente aprovado)
-/// nem `.sdd/**` (estado do Nants), mesmo com escopo largo.
+/// `true` quando `path` cabe em `allowed_scope`. Nunca cabem `.git`, `.nants/**` (ambiente aprovado),
+/// `.sdd/**` (estado do Nants) nem `.nants-home/**` (pasta pessoal do workspace, spec 129 T01),
+/// mesmo com escopo largo.
 pub fn in_scope(path: &str, scope: &[String]) -> bool {
     let first = path.split('/').next().unwrap_or_default();
-    if first == ".nants" || first == ".sdd" || path.split('/').any(|c| c == ".git") {
+    if first == ".nants" || first == ".sdd" || first == crate::harness::home::HOME_DIR || path.split('/').any(|c| c == ".git") {
         return false;
     }
     scope.iter().any(|glob| glob_match_path(glob, path))
 }
 
-/// Pastas do Nants que formatadores e linters nunca alteram (spec 127 T03).
-pub const NANTS_DIRS: [&str; 3] = [".nants/", ".nants-outputs/", ".sdd/"];
+/// Pastas do Nants que formatadores e linters nunca alteram (spec 127 T03; a pasta pessoal do
+/// workspace desde a spec 129 T01).
+pub const NANTS_DIRS: [&str; 4] = [".nants/", ".nants-outputs/", ".sdd/", ".nants-home/"];
 
 /// Spec 127 T03: a saída de um formatador que falhou mostra que ele tentou escrever numa pasta do
 /// Nants montada só para leitura (`read-only` ou `EROFS` e um caminho dentro de [`NANTS_DIRS`])?
@@ -196,6 +198,7 @@ mod tests {
         assert_eq!(readonly_nants_dir(test5), Some(".nants/"));
         assert_eq!(readonly_nants_dir("Read-only file system: /work/.nants-outputs/x.json"), Some(".nants-outputs/"));
         assert_eq!(readonly_nants_dir("cannot write .sdd/specs/a.md: read-only"), Some(".sdd/"));
+        assert_eq!(readonly_nants_dir("EROFS: read-only file system, open '/work/.nants-home/.cache/x'"), Some(".nants-home/"));
         // Sem o erro de escrita, ou o erro fora das pastas do Nants, nada.
         assert_eq!(readonly_nants_dir("[warn] .nants/compose.yaml\nexit 2"), None);
         assert_eq!(readonly_nants_dir("EROFS: read-only file system, open '/work/src/a.ts'"), None);
@@ -261,6 +264,7 @@ mod tests {
         assert!(in_scope("src/a.rs", &wide));
         assert!(!in_scope(".sdd/settings.yaml", &wide));
         assert!(!in_scope(".nants/compose.yaml", &wide));
+        assert!(!in_scope(".nants-home/.local/bin/tool", &wide));
         assert!(!in_scope("x/.git/config", &wide));
         assert!(!in_scope("docs/b.txt", &["src/**".to_string()]));
     }

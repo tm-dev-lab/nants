@@ -8,6 +8,7 @@ pub mod finding_reply;
 pub mod finding_track;
 pub mod llm_agents;
 pub mod llm_client;
+pub mod markers;
 pub mod plan_review;
 pub mod recovery_plan;
 pub mod prompts;

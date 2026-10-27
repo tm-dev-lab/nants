@@ -14,7 +14,7 @@ import { localized } from "../../i18n";
 import { useT } from "../../i18n/react";
 import { useShell } from "../../desktop/shellContext";
 import { parseEscalation, type EscalationContext } from "../../escalation";
-import { localizeAttempted, localizeRecoveryAnalysis, localizeRecoveryCause } from "../../recoveryAnalysis";
+import { isRecoveryAnalysis, localizeAttempted, localizeRecoveryAnalysis, localizeRecoveryCause } from "../../recoveryAnalysis";
 import { recoveryKey, useAppStore, type ChatMessage } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
@@ -42,7 +42,7 @@ function lastAnalysis(messages: readonly ChatMessage[] | undefined, specId: stri
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
     if (m !== undefined && m.role === "agent" && m.agent === "architect" && m.taskId === taskId && m.specId === specId) {
-      if (onlyRecovery && !m.text.startsWith("Análise de recuperação")) continue;
+      if (onlyRecovery && !isRecoveryAnalysis(m.text)) continue;
       return m.text;
     }
   }

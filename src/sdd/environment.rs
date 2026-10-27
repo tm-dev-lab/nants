@@ -17,6 +17,16 @@ pub const WORKSPACE_SERVICE: &str = "workspace";
 pub const MAX_ENV_FILE_BYTES: usize = 64 * 1024;
 /// Variável aceita como origem de bind mount (a worktree, resolvida pelo Nants na execução).
 pub const WORKTREE_VAR: &str = "NANTS_WORKTREE";
+/// Spec 129 T05: a variável sem valor padrão, como os projetos antigos a escrevem.
+const WORKTREE_BARE: &str = "${NANTS_WORKTREE}";
+/// Spec 129 T05: a origem do workspace com o valor padrão `..` (a raiz do projeto, relativa a
+/// `.nants/`, onde fica o compose). Fora do Nants, `docker compose -f .nants/compose.yaml …` na raiz
+/// funciona sem nenhuma variável; no Nants, o override sempre monta o caminho absoluto da worktree
+/// (C-14), e o ambiente do subprocesso também define a variável.
+pub const WORKTREE_SOURCE: &str = "${NANTS_WORKTREE:-..}";
+/// Recusa de qualquer outra forma da variável (outro padrão, `-` sem `:`, `:?`).
+const WORKTREE_FORM_MSG: &str = "compose.yaml: a origem da worktree é `${NANTS_WORKTREE:-..}` (o padrão `..` é a raiz do \
+     projeto, relativa a .nants/compose.yaml); outra forma de ${NANTS_WORKTREE…} não é aceita";
 
 /// Caminho de arquivo de ambiente gravável pelo Arquiteto: `.nants/compose.yaml` ou
 /// `.nants/Dockerfile*` (nome simples, sem subpasta).
@@ -31,6 +41,39 @@ pub fn is_env_file(rel: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Spec 129 T05: arquivo de ambiente novo (escrito pelo Arquiteto no plano, numa mudança de
+/// ambiente ou numa opção de recuperação) já ajustado e validado. No `compose.yaml`, toda
+/// `${NANTS_WORKTREE}` sem valor padrão vira `${NANTS_WORKTREE:-..}`: o projeto entregue roda pelo
+/// README sem nenhuma variável do Nants. Os projetos antigos não são migrados (a validação de
+/// sempre, [`validate_env_file`], ainda aceita a forma sem padrão).
+pub fn prepare_env_file(rel: &str, content: &str) -> Result<String, String> {
+    let adjusted = if rel == COMPOSE_REL { with_worktree_default(content) } else { content.to_string() };
+    validate_env_file(rel, &adjusted)?;
+    Ok(adjusted)
+}
+
+/// Troca cada `${NANTS_WORKTREE}` (fora de `$$`, o cifrão literal) por [`WORKTREE_SOURCE`].
+pub fn with_worktree_default(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push_str("$$");
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix(WORKTREE_BARE) {
+            out.push_str(WORKTREE_SOURCE);
+            rest = after;
+        } else {
+            out.push('$');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Valida o conteúdo de um arquivo de ambiente. Mensagens sem eco do conteúdo (só nomes de chave
@@ -157,8 +200,12 @@ pub fn validate_compose(text: &str) -> Check {
     if text.contains("docker.sock") {
         return Err("compose.yaml não pode expor o docker.sock".into());
     }
-    // Interpolação herdaria o ambiente do host (segredos): só `$$` (escape) e `${NANTS_WORKTREE}`.
-    let probe = text.replace("$$", "").replace("${NANTS_WORKTREE}", "");
+    // Interpolação herdaria o ambiente do host (segredos): só `$$` (escape), `${NANTS_WORKTREE}` e
+    // `${NANTS_WORKTREE:-..}` (spec 129 T05).
+    let probe = text.replace("$$", "").replace(WORKTREE_SOURCE, "").replace(WORKTREE_BARE, "");
+    if probe.contains("${NANTS_WORKTREE") {
+        return Err(WORKTREE_FORM_MSG.into());
+    }
     if probe.contains('$') {
         return Err("compose.yaml não pode interpolar variáveis ($); use $$ para um cifrão literal".into());
     }
@@ -369,11 +416,9 @@ fn check_volume(service: &str, vol: &Value, declared: &[String]) -> Check {
     let ctx = format!("serviço `{service}`");
     match vol {
         Value::String(s) => {
-            let mut parts = s.split(':');
-            let source = parts.next().unwrap_or("");
-            if parts.next().is_none() {
+            let Some((source, _)) = split_short_volume(s) else {
                 return Err(format!("compose.yaml: volume anônimo não permitido no {ctx}"));
-            }
+            };
             check_source(source, declared)
         }
         Value::Mapping(m) => {
@@ -399,6 +444,14 @@ fn check_volume(service: &str, vol: &Value, declared: &[String]) -> Check {
     }
 }
 
+/// Sintaxe curta `origem:destino[:modo]` em (origem, resto); a origem `${…}` pode ter `:` dentro
+/// (`${NANTS_WORKTREE:-..}`). `None` sem destino (volume anônimo).
+fn split_short_volume(s: &str) -> Option<(&str, &str)> {
+    let skip = if s.trim_start().starts_with("${") { s.find('}').map_or(0, |i| i + 1) } else { 0 };
+    let at = skip + s[skip..].find(':')?;
+    Some((&s[..at], &s[at + 1..]))
+}
+
 /// Origem na sintaxe curta: bind relativo dentro do projeto ou volume nomeado declarado.
 fn check_source(source: &str, declared: &[String]) -> Check {
     let is_path = source.starts_with('.') || source.contains('/') || source.contains('$') || source.starts_with('~');
@@ -414,18 +467,24 @@ fn check_source(source: &str, declared: &[String]) -> Check {
 const BIND_MSG: &str = "bind mount fora do diretório do projeto no compose.yaml";
 
 /// Origem de bind: relativa ao projeto (o compose fica em `.nants/`, então `..` é a raiz) ou
-/// `${NANTS_WORKTREE}[/sub]`.
+/// `${NANTS_WORKTREE}[/sub]` e `${NANTS_WORKTREE:-..}[/sub]`.
 fn walk_source(source: &str) -> Check {
     let s = source.trim();
     if s.is_empty() || s.starts_with('/') || s.starts_with('~') || s.contains('\\') {
         return Err(BIND_MSG.into());
     }
-    let s = match s.strip_prefix("${").and_then(|r| r.split_once('}')) {
-        Some((var, rest)) if var == WORKTREE_VAR => rest.trim_start_matches('/'),
-        _ if s.contains('$') => return Err(BIND_MSG.into()),
-        _ => s,
-    };
-    walk(0, s).map(|_| ())
+    match s.strip_prefix("${").and_then(|r| r.split_once('}')) {
+        // Com a variável, o resto é relativo à RAIZ do projeto (profundidade -1): vazio ou `/sub`,
+        // e nunca sobe acima da raiz (spec 129 T05, F-01).
+        Some((var, rest)) if var == WORKTREE_VAR || var == "NANTS_WORKTREE:-.." => {
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return Err(BIND_MSG.into());
+            }
+            walk(-1, rest.trim_start_matches('/')).map(|_| ())
+        }
+        _ if s.contains('$') => Err(BIND_MSG.into()),
+        _ => walk(0, s).map(|_| ()),
+    }
 }
 
 /// Caminha por `path` a partir da profundidade `start` (relativa a `.nants/`); nunca pode ficar
@@ -876,6 +935,61 @@ mod tests {
     fn compose_accepts_escaped_dollar_and_worktree_bind() {
         let ok = "services:\n  workspace:\n    image: x\n    volumes:\n      - ${NANTS_WORKTREE}:/work\n    environment:\n      - A=1\n  db:\n    image: postgres:16\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U $$POSTGRES_USER\"]\n";
         assert_eq!(validate_compose(ok), Ok(()));
+    }
+
+    /// Spec 129 T05: a origem com o valor padrão `..` é aceita (curta e longa); a forma sem padrão
+    /// continua aceita (projetos antigos, sem migração); outra forma da variável é recusada com motivo.
+    #[test]
+    fn compose_accepts_worktree_default_and_refuses_other_forms() {
+        let short = |src: &str| format!("services:\n  workspace:\n    image: x\n    volumes:\n      - \"{src}:/work\"\n");
+        assert_eq!(validate_compose(&short("${NANTS_WORKTREE:-..}")), Ok(()));
+        assert_eq!(validate_compose(&short("${NANTS_WORKTREE:-..}/sub")), Ok(()));
+        assert_eq!(validate_compose(&short("${NANTS_WORKTREE}")), Ok(()), "sem padrão: projetos antigos");
+        let long = "services:\n  workspace:\n    image: x\n    volumes:\n      - type: bind\n        source: ${NANTS_WORKTREE:-..}\n        target: /work\n";
+        assert_eq!(validate_compose(long), Ok(()));
+        for other in ["${NANTS_WORKTREE:-/etc}", "${NANTS_WORKTREE:-.}", "${NANTS_WORKTREE-..}", "${NANTS_WORKTREE:?x}", "${NANTS_WORKTREE:-../..}"] {
+            let err = validate_compose(&short(other)).expect_err(other);
+            assert!(err.contains("${NANTS_WORKTREE:-..}"), "{other}: {err}");
+        }
+        let elsewhere = "services:\n  workspace:\n    image: x\n    environment:\n      K: ${NANTS_WORKTREE:-..}\n";
+        assert!(validate_compose(elsewhere).is_err(), "só na origem de bind");
+    }
+
+    /// Spec 129 T05 (F-01): com a variável, o resto é relativo à raiz do projeto e nunca sobe acima
+    /// dela, nas sintaxes curta e longa.
+    #[test]
+    fn worktree_source_never_climbs_above_the_project_root() {
+        let short = |src: &str| format!("services:\n  workspace:\n    image: x\n    volumes:\n      - \"{src}:/work\"\n");
+        let long = |src: &str| format!("services:\n  workspace:\n    image: x\n    volumes:\n      - type: bind\n        source: \"{src}\"\n        target: /work\n");
+        for bad in ["${NANTS_WORKTREE:-..}/..", "${NANTS_WORKTREE}/..", "${NANTS_WORKTREE:-..}../x", "${NANTS_WORKTREE}/a/../..", "${NANTS_WORKTREE}x"] {
+            assert!(validate_compose(&short(bad)).is_err(), "curta: {bad}");
+            assert!(validate_compose(&long(bad)).is_err(), "longa: {bad}");
+        }
+        for ok in ["${NANTS_WORKTREE:-..}", "${NANTS_WORKTREE:-..}/data", "${NANTS_WORKTREE}/sub/dir", "${NANTS_WORKTREE}/a/.."] {
+            assert_eq!(validate_compose(&short(ok)), Ok(()), "curta: {ok}");
+            assert_eq!(validate_compose(&long(ok)), Ok(()), "longa: {ok}");
+        }
+    }
+
+    /// Spec 129 T05: o arquivo novo ganha o valor padrão (fora de `$$`); o que já tem o padrão, o
+    /// Dockerfile e o compose sem a variável não mudam; o resultado passa na validação.
+    #[test]
+    fn prepare_env_file_adds_the_worktree_default() {
+        let bare = "services:\n  workspace:\n    image: x\n    volumes:\n      - \"${NANTS_WORKTREE}:/work\"\n      - ${NANTS_WORKTREE}/data:/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"echo $${NANTS_WORKTREE}\"]\n";
+        let out = prepare_env_file(COMPOSE_REL, bare).expect("ajusta");
+        assert!(out.contains("- \"${NANTS_WORKTREE:-..}:/work\"") && out.contains("- ${NANTS_WORKTREE:-..}/data:/data"), "{out}");
+        assert!(out.contains("echo $${NANTS_WORKTREE}"), "cifrão literal intacto: {out}");
+        assert!(!out.replace("$${NANTS_WORKTREE}", "").contains("${NANTS_WORKTREE}"), "{out}");
+        assert_eq!(prepare_env_file(COMPOSE_REL, &out).expect("idempotente"), out);
+        let plain = "services:\n  workspace:\n    image: x\n    volumes:\n      - ..:/work\n";
+        assert_eq!(prepare_env_file(COMPOSE_REL, plain).expect("sem variável"), plain);
+        assert_eq!(prepare_env_file(".nants/Dockerfile", "FROM x ${NANTS_WORKTREE}\n").expect("Dockerfile"), "FROM x ${NANTS_WORKTREE}\n");
+        assert!(prepare_env_file(COMPOSE_REL, "services:\n  workspace:\n    image: x\n    privileged: true\n").is_err());
+        assert!(prepare_env_file(COMPOSE_REL, &short_other()).is_err());
+    }
+
+    fn short_other() -> String {
+        "services:\n  workspace:\n    image: x\n    volumes:\n      - ${NANTS_WORKTREE:-/}:/work\n".to_string()
     }
 
     #[test]

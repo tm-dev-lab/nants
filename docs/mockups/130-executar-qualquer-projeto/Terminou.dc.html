@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Execução: terminou</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#C4B5FD}a:hover{color:#DDD6FE}
+</style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; background: #050508; padding: 20px; font-family: Inter, sans-serif; color: #F4F4F6">
+<div style="height: 100%; display: flex; flex-direction: column; background: #0D0D15; border-radius: 14px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.55)">
+<div style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #11111B">
+<span style="font-weight: 600; font-size: 14px">App</span>
+<span style="font-size: 13px; color: #AEAEB8">household-ledger</span>
+<span style="font-size: 12px; padding: 3px 10px; border-radius: 999px; background: rgba(134,239,172,0.12); color: #86EFAC">Terminou · código 0 · 1,8 s</span>
+<div style="flex-grow: 1"></div>
+<button style="font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.11); background: transparent; color: #F4F4F6">Abrir no Console</button>
+<button style="font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 8px; border: none; background: #7C3AED; color: #FFFFFF">Rodar de novo</button>
+</div>
+<div style="padding: 14px 16px 0; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #AEAEB8">$ ledger report --month 2026-09 --sample</div>
+<div style="display: flex; gap: 16px; flex-grow: 1; padding: 12px 16px 16px; min-height: 0">
+<div style="flex: 3 1 0; padding: 14px 16px; border-radius: 10px; background: #08080D; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7; color: #D4D4D8; overflow: hidden">
+<div>Imported 3 sample files (412 transactions, 9 duplicates skipped)</div>
+<div>Detected 6 internal transfers</div>
+<div>Uncategorized: 14 transactions</div>
+<div>Wrote reports/2026-09.md</div>
+<div>Wrote reports/2026-09.csv</div>
+</div>
+<div style="flex: 2 1 0; display: flex; flex-direction: column; gap: 10px">
+<span style="font-size: 12px; font-weight: 600; color: #AEAEB8; letter-spacing: 0.04em">ARQUIVOS CRIADOS OU MUDADOS</span>
+<div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; background: #151522">
+<span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: rgba(134,239,172,0.12); color: #86EFAC">novo</span>
+<span style="flex-grow: 1; font-family: 'JetBrains Mono', monospace; font-size: 12px">reports/2026-09.md</span>
+<a href="#" style="font-size: 12px">Abrir</a>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; background: #151522">
+<span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: rgba(134,239,172,0.12); color: #86EFAC">novo</span>
+<span style="flex-grow: 1; font-family: 'JetBrains Mono', monospace; font-size: 12px">reports/2026-09.csv</span>
+<a href="#" style="font-size: 12px">Abrir</a>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; background: #151522">
+<span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: rgba(252,211,77,0.12); color: #FCD34D">mudou</span>
+<span style="flex-grow: 1; font-family: 'JetBrains Mono', monospace; font-size: 12px">ledger.db</span>
+<span style="font-size: 12px; color: #AEAEB8">binário</span>
+</div>
+</div>
+</div>
+<div style="padding: 0 16px 14px; font-size: 12px; color: #AEAEB8">O programa rodou e terminou: sem erro, a janela mostra a saída e o que ele gerou.</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

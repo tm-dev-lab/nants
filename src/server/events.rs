@@ -75,8 +75,17 @@ pub enum EventType {
     RecoveryDecided,
     /// App de teste iniciado (`spec_id`, `url`).
     AppStarted,
-    /// App de teste encerrado (`code`, `reason`).
+    /// App de teste encerrado (`code`, `reason`, `mode`).
     AppExited,
+    /// O modo do app mudou (spec 130 T02: `spec_id`, `mode`, `previous`, `exit_code`).
+    AppModeChanged,
+    /// Console (spec 130 T03): comando iniciado (`exec_id`, `spec_id`, `command` redigido,
+    /// `started_at`, `origin`, `timeout_secs`).
+    AppExecStarted,
+    /// Console: pedaço da saída ao vivo (`exec_id`, `seq`, `text` redigido, `truncated`).
+    AppExecOutput,
+    /// Console: fim do comando (`exec_id`, `status`, `exit_code`, `files`, `notice`...).
+    AppExecFinished,
     /// Atividade ao vivo de um agente (efêmera: só no barramento, nunca em arquivo).
     AgentActivity,
     /// Turno do Arquiteto começou (`turn_id`, `user_text` redigido se não interno, `started_at`).
@@ -106,6 +115,10 @@ impl EventType {
             Self::RecoveryDecided => "recovery_decided",
             Self::AppStarted => "app_started",
             Self::AppExited => "app_exited",
+            Self::AppModeChanged => "app_mode_changed",
+            Self::AppExecStarted => "app_exec_started",
+            Self::AppExecOutput => "app_exec_output",
+            Self::AppExecFinished => "app_exec_finished",
             Self::AgentActivity => "agent_activity",
             Self::ChatTurnStarted => "chat_turn_started",
             Self::ChatTurnEnded => "chat_turn_ended",

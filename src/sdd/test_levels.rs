@@ -7,8 +7,8 @@
 //! - entram todos os arquivos que o Git veria, rastreados ou não (código, testes, configuração,
 //!   arquivos de trava, `.nants/` com o ambiente), com conteúdo, nome e modo (executável ou link);
 //! - ficam fora os caminhos ignorados pelo `.gitignore` do projeto (dependências instaladas e
-//!   artefatos de build), o `.sdd/` (estado do fluxo) e o `.nants-outputs/` (saídas longas das
-//!   ferramentas).
+//!   artefatos de build), o `.sdd/` (estado do fluxo), o `.nants-outputs/` (saídas longas das
+//!   ferramentas) e o `.nants-home/` (pasta pessoal do workspace, spec 129 T01).
 //!
 //! # Quando a rodada do Desenvolvedor dispensa a do runner
 //!
@@ -36,9 +36,10 @@ use sha2::{Digest, Sha256};
 
 use super::{Environment, Settings};
 use crate::harness::git::Git;
+use crate::harness::home;
 
 /// Caminhos fora do hash da árvore, além dos ignorados pelo `.gitignore`.
-pub const TREE_EXCLUDES: &[&str] = &[".sdd", ".nants-outputs"];
+pub const TREE_EXCLUDES: &[&str] = &[".sdd", ".nants-outputs", home::HOME_DIR];
 
 /// Rodadas guardadas no registro (as mais antigas saem).
 const LEDGER_MAX_RUNS: usize = 32;
@@ -254,10 +255,15 @@ pub fn remember_install(dir: &Path, key: &str, at: &str) {
     }
 }
 
-/// Esquece a instalação da pasta: a próxima rodada instala de novo (melhor esforço).
+/// Esquece a instalação da pasta: a próxima rodada instala de novo (melhor esforço). Spec 129 T01:
+/// a pasta pessoal persistente segue o estado da instalação e é apagada junto, menos o cache de
+/// download (na worktree e na base).
 pub fn forget_install(dir: &Path) {
     if let Some(path) = install_state_path(dir) {
         let _ = std::fs::remove_file(path);
+    }
+    if let Err(e) = home::reset(dir) {
+        eprintln!("nants: pasta pessoal sem limpeza ({}): {}", home::HOME_DIR, e.kind());
     }
 }
 
@@ -273,29 +279,35 @@ pub fn install_needed(settings: &Settings, command: &str, dir: &Path) -> bool {
 /// os formatadores e as checagens (`formatters[<nome>].command`, `checks[<nome>].command`). Vazio
 /// sem `install_command`. Cada item é (campo, comando).
 pub fn repeated_install(settings: &Settings) -> Vec<(String, String)> {
-    let Some(install) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+    let mut fields = vec![("test_command".to_string(), settings.test_command.clone())];
+    if let Some(full) = &settings.full_test_command {
+        fields.push(("full_test_command".to_string(), full.clone()));
+    }
+    fields.extend(settings.formatters.iter().map(|f| (format!("formatters[{}].command", f.name), f.command.clone())));
+    fields.extend(settings.checks.iter().map(|c| (format!("checks[{}].command", c.name), c.command.clone())));
+    repeated_install_in(settings.install_command.as_deref(), fields)
+}
+
+/// Spec 129 T05: a regra de [`repeated_install`] sobre campos avulsos (`campo`, `comando`), para o
+/// plano (frontmatter do spec.md) e para a recuperação (REVISE_CONFIG). Vazio sem `install`.
+pub fn repeated_install_in(install: Option<&str>, fields: Vec<(String, String)>) -> Vec<(String, String)> {
+    let Some(install) = install.map(str::trim).filter(|c| !c.is_empty()) else {
         return Vec::new();
     };
-    let starts_with_install = |command: &str| {
-        command
-            .trim()
-            .strip_prefix(install)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || "&;|".contains(c)))
-    };
-    let mut out = Vec::new();
-    if starts_with_install(&settings.test_command) {
-        out.push(("test_command".to_string(), settings.test_command.trim().to_string()));
-    }
-    if let Some(full) = settings.full_test_command.as_deref().filter(|f| starts_with_install(f)) {
-        out.push(("full_test_command".to_string(), full.trim().to_string()));
-    }
-    for f in settings.formatters.iter().filter(|f| starts_with_install(&f.command)) {
-        out.push((format!("formatters[{}].command", f.name), f.command.trim().to_string()));
-    }
-    for c in settings.checks.iter().filter(|c| starts_with_install(&c.command)) {
-        out.push((format!("checks[{}].command", c.name), c.command.trim().to_string()));
-    }
-    out
+    fields
+        .into_iter()
+        .filter(|(_, command)| starts_with_install(install, command))
+        .map(|(field, command)| (field, command.trim().to_string()))
+        .collect()
+}
+
+/// `command` começa com `install` (o mesmo texto, seguido de nada, de espaço ou de um operador do
+/// shell)?
+fn starts_with_install(install: &str, command: &str) -> bool {
+    command
+        .trim()
+        .strip_prefix(install)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || "&;|".contains(c)))
 }
 
 /// Spec 127 T03: o campo de [`repeated_install`] é de um comando de teste (e não de um formatador
@@ -431,6 +443,26 @@ mod tests {
         let no_locks = settings("test_command: \"make test\"\ninstall_command: \"make deps\"\n");
         remember_install(&dir, &install_key(&no_locks, "make deps", &dir), "2026-10-25T10:00:00Z");
         assert!(install_needed(&no_locks, "make deps", &dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Spec 129 T01: esquecer a instalação (rodada limpa, falha) apaga a pasta pessoal, menos o
+    /// cache de download; a próxima instalação começa do zero.
+    #[test]
+    fn forget_install_resets_the_personal_folder_but_keeps_the_download_cache() {
+        let dir = repo("home");
+        let h = home::ensure(&dir).expect("home");
+        fs::create_dir_all(h.join(".local/lib")).expect("mk");
+        fs::write(h.join(".local/lib/pkg"), "instalado").expect("w");
+        fs::create_dir_all(h.join(".cache")).expect("mk");
+        fs::write(h.join(".cache/pkg.tar"), "baixado").expect("w");
+        forget_install(&dir);
+        assert!(!h.join(".local").exists());
+        assert!(h.join(".cache/pkg.tar").exists());
+        // A pasta não entra no hash da árvore.
+        let t0 = tree_hash(&dir);
+        fs::write(h.join("novo"), "x").expect("w");
+        assert_eq!(tree_hash(&dir), t0);
         let _ = fs::remove_dir_all(&dir);
     }
 

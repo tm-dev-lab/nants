@@ -4,9 +4,11 @@ pub mod allowlist;
 pub mod browser;
 pub mod compose;
 pub mod git;
+pub mod home;
 pub mod progress;
 pub mod web;
 pub mod tools;
+pub mod tree_snapshot;
 
 use std::io;
 use std::string::FromUtf8Error;
