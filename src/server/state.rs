@@ -418,13 +418,16 @@ impl AppState {
             .insert(connection_id.to_string());
     }
 
-    /// A conexão do Arquiteto oferece busca nativa: `wire_api = responses` e sem rejeição registrada.
+    /// A conexão do Arquiteto oferece busca nativa: `wire_api = responses`, a Anthropic (spec 132
+    /// T05) ou o Gemini (`google_search`, T07), e sem rejeição registrada.
     pub async fn web_search_available(&self) -> bool {
         let connection_id = {
             let cfg = self.config.read().await;
             let agent = &cfg.agents.architect;
             let supports = cfg.connections.iter().any(|c| {
-                c.id == agent.connection_id && matches!(c.wire_api, crate::config::WireApi::Responses)
+                c.id == agent.connection_id
+                    && (matches!(c.wire_api, crate::config::WireApi::Responses)
+                        || c.kind.is_native())
             });
             supports.then(|| agent.connection_id.clone())
         };

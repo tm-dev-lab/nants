@@ -119,6 +119,7 @@ fn smoke_config() -> Config {
             api_key: SECRET_KEY.to_string(),
             wire_api: nants::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }],
         agents: Agents {
             architect: agent.clone(),

@@ -141,6 +141,25 @@ Known limits:
   insist. Devices already authorized keep working, and this computer can still sign in with the
   terminal link (restart Nants for a new one).
 
+## API keys (OpenAI compatible, Anthropic and Google Gemini)
+
+The Anthropic (Claude) and Google Gemini (AI Studio) connections keep their key exactly like the
+OpenAI compatible ones:
+
+- **Storage:** the key, or an `env:NAME` reference that is read from the environment when it is
+  used, is stored only in the configuration file (`~/.config/nants/config.toml`, mode 0600). It
+  never goes to the project, the workspace, logs, events or the browser, which only
+  sees a masked form.
+- **Where it goes:** only to the provider address of the connection: the official one
+  (`https://api.anthropic.com` in the `x-api-key` header, `https://generativelanguage.googleapis.com`
+  in the `x-goog-api-key` header) or the advanced address you set, for example a company proxy.
+  Changing the address of a saved connection requires typing the key again, so a saved key is
+  never sent to a new host.
+- **Test before saving:** **Test** sends the key from the browser to Nants once, in the request
+  body, to list the models; nothing is saved until **Save connection**.
+- **Errors:** provider errors become fixed codes (invalid key, no permission, rate limit, spend
+  limit, daily quota); the provider's text and the key never reach the screen.
+
 ## ChatGPT plan connection
 
 A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and has no API key:

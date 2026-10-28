@@ -211,6 +211,7 @@ async fn get_returns_page_shape_and_redacts_again() {
         api_key: SECRET.into(),
         wire_api: crate::config::WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let state = AppState::new(root.join("config.toml"), cfg, 3000);
 
@@ -256,6 +257,7 @@ async fn get_keeps_codes_and_reads_old_lines() {
         api_key: SECRET.into(),
         wire_api: crate::config::WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let state = AppState::new(root.join("config.toml"), cfg, 3000);
     let (st, body) = get(&state, &uri(PROJECT, SPEC, "?task=T01")).await;

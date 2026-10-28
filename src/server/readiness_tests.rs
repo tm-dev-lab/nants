@@ -65,6 +65,7 @@ fn ready_config() -> Config {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.agents.architect = agent("m-arq");
     cfg.agents.developer = agent("m-dev");
@@ -358,7 +359,7 @@ const ABSENT_VAR: &str = "NANTS_TEST_T12_READY_KEY_NEVER_SET";
 const LEAK_URL: &str = "https://segredo-host-t12.example.com/v1";
 
 fn conn(id: &str, name: &str, api_key: &str) -> Connection {
-    Connection { id: id.into(), name: name.into(), base_url: LEAK_URL.into(), api_key: api_key.into(), wire_api: WireApi::default(), kind: Default::default() }
+    Connection { id: id.into(), name: name.into(), base_url: LEAK_URL.into(), api_key: api_key.into(), wire_api: WireApi::default(), kind: Default::default(), base_url_override: None }
 }
 
 /// Três papéis prontos; o Arquiteto em `c1` e Developer/Revisor em `c2`, com as chaves dadas.
@@ -567,4 +568,24 @@ fn plan_connection_needs_login_not_key_nor_price() {
     let r = evaluate_with(&cfg, &items(true, true), &secrets(&cfg), &|id| id == "c1");
     assert!(r.chat.ok && r.execute.ok, "{:?} {:?}", r.chat, r.execute);
     assert!(!evaluate(&cfg, &items(true, true), &secrets(&cfg)).chat.ok);
+}
+
+/// Spec 132 T08: a conexão Anthropic ou Gemini com chave resolvível conta como pronta (endereço
+/// oficial ou avançado, sem `base_url` próprio); sem chave, a pendência é a da chave.
+#[test]
+fn native_connection_with_a_key_is_ready() {
+    use crate::config::ConnectionKind;
+    for kind in [ConnectionKind::Anthropic, ConnectionKind::GoogleGemini] {
+        let mut cfg = ready_config();
+        cfg.connections[0] = Connection::native("c1", "Nativa", kind, SECRET);
+        let r = evaluate(&cfg, &items(true, true), &secrets(&cfg));
+        assert!(r.chat.ok && r.create_project.ok && r.execute.ok, "{kind:?}: {r:?}");
+        cfg.connections[0].base_url_override = Some("https://proxy.example.com".into());
+        cfg.connections[0].normalize();
+        let r = evaluate(&cfg, &items(true, true), &secrets(&cfg));
+        assert!(r.chat.ok && r.execute.ok, "{kind:?} com o avançado: {r:?}");
+        cfg.connections[0].api_key = format!("env:{ABSENT_VAR}");
+        let r = evaluate(&cfg, &items(true, true), &secrets(&cfg));
+        assert_eq!(ids(&r.chat), ["connection_key:c1"], "{kind:?}");
+    }
 }

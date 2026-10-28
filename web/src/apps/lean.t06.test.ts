@@ -124,7 +124,7 @@ describe("celular: nada rola na horizontal a 390 px", () => {
     expect(tabs).toContain("min-width: 0;");
     const files = read("apps/files/files.css");
     expect(cssRuleBody(files, ".nd-files-segment")).toContain("flex-wrap: nowrap;");
-    expect(cssRuleBody(files, ".nd-segment-btn")).toContain("text-overflow: ellipsis;");
+    expect(cssRuleBody(read("desktop/theme/shell.css"), ".nd-segment-item > span")).toContain("text-overflow: ellipsis;");
     expect(cssRuleBody(read("desktop/theme/mobile.css"), '.nd-root[data-mobile="true"] .nd-window-tools')).toContain("overflow-x: auto;");
   });
 });

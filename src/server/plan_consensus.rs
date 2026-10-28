@@ -92,6 +92,22 @@ pub struct PlanDecision {
     pub reason_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Spec 131 T03: `accept` deduzido sem bloco, porque a tarefa citada mudou ou foi dividida no
+    /// turno ([`infer_adjusted`]). Vale como ajustado enquanto o ponto não volta na revisão seguinte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inferred: bool,
+}
+
+impl PlanDecision {
+    /// Apontamento sem decisão válida: continua em aberto.
+    pub fn open(id: String) -> Self {
+        Self { id, decision: DECISION_OPEN.to_string(), reason_kind: None, reason: None, inferred: false }
+    }
+
+    /// Ajuste deduzido pela mudança da tarefa citada (spec 131 T03).
+    pub fn inferred(id: String) -> Self {
+        Self { id, decision: DECISION_ACCEPT.to_string(), reason_kind: None, reason: None, inferred: true }
+    }
 }
 
 /// Uma rodada do ciclo: o turno do Arquiteto (vazio na rodada 0) seguido da revisão.
@@ -111,6 +127,9 @@ pub struct ConsensusRound {
     pub rejected: u32,
     #[serde(default)]
     pub unanswered: u32,
+    /// Aceitos por inferência (spec 131 T03), contados também em `accepted`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub inferred: u32,
     /// Taxa de aceite da rodada, em porcentagem; ausente sem decisão a tomar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept_rate: Option<u32>,
@@ -127,12 +146,18 @@ pub struct ConsensusRound {
     pub criteria: u32,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl ConsensusRound {
     fn tally(&mut self) {
         let count = |d: &str| u32::try_from(self.decisions.iter().filter(|x| x.decision == d).count()).unwrap_or(u32::MAX);
         self.accepted = count(DECISION_ACCEPT);
         self.rejected = count(DECISION_REJECT);
         self.unanswered = count(DECISION_OPEN);
+        self.inferred = u32::try_from(self.decisions.iter().filter(|x| x.inferred).count()).unwrap_or(u32::MAX);
         let total = self.accepted + self.rejected + self.unanswered;
         self.accept_rate = (total > 0).then(|| self.accepted.saturating_mul(100) / total);
     }
@@ -276,7 +301,7 @@ impl Cycle {
             .iter()
             .filter_map(|issue| issue.id.clone())
             .map(|id| {
-                parsed.get(&id).cloned().unwrap_or(PlanDecision { id, decision: DECISION_OPEN.to_string(), reason_kind: None, reason: None })
+                parsed.get(&id).cloned().unwrap_or_else(|| PlanDecision::open(id))
             })
             .collect();
         for decision in &decisions {
@@ -370,6 +395,27 @@ pub fn split_decisions(text: &str) -> (String, Option<String>) {
     (shown.trim_end().to_string(), last)
 }
 
+/// Corpo do último bloco ```` ```nants-plan-decisions ```` entre as mensagens do assistente no turno
+/// (spec 131 T03), na ordem em que foram ditas: o bloco pode vir numa mensagem intermediária (ex.: a
+/// que acompanhou a gravação, antes da continuação dos avisos do plano).
+pub fn decisions_in(texts: &[String]) -> Option<String> {
+    texts.iter().filter_map(|t| split_decisions(t).1).next_back()
+}
+
+/// Ponto ajustado por inferência (spec 131 T03, critério 2): sem decisão no bloco, um apontamento
+/// de tarefa conta como aceito quando a própria tarefa citada mudou no turno (`changed`, inclusive
+/// a que sumiu ou foi renomeada; dividir é alterar a original). Uma tarefa nova sozinha não basta
+/// (F-02). Se o ponto voltar na revisão seguinte, ele fica em aberto de novo.
+pub fn infer_adjusted(sent: &[PlanIssue], parsed: &HashMap<String, PlanDecision>, changed: &HashSet<String>) -> HashMap<String, PlanDecision> {
+    sent.iter()
+        .filter_map(|issue| {
+            let id = issue.id.clone()?;
+            let task = issue.task.as_deref()?;
+            (!parsed.contains_key(&id) && changed.contains(task)).then(|| (id.clone(), PlanDecision::inferred(id)))
+        })
+        .collect()
+}
+
 /// Decisões válidas do bloco (JSON `{"decisions":[{"id","decision","reason_kind","reason"}]}`),
 /// por id. Fica de fora (e o apontamento segue em aberto): id fora de `ids` ou repetido, decisão
 /// fora de `accept|reject`, `reason_kind` ausente ou fora do vocabulário, `other` ou `reject` sem
@@ -412,6 +458,7 @@ pub fn parse_decisions(body: &str, ids: &[String], secrets: &SecretSet) -> HashM
                 decision: decision.to_string(),
                 reason_kind: Some(kind.to_string()),
                 reason: (!reason.is_empty()).then_some(reason),
+                inferred: false,
             },
         );
     }
@@ -446,8 +493,13 @@ pub fn reviewer_memory(round: u32, previous: &[PlanIssue], cycle: &Cycle, change
     }
     for issue in previous {
         let point = issue.id.as_deref().and_then(|id| cycle.point(id));
+        let inferred = issue.id.as_deref().is_some_and(|id| {
+            cycle.rounds.iter().flat_map(|r| &r.decisions).rev().find(|d| d.id == id).is_some_and(|d| d.inferred)
+        });
         let position = if issue.disputed {
             "em disputa (o Arquiteto já recusou; o usuário decide)".to_string()
+        } else if inferred {
+            "accept (deduzido: a tarefa citada mudou no turno, sem resposta escrita)".to_string()
         } else {
             match point.and_then(|p| p.decision.as_deref()) {
                 Some(d) => d.to_string(),
@@ -607,7 +659,7 @@ mod tests {
     }
 
     fn decision(id: &str, d: &str, kind: &str, reason: &str) -> PlanDecision {
-        PlanDecision { id: id.into(), decision: d.into(), reason_kind: Some(kind.into()), reason: Some(reason.into()) }
+        PlanDecision { id: id.into(), decision: d.into(), reason_kind: Some(kind.into()), reason: Some(reason.into()), inferred: false }
     }
 
     #[test]
@@ -697,6 +749,49 @@ mod tests {
         let (shown, body) = split_decisions("A\n```nants-plan-decisions\n{\"a\":1}\n```\nB\n```nants-plan-decisions\n{\"b\":2}");
         assert_eq!(shown, "A\n\nB");
         assert_eq!(body.as_deref(), Some("{\"b\":2}"));
+    }
+
+    /// Spec 131 T03: o bloco vale em qualquer mensagem do turno; o último dito vence.
+    #[test]
+    fn decisions_are_found_in_any_message_of_the_turn() {
+        let block = |n: u32| format!("Texto.\n```nants-plan-decisions\n{{\"n\": {n}}}\n```");
+        let texts = vec![block(1), "Gravei.".to_string(), "Pronto.".to_string()];
+        assert_eq!(decisions_in(&texts).as_deref(), Some("{\"n\": 1}\n"), "na mensagem intermediária");
+        let texts = vec![block(1), block(2)];
+        assert_eq!(decisions_in(&texts).as_deref(), Some("{\"n\": 2}\n"), "o último vence");
+        assert_eq!(decisions_in(&["Sem bloco.".to_string()]), None);
+        assert_eq!(decisions_in(&[]), None);
+    }
+
+    /// Spec 131 T03: sem decisão, o ponto da tarefa que mudou conta como ajustado por inferência; o
+    /// ponto da spec, o decidido e o de tarefa intacta (mesmo `too_large` com tarefa nova), não.
+    #[test]
+    fn point_of_a_changed_task_is_inferred_as_adjusted() {
+        let mut cycle = Cycle::start(Vec::new(), 0, 0);
+        let sent = cycle.classify(vec![
+            item(Some("T01"), "scope", "Escopo curto.", None, false),
+            item(Some("T02"), "too_large", "Mistura servidor e cliente.", None, false),
+            item(Some("T03"), "untestable", "Critério vago.", None, false),
+            item(None, "uncovered_criterion", "G3 sem dono.", None, false),
+            item(Some("T01"), "contradiction", "Contradiz a spec.", None, false),
+        ]);
+        let parsed: HashMap<_, _> = [("P5".to_string(), decision("P5", DECISION_REJECT, "other", "Não contradiz."))].into_iter().collect();
+        let changed: HashSet<String> = ["T01".to_string()].into_iter().collect();
+        let mut keys: Vec<_> = infer_adjusted(&sent, &parsed, &changed).into_keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["P1"], "T02 e T03 intactas, spec sem tarefa, P5 decidido");
+        // A T02 dividida (alterada): o too_large dela conta.
+        let changed: HashSet<String> = ["T01".to_string(), "T02".to_string()].into_iter().collect();
+        let split = infer_adjusted(&sent, &parsed, &changed);
+        let mut keys: Vec<_> = split.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["P1", "P2"]);
+        assert!(split.values().all(|d| d.inferred && d.decision == DECISION_ACCEPT));
+        let mut all = parsed.clone();
+        all.extend(split);
+        cycle.record_decisions(1, &sent, &all);
+        let round = &cycle.rounds[0];
+        assert_eq!((round.accepted, round.inferred, round.rejected, round.unanswered), (2, 2, 1, 2));
     }
 
     #[test]

@@ -398,6 +398,7 @@ pub(crate) fn chat_ready(mut cfg: Config) -> Config {
                 api_key: "env:NANTS_TEST_READY_KEY_NEVER_SET".into(),
                 wire_api: crate::config::WireApi::default(),
                 kind: Default::default(),
+                base_url_override: None,
             });
         }
         cfg.agents.architect.connection_id = CONN.into();

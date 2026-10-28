@@ -3,19 +3,92 @@
 //! [`diff_lines`] descreve a diferença em linhas curtas ("T04 nova: <título>", "T02 removida",
 //! "T03: critérios alterados (2 novos, 1 removido)", "test_command alterado"…).
 //!
+//! Desde a spec 131 T06 cada linha é um [`ChangeLine`]: `code` + `params`, sem idioma. A web a
+//! traduz (`planChange.<code>`) e o servidor a escreve no idioma do projeto quando a cita ao modelo
+//! (`plan_review.change.<code>`).
+//!
 //! Só conteúdo conta: espaços, marcadores de lista, caixas `[ ]` e linhas em branco são
 //! normalizados, e listas de `depends_on`/`allowed_scope`/`covers` são comparadas sem ordem.
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
 use super::coverage::global_criteria;
 use super::{Spec, Task};
 use crate::agents::runner::{section_text, ACCEPTANCE};
+use crate::i18n::{tr, tr_plural, Lang};
 
-/// Máximo de linhas do resumo (incluindo a linha "…" quando há mais).
+/// Máximo de linhas do resumo (incluindo a de [`CODE_MORE`] quando há mais).
 pub const MAX_CHANGE_LINES: usize = 20;
-/// Marcador da última linha quando o resumo é cortado.
-pub const MORE_LINE: &str = "…";
+
+/// Códigos das linhas (a chave é `plan_review.change.<código>` no servidor e `planChange.<código>`
+/// na web).
+pub const CODE_SPEC_TITLE: &str = "spec_title";
+pub const CODE_TEST_COMMAND: &str = "test_command";
+pub const CODE_GLOBAL_CRITERIA: &str = "global_criteria";
+pub const CODE_TASK_REMOVED: &str = "task_removed";
+pub const CODE_TASK_NEW: &str = "task_new";
+pub const CODE_TASK_TITLE: &str = "task_title";
+pub const CODE_TASK_DEPENDS: &str = "task_depends";
+pub const CODE_TASK_SCOPE: &str = "task_scope";
+pub const CODE_TASK_CRITERIA: &str = "task_criteria";
+pub const CODE_TASK_COVERS: &str = "task_covers";
+/// Última linha quando o resumo é cortado.
+pub const CODE_MORE: &str = "more";
+/// Prefixo das chaves das linhas no dicionário do servidor.
+pub const CHANGE_KEY_PREFIX: &str = "plan_review.change.";
+
+/// Uma linha do resumo, neutra de idioma: `params` traz `id` (tarefa), `title` (tarefa nova) e, nas
+/// listas, `added` e `removed` (a contagem; os dois em zero = só reordenados).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeLine {
+    pub code: String,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+impl ChangeLine {
+    fn new(code: &str, params: &[(&str, Value)]) -> Self {
+        Self { code: code.to_string(), params: params.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect() }
+    }
+
+    fn task(code: &str, id: &str) -> Self {
+        Self::new(code, &[("id", Value::from(id))])
+    }
+
+    fn count(&self, name: &str) -> u64 {
+        self.params.get(name).and_then(Value::as_u64).unwrap_or(0)
+    }
+
+    /// Texto da linha no idioma (para o modelo e para os testes); a web monta o mesmo texto.
+    pub fn render(&self, lang: Lang) -> String {
+        let mut values: Vec<(String, String)> = self
+            .params
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Value::String(s) => Some((k.clone(), s.clone())),
+                Value::Number(n) => Some((k.clone(), n.to_string())),
+                _ => None,
+            })
+            .collect();
+        if self.code == CODE_GLOBAL_CRITERIA || self.code == CODE_TASK_CRITERIA {
+            let (added, removed) = (self.count("added"), self.count("removed"));
+            let mut parts = Vec::new();
+            if added > 0 {
+                parts.push(tr_plural(lang, &format!("{CHANGE_KEY_PREFIX}added"), added, &[]));
+            }
+            if removed > 0 {
+                parts.push(tr_plural(lang, &format!("{CHANGE_KEY_PREFIX}removed"), removed, &[]));
+            }
+            let delta = if parts.is_empty() { tr(lang, &format!("{CHANGE_KEY_PREFIX}reordered"), &[]) } else { parts.join(", ") };
+            values.push(("delta".to_string(), delta));
+        }
+        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        tr(lang, &format!("{CHANGE_KEY_PREFIX}{}", self.code), &pairs)
+    }
+}
 /// Tamanho máximo (em caracteres) do título citado em "Txx nova: <título>".
 pub const TITLE_CHARS: usize = 80;
 
@@ -115,23 +188,22 @@ fn added_removed(old: &[String], new: &[String]) -> (usize, usize) {
     (added, removed)
 }
 
-/// "2 novos, 1 removido" / "1 novo" / "reordenados" (mesmos itens, outra ordem).
-fn list_delta(old: &[String], new: &[String]) -> Option<String> {
+/// Contagem da mudança de uma lista (`added`, `removed`); `None` sem mudança. Os mesmos itens em
+/// outra ordem dão os dois em zero ("reordenados").
+fn list_delta(old: &[String], new: &[String]) -> Option<(usize, usize)> {
     if old == new {
         return None;
     }
-    let (added, removed) = added_removed(old, new);
-    let mut parts = Vec::new();
-    if added > 0 {
-        parts.push(format!("{added} {}", if added == 1 { "novo" } else { "novos" }));
+    Some(added_removed(old, new))
+}
+
+/// Linha de uma lista alterada, com a contagem.
+fn delta_line(code: &str, id: Option<&str>, (added, removed): (usize, usize)) -> ChangeLine {
+    let mut line = ChangeLine::new(code, &[("added", Value::from(added)), ("removed", Value::from(removed))]);
+    if let Some(id) = id {
+        line.params.insert("id".into(), Value::from(id));
     }
-    if removed > 0 {
-        parts.push(format!("{removed} {}", if removed == 1 { "removido" } else { "removidos" }));
-    }
-    if parts.is_empty() {
-        return Some("reordenados".to_string());
-    }
-    Some(parts.join(", "))
+    line
 }
 
 /// Título curto (já redigido pelo chamador; o corte vem depois).
@@ -145,17 +217,17 @@ fn short_title(title: &str) -> String {
 
 /// Linhas do que mudou de `old` para `new`, na ordem: spec (título, `test_command`, critérios
 /// globais), depois tarefas por id. Sem mudança de conteúdo, lista vazia. No máximo
-/// [`MAX_CHANGE_LINES`] linhas; se houver mais, a última é [`MORE_LINE`].
-pub fn diff_lines(old: &PlanSnapshot, new: &PlanSnapshot) -> Vec<String> {
+/// [`MAX_CHANGE_LINES`] linhas; se houver mais, a última é [`CODE_MORE`].
+pub fn diff_lines(old: &PlanSnapshot, new: &PlanSnapshot) -> Vec<ChangeLine> {
     let mut lines = Vec::new();
     if old.title != new.title {
-        lines.push("Título da spec alterado".to_string());
+        lines.push(ChangeLine::new(CODE_SPEC_TITLE, &[]));
     }
     if old.test_command != new.test_command {
-        lines.push("test_command alterado".to_string());
+        lines.push(ChangeLine::new(CODE_TEST_COMMAND, &[]));
     }
     if let Some(delta) = list_delta(&old.global_criteria, &new.global_criteria) {
-        lines.push(format!("Critérios globais: {delta}"));
+        lines.push(delta_line(CODE_GLOBAL_CRITERIA, None, delta));
     }
     let old_tasks: BTreeMap<&str, &TaskSnapshot> = old.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let new_tasks: BTreeMap<&str, &TaskSnapshot> = new.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
@@ -164,34 +236,34 @@ pub fn diff_lines(old: &PlanSnapshot, new: &PlanSnapshot) -> Vec<String> {
     ids.dedup();
     for id in ids {
         match (old_tasks.get(id), new_tasks.get(id)) {
-            (Some(_), None) => lines.push(format!("{id} removida")),
-            (None, Some(t)) => lines.push(format!("{id} nova: {}", short_title(&t.title))),
+            (Some(_), None) => lines.push(ChangeLine::task(CODE_TASK_REMOVED, id)),
+            (None, Some(t)) => lines.push(ChangeLine::new(CODE_TASK_NEW, &[("id", Value::from(id)), ("title", Value::from(short_title(&t.title)))])),
             (Some(a), Some(b)) => task_lines(id, a, b, &mut lines),
             (None, None) => {}
         }
     }
     if lines.len() > MAX_CHANGE_LINES {
         lines.truncate(MAX_CHANGE_LINES - 1);
-        lines.push(MORE_LINE.to_string());
+        lines.push(ChangeLine::new(CODE_MORE, &[]));
     }
     lines
 }
 
-fn task_lines(id: &str, a: &TaskSnapshot, b: &TaskSnapshot, lines: &mut Vec<String>) {
+fn task_lines(id: &str, a: &TaskSnapshot, b: &TaskSnapshot, lines: &mut Vec<ChangeLine>) {
     if a.title != b.title {
-        lines.push(format!("{id}: título alterado"));
+        lines.push(ChangeLine::task(CODE_TASK_TITLE, id));
     }
     if a.depends_on != b.depends_on {
-        lines.push(format!("{id}: dependências alteradas"));
+        lines.push(ChangeLine::task(CODE_TASK_DEPENDS, id));
     }
     if a.allowed_scope != b.allowed_scope {
-        lines.push(format!("{id}: escopo alterado"));
+        lines.push(ChangeLine::task(CODE_TASK_SCOPE, id));
     }
     if let Some(delta) = list_delta(&a.criteria, &b.criteria) {
-        lines.push(format!("{id}: critérios alterados ({delta})"));
+        lines.push(delta_line(CODE_TASK_CRITERIA, Some(id), delta));
     }
     if a.covers != b.covers {
-        lines.push(format!("{id}: cobertura alterada"));
+        lines.push(ChangeLine::task(CODE_TASK_COVERS, id));
     }
 }
 
@@ -208,6 +280,11 @@ mod tests {
             criteria: criteria.iter().map(|c| c.to_string()).collect(),
             covers: Vec::new(),
         }
+    }
+
+    /// Linhas em pt-BR (o texto de antes da spec 131 T06).
+    fn pt(old: &PlanSnapshot, new: &PlanSnapshot) -> Vec<String> {
+        diff_lines(old, new).iter().map(|l| l.render(Lang::PtBr)).collect()
     }
 
     fn plan(tasks: Vec<TaskSnapshot>) -> PlanSnapshot {
@@ -237,7 +314,7 @@ mod tests {
     fn new_and_removed_tasks() {
         let old = plan(vec![task("T01", "A", &[]), task("T02", "B", &[])]);
         let new = plan(vec![task("T01", "A", &[]), task("T04", "Nova tarefa", &[])]);
-        assert_eq!(diff_lines(&old, &new), vec!["T02 removida", "T04 nova: Nova tarefa"]);
+        assert_eq!(pt(&old, &new), vec!["T02 removida", "T04 nova: Nova tarefa"]);
     }
 
     #[test]
@@ -249,7 +326,7 @@ mod tests {
         t.covers = vec!["G1".into()];
         let new = plan(vec![t]);
         assert_eq!(
-            diff_lines(&old, &new),
+            pt(&old, &new),
             vec![
                 "T03: título alterado",
                 "T03: dependências alteradas",
@@ -264,7 +341,7 @@ mod tests {
     fn reordered_criteria_line() {
         let a = task("T01", "A", &["um", "dois"]);
         let b = task("T01", "A", &["dois", "um"]);
-        assert_eq!(diff_lines(&plan(vec![a]), &plan(vec![b])), vec!["T01: critérios alterados (reordenados)"]);
+        assert_eq!(pt(&plan(vec![a]), &plan(vec![b])), vec!["T01: critérios alterados (reordenados)"]);
     }
 
     #[test]
@@ -288,7 +365,7 @@ mod tests {
         new.test_command = Some("npm test".into());
         new.global_criteria.push("build verde".into());
         assert_eq!(
-            diff_lines(&old, &new),
+            pt(&old, &new),
             vec!["Título da spec alterado", "test_command alterado", "Critérios globais: 1 novo"]
         );
     }
@@ -299,16 +376,48 @@ mod tests {
         let new = plan((1..=30).map(|n| task(&format!("T{n:02}"), "x", &[])).collect());
         let lines = diff_lines(&old, &new);
         assert_eq!(lines.len(), MAX_CHANGE_LINES);
-        assert_eq!(lines.last().map(String::as_str), Some(MORE_LINE));
-        assert_eq!(lines[0], "T01 nova: x");
+        assert_eq!(lines.last().map(|l| l.code.as_str()), Some(CODE_MORE));
+        assert_eq!(lines.last().map(|l| l.render(Lang::En)).as_deref(), Some("and more changes beyond these"));
+        assert_eq!(lines[0].render(Lang::PtBr), "T01 nova: x");
         let exact = plan((1..=20).map(|n| task(&format!("T{n:02}"), "x", &[])).collect());
-        assert!(diff_lines(&old, &exact).iter().all(|l| l != MORE_LINE), "20 cabem sem corte");
+        assert!(diff_lines(&old, &exact).iter().all(|l| l.code != CODE_MORE), "20 cabem sem corte");
     }
 
     #[test]
     fn long_title_is_cut() {
         let new = plan(vec![task("T01", &"a".repeat(200), &[])]);
-        let line = &diff_lines(&plan(Vec::new()), &new)[0];
+        let line = &pt(&plan(Vec::new()), &new)[0];
         assert!(line.ends_with('…') && line.chars().count() < 100, "{line}");
+    }
+
+    /// Spec 131 T06: a linha sai neutra (`code` + `params`) e o texto segue o idioma pedido.
+    #[test]
+    fn lines_are_coded_and_render_in_both_languages() {
+        let old = plan(vec![task("T06", "A", &["um"]), task("T07", "B", &["um"])]);
+        let mut t07 = task("T07", "B", &[]);
+        t07.depends_on = vec!["T06".into()];
+        t07.allowed_scope = vec!["web/**".into()];
+        let new = plan(vec![task("T06", "A", &["um"]), t07, task("T08", "Executable launcher", &[])]);
+        let lines = diff_lines(&old, &new);
+        assert_eq!(lines[0].code, CODE_TASK_DEPENDS);
+        assert_eq!(lines[0].params["id"], "T07");
+        assert_eq!(lines[2].code, CODE_TASK_CRITERIA);
+        assert_eq!((lines[2].params["added"].as_u64(), lines[2].params["removed"].as_u64()), (Some(0), Some(1)));
+        let en: Vec<String> = lines.iter().map(|l| l.render(Lang::En)).collect();
+        assert_eq!(
+            en,
+            vec![
+                "T07: dependencies changed",
+                "T07: scope changed",
+                "T07: criteria changed (1 removed)",
+                "T08 new: Executable launcher",
+            ]
+        );
+        assert_eq!(
+            pt(&old, &new),
+            vec!["T07: dependências alteradas", "T07: escopo alterado", "T07: critérios alterados (1 removido)", "T08 nova: Executable launcher"]
+        );
+        let json = serde_json::to_string(&lines[0]).expect("json");
+        assert_eq!(serde_json::from_str::<ChangeLine>(&json).expect("ler"), lines[0]);
     }
 }

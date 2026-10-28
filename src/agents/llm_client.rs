@@ -17,9 +17,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::LlmError;
-use crate::config::{Connection, Effort, WireApi};
+use crate::config::{Connection, ConnectionKind, Effort, WireApi};
 use crate::i18n::Lang;
 
+pub mod anthropic;
+pub mod gemini;
 mod bad_reason;
 pub use bad_reason::{BadKind, BadReason, ProviderCode, THROTTLE_CODES};
 mod cut;
@@ -32,6 +34,8 @@ pub use image::{
 };
 mod plan;
 pub use plan::{Billing, PlanError, PlanFuture, PlanTokenError, PlanTokens, PLAN_FORBIDDEN_FIELDS, PLAN_UNSUPPORTED_TOOLS, PLAN_USAGE_URL};
+pub mod limit;
+pub use limit::ProviderLimit;
 mod pace;
 pub use pace::{pace_notice, pace_notice_secs, parse_reset, PaceClock, Pacer, Quota, PACE_MAX_WAIT, PACE_NOTICE_AFTER, PACE_WINDOW};
 
@@ -231,8 +235,13 @@ pub struct ChatRequest {
     /// Quando `true`, pede saída JSON (`response_format: json_object`).
     pub response_json: bool,
     /// Quando `true` em `wire_api = responses`, acrescenta a ferramenta hospedada `web_search`
-    /// (com fallback automático se o provedor a recusar). Ignorado em `chat`.
+    /// (com fallback automático se o provedor a recusar). Ignorado em `chat`. A Anthropic (spec 132
+    /// T05) e o Gemini (`google_search`, T07) também a atendem.
     pub web_search: bool,
+    /// Spec 132 T05: teto de buscas da ferramenta nesta chamada (`max_uses` da Anthropic), o que
+    /// resta do limite do interruptor de internet do Arquiteto (076). `None`: sem teto no pedido.
+    /// A OpenAI e o Gemini não têm o campo: o limite vale pela contagem do Arquiteto.
+    pub web_search_max_uses: Option<u32>,
     /// Spec 122 T05: `prompt_cache_key` do corpo em `wire_api = responses` (inclusive o plano),
     /// estável dentro de um histórico ([`crate::agents::usage::cache_key`]). Retirada uma vez se o
     /// provedor recusar o campo. Ignorada em `chat`.
@@ -255,12 +264,16 @@ pub struct Usage {
     pub cached: Option<u32>,
     /// Tokens de raciocínio (já contidos em `completion`), quando informado.
     pub reasoning: Option<u32>,
+    /// Tokens de entrada gravados no cache do provedor nesta chamada (já contidos em `prompt`),
+    /// quando informado (spec 132 T02: `cache_creation_input_tokens` da Anthropic). A OpenAI não
+    /// cobra a escrita e não informa: `None`.
+    pub cache_write: Option<u32>,
 }
 
 impl Usage {
     /// Uso sem detalhes de cache/reasoning.
     pub fn new(prompt: u32, completion: u32) -> Self {
-        Self { prompt, completion, cached: None, reasoning: None }
+        Self { prompt, completion, cached: None, reasoning: None, cache_write: None }
     }
 }
 
@@ -301,6 +314,9 @@ pub enum ProviderFailure {
     InvalidConfig,
     /// Falha do plano ChatGPT que pausa a execução (spec 116 T02).
     Plan(PlanError),
+    /// Limite do provedor que pausa a execução (spec 132 T09): o teto de gasto da Anthropic ou a
+    /// cota diária do Gemini.
+    Limit(ProviderLimit),
 }
 
 impl ProviderFailure {
@@ -402,6 +418,7 @@ impl fmt::Display for ProviderFailure {
             ProviderFailure::BadResponse(_) => f.write_str("provider_bad_response"),
             ProviderFailure::InvalidConfig => f.write_str("provider_invalid_config"),
             ProviderFailure::Plan(plan) => write!(f, "provider_{}", plan.as_str()),
+            ProviderFailure::Limit(limit) => write!(f, "provider_{}", limit.as_str()),
         }
     }
 }
@@ -420,8 +437,9 @@ pub fn provider_failure(err: &LlmError) -> ProviderFailure {
         LlmError::Parse(reason) => ProviderFailure::BadResponse(*reason),
         LlmError::Timeout => ProviderFailure::Timeout,
         LlmError::Transport(_) => ProviderFailure::ConnectFailed,
-        LlmError::Config(_) => ProviderFailure::InvalidConfig,
+        LlmError::Config(_) | LlmError::KindNotSupported(_) => ProviderFailure::InvalidConfig,
         LlmError::Plan(plan) => ProviderFailure::Plan(*plan),
+        LlmError::Limit(limit) => ProviderFailure::Limit(*limit),
     }
 }
 
@@ -467,8 +485,13 @@ impl From<LlmError> for Failed {
 fn is_transient(err: &LlmError) -> bool {
     match err {
         LlmError::Transport(_) | LlmError::Timeout => true,
-        LlmError::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
-        LlmError::Parse(_) | LlmError::Config(_) | LlmError::Plan(_) => false,
+        // 529: a Anthropic sobrecarregada (`overloaded_error`, spec 132 T03).
+        LlmError::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504 | 529),
+        LlmError::Parse(_)
+        | LlmError::Config(_)
+        | LlmError::Plan(_)
+        | LlmError::Limit(_)
+        | LlmError::KindNotSupported(_) => false,
     }
 }
 
@@ -509,7 +532,16 @@ fn http_date_secs(value: &str) -> Option<u64> {
     let year: u64 = year.parse().ok().filter(|y| *y >= 1970)?;
     let mut hms = time.split(':').map(|p| p.parse::<u64>().ok());
     let (h, m, sec) = (hms.next()??, hms.next()??, hms.next()??);
-    if hms.next().is_some() || h > 23 || m > 59 || sec > 60 {
+    if hms.next().is_some() {
+        return None;
+    }
+    civil_secs(year, month, day, h, m, sec)
+}
+
+/// Segundos desde a época Unix de uma data e hora UTC já separadas (ano de 1970 a 9999, mês de 1 a
+/// 12, dia de 1 a 31). Fora da faixa = `None`; nenhuma conta estoura.
+fn civil_secs(year: u64, month: u64, day: u64, h: u64, m: u64, sec: u64) -> Option<u64> {
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) || h > 23 || m > 59 || sec > 60 {
         return None;
     }
     // Dias desde a época (algoritmo `days_from_civil`, calendário gregoriano proléptico).
@@ -555,6 +587,8 @@ pub struct LlmClient {
     timeout: Duration,
     max_response_bytes: usize,
     wire_api: WireApi,
+    /// Tipo da conexão (spec 132 T02): decide os cabeçalhos de autenticação ([`auth_headers`]).
+    kind: ConnectionKind,
     /// Esperas antes de cada nova tentativa (uma por tentativa extra).
     retry_delays: Vec<Duration>,
     /// Esperas antes de cada nova tentativa quando o provedor está no limite (spec 089).
@@ -630,6 +664,7 @@ impl LlmClient {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: MAX_RESPONSE_BYTES,
             wire_api: WireApi::Chat,
+            kind: ConnectionKind::ApiKey,
             retry_delays: RETRY_DELAYS.to_vec(),
             throttle_delays: THROTTLE_DELAYS.to_vec(),
             retry_sleep: default_sleep(),
@@ -657,15 +692,30 @@ impl LlmClient {
         let api_key = conn
             .resolve_api_key()
             .map_err(|e| LlmError::Config(e.to_string()))?;
-        let client = Self::new(conn.base_url.clone(), api_key)?.with_wire_api(conn.wire_api);
+        // Spec 132: os nativos no endereço da conexão (o oficial ou o avançado): a Anthropic pela
+        // Messages API ([`anthropic`], T03) e o Google Gemini pela Interactions API ([`gemini`], T06).
+        let client = if conn.kind.is_native() {
+            Self::new(conn.endpoint(), api_key)?.with_kind(conn.kind)
+        } else {
+            Self::new(conn.base_url.clone(), api_key)?.with_wire_api(conn.wire_api)
+        };
         Ok(Self { pace: Some(PaceLink { pacer: Pacer::global(), conn: conn.id.clone() }), ..client })
     }
 
     /// Cliente da conexão pelo plano ChatGPT (spec 116 T02): Responses no modo plano, com o access
     /// token de `tokens` e o ritmo do processo para o par (id da conexão, modelo).
     pub fn from_plan_connection(conn: &Connection, tokens: Arc<dyn PlanTokens>) -> Result<Self, LlmError> {
-        let client = Self::new(conn.base_url.clone(), String::new())?.with_plan_tokens(tokens);
+        let client = Self::new(conn.base_url.clone(), String::new())?
+            .with_kind(ConnectionKind::ChatgptPlan)
+            .with_plan_tokens(tokens);
         Ok(Self { pace: Some(PaceLink { pacer: Pacer::global(), conn: conn.id.clone() }), ..client })
+    }
+
+    /// Tipo da conexão, que decide a autenticação de cada pedido ([`auth_headers`], spec 132 T02).
+    /// Os adaptadores nativos (T03 e T06) montam o cliente com o tipo deles.
+    pub fn with_kind(mut self, kind: ConnectionKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Liga o modo plano ChatGPT (spec 116 T02): Responses, `store:false` e `stream:true` sempre,
@@ -1009,6 +1059,41 @@ impl LlmClient {
         }
     }
 
+    /// Teto do `max_tokens` do `model` pelo limitador (spec 132 T09): o limite de tokens de saída
+    /// por minuto lido no cabeçalho ou o aprendido com um 429 que citou os tokens de saída.
+    fn output_ceiling(&self, model: &str) -> Option<u32> {
+        let link = self.pace.as_ref()?;
+        let ceiling = link.pacer.output_ceiling(&link.conn, model)?;
+        Some(u32::try_from(ceiling).unwrap_or(u32::MAX).max(1))
+    }
+
+    /// O `max_tokens` `base` do `model` limitado pelo [`Self::output_ceiling`].
+    pub(crate) fn capped_max_tokens(&self, model: &str, base: u32) -> u32 {
+        self.output_ceiling(model).map_or(base, |c| base.min(c))
+    }
+
+    /// Como [`Self::capped_max_tokens`] para um limite opcional (o Gemini só manda o campo quando há
+    /// algum): o menor dos dois presentes.
+    fn capped_known(&self, model: &str, known: Option<u32>) -> Option<u32> {
+        match (known, self.output_ceiling(model)) {
+            (Some(k), Some(c)) => Some(k.min(c)),
+            (k, c) => k.or(c),
+        }
+    }
+
+    /// Um 429 de ritmo que cita os tokens de saída (spec 132 T09): reduz o `max_tokens` do par uma
+    /// vez, a partir do `current` enviado ([`limit::output_tokens_cited`]). O 429 que pausa (teto de
+    /// gasto, cota diária) não conta.
+    fn note_output_limit(&self, model: &str, status: u16, body: &str, current: u32) {
+        let Some(link) = &self.pace else { return };
+        if status != 429 || limit::classify(self.kind, status, body).is_some() {
+            return;
+        }
+        if let Some(max) = limit::output_tokens_cited(body, current) {
+            link.pacer.cap_output(&link.conn, model, u64::from(max));
+        }
+    }
+
     /// Cabeçalhos de cota de uma resposta do `model` para o limitador, quando ligado.
     fn observe_quota(&self, model: &str, headers: &reqwest::header::HeaderMap) {
         if let Some(link) = &self.pace {
@@ -1033,6 +1118,18 @@ impl LlmClient {
             return self.chat_stream(req, &|_| {}).await;
         }
         let quiet = |_: String| {};
+        // Spec 132 T03: a Anthropic pela Messages API.
+        if self.kind == ConnectionKind::Anthropic {
+            return self
+                .with_retry(|| self.paced(req, &quiet, self.anthropic_messages(req)), || false, |_| {})
+                .await;
+        }
+        // Spec 132 T06: o Google Gemini pela Interactions API.
+        if self.kind == ConnectionKind::GoogleGemini {
+            return self
+                .with_retry(|| self.paced(req, &quiet, self.gemini_interactions(req)), || false, |_| {})
+                .await;
+        }
         self.with_retry(
             || {
                 self.paced(req, &quiet, async {
@@ -1195,9 +1292,9 @@ impl LlmClient {
         }
     }
 
-    /// Aplica a autenticação `Authorization: Bearer` em toda requisição.
-    fn authorize(&self, builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
-        builder.bearer_auth(token)
+    /// Aplica a autenticação do tipo da conexão ([`auth_headers`]) em toda requisição.
+    fn authorize(&self, builder: reqwest::RequestBuilder, token: &str) -> Result<reqwest::RequestBuilder, LlmError> {
+        Ok(auth_headers(self.kind, token)?.into_iter().fold(builder, |b, (name, value)| b.header(name, value)))
     }
 
     /// Envia, lê o corpo respeitando `max_response_bytes` e devolve status e texto.
@@ -1218,7 +1315,7 @@ impl LlmClient {
     ) -> Result<(reqwest::StatusCode, String, Option<Duration>), LlmError> {
         let token = self.bearer().await?;
         let mut resp = self
-            .authorize(builder, &token)
+            .authorize(builder, &token)?
             .send()
             .await
             .map_err(transport_error)?;
@@ -1294,6 +1391,14 @@ impl LlmClient {
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
         removed_slot: &std::sync::Mutex<Option<String>>,
     ) -> Result<ChatResponse, Failed> {
+        // Spec 132 T04: a Anthropic pelo stream da Messages API.
+        if self.kind == ConnectionKind::Anthropic {
+            return self.anthropic_stream_once(req, on_delta).await;
+        }
+        // Spec 132 T07: o Google Gemini pelo stream da Interactions API.
+        if self.kind == ConnectionKind::GoogleGemini {
+            return self.gemini_stream_once(req, on_delta).await;
+        }
         let plan = self.plan.is_some();
         let responses = plan || matches!(self.wire_api, WireApi::Responses);
         let path = if responses { "/responses" } else { "/chat/completions" };
@@ -1346,7 +1451,8 @@ impl LlmClient {
                 .json(&body);
             // Spec 114 T05: o diagnóstico conta o tempo desde o envio do pedido.
             let mut diag = StreamDiag::new(prompt_estimate);
-            let mut resp = tokio::time::timeout(self.timeout, self.authorize(builder, &token).send())
+            let authorized = self.authorize(builder, &token).map_err(Failed::from)?;
+            let mut resp = tokio::time::timeout(self.timeout, authorized.send())
                 .await
                 .map_err(|_| LlmError::Timeout)?
                 .map_err(transport_error)?;
@@ -1408,7 +1514,8 @@ impl LlmClient {
                 }
                 .map_err(Failed::from);
             }
-            let out = self.read_sse(resp, first, responses, fallback_used, on_delta, &mut diag).await;
+            let acc = if responses { SseAcc::Responses(RespAcc::default()) } else { SseAcc::Chat(ChatAcc::default()) };
+            let out = self.read_sse(resp, first, acc, fallback_used, on_delta, &mut diag).await;
             // Spec 114 T05: resposta cortada (tamanho, tempo, transmissão ou formato) vira um
             // diagnóstico com o custo, entregue antes do erro subir. Nunca a resposta inteira.
             if let Err(e) = &out {
@@ -1434,18 +1541,13 @@ impl LlmClient {
         &self,
         mut resp: reqwest::Response,
         first: Vec<u8>,
-        responses: bool,
+        mut acc: SseAcc,
         fallback_used: bool,
         on_delta: &(dyn Fn(StreamDelta) + Send + Sync),
         diag: &mut StreamDiag,
     ) -> Result<ChatResponse, LlmError> {
         let mut parser = SseParser::default();
         let plan = self.plan.is_some();
-        let mut acc = if responses {
-            SseAcc::Responses(RespAcc::default())
-        } else {
-            SseAcc::Chat(ChatAcc::default())
-        };
         let mut total = 0usize;
         let mut pending = (!first.is_empty()).then(|| axum::body::Bytes::from(first));
         'read: loop {
@@ -1530,6 +1632,10 @@ impl LlmClient {
                 return LlmError::Plan(PlanError::NeedsLogin);
             }
         }
+        // Spec 132 T09: o teto de gasto da Anthropic e a cota diária do Gemini pausam, sem repetir.
+        if let Some(limit) = limit::classify(self.kind, status, body) {
+            return LlmError::Limit(limit);
+        }
         LlmError::Http {
             status,
             body_snippet: snippet(body, &self.secret()),
@@ -1584,6 +1690,44 @@ fn build_http(timeout: Duration) -> Result<reqwest::Client, LlmError> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| LlmError::Config(format!("cliente HTTP: {e}")))
+}
+
+/// Versão da API Messages enviada em todo pedido à Anthropic (spec 132 T02).
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Cabeçalhos de autenticação de cada tipo de conexão (spec 132 T02):
+/// - chave de API e plano ChatGPT: `Authorization: Bearer <token>`;
+/// - Anthropic: `x-api-key: <chave>` e `anthropic-version: 2023-06-01`;
+/// - Google Gemini: `x-goog-api-key: <chave>`.
+///
+/// Os nativos não mandam `Authorization`. O valor com o segredo vai marcado como sensível (fora do
+/// `Debug` do reqwest). Chave que não cabe num cabeçalho é configuração inválida, e o erro não a
+/// repete.
+pub(crate) fn auth_headers(
+    kind: ConnectionKind,
+    token: &str,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, LlmError> {
+    use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
+    let secret = |raw: String| {
+        HeaderValue::from_str(&raw)
+            .map(|mut v| {
+                v.set_sensitive(true);
+                v
+            })
+            .map_err(|_| LlmError::Config("chave da conexão com caracteres inválidos para o cabeçalho".into()))
+    };
+    Ok(match kind {
+        ConnectionKind::ApiKey | ConnectionKind::ChatgptPlan => {
+            vec![(AUTHORIZATION, secret(format!("Bearer {token}"))?)]
+        }
+        ConnectionKind::Anthropic => vec![
+            (HeaderName::from_static("x-api-key"), secret(token.to_string())?),
+            (HeaderName::from_static("anthropic-version"), HeaderValue::from_static(ANTHROPIC_VERSION)),
+        ],
+        ConnectionKind::GoogleGemini => {
+            vec![(HeaderName::from_static("x-goog-api-key"), secret(token.to_string())?)]
+        }
+    })
 }
 
 /// Trecho do corpo de erro, com a chave redigida e limitado a `SNIPPET_MAX_CHARS`.
@@ -1754,6 +1898,7 @@ fn parse_response(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmEr
             completion: u.completion_tokens,
             cached: u.prompt_tokens_details.as_ref().and_then(|d| d["cached_tokens"].as_u64()).map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
             reasoning: u.completion_tokens_details.as_ref().and_then(|d| d["reasoning_tokens"].as_u64()).map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            cache_write: None,
         }),
         fallback_used,
         web_search_calls: 0,
@@ -1924,25 +2069,49 @@ fn responses_input(msg: &ChatMessage, input: &mut Vec<Value>) -> Result<(), LlmE
     Ok(())
 }
 
-/// Alinha o `call_id` dos itens `function_call` de `provider_items` ao da `ToolCall` de mesma
-/// posição. Necessário quando o id foi substituído localmente (ex.: `nants-synth-*`), para que o
-/// `function_call_output` correspondente continue válido.
+/// Alinha o id das chamadas de `provider_items` ao da `ToolCall` de mesma posição: o `call_id` dos
+/// itens `function_call` (Responses), o `id` dos blocos `tool_use` (Anthropic, spec 132 T03) e o
+/// `id` dos passos `function_call` (Gemini Interactions, que não têm `call_id`; spec 132 T06).
+/// Necessário quando o id foi substituído localmente (ex.: `nants-synth-*`), para que o resultado
+/// correspondente continue válido.
 pub(crate) fn sync_provider_call_ids(msg: &mut ChatMessage) {
     let Some(items) = msg.provider_items.as_mut() else {
         return;
     };
+    let gemini_turn = gemini::is_turn(items);
     let mut calls = msg.tool_calls.iter();
     for item in items.iter_mut() {
-        if item_str(item, "type") != "function_call" {
-            continue;
-        }
+        let field = match item_str(item, "type") {
+            "function_call" if gemini_turn => "id",
+            "function_call" => "call_id",
+            "tool_use" => "id",
+            _ => continue,
+        };
         let Some(call) = calls.next() else {
             break;
         };
         if let Some(obj) = item.as_object_mut() {
-            obj.insert("call_id".into(), json!(call.id));
+            obj.insert(field.into(), json!(call.id));
         }
     }
+}
+
+/// Troca os argumentos da chamada `id` também nos itens guardados que vão ao provedor (compactação
+/// do histórico, spec 122): o `arguments` do `function_call` (Responses), o `input` do `tool_use`
+/// (Anthropic) e o `arguments` do passo `function_call` (Gemini). Nos nativos, o turno alterado perde
+/// os blocos de raciocínio ([`anthropic::rewrite_tool_use`] e [`gemini::rewrite_function_call`]).
+pub(crate) fn rewrite_call_arguments(msg: &mut ChatMessage, id: &str, arguments: &str) {
+    let Some(items) = msg.provider_items.as_mut() else {
+        return;
+    };
+    for item in items.iter_mut() {
+        let is_call = item_str(item, "type") == "function_call" && item_str(item, "call_id") == id;
+        if let (true, Some(obj)) = (is_call, item.as_object_mut()) {
+            obj.insert("arguments".into(), Value::String(arguments.to_string()));
+        }
+    }
+    anthropic::rewrite_tool_use(items, id, arguments);
+    gemini::rewrite_function_call(items, id, arguments);
 }
 
 /// Texto dos `arguments` de um item `function_call`: ausente/null vira vazio.
@@ -2100,6 +2269,7 @@ fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmE
         completion: u.output_tokens,
         cached: u.input_tokens_details.as_ref().and_then(|d| d["cached_tokens"].as_u64()).map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         reasoning: u.output_tokens_details.as_ref().and_then(|d| d["reasoning_tokens"].as_u64()).map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        cache_write: None,
     });
     Ok(ChatResponse {
         message: ChatMessage {
@@ -2368,6 +2538,10 @@ impl RespAcc {
 enum SseAcc {
     Responses(RespAcc),
     Chat(ChatAcc),
+    /// Messages API da Anthropic (spec 132 T04).
+    Anthropic(anthropic::StreamAcc),
+    /// Interactions API do Gemini (spec 132 T07).
+    Gemini(gemini::StreamAcc),
 }
 
 fn emit(on: &(dyn Fn(StreamDelta) + Send + Sync), delta: StreamDelta) {
@@ -2387,6 +2561,8 @@ impl SseAcc {
         match self {
             SseAcc::Responses(r) => r.done.is_some(),
             SseAcc::Chat(c) => c.done,
+            SseAcc::Anthropic(a) => a.is_done(),
+            SseAcc::Gemini(g) => g.is_done(),
         }
     }
 
@@ -2434,6 +2610,8 @@ impl SseAcc {
                 }
                 Ok(false)
             }
+            SseAcc::Anthropic(acc) => acc.event(name, data, on),
+            SseAcc::Gemini(acc) => acc.event(name, data, on),
             SseAcc::Chat(acc) => {
                 if data.trim() == "[DONE]" {
                     acc.done = true;
@@ -2452,6 +2630,7 @@ impl SseAcc {
                         completion: n("completion_tokens"),
                         cached: nested_tokens(u, "prompt_tokens_details", "cached_tokens"),
                         reasoning: nested_tokens(u, "completion_tokens_details", "reasoning_tokens"),
+                        cache_write: None,
                     });
                 }
                 let Some(choice) = v["choices"].as_array().and_then(|c| c.first()) else {
@@ -2494,6 +2673,8 @@ impl SseAcc {
         match self {
             SseAcc::Responses(RespAcc { done: Some(r), .. }) => Ok(r),
             SseAcc::Responses(RespAcc { done: None, .. }) => Err(LlmError::Parse(NO_FINAL)),
+            SseAcc::Anthropic(acc) => acc.finish(fallback_used),
+            SseAcc::Gemini(acc) => acc.finish(fallback_used),
             SseAcc::Chat(acc) => {
                 if !acc.done && acc.finish_reason.is_none() {
                     return Err(LlmError::Parse(NO_FINAL));
@@ -2543,6 +2724,21 @@ mod pace_client_tests;
 mod plan_client_tests;
 
 #[cfg(test)]
+mod auth_tests;
+
+#[cfg(test)]
+mod anthropic_tests;
+
+#[cfg(test)]
+mod gemini_tests;
+
+#[cfg(test)]
+mod limit_client_tests;
+
+#[cfg(test)]
+mod live_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -2590,6 +2786,7 @@ pub(crate) mod tests {
             response_json: false,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         }
     }
 
@@ -3052,6 +3249,7 @@ pub(crate) mod tests {
             api_key: format!("env:{var}"),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         };
         let client = LlmClient::from_connection(&conn).expect("client");
         std::env::remove_var(var);
@@ -3070,9 +3268,25 @@ pub(crate) mod tests {
             api_key: format!("env:{var}"),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         };
         let err = LlmClient::from_connection(&conn).expect_err("deve falhar");
         assert!(matches!(err, LlmError::Config(_)), "{err:?}");
+    }
+
+    /// Spec 132: os nativos montam o cliente (Anthropic na T03, Gemini na T06) e resolvem a chave:
+    /// a referência indefinida é configuração inválida. O `KindNotSupported` segue com a causa fixa
+    /// `provider_invalid_config`, sem nova tentativa.
+    #[test]
+    fn from_connection_native_kind_resolves_the_key() {
+        for kind in [crate::config::ConnectionKind::Anthropic, crate::config::ConnectionKind::GoogleGemini] {
+            let conn = Connection::native("c", "c", kind, "env:NANTS_T132_NUNCA_DEFINIDA");
+            let err = LlmClient::from_connection(&conn).expect_err("chave indefinida");
+            assert!(matches!(err, LlmError::Config(_)), "{kind:?}: {err:?}");
+        }
+        let err = LlmError::KindNotSupported(crate::config::ConnectionKind::GoogleGemini);
+        assert_eq!(provider_failure(&err).to_string(), "provider_invalid_config");
+        assert!(!is_transient(&err));
     }
 
     #[tokio::test]
@@ -3238,7 +3452,7 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(resp.usage, Some(Usage { prompt: 11, completion: 5, cached: None, reasoning: Some(2) }));
+        assert_eq!(resp.usage, Some(Usage { prompt: 11, completion: 5, cached: None, reasoning: Some(2), cache_write: None }));
         assert!(!resp.fallback_used);
         // Todos os itens de saída são preservados, na ordem recebida.
         let items = resp.message.provider_items.clone().expect("itens brutos");
@@ -3501,6 +3715,7 @@ pub(crate) mod tests {
                 api_key: KEY.into(),
                 wire_api: wire,
                 kind: Default::default(),
+                base_url_override: None,
             };
             let client = LlmClient::from_connection(&conn).expect("client");
             // Chat não entende o corpo Responses, mas o caminho basta para o teste de seleção.

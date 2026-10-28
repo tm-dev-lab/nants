@@ -222,7 +222,9 @@ describe("remontagem por projeto e especificação", () => {
     });
     await settle();
     expect(rendered.container.querySelector("iframe")).toBeNull();
-    expect(rendered.container.querySelector("[data-app-state]")?.getAttribute("data-app-state")).toBe("stopped");
+    // Parado, com o guia ainda segurado: as duas janelas no estado neutro da spec 131 T05.
+    expect(rendered.container.querySelectorAll('[data-runview="loading"]')).toHaveLength(2);
+    expect(rendered.container.querySelector("[data-app-state]")).toBeNull();
     await act(async () => {
       statusHeld[1]?.release();
     });

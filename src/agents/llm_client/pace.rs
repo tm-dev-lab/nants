@@ -2,7 +2,8 @@
 //!
 //! Um limitador no processo, chaveado por (id da conexão, modelo), compartilhado por todo
 //! [`super::LlmClient`] criado de uma conexão. Nada é configurado: os tetos vêm só da observação.
-//! - cabeçalhos `x-ratelimit-*` de toda resposta (restante, reset e limite);
+//! - cabeçalhos `x-ratelimit-*` de toda resposta (restante, reset e limite) e, na Anthropic, os
+//!   `anthropic-ratelimit-*` (spec 132 T09), com o reset em RFC 3339;
 //! - o próprio limite (HTTP 429 ou `throttled`): 70% do ritmo dos 60 s anteriores, relaxado em 25%
 //!   a cada 5 min sem novo limite e descartado acima do observado + 100%.
 //!
@@ -15,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::HeaderMap;
 
@@ -67,24 +68,99 @@ pub struct Quota {
     pub reset_tokens: Option<Duration>,
     pub limit_requests: Option<u64>,
     pub limit_tokens: Option<u64>,
+    /// Limite de tokens de saída por minuto (`anthropic-ratelimit-output-tokens-limit`, spec 132
+    /// T09): o `max_tokens` enviado não passa dele.
+    pub limit_output_tokens: Option<u64>,
 }
 
 impl Quota {
-    /// Lê os `x-ratelimit-*` conhecidos; `None` quando nenhum veio válido.
+    /// Lê os cabeçalhos de cota conhecidos; `None` quando nenhum veio válido.
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        Self::from_headers_at(headers, SystemTime::now())
+    }
+
+    /// Como [`Self::from_headers`], com o instante atual dado (o reset da Anthropic é uma data).
+    ///
+    /// - `x-ratelimit-*` (OpenAI e compatíveis): restante, reset (`6m0s`, `20ms`, segundos) e limite.
+    /// - `anthropic-ratelimit-*` (spec 132 T09), na falta dos anteriores: requisições (`requests-*`)
+    ///   e tokens (`tokens-*`, o mais restritivo em vigor; na falta dele, `input-tokens-*`), com o
+    ///   reset em RFC 3339; e o limite dos tokens de saída (`output-tokens-limit`).
+    pub fn from_headers_at(headers: &HeaderMap, now: SystemTime) -> Option<Self> {
         let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let count = |name: &str| text(name).and_then(|v| v.trim().parse::<u64>().ok());
+        // Limite zero não serve de teto (nenhum pedido passaria): ignorado.
+        let limit = |name: &str| count(name).filter(|n| *n > 0);
+        let reset_at = |name: &str| text(name).and_then(|v| until_rfc3339(v, now));
+        let ant = |what: &str, field: &str| format!("anthropic-ratelimit-{what}-{field}");
+        let ant_tokens = |field: &str, read: &dyn Fn(&str) -> Option<u64>| {
+            read(&ant("tokens", field)).or_else(|| read(&ant("input-tokens", field)))
+        };
         let quota = Self {
-            remaining_requests: count("x-ratelimit-remaining-requests"),
-            remaining_tokens: count("x-ratelimit-remaining-tokens"),
-            reset_requests: text("x-ratelimit-reset-requests").and_then(parse_reset),
-            reset_tokens: text("x-ratelimit-reset-tokens").and_then(parse_reset),
-            // Limite zero não serve de teto (nenhum pedido passaria): ignorado.
-            limit_requests: count("x-ratelimit-limit-requests").filter(|n| *n > 0),
-            limit_tokens: count("x-ratelimit-limit-tokens").filter(|n| *n > 0),
+            remaining_requests: count("x-ratelimit-remaining-requests").or_else(|| count(&ant("requests", "remaining"))),
+            remaining_tokens: count("x-ratelimit-remaining-tokens").or_else(|| ant_tokens("remaining", &count)),
+            reset_requests: text("x-ratelimit-reset-requests")
+                .and_then(parse_reset)
+                .or_else(|| reset_at(&ant("requests", "reset"))),
+            reset_tokens: text("x-ratelimit-reset-tokens").and_then(parse_reset).or_else(|| {
+                reset_at(&ant("tokens", "reset")).or_else(|| reset_at(&ant("input-tokens", "reset")))
+            }),
+            limit_requests: limit("x-ratelimit-limit-requests").or_else(|| limit(&ant("requests", "limit"))),
+            limit_tokens: limit("x-ratelimit-limit-tokens").or_else(|| ant_tokens("limit", &limit)),
+            limit_output_tokens: limit(&ant("output-tokens", "limit")),
         };
         (quota != Self::default()).then_some(quota)
     }
+}
+
+/// Tempo de `now` até a data RFC 3339 `value` (`2026-10-28T12:00:30Z`, com fração e deslocamento
+/// opcionais). Data já passada ou inválida = `None`.
+pub fn until_rfc3339(value: &str, now: SystemTime) -> Option<Duration> {
+    let at = UNIX_EPOCH.checked_add(rfc3339_epoch(value.trim())?)?;
+    at.duration_since(now).ok().filter(|d| !d.is_zero())
+}
+
+/// Instante (desde a época Unix) de uma data RFC 3339. Só o formato completo, com `T` (ou espaço),
+/// segundos e a zona (`Z` ou `±HH:MM`).
+fn rfc3339_epoch(value: &str) -> Option<Duration> {
+    let num = |s: &str| -> Option<u64> { s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok()).flatten() };
+    let bytes = value.as_bytes();
+    if value.len() < 20 || !value.is_ascii() || bytes[4] != b'-' || bytes[7] != b'-' || !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let (year, month, day) = (num(&value[0..4])?, num(&value[5..7])?, num(&value[8..10])?);
+    let (h, m, sec) = (num(&value[11..13])?, num(&value[14..16])?, num(&value[17..19])?);
+    let mut rest = &value[19..];
+    let mut nanos = 0u32;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let len = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if len == 0 {
+            return None;
+        }
+        let digits: String = frac[..len].chars().chain(std::iter::repeat('0')).take(9).collect();
+        nanos = digits.parse().ok()?;
+        rest = &frac[len..];
+    }
+    let base = super::civil_secs(year, month, day, h, m, sec)?;
+    let secs = match rest {
+        "Z" | "z" => base,
+        zone if zone.len() == 6 && zone.as_bytes()[3] == b':' => {
+            let (oh, om) = (num(&zone[1..3])?, num(&zone[4..6])?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let offset = oh * 3600 + om * 60;
+            match zone.as_bytes()[0] {
+                b'+' => base.checked_sub(offset)?,
+                b'-' => base.checked_add(offset)?,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(Duration::new(secs, nanos))
 }
 
 /// Tempo até o reset: segundos inteiros (`30`) ou componentes com unidade (`6m0s`, `1s`, `20ms`,
@@ -154,6 +230,10 @@ struct PaceState {
     header_rpm: Option<u64>,
     header_tpm: Option<u64>,
     learned: Option<Learned>,
+    /// Limite de tokens de saída por minuto informado por cabeçalho (spec 132 T09).
+    header_output: Option<u64>,
+    /// Teto do `max_tokens` aprendido com um 429 que citou os tokens de saída (uma vez por par).
+    output_cap: Option<u64>,
 }
 
 /// Menor dos dois tetos presentes.
@@ -388,6 +468,9 @@ impl Pacer {
             if let Some(remaining) = quota.remaining_tokens {
                 st.tokens = Some(Gate { remaining, reset_at: reset_at(quota.reset_tokens) });
             }
+            if let Some(output) = quota.limit_output_tokens {
+                st.header_output = Some(output);
+            }
             let rpm = quota.limit_requests.or(st.header_rpm);
             let tpm = quota.limit_tokens.or(st.header_tpm);
             if (rpm, tpm) != (st.header_rpm, st.header_tpm) {
@@ -425,6 +508,39 @@ impl Pacer {
             PaceLog::new(&key, st, "limite")
         };
         log.emit();
+    }
+
+    /// Teto do `max_tokens` do par (spec 132 T09): o menor entre o limite de tokens de saída por
+    /// minuto do cabeçalho e o aprendido com um 429 ([`Self::cap_output`]). `None` sem sinal.
+    pub fn output_ceiling(&self, conn: &str, model: &str) -> Option<u64> {
+        let pairs = self.lock();
+        let st = pairs.map.get(&(conn.to_string(), model.to_string()))?;
+        min_opt(st.header_output, st.output_cap)
+    }
+
+    /// Um 429 citou os tokens de saída: o `max_tokens` do par passa a `max` (mínimo 1). Só a primeira
+    /// vez conta; `false` quando o par já tinha sido reduzido assim.
+    pub fn cap_output(&self, conn: &str, model: &str, max: u64) -> bool {
+        let key = (conn.to_string(), model.to_string());
+        let changed = {
+            let mut pairs = self.lock();
+            let st = pairs.map.entry(key.clone()).or_default();
+            if st.output_cap.is_some() {
+                false
+            } else {
+                st.output_cap = Some(max.max(1));
+                true
+            }
+        };
+        if changed {
+            eprintln!(
+                "nants: ritmo conexão={} modelo={} max_tokens={} origem=limite_saida",
+                log_safe(&key.0),
+                log_safe(&key.1),
+                max.max(1)
+            );
+        }
+        changed
     }
 
     /// Desfaz uma reserva cujo pedido não chegou a sair (parada ou futuro descartado na espera).

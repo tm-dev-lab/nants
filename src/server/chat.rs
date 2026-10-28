@@ -90,18 +90,23 @@ struct Incoming {
 }
 
 /// O que o turno deixa para quem o pediu, na extensão da resposta (spec 128 T02): o corpo do
-/// bloco `nants-plan-decisions` (fora do texto mostrado) e se a resposta pergunta algo ao usuário.
+/// bloco `nants-plan-decisions` (fora do texto mostrado), se a resposta pergunta algo ao usuário e
+/// o texto final mostrado (spec 131 T03: o pedido curto do bloco leva esse texto).
 #[derive(Debug, Clone, Default)]
 struct TurnOutcome {
     decisions: Option<String>,
     asks_user: bool,
+    reply: String,
 }
 
 /// Resultado de um turno interno do consenso.
 pub(super) struct ConsensusTurnOutcome {
     pub status: StatusCode,
+    /// Corpo do último bloco das decisões entre as mensagens do assistente no turno (spec 131 T03).
     pub decisions: Option<String>,
     pub asks_user: bool,
+    /// Texto final mostrado do turno, redigido e sem o bloco.
+    pub reply: String,
 }
 
 /// Esperas pela reserva do turno ocupado: o turno interno do consenso logo depois do turno do
@@ -290,7 +295,7 @@ pub(super) fn consensus_turn(
                 continue;
             }
             let outcome = resp.extensions().get::<TurnOutcome>().cloned().unwrap_or_default();
-            return ConsensusTurnOutcome { status, decisions: outcome.decisions, asks_user: outcome.asks_user };
+            return ConsensusTurnOutcome { status, decisions: outcome.decisions, asks_user: outcome.asks_user, reply: outcome.reply };
         }
     })
 }
@@ -313,6 +318,20 @@ pub(super) async fn internal_turn(state: &AppState, project_id: &str, message: S
 /// histórico com `code` e `params` (o texto de reserva no idioma do projeto, pelo dicionário) e
 /// publicada como `agent_message` do sistema.
 pub(super) async fn system_notice(state: &AppState, project_id: &str, root: PathBuf, code: &str, params: Map<String, serde_json::Value>) {
+    system_notice_with_tail(state, project_id, root, code, params, None).await;
+}
+
+/// [`system_notice`] com um conteúdo longo depois da frase fixa (spec 131 T03: a lista final das
+/// tarefas): ele não cabe num param (cortado em 512 bytes) e vai no texto, depois da primeira
+/// quebra de linha, como as mensagens com cauda da web (`SYSTEM_CODES_WITH_TAIL`).
+pub(super) async fn system_notice_with_tail(
+    state: &AppState,
+    project_id: &str,
+    root: PathBuf,
+    code: &str,
+    params: Map<String, serde_json::Value>,
+    tail: Option<&str>,
+) {
     let lang = state.project_lang(project_id).get();
     let secrets = state.secret_set().await;
     let pairs: Vec<(String, String)> = params
@@ -320,7 +339,11 @@ pub(super) async fn system_notice(state: &AppState, project_id: &str, root: Path
         .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string)))
         .collect();
     let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let text = output_text(&secrets, &crate::i18n::tr(lang, &format!("system.{code}"), &refs));
+    let fixed = crate::i18n::tr(lang, &format!("system.{code}"), &refs);
+    let text = match tail.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tail) => output_text(&secrets, &format!("{fixed}\n{tail}")),
+        None => output_text(&secrets, &fixed),
+    };
     let notice = TurnNotice { code: code.to_string(), params: params.clone() };
     let turn = ChatTurn {
         role: TurnRole::System,
@@ -789,7 +812,9 @@ async fn finish_turn(
     plans_before: super::plan_changes::Snapshots,
     kind: TurnKind,
 ) -> Response {
-    let (shown, decisions) = super::plan_consensus::split_decisions(&reply.text);
+    // Spec 131 T03: o bloco vale em qualquer mensagem do assistente no turno (o último dito).
+    let (shown, last) = super::plan_consensus::split_decisions(&reply.text);
+    let decisions = super::plan_consensus::decisions_in(&reply.said).or(last);
     let asks_user = super::choices::parse_choices(&shown).is_some();
     let hidden = kind.consensus && !asks_user;
     let text = output_text(secrets, &shown);
@@ -852,7 +877,7 @@ async fn finish_turn(
         "turn_id": turn_id,
     }))
     .into_response();
-    response.extensions_mut().insert(TurnOutcome { decisions, asks_user });
+    response.extensions_mut().insert(TurnOutcome { decisions, asks_user, reply: text });
     response
 }
 
@@ -1227,6 +1252,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = if configured {
             AgentConfig {
@@ -1350,8 +1376,13 @@ mod tests {
         }
     }
 
+    /// Spec de exemplo com `run_command` (spec 131 T04: sem ele, o plano recebe um aviso).
+    fn spec_with_run() -> String {
+        EXAMPLE_SPEC_MD.replace("created_at", "run_command: \"cargo run\"\ncreated_at")
+    }
+
     fn write_spec_call() -> Reply {
-        let args = json!({"path": ".sdd/specs/001-exemplo/spec.md", "content": EXAMPLE_SPEC_MD});
+        let args = json!({"path": ".sdd/specs/001-exemplo/spec.md", "content": spec_with_run()});
         calls(&[("c1", "write_sdd_artifacts", &args.to_string())])
     }
 
@@ -1617,7 +1648,7 @@ mod tests {
         assert_eq!(body["reply"], "Qual o escopo?");
 
         // Turno que altera outra spec (limpa): o aviso da spec não alterada não volta ao modelo.
-        let other = json!({"path": ".sdd/specs/002-outra/spec.md", "content": EXAMPLE_SPEC_MD.replace("001-exemplo", "002-outra")});
+        let other = json!({"path": ".sdd/specs/002-outra/spec.md", "content": spec_with_run().replace("001-exemplo", "002-outra")});
         let (scripted, dynb) = backend(vec![
             calls(&[("c9", "write_sdd_artifacts", &other.to_string())]),
             write_task_as("c10", "002-outra", &crate::agents::prompts::EXAMPLE_TASK_MD.replace("001-exemplo", "002-outra")),
@@ -1695,6 +1726,7 @@ mod tests {
         let (status, body) = turn(&state, PROJECT_ID, "ajusta", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let lines = crate::server::plan_changes::view(&root, "001-exemplo", &SecretSet::default()).expect("resumo");
+        let lines: Vec<String> = lines.iter().map(|l| l.render(crate::i18n::Lang::PtBr)).collect();
         assert_eq!(lines, vec!["T01: critérios alterados (2 novos, 1 removido)"]);
     }
 
@@ -1979,6 +2011,7 @@ mod tests {
             api_key: "env:NANTS_CHAT_TEST_UNSET_KEY_5151".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect.connection_id = "envkey".into();
         let state = state_for(&root, cfg);
@@ -2081,6 +2114,7 @@ mod tests {
             response_json: false,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         }
     }
 

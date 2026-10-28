@@ -49,12 +49,17 @@ export interface ConnectionView {
   wire_api?: WireApi;
   /** Como a conexão se autentica (spec 116); ausente = por chave. */
   kind?: ConnectionKind;
+  /** Endereço avançado das conexões nativas (Anthropic e Gemini, spec 132), quando houver. */
+  base_url_override?: string;
   /** Estado do login da conexão pelo plano ChatGPT (spec 116), sem segredos. */
   chatgpt?: ChatgptPlanStatus;
 }
 
-/** Tipo da conexão (spec 116): chave de API ou plano ChatGPT. */
-type ConnectionKind = "api_key" | "chatgpt_plan";
+/**
+ * Tipo da conexão: chave de API ou plano ChatGPT (spec 116), e as APIs nativas da Anthropic e do
+ * Google Gemini (spec 132), por chave e com o endereço oficial fixo.
+ */
+export type ConnectionKind = "api_key" | "chatgpt_plan" | "anthropic" | "google_gemini";
 
 /** Estado do login pelo plano ChatGPT (`GET /api/connections/:id/chatgpt`). */
 export type ChatgptPlanStatus =
@@ -80,6 +85,8 @@ export interface ConnectionInput {
   wire_api?: WireApi;
   /** Na conexão pelo plano ChatGPT, só o nome muda por aqui (spec 116). */
   kind?: ConnectionKind;
+  /** Endereço avançado da conexão nativa (spec 132): vazio volta ao oficial; ausente mantém o salvo. */
+  base_url_override?: string;
 }
 
 export interface AgentConfig {
@@ -185,6 +192,8 @@ export interface ModelPricing {
   input_per_mtok: number;
   output_per_mtok: number;
   cached_input_per_mtok?: number;
+  /** US$ por 1M de tokens gravados no cache do provedor (spec 132 T02); ausente = preço de entrada. */
+  cache_write_per_mtok?: number;
   /** US$ por imagem gerada (spec 092 T03); ausente = estimativa padrão por qualidade. */
   image_per_unit?: number;
   /** Origem; ausente (formato antigo) = manual. */
@@ -200,6 +209,8 @@ export interface UsageTotals {
   output: number;
   cached: number;
   reasoning: number;
+  /** Tokens de entrada gravados no cache do provedor (spec 132; contidos em `input`, omitido quando zero). */
+  cache_write?: number;
   cost_usd: number | null;
   unpriced_calls: number;
   /** O custo usa preço estimado (catálogo), não digitado. */
@@ -302,6 +313,10 @@ export interface TestConnectionInput {
   base_url?: string;
   api_key?: string;
   model?: string;
+  /** Tipo da conexão ainda não salva (spec 132 T08): `anthropic` ou `google_gemini`. */
+  kind?: ConnectionKind;
+  /** Endereço avançado da conexão nativa (spec 132 T08); vazio volta ao oficial. */
+  base_url_override?: string;
 }
 
 /** Resultado do teste: `error` é sempre um código fixo do servidor. */
@@ -312,14 +327,22 @@ export interface TestConnectionResult {
   status?: number;
   /** Quantidade de modelos listados (só no teste sem `model`). */
   models_count?: number;
+  /** Modelos listados, na ordem do provedor (spec 132 T10: só no teste sem `model` das conexões nativas). */
+  models?: ModelEntry[];
 }
 
 /** Um modelo listado por `GET /api/config/connections/:id/models`. */
-interface ModelEntry {
+export interface ModelEntry {
   /** O que vai no pedido (no plano ChatGPT, o `slug`). */
   id: string;
   /** Nome mostrado (no plano ChatGPT, o `display_name`; spec 116 T02). */
   name?: string;
+  /** Janela de entrada e limite de saída em tokens, quando o provedor nativo informa (spec 132 T08). */
+  input_tokens?: number;
+  output_tokens?: number;
+  /** Raciocínio e imagem na entrada, quando o provedor nativo informa (spec 132 T08). */
+  thinking?: boolean;
+  vision?: boolean;
 }
 
 /**
@@ -371,6 +394,9 @@ export interface TaskView {
   recovery_options_analysis?: number;
 }
 
+/** Linha do `plan_changes` (spec 131 T06): com `code` e `params`, ou o texto de um arquivo antigo. */
+export type PlanChangeEntry = string | { code: string; params?: Record<string, string | number> };
+
 export interface SpecView {
   id: string;
   title: string;
@@ -395,8 +421,11 @@ export interface SpecView {
   tool_counts?: Record<string, number>;
   /** Revisão do plano pelo Revisor (spec 086 T08), só da versão atual do plano; ausente = sem revisão. */
   plan_review?: PlanReviewView;
-  /** O que mudou no plano desde a versão anterior (spec 086 T09), só da versão atual; ausente = sem mudanças. */
-  plan_changes?: string[];
+  /**
+   * O que mudou no plano desde a versão anterior (spec 086 T09), só da versão atual; ausente = sem
+   * mudanças. Cada linha vem com `code` e `params` (spec 131 T06) ou, gravada antes, em texto.
+   */
+  plan_changes?: PlanChangeEntry[];
   /** Aviso de custo por tarefa (spec 124 T06), só das que passaram do patamar; ausente = nenhuma. */
   cost_alerts?: Record<string, CostAlertView>;
 }

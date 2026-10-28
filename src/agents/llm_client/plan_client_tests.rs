@@ -73,6 +73,7 @@ fn request(web_search: bool) -> ChatRequest {
         response_json: false,
         web_search,
         cache_key: None,
+        web_search_max_uses: None,
     }
 }
 
@@ -637,6 +638,7 @@ async fn plan_live_text_and_tool() {
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let resp = client.chat_stream(&text_req, &|_| {}).await.unwrap_or_else(|e| panic!("texto: {e:?}"));
     eprintln!("texto: {:?} usage={:?}", resp.message.content, resp.usage);
@@ -655,6 +657,7 @@ async fn plan_live_text_and_tool() {
         response_json: true,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let resp = client.chat_stream(&json_req, &|_| {}).await.unwrap_or_else(|e| panic!("json: {e:?}"));
     eprintln!("json: {:?} usage={:?}", resp.message.content, resp.usage);
@@ -700,6 +703,7 @@ async fn live_round_trip(base: &LlmClient, model: &str, effort: Option<Effort>, 
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let resp = first.chat_stream(&req, &|_| {}).await.map_err(|e| format!("1º turno: {e:?}"))?;
     let calls: Vec<(&str, &str, &str)> =
@@ -764,6 +768,7 @@ async fn plan_second_turn_resends_the_items_as_they_came() {
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
     let mut messages = req.messages.clone();
@@ -799,6 +804,7 @@ async fn plan_second_turn_resends_the_items_as_they_came() {
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let resp = client.chat_stream(&req, &|_| {}).await.expect("1º turno");
     let mut messages = req.messages.clone();

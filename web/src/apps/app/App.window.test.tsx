@@ -667,7 +667,8 @@ describe("App: respostas atrasadas", () => {
     });
     await settle();
     expect(rendered.container.querySelector("iframe")).toBeNull();
-    expect(rendered.container.querySelector("[data-app-empty]")?.getAttribute("data-app-empty")).toBe("stopped");
+    // Parado, com o guia ainda segurado: o estado neutro da spec 131 T05 (sem "Iniciar").
+    expect(rendered.container.querySelector('[data-runview="loading"]')).not.toBeNull();
     // A resposta atual (p2) vale.
     await act(async () => {
       heldOf("/api/projects/p2/app")?.();

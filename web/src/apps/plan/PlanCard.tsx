@@ -31,13 +31,15 @@
  */
 import { useId, useState, type ReactNode } from "react";
 import { approveSpec, postChat, postChatContinue } from "../../api/client";
-import type { ConsensusView, EnvironmentView, PlanIssue, PlanPointView, PlanReviewView, SpecView } from "../../api/types";
+import type { ConsensusView, EnvironmentView, PlanChangeEntry, PlanIssue, PlanPointView, PlanReviewView, SpecView } from "../../api/types";
 import { chatFailureMessage } from "../../chatFailure";
 import { loadChatHistory } from "../../chatHistory";
 import { ARCHITECT_COMPLETE_PLAN_MESSAGE } from "../../copy";
 import { Icon } from "../../desktop/Icon";
 import { t, tp, type MessageKey } from "../../i18n";
+import { planChangeText } from "../../i18n/planChanges";
 import { useT } from "../../i18n/react";
+import { localizeHeadingTitle } from "../../i18n/sddHeadings";
 import { useShell } from "../../desktop/shellContext";
 import { planStage, type PlanStage } from "../../phase";
 import { architectWireApi } from "../../settings/rules";
@@ -483,8 +485,11 @@ function PlanChecksDetail({ checks }: { checks: Checks }) {
   );
 }
 
-function PlanChangesSection({ lines }: { lines: readonly string[] }) {
-  const { t } = useT();
+/** Linhas do "Mudou nesta versão" no idioma ativo (spec 131 T06); código sem chave fica de fora. */
+function PlanChangesSection({ entries }: { entries: readonly PlanChangeEntry[] }) {
+  const { t, lang } = useT();
+  const lines = entries.map((entry) => planChangeText(entry, lang)).filter((line): line is string => line !== null && line !== "");
+  if (lines.length === 0) return null;
   return (
     <section aria-label={t("plan.changesTitle")} className="nd-plan-more-section">
       <h3 className="nd-plan-heading">
@@ -551,7 +556,7 @@ interface Props {
 
 export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisabled = false, stage: stageProp }: Props) {
   const shell = useShell();
-  const { t, tp } = useT();
+  const { t, tp, lang } = useT();
   const titleId = useId();
   const confirmId = useId();
   const waitingId = useId();
@@ -795,7 +800,8 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
                 </h3>
                 {guidance.map((g) => (
                   <div key={g.role} className="nd-stack-xs">
-                    <h4 className="nd-section-label">{g.role}</h4>
+                    {/* O papel é o título da subseção no spec.md (gravado em pt-BR): no idioma ativo. */}
+                    <h4 className="nd-section-label">{localizeHeadingTitle(g.role, lang)}</h4>
                     <p className="nd-prewrap">{g.text}</p>
                   </div>
                 ))}
@@ -828,7 +834,7 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
 
             {drafting ? null : <PlanChecksDetail checks={checks} />}
 
-            {changes.length > 0 ? <PlanChangesSection lines={changes} /> : null}
+            {changes.length > 0 ? <PlanChangesSection entries={changes} /> : null}
           </div>
         </details>
       ) : null}

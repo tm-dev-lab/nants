@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::schema::{check_run_url, check_test_command_shape, valid_optional_command, validate_checks, validate_failure_artifacts, validate_formatters, validate_lockfiles, Sdd, Settings, Spec, SpecMeta, Task};
+use super::schema::{
+    check_run_command_shape, check_run_url, check_test_command_shape, normalize_formatter_glob, valid_optional_command,
+    valid_sandbox_note, validate_checks, validate_failure_artifacts, validate_formatters, validate_lockfiles, FieldIssue,
+    Sdd, Settings, Spec, SpecMeta, Task, TestCommandError, MAX_CHECKS, MAX_FAILURE_ARTIFACTS, MAX_FORMATTERS,
+    MAX_LOCKFILES, MAX_SANDBOX_NOTE_CHARS, RUN_COMMAND_MAX_CHARS, TEST_COMMAND_MAX_CHARS,
+};
 use super::{sdd_dir, SddError};
 
 const FENCE: &str = "---";
@@ -44,19 +49,28 @@ fn render_doc<T: Serialize>(meta: &T, body: &str) -> Result<String, SddError> {
 
 impl Spec {
     /// Interpreta o conteúdo de um `spec.md`. `test_command` vazio é aceito (equivale a ausente);
-    /// valor não vazio com forma inválida é recusado.
+    /// valor não vazio com forma inválida é recusado. Campo opcional inválido é ignorado: quem grava
+    /// a spec usa [`Self::parse_with_issues`] para recusar e devolver o motivo (spec 131 T04).
     pub fn parse(content: &str) -> Result<Self, SddError> {
+        Self::parse_with_issues(content).map(|(spec, _)| spec)
+    }
+
+    /// Como [`Self::parse`], devolvendo também cada campo opcional que a leitura descartou, inteiro
+    /// ou em parte, com o motivo (spec 131 T04: nenhum descarte em silêncio). Vazio equivale a
+    /// ausente e não é problema.
+    pub fn parse_with_issues(content: &str) -> Result<(Self, Vec<FieldIssue>), SddError> {
         let (mut frontmatter, body): (SpecMeta, String) = parse_doc(content)?;
         if let Some(raw) = frontmatter.test_command.as_deref() {
             if !raw.trim().is_empty() && check_test_command_shape(raw).is_err() {
                 return Err(SddError::InvalidTestCommand);
             }
         }
+        let issues = field_issues(&frontmatter);
         // Campos de execução para teste são opcionais: inválido = ignorado, a spec segue válida.
         frontmatter.run_command = frontmatter
             .run_command
             .as_deref()
-            .and_then(|raw| check_test_command_shape(raw).ok());
+            .and_then(|raw| check_run_command_shape(raw).ok());
         frontmatter.run_url = frontmatter
             .run_url
             .as_deref()
@@ -98,19 +112,151 @@ impl Spec {
             .as_deref()
             .map(validate_lockfiles)
             .filter(|l| !l.is_empty());
-        frontmatter.environment = frontmatter
-            .environment
-            .as_deref()
-            .map(|e| e.trim().to_ascii_lowercase())
-            .filter(|e| e == "docker" || e == "host");
-        frontmatter.not_in_sandbox = super::schema::valid_sandbox_note(frontmatter.not_in_sandbox.as_deref());
-        Ok(Self { frontmatter, body })
+        frontmatter.environment = frontmatter.environment.as_deref().and_then(valid_environment);
+        frontmatter.not_in_sandbox = valid_sandbox_note(frontmatter.not_in_sandbox.as_deref());
+        frontmatter.nothing_to_run = valid_sandbox_note(frontmatter.nothing_to_run.as_deref());
+        Ok((Self { frontmatter, body }, issues))
     }
 
     /// Gera o conteúdo de `spec.md`, preservando o corpo.
     pub fn render(&self) -> Result<String, SddError> {
         render_doc(&self.frontmatter, &self.body)
     }
+}
+
+/// `environment` reconhecido (`docker` ou `host`, sem diferença de caixa).
+fn valid_environment(raw: &str) -> Option<String> {
+    let env = raw.trim().to_ascii_lowercase();
+    (env == "docker" || env == "host").then_some(env)
+}
+
+/// Campos opcionais do frontmatter que a leitura tolerante descartaria (spec 131 T04). Vazio
+/// equivale a ausente; repetição sem perda (o mesmo glob duas vezes) não é problema.
+fn field_issues(meta: &SpecMeta) -> Vec<FieldIssue> {
+    let mut out = Vec::new();
+    let mut push = |field: &'static str, reason: String| out.push(FieldIssue { field, reason });
+    let filled = |v: &Option<String>| v.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+    if let Some(raw) = filled(&meta.run_command) {
+        if check_run_command_shape(&raw).is_err() {
+            let reason = if raw.chars().count() > RUN_COMMAND_MAX_CHARS {
+                format!(
+                    "tem {} caracteres, acima do limite de {RUN_COMMAND_MAX_CHARS}: ponha o fluxo num script do \
+                     projeto (ex.: `scripts/demo.sh`, criado por uma tarefa) e declare o comando que o chama",
+                    raw.chars().count()
+                )
+            } else {
+                "precisa ser uma linha só, sem caractere de controle".to_string()
+            };
+            push("run_command", reason);
+        }
+    }
+    if let Some(raw) = filled(&meta.run_url) {
+        if check_run_url(&raw).is_none() {
+            push(
+                "run_url",
+                "use http://localhost, http://127.0.0.1 ou http://[::1] com porta explícita de 1024 a 65535 e \
+                 caminho opcional"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(checks) = meta.checks.as_deref().filter(|c| !c.is_empty()) {
+        if validate_checks(checks).is_none() {
+            push(
+                "checks",
+                format!(
+                    "lista inteira descartada: até {MAX_CHECKS} itens, `name` único em [a-z0-9_-] (até 32) e \
+                     `command` numa linha de até {TEST_COMMAND_MAX_CHARS} caracteres"
+                ),
+            );
+        }
+    }
+    if let Some(list) = meta.formatters.as_deref() {
+        let mut names: Vec<&str> = Vec::new();
+        let mut bad: Vec<String> = Vec::new();
+        for f in list {
+            if validate_formatters(std::slice::from_ref(f)).is_empty() {
+                bad.push(format!("`{}` inválido", f.name));
+            } else if names.contains(&f.name.as_str()) {
+                bad.push(format!("`{}` repetido", f.name));
+            } else {
+                names.push(&f.name);
+            }
+        }
+        if names.len() > MAX_FORMATTERS {
+            bad.push(format!("só valem os {MAX_FORMATTERS} primeiros"));
+        }
+        if !bad.is_empty() {
+            push(
+                "formatters",
+                format!(
+                    "{} (cada item: `name` em [a-z0-9_-], `command` numa linha de até {TEST_COMMAND_MAX_CHARS} \
+                     caracteres, `workdir` e `paths` relativos, sem `..`)",
+                    bad.join("; ")
+                ),
+            );
+        }
+    }
+    for (field, list) in [("failure_artifacts", &meta.failure_artifacts), ("screenshots", &meta.screenshots)] {
+        if let Some(reason) = list_issue(list.as_deref(), MAX_FAILURE_ARTIFACTS, normalize_formatter_glob) {
+            push(field, format!("{reason} (globs relativos à raiz, sem `..` nem caminho absoluto)"));
+        }
+    }
+    let reference = |n: &str| {
+        let n = n.trim();
+        super::references::attachment_mime(n).map(|_| n.to_string())
+    };
+    if let Some(reason) = list_issue(meta.references.as_deref(), super::references::MAX_REFERENCES, reference) {
+        push("references", format!("{reason} (nomes de anexos de imagem do chat)"));
+    }
+    let lockfile = |p: &str| validate_lockfiles(&[p.to_string()]).pop();
+    if let Some(reason) = list_issue(meta.lockfiles.as_deref(), MAX_LOCKFILES, lockfile) {
+        push("lockfiles", format!("{reason} (caminhos relativos à raiz, sem `..` e sem glob)"));
+    }
+    for (field, value) in [("full_test_command", &meta.full_test_command), ("install_command", &meta.install_command)] {
+        if let Some(raw) = filled(value) {
+            if check_test_command_shape(&raw) == Err(TestCommandError::Invalid) {
+                push(
+                    field,
+                    format!("precisa ser uma linha só, de até {TEST_COMMAND_MAX_CHARS} caracteres, sem caractere de controle"),
+                );
+            }
+        }
+    }
+    if let Some(raw) = filled(&meta.environment) {
+        if valid_environment(&raw).is_none() {
+            push("environment", "use `docker` ou `host`".to_string());
+        }
+    }
+    for (field, value) in [("not_in_sandbox", &meta.not_in_sandbox), ("nothing_to_run", &meta.nothing_to_run)] {
+        if filled(value).is_some() && valid_sandbox_note(value.as_deref()).is_none() {
+            push(field, format!("uma frase só, de até {MAX_SANDBOX_NOTE_CHARS} caracteres, sem quebra de linha"));
+        }
+    }
+    out
+}
+
+/// Itens de uma lista que a leitura descartaria: os inválidos (por `valid`, que devolve a forma
+/// normalizada) e os que passam do `max` (contados sem repetição). `None` sem perda.
+fn list_issue(list: Option<&[String]>, max: usize, valid: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let list = list?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for item in list {
+        match valid(item) {
+            Some(norm) if !kept.contains(&norm) => kept.push(norm),
+            Some(_) => {}
+            None => bad.push(format!("`{}`", item.trim())),
+        }
+    }
+    let mut parts = Vec::new();
+    if !bad.is_empty() {
+        parts.push(format!("itens inválidos descartados: {}", bad.join(", ")));
+    }
+    if kept.len() > max {
+        parts.push(format!("{} itens, só valem os {max} primeiros", kept.len()));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 impl Task {
@@ -704,6 +850,10 @@ denied_commands:
         let spec = Spec::parse(&content).expect("spec válida");
         assert_eq!(spec.frontmatter.run_command, None);
         assert_eq!(spec.frontmatter.run_url, None);
+        // Spec 131 T04: quem grava sabe o que foi descartado e por quê.
+        let (_, issues) = Spec::parse_with_issues(&content).expect("spec válida");
+        let fields: Vec<&str> = issues.iter().map(|i| i.field).collect();
+        assert_eq!(fields, vec!["run_command", "run_url"]);
         let good = SPEC_EXAMPLE.replace(
             "base_branch: \"main\"\n",
             "base_branch: \"main\"\nrun_command: \"npm start\"\nrun_url: \"http://localhost:3000/\"\n",
@@ -884,6 +1034,64 @@ denied_commands:
             let spec = Spec::parse(&mk(&format!("not_in_sandbox: {bad}\n"))).expect("válida");
             assert!(spec.frontmatter.not_in_sandbox.is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn nothing_to_run_records_the_decision_in_one_short_line() {
+        // Spec 131 T04: a decisão de que não há o que executar; mesma forma do not_in_sandbox.
+        let mk = |f: &str| format!("---\nid: s\ntitle: t\nstatus: DRAFT\nbase_branch: main\ncreated_at: x\n{f}---\ncorpo\n");
+        let ok = Spec::parse(&mk("nothing_to_run: \" Biblioteca: o uso é pelos testes. \"\n")).expect("ok");
+        assert_eq!(ok.frontmatter.nothing_to_run.as_deref(), Some("Biblioteca: o uso é pelos testes."));
+        assert_eq!(Spec::parse(&ok.render().expect("render")).expect("rt"), ok);
+        assert!(!Spec::parse(&mk("")).expect("sem").render().expect("render").contains("nothing_to_run"));
+        let (spec, issues) = Spec::parse_with_issues(&mk("nothing_to_run: \"a\\nb\"\n")).expect("válida");
+        assert!(spec.frontmatter.nothing_to_run.is_none());
+        assert_eq!(issues.iter().map(|i| i.field).collect::<Vec<_>>(), vec!["nothing_to_run"]);
+    }
+
+    #[test]
+    fn every_optional_field_dropped_by_the_reader_is_reported() {
+        // Spec 131 T04: nenhum descarte em silêncio. Vazio equivale a ausente e não é problema.
+        let mk = |f: &str| format!("---\nid: s\ntitle: t\nstatus: DRAFT\nbase_branch: main\ncreated_at: x\n{f}---\ncorpo\n");
+        let fields = |f: &str| -> Vec<&'static str> {
+            Spec::parse_with_issues(&mk(f)).expect("válida").1.iter().map(|i| i.field).collect()
+        };
+        assert!(fields("run_command: \"\"\nrun_url: \"\"\nchecks: []\nformatters: []\nlockfiles: []\n").is_empty());
+        assert!(fields("failure_artifacts: [\"a.log\", \"a.log\"]\n").is_empty(), "repetido não perde nada");
+        let cases: [(&str, &str); 12] = [
+            ("run_command: \"a\\nb\"\n", "run_command"),
+            ("run_url: \"http://localhost:80/\"\n", "run_url"),
+            ("checks: [{name: \"Lint!\", command: \"x\"}]\n", "checks"),
+            ("formatters: [{name: f, command: \"a\\nb\"}]\n", "formatters"),
+            ("failure_artifacts: [\"/abs.log\"]\n", "failure_artifacts"),
+            ("screenshots: [\"../x.png\"]\n", "screenshots"),
+            ("references: [\"a.txt\"]\n", "references"),
+            ("full_test_command: \"a\\nb\"\n", "full_test_command"),
+            ("install_command: \"a\\nb\"\n", "install_command"),
+            ("lockfiles: [\"*.lock\"]\n", "lockfiles"),
+            ("environment: vm\n", "environment"),
+            ("not_in_sandbox: \"a\\nb\"\n", "not_in_sandbox"),
+        ];
+        for (yaml, field) in cases {
+            assert_eq!(fields(yaml), vec![field], "{yaml}");
+        }
+        // Lista acima do máximo: o excesso também é descarte.
+        let globs: Vec<String> = (0..9).map(|i| format!("\"l{i}.log\"")).collect();
+        let issues = Spec::parse_with_issues(&mk(&format!("failure_artifacts: [{}]\n", globs.join(", ")))).expect("ok").1;
+        assert!(issues[0].reason.contains("9 itens, só valem os 8 primeiros"), "{issues:?}");
+    }
+
+    #[test]
+    fn run_command_limit_is_its_own() {
+        // Spec 131 T04: o run_command do Test 9 (cerca de 315 caracteres) cabe; acima de 500, não.
+        let mk = |c: &str| format!("---\nid: s\ntitle: t\nstatus: DRAFT\nbase_branch: main\ncreated_at: x\nrun_command: \"{c}\"\n---\n");
+        let fits = "y".repeat(crate::sdd::RUN_COMMAND_MAX_CHARS);
+        assert_eq!(Spec::parse(&mk(&fits)).expect("ok").frontmatter.run_command.as_deref(), Some(fits.as_str()));
+        let (spec, issues) = Spec::parse_with_issues(&mk(&format!("{fits}y"))).expect("ok");
+        assert!(spec.frontmatter.run_command.is_none());
+        assert!(issues[0].reason.starts_with("tem 501 caracteres"), "{issues:?}");
+        // O test_command continua com o limite de 200.
+        assert_eq!(crate::sdd::TEST_COMMAND_MAX_CHARS, 200);
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub mod lan;
 pub mod lang;
 pub mod live_activity;
 pub mod models_api;
+pub mod models_native;
 pub mod netinfo;
 pub mod plan_changes;
 pub mod plan_consensus;
@@ -313,6 +314,7 @@ mod tests {
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }
     }
 
@@ -873,6 +875,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         };
         let result = config_api::run_handshake_with(&conn, "m".into(), Duration::from_millis(200)).await;
         assert!(!result.ok);
@@ -893,6 +896,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         };
         let result = config_api::run_handshake_with(&conn, "m".into(), Duration::from_secs(5)).await;
         assert_eq!(result.status, Some(429));
@@ -905,6 +909,7 @@ mod tests {
             response_json: false,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         };
         let client = crate::agents::llm_client::LlmClient::from_connection(&conn)
             .expect("cliente")
@@ -949,6 +954,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("test-id"), cfg);
         let req = request(
@@ -1010,6 +1016,7 @@ mod tests {
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("userinfo-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -1030,6 +1037,7 @@ mod tests {
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("legacy-test"), cfg);
         let req = request(
@@ -1158,6 +1166,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "salva".into(),
@@ -1186,6 +1195,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("probe-cache"), cfg);
         let key = super::models_api::CacheKey::new("salva", &base);
@@ -1261,6 +1271,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("probe-f03"), cfg);
         let (status, resp) = call(
@@ -1291,6 +1302,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         };
         let result =
             config_api::run_models_probe_with(&conn, Duration::from_millis(200)).await;
@@ -1389,6 +1401,7 @@ mod tests {
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("query-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -1451,6 +1464,7 @@ mod tests {
             api_key: "sk-outra-chave-9999".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "bad id".into(),
@@ -1551,6 +1565,7 @@ mod tests {
             api_key: "env:sk-abc123segredo".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("env-f11-get"), cfg);
         let (_, listing) = call(&state, get_req("/api/config")).await;
@@ -1592,6 +1607,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&temp_dir("f03"), cfg);
         let body = json!({

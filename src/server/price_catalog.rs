@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::projects::format_utc;
-use crate::config::{PriceSource, Pricing};
+use crate::config::{ConnectionKind, PriceSource, Pricing};
 
 pub const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -72,6 +72,10 @@ pub struct CatalogEntry {
     pub output: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached: Option<f64>,
+    /// Escrita de cache (`cache_creation_input_token_cost` do LiteLLM; spec 132 T02, a Anthropic).
+    /// Ausente no cache antigo ou no modelo sem o dado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
     /// Janela de entrada do modelo em tokens (`max_input_tokens` do LiteLLM; spec 122 T04): base
     /// do limiar do resumo do histórico. Ausente no cache antigo ou no modelo sem o dado.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,6 +123,7 @@ pub fn parse_catalog(raw: &[u8]) -> Option<BTreeMap<String, CatalogEntry>> {
                 input,
                 output,
                 cached: per_mtok(v, "cache_read_input_token_cost"),
+                cache_write: per_mtok(v, "cache_creation_input_token_cost"),
                 context: v.get("max_input_tokens").and_then(serde_json::Value::as_u64).filter(|n| *n > 0),
             },
         );
@@ -126,13 +131,37 @@ pub fn parse_catalog(raw: &[u8]) -> Option<BTreeMap<String, CatalogEntry>> {
     Some(out)
 }
 
+/// Prefixos de provedor com que o LiteLLM grava os modelos da Anthropic e do Gemini pelo AI
+/// Studio (spec 132 T02), tentados quando o id do modelo vem sem prefixo.
+const PROVIDER_PREFIXES: [&str; 2] = ["anthropic/", "gemini/"];
+
+/// Prefixo do catálogo com o preço do próprio provedor do tipo de conexão (spec 132 T02):
+/// `anthropic/` para a Anthropic e `gemini/` (o AI Studio) para o Gemini; nenhum nos outros tipos.
+fn kind_prefix(kind: ConnectionKind) -> Option<&'static str> {
+    match kind {
+        ConnectionKind::Anthropic => Some("anthropic/"),
+        ConnectionKind::GoogleGemini => Some("gemini/"),
+        ConnectionKind::ApiKey | ConnectionKind::ChatgptPlan => None,
+    }
+}
+
 impl Catalog {
-    /// Entrada do modelo: casamento exato; depois sem o prefixo de provedor (`openai/`).
+    /// Entrada do modelo: casamento exato; depois sem o prefixo (`openai/`, `models/`); depois com
+    /// o prefixo de provedor do catálogo ([`PROVIDER_PREFIXES`]: `claude-x` casa `anthropic/claude-x`).
     fn entry(&self, model: &str) -> Option<&CatalogEntry> {
-        self.entries.get(model).or_else(|| {
-            let (_, rest) = model.split_once('/')?;
-            self.entries.get(rest)
-        })
+        self.entry_for(model, ConnectionKind::ApiKey)
+    }
+
+    /// Como [`Self::entry`], mas na conexão nativa o prefixo do provedor dela vem primeiro
+    /// ([`kind_prefix`]): no Gemini, `gemini/<id>` (preço do AI Studio) antes do id exato, que no
+    /// LiteLLM costuma ser o da Vertex; na Anthropic, `anthropic/<id>`.
+    fn entry_for(&self, model: &str, kind: ConnectionKind) -> Option<&CatalogEntry> {
+        let bare = model.split_once('/').map_or(model, |(_, rest)| rest);
+        kind_prefix(kind)
+            .and_then(|p| self.entries.get(&format!("{p}{bare}")))
+            .or_else(|| self.entries.get(model))
+            .or_else(|| self.entries.get(bare))
+            .or_else(|| PROVIDER_PREFIXES.iter().find_map(|p| self.entries.get(&format!("{p}{bare}"))))
     }
 
     /// Janela de entrada do modelo em tokens, quando o catálogo a traz (spec 122 T04).
@@ -140,13 +169,20 @@ impl Catalog {
         self.entry(model).and_then(|e| e.context)
     }
 
-    /// Casamento exato; depois sem o prefixo de provedor (`openai/`). Sem aproximação.
+    /// Casamento exato; depois sem o prefixo, depois com o prefixo de provedor ([`Self::entry`]).
+    /// Sem aproximação.
     pub fn lookup(&self, model: &str) -> Option<Pricing> {
-        let found = self.entry(model)?;
+        self.lookup_for(model, ConnectionKind::ApiKey)
+    }
+
+    /// Como [`Self::lookup`], com a ordem do tipo de conexão do modelo ([`Self::entry_for`]).
+    pub fn lookup_for(&self, model: &str, kind: ConnectionKind) -> Option<Pricing> {
+        let found = self.entry_for(model, kind)?;
         Some(Pricing {
             input_per_mtok: found.input,
             output_per_mtok: found.output,
             cached_input_per_mtok: found.cached,
+            cache_write_per_mtok: found.cache_write,
             web_search_per_call: None,
             image_per_unit: None,
             source: PriceSource::Estimated,
@@ -254,28 +290,33 @@ pub async fn current_catalog(fetcher: &dyn PriceFetcher, dir: &Path, force: bool
 }
 
 /// Aplica estimativas ao mapa: preenche modelos de `models` sem preço e atualiza os já `estimated`
-/// (todos os `estimated` se `refresh`). `manual` nunca muda. Devolve se algo mudou.
+/// (todos os `estimated` se `refresh`). `manual` nunca muda. Devolve se algo mudou. Cada modelo em
+/// uso leva o tipo da conexão dele ([`Catalog::lookup_for`], spec 132 T02); o `estimated` fora de
+/// uso renova como conexão por chave.
 pub fn apply_estimates(
     pricing: &mut BTreeMap<String, Pricing>,
-    models: &[String],
+    models: &[(String, ConnectionKind)],
     catalog: &Catalog,
     refresh: bool,
 ) -> bool {
-    let mut targets: Vec<String> = models.to_vec();
+    let mut targets: Vec<(String, ConnectionKind)> = models.to_vec();
     if refresh {
-        targets.extend(
-            pricing.iter().filter(|(_, p)| p.source == PriceSource::Estimated).map(|(m, _)| m.clone()),
-        );
+        let extra: Vec<(String, ConnectionKind)> = pricing
+            .iter()
+            .filter(|(m, p)| p.source == PriceSource::Estimated && !models.iter().any(|(u, _)| u == *m))
+            .map(|(m, _)| (m.clone(), ConnectionKind::ApiKey))
+            .collect();
+        targets.extend(extra);
     }
     let mut changed = false;
-    for model in targets {
+    for (model, kind) in targets {
         if model.trim().is_empty() {
             continue;
         }
         if pricing.get(&model).is_some_and(|p| p.source == PriceSource::Manual) {
             continue;
         }
-        if let Some(mut est) = catalog.lookup(&model) {
+        if let Some(mut est) = catalog.lookup_for(&model, kind) {
             // Spec 092 T03: o preço por imagem do usuário sobrevive à renovação da estimativa.
             est.image_per_unit = pricing.get(&model).and_then(|p| p.image_per_unit);
             if pricing.get(&model) != Some(&est) {
@@ -364,6 +405,83 @@ mod tests {
         assert!(c.lookup("gpt").is_none());
     }
 
+    /// Formato do LiteLLM para a Anthropic (com e sem prefixo, com escrita de cache) e para o Gemini
+    /// do AI Studio (com o prefixo `gemini/`).
+    const FIXTURE_NATIVOS: &str = r#"{
+      "claude-sonnet-x": {"litellm_provider": "anthropic", "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015, "cache_read_input_token_cost": 0.0000003, "cache_creation_input_token_cost": 0.00000375},
+      "anthropic/claude-haiku-x": {"litellm_provider": "anthropic", "input_cost_per_token": 0.000001, "output_cost_per_token": 0.000005, "cache_read_input_token_cost": 0.0000001, "cache_creation_input_token_cost": 0.00000125},
+      "gemini/gemini-flash-x": {"litellm_provider": "gemini", "input_cost_per_token": 0.0000003, "output_cost_per_token": 0.0000025, "cache_read_input_token_cost": 0.00000003, "max_input_tokens": 1048576}
+    }"#;
+
+    /// Spec 132 T02: modelos da Anthropic e do Gemini casam com e sem o prefixo de provedor, e a
+    /// escrita de cache vem do catálogo.
+    #[test]
+    fn modelos_nativos_casam_com_e_sem_prefixo_e_trazem_a_escrita_de_cache() {
+        let entries = parse_catalog(FIXTURE_NATIVOS.as_bytes()).expect("parse");
+        let c = Catalog { date: "2026-10-27".into(), fetched_at: 0, entries };
+        let close = |a: Option<f64>, b: f64| a.is_some_and(|x| (x - b).abs() < 1e-9);
+        for id in ["claude-sonnet-x", "anthropic/claude-sonnet-x"] {
+            let p = c.lookup(id).expect(id);
+            assert!((p.input_per_mtok - 3.0).abs() < 1e-9, "{id}");
+            assert!(close(p.cached_input_per_mtok, 0.3) && close(p.cache_write_per_mtok, 3.75), "{id}: {p:?}");
+        }
+        for id in ["claude-haiku-x", "anthropic/claude-haiku-x"] {
+            let p = c.lookup(id).expect(id);
+            assert!((p.output_per_mtok - 5.0).abs() < 1e-9 && close(p.cache_write_per_mtok, 1.25), "{id}: {p:?}");
+        }
+        for id in ["gemini-flash-x", "gemini/gemini-flash-x", "models/gemini-flash-x"] {
+            let p = c.lookup(id).expect(id);
+            assert!(close(p.cached_input_per_mtok, 0.03), "{id}: {p:?}");
+            assert_eq!(p.cache_write_per_mtok, None, "{id}: o Gemini não cobra a escrita");
+            assert_eq!(c.context_window(id), Some(1_048_576), "{id}");
+        }
+        assert!(c.lookup("claude-sonnet").is_none(), "sem aproximação");
+        assert!(c.lookup("gemini-flash").is_none(), "sem aproximação");
+        // O cache antigo, sem o campo, continua carregando.
+        let old: CatalogEntry = serde_json::from_str(r#"{"input":1.0,"output":2.0}"#).expect("antigo");
+        assert_eq!(old.cache_write, None);
+    }
+
+    /// Id exato (preço da Vertex no LiteLLM) e prefixado com preços diferentes.
+    const FIXTURE_PRECOS_DIFERENTES: &str = r#"{
+      "gemini-flash-y": {"litellm_provider": "vertex_ai-language-models", "input_cost_per_token": 0.000001, "output_cost_per_token": 0.000004},
+      "gemini/gemini-flash-y": {"litellm_provider": "gemini", "input_cost_per_token": 0.0000003, "output_cost_per_token": 0.0000025},
+      "claude-z": {"litellm_provider": "bedrock", "input_cost_per_token": 0.000009, "output_cost_per_token": 0.00002},
+      "anthropic/claude-z": {"litellm_provider": "anthropic", "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015}
+    }"#;
+
+    /// Spec 132 T02: na conexão Gemini, `gemini/<id>` (AI Studio) vem antes do id exato; na
+    /// Anthropic, `anthropic/<id>`; nos outros tipos, o id exato continua primeiro.
+    #[test]
+    fn tipo_nativo_prefere_o_preco_do_proprio_provedor() {
+        let entries = parse_catalog(FIXTURE_PRECOS_DIFERENTES.as_bytes()).expect("parse");
+        let c = Catalog { date: "2026-10-27".into(), fetched_at: 0, entries };
+        let input = |m: &str, k: ConnectionKind| c.lookup_for(m, k).map(|p| p.input_per_mtok);
+        assert_eq!(input("gemini-flash-y", ConnectionKind::GoogleGemini), Some(0.3));
+        assert_eq!(input("models/gemini-flash-y", ConnectionKind::GoogleGemini), Some(0.3));
+        assert_eq!(input("claude-z", ConnectionKind::Anthropic), Some(3.0));
+        for kind in [ConnectionKind::ApiKey, ConnectionKind::ChatgptPlan] {
+            assert_eq!(input("gemini-flash-y", kind), Some(1.0), "{kind:?}: exato primeiro");
+            assert_eq!(input("claude-z", kind), Some(9.0), "{kind:?}: exato primeiro");
+        }
+        assert_eq!(c.lookup("gemini-flash-y").map(|p| p.input_per_mtok), Some(1.0), "lookup = por chave");
+        // Sem a entrada do provedor, o nativo cai no id exato.
+        assert_eq!(input("claude-z", ConnectionKind::GoogleGemini), Some(9.0));
+
+        // apply_estimates usa o tipo de cada modelo em uso; o estimado fora de uso renova por chave.
+        let mut map = BTreeMap::new();
+        let models = vec![
+            ("gemini-flash-y".to_string(), ConnectionKind::GoogleGemini),
+            ("claude-z".to_string(), ConnectionKind::Anthropic),
+        ];
+        assert!(apply_estimates(&mut map, &models, &c, true));
+        assert_eq!(map["gemini-flash-y"].input_per_mtok, 0.3);
+        assert_eq!(map["claude-z"].input_per_mtok, 3.0);
+        assert!(!apply_estimates(&mut map, &models, &c, true), "a renovação não volta ao id exato");
+        assert!(apply_estimates(&mut map, &[], &c, true), "fora de uso: renova como conexão por chave");
+        assert_eq!(map["gemini-flash-y"].input_per_mtok, 1.0);
+    }
+
     #[tokio::test]
     async fn cache_ttl_e_fallback() {
         let dir = tmp("cache");
@@ -424,13 +542,15 @@ mod tests {
             input_per_mtok: 9.0,
             output_per_mtok: 9.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             web_search_per_call: None,
             image_per_unit: None,
             source: PriceSource::Manual,
             estimated_at: None,
         };
         let mut map = BTreeMap::from([("gpt-4o".to_string(), manual.clone())]);
-        let models = vec!["gpt-4o".to_string(), "claude-x".to_string(), "desconhecido".to_string()];
+        let models: Vec<(String, ConnectionKind)> =
+            ["gpt-4o", "claude-x", "desconhecido"].iter().map(|m| (m.to_string(), ConnectionKind::ApiKey)).collect();
         assert!(apply_estimates(&mut map, &models, &c, true));
         assert_eq!(map["gpt-4o"], manual);
         assert_eq!(map["claude-x"].source, PriceSource::Estimated);

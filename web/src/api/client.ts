@@ -30,6 +30,7 @@ import type {
   ToolActionsView,
   ChatgptStartResult,
   ConnectionInput,
+  ConnectionKind,
   ConnectionView,
   ModelsResult,
   PrereqItem,
@@ -556,10 +557,12 @@ export function putPricing(pricing: Record<string, ModelPricing>): Promise<ApiRe
 }
 
 /** GET /api/config/pricing/estimate?models=a,b (estimativas do catálogo; não grava). */
-export function getPriceEstimate(models: string[]): Promise<ApiResult<Record<string, ModelPricing>>> {
+export function getPriceEstimate(models: string[], opts?: { kind?: ConnectionKind }): Promise<ApiResult<Record<string, ModelPricing>>> {
+  // `kind` (spec 132 T10): o preço pelo tipo da conexão, para modelos ainda fora de uso.
+  const kind = opts?.kind !== undefined ? `&kind=${encodeURIComponent(opts.kind)}` : "";
   return request<Record<string, ModelPricing>>({
     method: "GET",
-    path: `/api/config/pricing/estimate?models=${encodeURIComponent(models.join(","))}`,
+    path: `/api/config/pricing/estimate?models=${encodeURIComponent(models.join(","))}${kind}`,
     timeoutMs: 30_000,
   }).then((r) => asObject<Record<string, ModelPricing>>(r));
 }
@@ -1757,6 +1760,13 @@ export interface AppGuide {
   runsHere: boolean;
   /** O que o Arquiteto escreveu sobre isso (redigido). */
   sandboxNote: string | null;
+  /**
+   * Spec 131 T05: `false` quando a spec não declara `run_command` (as janelas abrem no Console,
+   * sem "Iniciar"). Ausente na resposta (servidor antigo) vale `true`.
+   */
+  runDeclared: boolean;
+  /** A decisão "nada a executar" do plano (`nothing_to_run`, redigida), ou `null`. */
+  nothingToRun: string | null;
 }
 
 function toGuide(value: unknown): AppGuide | null {
@@ -1771,6 +1781,7 @@ function toGuide(value: unknown): AppGuide | null {
     }
   }
   const sandbox = isRecord(value.sandbox) ? value.sandbox : {};
+  const run = isRecord(value.run) ? value.run : {};
   return {
     howToUse:
       how === null
@@ -1784,6 +1795,8 @@ function toGuide(value: unknown): AppGuide | null {
     capturesTotal: Math.max(nonNegative(proofs.captures_total), captures.length),
     runsHere: sandbox.runs_here !== false,
     sandboxNote: isString(sandbox.note) && sandbox.note.trim() !== "" ? sandbox.note.slice(0, 4000) : null,
+    runDeclared: run.declared !== false,
+    nothingToRun: isString(run.nothing_to_run) && run.nothing_to_run.trim() !== "" ? run.nothing_to_run.slice(0, 4000) : null,
   };
 }
 

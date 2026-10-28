@@ -59,7 +59,7 @@ const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-dock-btn", "ícone do dock (neutro, estado pelo ponto)"],
   ["nd-tab", "aba (Atividade e outras janelas)"],
   ["nd-settings-tab", "aba de Configurações"],
-  ["nd-segment-btn", "segmento de controle segmentado (Arquivos)"],
+  ["nd-segment-item", "item do controle segmentado (Console e Arquivos; nas Configurações é um rótulo de rádio)"],
   ["nd-choice", "opção visual em grade (Aparência)"],
   ["nd-conn-method", "cartão de como conectar (chave de API ou plano ChatGPT, spec 116)"],
   ["nd-link", "link em linha (trilha de pastas)"],

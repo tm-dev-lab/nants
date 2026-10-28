@@ -162,7 +162,17 @@ export function pickActiveTask(tasks: readonly TaskView[]): TaskView | null {
  * Motivo curto da pausa: o provedor falhou, a pessoa parou, erro interno, interrupção sem aviso
  * (servidor reiniciado) ou, com a execução viva, um pedido esperando a decisão da pessoa.
  */
-export type PauseReason = "provider" | "plan_limit" | "plan_not_eligible" | "plan_sign_in" | "stopped" | "failed" | "interrupted" | "decision";
+export type PauseReason =
+  | "provider"
+  | "plan_limit"
+  | "plan_not_eligible"
+  | "plan_sign_in"
+  | "spend_limit"
+  | "daily_quota"
+  | "stopped"
+  | "failed"
+  | "interrupted"
+  | "decision";
 
 /** Estados em que a tarefa está com um agente: parada a execução, ela fica pausada (não "em andamento"). */
 const HALTABLE: ReadonlySet<string> = new Set(["IN_PROGRESS", "IN_REVIEW", "CHANGES_REQUESTED", "APPROVED", "INTEGRATING"]);
@@ -176,6 +186,9 @@ const STOP_CODES: Readonly<Record<string, PauseReason>> = {
   "run.plan_limit": "plan_limit",
   "run.plan_not_eligible": "plan_not_eligible",
   "run.plan_needs_login": "plan_sign_in",
+  // Limites do provedor que pausam (spec 132 T09).
+  "run.spend_limit": "spend_limit",
+  "run.daily_quota": "daily_quota",
   "run.failed": "failed",
   "run.failed_cause": "failed",
 };
@@ -231,6 +244,8 @@ const PAUSE_REASON_KEY: Readonly<Record<PauseReason, MessageKey>> = {
   plan_limit: "board.pause.planLimit",
   plan_not_eligible: "board.pause.planNotEligible",
   plan_sign_in: "board.pause.planNeedsLogin",
+  spend_limit: "board.pause.spendLimit",
+  daily_quota: "board.pause.dailyQuota",
   stopped: "board.pause.stopped",
   failed: "board.pause.failed",
   interrupted: "board.pause.interrupted",

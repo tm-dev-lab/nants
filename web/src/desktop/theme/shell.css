@@ -907,6 +907,12 @@
   color: var(--pill-amber-ink);
 }
 
+/*
+ * Controle segmentado (131/T07): uma classe só para o item, botão (`aria-pressed`) ou rótulo de
+ * rádio (`data-checked`). O raio do item é o da barra menos o padding (`--r-md` − `--sp-1` =
+ * `--r-xs`; no celular, `--r-lg` − `--sp-1` = `--r-md`, em `mobile.css`), e o item ocupa a altura
+ * da faixa, centrado nela. O texto fica num `<span>` filho, que corta com reticências.
+ */
 .nd-segment {
   display: inline-flex;
   gap: var(--sp-1);
@@ -917,17 +923,30 @@
 
 .nd-segment-item {
   min-height: 24px;
+  min-width: 0;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   padding: 0 var(--sp-2);
+  border: 0;
   border-radius: var(--r-xs);
-  font-size: var(--fs-label);
+  background: transparent;
   color: var(--ink3);
+  font: var(--fs-label) var(--font-sans);
   cursor: pointer;
 }
 
-.nd-segment-item:focus-within {
+.nd-segment-item > span {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-root .nd-segment-item:focus-visible,
+.nd-root .nd-segment-item:has(> input:focus-visible) {
   outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
   box-shadow: 0 0 0 2px var(--focus-inner);
 }
 

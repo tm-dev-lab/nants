@@ -68,7 +68,7 @@ function row(id: string): HTMLElement {
 }
 
 describe("Como conectar", () => {
-  it("dois cartões; o do plano diz só a frase curta e tem o botão (sem logo); chave de API segue para o formulário", async () => {
+  it("quatro cartões (spec 132); o do plano diz só a frase curta e tem o botão (sem logo); chave de API segue para o formulário", async () => {
     await openSettings();
     await act(async () => {
       fireEvent.click(within(settings()).getByRole("button", { name: "Nova conexão" }));
@@ -77,11 +77,14 @@ describe("Como conectar", () => {
     if (step === null) throw new Error("passo ausente");
     expect(within(step).getByText("Como conectar")).toBeTruthy();
     const plan = step.querySelector<HTMLElement>('[data-method="chatgpt_plan"]');
-    expect(plan?.textContent).toBe("Plano ChatGPT (Plus ou Pro)Use o plano da sua conta ChatGPT, sem chave.Continue with ChatGPT");
+    expect(plan?.textContent).toBe("Plano ChatGPTUse o plano Plus ou Pro da sua conta ChatGPT, sem chave.Continue with ChatGPT");
     expect(plan?.querySelector("img")).toBeNull();
-    expect(within(step).getByRole("button", { name: /^Chave de API/ }).textContent).toBe("Chave de APIOpenAI, Azure e outros compatíveis.");
+    expect(within(step).getByRole("button", { name: /^OpenAI ou compatível/ }).textContent).toBe(
+      "OpenAI ou compatível (chave de API)OpenAI, Azure, OpenRouter e servidores locais com a API da OpenAI.",
+    );
+    expect([...step.querySelectorAll("[data-method]")].map((el) => el.getAttribute("data-method"))).toEqual(["api_key", "anthropic", "google_gemini", "chatgpt_plan"]);
     expect(findForbiddenGlyphs(step)).toEqual([]);
-    fireEvent.click(within(step).getByRole("button", { name: /^Chave de API/ }));
+    fireEvent.click(within(step).getByRole("button", { name: /^OpenAI ou compatível/ }));
     expect(within(settings()).getByLabelText("URL base")).toBeTruthy();
     // "Cancelar" do formulário volta à escolha.
     fireEvent.click(within(settings()).getByRole("button", { name: "Cancelar" }));

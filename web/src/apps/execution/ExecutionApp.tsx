@@ -17,6 +17,8 @@
  * - spec 130: a pílula diz a forma (no ar com página, rodando sem página, terminou com o código);
  *   "Abrir o Console" mostra o Console do projeto na janela App; com a falha do ambiente guardada no
  *   servidor, "Pedir ao Arquiteto para corrigir" leva à Conversa.
+ * - spec 131 T05: sem `run_command` (ou com a decisão `nothing_to_run`), a Execução abre no Console
+ *   do projeto, com o "Como usar" e as provas, sem "Iniciar" nem o erro.
  * Todo texto do servidor é renderizado como texto React.
  */
 import "./execution.css";
@@ -43,13 +45,15 @@ import {
   urlPort,
   type RunPhase,
 } from "../app/appModel";
-import { FixButton } from "../app/RunViews";
+import { FixButton, SandboxView } from "../app/RunViews";
 import { rangeReleased } from "../../desktop/network";
 import { useNetworkView } from "../../desktop/useNetwork";
 import type { AppPort } from "../../api/client";
 import { noticeText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
-import { canStart, reachEnvironment, runProblemText, useRunSession } from "../app/runSession";
+import { ConsolePanel } from "../app/ConsolePanel";
+import { canStart, consoleOnly, reachEnvironment, runProblemText, useRunSession } from "../app/runSession";
+import { guideRunDeclared, guideRunsHere, useAppGuide } from "../app/useAppGuide";
 import type { AppContentProps } from "../registry";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
@@ -222,135 +226,177 @@ export function ExecutionPanel({ projectId, specId, projectPath, size }: PanelPr
     !remote ? null : range !== null ? reachRangeNote(range) : reachPortNote(urlPort(p.url) ?? String(p.published));
   const noOutput = logs === null || logs === "";
   const reason = specId === null ? t("exec.noSpecReason") : null;
+  const guide = useAppGuide(projectId, specId, visible);
+
+  // Spec 131 T05: sem `run_command`, a Execução abre no Console (o mesmo do App), sem "Iniciar".
+  // O que não roda no sandbox (spec 130) tem precedência: sem `run_command`, a explicação do App,
+  // que já oferece "Abrir o Console"; com ele, o cartão de sempre.
+  const runsHere = guideRunsHere(guide);
+  const noRun = specId !== null && runsHere && consoleOnly(snap, guideRunDeclared(guide));
+  const sandboxed = specId !== null && !runsHere && !guideRunDeclared(guide) && phase.kind === "stopped" && !snap.confirming;
+  // Enquanto o guia não responde, nem "Iniciar" nem o Console (sem piscar); se ele falhar, vale o
+  // cartão de sempre.
+  const guideLoading = specId !== null && guide?.status === "loading" && phase.kind === "stopped" && !snap.confirming;
 
   return (
-    <div className="nd-exec nd-app-scroll" data-execution="" data-size={size}>
-      <section className="nd-exec-card" aria-label={t("exec.card")} data-run-panel="">
-        <div className="nd-exec-card-text">
-          <span className="nd-exec-spec">{specId ?? t("exec.noCompletedSpec")}</span>
-          <span className="nd-exec-line">{port !== null ? t("exec.composePort", { port: port.published }) : "docker compose up"}</span>
-          {phase.kind === "exited" ? <span className="nd-exec-line">{appExitedText(phase.code, phase.reason)}</span> : null}
-          {reason !== null ? (
-            <span id={reasonId} className="nd-exec-line">
-              {reason}
-            </span>
-          ) : null}
-        </div>
-        <StatePill phase={phase} />
-        {startable ? (
-          <button
-            type="button"
-            className="nd-btn"
-            data-variant="primary"
-            disabled={specId === null || blocked}
-            aria-describedby={reason !== null ? reasonId : undefined}
-            onClick={actions.requestStart}
-          >
-            <Icon name="play" size={14} />
-            {t("exec.start")}
-          </button>
-        ) : null}
-        {phase.kind === "running" || phase.kind === "other" ? (
-          <button type="button" className="nd-btn" data-variant="danger" onClick={actions.stop} disabled={snap.stopping} aria-busy={snap.stopping}>
-            <Icon name="stop" size={14} />
-            {t(snap.stopping ? "run.stopping" : "run.stop")}
-          </button>
-        ) : null}
-        {specId !== null ? (
-          <button
-            type="button"
-            className="nd-btn"
-            data-variant="ghost"
-            data-open-console=""
-            onClick={() => {
-              actions.openConsole();
-              shell.openWindow("app");
-            }}
-          >
-            <Icon name="terminal" size={14} />
-            {t("app.openConsole")}
-          </button>
-        ) : null}
-      </section>
-      {ports.length > 0 ? (
-        <ul aria-label={t("exec.ports")} className="nd-exec-ports">
-          {ports.map((p) => (
-            <PortRow
-              key={`${p.service}:${p.published}`}
-              port={p}
-              note={portNote(p)}
-              onOpenInApp={() => {
-                actions.showPort(p.url);
-                shell.openWindow("app");
-              }}
-            />
-          ))}
-        </ul>
-      ) : null}
-      {phase.kind === "running" && snap.notices.length > 0 ? (
-        <p role="status" aria-label={t("exec.portNotice")} className="nd-strip" data-tone="amber">
-          {snap.notices.map((notice) => noticeText(notice, notice.text)).join(" ")}
-        </p>
-      ) : null}
-      {startable && specId !== null && blocked && shell.readiness !== null ? (
-        <ReadinessNotice title={t("exec.blockedTitle")} missing={shell.readiness.execute.missing} />
-      ) : null}
-      {snap.problem !== null ? <ProblemNotice message={runProblemText(snap.problem)} missing={snap.problem.missing} prereq={snap.problem.prereq} /> : null}
-      {askable ? (
-        <div className="nd-exec-fix" data-exec-fix="">
-          <FixButton run={run} primary={false} />
-        </div>
-      ) : null}
-      {snap.problem !== null && snap.errorDetail !== null ? (
-        <details className="nd-details nd-exec-detail">
-          <summary>
-            <Icon name="chevron-right" size={14} className="nd-details-chevron" />
-            {t("exec.details")}
-          </summary>
-          <pre aria-label={t("exec.detailsLabel")} className="nd-mono nd-prewrap">
-            {snap.errorDetail}
-          </pre>
-        </details>
-      ) : null}
-      <section className="nd-exec-console" aria-label="Console" data-exec-console="">
-        <div className="nd-exec-console-head">
-          <span className="nd-exec-console-title">{t("exec.log")}</span>
-          <button
-            type="button"
-            className="nd-btn nd-btn-sm"
-            data-variant="ghost"
-            disabled={noOutput}
-            onClick={() => {
-              void copyText(logs ?? "").then((ok) => setCopied(ok));
-            }}
-          >
-            <Icon name={copied ? "check" : "copy"} size={14} />
-            {copied ? t("result.copied") : t("exec.copyLog")}
-          </button>
-        </div>
-        <div className="nd-exec-console-body">
-          <AutoScrollBox
-            items={NO_ITEMS}
-            tailKey={logs}
-            label={t("exec.logLabel")}
-            className="nd-app-log nd-mono"
-            scrollAttrs={{ role: "log", "aria-live": "off", "data-run-log": "" }}
-          >
-            {noOutput ? t("exec.noOutput") : logs}
-          </AutoScrollBox>
-        </div>
-      </section>
-      <p className="nd-exec-hint" data-exec-hint="">
-        <Icon name="info" size={14} />
-        <span>{t("exec.hint")}</span>
-      </p>
-      {snap.confirming ? (
-        <ConfirmRunDialog
-          projectPath={projectPath}
-          onCancel={actions.cancelStart}
-          onConfirm={() => actions.confirmStart({ readiness: shell.readiness, reloadReadiness: shell.reloadReadiness })}
+    <div className="nd-exec nd-app-scroll" data-execution="" data-size={size} data-exec-view={noRun ? "console" : undefined}>
+      {noRun ? (
+        <ConsolePanel
+          projectId={projectId}
+          specId={specId}
+          compact={size === "narrow"}
+          visible={visible}
+          guide={guide}
+          run={run}
+          headAction={null}
+          noRun={{ decision: guide?.status === "ok" ? guide.guide.nothingToRun : null }}
         />
-      ) : null}
+      ) : sandboxed ? (
+        <SandboxView
+          projectId={projectId}
+          specId={specId}
+          guide={guide}
+          onOpenConsole={() => {
+            actions.openConsole();
+            shell.openWindow("app");
+          }}
+        />
+      ) : guideLoading ? (
+        <section className="nd-runview" data-runview="loading" aria-busy="true">
+          <p className="nd-runview-muted" role="status">
+            {t("runview.loadingGuide")}
+          </p>
+        </section>
+      ) : (
+        <>
+          <section className="nd-exec-card" aria-label={t("exec.card")} data-run-panel="">
+            <div className="nd-exec-card-text">
+              <span className="nd-exec-spec">{specId ?? t("exec.noCompletedSpec")}</span>
+              <span className="nd-exec-line">{port !== null ? t("exec.composePort", { port: port.published }) : "docker compose up"}</span>
+              {phase.kind === "exited" ? <span className="nd-exec-line">{appExitedText(phase.code, phase.reason)}</span> : null}
+              {reason !== null ? (
+                <span id={reasonId} className="nd-exec-line">
+                  {reason}
+                </span>
+              ) : null}
+            </div>
+            <StatePill phase={phase} />
+            {startable ? (
+              <button
+                type="button"
+                className="nd-btn"
+                data-variant="primary"
+                disabled={specId === null || blocked}
+                aria-describedby={reason !== null ? reasonId : undefined}
+                onClick={actions.requestStart}
+              >
+                <Icon name="play" size={14} />
+                {t("exec.start")}
+              </button>
+            ) : null}
+            {phase.kind === "running" || phase.kind === "other" ? (
+              <button type="button" className="nd-btn" data-variant="danger" onClick={actions.stop} disabled={snap.stopping} aria-busy={snap.stopping}>
+                <Icon name="stop" size={14} />
+                {t(snap.stopping ? "run.stopping" : "run.stop")}
+              </button>
+            ) : null}
+            {specId !== null ? (
+              <button
+                type="button"
+                className="nd-btn"
+                data-variant="ghost"
+                data-open-console=""
+                onClick={() => {
+                  actions.openConsole();
+                  shell.openWindow("app");
+                }}
+              >
+                <Icon name="terminal" size={14} />
+                {t("app.openConsole")}
+              </button>
+            ) : null}
+          </section>
+          {ports.length > 0 ? (
+            <ul aria-label={t("exec.ports")} className="nd-exec-ports">
+              {ports.map((p) => (
+                <PortRow
+                  key={`${p.service}:${p.published}`}
+                  port={p}
+                  note={portNote(p)}
+                  onOpenInApp={() => {
+                    actions.showPort(p.url);
+                    shell.openWindow("app");
+                  }}
+                />
+              ))}
+            </ul>
+          ) : null}
+          {phase.kind === "running" && snap.notices.length > 0 ? (
+            <p role="status" aria-label={t("exec.portNotice")} className="nd-strip" data-tone="amber">
+              {snap.notices.map((notice) => noticeText(notice, notice.text)).join(" ")}
+            </p>
+          ) : null}
+          {startable && specId !== null && blocked && shell.readiness !== null ? (
+            <ReadinessNotice title={t("exec.blockedTitle")} missing={shell.readiness.execute.missing} />
+          ) : null}
+          {snap.problem !== null ? <ProblemNotice message={runProblemText(snap.problem)} missing={snap.problem.missing} prereq={snap.problem.prereq} /> : null}
+          {askable ? (
+            <div className="nd-exec-fix" data-exec-fix="">
+              <FixButton run={run} primary={false} />
+            </div>
+          ) : null}
+          {snap.problem !== null && snap.errorDetail !== null ? (
+            <details className="nd-details nd-exec-detail">
+              <summary>
+                <Icon name="chevron-right" size={14} className="nd-details-chevron" />
+                {t("exec.details")}
+              </summary>
+              <pre aria-label={t("exec.detailsLabel")} className="nd-mono nd-prewrap">
+                {snap.errorDetail}
+              </pre>
+            </details>
+          ) : null}
+          <section className="nd-exec-console" aria-label="Console" data-exec-console="">
+            <div className="nd-exec-console-head">
+              <span className="nd-exec-console-title">{t("exec.log")}</span>
+              <button
+                type="button"
+                className="nd-btn nd-btn-sm"
+                data-variant="ghost"
+                disabled={noOutput}
+                onClick={() => {
+                  void copyText(logs ?? "").then((ok) => setCopied(ok));
+                }}
+              >
+                <Icon name={copied ? "check" : "copy"} size={14} />
+                {copied ? t("result.copied") : t("exec.copyLog")}
+              </button>
+            </div>
+            <div className="nd-exec-console-body">
+              <AutoScrollBox
+                items={NO_ITEMS}
+                tailKey={logs}
+                label={t("exec.logLabel")}
+                className="nd-app-log nd-mono"
+                scrollAttrs={{ role: "log", "aria-live": "off", "data-run-log": "" }}
+              >
+                {noOutput ? t("exec.noOutput") : logs}
+              </AutoScrollBox>
+            </div>
+          </section>
+          <p className="nd-exec-hint" data-exec-hint="">
+            <Icon name="info" size={14} />
+            <span>{t("exec.hint")}</span>
+          </p>
+          {snap.confirming ? (
+            <ConfirmRunDialog
+              projectPath={projectPath}
+              onCancel={actions.cancelStart}
+              onConfirm={() => actions.confirmStart({ readiness: shell.readiness, reloadReadiness: shell.reloadReadiness })}
+            />
+          ) : null}
+        </>
+      )}
     </div>
   );
 }

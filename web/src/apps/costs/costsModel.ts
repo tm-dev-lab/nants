@@ -29,6 +29,14 @@ export function tokensText(u: Pick<UsageTotals, "input" | "output">): string {
   return t("costs.tokensLine", { input: formatTokens(u.input), output: formatTokens(u.output) });
 }
 
+/**
+ * Linha do cache (spec 132): os tokens lidos do cache e os gravados nele (a escrita, que a Anthropic
+ * cobra à parte). Os dois estão contidos na entrada.
+ */
+export function cacheText(u: Pick<UsageTotals, "cached" | "cache_write">): string {
+  return t("costs.cacheLine", { read: formatTokens(u.cached), written: formatTokens(u.cache_write ?? 0) });
+}
+
 /** "1,2 mil tokens" no idioma ativo. */
 export function tokensValue(n: number): string {
   return t("costs.tokens", { value: formatTokens(n) });

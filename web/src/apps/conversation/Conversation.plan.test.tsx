@@ -13,6 +13,7 @@ import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
 import { authNavigation } from "../settings/PlanConnection";
+import { ANTHROPIC_LIMITS_URL } from "../../settings/rules";
 
 afterEach(() => {
   cleanup();
@@ -119,5 +120,50 @@ describe("pausa pelo plano", () => {
     await settle();
     expect(within(card()).getByText("Execução parada")).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "Limite de uso atingido" })).toBeNull();
+  });
+});
+
+describe("pausa pelos limites do provedor (spec 132 T09/T10)", () => {
+  it("teto de gasto da Anthropic: título, o que fazer, o console e Continuar", async () => {
+    await open([KEY]);
+    stopWith("run.spend_limit");
+    await settle();
+    const article = card();
+    expect(within(article).getByRole("heading", { name: "Teto de gasto atingido" })).toBeTruthy();
+    expect(article.textContent).toContain("Aumente o limite no console dela e use Continuar.");
+    expect(within(article).getByRole("link", { name: "Abrir os limites da Anthropic" }).getAttribute("href")).toBe(ANTHROPIC_LIMITS_URL);
+    expect(within(article).getByRole("button", { name: "Continuar" })).toBeTruthy();
+    expect(within(article).queryByRole("link", { name: "Gerenciar uso" })).toBeNull();
+    expect(findForbiddenGlyphs(article)).toEqual([]);
+  });
+
+  it("cota diária do Gemini: esperar o dia virar ou trocar de conexão, que abre Agentes", async () => {
+    await open([KEY]);
+    stopWith("run.daily_quota");
+    await settle();
+    const article = card();
+    expect(within(article).getByRole("heading", { name: "Cota diária esgotada" })).toBeTruthy();
+    expect(article.textContent).toContain("quando o dia virar e a cota renovar");
+    expect(within(article).getByRole("button", { name: "Continuar" })).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(article).getByRole("button", { name: "Trocar de conexão" }));
+    });
+    await settle();
+    const settings = screen.getByRole("region", { name: "Configurações" });
+    expect(within(settings).getByRole("tab", { name: /Agentes/, selected: true })).toBeTruthy();
+  });
+
+  it("em en", async () => {
+    setLanguage("en", { persist: false });
+    await open([KEY]);
+    stopWith("run.spend_limit");
+    await settle();
+    expect(within(card()).getByRole("heading", { name: "Spend limit reached" })).toBeTruthy();
+    expect(within(card()).getByRole("link", { name: "Open the Anthropic limits" })).toBeTruthy();
+    stopWith("run.daily_quota");
+    await settle();
+    expect(within(card()).getByRole("heading", { name: "Daily quota used up" })).toBeTruthy();
+    expect(within(card()).getByRole("button", { name: "Switch connection" })).toBeTruthy();
+    expect(within(card()).getByRole("button", { name: "Continue" })).toBeTruthy();
   });
 });

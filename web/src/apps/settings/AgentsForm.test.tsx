@@ -109,6 +109,22 @@ async function waitForOptions(region: HTMLElement, count: number) {
   return user;
 }
 
+describe("AgentsForm: dica do esforço por provedor (spec 132 T10)", () => {
+  it("três níveis e, abaixo, a dica do provedor da conexão do papel", () => {
+    installFetch(routes());
+    const anthropic: ConnectionView = { id: "claude", name: "Claude", base_url: "https://api.anthropic.com", api_key_masked: "****", kind: "anthropic" };
+    const gemini: ConnectionView = { id: "gem", name: "Gemini", base_url: "https://generativelanguage.googleapis.com", api_key_masked: "****", kind: "google_gemini" };
+    renderPanel(agents({ architect: { connection_id: "claude" }, developer: { connection_id: "gem" } }), [openai, anthropic, gemini]);
+    const hint = (role: string) => roleRegion(role).querySelector("[data-effort-hint]");
+    expect(within(roleRegion("Arquiteto")).getAllByRole("radio")).toHaveLength(3);
+    expect(hint("Arquiteto")?.getAttribute("data-effort-hint")).toBe("anthropic");
+    expect(hint("Arquiteto")?.textContent).toBe("Anthropic: o esforço define quanto o Claude raciocina antes de responder.");
+    expect(hint("Desenvolvedor")?.getAttribute("data-effort-hint")).toBe("google_gemini");
+    // O Revisor está numa conexão que não existe mais: sem dica.
+    expect(hint("Revisor")).toBeNull();
+  });
+});
+
 describe("AgentsForm: lista de modelos", () => {
   it("carrega os modelos da conexão salva e lista como opções filtráveis", async () => {
     const fetchMock = installFetch(routes());

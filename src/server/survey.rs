@@ -390,6 +390,7 @@ mod tests {
             api_key: "sk-x".into(),
             wire_api: WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig { connection_id: "c".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
         cfg.projects.push(Project {

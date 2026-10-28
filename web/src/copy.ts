@@ -154,6 +154,8 @@ const PROVIDER_FIXED_CODES: ReadonlySet<string> = new Set([
   "provider_plan_limit",
   "provider_plan_not_eligible",
   "provider_plan_needs_login",
+  "provider_spend_limit",
+  "provider_daily_quota",
 ]);
 
 /** Dica de limite (spec 089) para `provider_bad_response` com detalhe "provedor no limite…" (reserva pt-BR). */
@@ -271,6 +273,11 @@ export function providerFailureMessage(
       return t("providerMsg.planNotEligible");
     case "provider_plan_needs_login":
       return t("providerMsg.planNeedsLogin");
+    // Limites que pausam (spec 132 T09): o teto de gasto da Anthropic e a cota diária do Gemini.
+    case "provider_spend_limit":
+      return t("providerMsg.spendLimit");
+    case "provider_daily_quota":
+      return t("providerMsg.dailyQuota");
     default:
       return null;
   }

@@ -116,7 +116,7 @@ pub fn normalize_plan_models(body: &Value, secret: &str) -> Option<ModelList> {
             .and_then(Value::as_str)
             .filter(|n| valid_text(n, secret))
             .map(|n| n.trim().to_string());
-        models.push(ModelInfo { id: slug.to_string(), name });
+        models.push(ModelInfo { id: slug.to_string(), name, ..ModelInfo::default() });
     }
     if !visible.is_empty() && models.is_empty() {
         return None;

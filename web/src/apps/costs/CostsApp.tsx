@@ -7,7 +7,8 @@
  *   do projeto e uma da spec ativa (compactações, resumos e os tokens evitados, estimativa); em
  *   "Ver detalhes do contexto" (recolhido), por projeto e spec, chamadas, entrada média, maior
  *   contexto, cache, os eventos por tipo e os tokens evitados, com a nota da estimativa;
- * - "Ver detalhes por tarefa e modelo" (`<details>` recolhido): tokens e chamadas, barras por papel
+ * - "Ver detalhes por tarefa e modelo" (`<details>` recolhido): tokens e chamadas, o cache (lido e
+ *   gravado, quando o provedor informa a escrita; spec 132), barras por papel
  *   e por tarefa, o ritmo do provedor, a tabela por categoria com TOTAL, as chamadas sem preço com
  *   "Configurar", as buscas na web, as imagens, por agente e por modelo;
  * - orçamento da spec (`<details>` recolhido): o formulário do limite, editável.
@@ -40,6 +41,7 @@ import {
   contextEffectText,
   contextRows,
   costBars,
+  cacheText,
   costText,
   hasApiConsumption,
   hasConsumption,
@@ -183,6 +185,11 @@ function CostsContentView({ size }: AppContentProps) {
           </summary>
           <div className="nd-costs-more-body">
             <p className="nd-muted nd-num" data-costs-tokens="">{`${tokensText(totals)} · ${tp("costs.calls", totals.calls)}`}</p>
+            {(totals.cache_write ?? 0) > 0 ? (
+              <p className="nd-muted nd-num" data-costs-cache="">
+                {cacheText(totals)}
+              </p>
+            ) : null}
             <Bars title={t("costs.byRole")} bars={costBars(project.by_agent ?? [], agentLabel)} />
             {specUsage !== undefined && specUsage.tasks.length > 0 ? (
               <Bars title={t("costs.byTask", { spec: spec?.id ?? "" })} bars={costBars(specUsage.tasks, taskTitle)} />

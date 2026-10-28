@@ -276,6 +276,7 @@ fn state_with_reviewer(dir: &Path, ids: &[&str]) -> AppState {
         api_key: "sk-teste-atencao-0123456789".into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.agents.reviewer = AgentConfig { connection_id: "c".into(), model: "rev".into(), effort: Effort::Medium, max_steps: None };
     AppState::new(dir.join("config.toml"), cfg, 3000).with_data_dir(dir.join("data"))

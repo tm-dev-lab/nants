@@ -338,6 +338,7 @@ async fn long_readme_is_truncated_and_redacted_as_plain_text() {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let (state, id, root) = project("readme-long", cfg).await;
     let mut text = format!("# Projeto\nchave: {SECRET}\nrepo: https://user:pw123@host.example/x\n");
@@ -566,6 +567,7 @@ async fn subject_keeps_long_text_and_redacts_instead_of_marking_invalid() {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let (state, id, root) = project("subject", cfg).await;
     let long = "x".repeat(110);
@@ -652,6 +654,7 @@ async fn secret_in_test_command_is_redacted() {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let (state, id, root) = project("cmd-secret", cfg).await;
     write(&root.join(".sdd/settings.yaml"), &settings_yaml(&format!("node --test {SECRET}")));
@@ -714,6 +717,7 @@ async fn secret_in_run_command_is_redacted() {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let (state, id, root) = project("run-secret", cfg).await;
     write(

@@ -534,6 +534,11 @@
   overflow-wrap: anywhere;
 }
 
+/* Spec 131 T03: aviso do sistema que só informa (rodada sem ponto em aberto, plano final). */
+.nd-system-text[data-tone="info"] {
+  color: var(--ink2);
+}
+
 /* Item da linha do tempo: o separador de dia (quando abre um dia) vem antes da mensagem. */
 .nd-timeline-item {
   display: flex;

@@ -12,7 +12,7 @@ import { memo, type ReactNode } from "react";
 import { looksLikeChoicesAnswer, parseChoices } from "../../choices";
 import { Icon } from "../../desktop/Icon";
 import { useT } from "../../i18n/react";
-import { systemMessageText } from "../../i18n/serverCodes";
+import { isInfoSystemMessage, systemMessageText } from "../../i18n/serverCodes";
 import { localizeRecoveryAnalysis } from "../../recoveryAnalysis";
 import { parseReviewMessage } from "../../reviewMessage";
 import type { ChatMessage } from "../../store";
@@ -35,16 +35,26 @@ import { userMeta } from "./chatTime";
 import { ChoicesForm } from "./ChoicesForm";
 
 /*
- * Prefixos do servidor (`approvals::YOLO_AUTO_PREFIX` e a marca da rodada autônoma da recuperação),
- * sempre em pt-BR no texto gravado: só servem para reconhecer a mensagem; a pílula mostra o rótulo
- * do dicionário. Os antigos, com a sigla, só são lidos nas mensagens já gravadas.
+ * Aprovação automática: desde a spec 131 T06 o servidor manda o `code` `run.auto_approved` com o
+ * pedido em `params.detail`. Os prefixos (`approvals::YOLO_AUTO_PREFIX` e a marca da rodada
+ * autônoma da recuperação), sempre em pt-BR no texto gravado, só reconhecem as mensagens gravadas
+ * antes; a pílula mostra o rótulo do dicionário. Os antigos, com a sigla, também.
  */
+const AUTO_APPROVED_CODE = "run.auto_approved";
 const AUTO_PREFIXES = ["aprovada automaticamente", "aprovado automaticamente (YOLO)"];
 const ROUND_MARKER = "[rodada autônoma]";
 const LEGACY_ROUND_MARKER = "[rodada autônoma YOLO]";
 
-/** Comando de uma aprovação automática (texto após o prefixo), ou `null` se não for uma. */
-function parseYoloAuto(text: string): string | null {
+/**
+ * Comando de uma aprovação automática (`params.detail`; na mensagem antiga, o texto após o
+ * prefixo), ou `null` se não for uma.
+ */
+function parseYoloAuto(message: Pick<ChatMessage, "text" | "code" | "params">): string | null {
+  if (message.code === AUTO_APPROVED_CODE) {
+    const detail = message.params?.detail;
+    return typeof detail === "string" ? detail.trim() : "";
+  }
+  const text = message.text;
   const prefix = AUTO_PREFIXES.find((p) => text.startsWith(p));
   if (prefix === undefined) return null;
   return text.slice(prefix.length).replace(/^\s*:\s*/, "").trim();
@@ -141,13 +151,15 @@ function BubbleView({
     );
   }
   if (message.role === "system") {
+    // Spec 131 T03: o aviso que só informa sai no tom neutro; o resto continua como alerta.
+    const info = isInfoSystemMessage(message);
     return (
-      <ChatCard tone="rose" data-system-message="">
+      <ChatCard tone={info ? undefined : "rose"} data-system-message={info ? "info" : ""}>
         <div className="nd-chat-card-body nd-chat-card-row">
           <AgentAvatar kind="system" decorative size="sm" />
           <span className="nd-sr-only">{t("conversation.systemPrefix")}</span>
           <div className="nd-stack-xs">
-            <p role="status" className="nd-system-text">
+            <p role="status" className="nd-system-text" data-tone={info ? "info" : undefined}>
               {systemMessageText(message)}
             </p>
             {onRetryTurn !== undefined ? (
@@ -163,7 +175,7 @@ function BubbleView({
       </ChatCard>
     );
   }
-  const yoloAuto = message.role === "agent" ? parseYoloAuto(message.text) : null;
+  const yoloAuto = message.role === "agent" ? parseYoloAuto(message) : null;
   if (yoloAuto !== null) {
     // Evento de agente: pílula central entre linhas (095/T04).
     return (

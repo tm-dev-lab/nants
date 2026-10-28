@@ -346,6 +346,14 @@
   flex-shrink: 0;
 }
 
+/* Spec 131 T05: sem run_command, a linha que diz que o uso é pelo Console (e a decisão do plano). */
+.nd-console-norun {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+}
+
 .nd-console-history li {
   display: flex;
   flex-direction: column;

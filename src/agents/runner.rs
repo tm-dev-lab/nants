@@ -56,7 +56,7 @@ use crate::agents::markers;
 use crate::agents::finding_track::{self, REGISTRY};
 use crate::agents::llm_client::ProviderFailure;
 use crate::agents::usage::BudgetGuard;
-use crate::harness::compose::ComposeEnv;
+use crate::harness::compose::{ComposeEnv, KeptRun};
 use crate::harness::git::{Git, LOCAL_SETTINGS};
 use crate::harness::GitError;
 use crate::harness::progress::CommandProgress;
@@ -674,10 +674,15 @@ pub struct DevBrief {
     pub history: String,
     /// Seção "Orientação do humano" do corpo da tarefa (spec 073); vazia sem ela.
     pub human_guidance: String,
-    /// Seções "Premissas" e "Abordagem Técnica" do spec.md (≤ 4 KiB, já redigido); vazio sem elas.
+    /// Índice da spec e as seções inteiras que cabem no teto (spec 131 T01, já redigido); vazio sem seções.
     pub spec_context: String,
+    /// spec.md inteiro e redigido, lido por `read_spec_section` (spec 131 T01); vazio = sem a ferramenta.
+    pub spec_text: String,
     /// Subseção `### Desenvolvedor` de "Orientações por papel" do spec.md (≤ 1,5 KiB, redigida); vazia sem ela.
     pub role_guidance: String,
+    /// Spec 131 T02: subseção `### Revisor` das "Orientações por papel" (≤ 1,5 KiB, redigida), o que
+    /// o Revisor vai cobrar; vazia sem ela.
+    pub reviewer_guidance: String,
     /// Bloco do perfil de especialista do Desenvolvedor (spec 063; raiz do projeto, redigido e
     /// limitado); vazio sem perfil ou com `skills: false`.
     pub skill_profile: String,
@@ -764,8 +769,10 @@ pub struct ReviewInput {
     /// 092 T04); `None` na 1ª revisão ou sem base do diff. Os FATOS mostram no máximo
     /// [`CHANGED_FILES_MAX`] caminhos.
     pub changed_files: Option<Vec<String>>,
-    /// Seções "Premissas" e "Abordagem Técnica" do spec.md (≤ 4 KiB, já redigido); vazio sem elas.
+    /// Índice da spec e as seções inteiras que cabem no teto (spec 131 T01, já redigido); vazio sem seções.
     pub spec_context: String,
+    /// spec.md inteiro e redigido, lido por `read_spec_section` (spec 131 T01); vazio = sem a ferramenta.
+    pub spec_text: String,
     /// Subseção `### Revisor` de "Orientações por papel" do spec.md (≤ 1,5 KiB, redigida); vazia sem ela.
     pub role_guidance: String,
     /// Bloco do perfil de especialista do Revisor (spec 063); vazio sem perfil ou com `skills: false`.
@@ -809,8 +816,9 @@ pub fn ask_epoch(task: &Task) -> u64 {
     ((recovery_total(&task.body) as u64) << 32) | u64::from(task.frontmatter.attempts + 1)
 }
 
-/// Teto conjunto das seções "Premissas" e "Abordagem Técnica" nos briefings.
-pub const SPEC_CONTEXT_MAX_BYTES: usize = 4 * 1024;
+/// Teto das seções inteiras da spec nos briefings (spec 131 T01); o índice fica fora do teto e o
+/// que não cabe se lê com `read_spec_section`.
+pub const SPEC_CONTEXT_MAX_BYTES: usize = 6 * 1024;
 /// Tetos da lista de arquivos do projeto no briefing do Desenvolvedor.
 pub const PROJECT_FILES_MAX_LINES: usize = 200;
 pub const PROJECT_FILES_MAX_BYTES: usize = 4 * 1024;
@@ -824,23 +832,11 @@ fn truncate_bytes(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Extrai "Premissas" e "Abordagem Técnica" do spec.md, juntas em até `max` bytes.
-pub fn spec_context_of(spec_md: &str, max: usize) -> String {
-    let mut out = String::new();
-    for title in ["Premissas", "Abordagem Técnica"] {
-        if let Some(text) = section_text(spec_md, title) {
-            let text = text.trim();
-            if !text.is_empty() {
-                out.push_str(&format!("### {title}\n{text}\n\n"));
-            }
-        }
-    }
-    let out = out.trim_end();
-    if out.len() > max {
-        format!("{}\n[...truncado]", truncate_bytes(out, max).trim_end())
-    } else {
-        out.to_string()
-    }
+/// Contexto da spec para o briefing (spec 131 T01): o índice com todos os títulos e as seções
+/// inteiras que cabem em `max` bytes, primeiro as citadas em `cited` (objetivo e critérios), depois
+/// as Premissas e o resto na ordem do texto. Nunca corta uma seção ao meio.
+pub fn spec_context_of(spec_md: &str, cited: &str, max: usize) -> String {
+    crate::sdd::spec_sections::briefing_context(spec_md, cited, max, &[])
 }
 
 /// Prefixo literal de diretório de um glob de escopo (`src/agents/**` -> `src/agents/`).
@@ -1162,7 +1158,7 @@ fn same_file_path(a: &str, b: &str) -> bool {
 
 /// Caminhos (e faixas de linhas) citados em `location`: `caminho:linha`, `caminho:a-b` ou só `caminho`.
 /// Vazio quando nada parece um caminho (ex.: `"critérios de aceitação"`).
-fn parse_locations(location: &str) -> Vec<(String, Option<(u32, u32)>)> {
+pub(crate) fn parse_locations(location: &str) -> Vec<(String, Option<(u32, u32)>)> {
     let mut out = Vec::new();
     for raw in location.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
         let token = raw
@@ -1373,18 +1369,24 @@ pub fn demote_late_new(lang: Lang, mut result: ReviewResult, registry: &[Finding
     }
     let (demoted, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut result.findings).into_iter().partition(demotable);
     result.findings = kept;
+    let demoted = renumber_demoted(registry, &result.findings, demoted);
+    if result.findings.is_empty() {
+        result.verdict = Verdict::Approved;
+        result.summary =
+            i18n::tr(lang, "runner.review.late_new_demoted", &[("summary", result.summary.trim_end()), ("review", &CONVERGENCE_FROM_REVIEW.to_string())]);
+        // Todos os critérios estão atendidos (conferido acima); o enforce fica como garantia.
+        result = enforce_criteria(lang, result);
+    }
+    (result, demoted)
+}
+
+/// Ids das observações rebaixadas na convergência: o que colide com o registro ou com um bloqueante
+/// que fica (`kept`), ou está fora do formato, ganha o próximo número livre.
+fn renumber_demoted(registry: &[Finding], kept: &[Finding], demoted: Vec<Finding>) -> Vec<Finding> {
     let number = |id: &str| id.trim().strip_prefix("F-").and_then(|n| n.parse::<u32>().ok());
-    let mut used: HashSet<String> =
-        registry.iter().chain(result.findings.iter()).map(|f| f.id.trim().to_string()).collect();
-    let mut next = registry
-        .iter()
-        .chain(result.findings.iter())
-        .chain(demoted.iter())
-        .filter_map(|f| number(&f.id))
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let demoted = demoted
+    let mut used: HashSet<String> = registry.iter().chain(kept.iter()).map(|f| f.id.trim().to_string()).collect();
+    let mut next = registry.iter().chain(kept.iter()).chain(demoted.iter()).filter_map(|f| number(&f.id)).max().unwrap_or(0) + 1;
+    demoted
         .into_iter()
         .map(|mut f| {
             let id = f.id.trim().to_string();
@@ -1400,13 +1402,222 @@ pub fn demote_late_new(lang: Lang, mut result: ReviewResult, registry: &[Finding
             used.insert(f.id.clone());
             f
         })
-        .collect();
+        .collect()
+}
+
+/// Spec 131 T02: o `failure_scenario` traz um cenário concreto, com a entrada e o resultado errado
+/// separados por seta (`gatilho → resultado errado`, também `->` ou `=>`), os dois com conteúdo.
+pub fn concrete_scenario(scenario: &str) -> bool {
+    let has_content = |t: &str| t.chars().any(char::is_alphanumeric);
+    ["→", "->", "=>"]
+        .iter()
+        .any(|sep| scenario.trim().split_once(sep).is_some_and(|(input, wrong)| has_content(input) && has_content(wrong)))
+}
+
+/// Spec 131 T02: lacuna nova em código que não mudou desde a reprovação anterior. A partir da
+/// revisão [`CONVERGENCE_FROM_REVIEW`], com os hunks desde o `rejected_sha` (`hunks`; `None` sem
+/// base do diff, e nada muda), um apontamento é lacuna quando:
+/// - é MEDIUM ou LOW e não traz `failure_scenario` concreto ([`concrete_scenario`]): o defeito com
+///   entrada e resultado errado reproduzíveis continua bloqueando;
+/// - é novo para a tarefa. **Precedência:** a recorrência do critério 1 vem antes. O que
+///   [`finding_track::is_new`] liga ao registro (o mesmo id, o mesmo problema, os mesmos arquivos com
+///   título próximo) e a continuação declarada (`continues`) nunca são lacuna e continuam bloqueando;
+/// - cita ao menos um caminho, e nenhuma das linhas citadas está num hunk (caminho sem linha conta
+///   como tocado se o arquivo tem hunk). Captura e visual ficam de fora.
+///
+/// O critério ✗ por uma lacuna deixa de bloquear: ele passa a ✓ com a nota da observação, e a
+/// lacuna vira observação para a verificação final. Um critério ✗ conta como "por uma lacuna" quando
+/// a evidência dele cita a lacuna (o id ou o arquivo) e nenhum outro apontamento; sem essa citação,
+/// só quando todos os apontamentos da revisão são lacunas, a evidência não cita arquivo alterado e
+/// sobra uma lacuna ainda não usada (no máximo um critério por lacuna). Nunca é liberado o critério
+/// que já estava ✗ (o registro tem pendente o "critério não atendido" gerado para ele, ou a
+/// evidência cita um aberto) nem o que tem evidência em linhas dos hunks. Basta um critério ✗ sem
+/// liberação para nada mudar (como antes), e sem nenhum critério ✗ vale [`demote_late_new`]. Sem bloqueante restante, o
+/// veredito vira APPROVED. Sem estado novo: só o registro,
+/// a revisão e os hunks que a convergência já usa.
+pub fn demote_untouched_gaps(
+    lang: Lang,
+    mut result: ReviewResult,
+    registry: &[Finding],
+    review: u32,
+    hunks: Option<&[ChangedHunk]>,
+) -> (ReviewResult, Vec<Finding>) {
+    let Some(hunks) = hunks else {
+        return (result, Vec::new());
+    };
+    if review < CONVERGENCE_FROM_REVIEW || result.verdict != Verdict::ChangesRequested {
+        return (result, Vec::new());
+    }
+    // Com todos os critérios atendidos, vale a regra da 127 ([`demote_late_new`]), que já rebaixa o novo.
+    if !result.criteria.iter().any(|c| !c.met && !is_manual_criterion(&c.criterion)) {
+        return (result, Vec::new());
+    }
+    // Algum local (caminho com linha; sem linha, o arquivo) cai num hunk desde a reprovação anterior.
+    let touches = |locs: &[(String, Option<(u32, u32)>)]| {
+        locs.iter().any(|(path, lines)| {
+            hunks.iter().any(|h| same_file_path(&h.path, path) && lines.is_none_or(|(a, b)| a <= h.end && b >= h.start))
+        })
+    };
+    let is_gap = |f: &Finding| -> bool {
+        let severity = f.severity.trim();
+        if !(severity.eq_ignore_ascii_case("MEDIUM") || severity.eq_ignore_ascii_case("LOW"))
+            || concrete_scenario(&f.failure_scenario)
+            || !f.continues.trim().is_empty()
+            || is_visual_finding(f)
+            || cites_image(&f.location)
+            || !finding_track::is_new(registry, f)
+        {
+            return false;
+        }
+        let locs = parse_locations(&f.location);
+        !locs.is_empty() && !touches(&locs)
+    };
+    let (gaps, others): (Vec<&Finding>, Vec<&Finding>) = result.findings.iter().partition(|f| is_gap(f));
+    if gaps.is_empty() {
+        return (result, Vec::new());
+    }
+    let all_gaps = others.is_empty();
+    let cites_id = |evidence: &str, id: &str| {
+        let id = id.trim();
+        !id.is_empty() && evidence.split(|c: char| !(c.is_alphanumeric() || c == '-')).any(|t| t == id)
+    };
+    let cites = |evidence: &str, f: &Finding| -> bool {
+        let cited = parse_locations(evidence);
+        cites_id(evidence, &f.id) || parse_locations(&f.location).iter().any(|(p, _)| cited.iter().any(|(c, _)| same_file_path(c, p)))
+    };
+    // O critério já estava ✗ antes: o registro tem pendente o "critério não atendido" gerado para ele.
+    let unmet_before = |criterion: &str| {
+        let pending: Vec<&Finding> = registry.iter().filter(|f| f.state.is_some_and(FindingState::is_pending)).collect();
+        Lang::ALL.iter().any(|l| {
+            let prefix = i18n::tr(*l, "runner.review.unmet_description", &[("criterion", criterion.trim()), ("evidence", "")]);
+            let prefix = prefix.trim_end();
+            pending.iter().any(|f| f.description.trim_start().starts_with(prefix))
+        })
+    };
+    let open_ids: Vec<&str> =
+        registry.iter().filter(|f| f.state.is_some_and(FindingState::is_pending)).map(|f| f.id.trim()).collect();
+    // Lacunas ainda livres para a ligação sem citação explícita: no máximo um critério por lacuna.
+    let mut spare: Vec<&str> = gaps.iter().map(|g| g.id.trim()).collect();
+    let mut flips = Vec::new();
+    for (i, c) in result.criteria.iter().enumerate() {
+        if c.met || is_manual_criterion(&c.criterion) {
+            continue;
+        }
+        let evidence_locs = parse_locations(&c.evidence);
+        // Nunca libera: o critério já estava ✗ (o pendente gerado para ele ou um aberto citado), a
+        // evidência aponta para linhas alteradas, ou ele cita outro apontamento desta revisão.
+        if unmet_before(&c.criterion)
+            || open_ids.iter().any(|id| cites_id(&c.evidence, id))
+            || touches(&evidence_locs)
+            || others.iter().any(|o| cites(&c.evidence, o))
+        {
+            return (result, Vec::new());
+        }
+        let linked: Vec<&str> = gaps.iter().filter(|g| cites(&c.evidence, g)).map(|g| g.id.trim()).collect();
+        let ids = if !linked.is_empty() {
+            spare.retain(|id| !linked.contains(id));
+            linked
+        } else {
+            // Sem ligação explícita: só com todos os apontamentos lacunas, sem citar arquivo alterado,
+            // e com uma lacuna ainda não usada por outro critério.
+            let cites_changed = evidence_locs.iter().any(|(p, _)| hunks.iter().any(|h| same_file_path(&h.path, p)));
+            if !all_gaps || cites_changed || spare.is_empty() {
+                return (result, Vec::new());
+            }
+            vec![spare.remove(0)]
+        };
+        flips.push((i, ids.join(", ")));
+    }
+    for (i, ids) in flips {
+        let c = &mut result.criteria[i];
+        c.met = true;
+        let note = i18n::tr(lang, "runner.review.gap_criterion_note", &[("ids", &ids)]);
+        c.evidence = if c.evidence.trim().is_empty() { note } else { format!("{} ({note})", c.evidence.trim()) };
+    }
+    let (demoted, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut result.findings).into_iter().partition(|f| is_gap(f));
+    result.findings = kept;
+    let demoted = renumber_demoted(registry, &result.findings, demoted);
     if result.findings.is_empty() {
         result.verdict = Verdict::Approved;
-        result.summary =
-            i18n::tr(lang, "runner.review.late_new_demoted", &[("summary", result.summary.trim_end()), ("review", &CONVERGENCE_FROM_REVIEW.to_string())]);
-        // Todos os critérios estão atendidos (conferido acima); o enforce fica como garantia.
+        result.summary = i18n::tr(
+            lang,
+            "runner.review.untouched_gap_demoted",
+            &[("summary", result.summary.trim_end()), ("review", &CONVERGENCE_FROM_REVIEW.to_string())],
+        );
         result = enforce_criteria(lang, result);
+    }
+    (result, demoted)
+}
+
+/// Spec 131 T05 (C-09): o que cita um campo da spec que ela não declara
+/// ([`crate::sdd::field_citations::missing_fields_cited`], a mesma função dos avisos do plano) não
+/// é julgado na revisão nem volta ao Desenvolvedor, que não muda a spec:
+/// - o critério (não manual) sai da matriz: não recebe ✓ nem ✗, e vira observação;
+/// - o apontamento MEDIUM ou LOW que cita o campo ausente, sem `failure_scenario` concreto
+///   ([`concrete_scenario`]), vira observação. O HIGH (o nome pode ser também um identificador do
+///   código) e o defeito com cenário concreto continuam bloqueando, como nas regras da T02.
+///
+/// As observações seguem para a verificação final ([`FINAL_OBSERVATIONS`]). Sem bloqueante restante,
+/// o veredito vira APPROVED (o enforce de depois gera o apontamento de algum outro critério ✗).
+pub fn demote_missing_fields(
+    lang: Lang,
+    mut result: ReviewResult,
+    spec: &crate::sdd::SpecMeta,
+    settings: Option<&Settings>,
+    registry: &[Finding],
+) -> (ReviewResult, Vec<Finding>) {
+    use crate::sdd::field_citations::missing_fields_cited;
+    if result.verdict == Verdict::None {
+        return (result, Vec::new());
+    }
+    let fields = |names: &[&str]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+    let mut demoted = Vec::new();
+    result.criteria.retain(|c| {
+        if is_manual_criterion(&c.criterion) {
+            return true;
+        }
+        let missing = missing_fields_cited(&c.criterion, spec, settings);
+        if missing.is_empty() {
+            return true;
+        }
+        demoted.push(Finding {
+            severity: "LOW".into(),
+            location: i18n::text(lang, "runner.review.missing_field_location"),
+            description: i18n::tr(
+                lang,
+                "runner.review.missing_field_criterion",
+                &[("criterion", c.criterion.trim()), ("fields", &fields(&missing))],
+            ),
+            recommendation: i18n::text(lang, "runner.review.missing_field_recommendation"),
+            state: Some(FindingState::New),
+            ..Finding::default()
+        });
+        false
+    });
+    let (cited, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut result.findings).into_iter().partition(|f| {
+        let severity = f.severity.trim();
+        (severity.eq_ignore_ascii_case("MEDIUM") || severity.eq_ignore_ascii_case("LOW"))
+            && !concrete_scenario(&f.failure_scenario)
+            && !missing_fields_cited(&format!("{}\n{}", f.description, f.recommendation), spec, settings).is_empty()
+    });
+    result.findings = kept;
+    for mut f in cited {
+        let missing = missing_fields_cited(&format!("{}\n{}", f.description, f.recommendation), spec, settings);
+        f.description = i18n::tr(
+            lang,
+            "runner.review.missing_field_finding",
+            &[("fields", &fields(&missing)), ("description", f.description.trim())],
+        );
+        f.recommendation = i18n::text(lang, "runner.review.missing_field_recommendation");
+        demoted.push(f);
+    }
+    if demoted.is_empty() {
+        return (result, Vec::new());
+    }
+    let demoted = renumber_demoted(registry, &result.findings, demoted);
+    if result.verdict == Verdict::ChangesRequested && result.findings.is_empty() {
+        result.verdict = Verdict::Approved;
+        result.summary = i18n::tr(lang, "runner.review.missing_field_demoted", &[("summary", result.summary.trim_end())]);
     }
     (result, demoted)
 }
@@ -1481,6 +1692,7 @@ fn demote_unchanged_files(
         let locs = parse_locations(&f.location);
         !locs.is_empty()
             && locs.iter().all(|(path, _)| !changed.iter().any(|c| same_file_path(c, path)) && exists(norm_path(path)))
+            && f.continues.trim().is_empty()
             && !previous.iter().any(|p| is_reopened(f, p))
             && !cites_changed_file(f, changed)
     };
@@ -1592,7 +1804,8 @@ fn converge_findings(lang: Lang, mut result: ReviewResult, previous: &[Finding],
     }
     let prev_paths: Vec<String> = previous.iter().flat_map(|f| parse_locations(&f.location)).map(|(p, _)| p).collect();
     let blocks = |f: &Finding| -> bool {
-        if !is_medium(f) {
+        // Spec 131 T02: a continuação declarada e aceita é recorrência e bloqueia.
+        if !is_medium(f) || !f.continues.trim().is_empty() {
             return true;
         }
         let locs = parse_locations(&f.location);
@@ -2236,7 +2449,13 @@ pub struct TaskRunner {
     probed_env: Mutex<Option<String>>,
     /// Rodadas dos comandos de teste do projeto feitas pelo Desenvolvedor (spec 124 T05).
     suite_ledger: test_levels::SuiteLedger,
+    /// Spec 131 T05: a spec desta execução, cuja conferência da persistência da instalação vai junto
+    /// da primeira instalação real (`ensure_installed`) enquanto o spec.md não a registra.
+    footprint_spec: Mutex<Option<String>>,
 }
+
+/// Resultado do container mantido da instalação que também confere a persistência (spec 131 T05).
+type KeptSlot = Arc<Mutex<Option<KeptRun>>>;
 
 /// Rótulo (`stage`) da atividade ao vivo da verificação final.
 pub const FINAL_VERIFICATION_STAGE: &str = "final_verification";
@@ -2276,6 +2495,7 @@ impl TaskRunner {
             arbiter: None,
             probed_env: Mutex::new(None),
             suite_ledger: test_levels::SuiteLedger::default(),
+            footprint_spec: Mutex::new(None),
         }
     }
 
@@ -2397,10 +2617,12 @@ impl TaskRunner {
         command: &str,
         fresh: bool,
     ) -> Result<TestResult, RunnerError> {
-        self.exec_cmd_watched(settings, dir, command, fresh, None).await
+        self.exec_cmd_watched(settings, dir, command, fresh, None, None).await
     }
 
     /// Como [`Self::exec_cmd`], com o progresso da saída em `progress` enquanto roda (spec 123 T01).
+    /// Spec 131 T05: com `kept` (só no Docker), o comando roda num container mantido até o `docker
+    /// diff` ([`ComposeEnv::run_kept`]) e o resultado completo fica em `kept`.
     async fn exec_cmd_watched(
         &self,
         settings: &Settings,
@@ -2408,6 +2630,7 @@ impl TaskRunner {
         command: &str,
         fresh: bool,
         progress: Option<Arc<CommandProgress>>,
+        kept: Option<KeptSlot>,
     ) -> Result<TestResult, RunnerError> {
         if settings.environment != Environment::Docker {
             return match progress {
@@ -2424,7 +2647,14 @@ impl TaskRunner {
             if fresh {
                 compose.prepare(&dir)?;
             }
-            let out = compose.exec_watched(&dir, &command, TEST_TIMEOUT, progress.as_ref());
+            let out = match &kept {
+                Some(slot) => compose.run_kept(&dir, &command, TEST_TIMEOUT, progress.as_ref()).map(|run| {
+                    let output = run.output.clone();
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(run);
+                    output
+                }),
+                None => compose.exec_watched(&dir, &command, TEST_TIMEOUT, progress.as_ref()),
+            };
             // Devolve ao usuário o que um container root (imagens antigas) tenha criado.
             let _ = compose.repair_ownership(&dir);
             out
@@ -2476,7 +2706,7 @@ impl TaskRunner {
         attempt: u32,
     ) -> (Result<TestResult, RunnerError>, Duration) {
         let started = std::time::Instant::now();
-        let out = self.run_tracked_inner(settings, dir, command, fresh, check, place, task_id, attempt).await;
+        let out = self.run_tracked_inner(settings, dir, command, fresh, check, place, task_id, attempt, None).await;
         let elapsed = started.elapsed();
         if let (None, Ok(result)) = (check, &out) {
             let limit = self.round_limit(settings);
@@ -2510,6 +2740,7 @@ impl TaskRunner {
         place: &str,
         task_id: &str,
         attempt: u32,
+        kept: Option<KeptSlot>,
     ) -> Result<TestResult, RunnerError> {
         let (kind, what) = match check {
             Some(name) => (CommandKind::Check, format!("Checagem {name}")),
@@ -2550,7 +2781,7 @@ impl TaskRunner {
         // Spec 123 T01: enquanto a rodada corre, um sinal de vida a cada intervalo com o progresso
         // real da saída (bytes e última linha). Antes, só saíam o início e o fim.
         let progress = Arc::new(CommandProgress::new());
-        let work = self.exec_cmd_watched(settings, dir, command, fresh, Some(progress.clone()));
+        let work = self.exec_cmd_watched(settings, dir, command, fresh, Some(progress.clone()), kept);
         tokio::pin!(work);
         let mut ticker = tokio::time::interval(self.command_heartbeat.max(Duration::from_millis(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2766,6 +2997,7 @@ impl TaskRunner {
         let path = self.task_path(spec_id, task_id);
         self.remember(&path)?;
         let mut task = read_task(&path)?;
+        self.arm_install_footprint(spec_id);
         if task.frontmatter.spec_id != spec_id || task.frontmatter.id != task_id {
             return Err(RunnerError::Invalid(format!(
                 "arquivo de {spec_id}/{task_id} declara {}/{}",
@@ -2854,8 +3086,8 @@ impl TaskRunner {
         validate_id("spec_id", spec_id)?;
         let settings = read_settings(&sdd_dir(&self.repo_root).join("settings.yaml"))?;
         self.remember(&self.spec_dir(spec_id).join("spec.md"))?;
-        // Spec 129 T02: antes da primeira tarefa, onde a instalação grava (uma vez por spec).
-        self.check_install_footprint(&settings, spec_id).await?;
+        // Spec 131 T05: a conferência da instalação vai junto da primeira instalação real.
+        self.arm_install_footprint(spec_id);
         loop {
             self.check_cancel()?;
             let tasks = self.load_tasks(spec_id)?;
@@ -3404,7 +3636,19 @@ impl TaskRunner {
             return Ok(Install::Current { since: test_levels::installed_at(dir) });
         }
         let started = Instant::now();
-        let mut out = self.run_tracked(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt).await?;
+        // Spec 131 T05: a primeira instalação real da execução também confere a persistência, no
+        // mesmo container (mantido até o `docker diff`), sem uma segunda instalação.
+        let footprint = self.footprint_pending(settings);
+        let slot: Option<KeptSlot> = footprint.as_ref().map(|_| Arc::new(Mutex::new(None)));
+        let mut out = self
+            .run_tracked_inner(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt, slot.clone())
+            .await?;
+        if let (Some(spec_id), Some(slot)) = (footprint, slot) {
+            let kept = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(kept) = kept {
+                self.record_install_footprint(&spec_id, command, &kept, started.elapsed());
+            }
+        }
         if out.passed {
             // A chave sai do disco depois da instalação (ela pode ter reescrito a trava).
             let at = rfc3339_of(std::time::SystemTime::now());
@@ -3768,51 +4012,46 @@ impl TaskRunner {
         }
     }
 
-    /// Spec 129 T02: antes da primeira tarefa, na base e com o ambiente Docker aprovado, roda o
-    /// `install_command` num container mantido até o `docker diff` e confere o que ele gravou fora
-    /// de `/work` (o que se perde entre comandos). Uma vez por spec: a seção
+    /// Spec 131 T05: a spec desta execução passa a ter a conferência da persistência da instalação
+    /// pendente (ela acontece na primeira instalação real, em [`Self::ensure_installed`]).
+    fn arm_install_footprint(&self, spec_id: &str) {
+        *self.footprint_spec.lock().unwrap_or_else(PoisonError::into_inner) = Some(spec_id.to_string());
+    }
+
+    /// Spec 129 T02 e 131 T05: a spec cuja conferência da instalação vai junto da próxima instalação,
+    /// ou `None`: sem `install_command`, fora do Docker, sem o Compose, sem spec armada ou com a seção
+    /// [`INSTALL_FOOTPRINT_SECTION`] já gravada (a conferência roda uma vez por spec).
+    fn footprint_pending(&self, settings: &Settings) -> Option<String> {
+        settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty())?;
+        if settings.environment != Environment::Docker || self.compose.is_none() {
+            return None;
+        }
+        let spec_id = self.footprint_spec.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+        let spec = read_spec(&self.spec_dir(&spec_id).join("spec.md")).ok()?;
+        let done = section_text(&spec.body, INSTALL_FOOTPRINT_SECTION).is_some_and(|s| !s.trim().is_empty());
+        (!done).then_some(spec_id)
+    }
+
+    /// Spec 129 T02, com a 131 T05: confere o que a instalação real (`kept`, o container mantido até o
+    /// `docker diff`) gravou fora de `/work` (o que se perde entre comandos). Só a instalação que
+    /// terminou com código 0 e cujo `docker diff` foi lido é conclusiva: a seção
     /// [`INSTALL_FOOTPRINT_SECTION`] do spec.md guarda o registro (resultado e tempo) e, acima de
-    /// [`INSTALL_FOOTPRINT_LIMIT`], o aviso com os caminhos principais, que também vai à Conversa e,
-    /// pelo spec.md, ao briefing do Desenvolvedor e à recuperação. Sinal, nunca trava: falha do
-    /// Docker ou do ambiente não aprovado só deixa a conferência para a próxima execução. Sem
-    /// `install_command`, nada roda.
-    async fn check_install_footprint(&self, settings: &Settings, spec_id: &str) -> Result<(), RunnerError> {
-        let Some(command) = settings.install_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-            return Ok(());
-        };
-        if settings.environment != Environment::Docker {
-            return Ok(());
+    /// [`INSTALL_FOOTPRINT_LIMIT`] entradas, o aviso com os caminhos principais, que também vai à
+    /// Conversa e, pelo spec.md, ao briefing do Desenvolvedor e à recuperação. A que falhou (ex.: a
+    /// trava ainda não existe), estourou o tempo ou não teve o `docker diff` é inconclusiva: nada é
+    /// gravado, e a conferência fica para a próxima instalação. Sinal, nunca trava: erro ao gravar é
+    /// ignorado.
+    fn record_install_footprint(&self, spec_id: &str, command: &str, kept: &KeptRun, elapsed: Duration) {
+        if !kept.output.success() {
+            return;
         }
-        let Some(compose) = self.compose.clone() else { return Ok(()) };
+        let Ok(diff) = &kept.diff else { return };
         let path = self.spec_dir(spec_id).join("spec.md");
-        let mut spec = read_spec(&path)?;
-        if section_text(&spec.body, INSTALL_FOOTPRINT_SECTION).is_some_and(|s| !s.trim().is_empty()) {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let (dir, cmd) = (self.repo_root.clone(), command.to_string());
-        let joined = tokio::task::spawn_blocking(move || {
-            compose.prepare(&dir)?;
-            let kept = compose.run_kept(&dir, &cmd, TEST_TIMEOUT);
-            let _ = compose.repair_ownership(&dir);
-            kept
-        })
-        .await;
-        let Ok(Ok(kept)) = joined else { return Ok(()) };
-        let secs = started.elapsed().as_secs();
-        if kept.output.success() {
-            // A base ficou instalada: a próxima instalação nela só roda se a trava mudar.
-            let at = rfc3339_of(std::time::SystemTime::now());
-            test_levels::remember_install(&self.repo_root, &test_levels::install_key(settings, command, &self.repo_root), &at);
-        } else {
-            // A mesma regra do `ensure_installed`: a instalação que falhou ou estourou o tempo pode
-            // ter deixado as dependências pela metade, então a próxima instala de novo.
-            test_levels::forget_install(&self.repo_root);
-        }
-        let outside = crate::harness::compose::written_outside_work(&kept.diff);
+        let Ok(mut spec) = read_spec(&path) else { return };
+        let outside = crate::harness::compose::written_outside_work(diff);
         let lang = self.lang.get();
         let code = kept.output.code.map_or_else(|| "-".to_string(), |c| c.to_string());
-        let (secs, limit) = (secs.to_string(), INSTALL_FOOTPRINT_LIMIT.to_string());
+        let (secs, limit) = (elapsed.as_secs().to_string(), INSTALL_FOOTPRINT_LIMIT.to_string());
         let scrubbed = self.scrub(command);
         let mut lines = vec![i18n::tr_plural(
             lang,
@@ -3841,9 +4080,8 @@ impl TaskRunner {
         }
         let text = lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n");
         spec.body = replace_section(&spec.body, INSTALL_FOOTPRINT_SECTION, Some(text));
-        match self.write_guarded(&path, &spec.render()?) {
-            Err(RunnerError::ExternalEdit { .. }) => Ok(()),
-            other => other,
+        if let Ok(rendered) = spec.render() {
+            let _ = self.write_guarded(&path, &rendered);
         }
     }
 
@@ -3904,7 +4142,7 @@ impl TaskRunner {
         let registry = finding_track::seed(&read_registry(&task.body)?, &previous);
         let mut prior_open = finding_track::pending(&registry);
         finding_track::by_recurrence(&mut prior_open);
-        let prior_findings = prior_findings_text(&prior_open);
+        let prior_findings = with_resolved_text(prior_findings_text(&prior_open), &registry);
         // Spec 124 T02: respostas do Desenvolvedor e decisões do Arquiteto, para o Revisor conferir.
         let responses = finding_reply::read_section(&section_text(&task.body, RESPONSES).unwrap_or_default());
         let waived = finding_reply::waived(&registry);
@@ -3940,7 +4178,13 @@ impl TaskRunner {
             prior_findings: self.scrub(&prior_findings),
             finding_responses: self.scrub(&responses.iter().map(|r| format!("- {}", r.line())).collect::<Vec<_>>().join("\n")),
             arbitration: self.scrub(&decision_lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")),
-            spec_context: self.spec_context(&task.frontmatter.spec_id),
+            spec_context: self.spec_context(
+                &task.frontmatter.spec_id,
+                &task_citations(task),
+                &[crate::sdd::role_guidance::ROLE_REVIEWER],
+                false,
+            ),
+            spec_text: self.spec_text(&task.frontmatter.spec_id),
             role_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("reviewer"),
             formatters: self.scrub(&formatting::briefing_list(&settings.formatters)),
@@ -3971,7 +4215,16 @@ impl TaskRunner {
         if let Some(step) = self.budget_stop(task)? {
             return Ok(step);
         }
-        let reviewed = self.reviewer.review(&input).await?;
+        let mut reviewed = self.reviewer.review(&input).await?;
+        // Spec 131 T02: a continuação declarada (`continues`) só vale com um id do registro.
+        reviewed.findings = finding_track::apply_continues(&registry, std::mem::take(&mut reviewed.findings));
+        // Spec 131 T05: o que cita um campo que a spec não declara vai à verificação final, nunca ao
+        // Desenvolvedor (spec ilegível: nada muda).
+        let spec_meta = read_spec(&self.spec_dir(&task.frontmatter.spec_id).join("spec.md")).ok().map(|s| s.frontmatter);
+        let (reviewed, cited_missing) = match &spec_meta {
+            Some(meta) => demote_missing_fields(self.lang.get(), reviewed, meta, Some(settings), &registry),
+            None => (reviewed, Vec::new()),
+        };
         self.sync_advice(task);
         // Spec 087 T05: tamanho do diff de código desta tentativa (informativo; falha do git não registra).
         if let Ok(lines) = code_diff_lines(&root, &settings.base_branch, &branch) {
@@ -3990,7 +4243,16 @@ impl TaskRunner {
             .filter(|f| f.state != Some(FindingState::Resolved))
             .map(|f| f.id.trim().to_string())
             .collect();
-        let enforced = enforce_criteria(self.lang.get(), consolidate_visual(reviewed, &open_ids));
+        // Spec 131 T02: a partir da 3ª revisão, lacuna nova sem cenário concreto em linhas que não mudaram
+        // desde a reprovação anterior não bloqueia, nem pelo critério que ela deixou ✗ (antes do enforce).
+        let (consolidated, gaps) = demote_untouched_gaps(
+            self.lang.get(),
+            consolidate_visual(reviewed, &open_ids),
+            &registry,
+            input.review_number,
+            hunks.as_deref(),
+        );
+        let enforced = enforce_criteria(self.lang.get(), consolidated);
         // Spec 092 T04: na re-revisão, finding novo MEDIUM/LOW em arquivo que não mudou (e que existe na
         // worktree da branch revisada) vira observação.
         let exists = |path: &str| file_in_worktree(&input.worktree, path);
@@ -4001,7 +4263,12 @@ impl TaskRunner {
         // Spec 124 T02: o que o Arquiteto ajustou ou tornou manual não bloqueia mais.
         let (result, dispensed) = demote_waived(self.lang.get(), result, &waived);
         // Spec 127 T02: a partir da 3ª revisão, MEDIUM/LOW novo vira observação (sem critério não atendido).
-        let (result, late) = demote_late_new(self.lang.get(), result, &registry, input.review_number);
+        let (result, late_new) = demote_late_new(self.lang.get(), result, &registry, input.review_number);
+        let mut late = cited_missing;
+        late.extend(gaps);
+        late.extend(late_new);
+        // Cada rebaixamento numerou os seus; juntos, um id repetido ganha o próximo livre.
+        let late = renumber_demoted(&registry, &result.findings, late);
         let mut observations = observations;
         observations.extend(dispensed);
         observations.extend(late.iter().cloned());
@@ -4582,10 +4849,32 @@ impl TaskRunner {
         }
     }
 
-    /// Premissas e Abordagem Técnica do spec.md (redigidas); vazio se ausentes ou ilegíveis.
-    fn spec_context(&self, spec_id: &str) -> String {
+    /// Índice e seções inteiras do spec.md (redigidos), com as citadas em `cited` primeiro (spec 131
+    /// T01); vazio se ilegível ou sem seções. Não repete o que o mesmo briefing entrega inteiro por
+    /// outro caminho, detectado pelos mesmos leitores: a orientação do papel `role` e, com
+    /// `global_criteria` (verificação final), os critérios globais.
+    fn spec_context(&self, spec_id: &str, cited: &str, roles: &[&str], global_criteria: bool) -> String {
+        use crate::sdd::role_guidance::{delivered_whole, ROLE_GUIDANCE_SECTION};
+        use crate::sdd::spec_sections::Delivered;
+        let text = self.spec_text(spec_id);
+        let mut delivered = Vec::new();
+        // Spec 131 T02: cada subseção de "Orientações por papel" que o briefing entrega inteira.
+        for role in roles {
+            if delivered_whole(&text, role) {
+                delivered.push(Delivered { section: ROLE_GUIDANCE_SECTION, sub: Some(role) });
+            }
+        }
+        if global_criteria && section_text(&text, GLOBAL_CRITERIA).is_some_and(|c| !c.trim().is_empty()) {
+            delivered.push(Delivered { section: GLOBAL_CRITERIA, sub: None });
+        }
+        crate::sdd::spec_sections::briefing_context(&text, cited, SPEC_CONTEXT_MAX_BYTES, &delivered)
+    }
+
+    /// spec.md inteiro e redigido, para `read_spec_section` (as worktrees não têm `.sdd/specs`);
+    /// vazio se ilegível. Redige antes de recortar: segredo nunca vaza por um corte.
+    fn spec_text(&self, spec_id: &str) -> String {
         let text = fs::read_to_string(self.spec_dir(spec_id).join("spec.md")).unwrap_or_default();
-        self.scrub(&spec_context_of(&text, SPEC_CONTEXT_MAX_BYTES))
+        self.scrub(&text)
     }
 
     /// Orientação do Arquiteto para o papel (`Desenvolvedor`/`Revisor`), redigida; vazia se ausente.
@@ -4644,8 +4933,16 @@ impl TaskRunner {
             recovery: recovery_notes_for_dev(&task.body, yolo),
             history: section_text(&task.body, HISTORY).unwrap_or_default().trim().to_string(),
             human_guidance: section_text(&task.body, GUIDANCE_SECTION).unwrap_or_default().trim().to_string(),
-            spec_context: self.spec_context(&task.frontmatter.spec_id),
+            spec_context: self.spec_context(
+                &task.frontmatter.spec_id,
+                &task_citations(task),
+                // Spec 131 T02: o Desenvolvedor recebe também as orientações do Revisor.
+                &[crate::sdd::role_guidance::ROLE_DEVELOPER, crate::sdd::role_guidance::ROLE_REVIEWER],
+                false,
+            ),
+            spec_text: self.spec_text(&task.frontmatter.spec_id),
             role_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_DEVELOPER),
+            reviewer_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("developer"),
             project_files: self.scrub(&project_files_listing(
                 &Git::new(wt.to_path_buf()).ls_files().unwrap_or_default(),
@@ -4807,7 +5104,9 @@ impl TaskRunner {
             arbitration: String::new(),
             incremental_diff: String::new(),
             changed_files: None,
-            spec_context: self.spec_context(spec_id),
+            // Spec 131 T01: os critérios globais citam as seções que a verificação final recebe primeiro.
+            spec_context: self.spec_context(spec_id, &criteria, &[crate::sdd::role_guidance::ROLE_REVIEWER], true),
+            spec_text: self.spec_text(spec_id),
             role_guidance: self.role_guidance(spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("reviewer"),
             formatters: String::new(),
@@ -5680,7 +5979,7 @@ impl TaskEditor {
     }
 }
 
-const HISTORY: &str = "Tentativas anteriores";
+pub const HISTORY: &str = "Tentativas anteriores";
 const HISTORY_SUMMARY_BYTES: usize = 2 * 1024;
 const HISTORY_STAT_BYTES: usize = 1024;
 const HISTORY_MAX_BYTES: usize = 8 * 1024;
@@ -5729,6 +6028,12 @@ fn append_history(existing: &str, entry: &str, max: usize) -> String {
     }
     kept.reverse();
     kept.concat()
+}
+
+/// Objetivo e critérios da tarefa: onde ela cita, pelo título, as seções da spec que implementa
+/// (spec 131 T01).
+fn task_citations(task: &Task) -> String {
+    format!("{}\n{}", section_text(&task.body, OBJECTIVE).unwrap_or_default(), acceptance_of(&task.body))
 }
 
 /// Critérios de aceitação da tarefa; sem a seção, usa o corpo inteiro.
@@ -6334,6 +6639,33 @@ fn prior_findings_text(open: &[Finding]) -> String {
         .join("\n")
 }
 
+/// Teto dos resolvidos listados ao Revisor para o `continues` (spec 131 T02).
+const RESOLVED_FOR_CONTINUES_MAX: usize = 10;
+
+/// Spec 131 T02: acrescenta aos abertos os resolvidos do registro (os mais recentes, até
+/// [`RESOLVED_FOR_CONTINUES_MAX`], sem os dispensados pelo Arquiteto), para o Revisor declarar
+/// `continues` quando um problema continua um deles. Sem resolvido, o texto não muda.
+fn with_resolved_text(open_text: String, registry: &[Finding]) -> String {
+    let mut resolved: Vec<&Finding> =
+        registry.iter().filter(|f| f.state == Some(FindingState::Resolved) && f.arbitration.is_none()).collect();
+    if resolved.is_empty() {
+        return open_text;
+    }
+    resolved.sort_by(|a, b| b.last_review.cmp(&a.last_review));
+    let lines: Vec<String> = resolved
+        .iter()
+        .take(RESOLVED_FOR_CONTINUES_MAX)
+        .map(|f| format!("- {} [{}] {}: {}", f.id, f.severity, f.location, finding_track::short_title(&f.description)))
+        .collect();
+    let head = "Já resolvidos (não liste; se um problema desta revisão continua um deles, use \"continues\" com o id):";
+    let open_text = open_text.trim_end();
+    if open_text.is_empty() {
+        format!("{head}\n{}", lines.join("\n"))
+    } else {
+        format!("{open_text}\n\n{head}\n{}", lines.join("\n"))
+    }
+}
+
 /// Lê os findings abertos do corpo da tarefa. Seção ausente ou vazia significa nenhum.
 fn read_findings(body: &str) -> Result<Vec<Finding>, RunnerError> {
     match section_text(body, FINDINGS) {
@@ -6736,6 +7068,7 @@ mod tests {
                         references: None,
                         environment: None,
                         not_in_sandbox: None,
+                        nothing_to_run: None,
                     },
                     body: "## Contexto\nteste\n".into(),
                 },
@@ -6857,6 +7190,37 @@ mod tests {
         }
     }
 
+    /// Spec 131 T01: o contexto da spec não repete o que o briefing já entrega inteiro (a orientação
+    /// do papel e, na verificação final, os critérios globais); a seção fica no índice.
+    #[test]
+    fn spec_context_skips_what_the_briefing_already_delivers() {
+        use crate::sdd::role_guidance::{ROLE_DEVELOPER, ROLE_REVIEWER};
+        let fx = Fixture::new("spec-ctx-delivered", "true");
+        let dir = fx.repo.join(".sdd/specs/s1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), include_str!("../sdd/testdata/test9/spec.md")).unwrap();
+        let runner = fx.noop_runner(&FakeReviewer::new(|_, _| approved(vec![])));
+        let elsewhere = "[entregue em outra seção do briefing]";
+        // Spec 131 T02: o Desenvolvedor recebe as duas subseções; nenhuma se repete no contexto.
+        let dev = runner.spec_context("s1", "", &[ROLE_DEVELOPER, ROLE_REVIEWER], false);
+        assert!(dev.contains(&format!("### Desenvolvedor (562 B) {elsewhere}")), "{dev}");
+        assert!(dev.contains(&format!("### Revisor (535 B) {elsewhere}")), "{dev}");
+        assert!(!dev.contains("Use Decimal only at parsing"), "{dev}");
+        assert!(!dev.contains("Check overlap multiplicity"), "{dev}");
+        assert!(!dev.contains(&format!("Globais (999 B) {elsewhere}")), "{dev}");
+        let task_review = runner.spec_context("s1", "", &[ROLE_REVIEWER], false);
+        assert!(task_review.contains(&format!("### Revisor (535 B) {elsewhere}")), "{task_review}");
+        assert!(!task_review.contains("Check overlap multiplicity"), "{task_review}");
+        let last = runner.spec_context("s1", "", &[ROLE_REVIEWER], true);
+        assert!(last.contains(&format!("## Critérios de Aceitação Globais (999 B) {elsewhere}")), "{last}");
+        assert!(!last.contains("G1: The Docker workspace"), "{last}");
+        // Orientação cortada pelo leitor não conta como entregue inteira: continua no texto da spec.
+        let long = format!("## Orientações por papel\n### Desenvolvedor\n{}\n## Outra\nz\n", "palavra ".repeat(300));
+        fs::write(dir.join("spec.md"), long).unwrap();
+        let cut = runner.spec_context("s1", "", &[ROLE_DEVELOPER], false);
+        assert!(!cut.contains(elsewhere) && cut.contains("palavra palavra"), "{cut}");
+    }
+
     fn write_profile(root: &Path, role: &str, extra: &str) {
         let dir = root.join(".sdd/skills");
         fs::create_dir_all(&dir).unwrap();
@@ -6965,6 +7329,31 @@ mod tests {
         let planned = &rev.inputs()[0].planned_images;
         assert_eq!(planned.paths, vec!["web/img/hero.webp"]);
         assert_eq!(planned.status, GenerationStatus::Failed(images::REASON_LIMIT.into()));
+    }
+
+    /// Spec 132 T12: sem `user.name`/`user.email` no repositório nem no HOME (isolado), a tarefa é
+    /// integrada, e os commits do Nants (o da worktree e o da integração) usam a identidade de reserva.
+    #[tokio::test]
+    async fn integrates_with_the_fallback_identity_when_none_is_configured() {
+        let fx = Fixture::new("sem-identidade", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        git_in(&fx.repo, &["config", "--unset", "user.name"]);
+        git_in(&fx.repo, &["config", "--unset", "user.email"]);
+        let home = fx.repo.parent().expect("base").join("home");
+        fs::create_dir_all(&home).unwrap();
+        let home_text = home.to_str().expect("utf8").to_string();
+        crate::harness::git::isolate_env_for_tests(
+            &fx.repo,
+            &[("HOME", &home_text), ("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")],
+        );
+        assert_eq!(Git::new(&fx.repo).missing_identity(), vec!["user.name", "user.email"]);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(fx.feat_commits(), 1);
+        assert_eq!(git_in(&fx.repo, &["log", "-1", "--format=%s|%an <%ae>"]), "feat(s1): T01 - Título T01|Nants <nants@localhost>");
+        let local = git_in(&fx.repo, &["config", "--local", "--list"]);
+        assert!(!local.contains("user."), "{local}");
     }
 
     #[tokio::test]
@@ -8199,6 +8588,358 @@ mod tests {
     /// Spec 127 T02: critérios atendidos da tarefa de teste (o `task` tem um só).
     fn all_met() -> Vec<CriterionCheck> {
         vec![met("arquivo criado", true)]
+    }
+
+    /// Spec 131 T02: a T05 do Test 9, apontamentos com o texto real.
+    fn t05_finding(id: &str, location: &str, description: &str) -> Finding {
+        Finding { id: id.into(), severity: "MEDIUM".into(), location: location.into(), description: description.into(), recommendation: "fix".into(), ..Finding::default() }
+    }
+
+    const T05_F01: (&str, &str) = ("tests/test_reporting.py:49-89", "The tests do not establish the required top-10 tie order, and they do not prove that both transfer sides are excluded from every report section. The seeded expenses have distinct amounts.");
+    const T05_F02: (&str, &str) = ("tests/test_reporting.py:20-89", "The tests do not prove CSV and Markdown agree on ranked transaction IDs or uncategorized IDs. They also do not check the expected category values across both renderers, nor exercise a normalized description.");
+    const T05_F03: (&str, &str) = ("tests/test_reporting.py:46-48, tests/test_reporting.py:150-176", "The renderer test inserts a description that is already normalized, so it does not verify behavior for descriptions requiring whitespace normalization. The ranked and uncategorized IDs are compared to each other only.");
+    const T05_F04: (&str, &str) = ("ledger/reporting.py:35", "The month format check uses `\\d`, which accepts Unicode digits. A value such as `２０２５-０１` passes validation instead of producing the strict month error required by the CLI criterion.");
+    const T05_CLI: &str = "CLI tests verify strict month errors, output paths, deterministic file replacement on rerun, and unchanged database contents after successful or invalid reports.";
+
+    /// Registro da T05 depois das revisões 1 (F-01, F-02) e 2 (F-03; F-01 e F-02 resolvidos): a próxima é a 3.
+    fn t05_registry() -> Vec<Finding> {
+        let r1 = finding_track::track(&[], &[], vec![t05_finding("F-01", T05_F01.0, T05_F01.1), t05_finding("F-02", T05_F02.0, T05_F02.1)], 1);
+        let f03 = Finding { state: Some(FindingState::New), ..t05_finding("F-03", T05_F03.0, T05_F03.1) };
+        let r2 = finding_track::track(&r1.registry, &r1.open, vec![f03], 2);
+        assert_eq!(finding_track::next_review(&r2.registry), 3);
+        r2.registry
+    }
+
+    /// Revisão 3 da T05: critérios 1 a 4 atendidos, o da CLI ✗ pelo F-04 (`scenario` vazio ou não).
+    fn t05_review3(scenario: &str) -> ReviewResult {
+        let f04 = Finding { state: Some(FindingState::New), failure_scenario: scenario.into(), ..t05_finding("F-04", T05_F04.0, T05_F04.1) };
+        let mut criteria: Vec<CriterionCheck> = (1..=4).map(|i| met(&format!("c{i}"), true)).collect();
+        criteria.push(CriterionCheck {
+            criterion: T05_CLI.into(),
+            met: false,
+            evidence: "tests/test_reporting.py::test_report_cli_strict_month_output_replacement_and_read_only_database; ledger/reporting.py:35".into(),
+        });
+        ReviewResult { criteria, ..rejected(vec![f04]) }
+    }
+
+    /// Hunks da tentativa 3 da T05: a normalização (`ledger/reporting.py:82-85`) e os testes.
+    fn t05_hunks() -> Vec<ChangedHunk> {
+        vec![
+            ChangedHunk { path: "ledger/reporting.py".into(), start: 82, end: 85 },
+            ChangedHunk { path: "tests/test_reporting.py".into(), start: 140, end: 200 },
+        ]
+    }
+
+    /// Spec 131 T02, critério 2: lacuna MEDIUM sem cenário em linha que não mudou, da revisão 3 em diante,
+    /// vira observação, e o critério que ela deixou ✗ deixa de bloquear.
+    #[test]
+    fn untouched_gap_without_scenario_becomes_observation_from_review_3() {
+        let registry = t05_registry();
+        let hunks = t05_hunks();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, t05_review3(""), &registry, 3, Some(&hunks));
+        assert_eq!(result.verdict, Verdict::Approved, "{}", result.summary);
+        assert!(result.findings.is_empty());
+        assert_eq!(gaps.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-04"]);
+        let cli = result.criteria.iter().find(|c| c.criterion == T05_CLI).expect("critério da CLI");
+        assert!(cli.met && cli.evidence.contains("verificação final: F-04"), "{}", cli.evidence);
+        assert!(result.summary.contains("a partir da revisão 3"), "{}", result.summary);
+        let (en, _) = demote_untouched_gaps(Lang::En, t05_review3(""), &registry, 3, Some(&hunks));
+        assert!(en.summary.contains("from review 3 on") && en.criteria[4].evidence.contains("final verification: F-04"), "{}", en.summary);
+        // Antes da revisão 3, sem hunks (sem `rejected_sha`) ou com a linha num hunk: nada muda.
+        for (review, h) in [(2, Some(hunks.as_slice())), (3, None)] {
+            let (same, none) = demote_untouched_gaps(Lang::PtBr, t05_review3(""), &registry, review, h);
+            assert_eq!((same.verdict, none.len()), (Verdict::ChangesRequested, 0));
+        }
+        // Sem critério ✗, a regra da 127 (`demote_late_new`) é que cuida do apontamento novo.
+        let mut all_ok = t05_review3("");
+        all_ok.criteria[4].met = true;
+        let (same, none) = demote_untouched_gaps(Lang::PtBr, all_ok, &registry, 3, Some(&hunks));
+        assert_eq!((same.verdict, none.len()), (Verdict::ChangesRequested, 0));
+        let touched = vec![ChangedHunk { path: "ledger/reporting.py".into(), start: 30, end: 40 }];
+        let (same, none) = demote_untouched_gaps(Lang::PtBr, t05_review3(""), &registry, 3, Some(&touched));
+        assert_eq!((same.verdict, none.len()), (Verdict::ChangesRequested, 0));
+        assert!(!same.criteria[4].met);
+    }
+
+    /// Spec 131 T02 (F-01 da revisão): a lacuna não libera critério que já estava ✗ nem critério ✗ por
+    /// outro motivo.
+    #[test]
+    fn untouched_gap_never_releases_a_criterion_unmet_before_or_for_another_reason() {
+        let hunks = t05_hunks();
+        // Cenário 1: na revisão 2, o C ficou ✗ e o "critério não atendido" gerado está pendente; na 3,
+        // o Revisor marca o C ✗ de novo sem relistar o HIGH e traz só uma MEDIUM nova fora dos hunks.
+        let generated = enforce_criteria(
+            Lang::En,
+            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: "missing".into() }], ..approved(vec![]) },
+        );
+        let r1 = finding_track::track(&[], &[], vec![t05_finding("F-01", T05_F01.0, T05_F01.1)], 1);
+        let r2 = finding_track::track(&r1.registry, &r1.open, generated.findings, 2);
+        assert_eq!(finding_track::next_review(&r2.registry), 3);
+        let mut again = t05_review3("");
+        again.criteria[4].evidence = "ainda falta o teste de normalização".into();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, again.clone(), &r2.registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        assert!(!result.criteria[4].met);
+        // O mesmo com o pendente em pt e com um aberto citado na evidência.
+        let pt = enforce_criteria(
+            Lang::PtBr,
+            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: String::new() }], ..approved(vec![]) },
+        );
+        let r2pt = finding_track::track(&r1.registry, &r1.open, pt.findings, 2);
+        let (result, _) = demote_untouched_gaps(Lang::PtBr, again, &r2pt.registry, 3, Some(&hunks));
+        assert_eq!(result.verdict, Verdict::ChangesRequested);
+        let mut cites_open = t05_review3("");
+        cites_open.criteria[4].evidence = "ledger/reporting.py:35; ainda o F-03".into();
+        let (result, _) = demote_untouched_gaps(Lang::PtBr, cites_open, &t05_registry(), 3, Some(&hunks));
+        assert_eq!(result.verdict, Verdict::ChangesRequested);
+        // Cenário 2: uma lacuna não libera vários critérios ✗ sem ligação explícita, nem um com
+        // evidência em linhas alteradas.
+        let registry = t05_registry();
+        let mut two = t05_review3("");
+        two.criteria[4].evidence = "sem teste".into();
+        two.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "falta".into() };
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, two, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        assert!(!result.criteria[0].met && !result.criteria[4].met);
+        let mut in_hunk = t05_review3("");
+        in_hunk.criteria[4].evidence = "tests/test_reporting.py:160".into();
+        let (result, _) = demote_untouched_gaps(Lang::PtBr, in_hunk, &registry, 3, Some(&hunks));
+        assert_eq!(result.verdict, Verdict::ChangesRequested);
+        // Sem ligação explícita e só um critério ✗ com evidência fora dos arquivos alterados: libera.
+        let mut one = t05_review3("");
+        one.criteria[4].evidence = "sem teste".into();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, one, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::Approved, 1));
+        // Cenário 3: a lacuna em reporting.py:35 não se liga a um critério com evidência em reporting.py:82 (hunk).
+        let mut other_line = t05_review3("");
+        other_line.criteria[4].evidence = "ledger/reporting.py:82".into();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, other_line, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        assert!(!result.criteria[4].met);
+    }
+
+    /// Spec 131 T02 (F-02 da revisão): `continues` sobre um id dispensado pelo Arquiteto é ignorado, e
+    /// o defeito novo continua bloqueando em vez de herdar a dispensa.
+    #[test]
+    fn continues_on_a_waived_id_keeps_blocking() {
+        let mut registry = t05_registry();
+        let f02 = registry.iter_mut().find(|f| f.id == "F-02").expect("F-02");
+        f02.arbitration = Some(crate::sdd::Arbitration { decision: crate::sdd::ArbitrationDecision::Manual, reason: String::new(), review: 2 });
+        let high = Finding { continues: "F-02".into(), state: Some(FindingState::New), failure_scenario: "x → y".into(), ..finding("F-09") };
+        let current = finding_track::apply_continues(&registry, vec![high]);
+        assert_eq!((current[0].id.as_str(), current[0].continues.as_str()), ("F-09", ""));
+        let (result, dispensed) =
+            demote_waived(Lang::PtBr, rejected(current), &finding_reply::waived(&registry));
+        assert_eq!((result.verdict, result.findings.len(), dispensed.len()), (Verdict::ChangesRequested, 1, 0));
+    }
+
+    /// Spec 131 T02, critério 2 (exceção): o F-04 do Test 9 com cenário concreto continua bloqueando.
+    #[test]
+    fn untouched_gap_with_concrete_scenario_keeps_blocking() {
+        let registry = t05_registry();
+        let scenario = "`report --month ２０２５-０１` → the report is written instead of the strict month error";
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, t05_review3(scenario), &registry, 3, Some(&t05_hunks()));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        assert_eq!(result.findings[0].id, "F-04");
+        assert!(!result.criteria[4].met);
+        assert!(concrete_scenario("a -> b") && concrete_scenario("x => y") && concrete_scenario(scenario));
+        assert!(!concrete_scenario("") && !concrete_scenario("aceita dígitos Unicode") && !concrete_scenario("→ erro"));
+    }
+
+    /// Spec 131 T02: a recorrência (critério 1) vem antes da lacuna: a continuação declarada e o
+    /// apontamento parecido com um do registro continuam bloqueando, mesmo em linha que não mudou.
+    /// Um critério ✗ também citado por outro apontamento não é liberado.
+    #[test]
+    fn untouched_gap_rule_yields_to_recurrence_and_to_other_findings() {
+        let registry = t05_registry();
+        let hunks = t05_hunks();
+        let mut cont = t05_review3("");
+        cont.findings[0].continues = "F-03".into();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, cont, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        // O F-02 reescrito (mesmos arquivos, título próximo) em linhas fora dos hunks: recorrência.
+        let back = Finding { state: Some(FindingState::New), ..t05_finding("F-05", "tests/test_reporting.py:20-40", "The tests do not prove CSV and Markdown agree on ranked IDs") };
+        let mut rewritten = t05_review3("");
+        rewritten.findings = vec![back];
+        rewritten.criteria[4].evidence = "tests/test_reporting.py:20".into();
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, rewritten, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
+        // Critério ✗ que cita também um HIGH: nada muda.
+        let mut mixed = t05_review3("");
+        mixed.findings.push(Finding { failure_scenario: "x → y".into(), ..finding("F-05") });
+        mixed.criteria[4].evidence.push_str("; src/lib.rs:1");
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, mixed, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, result.findings.len(), gaps.len()), (Verdict::ChangesRequested, 2, 0));
+        // Outro critério ✗ que não é da lacuna (é do HIGH): nada muda, como na convergência da 127.
+        let mut other = t05_review3("");
+        other.findings.push(Finding { failure_scenario: "x → y".into(), ..finding("F-05") });
+        other.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "src/lib.rs:1".into() };
+        let (result, gaps) = demote_untouched_gaps(Lang::PtBr, other, &registry, 3, Some(&hunks));
+        assert_eq!((result.verdict, result.findings.len(), gaps.len()), (Verdict::ChangesRequested, 2, 0));
+        assert!(!result.criteria[4].met);
+    }
+
+    /// Spec 131 T02 com Revisor e Desenvolvedor falsos, na sequência da T05 do Test 9: a revisão 2
+    /// continua o F-01 com outro id e vários locais (`continues`), e a 3 traz uma lacuna nova numa
+    /// linha que não mudou (`scenario` vazio vira observação; com cenário concreto, reprova). O
+    /// Desenvolvedor recebe as orientações do Revisor da spec.
+    async fn t05_like_run(name: &str, scenario: &'static str) -> (Fixture, FakeDev, Recorder) {
+        let fx = Fixture::new(name, "true");
+        let mut spec = read_spec_file(&fx);
+        spec.body = "## Contexto\nteste\n\n## Orientações por papel\n### Desenvolvedor\nRode pytest.\n\n### Revisor\nConfira dígitos Unicode no mês.\n".into();
+        crate::sdd::write_spec(&fx.repo.join(".sdd/specs/s1/spec.md"), &spec).unwrap();
+        fx.commit_all("chore: orientações");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(move |n, _| {
+            let unmet = |evidence: &str| vec![CriterionCheck { criterion: "arquivo criado".into(), met: false, evidence: evidence.into() }];
+            match n {
+                0 => ReviewResult { criteria: unmet("out-T01-1.txt:1"), ..rejected(vec![Finding { state: Some(FindingState::New), ..medium("F-01", "out-T01-1.txt:1") }]) },
+                1 => {
+                    let cont = Finding {
+                        state: Some(FindingState::New),
+                        continues: "F-01".into(),
+                        description: "Outro texto, outro assunto.".into(),
+                        ..medium("F-02", "out-T01-1.txt:1, out-T01-2.txt:1")
+                    };
+                    ReviewResult { criteria: unmet("out-T01-2.txt:1"), ..rejected(vec![cont]) }
+                }
+                _ => {
+                    let gap = Finding {
+                        state: Some(FindingState::New),
+                        description: "Aceita dígitos Unicode no mês.".into(),
+                        failure_scenario: scenario.into(),
+                        ..medium("F-02", "out-T01-1.txt:1")
+                    };
+                    ReviewResult { criteria: unmet("out-T01-1.txt:1"), ..rejected(vec![gap]) }
+                }
+            }
+        });
+        let rec = Recorder::default();
+        let _ = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        (fx, dev, rec)
+    }
+
+    #[tokio::test]
+    async fn t05_sequence_links_the_continuation_and_converges_on_the_untouched_gap() {
+        let (fx, dev, rec) = t05_like_run("t05-converge", "").await;
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Done, "{}", t.body);
+        let texts = reviewer_texts(&rec);
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        // Revisão 2: o F-02 do Revisor é o F-01 continuado (recorrência 2), sem id novo.
+        assert!(texts[1].contains("- F-01 [MEDIUM, aberto há 2 revisões] out-T01-1.txt:1, out-T01-2.txt:1"), "{}", texts[1]);
+        let registry = read_registry(&t.body).unwrap();
+        let f01 = registry.iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f01.first_review, f01.continues.as_str()), (1, ""));
+        // Revisão 3: a lacuna sem cenário numa linha que não mudou vira observação e a tarefa é aprovada.
+        assert!(texts[2].starts_with("Aprovado: "), "{}", texts[2]);
+        assert!(texts[2].contains("✓ arquivo criado: out-T01-1.txt:1 (lacuna em código que não mudou"), "{}", texts[2]);
+        let kept = section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default();
+        assert!(kept.contains("F-02") && kept.contains("Unicode"), "{kept}");
+        // O Desenvolvedor recebeu as orientações do Revisor junto das suas, sem repeti-las no contexto.
+        let briefs = dev.briefs();
+        assert!(briefs.iter().all(|b| b.role_guidance == "Rode pytest." && b.reviewer_guidance == "Confira dígitos Unicode no mês."));
+        assert!(briefs[0].spec_context.contains("### Revisor") && !briefs[0].spec_context.contains("Confira dígitos"), "{}", briefs[0].spec_context);
+    }
+
+    #[tokio::test]
+    async fn t05_sequence_keeps_blocking_the_gap_with_a_concrete_scenario() {
+        let (fx, _dev, rec) = t05_like_run("t05-scenario", "mês `２０２５-０１` → relatório gerado em vez do erro").await;
+        let texts = reviewer_texts(&rec);
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(texts[2].starts_with("Pediu ajustes: "), "{}", texts[2]);
+        assert!(texts[2].contains("out-T01-1.txt:1: Aceita dígitos Unicode no mês."), "{}", texts[2]);
+        let t = fx.read_task("T01");
+        assert_ne!(t.frontmatter.status, TaskStatus::Done);
+        assert!(section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default().is_empty());
+    }
+
+    /// Spec da 131 T05 sem `run_command` (o caso do Test 9).
+    fn spec_without_run_command() -> crate::sdd::SpecMeta {
+        Spec::parse(crate::agents::prompts::EXAMPLE_SPEC_MD).unwrap().frontmatter
+    }
+
+    /// Spec 131 T05 (C-09): o critério que cita o `run_command` inexistente sai da matriz (sem ✓,
+    /// o caso B4) e vira observação para a verificação final; o apontamento sobre ele também, e o
+    /// veredito fica APPROVED sem nada voltar ao Desenvolvedor.
+    #[test]
+    fn criterion_citing_a_missing_field_is_not_judged_and_becomes_a_final_observation() {
+        let spec = spec_without_run_command();
+        let cites = "the spec run_command imports the sample statement";
+        let crit = |c: &str, met: bool| CriterionCheck { criterion: c.into(), met, evidence: "src/cli.py:10".into() };
+        // B4: o Revisor deu ✓ ao critério com o inexistente.
+        let ok = ReviewResult { criteria: vec![crit(cites, true), crit("arquivo criado", true)], ..approved(vec![]) };
+        let (out, obs) = demote_missing_fields(Lang::PtBr, ok, &spec, None, &[]);
+        assert_eq!(out.verdict, Verdict::Approved);
+        assert_eq!(out.criteria.iter().map(|c| c.criterion.as_str()).collect::<Vec<_>>(), vec!["arquivo criado"]);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].description.contains(cites) && obs[0].description.contains("`run_command`, que a spec não declara"), "{}", obs[0].description);
+        // ✗ com o apontamento sobre o campo: os dois viram observação, com ids livres.
+        let registry = vec![tracked("F-01", 1)];
+        let about = Finding { description: "O `run_command` da spec não existe; não há como importar.".into(), ..medium("F-01", "spec.md:1") };
+        let rejected_one = ReviewResult { criteria: vec![crit(cites, false), crit("arquivo criado", true)], ..rejected(vec![about]) };
+        let (out, obs) = demote_missing_fields(Lang::En, rejected_one, &spec, None, &registry);
+        assert_eq!(out.verdict, Verdict::Approved, "{out:?}");
+        assert!(out.findings.is_empty() && out.summary.contains("does not go back to the Developer"), "{}", out.summary);
+        assert_eq!(obs.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["F-02", "F-03"]);
+        assert!(obs[1].description.starts_with("The finding cites `run_command`, which the spec does not declare"), "{}", obs[1].description);
+        assert!(enforce_criteria(Lang::En, out).findings.is_empty(), "nada volta ao Desenvolvedor");
+        // O defeito com cenário concreto continua bloqueando; outro critério ✗ também.
+        let real = Finding { failure_scenario: "`run_command` ausente → `ledger` sai com 2".into(), ..medium("F-04", "src/cli.py:3") };
+        let mixed = ReviewResult { criteria: vec![crit(cites, false), crit("arquivo criado", false)], ..rejected(vec![real]) };
+        let (out, obs) = demote_missing_fields(Lang::PtBr, mixed, &spec, None, &[]);
+        assert_eq!((out.verdict, out.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 1));
+        assert_eq!(out.criteria.len(), 1);
+        // F-01: o HIGH que cita o nome (aqui, a função `run_command` do código), sem seta, continua bloqueando.
+        let high = Finding {
+            description: "`run_command` em src/cli.py passa a entrada para shell=True".into(),
+            failure_scenario: "entrada com ; executa outro comando".into(),
+            ..finding("F-05")
+        };
+        let high = Finding { location: "src/cli.py:3".into(), ..high };
+        let blocked = ReviewResult { criteria: vec![crit("arquivo criado", true)], ..rejected(vec![high]) };
+        let (out, obs) = demote_missing_fields(Lang::PtBr, blocked, &spec, None, &[]);
+        assert_eq!((out.verdict, out.findings.len(), obs.len()), (Verdict::ChangesRequested, 1, 0));
+        assert_eq!(out.findings[0].id, "F-05");
+        // Com o campo declarado, nada muda.
+        let mut declared = spec_without_run_command();
+        declared.run_command = Some("python -m ledger report".into());
+        let same = ReviewResult { criteria: vec![crit(cites, false)], ..rejected(vec![]) };
+        let (out, obs) = demote_missing_fields(Lang::PtBr, same.clone(), &declared, None, &[]);
+        assert_eq!((out, obs.len()), (same, 0));
+    }
+
+    /// Spec 131 T05 (C-09), na execução: o critério com o `run_command` inexistente ✗ e o apontamento
+    /// sobre ele não voltam ao Desenvolvedor; a tarefa é aprovada e a observação vai à verificação final.
+    #[tokio::test]
+    async fn review_sends_a_criterion_citing_a_missing_field_to_the_final_verification_not_the_developer() {
+        let fx = Fixture::new("missing-field-review", "make test");
+        let mut t = task("T01", TaskStatus::Todo, &[]);
+        t.body = "## Objetivo\nFazer T01.\n\n## Critérios de Aceitação\n- arquivo criado\n- the spec run_command imports the sample\n".into();
+        fx.add_task(&t);
+        let dev = FakeDev::default();
+        let rev = FakeReviewer::new(|_, _| {
+            let about = Finding { description: "There is no `run_command` in the spec.".into(), ..medium("F-01", "spec.md:1") };
+            ReviewResult {
+                criteria: vec![
+                    CriterionCheck { criterion: "arquivo criado".into(), met: true, evidence: "out-T01-1.txt:1".into() },
+                    CriterionCheck { criterion: "the spec run_command imports the sample".into(), met: false, evidence: "sem run_command".into() },
+                ],
+                ..rejected(vec![about])
+            }
+        });
+        let rec = Recorder::default();
+        let _ = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_task(SPEC, "T01").await.unwrap();
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Done, "{}", t.body);
+        assert_eq!(dev.briefs().len(), 1, "não volta ao Desenvolvedor");
+        let texts = reviewer_texts(&rec);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("Aprovado: ") && !texts[0].contains("✓ the spec run_command"), "{}", texts[0]);
+        let kept = section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default();
+        assert!(kept.contains("the spec run_command imports the sample") && kept.contains("There is no `run_command`"), "{kept}");
+        assert!(final_observations_facts(&[t]).contains("`run_command`, que a spec não declara"));
     }
 
     #[test]
@@ -13230,38 +13971,52 @@ mod tests {
             .collect()
     }
 
-    /// Spec 129 T02: acima do limite, a conferência roda a instalação na base num container mantido
-    /// (sem `--rm`), lê o `docker diff`, remove o container e avisa na Conversa, no spec.md e no
-    /// briefing do Desenvolvedor; roda uma vez por spec.
+    /// Chamadas do `run` da instalação (`make deps`) feitas pelo Compose falso: `(mantida, pasta)`;
+    /// mantida = sem `--rm` (o container da conferência).
+    fn install_runs(fake: &crate::harness::compose::fake::FakeRunner) -> Vec<(bool, PathBuf)> {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| crate::harness::compose::fake::sub_of(&c.args) == "run" && c.args.last().is_some_and(|a| a == "make deps"))
+            .map(|c| (!c.args.iter().any(|a| a == "--rm"), c.cwd.clone()))
+            .collect()
+    }
+
+    /// Spec 129 T02 e 131 T05: acima do limite, a primeira instalação real da execução roda num
+    /// container mantido (sem `--rm`), o `docker diff` é lido, o container sai, e o aviso vai à
+    /// Conversa, ao spec.md e ao briefing do Desenvolvedor; uma vez por spec. O texto do limite diz
+    /// "entradas".
     #[tokio::test]
-    async fn install_footprint_above_the_limit_warns_everywhere_once_per_spec() {
+    async fn install_footprint_rides_the_first_real_install_and_warns_everywhere_once_per_spec() {
         let (fx, fake, dev, rec, runner) = footprint_fixture("footprint-above", Some("make deps"));
         fake.reply("diff", 0, &footprint_diff(INSTALL_FOOTPRINT_LIMIT + 5));
         let settings = read_settings(&fx.settings_path()).unwrap();
-        runner.remember(&fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
-        runner.check_install_footprint(&settings, SPEC).await.unwrap();
-        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "prepare, instalação, diff e remoção");
+        runner.arm_install_footprint(SPEC);
+        let install = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
+        assert!(matches!(install, Install::Ran { clean: false }));
+        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "prepare, instalação mantida, diff e remoção");
         let calls = fake.calls.lock().unwrap().clone();
         assert!(!calls[2].args.iter().any(|a| a == "--rm") && calls[2].args.ends_with(&["-lc".into(), "make deps".into()]), "{:?}", calls[2].args);
         assert!(calls[2].args.contains(&"nants.project=footprint-above".to_string()));
-        assert_eq!(calls[2].cwd, fx.repo, "na base");
-        // spec.md: o registro (com o tempo) e o aviso com os caminhos principais, sem conteúdo.
+        // spec.md: o registro (com o tempo e o limite em entradas) e o aviso com os caminhos principais.
         let section = footprint_section(&fx).expect("seção do Arquiteto");
         let count = INSTALL_FOOTPRINT_LIMIT + 8;
-        assert!(section.contains(&format!("código 0): {count} entradas gravadas fora de /work, em ")), "{section}");
+        assert!(section.contains(&format!("Conferência da instalação (`make deps`, código 0): {count} entradas gravadas fora de /work, em ")), "{section}");
+        assert!(section.contains(&format!("(aviso acima de {INSTALL_FOOTPRINT_LIMIT} entradas)")), "{section}");
         assert!(section.contains("A instalação gravou fora da pasta do projeto; isso se perde entre comandos"), "{section}");
         assert!(section.contains(&format!("/tmp/.local/lib ({})", INSTALL_FOOTPRINT_LIMIT + 6)) && !section.contains("/work/fica"), "{section}");
-        // Conversa, pelo código do dicionário.
         let notices = outside_work_notices(&rec);
         assert_eq!(notices.len(), 1);
         assert!(notices[0].0.starts_with("Aviso: a instalação gravou fora da pasta do projeto"), "{}", notices[0].0);
         assert!(notices[0].1.get("paths").and_then(|v| v.as_str()).is_some_and(|p| p.starts_with("/tmp/.local/lib (")));
-        // Uma vez por spec: a seção gravada dispensa a próxima conferência.
-        runner.check_install_footprint(&settings, SPEC).await.unwrap();
-        assert_eq!(fake.subcommands().len(), 5, "não roda de novo");
+        assert!(test_levels::installed_key(&fx.repo).is_some(), "a instalação conta como a de sempre");
+        // Uma vez por spec: a próxima instalação é a de sempre (`--rm`), sem diff nem aviso.
+        assert!(runner.footprint_pending(&settings).is_none());
+        let _ = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
+        assert_eq!(install_runs(&fake).iter().filter(|(kept, _)| *kept).count(), 1);
+        assert_eq!(fake.subcommands().iter().filter(|s| *s == "diff").count(), 1);
         assert_eq!(outside_work_notices(&rec).len(), 1);
-        // A base ficou instalada: a instalação dela só roda de novo se a trava mudar.
-        assert!(test_levels::installed_key(&fx.repo).is_some());
         // Briefing do Desenvolvedor, com a regra.
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let _ = runner.run_task(SPEC, "T01").await.unwrap();
@@ -13269,37 +14024,63 @@ mod tests {
         assert!(brief.contains("só o que fica em /work persiste") && brief.contains("/tmp/.local/lib ("), "{brief}");
     }
 
-    /// Spec 129 T02: abaixo do limite, só o registro (resultado e tempo); nada na Conversa nem no
-    /// briefing. A instalação que falha também é conferida, e o container sai do mesmo jeito.
+    /// Spec 131 T05: a instalação que sai com código 1 (no Test 9, a base ainda sem a trava) é
+    /// inconclusiva: sem registro, sem contagem, sem aviso, e a conferência continua pendente. O
+    /// container sai do mesmo jeito, e a instalação falha como sempre.
     #[tokio::test]
-    async fn install_footprint_below_the_limit_only_records_and_a_failed_install_is_still_cleaned() {
-        let (fx, fake, _dev, rec, runner) = footprint_fixture("footprint-below", Some("make deps"));
-        fake.reply("run", 2, "erro na instalação");
-        fake.reply("diff", 0, &footprint_diff(2));
+    async fn install_footprint_with_exit_code_one_is_inconclusive_and_stays_pending() {
+        let (fx, fake, _dev, rec, runner) = footprint_fixture("footprint-code1", Some("make deps"));
+        fake.reply("run", 1, "ERROR: Could not open requirements file: requirements.lock");
+        fake.reply("diff", 0, &footprint_diff(INSTALL_FOOTPRINT_LIMIT + 5));
         let settings = read_settings(&fx.settings_path()).unwrap();
-        // Uma instalação antiga lembrada na base é esquecida quando a da conferência falha.
         test_levels::remember_install(&fx.repo, "chave-antiga", "2026-10-26T10:00:00Z");
-        assert!(test_levels::installed_key(&fx.repo).is_some());
-        runner.remember(&fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap();
-        runner.check_install_footprint(&settings, SPEC).await.unwrap();
-        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"]);
-        let section = footprint_section(&fx).expect("registro");
-        assert!(section.contains("código 2): 5 entradas gravadas fora de /work") && !section.contains("Caminhos principais"), "{section}");
+        runner.arm_install_footprint(SPEC);
+        let install = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
+        assert!(matches!(install, Install::Failed(..)));
+        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "o container sai do mesmo jeito");
+        assert!(footprint_section(&fx).is_none(), "não marcada como feita nem com contagem");
         assert!(outside_work_notices(&rec).is_empty());
-        assert!(install_footprint_prompt(&fs::read_to_string(fx.repo.join(".sdd/specs").join(SPEC).join("spec.md")).unwrap()).is_empty());
+        assert_eq!(runner.footprint_pending(&settings).as_deref(), Some(SPEC), "fica para a próxima instalação");
         assert!(test_levels::installed_key(&fx.repo).is_none(), "instalação que falhou não fica lembrada");
     }
 
-    /// Spec 129 T02: sem `install_command`, nada roda; a conferência é a primeira coisa do
-    /// `run_spec`, antes de qualquer tarefa.
+    /// Spec 131 T05: o `docker diff` que falha também deixa a conferência inconclusiva, sem estragar
+    /// a instalação que passou.
     #[tokio::test]
-    async fn install_footprint_needs_install_command_and_runs_before_the_first_task() {
+    async fn install_footprint_without_the_diff_is_inconclusive_but_the_install_counts() {
+        let (fx, fake, _dev, _rec, runner) = footprint_fixture("footprint-nodiff", Some("make deps"));
+        fake.reply("diff", 1, "No such container");
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        runner.arm_install_footprint(SPEC);
+        let install = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
+        assert!(matches!(install, Install::Ran { .. }));
+        assert!(footprint_section(&fx).is_none());
+        assert!(runner.footprint_pending(&settings).is_some());
+    }
+
+    /// Spec 131 T05: nada roda na base antes da primeira tarefa. Na execução, a instalação do
+    /// Desenvolvedor na worktree (a trava mudou) é a conferência; com a trava em dia, a rodada de
+    /// testes não instala de novo. Sem `install_command`, nada é conferido.
+    #[tokio::test]
+    async fn install_footprint_uses_the_worktree_install_without_a_second_install() {
         let (fx, fake, _dev, _rec, runner) = footprint_fixture("footprint-none", None);
         assert!(runner.run_spec(SPEC).await.is_err(), "spec sem tarefas");
         assert!(fake.subcommands().is_empty() && footprint_section(&fx).is_none());
         let (fx, fake, _dev, _rec, runner) = footprint_fixture("footprint-first", Some("make deps"));
         assert!(runner.run_spec(SPEC).await.is_err(), "spec sem tarefas");
-        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"]);
+        assert!(fake.subcommands().is_empty(), "nada roda na base antes da primeira tarefa");
+        assert!(footprint_section(&fx).is_none());
+        fs::write(fx.repo.join("deps.lock"), "pkg==1.0\n").unwrap();
+        edit_settings(&fx, |s| s.lockfiles = vec!["deps.lock".into()]);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let _ = runner.run_task(SPEC, "T01").await.unwrap();
+        let runs = install_runs(&fake);
+        let worktree = runner.worktree_path(SPEC, "T01");
+        // A primeira instalação da execução é a da worktree, e ela mesma é a conferência (mantida);
+        // as seguintes (a rodada limpa final e a da base na integração) são as de sempre.
+        assert!(runs.first().is_some_and(|(kept, dir)| *kept && *dir == worktree), "{runs:?}");
+        assert_eq!(runs.iter().filter(|(kept, _)| *kept).count(), 1, "{runs:?}");
+        assert_eq!(runs.len(), 3, "worktree, rodada limpa final e base: nenhuma instalação a mais pela conferência: {runs:?}");
         assert!(footprint_section(&fx).is_some_and(|s| s.contains("0 entradas gravadas fora de /work")));
     }
 
@@ -14016,12 +14797,15 @@ mod spec_context_tests {
     #[test]
     fn spec_context_extracts_sections_within_limit() {
         let spec = "---\nid: x\n---\n## Contexto\nc\n## Premissas\n- p1\n## Abordagem Técnica\n- a1\n## Outra\nz\n";
-        let t = spec_context_of(spec, 4096);
-        assert!(t.contains("p1") && t.contains("a1") && !t.contains('z'), "{t}");
-        assert_eq!(spec_context_of("## Contexto\nc\n", 4096), "");
-        let big = format!("## Premissas\n{}\n", "ç".repeat(5000));
-        let t = spec_context_of(&big, 4096);
-        assert!(t.len() <= 4096 + 20 && t.contains("truncado"));
+        // Spec 131 T01: tudo cabe, então todas as seções entram inteiras, com o índice.
+        let t = spec_context_of(spec, "", 4096);
+        assert!(t.contains("p1") && t.contains("a1") && t.contains('z') && !t.contains("id: x"), "{t}");
+        assert!(t.contains("- ## Outra (") && t.contains("[inteira abaixo]"), "{t}");
+        assert_eq!(spec_context_of("sem seções\n", "", 4096), "");
+        // Uma seção maior que o teto nunca chega cortada: fica só no índice.
+        let big = format!("## Premissas\n{}\n## Curta\nok\n", "çq".repeat(3000));
+        let t = spec_context_of(&big, "", 4096);
+        assert!(!t.contains("çq") && t.contains("[fora do briefing: read_spec_section]") && t.contains("ok"), "{t}");
     }
 
     #[test]

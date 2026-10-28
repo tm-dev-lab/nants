@@ -4,7 +4,7 @@
  */
 import { formatNumber, localized, t, tp } from "../../i18n";
 import type { Agents, ConnectionView, ModelPricing } from "../../api/types";
-import { ROLE_INFO, ROLE_ORDER, wireApiCardLabel, wireApiOf } from "../../settings/rules";
+import { isNativeKind, NATIVE_PROVIDERS, ROLE_INFO, ROLE_ORDER, wireApiCardLabel, wireApiOf } from "../../settings/rules";
 import type { IconName } from "../../desktop/Icon";
 import { requiredMissing, SETTINGS_WINDOW_TABS, type Readiness, type ReadinessItem, type SettingsWindowTab } from "../../desktop/api";
 import type { Tone } from "../../desktop/theme/tokens";
@@ -97,11 +97,16 @@ export function connectionHost(baseUrl: string): string {
   }
 }
 
-/** Detalhe da linha: host · protocolo · chave mascarada (ou a referência env:). */
+/**
+ * Detalhe da linha: host · protocolo · chave mascarada (ou a referência env:). Nas conexões nativas
+ * (spec 132), o host é o endereço efetivo (o avançado, quando houver) e, no lugar do protocolo, o
+ * provedor.
+ */
 export function connectionDetail(connection: ConnectionView): string {
+  const native = isNativeKind(connection.kind) ? connection.kind : null;
   return t("settings.connection.detail", {
-    host: connectionHost(connection.base_url),
-    protocol: wireApiCardLabel(wireApiOf(connection)),
+    host: connectionHost(native !== null ? (connection.base_url_override ?? connection.base_url) : connection.base_url),
+    protocol: native !== null ? NATIVE_PROVIDERS[native].brand : wireApiCardLabel(wireApiOf(connection)),
     key: connection.api_key_masked,
   });
 }
@@ -116,6 +121,11 @@ export interface PriceRow {
   image: string;
   source: "manual" | "estimated";
   estimatedAt?: string;
+  /**
+   * US$ por 1M de tokens gravados no cache (spec 132): o campo opcional "escrita de cache" (T10);
+   * vazio ou ausente = o servidor cobra a escrita pelo preço de entrada.
+   */
+  cacheWrite?: string;
 }
 
 export type PriceRows = Record<string, PriceRow>;
@@ -139,6 +149,7 @@ export function priceRowOf(p: ModelPricing): PriceRow {
     image: p.image_per_unit === undefined ? "" : formatPrice(p.image_per_unit),
     source: p.source === "estimated" ? "estimated" : "manual",
     ...(p.estimated_at !== undefined ? { estimatedAt: p.estimated_at } : {}),
+    cacheWrite: p.cache_write_per_mtok === undefined ? "" : formatPrice(p.cache_write_per_mtok),
   };
 }
 
@@ -180,10 +191,13 @@ export function buildPricing(models: readonly string[], rows: PriceRows): Pricin
     const output = parsePrice(row.output);
     const cached = row.cached.trim() === "" ? undefined : parsePrice(row.cached);
     const image = row.image.trim() === "" ? undefined : parsePrice(row.image);
-    if (input === null || output === null || cached === null || image === null) return { ok: false, model };
+    const writeText = row.cacheWrite ?? "";
+    const cacheWrite = writeText.trim() === "" ? undefined : parsePrice(writeText);
+    if (input === null || output === null || cached === null || image === null || cacheWrite === null) return { ok: false, model };
     const entry: ModelPricing = { input_per_mtok: input, output_per_mtok: output, source: row.source };
     if (cached !== undefined) entry.cached_input_per_mtok = cached;
     if (image !== undefined) entry.image_per_unit = image;
+    if (cacheWrite !== undefined) entry.cache_write_per_mtok = cacheWrite;
     if (row.source === "estimated" && row.estimatedAt !== undefined) entry.estimated_at = row.estimatedAt;
     out[model] = entry;
   }

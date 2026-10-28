@@ -192,6 +192,7 @@ fn config_for(root: &Path) -> Config {
         api_key: "sk-e2e".into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let agent = |model: &str| AgentConfig { connection_id: "c".into(), model: model.into(), effort: Effort::Low, max_steps: None };
     cfg.agents.architect = agent("arq");

@@ -176,9 +176,10 @@ pub struct SpecView {
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_review: Option<super::plan_review::PlanReviewView>,
     /// O que mudou no plano desde a versão anterior (spec 086 T09), só na spec em AWAITING_APPROVAL
-    /// e só quando o resumo é da versão atual. Omitido sem mudanças.
+    /// e só quando o resumo é da versão atual. Omitido sem mudanças. Cada linha vem com `code` e
+    /// `params` (spec 131 T06), ou em texto quando o arquivo é de antes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    plan_changes: Option<Vec<String>>,
+    plan_changes: Option<Vec<super::plan_changes::PlanChangeLine>>,
     /// Ações gravadas em `tools.jsonl` por `task_id` (inclui `FINAL`, a verificação final); link
     /// "Ações (N)" da UI. Contagem em cache por tamanho/mtime. Omitido quando vazio.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -620,12 +621,7 @@ fn ensure_git_repo(root: &Path, has_git: bool, lang: crate::i18n::Lang) -> Resul
     } else if !git.is_unborn() {
         return Ok(false);
     }
-    let fallback: Vec<(&str, &str)> = git
-        .missing_identity()
-        .into_iter()
-        .map(|k| (k, if k == "user.name" { "Nants" } else { "nants@localhost" }))
-        .collect();
-    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.init_repo"), &fallback)
+    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.init_repo"))
         .map_err(|_| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "git_init_failed", Map::new()))?;
     Ok(true)
 }
@@ -1522,8 +1518,57 @@ pub(super) fn changed_plan_warnings(root: &Path, before: &BTreeMap<String, Strin
     for (id, spec) in changed {
         let spec_rel = format!("{SPECS_REL}/{id}");
         let scope = plan_scope_warnings(root, &spec_rel).into_iter().map(|w| scrub_text(secrets, &w));
-        for w in scope.chain(plan_coverage_warnings(root, &spec_rel, &spec, secrets)) {
+        let run = plan_run_warnings(root, &spec_rel, &spec, secrets);
+        for w in scope.chain(plan_coverage_warnings(root, &spec_rel, &spec, secrets)).chain(run) {
             out.push(if tagged { format!("{id}: {w}") } else { w });
+        }
+    }
+    out
+}
+
+/// Aviso do plano sem `run_command` nem a decisão `nothing_to_run` (spec 131 T04). Texto de prompt
+/// (vai ao Arquiteto pela conferência do plano), não de tela.
+pub(super) const RUN_COMMAND_MISSING_WARNING: &str = "a spec não declara `run_command`: como o usuário vê o produto \
+funcionando? Declare no frontmatter o comando que o mostra (num CLI, um exemplo real sobre os dados de amostra; um fluxo \
+longo vai para um script do projeto, que o comando chama). Se não houver o que executar (ex.: uma biblioteca usada só \
+pelos testes), registre a decisão nas decisões do spec e, numa frase, no frontmatter `nothing_to_run`. Sem saber, \
+pergunte ao usuário na resposta";
+
+/// Avisos do plano sobre a execução (spec 131 T04): sem `run_command` nem decisão registrada, e
+/// critérios (globais e das tarefas) que citam um campo da spec inexistente ou vazio (detecção em
+/// [`crate::sdd::field_citations::missing_fields_cited`], a mesma da execução).
+fn plan_run_warnings(root: &Path, spec_rel: &str, spec: &Spec, secrets: &SecretSet) -> Vec<String> {
+    use crate::sdd::coverage::{criterion_items, global_criteria, snippet};
+    use crate::sdd::field_citations::missing_fields_cited;
+    let meta = &spec.frontmatter;
+    let mut out = Vec::new();
+    if meta.run_command.is_none() && meta.nothing_to_run.is_none() {
+        out.push(RUN_COMMAND_MISSING_WARNING.to_string());
+    }
+    let settings = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES)
+        .ok()
+        .and_then(|t| Settings::parse(&t).ok());
+    let mut check = |label: &str, criterion: &str| {
+        let fields = missing_fields_cited(criterion, meta, settings.as_ref());
+        if fields.is_empty() {
+            return;
+        }
+        let names: Vec<String> = fields.iter().map(|f| format!("`{f}`")).collect();
+        out.push(format!(
+            "{label}: o critério \"{}\" cita {}, que a spec não declara: declare o campo ou reescreva o critério para \
+             citar só o que existe",
+            // Redige antes do corte do trecho: segredo cortado não vaza prefixo (como na cobertura).
+            scrub_text(secrets, &snippet(&scrub_text(secrets, criterion))),
+            names.join(", ")
+        ));
+    };
+    for (i, criterion) in global_criteria(&spec.body).iter().enumerate() {
+        check(&format!("G{}", i + 1), criterion);
+    }
+    for task in plan_tasks(root, spec_rel) {
+        let acceptance = crate::agents::runner::section_text(&task.body, crate::agents::runner::ACCEPTANCE).unwrap_or_default();
+        for criterion in criterion_items(&acceptance) {
+            check(&task.frontmatter.id, &criterion);
         }
     }
     out
@@ -1771,6 +1816,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "literal".into(),
@@ -2087,13 +2133,8 @@ Texto.
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_env("GIT_CONFIG_NOSYSTEM", "1");
         repo.init_main().expect("init");
-        let fallback: Vec<(&str, &str)> = repo
-            .missing_identity()
-            .into_iter()
-            .map(|k| (k, if k == "user.name" { "Nants" } else { "nants@localhost" }))
-            .collect();
-        assert_eq!(fallback.len(), 2);
-        repo.commit_empty("chore: x", &fallback).expect("commit");
+        assert_eq!(repo.identity_fallback().len(), 2);
+        repo.commit_empty("chore: x").expect("commit");
         assert_eq!(git_out(&proj, &["log", "-1", "--format=%an <%ae>"]), "Nants <nants@localhost>");
     }
 
@@ -2366,6 +2407,7 @@ Texto.
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2399,6 +2441,7 @@ Texto.
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2444,6 +2487,7 @@ Texto.
             api_key: KEY.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("P", proj.to_str().expect("u"))).await;
@@ -2595,10 +2639,11 @@ Texto.
         write(&proj.join(".sdd/specs/001-demo/spec.md"), &SPEC_MD.replace("IN_PROGRESS", "AWAITING_APPROVAL"));
         write(&proj.join(".sdd/specs/001-demo/tasks/T01.md"), TASK_T01);
         let signature = super::super::plan_review::plan_signature(&proj, "001-demo").expect("sig");
-        let record = json!({"signature": signature, "lines": ["T02 removida"]});
+        // Linha em texto (arquivo de antes da spec 131 T06) e linha com código: as duas chegam ao estado.
+        let record = json!({"signature": signature, "lines": ["T02 removida", {"code": "task_new", "params": {"id": "T03", "title": "Nova"}}]});
         write(&proj.join(".sdd/specs/001-demo/plan-changes.json"), &record.to_string());
         let (_, body) = call(&state, get_req(&format!("/api/projects/{id}/state"))).await;
-        assert_eq!(json_of(&body)["specs"][0]["plan_changes"], json!(["T02 removida"]), "{body}");
+        assert_eq!(json_of(&body)["specs"][0]["plan_changes"], json!(["T02 removida", {"code": "task_new", "params": {"id": "T03", "title": "Nova"}}]), "{body}");
 
         write(&proj.join(".sdd/specs/001-demo/plan-changes.json"), &json!({"signature": signature, "lines": []}).to_string());
         let (_, body) = call(&state, get_req(&format!("/api/projects/{id}/state"))).await;
@@ -2625,6 +2670,7 @@ Texto.
             api_key: LONG.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&dir, cfg);
         let (_, created) = call(&state, post_project("Demo", proj.to_str().expect("u"))).await;
@@ -3035,6 +3081,7 @@ mod pending_tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig {
             connection_id: "literal".into(),
@@ -3480,6 +3527,7 @@ mod settings_tests {
                 api_key: "k".into(),
                 wire_api: crate::config::WireApi::Responses,
                 kind: Default::default(),
+                base_url_override: None,
             });
             cfg.connections.push(Connection {
                 id: "c-chat".into(),
@@ -3488,6 +3536,7 @@ mod settings_tests {
                 api_key: "k".into(),
                 wire_api: crate::config::WireApi::Chat,
                 kind: Default::default(),
+                base_url_override: None,
             });
             cfg.agents.architect.connection_id = "c-chat".into();
         }
@@ -3496,6 +3545,22 @@ mod settings_tests {
         assert!(state_of(state.clone(), id.clone()).await);
         state.mark_web_search_rejected("c-resp");
         assert!(!state_of(state.clone(), id.clone()).await, "rejeição registrada nesta execução");
+        // Spec 132 T05: a Anthropic tem a busca nativa pelo adaptador da Messages API.
+        {
+            let mut cfg = state.config().write().await;
+            cfg.connections.push(Connection::native("c-anth", "A", crate::config::ConnectionKind::Anthropic, "k"));
+            cfg.agents.architect.connection_id = "c-anth".into();
+        }
+        assert!(state_of(state.clone(), id.clone()).await, "Anthropic: busca nativa");
+        // Spec 132 T07: o Gemini tem o `google_search` pelo adaptador da Interactions API.
+        {
+            let mut cfg = state.config().write().await;
+            cfg.connections.push(Connection::native("c-gem", "G", crate::config::ConnectionKind::GoogleGemini, "k"));
+            cfg.agents.architect.connection_id = "c-gem".into();
+        }
+        assert!(state_of(state.clone(), id.clone()).await, "Gemini: busca nativa");
+        state.mark_web_search_rejected("c-gem");
+        assert!(!state_of(state.clone(), id.clone()).await, "Gemini: rejeição registrada");
     }
 
     #[tokio::test]
@@ -3515,6 +3580,7 @@ mod settings_tests {
                     api_key: "k".into(),
                     wire_api: wire,
                     kind: Default::default(),
+                    base_url_override: None,
                 });
             }
             cfg.agents.developer.connection_id = "c-chat".into();
@@ -3769,6 +3835,7 @@ mod settings_tests {
             api_key: "test".into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = AppState::new(dir.join("config.toml"), crate::server::readiness::chat_ready(cfg), 3000);
         let body = json!({ "name": "P", "path": proj.to_str().expect("u") }).to_string();
@@ -3878,10 +3945,16 @@ mod plan_warning_tests {
     const SPEC_REL: &str = ".sdd/specs/001-exemplo";
 
     fn root_with_task(tag: &str, task_body: &str) -> PathBuf {
+        root_with(tag, "run_command: \"cargo run -- exemplo\"\n", task_body)
+    }
+
+    /// Spec de exemplo com `extra` no frontmatter e a tarefa T01 com `task_body` nos critérios.
+    fn root_with(tag: &str, extra: &str, task_body: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("nants-plan-warnings-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(SPEC_REL).join("tasks")).expect("mkdir");
-        fs::write(root.join(SPEC_REL).join("spec.md"), crate::agents::prompts::EXAMPLE_SPEC_MD).expect("spec");
+        let spec = crate::agents::prompts::EXAMPLE_SPEC_MD.replace("created_at", &format!("{extra}created_at"));
+        fs::write(root.join(SPEC_REL).join("spec.md"), spec).expect("spec");
         let task = crate::agents::prompts::EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.", task_body);
         fs::write(root.join(SPEC_REL).join("tasks/T01.md"), task).expect("task");
         root
@@ -3906,6 +3979,85 @@ mod plan_warning_tests {
         let line = "T01: 4 caminhos citados fora do escopo (`a.md`, `b.md`, `docs/c.md` e mais 1)".to_string();
         assert_eq!(plan_scope_warnings(&root, SPEC_REL), vec![line.clone()]);
         assert_eq!(changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default()), vec![line]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Spec 131 T04: sem `run_command`, o aviso do plano pergunta como o usuário vê o produto
+    /// funcionando, no mesmo turno (a conferência do plano), sem rodada de consenso.
+    #[test]
+    fn plan_without_run_command_asks_how_the_user_sees_the_product() {
+        let root = root_with("no-run", "", "- [ ] Os testes passam.");
+        let warnings = changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default());
+        assert_eq!(warnings, vec![RUN_COMMAND_MISSING_WARNING.to_string()]);
+        assert!(RUN_COMMAND_MISSING_WARNING.contains("como o usuário vê o produto funcionando"));
+        assert!(RUN_COMMAND_MISSING_WARNING.contains("`nothing_to_run`"));
+        // Vazio equivale a ausente.
+        let root2 = root_with("empty-run", "run_command: \"  \"\n", "- [ ] Os testes passam.");
+        assert_eq!(changed_plan_warnings(&root2, &BTreeMap::new(), &SecretSet::default()), warnings);
+        // Spec fora do plano não recebe aviso.
+        let done = fs::read_to_string(root.join(SPEC_REL).join("spec.md")).expect("spec").replace("AWAITING_APPROVAL", "COMPLETED");
+        fs::write(root.join(SPEC_REL).join("spec.md"), done).expect("spec");
+        assert!(changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default()).is_empty());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    /// Spec 131 T04: a decisão "nada a executar" registrada no frontmatter cala o aviso.
+    #[test]
+    fn nothing_to_run_decision_silences_the_run_command_warning() {
+        let extra = "nothing_to_run: \"Biblioteca sem executável: o uso é pelos testes.\"\n";
+        let root = root_with("nothing", extra, "- [ ] Os testes passam.");
+        assert!(changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default()).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Spec 131 T04: critério (da tarefa ou global) que cita um campo da spec vazio ou inexistente
+    /// vira aviso do plano; citado e declarado, não.
+    #[test]
+    fn criterion_citing_an_empty_spec_field_is_a_plan_warning() {
+        let extra = "nothing_to_run: \"Sem servidor.\"\nrun_url: \"\"\n";
+        let root = root_with(
+            "cites",
+            extra,
+            "- [ ] The spec run_command imports the checking example.\n- [ ] O `run_url` abre a tela.\n- [ ] O test_command passa.",
+        );
+        let spec_path = root.join(SPEC_REL).join("spec.md");
+        let spec = fs::read_to_string(&spec_path).expect("spec").replace("- [ ] Critério verificável.", "- [ ] O `install_command` instala tudo.");
+        fs::write(&spec_path, spec).expect("spec");
+        let warnings = changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default());
+        let expected = vec![
+            "G1: o critério \"O `install_command` instala tudo.\" cita `install_command`, que a spec não declara: declare o \
+             campo ou reescreva o critério para citar só o que existe"
+                .to_string(),
+            "T01: o critério \"The spec run_command imports the checking example.\" cita `run_command`, que a spec não \
+             declara: declare o campo ou reescreva o critério para citar só o que existe"
+                .to_string(),
+            "T01: o critério \"O `run_url` abre a tela.\" cita `run_url`, que a spec não declara: declare o campo ou \
+             reescreva o critério para citar só o que existe"
+                .to_string(),
+        ];
+        assert_eq!(warnings, expected);
+        // O settings com instalação supre o campo herdável; o run_command não tem herança.
+        fs::write(
+            root.join(SETTINGS_REL),
+            "base_branch: main\nmerge_strategy: squash\ntest_command: \"make check\"\ninstall_command: \"make deps\"\n",
+        )
+        .expect("settings");
+        let warnings = changed_plan_warnings(&root, &BTreeMap::new(), &SecretSet::default());
+        assert_eq!(warnings, expected[1..].to_vec());
+
+        // Segredo que atravessa o corte do trecho (60 caracteres): redigido antes do corte, nenhum
+        // prefixo dele chega ao Arquiteto.
+        let secret = "valorconfidencialqwertyuiop";
+        let head = "The spec run_command shows the report using the value ";
+        assert!(head.chars().count() < 60 && head.chars().count() + secret.len() > 60);
+        let task = crate::agents::prompts::EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.", &format!("- [ ] {head}{secret}."));
+        fs::write(root.join(SPEC_REL).join("tasks/T01.md"), task).expect("task");
+        let secrets = SecretSet::new([secret.to_string()]);
+        let warnings = changed_plan_warnings(&root, &BTreeMap::new(), &secrets);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("cita `run_command`"), "{warnings:?}");
+        assert!(!warnings[0].contains("valorc"), "{warnings:?}");
         let _ = fs::remove_dir_all(&root);
     }
 }

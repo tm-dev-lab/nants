@@ -1,6 +1,7 @@
 /* Aprovação automática na janela Conversa: o pedido aprovado sozinho vira linha discreta e a rodada autônoma ganha o selo. */
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setLanguage } from "../../i18n";
 import { appStore, useAppStore } from "../../store";
 import type { ChatMessage } from "../../store";
 import { makeSpec, resetStore } from "../../test-utils";
@@ -37,6 +38,39 @@ describe("Aprovação automática na Conversa", () => {
     const all = document.body.textContent ?? "";
     expect(all.indexOf("antes")).toBeLessThan(all.indexOf("aprovada automaticamente"));
     expect(all.indexOf("aprovada automaticamente")).toBeLessThan(all.indexOf("depois"));
+  });
+
+  it("spec 131 T06: a linha com o código vira a pílula no idioma ativo, com o pedido de params.detail", () => {
+    setLanguage("en", { persist: false });
+    try {
+      render(<Harness />);
+      act(() => {
+        appStore.applyEvent({
+          event_type: "agent_message",
+          project_id: "p1",
+          payload: {
+            agent: "developer",
+            text: "approved automatically: python --version",
+            code: "run.auto_approved",
+            params: { detail: "python --version" },
+            seq: 1,
+            task_id: "T03",
+            spec_id: "s1",
+          },
+        });
+      });
+      const line = screen.getByTestId("yolo-auto");
+      expect(within(line).getByText("python --version").tagName).toBe("CODE");
+      expect(line.textContent).toBe("approved automaticallypython --version");
+      // A linha gravada antes (texto em pt-BR, sem código) continua reconhecida.
+      act(() => {
+        appStore.mergeDialog("p1", "s1", [{ seq: 2, ts: 1_700_000_002, agent: "developer", task_id: null, attempt: null, text: "aprovada automaticamente: git status --short" }]);
+      });
+      const lines = screen.getAllByTestId("yolo-auto");
+      expect(lines.map((l) => l.textContent).sort()).toEqual(["approved automaticallygit status --short", "approved automaticallypython --version"]);
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 
   it("reidratação do diálogo mostra a mesma linha", () => {

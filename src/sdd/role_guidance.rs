@@ -64,6 +64,12 @@ pub fn role_guidance_of(spec_md: &str, role: &str) -> String {
     role_subsection(spec_md, role).map(|t| clip(&t, MAX_ROLE_GUIDANCE_BYTES)).unwrap_or_default()
 }
 
+/// `true` se [`role_guidance_of`] entrega a subseção do papel inteira, sem corte (spec 131 T01: o
+/// contexto da spec não a repete).
+pub fn delivered_whole(spec_md: &str, role: &str) -> bool {
+    role_subsection(spec_md, role).is_some_and(|t| !t.is_empty() && t.len() <= MAX_ROLE_GUIDANCE_BYTES)
+}
+
 /// Valida a seção ao gravar o spec: ausente é válido; presente exige ao menos uma subseção
 /// reconhecida com conteúdo e cada subseção reconhecida não vazia e dentro do limite.
 pub fn validate(spec_md: &str) -> bool {

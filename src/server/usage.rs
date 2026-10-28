@@ -54,6 +54,10 @@ pub struct UsageRecord {
     pub cached: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
+    /// Tokens de entrada gravados no cache do provedor (já contidos em `input`; spec 132 T02).
+    /// Ausente = nenhum ou não informado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
     /// Chamadas de busca na web da resposta; ausente = 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search_calls: Option<u64>,
@@ -191,6 +195,7 @@ impl UsageSink for FileUsageSink {
             output: u64::from(event.usage.completion),
             cached: event.usage.cached.map(u64::from),
             reasoning: event.usage.reasoning.map(u64::from),
+            cache_write: event.usage.cache_write.filter(|n| *n > 0).map(u64::from),
             web_search_calls: (event.web_search_calls > 0).then_some(u64::from(event.web_search_calls)),
             images: (event.images > 0).then_some(u64::from(event.images)),
             image_quality: event
@@ -356,6 +361,10 @@ pub struct Totals {
     pub output: u64,
     pub cached: u64,
     pub reasoning: u64,
+    /// Tokens de entrada gravados no cache do provedor (spec 132 T10; contidos em `input`, omitido
+    /// quando zero).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_write: u64,
     /// Soma em US$ das chamadas com preço configurado; `null` se nenhuma tem preço.
     pub cost_usd: Option<f64>,
     /// Chamadas sem preço para o modelo (o custo acima as exclui).
@@ -431,6 +440,7 @@ impl Totals {
         self.output += r.output;
         self.cached += r.cached.unwrap_or(0);
         self.reasoning += r.reasoning.unwrap_or(0);
+        self.cache_write += r.cache_write.unwrap_or(0);
         let searches = r.web_search_calls.unwrap_or(0);
         self.web_search_calls += searches;
         if let Some(p) = pricing.get(&r.model) {
@@ -472,7 +482,9 @@ pub fn image_cost(r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) -> Optio
 
 /// Custo em US$ de uma chamada, ou `None` sem preço para o modelo (salvo registro com imagens: aí
 /// conta só a estimativa das imagens). A entrada em cache usa `cached_input_per_mtok` quando houver;
-/// senão, o preço de entrada. As imagens ([`image_cost`]) somam ao custo dos tokens. Pelo plano
+/// senão, o preço de entrada. A entrada gravada no cache (`cache_write`, spec 132 T02) usa
+/// `cache_write_per_mtok` quando houver; senão, também o preço de entrada. As duas partes estão
+/// contidas em `input` e nunca passam dele. As imagens ([`image_cost`]) somam ao custo dos tokens. Pelo plano
 /// ChatGPT (spec 116 T02), sem US$: `None`.
 pub fn cost_of(r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) -> Option<f64> {
     if r.is_chatgpt_plan() {
@@ -483,9 +495,12 @@ pub fn cost_of(r: &UsageRecord, pricing: &BTreeMap<String, Pricing>) -> Option<f
         return images;
     };
     let cached = r.cached.unwrap_or(0).min(r.input);
+    let written = r.cache_write.unwrap_or(0).min(r.input - cached);
     let cached_price = p.cached_input_per_mtok.unwrap_or(p.input_per_mtok);
-    let total = (r.input - cached) as f64 * p.input_per_mtok
+    let write_price = p.cache_write_per_mtok.unwrap_or(p.input_per_mtok);
+    let total = (r.input - cached - written) as f64 * p.input_per_mtok
         + cached as f64 * cached_price
+        + written as f64 * write_price
         + r.output as f64 * p.output_per_mtok;
     let web = r.web_search_calls.unwrap_or(0) as f64 * p.web_search_price();
     Some(total / 1_000_000.0 + web + images.unwrap_or(0.0))
@@ -1091,7 +1106,7 @@ mod tests {
     }
 
     fn price(i: f64, o: f64, c: Option<f64>) -> BTreeMap<String, Pricing> {
-        BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: i, output_per_mtok: o, cached_input_per_mtok: c, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None })])
+        BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: i, output_per_mtok: o, cached_input_per_mtok: c, cache_write_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None })])
     }
 
     #[test]
@@ -1107,6 +1122,7 @@ mod tests {
             output: 5,
             cached: None,
             reasoning: None,
+            cache_write: None,
             web_search_calls: w,
             images: None,
             image_quality: None,
@@ -1121,7 +1137,7 @@ mod tests {
             stage: None,
             round: None,
         };
-        let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
+        let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, cache_write_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
         let v = aggregate(&[mk(Some(2)), mk(Some(1)), mk(None)], &pr);
         assert_eq!(v.total.web_search_calls, 3);
         assert!((v.total.web_search_usd - 1.5).abs() < 1e-9);
@@ -1136,7 +1152,7 @@ mod tests {
     fn sink_writes_per_spec_and_chat_file_and_aggregates() {
         let root = tmp("agg");
         let sink = FileUsageSink::new(&root, "p1");
-        sink.record(ev(Some("s1"), Some("T01"), "developer", "m", Usage { prompt: 1000, completion: 500, cached: Some(400), reasoning: Some(100) }));
+        sink.record(ev(Some("s1"), Some("T01"), "developer", "m", Usage { prompt: 1000, completion: 500, cached: Some(400), reasoning: Some(100), cache_write: None }));
         sink.record(ev(Some("s1"), Some("T01"), "reviewer", "m", Usage::new(10, 5)));
         sink.record(ev(Some("s1"), Some("T02"), "developer", "other", Usage::new(7, 3)));
         sink.record(ev(None, None, "architect", "m", Usage::new(2, 1)));
@@ -1159,8 +1175,8 @@ mod tests {
 
         // Dois modelos com preços distintos: o custo total é a soma dos custos por modelo.
         let two = BTreeMap::from([
-            ("m".to_string(), Pricing { input_per_mtok: 2.0, output_per_mtok: 8.0, cached_input_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None }),
-            ("other".to_string(), Pricing { input_per_mtok: 100.0, output_per_mtok: 200.0, cached_input_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None }),
+            ("m".to_string(), Pricing { input_per_mtok: 2.0, output_per_mtok: 8.0, cached_input_per_mtok: None, cache_write_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None }),
+            ("other".to_string(), Pricing { input_per_mtok: 100.0, output_per_mtok: 200.0, cached_input_per_mtok: None, cache_write_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None }),
         ]);
         let v = aggregate(&load_records(&root, None), &two);
         assert_eq!(v.by_model.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m", "other"]);
@@ -1197,11 +1213,74 @@ mod tests {
     fn cached_without_cached_price_bills_as_input() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, cache_write: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
         };
         let c = cost_of(&r, &price(1.0, 1.0, None)).expect("preço");
         assert!((c - 0.001).abs() < 1e-12);
         assert_eq!(cost_of(&r, &BTreeMap::new()), None);
+    }
+
+    /// Spec 132 T02: a escrita de cache (contida em `input`) usa `cache_write_per_mtok`; sem esse
+    /// preço, cobra como entrada. Nunca passa da entrada que sobra fora da leitura de cache.
+    #[test]
+    fn cache_write_is_billed_with_its_own_price() {
+        let rec = |input: u64, cached: Option<u64>, write: Option<u64>| UsageRecord {
+            at: String::new(), project: String::new(), spec: None, task: None,
+            agent: "a".into(), model: "m".into(), input, output: 100, cached, reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+        };
+        let mut pr = price(3.0, 15.0, Some(0.3));
+        if let Some(p) = pr.get_mut("m") {
+            p.cache_write_per_mtok = Some(3.75);
+        }
+        // 1000 de entrada: 600 lidos do cache, 300 gravados, 100 normais; 100 de saída.
+        let c = cost_of(&rec(1000, Some(600), Some(300)), &pr).expect("preço");
+        let want = (100.0 * 3.0 + 600.0 * 0.3 + 300.0 * 3.75 + 100.0 * 15.0) / 1e6;
+        assert!((c - want).abs() < 1e-12, "{c} != {want}");
+        // Sem preço de escrita: a escrita cobra como entrada normal.
+        let plain = cost_of(&rec(1000, Some(600), Some(300)), &price(3.0, 15.0, Some(0.3))).expect("preço");
+        assert!((plain - (400.0 * 3.0 + 600.0 * 0.3 + 100.0 * 15.0) / 1e6).abs() < 1e-12, "{plain}");
+        // Escrita maior que a entrada que sobra: limitada a ela.
+        let capped = cost_of(&rec(1000, Some(600), Some(5000)), &pr).expect("preço");
+        assert!((capped - (600.0 * 0.3 + 400.0 * 3.75 + 100.0 * 15.0) / 1e6).abs() < 1e-12, "{capped}");
+        // Sem escrita: o custo de antes.
+        let none = cost_of(&rec(1000, Some(600), None), &pr).expect("preço");
+        assert!((none - (400.0 * 3.0 + 600.0 * 0.3 + 100.0 * 15.0) / 1e6).abs() < 1e-12, "{none}");
+    }
+
+    /// Spec 132 T10: a escrita de cache entra nos totais (para a tela de Custos) e só aparece no
+    /// JSON quando houver.
+    #[test]
+    fn totals_sum_cache_write() {
+        let rec = |write: Option<u64>| UsageRecord {
+            at: String::new(), project: String::new(), spec: None, task: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 10, cached: Some(200), reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+        };
+        let pr = price(3.0, 15.0, None);
+        let mut totals = Totals::default();
+        totals.add(&rec(None), &pr);
+        assert!(serde_json::to_value(&totals).expect("json").get("cache_write").is_none());
+        totals.add(&rec(Some(300)), &pr);
+        totals.add(&rec(Some(50)), &pr);
+        assert_eq!(totals.cache_write, 350);
+        assert_eq!(serde_json::to_value(&totals).expect("json")["cache_write"], 350);
+    }
+
+    /// Spec 132 T02: o registro guarda a escrita de cache do `Usage`; zero ou ausente fica fora.
+    #[test]
+    fn sink_records_cache_write() {
+        let root = tmp("cache-write");
+        let sink = FileUsageSink::new(&root, "p1");
+        let with = Usage { prompt: 900, completion: 10, cached: Some(500), reasoning: None, cache_write: Some(300) };
+        sink.record(ev(Some("s1"), None, "developer", "m", with));
+        sink.record(ev(Some("s1"), None, "developer", "m", Usage { cache_write: Some(0), ..Usage::new(5, 1) }));
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("file");
+        let recs: Vec<UsageRecord> = text.lines().map(|l| serde_json::from_str(l).expect("json")).collect();
+        assert_eq!(recs[0].cache_write, Some(300));
+        assert_eq!(recs[1].cache_write, None);
+        assert!(!text.lines().nth(1).expect("linha").contains("cache_write"));
+        let old: UsageRecord = serde_json::from_str(r#"{"at":"t","project":"p","agent":"a","model":"m","input":1,"output":1}"#).expect("antigo");
+        assert_eq!(old.cache_write, None, "registro antigo carrega sem o campo");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Spec 092 T03: imagens × (image_per_unit ou estimativa por qualidade), somadas aos tokens.
@@ -1209,7 +1288,7 @@ mod tests {
     fn image_cost_uses_unit_price_or_the_default_per_quality() {
         let img = |n: u64, q: Option<&str>| UsageRecord {
             at: String::new(), project: String::new(), spec: Some("s1".into()), task: Some("T01".into()),
-            agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None,
+            agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None, cache_write: None,
             web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
         };
         // Sem image_per_unit: padrão por qualidade, estimado; soma ao custo dos tokens (US$ 1).
@@ -1401,7 +1480,7 @@ mod tests {
     fn web_search_cost_uses_default_or_configured_price() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 0, output: 0, cached: None, reasoning: None,
+            agent: "a".into(), model: "m".into(), input: 0, output: 0, cached: None, reasoning: None, cache_write: None,
             web_search_calls: Some(3),
             images: None,
             image_quality: None,
@@ -1518,6 +1597,7 @@ mod tests {
             output: 1,
             cached: None,
             reasoning: None,
+            cache_write: None,
             web_search_calls: None,
             images: None,
             image_quality: None,
@@ -1680,6 +1760,7 @@ mod tests {
             response_json: false,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         };
         let err = metered.complete_stream(&req, &|_| {}).await.expect_err("cortada");
         assert!(format!("{err:?}").contains("TooLarge"), "{err:?}");
@@ -1881,6 +1962,7 @@ mod tests {
             output: 10,
             cached: None,
             reasoning: None,
+            cache_write: None,
             web_search_calls: None,
             images: None,
             image_quality: None,

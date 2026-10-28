@@ -131,6 +131,7 @@ fn setup_with(tag: &str, mode: Mode, limits: ConsoleLimits) -> Setup {
         api_key: PRIVATE.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.agents.architect = agent();
     cfg.agents.developer = agent();

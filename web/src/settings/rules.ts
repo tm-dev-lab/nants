@@ -4,7 +4,7 @@
  * continua sendo a autoridade. Mensagens são fixas e saem do dicionário no idioma ativo (spec 102
  * T05): as tabelas usam `localized` ou getters (cada leitura devolve o texto do idioma atual).
  */
-import type { ConfigView, Effort, TestConnectionResult, WireApi } from "../api/types";
+import type { ConfigView, ConnectionKind, Effort, ModelEntry, ModelPricing, TestConnectionResult, WireApi } from "../api/types";
 import { localized, t, tp } from "../i18n";
 
 const ID_MAX_LENGTH = 64;
@@ -243,6 +243,14 @@ const TEST_ERROR_MESSAGES: Readonly<Record<string, string>> = localized({
   plan_limit: "settings.test.error.plan_limit",
   plan_not_eligible: "settings.test.error.plan_not_eligible",
   plan_needs_login: "settings.test.error.plan_needs_login",
+  connection_kind_not_supported_yet: "settings.test.error.connection_kind_not_supported_yet",
+  // Spec 132 T08: Anthropic e Google Gemini.
+  auth_invalid: "settings.test.error.auth_invalid",
+  forbidden: "settings.test.error.forbidden",
+  model_not_found: "settings.test.error.model_not_found",
+  rate_limited: "settings.test.error.rate_limited",
+  spend_limit: "settings.test.error.spend_limit",
+  daily_quota: "settings.test.error.daily_quota",
 });
 
 /** Texto do erro HTTP do provedor (com o status quando houver), no idioma ativo. */
@@ -275,4 +283,177 @@ export function describeModelsError(error: string, status?: number): string {
   if (error === "unsupported") return t("settings.models.unsupported");
   if (Object.hasOwn(TEST_ERROR_MESSAGES, error)) return TEST_ERROR_MESSAGES[error] ?? t("settings.models.failed");
   return t("settings.models.failed");
+}
+
+// --- Conexões nativas (spec 132 T10): Anthropic e Google Gemini ---
+
+/** Tipos com API própria: endereço oficial fixo, protocolo implícito e só nome e chave na tela. */
+export type NativeKind = "anthropic" | "google_gemini";
+
+export function isNativeKind(kind: unknown): kind is NativeKind {
+  return kind === "anthropic" || kind === "google_gemini";
+}
+
+/**
+ * Dados fixos de cada provedor nativo: o nome do provedor (marca, igual nos dois idiomas), o
+ * endereço oficial (o mesmo de `src/config/schema.rs`, mostrado na dica do endereço avançado), a
+ * página oficial onde se cria a chave e o identificador base da conexão nova.
+ */
+export const NATIVE_PROVIDERS: Readonly<Record<NativeKind, { brand: string; officialUrl: string; keyUrl: string; idBase: string }>> = {
+  anthropic: {
+    brand: "Anthropic",
+    officialUrl: "https://api.anthropic.com",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+    idBase: "anthropic",
+  },
+  google_gemini: {
+    brand: "Google Gemini",
+    officialUrl: "https://generativelanguage.googleapis.com",
+    keyUrl: "https://aistudio.google.com/apikey",
+    idBase: "gemini",
+  },
+};
+
+/**
+ * O endereço é o do Gemini pela camada compatível com a OpenAI (`.../v1beta/openai/`)? A conexão
+ * por chave mostra a nota de que ela funciona com limites e de que o caminho recomendado é a
+ * conexão Gemini nativa (spec 132).
+ */
+export function isGeminiCompatUrl(value: string): boolean {
+  try {
+    const url = new URL(value.trim());
+    return url.hostname === new URL(NATIVE_PROVIDERS.google_gemini.officialUrl).hostname && /\/openai(\/|$)/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Página do console da Anthropic onde se ajusta o teto de gasto (pausa `run.spend_limit`). */
+export const ANTHROPIC_LIMITS_URL = "https://console.anthropic.com/settings/limits";
+
+/**
+ * Tipo da conexão vinda do servidor. Ausente (servidor antigo) ou desconhecido = por chave, para não
+ * quebrar a tela.
+ */
+export function connectionKindOf(view: { kind?: unknown }): ConnectionKind {
+  const kind = view.kind;
+  return kind === "chatgpt_plan" || kind === "anthropic" || kind === "google_gemini" ? kind : "api_key";
+}
+
+/**
+ * Identificador da conexão nativa nova, derivado do nome (a tela só pede o nome e a chave): letras
+ * sem acento em minúsculas, dígitos, `-` e `_`, até 64 caracteres. Vazio usa a base do provedor.
+ * Já usado, ganha o sufixo `-2`, `-3`... (o servidor recusa id repetido em conexão nova).
+ */
+export function nativeConnectionId(name: string, kind: NativeKind, existingIds: readonly string[]): string {
+  const slug = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, ID_MAX_LENGTH - 4)
+    .replace(/-+$/g, "");
+  const base = slug === "" ? NATIVE_PROVIDERS[kind].idBase : slug;
+  if (!existingIds.includes(base)) return base;
+  for (let n = 2; ; n += 1) {
+    const candidate = `${base}-${n}`;
+    if (!existingIds.includes(candidate)) return candidate;
+  }
+}
+
+export interface NativeFormValues {
+  name: string;
+  api_key: string;
+  /** Endereço avançado (recolhido); vazio usa o oficial. */
+  base_url_override: string;
+}
+
+export type NativeFieldErrors = Partial<Record<"name" | "api_key" | "base_url_override", string>>;
+
+/** Valida o formulário da conexão nativa. Em edição (`isEdit`), chave vazia mantém a salva. */
+export function validateNativeForm(values: NativeFormValues, isEdit: boolean): NativeFieldErrors {
+  const errors: NativeFieldErrors = {};
+  const name = validateName(values.name);
+  if (name !== null) errors.name = name;
+  if (values.api_key.trim().length > 0) {
+    const key = validateApiKey(values.api_key);
+    if (key !== null) errors.api_key = key;
+  } else if (!isEdit) {
+    errors.api_key = MSG.keyRequired;
+  }
+  if (values.base_url_override.trim() !== "") {
+    const url = validateBaseUrl(values.base_url_override);
+    if (url !== null) errors.base_url_override = url;
+  }
+  return errors;
+}
+
+/**
+ * Candidatos da sugestão de modelo por papel (spec 132 T10, critério 3): os modelos com raciocínio
+ * (`thinking`) e com imagem na entrada (`vision`), na ordem do provedor. Os papéis precisam dos
+ * dois: o Arquiteto planeja, o Desenvolvedor trabalha num laço longo de ferramentas e o Revisor
+ * confere capturas de tela. Cada filtro só vale quando a lista informa o campo em algum modelo e
+ * deixa ao menos um: sem o dado, ou sem nenhum que passe, o filtro é ignorado (primeiro o de
+ * imagem, depois o de raciocínio).
+ */
+export function suggestionCandidates(models: readonly ModelEntry[]): ModelEntry[] {
+  const valid = models.filter((m) => typeof m?.id === "string" && m.id.trim() !== "");
+  const narrow = (list: readonly ModelEntry[], field: "thinking" | "vision"): readonly ModelEntry[] => {
+    if (!list.some((m) => typeof m[field] === "boolean")) return list;
+    const kept = list.filter((m) => m[field] === true);
+    return kept.length > 0 ? kept : list;
+  };
+  return [...narrow(narrow(valid, "thinking"), "vision")];
+}
+
+/**
+ * Sugestão de modelo por papel para a primeira conexão de um provedor (spec 132 T10, critério 3).
+ * Regra agnóstica, sem nome de modelo no código: só os dados da lista do provedor e o catálogo de
+ * preços.
+ *
+ * 1. Candidatos: `suggestionCandidates` (raciocínio e imagem).
+ * 2. Preço: entre os candidatos com preço no catálogo (`prices`, a estimativa pelo tipo da conexão,
+ *    a mesma da tela de Preços), ganha o de menor entrada mais saída por 1M de tokens. Empate fica
+ *    com a ordem do provedor.
+ * 3. Sem preço para nenhum: o primeiro candidato, na ordem do provedor.
+ *
+ * Os três papéis recebem o mesmo modelo (o de menor custo atende a todos, como o usuário roda
+ * hoje), e o esforço continua o sugerido por papel. A tela deixa trocar cada um. Lista vazia dá
+ * `null`.
+ */
+export function suggestRoleModels(models: readonly ModelEntry[], prices: Readonly<Record<string, ModelPricing>> = {}): Record<AgentRole, string> | null {
+  const candidates = suggestionCandidates(models);
+  const costOf = (id: string): number | null => {
+    const p = Object.hasOwn(prices, id) ? prices[id] : undefined;
+    if (p === undefined || typeof p.input_per_mtok !== "number" || typeof p.output_per_mtok !== "number") return null;
+    const total = p.input_per_mtok + p.output_per_mtok;
+    return Number.isFinite(total) ? total : null;
+  };
+  let best: ModelEntry | undefined;
+  let bestCost: number | null = null;
+  for (const model of candidates) {
+    const cost = costOf(model.id);
+    if (cost !== null && (bestCost === null || cost < bestCost)) {
+      best = model;
+      bestCost = cost;
+    }
+  }
+  const pick = best ?? candidates[0];
+  if (pick === undefined) return null;
+  return { architect: pick.id, developer: pick.id, reviewer: pick.id };
+}
+
+/** Dica curta do esforço pelo tipo da conexão do papel (spec 132 T10, critério 4), no idioma ativo. */
+export function effortHint(kind: ConnectionKind): string {
+  switch (kind) {
+    case "anthropic":
+      return t("settings.agents.effortHint.anthropic");
+    case "google_gemini":
+      return t("settings.agents.effortHint.google_gemini");
+    case "chatgpt_plan":
+      return t("settings.agents.effortHint.chatgpt_plan");
+    default:
+      return t("settings.agents.effortHint.api_key");
+  }
 }

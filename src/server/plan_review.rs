@@ -44,7 +44,7 @@ use super::approvals::ProjectApprover;
 use super::chat::load_policy;
 use super::events::{ApiEvent, BusActivitySink, EventType, SecretSet};
 use super::plan_consensus::{
-    issue_line, parse_decisions, reviewer_memory, ConsensusRound, Cycle, PlanDecision, PlanPoint, ReviewItem, CONSENSUS_STAGE,
+    infer_adjusted, issue_line, parse_decisions, reviewer_memory, ConsensusRound, Cycle, PlanDecision, PlanPoint, ReviewItem, CONSENSUS_STAGE,
     DECISION_ACCEPT, DECISION_REJECT, MAX_CONSENSUS_ROUNDS, OUTCOME_AWAITING_USER, OUTCOME_CONSENSUS, OUTCOME_DISPUTED,
     OUTCOME_INTERRUPTED, OUTCOME_OPEN, OUTCOME_SHUTDOWN, OUTCOME_UNAVAILABLE,
 };
@@ -487,6 +487,8 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
     // Depois de cada turno que respondeu, o Revisor revisa de novo, mesmo sem mudança no plano
     // (todas as recusas): ele vê as decisões e fecha, mantém em disputa ou traz argumento novo.
     let mut force = false;
+    // Spec 131 T03: uma rodada de ajuste mudou o plano desde a última lista final.
+    let mut adjusted = false;
     loop {
         // Mensagem do usuário durante o ciclo (C-11): o ciclo em curso termina como interrompido e
         // o contador zera.
@@ -498,6 +500,7 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
             cycle.reset(gen);
             memory = Memory::default();
             force = false;
+            adjusted = false;
         }
         // Mensagem do usuário em andamento: a revisão da versão final roda no fim dela. A marca vem
         // antes da conferência: se o turno acabar entre as duas, o fim dele já a vê.
@@ -582,10 +585,22 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
         // As rodadas gravadas são deste ciclo: um ciclo novo sem mensagem do usuário as retoma.
         runtime.set_cycle_gen(project_id, spec_id, cycle.gen);
         if outcome.is_some() {
+            // Spec 131 T03 (critério 3): depois do consenso, a lista final das tarefas na Conversa.
+            if adjusted && matches!(outcome, Some(OUTCOME_CONSENSUS | OUTCOME_DISPUTED)) {
+                adjusted = false;
+                final_plan_line(state, project_id, root, spec_id).await;
+            }
             continue;
         }
+        let (sig_root, sid) = (root.to_path_buf(), spec_id.to_string());
+        let signed = record.signature.clone();
         match adjust(state, project_id, root, spec_id, claim, &mut cycle, &mut memory, open, record).await {
-            Ok(review_again) => force = review_again,
+            Ok(review_again) => {
+                force = review_again;
+                // F-03: a lista final só quando a rodada mudou o plano (só recusas não mudam).
+                let now = tokio::task::spawn_blocking(move || plan_signature(&sig_root, &sid)).await.ok().flatten();
+                adjusted |= review_again && now.is_some_and(|sig| sig != signed);
+            }
             Err(stop) => return stop,
         }
     }
@@ -593,8 +608,9 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
 
 /// Como terminou um turno interno do consenso.
 enum TurnEnd {
-    /// O turno respondeu: as decisões válidas e se terminou numa pergunta ao usuário.
-    Done { decisions: HashMap<String, PlanDecision>, asks_user: bool },
+    /// O turno respondeu: as decisões válidas, se terminou numa pergunta ao usuário, se trouxe o
+    /// bloco (em qualquer mensagem do turno) e o texto final mostrado.
+    Done { decisions: HashMap<String, PlanDecision>, asks_user: bool, block: bool, reply: String },
     /// O turno nem começou: `busy` quando outro turno ocupava o Arquiteto.
     NotStarted { busy: bool },
     /// Falha do provedor ou do turno.
@@ -635,8 +651,8 @@ async fn adjust(
         let (before, before_sig) = tokio::task::spawn_blocking(move || (task_fingerprints(&fp_root, &sid), plan_signature(&fp_root, &sid)))
             .await
             .unwrap_or_default();
-        let end = consensus_turn(state, project_id, spec_id, round, &sent, size_checked, cycle.gen).await;
-        let (decisions, asks_user) = match end {
+        let end = consensus_turn(state, project_id, root, spec_id, round, &sent, size_checked, cycle.gen).await;
+        let (decisions, asks_user, block, reply) = match end {
             TurnEnd::Shutdown => {
                 save(root, spec_id, outcome_record(&record, Some(OUTCOME_SHUTDOWN), cycle)).await;
                 return Err(Stop::Shutdown);
@@ -647,13 +663,17 @@ async fn adjust(
                 return Ok(false);
             }
             TurnEnd::Failed => {
-                memory.changes.extend(turn_changes(state, root, spec_id, before_sig.as_deref()).await);
+                memory.changes.extend(turn_changes(state, project_id, root, spec_id, before_sig.as_deref()).await);
                 halt(root, spec_id, cycle, &record, OUTCOME_UNAVAILABLE).await;
                 return Ok(false);
             }
-            TurnEnd::Done { decisions, asks_user } => (decisions, asks_user),
+            TurnEnd::Done { decisions, asks_user, block, reply } => (decisions, asks_user, block, reply),
         };
-        memory.changes.extend(turn_changes(state, root, spec_id, before_sig.as_deref()).await);
+        memory.changes.extend(turn_changes(state, project_id, root, spec_id, before_sig.as_deref()).await);
+        let (after_root, sid) = (root.to_path_buf(), spec_id.to_string());
+        let after = tokio::task::spawn_blocking(move || task_fingerprints(&after_root, &sid)).await.unwrap_or_default();
+        let missing = Missing { block, asks_user, reply: &reply };
+        let decisions = complete_decisions(state, project_id, root, round, &sent, decisions, missing, (&before, &after)).await;
         cycle.record_decisions(round, &sent, &decisions);
         if asks_user {
             round_line(state, project_id, root, cycle, round).await;
@@ -669,7 +689,6 @@ async fn adjust(
         let lang = state.project_lang(project_id).get();
         let (size_root, sid) = (root.to_path_buf(), spec_id.to_string());
         let big = tokio::task::spawn_blocking(move || {
-            let after = task_fingerprints(&size_root, &sid);
             let changed: Vec<TaskSize> = task_sizes(&size_root, &sid)
                 .into_iter()
                 .filter(|s| after.get(&s.id).is_some_and(|fp| before.get(&s.id) != Some(fp)))
@@ -733,18 +752,19 @@ async fn mark_outcome(root: &Path, spec_id: &str, outcome: &'static str, only_if
     .await;
 }
 
-/// Linhas do `plan_changes` gravadas pelo turno que acabou de terminar. Turno que não alterou o
-/// plano (assinatura igual à de antes dele, `before`) não acrescenta nada: o registro da última
-/// alteração não volta ao Revisor como novidade.
-async fn turn_changes(state: &AppState, root: &Path, spec_id: &str, before: Option<&str>) -> Vec<String> {
+/// Linhas do `plan_changes` gravadas pelo turno que acabou de terminar, no idioma do projeto (vão ao
+/// Revisor). Turno que não alterou o plano (assinatura igual à de antes dele, `before`) não
+/// acrescenta nada: o registro da última alteração não volta ao Revisor como novidade.
+async fn turn_changes(state: &AppState, project_id: &str, root: &Path, spec_id: &str, before: Option<&str>) -> Vec<String> {
     let secrets = state.secret_set().await;
+    let lang = state.project_lang(project_id).get();
     let (read_root, sid, before) = (root.to_path_buf(), spec_id.to_string(), before.map(str::to_string));
     tokio::task::spawn_blocking(move || {
         let now = plan_signature(&read_root, &sid);
         if now.is_none() || now == before {
             return Vec::new();
         }
-        super::plan_changes::view(&read_root, &sid, &secrets).unwrap_or_default()
+        super::plan_changes::view(&read_root, &sid, &secrets).unwrap_or_default().iter().map(|l| l.render(lang)).collect()
     })
         .await
         .unwrap_or_default()
@@ -753,6 +773,12 @@ async fn turn_changes(state: &AppState, root: &Path, spec_id: &str, before: Opti
 /// Códigos da linha da rodada na Conversa (`system.<código>` nos dicionários).
 pub const ROUND_CODE: &str = "plan.consensus_round";
 pub const ROUND_OPEN_CODE: &str = "plan.consensus_round_open";
+/// Rodada sem resposta em aberto, com ajustes deduzidos da mudança das tarefas (spec 131 T03).
+pub const ROUND_INFERRED_CODE: &str = "plan.consensus_round_inferred";
+/// Lista final das tarefas depois do consenso (spec 131 T03).
+pub const FINAL_PLAN_CODE: &str = "plan.final_plan";
+/// Teto do título de cada tarefa na lista final.
+const MAX_FINAL_TITLE_BYTES: usize = 160;
 
 /// Linha da rodada na Conversa (critério 5): "Revisor apontou N; Arquiteto ajustou A e manteve M",
 /// no idioma do projeto, pelo dicionário.
@@ -767,6 +793,10 @@ async fn round_line(state: &AppState, project_id: &str, root: &Path, cycle: &mut
     let code = if entry.unanswered > 0 {
         params.insert("open".into(), json!(entry.unanswered));
         ROUND_OPEN_CODE
+    } else if entry.inferred > 0 {
+        // Spec 131 T03: o ajuste deduzido da mudança da tarefa não é alerta.
+        params.insert("inferred".into(), json!(entry.inferred));
+        ROUND_INFERRED_CODE
     } else {
         ROUND_CODE
     };
@@ -776,9 +806,24 @@ async fn round_line(state: &AppState, project_id: &str, root: &Path, cycle: &mut
 /// Turno interno do Arquiteto numa rodada: o pedido com os apontamentos `sent` e a leitura das
 /// decisões. `gen`: a geração das mensagens do usuário do ciclo (com outra, o turno ocupado não é
 /// esperado).
-async fn consensus_turn(state: &AppState, project_id: &str, spec_id: &str, round: u32, sent: &[PlanIssue], size_check: bool, gen: u64) -> TurnEnd {
+#[allow(clippy::too_many_arguments)]
+async fn consensus_turn(
+    state: &AppState,
+    project_id: &str,
+    root: &Path,
+    spec_id: &str,
+    round: u32,
+    sent: &[PlanIssue],
+    size_check: bool,
+    gen: u64,
+) -> TurnEnd {
     let lines: Vec<String> = sent.iter().map(issue_line).collect();
-    let message = crate::agents::prompts::plan_consensus_request(spec_id, round, MAX_CONSENSUS_ROUNDS, &lines, size_check);
+    // Spec 131 T03 (critério 4): o texto atual das tarefas apontadas vai no pedido.
+    let secrets = state.secret_set().await;
+    let cited: Vec<String> = sent.iter().filter_map(|i| i.task.clone()).collect();
+    let (task_root, sid, task_secrets) = (root.to_path_buf(), spec_id.to_string(), Arc::clone(&secrets));
+    let tasks = tokio::task::spawn_blocking(move || cited_task_texts(&task_root, &sid, &cited, &task_secrets)).await.unwrap_or_default();
+    let message = crate::agents::prompts::plan_consensus_request(spec_id, round, MAX_CONSENSUS_ROUNDS, &lines, size_check, &tasks);
     let mut shutdown = state.shutdown_signal();
     let turn = super::chat::consensus_turn(state.clone(), project_id.to_string(), message, round, gen);
     let out = tokio::select! {
@@ -787,15 +832,176 @@ async fn consensus_turn(state: &AppState, project_id: &str, spec_id: &str, round
         out = turn => out,
     };
     if out.status.is_success() {
-        let secrets = state.secret_set().await;
         let ids: Vec<String> = sent.iter().filter_map(|i| i.id.clone()).collect();
         let decisions = out.decisions.as_deref().map(|body| parse_decisions(body, &ids, &secrets)).unwrap_or_default();
-        return TurnEnd::Done { decisions, asks_user: out.asks_user };
+        return TurnEnd::Done { decisions, asks_user: out.asks_user, block: out.decisions.is_some(), reply: out.reply };
     }
     if out.status.is_client_error() {
         return TurnEnd::NotStarted { busy: out.status == axum::http::StatusCode::CONFLICT };
     }
     TurnEnd::Failed
+}
+
+/// Caminho e texto atual de cada tarefa citada (`cited`, sem repetição, na ordem), redigido antes
+/// do corte e limitado como no plano do Revisor (spec 131 T03), e se o texto é o arquivo inteiro
+/// (F-01: sem corte nem redação; senão o Arquiteto o lê antes de regravar). Tarefa que não existe
+/// fica de fora.
+fn cited_task_texts(root: &Path, spec_id: &str, cited: &[String], secrets: &SecretSet) -> Vec<(String, String, bool)> {
+    let files: Vec<(String, String, String)> = task_names(root, spec_id)
+        .into_iter()
+        .filter_map(|name| {
+            let rel = format!("{SPECS_REL}/{spec_id}/tasks/{name}");
+            let raw = safe_fs::read_regular(root, &rel, MAX_READ_BYTES).ok()?;
+            let id = crate::sdd::Task::parse(&raw).ok()?.frontmatter.id;
+            Some((id, rel, raw))
+        })
+        .collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out: Vec<(String, String, bool)> = Vec::new();
+    for id in cited {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        if let Some((_, rel, raw)) = files.iter().find(|(tid, _, _)| tid == id) {
+            let text = truncate_bytes(&scrub_text(secrets, raw), MAX_TASK_BYTES);
+            let whole = text == *raw;
+            out.push((rel.clone(), text, whole));
+        }
+    }
+    out
+}
+
+/// O que o turno deixou, para completar as decisões.
+struct Missing<'a> {
+    /// O turno trouxe o bloco (em qualquer mensagem).
+    block: bool,
+    asks_user: bool,
+    /// Texto final mostrado do turno.
+    reply: &'a str,
+}
+
+/// Completa as decisões do turno (spec 131 T03, critérios 1 e 2): sem decisão no bloco, o ponto de
+/// uma tarefa que mudou no turno (`fingerprints`: antes e depois) conta como ajustado por inferência.
+/// Sem o bloco no turno inteiro e com pontos ainda sem decisão, um pedido curto, sem ferramentas,
+/// pede o bloco uma vez (não quando o turno termina numa pergunta ao usuário).
+#[allow(clippy::too_many_arguments)]
+async fn complete_decisions(
+    state: &AppState,
+    project_id: &str,
+    root: &Path,
+    round: u32,
+    sent: &[PlanIssue],
+    mut decisions: HashMap<String, PlanDecision>,
+    missing: Missing<'_>,
+    fingerprints: (&BTreeMap<String, String>, &BTreeMap<String, String>),
+) -> HashMap<String, PlanDecision> {
+    let (before, after) = fingerprints;
+    // Alteradas, apagadas ou renomeadas (o id antigo sumiu). Uma tarefa nova sozinha não conta
+    // (F-02): dividir é alterar a original.
+    let changed: std::collections::HashSet<String> =
+        before.iter().filter(|(id, fp)| after.get(*id) != Some(*fp)).map(|(id, _)| id.clone()).collect();
+    let inferred = infer_adjusted(sent, &decisions, &changed);
+    decisions.extend(inferred);
+    let unresolved: Vec<&PlanIssue> = sent.iter().filter(|i| i.id.as_ref().is_some_and(|id| !decisions.contains_key(id))).collect();
+    if missing.block || missing.asks_user || unresolved.is_empty() {
+        return decisions;
+    }
+    let lines: Vec<String> = unresolved.iter().map(|i| issue_line(i)).collect();
+    let ids: Vec<String> = unresolved.iter().filter_map(|i| i.id.clone()).collect();
+    if let Some(answer) = ask_decisions(state, project_id, root, round, &lines, missing.reply).await {
+        let secrets = state.secret_set().await;
+        let body = super::plan_consensus::split_decisions(&answer).1.unwrap_or(answer);
+        for (id, decision) in parse_decisions(&body, &ids, &secrets) {
+            decisions.entry(id).or_insert(decision);
+        }
+    }
+    decisions
+}
+
+/// Pedido curto do bloco ao Arquiteto (spec 131 T03): uma chamada sem ferramentas, com só os
+/// apontamentos sem decisão e o texto final do turno; o uso vai com a etapa do consenso. `None` sem
+/// o Arquiteto configurado, em falha do provedor, tempo esgotado ou shutdown.
+async fn ask_decisions(state: &AppState, project_id: &str, root: &Path, round: u32, lines: &[String], reply: &str) -> Option<String> {
+    use crate::agents::llm_client::{ChatMessage, ChatRequest, Role as ChatRole};
+    use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
+    let (model, effort, client) = super::chat::architect_client(state).await.ok()?;
+    let backend: Arc<dyn ChatBackend> = match state.llm_backend() {
+        Some(backend) => backend,
+        None => Arc::new(client),
+    };
+    let secrets = state.secret_set().await;
+    let sink: Arc<dyn UsageSink> =
+        super::usage::FileUsageSink::redacting_staged(root.to_path_buf(), project_id, Arc::clone(&secrets), CONSENSUS_STAGE, round);
+    let metered = UsageBackend::new(backend.as_ref(), Some(UsageScope::new(sink, "architect", None, None)));
+    let request = ChatRequest {
+        model,
+        messages: vec![
+            ChatMessage::text(ChatRole::System, crate::agents::prompts::PLAN_DECISIONS_ONLY_SYSTEM),
+            ChatMessage::text(ChatRole::User, scrub_text(&secrets, &crate::agents::prompts::plan_decisions_request(lines, reply))),
+        ],
+        tools: Vec::new(),
+        effort: Some(effort),
+        response_json: false,
+        web_search: false,
+        cache_key: None,
+        web_search_max_uses: None,
+    };
+    let mut shutdown = state.shutdown_signal();
+    tokio::select! {
+        biased;
+        _ = wait_shutdown(&mut shutdown) => None,
+        out = tokio::time::timeout(state.report_timeout(), metered.complete(&request)) => match out {
+            Ok(Ok(resp)) => Some(resp.message.content),
+            _ => None,
+        },
+    }
+}
+
+/// Lista final das tarefas na Conversa depois do consenso (spec 131 T03, critério 3): a frase fixa
+/// pelo dicionário e, depois dela, a lista (id e título, na ordem de execução) como conteúdo.
+async fn final_plan_line(state: &AppState, project_id: &str, root: &Path, spec_id: &str) {
+    let secrets = state.secret_set().await;
+    let (list_root, sid) = (root.to_path_buf(), spec_id.to_string());
+    let tasks = tokio::task::spawn_blocking(move || final_task_list(&list_root, &sid)).await.unwrap_or_default();
+    if tasks.is_empty() {
+        return;
+    }
+    let tail: Vec<String> = tasks
+        .iter()
+        .map(|(id, title)| {
+            let title = truncate_bytes(&clean_text(&secrets, title), MAX_FINAL_TITLE_BYTES);
+            if title.is_empty() {
+                format!("- {id}")
+            } else {
+                format!("- {id}: {title}")
+            }
+        })
+        .collect();
+    let mut params = serde_json::Map::new();
+    params.insert("spec".into(), json!(spec_id));
+    super::chat::system_notice_with_tail(state, project_id, root.to_path_buf(), FINAL_PLAN_CODE, params, Some(&tail.join("\n"))).await;
+}
+
+/// Tarefas do plano (id e título) na ordem de execução; com ciclo, na ordem dos ids.
+pub fn final_task_list(root: &Path, spec_id: &str) -> Vec<(String, String)> {
+    let tasks: Vec<crate::sdd::Task> = task_names(root, spec_id)
+        .iter()
+        .filter_map(|name| safe_fs::read_regular(root, &format!("{SPECS_REL}/{spec_id}/tasks/{name}"), MAX_READ_BYTES).ok())
+        .filter_map(|raw| crate::sdd::Task::parse(&raw).ok())
+        .filter(|t| valid_task_id(&t.frontmatter.id))
+        .collect();
+    let deps: Vec<(String, Vec<String>)> = tasks.iter().map(|t| (t.frontmatter.id.clone(), t.frontmatter.depends_on.clone())).collect();
+    let order: Vec<String> = crate::sdd::execution_order::execution_order(&deps).unwrap_or_else(|_| {
+        let mut ids: Vec<String> = deps.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        ids
+    });
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    order
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .filter_map(|id| tasks.iter().find(|t| t.frontmatter.id == id).map(|t| (id, t.frontmatter.title.clone())))
+        .collect()
 }
 
 /// Impressão digital de cada tarefa do plano (id → SHA-256 do arquivo), para achar as tarefas

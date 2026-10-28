@@ -40,27 +40,6 @@
   min-width: 0;
 }
 
-.nd-segment-btn {
-  min-height: 24px;
-  padding: 0 var(--sp-2);
-  border: 0;
-  border-radius: var(--r-xs);
-  background: transparent;
-  color: var(--ink3);
-  font: var(--fs-label) var(--font-sans);
-  cursor: pointer;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.nd-root .nd-segment-btn:focus-visible {
-  outline: 2px solid var(--focus-outer);
-  outline-offset: 2px;
-  box-shadow: 0 0 0 2px var(--focus-inner);
-}
-
 .nd-files .nd-strip[data-tone="amber"],
 .nd-file-viewer .nd-strip[data-tone="amber"] {
   border-color: var(--pill-amber-edge);

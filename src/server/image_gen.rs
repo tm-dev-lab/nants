@@ -69,8 +69,9 @@ impl LlmImageGenerator {
         let agent = &cfg.agents.developer;
         let connection = cfg.connections.iter().find(|c| c.id == agent.connection_id)?;
         // Spec 116 T02: pelo plano ChatGPT a ferramenta hospedada de imagem não é oferecida; segue o
-        // caminho alternativo (SVG/CSS), sem aviso.
-        if agent.model.trim().is_empty() || connection.is_chatgpt_plan() {
+        // caminho alternativo (SVG/CSS), sem aviso. O mesmo nas conexões nativas (spec 132: a geração
+        // de imagem pela Anthropic ou pelo Gemini está fora de escopo).
+        if agent.model.trim().is_empty() || connection.is_chatgpt_plan() || connection.kind.is_native() {
             return None;
         }
         let client = LlmClient::from_connection(connection).ok()?;
@@ -192,6 +193,7 @@ mod tests {
             api_key: "k".into(),
             wire_api: wire,
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.developer.connection_id = "c1".into();
         cfg.agents.developer.model = "m-img".into();

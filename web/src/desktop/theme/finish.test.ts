@@ -144,10 +144,14 @@ describe("raios aninhados concêntricos (interno = externo − padding)", () => 
     {
       label: "controle segmentado e segmentos",
       outer: [shellCss, ".nd-segment"],
-      inner: [
-        [shellCss, ".nd-segment-item"],
-        [read("apps/files/files.css"), ".nd-segment-btn"],
-      ],
+      inner: [[shellCss, ".nd-segment-item"]],
+    },
+    {
+      // 131/T07: no celular o item tem 44 px, e a faixa sobe para `--r-lg` (item `--r-md`).
+      label: "controle segmentado no celular",
+      outer: [mobileCss, '.nd-root[data-mobile="true"] .nd-segment'],
+      pad: [shellCss, ".nd-segment"],
+      inner: [[mobileCss, '.nd-root[data-mobile="true"] .nd-segment-item']],
     },
     { label: "lista do combo e opções", outer: [shellCss, ".nd-combo-list"], inner: [[shellCss, ".nd-combo-list li"]] },
     { label: "popover Colunas do Quadro e opções", outer: [boardCss, ".nd-board-popover"], inner: [[boardCss, ".nd-board-check"]] },
@@ -324,7 +328,6 @@ describe("estados iguais em todos os controles", () => {
     ".nd-wbtn",
     ".nd-menu-item",
     ".nd-pill-btn",
-    ".nd-segment-btn",
     ".nd-segment-item",
     ".nd-tab",
     ".nd-settings-tab",
@@ -351,7 +354,7 @@ describe("estados iguais em todos os controles", () => {
     const selected = rules.find((r) => r.selectors.includes('.nd-root .nd-tab[aria-selected="true"]'));
     expect(selected?.body).toContain("background-color: var(--accent-soft)");
     expect(selected?.body).toContain("color: var(--ink)");
-    for (const s of ['.nd-root .nd-segment-item[data-checked="true"]', '.nd-root .nd-launcher-item[data-active="true"]', '.nd-root .nd-btn[aria-pressed="true"]']) {
+    for (const s of ['.nd-root .nd-launcher-item[data-active="true"]', '.nd-root .nd-btn[aria-pressed="true"]']) {
       expect(selected?.selectors).toContain(s);
     }
     const edged = rules.find((r) => r.selectors.includes('.nd-root .nd-option[data-checked="true"]') && r.body.includes("border-color"));
@@ -385,7 +388,7 @@ describe("estados iguais em todos os controles", () => {
   it("desabilitado: a mesma opacidade em todos", () => {
     const disabled = rules.find((r) => r.selectors.includes(".nd-root .nd-btn:disabled"));
     expect(disabled?.body).toContain("opacity: var(--o-disabled)");
-    for (const s of [".nd-root .nd-pill-btn:disabled", ".nd-root .nd-segment-btn:disabled", ".nd-root .nd-menu-item:disabled"]) {
+    for (const s of [".nd-root .nd-pill-btn:disabled", ".nd-root .nd-segment-item:disabled", ".nd-root .nd-menu-item:disabled"]) {
       expect(disabled?.selectors).toContain(s);
     }
   });

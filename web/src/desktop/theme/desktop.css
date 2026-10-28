@@ -922,8 +922,8 @@
  * - pressionado (`:active`): a camada `--state-press`;
  * - ativo/selecionado (`aria-pressed`, `aria-selected`, `aria-current`, `data-checked`,
  *   `data-active`, `data-selected`, `data-open`): fundo `--accent-soft` e texto `--ink`; os
- *   controles com borda trocam a cor dela por `--selected-edge` (≥ 3:1); os segmentos sobem com o
- *   bisel do material;
+ *   controles com borda trocam a cor dela por `--selected-edge` (≥ 3:1); o controle segmentado,
+ *   sempre no titânio, usa o pressionado neutro e o semibold (131/T07);
  * - desabilitado: opacidade `--o-disabled`, sem camada de hover;
  * - foco: o anel duplo (bloco seguinte).
  * A camada vai em `background-image`: a cor de fundo de cada variante (perigo, destaque) fica.
@@ -947,7 +947,6 @@
 .nd-root .nd-combo-list li:hover:not(:disabled),
 .nd-root .nd-step:hover:not(:disabled),
 .nd-root .nd-tab:hover:not(:disabled),
-.nd-root .nd-segment-btn:hover:not(:disabled),
 .nd-root .nd-tree-item:hover:not(:disabled),
 .nd-root .nd-settings-tab:hover:not(:disabled),
 .nd-root .nd-option:hover:not(:disabled),
@@ -974,7 +973,6 @@
 .nd-root .nd-combo-list li:active:not(:disabled),
 .nd-root .nd-step:active:not(:disabled),
 .nd-root .nd-tab:active:not(:disabled),
-.nd-root .nd-segment-btn:active:not(:disabled),
 .nd-root .nd-tree-item:active:not(:disabled),
 .nd-root .nd-settings-tab:active:not(:disabled),
 .nd-root .nd-option:active:not(:disabled),
@@ -987,10 +985,8 @@
 .nd-root .nd-btn[aria-pressed="true"],
 .nd-root .nd-choice[aria-pressed="true"],
 .nd-root .nd-board-item[data-selected="true"],
-.nd-root .nd-segment-btn[aria-pressed="true"],
 .nd-root .nd-tab[aria-selected="true"],
 .nd-root .nd-settings-tab[aria-selected="true"],
-.nd-root .nd-segment-item[data-checked="true"],
 .nd-root .nd-option[data-checked="true"],
 .nd-root .nd-radio-card[data-checked="true"],
 .nd-root .nd-step[aria-current="step"],
@@ -1018,13 +1014,27 @@
 }
 
 /*
- * Contraste alto (095/T09, herdado da revisão da T07): o fundo neutro da aba atual e do item atual
- * do Alternador pode sumir; eles ganham o contorno neutro `--edge-strong` (nunca violeta). Com
- * foco de teclado, vale o anel de foco.
+ * Controle segmentado (131/T07, pedido do usuário no Test 9): ele sempre fica no titânio, então o
+ * item escolhido se marca como a aba atual do celular, no desktop e no celular: o "pressionado"
+ * neutro (`--state-press`) e o semibold, sem violeta nem relevo.
+ */
+.nd-root .nd-segment-item[aria-pressed="true"],
+.nd-root .nd-segment-item[data-checked="true"] {
+  background-color: var(--state-press);
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+}
+
+/*
+ * Contraste alto (095/T09, herdado da revisão da T07): o fundo neutro da aba atual, do item atual
+ * do Alternador e do segmento escolhido (131/T07) pode sumir; eles ganham o contorno neutro
+ * `--edge-strong` (nunca violeta). Com foco de teclado, vale o anel de foco.
  */
 @media (prefers-contrast: more) {
   .nd-root .nd-mobile-tab[aria-current="page"]:not(:focus-visible),
-  .nd-root .nd-switcher-item[aria-current="true"]:not(:focus-visible) {
+  .nd-root .nd-switcher-item[aria-current="true"]:not(:focus-visible),
+  .nd-root .nd-segment-item[aria-pressed="true"]:not(:focus-visible),
+  .nd-root .nd-segment-item[data-checked="true"]:not(:has(> input:focus-visible)) {
     outline: 1px solid var(--edge-strong);
     outline-offset: -1px;
   }
@@ -1040,11 +1050,6 @@
   border-color: var(--selected-edge);
 }
 
-/* Fora do foco: com foco, o anel duplo (que também é `box-shadow`) fica. */
-.nd-root .nd-segment-item[data-checked="true"]:not(:focus-within),
-.nd-root .nd-segment-btn[aria-pressed="true"]:not(:focus-visible) {
-  box-shadow: var(--bevel);
-}
 
 .nd-root .nd-btn:disabled,
 .nd-root .nd-wbtn:disabled,
@@ -1059,7 +1064,7 @@
 .nd-root .nd-folder-item:disabled,
 .nd-root .nd-step:disabled,
 .nd-root .nd-tab:disabled,
-.nd-root .nd-segment-btn:disabled,
+.nd-root .nd-segment-item:disabled,
 .nd-root .nd-settings-tab:disabled,
 .nd-root .nd-option:disabled,
 .nd-root .nd-board-card:disabled {

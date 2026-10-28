@@ -9,6 +9,19 @@ import { getAppGuide, type AppGuide } from "../../api/client";
 
 type GuideState = { status: "loading" } | { status: "ok"; guide: AppGuide } | { status: "error" };
 
+/** Spec 131 T05: a spec declara `run_command` (enquanto o guia não chega, vale que sim). */
+export function guideRunDeclared(guide: GuideState | null): boolean {
+  return guide?.status !== "ok" || guide.guide.runDeclared;
+}
+
+/**
+ * O app roda no sandbox (enquanto o guia não chega, vale que sim). Com `not_in_sandbox`, a
+ * explicação do "não roda aqui" (spec 130) tem precedência sobre o Console da spec 131 T05.
+ */
+export function guideRunsHere(guide: GuideState | null): boolean {
+  return guide?.status !== "ok" || guide.guide.runsHere;
+}
+
 const cache = new Map<string, AppGuide>();
 
 /** Testes: esquece as leituras guardadas. */

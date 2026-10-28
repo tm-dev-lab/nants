@@ -613,6 +613,9 @@ fn tool_label_full(name: &str, arguments: &str) -> String {
         "generate_image" => format!("gerando imagem {}", arg("path")),
         // Spec 091: falha final da geração, só com o motivo fixo (sem texto remoto).
         "image_failed" => format!("geração de imagem falhou ({})", arg("reason")),
+        // Spec 131 T06: a leitura de uma seção da spec (ou do índice, com `list`).
+        "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => "lendo o índice da spec".to_string(),
+        "read_spec_section" => format!("lendo a seção {} da spec", arg("title")),
         other => format!("usando {other}"),
     };
     label
@@ -643,6 +646,9 @@ pub fn notice_code(notice: &str) -> Option<ActivityCode> {
             code.params.insert(k.into(), Value::from(v));
         }
         return Some(code);
+    }
+    if notice == super::llm_client::anthropic::WEB_SEARCH_RETRY_NOTICE {
+        return Some(ActivityCode::new("provider.web_search_retry", &[]));
     }
     if notice == crate::harness::tools::IMAGE_PACE_NOTICE {
         return Some(ActivityCode::new("pace.queued", &[]));
@@ -688,6 +694,9 @@ pub fn tool_code(name: &str, arguments: &str) -> ActivityCode {
             Some(params) => ActivityCode { code: "tool.image_failed".into(), params },
             None => c("tool.image_failed", &[("failure", arg("reason"))]),
         },
+        // Spec 131 T06: rótulo próprio, com o título da seção (a tela o mostra no idioma dela).
+        "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => c("tool.read_spec_index", &[]),
+        "read_spec_section" => c("tool.read_spec_section", &[("title", arg("title"))]),
         other => c("tool.other", &[("name", other.to_string())]),
     }
 }
@@ -898,6 +907,7 @@ mod tests {
         run.notice(crate::agents::architect::PLAN_CHECK_ACTIVITY);
         run.delta(StreamDelta::Retry(crate::agents::llm_client::throttle_notice("HTTP 429", Duration::from_secs(5), 2, 6)));
         run.delta(StreamDelta::Retry("resposta do provedor falhou (x); repetindo (1/2)".into()));
+        run.delta(StreamDelta::Retry(crate::agents::llm_client::anthropic::WEB_SEARCH_RETRY_NOTICE.into()));
         run.end();
         let coded: Vec<(Option<String>, Option<String>, serde_json::Map<String, Value>)> = rec
             .events()
@@ -923,6 +933,9 @@ mod tests {
         assert_eq!(code_of(6), Some("pace.throttled"));
         assert_eq!(coded[6].2.get("attempt"), Some(&Value::from(2)));
         assert_eq!(code_of(7), None, "motivo fora do vocabulário: só o texto");
+        // Spec 132 T11: a busca dinâmica descartada no stream.
+        assert_eq!(code_of(8), Some("provider.web_search_retry"));
+        assert!(coded[8].2.is_empty());
     }
 
     /// Spec 119: a nova tentativa e a falha da imagem vão com o motivo neutro (`kind`,
@@ -1164,5 +1177,17 @@ mod tests {
         assert_eq!(tool_label("run_command", r#"{"command":"ls"}"#), "rodando `ls`");
         let long = format!(r#"{{"path":"{}"}}"#, "x".repeat(500));
         assert!(tool_label("write_file", &long).len() <= MAX_LABEL_BYTES);
+    }
+
+    /// Spec 131 T06: `read_spec_section` tem rótulo próprio (antes saía "usando read_spec_section").
+    #[test]
+    fn read_spec_section_has_its_own_label() {
+        let section = r#"{"title":"Abordagem Técnica"}"#;
+        assert_eq!(tool_label("read_spec_section", section), "lendo a seção Abordagem Técnica da spec");
+        assert_eq!(tool_label("read_spec_section", r#"{"title":"list"}"#), "lendo o índice da spec");
+        let code = tool_code("read_spec_section", section);
+        assert_eq!(code.code, "tool.read_spec_section");
+        assert_eq!(code.params.get("title"), Some(&Value::from("Abordagem Técnica")));
+        assert_eq!(tool_code("read_spec_section", r#"{"title":"list"}"#).code, "tool.read_spec_index");
     }
 }

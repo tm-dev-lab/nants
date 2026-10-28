@@ -57,6 +57,11 @@ pub fn global_criteria(spec_body: &str) -> Vec<String> {
     text.lines().filter_map(criterion_item).collect()
 }
 
+/// Itens de primeiro nível de uma seção de critérios (sem marcador nem caixa `[ ]`), na ordem.
+pub fn criterion_items(section: &str) -> Vec<String> {
+    section.lines().filter_map(criterion_item).collect()
+}
+
 /// Texto de uma linha de item (`- `, `* `, `1. `, `1) `), sem recuo de sublista.
 fn criterion_item(line: &str) -> Option<String> {
     let indent = line.len() - line.trim_start().len();

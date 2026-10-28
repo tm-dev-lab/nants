@@ -470,6 +470,8 @@ describe("Execução: respostas atrasadas", () => {
       vi.fn((input: string | URL | Request) => {
         const url = String(input);
         if (url.endsWith("/logs")) return Promise.resolve(new Response("", { status: 200 }));
+        // O guia da janela (spec 131 T05) responde na hora: só o estado fica segurado.
+        if (url.includes("/app/guide/")) return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }));
         return new Promise<Response>((resolve) => held.push(() => resolve(new Response(JSON.stringify(running()), { status: 200 }))));
       }),
     );

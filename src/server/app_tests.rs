@@ -66,6 +66,7 @@ fn state_rec(root: &Path, rec: &Arc<Rec>) -> AppState {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.agents.architect = agent("m");
     cfg.agents.developer = agent("m");

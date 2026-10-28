@@ -1072,6 +1072,7 @@ mod internet {
             api_key: "k".into(),
             wire_api: wire,
             kind: Default::default(),
+            base_url_override: None,
         });
         cfg.agents.architect = AgentConfig { connection_id: "c1".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
         cfg.architect_internet.recovery_searches = 2;

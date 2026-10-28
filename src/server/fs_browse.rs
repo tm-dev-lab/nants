@@ -367,6 +367,7 @@ mod tests {
             api_key: SECRET.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         });
         let state = state_in(&root, cfg);
         let (status, body) = call(&state, get_req(&browse_uri(&root, ""))).await;

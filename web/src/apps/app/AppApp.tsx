@@ -32,6 +32,8 @@
  *   para corrigir". Não roda no sandbox: a explicação, o "Como usar" e as provas. O Console do
  *   projeto (padrão para qualquer projeto) abre pelo "Abrir o Console" e pelo próximo passo
  *   `open_console` do servidor (`RunViews.tsx`, `ConsolePanel.tsx`).
+ * - spec 131 T05: sem `run_command` (ou com a decisão `nothing_to_run`), o App abre no Console, com
+ *   o "Como usar" e as provas, sem "Iniciar" nem o erro.
  * Todo texto do servidor é renderizado como texto React.
  */
 import "./app.css";
@@ -78,10 +80,10 @@ import {
   urlPort,
   type AppEmptyKind,
 } from "./appModel";
-import { canStart, reachEnvironment, runProblemText, useRunSession } from "./runSession";
+import { canStart, consoleOnly, reachEnvironment, runProblemText, useRunSession } from "./runSession";
 import { ConsolePanel } from "./ConsolePanel";
 import { FailureView, FinishedView, RunningView, SandboxView } from "./RunViews";
-import { useAppGuide } from "./useAppGuide";
+import { guideRunDeclared, guideRunsHere, useAppGuide } from "./useAppGuide";
 import { finishedRun, liveMode } from "./appModel";
 
 const defaultObserver: ResizeObserverFactory | null =
@@ -678,8 +680,25 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
     snap.failure !== null && snap.failure.code !== "app_exec_docker_failed" && (specId === null || snap.failure.spec_id === specId) ? snap.failure : null;
   const idle = (phase.kind === "stopped" || (phase.kind === "exited" && finished === null)) && !snap.confirming;
   const sandbox = guide?.status === "ok" && !guide.guide.runsHere;
+  // Spec 131 T05: sem `run_command`, o App abre no Console, sem "Iniciar" nem o erro. O que não roda
+  // no sandbox (spec 130) tem precedência: a explicação, que já oferece "Abrir o Console".
+  const noRun = specId !== null && guideRunsHere(guide) && consoleOnly(snap, guideRunDeclared(guide));
+  const inConsole = (snap.consoleOpen || noRun) && specId !== null;
   let view: ReactNode = null;
-  if (snap.consoleOpen && specId !== null) {
+  if (inConsole && noRun) {
+    view = (
+      <ConsolePanel
+        projectId={projectId}
+        specId={specId}
+        compact={size === "narrow"}
+        visible={visible}
+        guide={guide}
+        run={run}
+        headAction={null}
+        noRun={{ decision: guide?.status === "ok" ? guide.guide.nothingToRun : null }}
+      />
+    );
+  } else if (inConsole) {
     view = (
       <ConsolePanel
         projectId={projectId}
@@ -710,11 +729,21 @@ export function AppRunner({ projectId, specId, size, viewport, setSelection }: R
     view = <FinishedView projectId={projectId} phase={phase} canRun={startable} onRunAgain={requestStart} onOpenConsole={actions.openConsole} />;
   } else if (failure !== null && idle) {
     view = <FailureView failure={failure} run={run} canRetry={startable} onRetry={requestStart} />;
+  } else if (specId !== null && guide?.status === "loading" && phase.kind === "stopped" && !snap.confirming) {
+    // Spec 131 T05: enquanto o guia não responde, nem "Iniciar" nem o Console (sem piscar); se ele
+    // falhar, vale o estado parado de sempre.
+    view = (
+      <section className="nd-runview" data-runview="loading" aria-busy="true">
+        <p className="nd-runview-muted" role="status">
+          {t("runview.loadingGuide")}
+        </p>
+      </section>
+    );
   } else if (sandbox && phase.kind === "stopped" && !snap.confirming) {
     view = <SandboxView projectId={projectId} specId={specId} guide={guide} onOpenConsole={actions.openConsole} />;
   }
   return (
-    <div className="nd-app nd-app-scroll" data-app="" data-size={size} data-app-view={view === null ? undefined : snap.consoleOpen ? "console" : "run"}>
+    <div className="nd-app nd-app-scroll" data-app="" data-size={size} data-app-view={view === null ? undefined : inConsole ? "console" : "run"}>
       {view ?? (
         <AppBrowser
           url={port?.url ?? null}

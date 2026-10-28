@@ -133,9 +133,14 @@ interface ConsolePanelProps {
   run: RunSessionApi;
   /** Ação do cabeçalho (voltar ao app ou iniciá-lo). */
   headAction: ReactNode;
+  /**
+   * Spec 131 T05: a spec não declara como executar; o Console é a forma de uso. Mostra a linha que
+   * explica isso e, quando houver, a decisão do plano (`nothing_to_run`).
+   */
+  noRun?: { decision: string | null } | null;
 }
 
-export function ConsolePanel({ projectId, specId, compact, visible, guide, run, headAction }: ConsolePanelProps) {
+export function ConsolePanel({ projectId, specId, compact, visible, guide, run, headAction, noRun = null }: ConsolePanelProps) {
   const { t, tp, formatTime } = useT();
   const { snap, actions } = useConsoleSession(projectId, specId, visible);
   const [draft, setDraft] = useState("");
@@ -283,6 +288,18 @@ export function ConsolePanel({ projectId, specId, compact, visible, guide, run, 
     </div>
   );
 
+  const noRunLine =
+    noRun !== null ? (
+      <div className="nd-console-norun" data-console-norun="">
+        <p className="nd-runview-text">{t("console.noRun")}</p>
+        {noRun.decision !== null ? (
+          <p className="nd-runview-muted" data-console-decision="">
+            {noRun.decision}
+          </p>
+        ) : null}
+      </div>
+    ) : null;
+
   const dialog =
     confirming !== null ? (
       <ConfirmCommandDialog
@@ -305,10 +322,11 @@ export function ConsolePanel({ projectId, specId, compact, visible, guide, run, 
     return (
       <section className="nd-runview nd-console" aria-label={t("console.title")} data-console="" data-compact="true">
         {head}
+        {noRunLine}
         <div role="group" aria-label={t("console.tabs")} className="nd-segment nd-chrome nd-console-tabs">
           {tabs.map((item) => (
-            <button key={item.id} type="button" className="nd-segment-btn" aria-pressed={tab === item.id} data-console-tab={item.id} onClick={() => setTab(item.id)}>
-              {item.label}
+            <button key={item.id} type="button" className="nd-segment-item" aria-pressed={tab === item.id} data-console-tab={item.id} onClick={() => setTab(item.id)}>
+              <span>{item.label}</span>
             </button>
           ))}
         </div>
@@ -336,6 +354,7 @@ export function ConsolePanel({ projectId, specId, compact, visible, guide, run, 
   return (
     <section className="nd-runview nd-console" aria-label={t("console.title")} data-console="">
       {head}
+      {noRunLine}
       <div className="nd-runview-split">
         <div className="nd-runview-main nd-console-main">
           {output}

@@ -260,8 +260,8 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.install.skipped", "Install skipped: `{command}` did not run again, lockfiles unchanged since {since} ({locks})."),
     ("runner.install.skipped_no_date", "Install skipped: `{command}` did not run again, lockfiles unchanged since the last install in this folder ({locks})."),
     // Spec 129 T02: install persistence check, in the Architect section of spec.md.
-    ("runner.install_footprint.record.one", "Install check on the base (`{command}`, code {code}): {count} entry written outside /work, in {secs} s (warning limit: {limit})."),
-    ("runner.install_footprint.record.other", "Install check on the base (`{command}`, code {code}): {count} entries written outside /work, in {secs} s (warning limit: {limit})."),
+    ("runner.install_footprint.record.one", "Install check (`{command}`, code {code}): {count} entry written outside /work, in {secs} s (warning above {limit} entries)."),
+    ("runner.install_footprint.record.other", "Install check (`{command}`, code {code}): {count} entries written outside /work, in {secs} s (warning above {limit} entries)."),
     ("runner.install_footprint.warning", "The install wrote outside the project folder; that is lost between commands. Main paths: {paths}."),
     ("runner.install_footprint.cleanup_failed", "The check container ({name}) was not removed: {error}"),
     ("runner.install.repeated", "Warning: the {field} (`{command}`) starts with the install_command (`{install}`), which Nants already runs before the tests, so the install repeats on every round. The command was not changed; remove the install from the {field} in .sdd/settings.yaml."),
@@ -291,6 +291,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("survey.failed", "I could not finish the architecture survey ({code}). The project goes on as usual: when you plan the first specification with the Architect in the conversation, it reads the code and creates ARCHITECTURE.md along with the plan."),
     // Interface labels quoted to the model (the same text as the button in the interface).
     ("ui.app_start", "Start the app"),
+    ("ui.app_open_console", "Open the Console"),
     // Runner: automatic formatting (spec 078) in the conversation, `tests` agent.
     ("runner.format.failed", "automatic formatting failed (does not block): {why}"),
     ("runner.format.tool_failed", "automatic formatting ({name}) failed (does not block): {why}"),
@@ -380,6 +381,12 @@ nants uninstall --purge  also removes the settings and data; never the projects 
         "system.plan.consensus_round_open",
         "Plan review, round {round}: the Reviewer raised {issues}; the Architect adjusted {accepted}, kept {kept} and left {open} unanswered.",
     ),
+    // Spec 131 T03: the adjustment inferred from the task change and the final plan list.
+    (
+        "system.plan.consensus_round_inferred",
+        "Plan review, round {round}: the Reviewer raised {issues}; the Architect adjusted {accepted} ({inferred} inferred from the task change, with no written answer) and kept {kept}.",
+    ),
+    ("system.plan.final_plan", "Final plan for spec {spec}, after the review:"),
     ("system.plan.renumbered", "Tasks renumbered in execution order: {map}."),
     (
         "system.final.still_unmet",
@@ -392,6 +399,8 @@ nants uninstall --purge  also removes the settings and data; never the projects 
         "system.run.yolo_ignored",
         "Automatic approval ignored: .sdd/settings.yaml is invalid and could not be read; permission requests come to you until the file is fixed.",
     ),
+    // Spec 131 T06: the line of a request approved by automatic approval (the detail is the request).
+    ("system.run.auto_approved", "approved automatically: {detail}"),
     // Runner: generated findings and convergence notes in the Reviewer message (spec 115 T03).
     // Spec 129 T04: structural markers of the Developer and Reviewer messages, written in the
     // project language; readers accept the form of every language (`i18n::forms`).
@@ -443,6 +452,23 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("plan_review.too_large_dense.one", "{count} acceptance criterion, which counts as {weight} because of its length (a criterion over {words} words counts as more than one): too large for one review. Write one criterion per observable behavior, in one short sentence, and split the task if it is still large."),
     ("plan_review.too_large_dense.other", "{count} acceptance criteria, which count as {weight} because of their length (a criterion over {words} words counts as more than one): too large for one review. Write one criterion per observable behavior, in one short sentence, and split the task if it is still large."),
     // Spec 128 T04: ciclo de dependências e renumeração das tarefas na aprovação.
+    // Spec 131 T06: lines of "what changed in the plan" (`plan-changes.json`), by the line code.
+    ("plan_review.change.spec_title", "Spec title changed"),
+    ("plan_review.change.test_command", "test_command changed"),
+    ("plan_review.change.global_criteria", "Global criteria: {delta}"),
+    ("plan_review.change.task_removed", "{id} removed"),
+    ("plan_review.change.task_new", "{id} new: {title}"),
+    ("plan_review.change.task_title", "{id}: title changed"),
+    ("plan_review.change.task_depends", "{id}: dependencies changed"),
+    ("plan_review.change.task_scope", "{id}: scope changed"),
+    ("plan_review.change.task_criteria", "{id}: criteria changed ({delta})"),
+    ("plan_review.change.task_covers", "{id}: coverage changed"),
+    ("plan_review.change.more", "and more changes beyond these"),
+    ("plan_review.change.added.one", "{count} new"),
+    ("plan_review.change.added.other", "{count} new"),
+    ("plan_review.change.removed.one", "{count} removed"),
+    ("plan_review.change.removed.other", "{count} removed"),
+    ("plan_review.change.reordered", "reordered"),
     ("plan_review.dependency_cycle", "Tasks {tasks} depend on each other in a cycle through depends_on, so there is no execution order. Break the cycle."),
     ("runs.renumber.heading", "Renumbering"),
     ("runs.renumber.body", "On approval, the tasks were renumbered in execution order: {map}. The planning records (usage.jsonl, tools.jsonl, .context.jsonl and .chat.jsonl) keep the old ids, and this map explains the correspondence."),
@@ -456,6 +482,28 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     (
         "runner.review.late_new_demoted",
         "{summary} (new MEDIUM or LOW findings from review {review} on became observations and go to the final verification.)",
+    ),
+    (
+        "runner.review.untouched_gap_demoted",
+        "{summary} (from review {review} on, new MEDIUM or LOW gaps in lines unchanged since the previous rejection, with no concrete failure scenario, became observations and go to the final verification.)",
+    ),
+    ("runner.review.gap_criterion_note", "gap in code that did not change, kept as an observation for the final verification: {ids}"),
+    (
+        "runner.review.missing_field_demoted",
+        "{summary} (what cites a field the spec does not declare does not go back to the Developer: it became an observation for the final verification.)",
+    ),
+    ("runner.review.missing_field_location", "acceptance criteria"),
+    (
+        "runner.review.missing_field_criterion",
+        "The criterion \"{criterion}\" cites {fields}, which the spec does not declare; it was not judged in this review.",
+    ),
+    (
+        "runner.review.missing_field_finding",
+        "The finding cites {fields}, which the spec does not declare: {description}",
+    ),
+    (
+        "runner.review.missing_field_recommendation",
+        "The final verification checks the behavior against what the spec declares, without the missing field.",
     ),
     (
         "runner.review.untouched_code_demoted",
@@ -626,6 +674,9 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("serverError.connection_missing", "{role}: connection_id does not exist"),
     ("serverError.connection_not_found", "connection not found"),
     ("serverError.connection_kind_fixed", "the connection type cannot be changed"),
+    ("serverError.connection_kind_invalid", "unknown connection type"),
+    ("serverError.base_url_override_invalid", "invalid advanced address: use http or https, with a host, without user, password, query or fragment"),
+    ("serverError.base_url_override_not_allowed", "the advanced address only applies to Anthropic and Google Gemini connections"),
     ("serverError.content_type_json", "Content-Type must be application/json"),
     ("serverError.data_dir_unavailable", "Nants data folder is unavailable"),
     ("serverError.decision_invalid", "decision must be \"once\", \"run\", \"always\" or \"deny\""),

@@ -187,6 +187,17 @@ describe("dica de limite do provedor (spec 089)", () => {
   });
 });
 
+describe("limites do provedor que pausam (spec 132 T09)", () => {
+  it.each([
+    ["provider_spend_limit", "A conta atingiu o teto de gasto no provedor. Aumente o limite no console dele."],
+    ["provider_daily_quota", "A cota diária do provedor acabou. Tente de novo quando ela renovar."],
+  ])("%s tem mensagem própria, sem dica de protocolo nem de espera", (code, text) => {
+    expect(isProviderFailureCode(code)).toBe(true);
+    expect(providerFailureMessage(code, "chat")).toBe(text);
+    expect(providerFailureText(code, "responses")).toBe(text);
+  });
+});
+
 describe("falhas do plano ChatGPT (spec 116 T02)", () => {
   it.each([
     ["provider_plan_limit", "Limite de uso do plano ChatGPT atingido. Confira em Gerenciar uso."],

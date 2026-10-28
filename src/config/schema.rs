@@ -76,6 +76,10 @@ pub struct Pricing {
     /// Preço da entrada servida do cache; ausente = cobra como entrada normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
+    /// Preço da entrada gravada no cache do provedor (spec 132 T02: a escrita de cache da
+    /// Anthropic); ausente = cobra como entrada normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
     /// Preço em US$ de cada chamada de busca na web. Ausente = 0.01 (valor público da OpenAI:
     /// US$ 10 por 1.000 chamadas).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +138,7 @@ impl Pricing {
             Some(self.input_per_mtok),
             Some(self.output_per_mtok),
             self.cached_input_per_mtok,
+            self.cache_write_per_mtok,
             self.web_search_per_call,
             self.image_per_unit,
         ]
@@ -218,10 +223,19 @@ pub struct Connection {
     /// Como a conexão se autentica (spec 116); a por chave não é gravada.
     #[serde(default, skip_serializing_if = "ConnectionKind::is_api_key")]
     pub kind: ConnectionKind,
+    /// Endereço avançado das conexões nativas (Anthropic e Google Gemini, spec 132): substitui o
+    /// endereço oficial fixo (ex.: um proxy da empresa). Ausente usa o oficial. Não vale nos demais
+    /// tipos, e [`Connection::normalize`] o apaga neles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_override: Option<String>,
 }
 
 /// Endereço fixo da conexão pelo plano ChatGPT (spec 116).
 pub const CHATGPT_PLAN_BASE_URL: &str = "https://api.openai.com/v1";
+/// Endereço oficial da API da Anthropic (spec 132).
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+/// Endereço oficial da API do Google Gemini pelo AI Studio (spec 132).
+pub const GOOGLE_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// Como a conexão se autentica (spec 116).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +246,10 @@ pub enum ConnectionKind {
     ApiKey,
     /// Plano ChatGPT (Plus ou Pro), pelo login OAuth; sem chave.
     ChatgptPlan,
+    /// API nativa da Anthropic (Messages), por chave (spec 132).
+    Anthropic,
+    /// API nativa do Google Gemini pelo AI Studio, por chave (spec 132).
+    GoogleGemini,
 }
 
 impl ConnectionKind {
@@ -239,11 +257,36 @@ impl ConnectionKind {
         *self == ConnectionKind::ApiKey
     }
 
-    /// Forma textual usada na API (`"api_key"` ou `"chatgpt_plan"`).
+    /// Forma textual usada na API e no TOML (`"api_key"`, `"chatgpt_plan"`, `"anthropic"` ou
+    /// `"google_gemini"`).
     pub fn as_str(self) -> &'static str {
         match self {
             ConnectionKind::ApiKey => "api_key",
             ConnectionKind::ChatgptPlan => "chatgpt_plan",
+            ConnectionKind::Anthropic => "anthropic",
+            ConnectionKind::GoogleGemini => "google_gemini",
+        }
+    }
+
+    /// Lê a forma textual de [`Self::as_str`]; `None` para um tipo desconhecido.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::ApiKey, Self::ChatgptPlan, Self::Anthropic, Self::GoogleGemini]
+            .into_iter()
+            .find(|k| k.as_str() == raw)
+    }
+
+    /// Provedor com API própria (spec 132): endereço oficial fixo, protocolo implícito e chave.
+    pub fn is_native(self) -> bool {
+        matches!(self, ConnectionKind::Anthropic | ConnectionKind::GoogleGemini)
+    }
+
+    /// Endereço oficial fixo do tipo; `None` na conexão por chave, cujo endereço é livre.
+    pub fn fixed_base_url(self) -> Option<&'static str> {
+        match self {
+            ConnectionKind::ApiKey => None,
+            ConnectionKind::ChatgptPlan => Some(CHATGPT_PLAN_BASE_URL),
+            ConnectionKind::Anthropic => Some(ANTHROPIC_BASE_URL),
+            ConnectionKind::GoogleGemini => Some(GOOGLE_GEMINI_BASE_URL),
         }
     }
 }
@@ -258,22 +301,75 @@ impl Connection {
             api_key: String::new(),
             wire_api: WireApi::Responses,
             kind: ConnectionKind::ChatgptPlan,
+            base_url_override: None,
         }
+    }
+
+    /// Conexão nativa (Anthropic ou Google Gemini, spec 132) com o endereço oficial fixo.
+    pub fn native(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        kind: ConnectionKind,
+        api_key: impl Into<String>,
+    ) -> Self {
+        let mut conn = Self {
+            id: id.into(),
+            name: name.into(),
+            base_url: String::new(),
+            api_key: api_key.into(),
+            wire_api: WireApi::Chat,
+            kind,
+            base_url_override: None,
+        };
+        conn.normalize();
+        conn
     }
 
     pub fn is_chatgpt_plan(&self) -> bool {
         self.kind == ConnectionKind::ChatgptPlan
     }
 
-    /// Fixa os campos da conexão pelo plano ChatGPT (config editada à mão): `base_url`,
-    /// `wire_api` e nenhuma chave. A conexão por chave não muda.
-    pub fn normalize(&mut self) {
-        if self.is_chatgpt_plan() {
-            self.base_url = CHATGPT_PLAN_BASE_URL.to_string();
-            self.wire_api = WireApi::Responses;
-            self.api_key.clear();
-        }
+    /// Endereço usado nas chamadas: o avançado ([`Self::base_url_override`]) quando houver, senão
+    /// o `base_url`.
+    pub fn endpoint(&self) -> &str {
+        self.base_url_override.as_deref().unwrap_or(&self.base_url)
     }
+
+    /// Fixa os campos que vêm do tipo (config editada à mão):
+    /// - plano ChatGPT: `base_url` e `wire_api` fixos e nenhuma chave;
+    /// - Anthropic e Google Gemini (spec 132): `base_url` oficial e `wire_api` neutro (`chat`; o
+    ///   protocolo é o do tipo); o endereço avançado só fica se for válido ([`valid_override_url`]);
+    /// - por chave: não muda, a não ser o endereço avançado, que não vale nela.
+    pub fn normalize(&mut self) {
+        match self.kind {
+            ConnectionKind::ApiKey => {}
+            ConnectionKind::ChatgptPlan => {
+                self.wire_api = WireApi::Responses;
+                self.api_key.clear();
+            }
+            ConnectionKind::Anthropic | ConnectionKind::GoogleGemini => self.wire_api = WireApi::Chat,
+        }
+        if let Some(url) = self.kind.fixed_base_url() {
+            self.base_url = url.to_string();
+        }
+        self.base_url_override = match self.base_url_override.take() {
+            Some(raw) if self.kind.is_native() => valid_override_url(&raw),
+            _ => None,
+        };
+    }
+}
+
+/// Endereço avançado aceito (spec 132): `http` ou `https` com host, sem credenciais, consulta nem
+/// fragmento. Devolve a forma normalizada (sem `/` final); `None` se vazio ou inválido.
+pub fn valid_override_url(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    let ok = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    ok.then(|| url.as_str().trim_end_matches('/').to_string())
 }
 
 /// Protocolo HTTP de uma conexão: Chat Completions ou Responses (`/v1/responses`).
@@ -307,6 +403,7 @@ impl std::fmt::Debug for Connection {
             .field("api_key", &"***")
             .field("wire_api", &self.wire_api)
             .field("kind", &self.kind)
+            .field("base_url_override", &self.base_url_override)
             .finish()
     }
 }
@@ -419,7 +516,17 @@ mod tests {
         .expect("pricing");
         let p = cfg.pricing["m-1"].clone();
         assert_eq!(p.cached_input_per_mtok, None);
+        assert_eq!(p.cache_write_per_mtok, None, "config antiga carrega sem a escrita de cache");
         assert!(p.is_valid());
+        assert!(!toml::to_string(&cfg).expect("toml").contains("cache_write_per_mtok"), "ausente continua ausente");
+        let with: Config = toml::from_str(
+            "[pricing.\"m-1\"]\ninput_per_mtok = 3\noutput_per_mtok = 15\ncache_write_per_mtok = 3.75\n",
+        )
+        .expect("escrita de cache");
+        assert_eq!(with.pricing["m-1"].cache_write_per_mtok, Some(3.75));
+        let again: Config = toml::from_str(&toml::to_string(&with).expect("toml")).expect("reload");
+        assert_eq!(again.pricing, with.pricing);
+        assert!(!Pricing { cache_write_per_mtok: Some(-1.0), ..with.pricing["m-1"].clone() }.is_valid());
         let back: Config = toml::from_str(&toml::to_string(&cfg).expect("toml")).expect("reload");
         assert_eq!(back.pricing, cfg.pricing);
         assert!(!Pricing { input_per_mtok: -1.0, ..p.clone() }.is_valid());
@@ -457,6 +564,7 @@ mod tests {
             api_key: "sk-segredo-123".into(),
             wire_api: WireApi::Responses,
             kind: Default::default(),
+            base_url_override: None,
         };
         let dbg = format!("{conn:?}");
         assert!(!dbg.contains("sk-segredo-123"), "vazou segredo: {dbg}");
@@ -499,6 +607,7 @@ api_key = "k"
                 api_key: "k".into(),
                 wire_api: wire,
                 kind: Default::default(),
+                base_url_override: None,
             })
             .expect("toml");
             assert!(text.contains(&format!("wire_api = \"{}\"", wire.as_str())), "{text}");

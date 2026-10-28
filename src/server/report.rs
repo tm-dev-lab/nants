@@ -400,7 +400,13 @@ pub(super) fn build_facts(root: &Path, spec_id: &str, secrets: &SecretSet) -> Op
     if let Some(text) = final_base_fact(root, spec_id, secrets) {
         out.push_str(&format!("Verificação final na base (após a última integração): {text}\n"));
     }
-    out.push_str(&environment_facts(root, settings.as_ref(), spec.frontmatter.run_command.as_deref(), &test_command));
+    out.push_str(&environment_facts(
+        root,
+        settings.as_ref(),
+        spec.frontmatter.run_command.as_deref(),
+        spec.frontmatter.nothing_to_run.as_deref(),
+        &test_command,
+    ));
     out.push_str(&review_facts(&tasks, secrets));
     out.push_str(&skills_facts(root, settings.as_ref(), secrets));
     if git_ok {
@@ -466,8 +472,16 @@ pub(super) fn traceability(root: &Path, spec_id: &str, secrets: &SecretSet, lang
 
 /// Seção "Ambiente" (spec 075): determinística, lida do disco. O agente de relatório não lê `.nants`,
 /// então imagens, serviços, portas e comandos equivalentes fora do Nants chegam por aqui. O texto é
-/// redigido por `build_facts` (scrub final) e limitado.
-fn environment_facts(root: &Path, settings: Option<&Settings>, run_command: Option<&str>, test_command: &str) -> String {
+/// redigido por `build_facts` (scrub final) e limitado. Spec 131 T05: sem `run_command`, o fato
+/// positivo de como o produto é usado no Nants (o Console, onde App e Execução abrem), com a decisão
+/// `nothing_to_run` do plano quando houver, para o relatório não inventar como iniciar.
+fn environment_facts(
+    root: &Path,
+    settings: Option<&Settings>,
+    run_command: Option<&str>,
+    nothing_to_run: Option<&str>,
+    test_command: &str,
+) -> String {
     use crate::sdd::docker_command::{unwrap_workspace_command, wrap_workspace};
     use crate::sdd::Environment;
     let docker = settings.is_some_and(|s| s.environment == Environment::Docker);
@@ -505,8 +519,19 @@ fn environment_facts(root: &Path, settings: Option<&Settings>, run_command: Opti
         Err(safe_fs::SafeFsError::Missing) => {}
         Err(_) => out.push_str("- Serviços e portas publicadas (.nants/compose.yaml): não foi possível ler\n"),
     }
+    let run_command = run_command.map(str::trim).filter(|c| !c.is_empty());
+    if run_command.is_none() {
+        let decision = nothing_to_run
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(|d| format!(" (decisão do plano, nothing_to_run: {d})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- Executar: a spec não declara run_command{decision}. No Nants, o produto é usado pelo Console do projeto, onde as janelas App e Execução abrem; não há o que iniciar pelo botão de iniciar o app, e não há comando de execução a inventar.\n"
+        ));
+    }
     if docker {
-        if let Some(run) = run_command.map(str::trim).filter(|c| !c.is_empty()) {
+        if let Some(run) = run_command {
             let inner = unwrap_workspace_command(run).unwrap_or_else(|| run.to_string());
             out.push_str(&format!("- Executar fora do Nants: {}\n", wrap_workspace(&inner)));
         }

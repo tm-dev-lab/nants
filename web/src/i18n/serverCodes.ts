@@ -11,6 +11,7 @@
 import type { ApiFailure } from "../api/client";
 import { parseCodeParams, type CodeParams } from "../api/codes";
 import { DICTIONARIES, getLanguage, translate, type Lang, type MessageKey } from "./index";
+import { localizeHeadingTitle } from "./sddHeadings";
 
 const PARAM_RE = /\{(\w+)\}/g;
 
@@ -93,6 +94,14 @@ function withDockerItem(params: CodeParams, lang: Lang): CodeParams {
 }
 
 /**
+ * Título da seção lida por `read_spec_section` (spec 131 T06): o título canônico da spec, gravado
+ * em pt-BR, sai no idioma ativo; outro título, como veio.
+ */
+function withSectionTitle(params: CodeParams, lang: Lang): CodeParams {
+  return typeof params.title === "string" ? { ...params, title: localizeHeadingTitle(params.title, lang) } : params;
+}
+
+/**
  * Famílias de textos com `code`: erros da API, mensagens do sistema, etapas da atividade e rótulos
  * da atividade (ferramentas e avisos fixos do servidor).
  */
@@ -110,7 +119,9 @@ export function translateCode(prefix: CodePrefix, code: string, params: CodePara
       ? withDockerItem(base, lang)
       : prefix === "activity.code" && code === "tool.image_failed"
         ? withLegacyImageFailure(base, lang)
-        : base;
+        : prefix === "activity.code" && code === "tool.read_spec_section"
+          ? withSectionTitle(base, lang)
+          : base;
   for (const match of template.matchAll(PARAM_RE)) {
     const name = match[1] ?? "";
     if (!Object.hasOwn(values, name)) return null;
@@ -134,7 +145,18 @@ export function apiFailureText(failure: ApiFailure, lang: Lang = getLanguage()):
  * (lista de critérios não atendidos, erro): ele não cabe num param (o servidor corta em 512 bytes)
  * e aparece inteiro, como veio, abaixo da frase fixa traduzida.
  */
-const SYSTEM_CODES_WITH_TAIL: ReadonlySet<string> = new Set(["final.unavailable", "final.still_unmet", "final.fix_refused"]);
+const SYSTEM_CODES_WITH_TAIL: ReadonlySet<string> = new Set(["final.unavailable", "final.still_unmet", "final.fix_refused", "plan.final_plan"]);
+
+/**
+ * Avisos do sistema que só informam (spec 131 T03): a rodada do consenso sem ponto em aberto e a
+ * lista final do plano. Saem no tom neutro, não como alerta.
+ */
+const INFO_SYSTEM_CODES: ReadonlySet<string> = new Set(["plan.consensus_round", "plan.consensus_round_inferred", "plan.final_plan"]);
+
+/** `true` quando a mensagem do sistema só informa (sem a faixa e a cor de alerta). */
+export function isInfoSystemMessage(message: { code?: string }): boolean {
+  return message.code !== undefined && INFO_SYSTEM_CODES.has(message.code);
+}
 
 /** Mensagem gravada na conversa (`agent_message`/diálogo): pelo `code` quando houver; senão, o texto. */
 export function systemMessageText(

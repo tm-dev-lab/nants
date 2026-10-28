@@ -638,3 +638,10 @@ button.nd-conn-method:hover {
   flex-wrap: wrap;
   gap: var(--sp-1);
 }
+
+/* Sugestão de modelo por papel (spec 132 T10): um seletor por papel, lado a lado quando cabe. */
+.nd-suggest-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: var(--sp-2);
+}

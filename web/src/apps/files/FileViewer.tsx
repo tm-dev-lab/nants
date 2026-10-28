@@ -5,12 +5,15 @@
  * teto; falha ao carregar ou montar mantém o texto puro. Em `source=task`, arquivo alterado
  * ganha "Diff" (unificado, linhas marcadas por tipo em `<pre>`).
  * Todo conteúdo vem do servidor e entra como texto React (nunca como HTML).
+ * No `spec.md` e nas tarefas, os títulos canônicos aparecem no idioma ativo (spec 131 T06); o
+ * arquivo e o "Copiar" ficam com o texto gravado.
  */
 import { useEffect, useRef, useState, type ComponentType } from "react";
 import { getProjectFile, type ApiFailure, type FileContent, type FileSource } from "../../api/client";
 import { Icon } from "../../desktop/Icon";
 import { useAppearance } from "../../desktop/theme/appearanceContext";
 import { useT } from "../../i18n/react";
+import { localizeSddHeadings, isSddDocumentPath } from "../../i18n/sddHeadings";
 import { apiFailureText } from "../../i18n/serverCodes";
 import type { CodeViewProps } from "./CodeView";
 import { diffLineKind, formatBytes, HIGHLIGHT_MAX_BYTES, HIGHLIGHT_MAX_LINES, splitLines } from "./filesModel";
@@ -48,7 +51,7 @@ type View = { status: "loading" } | { status: "error"; failure: ApiFailure } | {
 
 export function FileViewer({ projectId, source, path, refreshKey, changed = false, onClose }: FileViewerProps) {
   const { theme } = useAppearance();
-  const { t } = useT();
+  const { t, lang } = useT();
   const [view, setView] = useState<View>({ status: "loading" });
   const [revealed, setRevealed] = useState(false);
   const [wrap, setWrap] = useState(false);
@@ -116,7 +119,9 @@ export function FileViewer({ projectId, source, path, refreshKey, changed = fals
   }
 
   const file = view.status === "ok" ? view.file : null;
-  const lines = file?.kind === "text" ? splitLines(file.content) : [];
+  // Só a exibição: os títulos do spec.md e das tarefas no idioma ativo (mesma contagem de linhas).
+  const shown = file?.kind === "text" ? (isSddDocumentPath(path) ? localizeSddHeadings(file.content, lang) : file.content) : "";
+  const lines = file?.kind === "text" ? splitLines(shown) : [];
   const diffLines = file?.kind === "diff" ? splitLines(file.content) : [];
   const highlightable =
     file?.kind === "text" && !highlightFailed && file.content.length <= HIGHLIGHT_MAX_BYTES && lines.length <= HIGHLIGHT_MAX_LINES;
@@ -228,7 +233,7 @@ export function FileViewer({ projectId, source, path, refreshKey, changed = fals
           )
         ) : null}
         {file?.kind === "text" && highlightable && CodeView !== null ? (
-          <CodeView content={file.content} filename={path} wrap={wrap} theme={theme} onError={() => setHighlightFailed(true)} />
+          <CodeView content={shown} filename={path} wrap={wrap} theme={theme} onError={() => setHighlightFailed(true)} />
         ) : null}
         {file?.kind === "text" && !(highlightable && CodeView !== null) ? (
           <div data-testid="file-code" className="nd-file-code nd-mono" data-wrap={wrap ? "true" : undefined}>

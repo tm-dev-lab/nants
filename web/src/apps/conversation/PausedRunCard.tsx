@@ -23,6 +23,7 @@ import { ChatCard, ChatCardHead } from "./ChatCard";
 import { runStopCode } from "../board/boardModel";
 import { PLAN_USAGE_URL, planConnectionToReconnect } from "../settings/chatgptPlan";
 import { useChatgptStart } from "../settings/PlanConnection";
+import { ANTHROPIC_LIMITS_URL } from "../../settings/rules";
 
 /** Rótulo de cada tipo de opção de escalada, no idioma ativo. */
 export const ESCALATION_KIND_LABELS: Readonly<Record<string, string>> = localized({
@@ -213,6 +214,9 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
   // Pausa pelo plano ChatGPT (spec 116 T03): limite de uso ou novo login, com o cartão próprio.
   const stopCode = useAppStore((s) => (stalled ? runStopCode(s.messages[projectId], spec.id, s.runStarts[projectId]) : null));
   const planPause = stopCode === "run.plan_limit" ? "limit" : stopCode === "run.plan_needs_login" ? "sign_in" : null;
+  // Limites do provedor que pausam (spec 132 T09/T10), no mesmo padrão: o teto de gasto da Anthropic
+  // e a cota diária do Gemini.
+  const limitPause = stopCode === "run.spend_limit" ? "spend" : stopCode === "run.daily_quota" ? "quota" : null;
   const reconnectTarget = useAppStore((s) => (planPause === "sign_in" ? (planConnectionToReconnect(s.config?.agents, s.config?.connections)?.id ?? null) : null));
   const reconnect = useChatgptStart(reconnectTarget ?? undefined);
   const locked = busy || blockedByReadiness;
@@ -279,12 +283,16 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
         ))}
       />
       <div className="nd-chat-card-body nd-stack">
-        <h3 className="nd-callout-title" data-plan-pause={planPause ?? undefined}>
+        <h3 className="nd-callout-title" data-plan-pause={planPause ?? undefined} data-limit-pause={limitPause ?? undefined}>
           {planPause === "limit"
             ? t("paused.planLimitTitle")
             : planPause === "sign_in"
               ? t("paused.planLoginTitle")
-              : stalled
+              : limitPause === "spend"
+                ? t("paused.spendLimitTitle")
+                : limitPause === "quota"
+                  ? t("paused.dailyQuotaTitle")
+                  : stalled
                 ? t("paused.stalledTitle")
                 : environmental
                   ? t("envBlock.title")
@@ -294,6 +302,10 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
           <p className="nd-muted">{t("paused.planLimitHint")}</p>
         ) : planPause === "sign_in" ? (
           <p className="nd-muted">{t("paused.planLoginHint")}</p>
+        ) : limitPause === "spend" ? (
+          <p className="nd-muted">{t("paused.spendLimitHint")}</p>
+        ) : limitPause === "quota" ? (
+          <p className="nd-muted">{t("paused.dailyQuotaHint")}</p>
         ) : stalled ? (
           <p className="nd-muted">{t("paused.stalledHint")}</p>
         ) : environmental ? (
@@ -425,6 +437,18 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
               <Icon name="external" size={14} />
               {t("chatgpt.manageUsage")}
             </a>
+          ) : null}
+          {limitPause === "spend" ? (
+            <a className="nd-btn" href={ANTHROPIC_LIMITS_URL} target="_blank" rel="noopener noreferrer" data-provider-limits="">
+              <Icon name="external" size={14} />
+              {t("paused.openAnthropicLimits")}
+            </a>
+          ) : null}
+          {limitPause === "quota" ? (
+            <button type="button" className="nd-btn" data-switch-connection="" onClick={() => shell.openSettings("agents")}>
+              <Icon name="users" size={14} />
+              {t("paused.switchConnection")}
+            </button>
           ) : null}
           {planPause === "sign_in" ? (
             <button

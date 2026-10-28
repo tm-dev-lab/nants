@@ -322,7 +322,7 @@ pub fn rebuild(messages: &[ChatMessage], snapshot: &str, files: &str, reminder: 
 }
 
 /// Trechos (em minúsculas) das mensagens de erro por tamanho do contexto dos provedores.
-const OVERFLOW_PATTERNS: [&str; 10] = [
+const OVERFLOW_PATTERNS: [&str; 12] = [
     "context_length_exceeded",
     "context length",
     "maximum context",
@@ -333,6 +333,11 @@ const OVERFLOW_PATTERNS: [&str; 10] = [
     "too many tokens",
     "exceeds the available context",
     "range of input length",
+    // Anthropic (spec 132 T03): "input length and `max_tokens` exceed context limit".
+    "context limit",
+    // Google Gemini (spec 132 T06): "The input token count exceeds the maximum number of tokens
+    // allowed" (a frase da API do Gemini; o estouro não foi provocado ao vivo).
+    "exceeds the maximum number of tokens",
 ];
 
 /// O provedor recusou o pedido por tamanho do contexto: HTTP 413, ou 400/422 com o código ou a
@@ -468,6 +473,7 @@ mod tests {
         assert!(is_context_overflow(&http(400, r#"{"error":{"code":"context_length_exceeded"}}"#)));
         assert!(is_context_overflow(&http(400, "This model's maximum context length is 128000 tokens")));
         assert!(is_context_overflow(&http(400, "prompt is too long: 210000 tokens > 200000 maximum")));
+        assert!(is_context_overflow(&http(400, "input length and `max_tokens` exceed context limit: 180000 + 32000 > 200000")));
         assert!(is_context_overflow(&http(413, "")));
         assert!(!is_context_overflow(&http(400, "invalid tool schema")));
         assert!(!is_context_overflow(&http(429, "too many tokens per minute")), "limite de ritmo não é tamanho");

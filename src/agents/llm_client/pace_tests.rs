@@ -87,6 +87,100 @@ fn quota_headers_are_read_and_invalid_ones_ignored() {
     assert_eq!(quota(&[]), None);
 }
 
+/// Instante fixo de `2026-10-28T12:00:00Z`.
+fn noon() -> SystemTime {
+    UNIX_EPOCH + secs(1_793_188_800)
+}
+
+fn quota_at(pairs: &[(&'static str, &'static str)], now: SystemTime) -> Option<Quota> {
+    let mut h = HeaderMap::new();
+    for (k, v) in pairs {
+        h.insert(*k, HeaderValue::from_static(v));
+    }
+    Quota::from_headers_at(&h, now)
+}
+
+/// Spec 132 T09: os `anthropic-ratelimit-*`, com o reset em RFC 3339 e o limite de saída.
+#[test]
+fn anthropic_headers_are_read_with_the_rfc3339_reset() {
+    let q = quota_at(
+        &[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "49"),
+            ("anthropic-ratelimit-requests-reset", "2026-10-28T12:00:30Z"),
+            ("anthropic-ratelimit-tokens-limit", "40000"),
+            ("anthropic-ratelimit-tokens-remaining", "39000"),
+            ("anthropic-ratelimit-tokens-reset", "2026-10-28T12:00:01.5Z"),
+            ("anthropic-ratelimit-input-tokens-limit", "30000"),
+            ("anthropic-ratelimit-output-tokens-limit", "8000"),
+        ],
+        noon(),
+    )
+    .expect("cota");
+    assert_eq!(q.limit_requests, Some(50));
+    assert_eq!(q.remaining_requests, Some(49));
+    assert_eq!(q.reset_requests, Some(secs(30)));
+    assert_eq!(q.limit_tokens, Some(40_000), "o tokens-* (o mais restritivo) vence o input-tokens-*");
+    assert_eq!(q.remaining_tokens, Some(39_000));
+    assert_eq!(q.reset_tokens, Some(Duration::from_millis(1500)));
+    assert_eq!(q.limit_output_tokens, Some(8_000));
+
+    // Sem o tokens-*, vale o input-tokens-*; o deslocamento da zona entra na conta.
+    let q = quota_at(
+        &[
+            ("anthropic-ratelimit-input-tokens-limit", "30000"),
+            ("anthropic-ratelimit-input-tokens-remaining", "100"),
+            ("anthropic-ratelimit-input-tokens-reset", "2026-10-28T09:01:00-03:00"),
+        ],
+        noon(),
+    )
+    .expect("cota");
+    assert_eq!((q.limit_tokens, q.remaining_tokens, q.reset_tokens), (Some(30_000), Some(100), Some(secs(60))));
+    assert_eq!(q.limit_output_tokens, None);
+
+    // Os `x-ratelimit-*` vencem quando os dois vêm.
+    let q = quota_at(&[("x-ratelimit-limit-requests", "7"), ("anthropic-ratelimit-requests-limit", "50")], noon()).expect("cota");
+    assert_eq!(q.limit_requests, Some(7));
+}
+
+#[test]
+fn rfc3339_reset_ignores_past_and_invalid_dates() {
+    assert_eq!(until_rfc3339("2026-10-28T12:00:10+00:00", noon()), Some(secs(10)));
+    assert_eq!(until_rfc3339("2026-10-28t12:00:10z", noon()), Some(secs(10)));
+    assert_eq!(until_rfc3339("2026-10-28T13:00:10+01:00", noon()), Some(secs(10)));
+    for bad in [
+        "2026-10-28T11:59:59Z",
+        "2026-10-28T12:00:00Z",
+        "2026-10-28T12:00:10",
+        "2026-13-28T12:00:10Z",
+        "2026-10-28T25:00:10Z",
+        "2026-10-28T12:00:10.Z",
+        "2026-10-28T12:00:10+0100",
+        "28/10/2026 12:00:10",
+        "",
+        "2026-10-28T12:00:1çZ",
+    ] {
+        assert_eq!(until_rfc3339(bad, noon()), None, "{bad}");
+    }
+}
+
+/// Spec 132 T09: o teto do `max_tokens` é o menor entre o limite de saída do cabeçalho e o aprendido
+/// com um 429, que só vale uma vez por par.
+#[test]
+fn output_ceiling_takes_the_header_and_one_429_reduction() {
+    let (p, _) = pacer();
+    assert_eq!(p.output_ceiling(C, M), None);
+    p.observe(C, M, &Quota { limit_output_tokens: Some(8_000), ..Quota::default() });
+    assert_eq!(p.output_ceiling(C, M), Some(8_000));
+    assert!(p.cap_output(C, M, 4_000));
+    assert_eq!(p.output_ceiling(C, M), Some(4_000));
+    assert!(!p.cap_output(C, M, 1_000), "só a primeira redução conta");
+    assert_eq!(p.output_ceiling(C, M), Some(4_000));
+    p.observe(C, M, &Quota { limit_output_tokens: Some(2_000), ..Quota::default() });
+    assert_eq!(p.output_ceiling(C, M), Some(2_000));
+    assert_eq!(p.output_ceiling(C, "outro"), None, "por par");
+}
+
 #[test]
 fn without_any_signal_there_is_never_a_wait() {
     let (p, clock) = pacer();

@@ -10,8 +10,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    default_image_price, AgentConfig, DEFAULT_PROJECTS_ROOT, Agents, MAX_STEPS_RANGE, Config, Connection, ConnectionKind, CHATGPT_PLAN_BASE_URL, Effort, PriceSource, Pricing, Project, ServerConfig, WireApi,
-    LanViewPortsConfig,
+    default_image_price, AgentConfig, DEFAULT_PROJECTS_ROOT, Agents, MAX_STEPS_RANGE, Config, Connection, ConnectionKind, ANTHROPIC_BASE_URL, CHATGPT_PLAN_BASE_URL, GOOGLE_GEMINI_BASE_URL, Effort, PriceSource, Pricing, Project, ServerConfig, WireApi,
+    LanViewPortsConfig, valid_override_url,
 };
 pub use view_ports::{ViewPorts, DEFAULT_VIEW_PORTS, MAX_VIEW_PORTS, MIN_VIEW_PORT, VIEW_PORTS_EXHAUSTED_PREFIX};
 
@@ -93,8 +93,9 @@ impl Connection {
 
     /// Endereço utilizável: não vazio depois de tirar espaços e `/` finais. Cobre a recusa de
     /// `LlmClient::new` (`base_url` vazia após `trim_end_matches('/')`), um pouco mais estrito.
+    /// Nas nativas (spec 132), vale o [`Self::endpoint`]: o oficial ou o avançado.
     pub fn has_usable_base_url(&self) -> bool {
-        !self.base_url.trim().trim_end_matches('/').is_empty()
+        !self.endpoint().trim().trim_end_matches('/').is_empty()
     }
 
     /// Problemas que impedem montar o cliente desta conexão (prontidão, spec 093 T12), na ordem
@@ -419,6 +420,7 @@ api_key = "env:OA_KEY"
             api_key: api_key.into(),
             wire_api: WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }
     }
 
@@ -538,5 +540,88 @@ wire_api = "foo"
         }
         conn.api_key = "sk-literal".into();
         assert_eq!(conn.usable_problems(), [ConnectionProblem::BaseUrl]);
+    }
+
+    // --- spec 132 T01: conexões Anthropic e Google Gemini ---
+
+    const NATIVE: &str = r#"
+[[connections]]
+id = "anth"
+name = "Claude"
+base_url = "https://outro.example.com/v1"
+api_key = "env:ANTHROPIC_API_KEY"
+wire_api = "responses"
+kind = "anthropic"
+
+[[connections]]
+id = "gem"
+name = "Gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "env:GEMINI_API_KEY"
+kind = "google_gemini"
+base_url_override = "https://proxy.example.com/gemini/"
+"#;
+
+    #[test]
+    fn native_kinds_fix_the_official_url_and_round_trip_through_toml() {
+        let dir = temp_dir("native-roundtrip");
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(&path, NATIVE).expect("write");
+        let loaded = Config::load_from(&path).expect("carrega");
+        let (anth, gem) = (&loaded.connections[0], &loaded.connections[1]);
+        assert_eq!((anth.kind, anth.base_url.as_str(), anth.wire_api), (ConnectionKind::Anthropic, ANTHROPIC_BASE_URL, WireApi::Chat));
+        assert_eq!((anth.base_url_override.as_deref(), anth.endpoint()), (None, ANTHROPIC_BASE_URL));
+        assert_eq!((gem.kind, gem.base_url.as_str()), (ConnectionKind::GoogleGemini, GOOGLE_GEMINI_BASE_URL));
+        assert_eq!(gem.base_url_override.as_deref(), Some("https://proxy.example.com/gemini"));
+        assert_eq!(gem.endpoint(), "https://proxy.example.com/gemini");
+        assert_eq!(gem.api_key, "env:GEMINI_API_KEY");
+
+        loaded.save_to(&path).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("kind = \"anthropic\"") && text.contains("kind = \"google_gemini\""), "{text}");
+        assert!(text.contains("base_url_override = \"https://proxy.example.com/gemini\""), "{text}");
+        assert_eq!(text.matches("base_url_override").count(), 1, "{text}");
+        assert_eq!(Config::load_from(&path).expect("reload"), loaded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_override_is_dropped_and_other_kinds_never_keep_one() {
+        let mut gem = Connection::native("g", "g", ConnectionKind::GoogleGemini, "env:X");
+        for bad in ["", "  ", "ftp://h.example.com", "https://u:p@h.example.com", "https://h.example.com/?a=1", "nada"] {
+            gem.base_url_override = Some(bad.into());
+            gem.normalize();
+            assert_eq!(gem.base_url_override, None, "{bad:?}");
+        }
+        let mut key = connection_with_key("env:X");
+        key.base_url_override = Some("https://proxy.example.com".into());
+        key.normalize();
+        assert_eq!((key.base_url_override, key.base_url.as_str()), (None, "http://localhost"));
+        let mut plan = Connection::chatgpt_plan("p", "p");
+        plan.base_url_override = Some("https://proxy.example.com".into());
+        plan.normalize();
+        assert_eq!((plan.base_url_override.as_deref(), plan.endpoint()), (None, CHATGPT_PLAN_BASE_URL));
+    }
+
+    #[test]
+    fn native_kind_needs_a_key_and_accepts_env_reference() {
+        let var = "NANTS_TEST_T132_NATIVE_KEY";
+        env::set_var(var, "valor");
+        let conn = Connection::native("a", "a", ConnectionKind::Anthropic, format!("env:{var}"));
+        assert_eq!(conn.resolve_api_key().expect("env"), "valor");
+        assert!(conn.usable_problems().is_empty());
+        env::remove_var(var);
+        assert_eq!(conn.usable_problems(), [ConnectionProblem::ApiKey]);
+    }
+
+    #[test]
+    fn unknown_kind_is_load_error_and_kind_parse_round_trips() {
+        let bad: Result<Config, _> = toml::from_str("[[connections]]\nid = \"x\"\nname = \"x\"\nbase_url = \"https://h.example.com\"\nkind = \"azure\"\n");
+        assert!(bad.is_err());
+        for kind in [ConnectionKind::ApiKey, ConnectionKind::ChatgptPlan, ConnectionKind::Anthropic, ConnectionKind::GoogleGemini] {
+            assert_eq!(ConnectionKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ConnectionKind::parse("gemini"), None);
     }
 }

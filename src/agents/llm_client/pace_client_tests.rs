@@ -42,6 +42,7 @@ fn req() -> ChatRequest {
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     }
 }
 
@@ -209,6 +210,7 @@ fn only_connection_clients_are_paced() {
         api_key: "sk-literal".into(),
         wire_api: WireApi::Chat,
         kind: Default::default(),
+        base_url_override: None,
     };
     let from_conn = LlmClient::from_connection(&conn).expect("cliente");
     assert!(from_conn.is_paced());
@@ -227,6 +229,7 @@ async fn connection_clients_share_the_process_registry() {
         api_key: "sk-literal".into(),
         wire_api: WireApi::Chat,
         kind: Default::default(),
+        base_url_override: None,
     };
     LlmClient::from_connection(&conn).expect("cliente").chat(&req()).await.expect("ok");
     // Outro cliente da mesma conexão (outro papel, outro turno) vê o mesmo par.

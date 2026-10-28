@@ -316,7 +316,7 @@ describe("Configurações: Conexões", () => {
     const win = settings();
     fireEvent.click(within(win).getByRole("button", { name: "Nova conexão" }));
     // Spec 116: o primeiro passo pergunta como conectar.
-    fireEvent.click(within(win).getByRole("button", { name: /^Chave de API/ }));
+    fireEvent.click(within(win).getByRole("button", { name: /^OpenAI ou compatível/ }));
     const form = within(win).getByRole("region", { name: "Nova conexão" });
     const key = within(form).getByLabelText("Chave de API") as HTMLInputElement;
     expect(key.type).toBe("password");
@@ -349,7 +349,7 @@ describe("Configurações: Conexões", () => {
     const win = settings();
     fireEvent.click(within(win).getByRole("button", { name: "Nova conexão" }));
     // Spec 116: o primeiro passo pergunta como conectar.
-    fireEvent.click(within(win).getByRole("button", { name: /^Chave de API/ }));
+    fireEvent.click(within(win).getByRole("button", { name: /^OpenAI ou compatível/ }));
     const form = within(win).getByRole("region", { name: "Nova conexão" });
     fireEvent.change(within(form).getByLabelText("Identificador"), { target: { value: "novo" } });
     fireEvent.change(within(form).getByLabelText("Nome"), { target: { value: "Novo" } });

@@ -63,6 +63,7 @@ fn state_with(root: &Path, rec: &Arc<Rec>, backend: Option<Arc<Scripted>>) -> Ap
         api_key: KEY.into(),
         wire_api: Default::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.agents.architect = agent();
     cfg.agents.developer = agent();
@@ -190,6 +191,25 @@ async fn guide_explains_what_does_not_run_in_the_sandbox() {
     let (status, v) = guide(&state_with(&root, &Rec::with_ports(), None)).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["sandbox"], json!({"runs_here": false, "note": note}));
+}
+
+/// Spec 131 T05: `run` diz se a spec declara `run_command` e traz a decisão `nothing_to_run`
+/// (redigida): sem `run_command`, a janela abre no Console.
+#[tokio::test]
+async fn guide_says_whether_there_is_a_run_command_and_the_nothing_to_run_decision() {
+    let root = root_for("no-run", "");
+    let (status, v) = guide(&state_with(&root, &Rec::with_ports(), None)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["run"], json!({"declared": false, "nothing_to_run": null}));
+    let decision = format!("Biblioteca: o uso é pelos testes. {KEY}");
+    let root = root_for("nothing-to-run", &format!("nothing_to_run: \"{decision}\"\n"));
+    let (_, v) = guide(&state_with(&root, &Rec::with_ports(), None)).await;
+    assert_eq!(v["run"]["declared"], false);
+    let note = v["run"]["nothing_to_run"].as_str().expect("decisão");
+    assert!(note.starts_with("Biblioteca: o uso é pelos testes.") && !note.contains(KEY), "{note}");
+    let root = root_for("with-run", "run_command: \"python -m ledger resumo dados/exemplo.csv\"\n");
+    let (_, v) = guide(&state_with(&root, &Rec::with_ports(), None)).await;
+    assert_eq!(v["run"], json!({"declared": true, "nothing_to_run": null}));
 }
 
 #[tokio::test]

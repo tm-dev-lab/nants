@@ -489,6 +489,7 @@ mod tests {
             response_json: false,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         }
     }
 
@@ -499,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn records_complete_and_stream() {
         let sink = Arc::new(MemSink::default());
-        let fake = Fake(Some(Usage { prompt: 3, completion: 4, cached: Some(1), reasoning: Some(2) }));
+        let fake = Fake(Some(Usage { prompt: 3, completion: 4, cached: Some(1), reasoning: Some(2), cache_write: None }));
         let b = UsageBackend::new(&fake, Some(scope(&sink)));
         b.complete(&req()).await.expect("ok");
         b.complete_stream(&req(), &|_| {}).await.expect("ok");

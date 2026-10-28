@@ -107,6 +107,22 @@ describe("preços", () => {
     });
     expect(buildPricing(["a"], { a: { ...rows.a, image: "x" } })).toEqual({ ok: false, model: "a" });
   });
+
+  it("a escrita de cache (132) vira o campo opcional e sobrevive ao salvar", () => {
+    const row = priceRowOf({ input_per_mtok: 3, output_per_mtok: 15, cache_write_per_mtok: 3.75, source: "estimated", estimated_at: "2026-10-27" });
+    expect(row.cacheWrite).toBe("3,75");
+    const saved = buildPricing(["m"], { m: { ...row, input: "4" } });
+    expect(saved).toEqual({
+      ok: true,
+      pricing: { m: { input_per_mtok: 4, output_per_mtok: 15, cache_write_per_mtok: 3.75, source: "estimated", estimated_at: "2026-10-27" } },
+    });
+    expect(priceRowOf({ input_per_mtok: 1, output_per_mtok: 2 }).cacheWrite).toBe("");
+    // Digitado com ponto ou vírgula; vazio fica de fora; inválido aponta o modelo.
+    expect(buildPricing(["m"], { m: { ...row, cacheWrite: "1.25" } })).toMatchObject({ ok: true, pricing: { m: { cache_write_per_mtok: 1.25 } } });
+    const cleared = buildPricing(["m"], { m: { ...row, cacheWrite: " " } });
+    expect(cleared.ok && cleared.pricing.m?.cache_write_per_mtok).toBeUndefined();
+    expect(buildPricing(["m"], { m: { ...row, cacheWrite: "-1" } })).toEqual({ ok: false, model: "m" });
+  });
 });
 
 describe("conexões em lista (095/T06)", () => {

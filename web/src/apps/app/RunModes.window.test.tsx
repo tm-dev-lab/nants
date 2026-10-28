@@ -24,6 +24,8 @@ import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
 import { resetStore } from "../../test-utils";
 import { AppRunner } from "./AppApp";
+import { clearGuideCache } from "./useAppGuide";
+import { ExecutionPanel } from "../execution/ExecutionApp";
 import { CONSOLE_EMPTY, S, STOP_URL, appWindow, calls, emit, execWindow, guide, mountRun, running } from "./app-test-utils";
 
 afterEach(() => {
@@ -320,7 +322,7 @@ describe("Console do projeto", () => {
     expect(out.querySelector("[data-console-notice]")?.textContent).toContain("O Console não tem entrada");
   });
 
-  it("sem run_command (próximo passo open_console), o Console abre sozinho", async () => {
+  it("sem run_command (próximo passo open_console), o Console abre sozinho nas duas janelas, sem o erro", async () => {
     await mountRun({
       app: { start: { status: 422, body: { error: "x", code: "app_no_run_command", reason: "no_run_command", action: "open_console" } } },
       open: ["App", "Execução"],
@@ -328,6 +330,193 @@ describe("Console do projeto", () => {
     await click(within(execWindow()).getByRole("button", { name: "Iniciar" }));
     await click(within(screen.getByRole("dialog", { name: "Iniciar o app?" })).getByRole("button", { name: "Executar" }));
     expect(appWindow().querySelector("[data-console]")).not.toBeNull();
+    // Spec 131 T05: a Execução também abre no Console, sem "Iniciar" nem o erro vermelho.
+    expect(execWindow().querySelector("[data-console]")).not.toBeNull();
+    for (const w of [appWindow(), execWindow()]) {
+      expect(within(w).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+      expect(w.textContent).not.toContain("não declara como executar");
+    }
+  });
+
+  // Spec 131 T05 (U2 do Test 9): a spec sem run_command, com a decisão "nada a executar".
+  const NO_RUN_GUIDE = guide({ run: { declared: false, nothing_to_run: "Biblioteca: o uso é pelos testes e pelo README." } });
+
+  it("sem run_command: App e Execução abrem no Console com o Como usar e as provas, sem Iniciar nem erro", async () => {
+    const mounted = await mountRun({ app: { guide: { status: 200, body: NO_RUN_GUIDE } }, open: ["App", "Execução"] });
+    for (const w of [appWindow(), execWindow()]) {
+      const c = w.querySelector<HTMLElement>("[data-console]");
+      if (c === null) throw new Error("Console ausente");
+      expect(c.querySelector("[data-console-norun]")?.textContent).toContain("não declara um comando para iniciar o produto");
+      expect(c.querySelector("[data-console-decision]")?.textContent).toBe("Biblioteca: o uso é pelos testes e pelo README.");
+      expect(c.textContent).toContain("ledger report --month 2026-09");
+      expect(c.querySelector("[data-proofs]")?.textContent).toContain("7 de 7");
+      expect(within(w).getByRole("textbox", { name: "Comando" })).toBeTruthy();
+      expect(within(w).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+      expect(w.querySelector("[data-console-start], [data-console-back]")).toBeNull();
+      expect(within(w).queryByRole("alert")).toBeNull();
+      expect(findForbiddenGlyphs(w)).toEqual([]);
+    }
+    expect(appWindow().querySelector("[data-app-view]")?.getAttribute("data-app-view")).toBe("console");
+    expect(calls(mounted, /\/app\/start$/)).toBe(0);
+  });
+
+  it("sem run_command e sem a decisão: o Console abre igual, só com a linha do dicionário (en)", async () => {
+    await mountRun({ app: { guide: { status: 200, body: guide({ run: { declared: false, nothing_to_run: null } }) } }, open: ["App", "Execução"] });
+    const exec = execWindow();
+    await act(async () => {
+      setLanguage("en", { persist: false });
+    });
+    const c = screen.getByRole("region", { name: "App" }).querySelector<HTMLElement>("[data-console]");
+    if (c === null) throw new Error("Console ausente");
+    expect(c.querySelector("[data-console-norun]")?.textContent).toBe("This specification does not declare a command to start the product: it is used through Console commands.");
+    expect(c.querySelector("[data-console-decision]")).toBeNull();
+    expect(within(exec).queryByRole("button", { name: /^Start/ })).toBeNull();
+    expect(exec.querySelector("[data-console-norun]")?.textContent).toContain("does not declare a command to start");
+  });
+
+  it("enquanto o guia carrega, o App parado fica neutro (sem Iniciar nem Console); decide quando ele responde", async () => {
+    const STOPPED_BODY = { state: "stopped", spec_id: null, url: null, started_at: null, exit_code: null };
+    const mountHeld = async (): Promise<{ container: HTMLElement; release: (status: number, body: unknown) => Promise<void> }> => {
+      resetStore();
+      clearGuideCache();
+      let answer: ((r: Response) => void) | null = null;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: string | URL | Request) => {
+          const url = String(input);
+          if (url.includes("/guide/")) return new Promise<Response>((resolve) => (answer = resolve));
+          const body = url.endsWith("/app/exec") ? CONSOLE_EMPTY : STOPPED_BODY;
+          return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
+        }),
+      );
+      const layout = { windows: { app: { x: 0, y: 0, w: 900, h: 700, z: 1, mode: "normal" as const, open: true } } };
+      const rendered = render(
+        <WindowLayoutContext.Provider value={layout}>
+          <AppRunner projectId="p1" specId={S} size="wide" viewport="free" setSelection={() => undefined} />
+        </WindowLayoutContext.Provider>,
+      );
+      await settle();
+      const release = async (status: number, body: unknown): Promise<void> => {
+        await act(async () => {
+          answer?.(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
+        });
+        await settle();
+      };
+      return { container: rendered.container, release };
+    };
+    const neutral = (c: HTMLElement): void => {
+      expect(c.querySelector('[data-runview="loading"]')?.textContent).toBe("Carregando o Como usar e as provas.");
+      expect(within(c).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+      expect(c.querySelector("[data-console]")).toBeNull();
+    };
+
+    // Sem run_command: do neutro direto para o Console, sem "Iniciar" no meio.
+    let m = await mountHeld();
+    neutral(m.container);
+    await m.release(200, NO_RUN_GUIDE);
+    expect(m.container.querySelector("[data-console]")).not.toBeNull();
+    expect(m.container.querySelector('[data-runview="loading"]')).toBeNull();
+    cleanup();
+
+    // Com run_command: do neutro para o "Iniciar o app".
+    m = await mountHeld();
+    neutral(m.container);
+    await m.release(200, guide());
+    expect(within(m.container).getByRole("button", { name: "Iniciar o app" })).toBeTruthy();
+    expect(m.container.querySelector("[data-console]")).toBeNull();
+    cleanup();
+
+    // O guia falhou: vale o comportamento de antes (parado com "Iniciar o app").
+    m = await mountHeld();
+    neutral(m.container);
+    await m.release(500, { error: "x", code: "internal" });
+    expect(within(m.container).getByRole("button", { name: "Iniciar o app" })).toBeTruthy();
+    expect(m.container.querySelector('[data-runview="loading"]')).toBeNull();
+  });
+
+  it("Execução: enquanto o guia carrega, fica neutra (sem Iniciar nem Console); decide quando ele responde", async () => {
+    const STOPPED_BODY = { state: "stopped", spec_id: null, url: null, started_at: null, exit_code: null };
+    const mountHeld = async (): Promise<{ container: HTMLElement; release: (status: number, body: unknown) => Promise<void> }> => {
+      resetStore();
+      clearGuideCache();
+      let answer: ((r: Response) => void) | null = null;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: string | URL | Request) => {
+          const url = String(input);
+          if (url.includes("/guide/")) return new Promise<Response>((resolve) => (answer = resolve));
+          if (url.endsWith("/logs")) return Promise.resolve(new Response("", { status: 200 }));
+          const body = url.endsWith("/app/exec") ? CONSOLE_EMPTY : STOPPED_BODY;
+          return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
+        }),
+      );
+      const layout = { windows: { execution: { x: 0, y: 0, w: 390, h: 800, z: 1, mode: "normal" as const, open: true } } };
+      const rendered = render(
+        <WindowLayoutContext.Provider value={layout}>
+          <ExecutionPanel projectId="p1" specId={S} projectPath="/x" size="narrow" />
+        </WindowLayoutContext.Provider>,
+      );
+      await settle();
+      const release = async (status: number, body: unknown): Promise<void> => {
+        await act(async () => {
+          answer?.(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
+        });
+        await settle();
+      };
+      return { container: rendered.container, release };
+    };
+    const neutral = (c: HTMLElement): void => {
+      expect(c.querySelector('[data-runview="loading"]')?.textContent).toBe("Carregando o Como usar e as provas.");
+      expect(within(c).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+      expect(c.querySelector("[data-console]")).toBeNull();
+    };
+
+    // Sem run_command: do neutro direto para o Console, sem "Iniciar" no meio.
+    let m = await mountHeld();
+    neutral(m.container);
+    await m.release(200, NO_RUN_GUIDE);
+    expect(m.container.querySelector("[data-console]")).not.toBeNull();
+    expect(within(m.container).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+    cleanup();
+
+    // Com run_command: do neutro para o "Iniciar".
+    m = await mountHeld();
+    neutral(m.container);
+    await m.release(200, guide());
+    expect(within(m.container).getByRole("button", { name: "Iniciar" })).toBeTruthy();
+    expect(m.container.querySelector("[data-console]")).toBeNull();
+    cleanup();
+
+    // O guia falhou: vale o cartão de antes, com "Iniciar".
+    m = await mountHeld();
+    neutral(m.container);
+    await m.release(500, { error: "x", code: "internal" });
+    expect(within(m.container).getByRole("button", { name: "Iniciar" })).toBeTruthy();
+    expect(m.container.querySelector('[data-runview="loading"]')).toBeNull();
+  });
+
+  it("não roda no sandbox e sem run_command: a explicação do sandbox vale nas duas janelas, não o Console direto", async () => {
+    const note = "A janela nativa de desktop não abre no sandbox; o Console roda o núcleo.";
+    await mountRun({
+      app: { guide: { status: 200, body: guide({ sandbox: { runs_here: false, note }, run: { declared: false, nothing_to_run: null } }) } },
+      open: ["App", "Execução"],
+    });
+    for (const w of [appWindow(), execWindow()]) {
+      const v = w.querySelector<HTMLElement>('[data-runview="sandbox"]');
+      if (v === null) throw new Error("explicação do sandbox ausente");
+      expect(v.querySelector("[data-sandbox-note]")?.textContent).toBe(note);
+      expect(w.querySelector("[data-console]")).toBeNull();
+      expect(within(w).queryByRole("button", { name: /^Iniciar/ })).toBeNull();
+    }
+    // "Abrir o Console do projeto" na Execução abre o Console no App.
+    await click(within(execWindow()).getByRole("button", { name: "Abrir o Console do projeto" }));
+    expect(appWindow().querySelector("[data-console]")).not.toBeNull();
+  });
+
+  it("com run_command declarado: nada muda (Iniciar na Execução e no App)", async () => {
+    await mountRun({ app: { guide: { status: 200, body: guide({ run: { declared: true, nothing_to_run: null } }) } }, open: ["App", "Execução"] });
+    expect(appWindow().querySelector("[data-console]")).toBeNull();
+    expect(within(execWindow()).getByRole("button", { name: "Iniciar" })).toBeTruthy();
   });
 
   it("no celular: abas Saída, Como usar e Provas, e o campo embaixo", async () => {

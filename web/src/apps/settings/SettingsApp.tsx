@@ -41,6 +41,8 @@ import { ConnectionRow } from "./ConnectionRow";
 import { ConnectionForm } from "./ConnectionForm";
 import { dismissChatgptReturn, isPlanConnection, loginErrorText, useChatgptReturn } from "./chatgptPlan";
 import { NewConnection } from "./NewConnection";
+import { NativeConnectionForm } from "./NativeConnectionForm";
+import { isNativeKind } from "../../settings/rules";
 import { PlanConnectionPanel } from "./PlanConnection";
 import { MachineTab } from "./MachineTab";
 import { PricingEditor } from "./PricingEditor";
@@ -154,7 +156,16 @@ function ConnectionsTab() {
       ) : showForm ? (
         <section className="nd-settings-form" aria-label={editingView !== null ? t("settings.editConnectionLabel", { name: editingView.name }) : t("settings.newConnection")}>
           <h3 className="nd-strong">{editingView !== null ? t("settings.editConnectionTitle", { name: editingView.name }) : t("settings.newConnection")}</h3>
-          {editingView !== null ? (
+          {editingView !== null && isNativeKind(editingView.kind) ? (
+            <NativeConnectionForm
+              key={editingView.id}
+              kind={editingView.kind}
+              existingIds={connections.map((c) => c.id)}
+              initial={editingView}
+              onSaved={closeEditor}
+              onCancel={() => setEditing(null)}
+            />
+          ) : editingView !== null ? (
             <ConnectionForm key={editingView.id} existingIds={connections.map((c) => c.id)} initial={editingView} onSaved={closeEditor} onCancel={() => setEditing(null)} />
           ) : (
             <NewConnection

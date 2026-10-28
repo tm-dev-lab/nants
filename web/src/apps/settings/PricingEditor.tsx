@@ -1,7 +1,7 @@
 /*
  * Preços por modelo (aba Preços; specs 031/032/092): um cartão
- * por modelo em uso com entrada, saída e cache (opcional) em US$/1M tokens e o "US$ por imagem"
- * (092), selo estimado/manual/sem preço, "Usar estimativa" por modelo e "Atualizar estimativas".
+ * por modelo em uso com entrada, saída, cache (opcional) e escrita de cache (opcional, spec 132) em
+ * US$/1M tokens e o "US$ por imagem" (092), selo estimado/manual/sem preço, "Usar estimativa" por modelo e "Atualizar estimativas".
  * Estimativas vêm do catálogo público (servidor); preço digitado é "manual" e o servidor nunca o
  * sobrescreve. Linha sem entrada e saída fica fora do mapa. Nunca inventa valores.
  *
@@ -115,7 +115,7 @@ export function PricingEditor({ agents, pricing, onSaved }: PricingEditorProps) 
     // Só na abertura da aba.
   }, []);
 
-  function edit(model: string, field: "input" | "output" | "cached" | "image", value: string): void {
+  function edit(model: string, field: "input" | "output" | "cached" | "cacheWrite" | "image", value: string): void {
     setRows((r) => {
       const base: PriceRow = r[model] ?? EMPTY_PRICE_ROW;
       // O preço por imagem é do usuário e não muda a origem dos preços de tokens.
@@ -210,6 +210,13 @@ export function PricingEditor({ agents, pricing, onSaved }: PricingEditorProps) 
                   <PriceField label={tr("settings.pricing.input")} aria={tr("settings.pricing.inputOf", { model })} unit="US$/1M" value={row?.input ?? ""} onChange={(v) => edit(model, "input", v)} />
                   <PriceField label={tr("settings.pricing.output")} aria={tr("settings.pricing.outputOf", { model })} unit="US$/1M" value={row?.output ?? ""} onChange={(v) => edit(model, "output", v)} />
                   <PriceField label={tr("settings.pricing.cached")} aria={tr("settings.pricing.cachedOf", { model })} unit="US$/1M" value={row?.cached ?? ""} onChange={(v) => edit(model, "cached", v)} />
+                  <PriceField
+                    label={tr("settings.pricing.cacheWrite")}
+                    aria={tr("settings.pricing.cacheWriteOf", { model })}
+                    unit="US$/1M"
+                    value={row?.cacheWrite ?? ""}
+                    onChange={(v) => edit(model, "cacheWrite", v)}
+                  />
                   <PriceField
                     label={tr("settings.pricing.image")}
                     aria={tr("settings.pricing.imageOf", { model })}

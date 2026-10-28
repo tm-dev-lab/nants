@@ -9,6 +9,7 @@ import { putConnection, type ApiFailure } from "../../api/client";
 import type { ConnectionInput, ConnectionView, WireApi } from "../../api/types";
 import { Icon } from "../../desktop/Icon";
 import {
+  isGeminiCompatUrl,
   normalizeBaseUrl,
   validateConnectionForm,
   WIRE_API_OPTIONS,
@@ -152,6 +153,11 @@ export function ConnectionForm({ existingIds, initial, onSaved, onCancel }: Conn
           autoComplete="off"
           spellCheck={false}
         />
+        {isGeminiCompatUrl(form.base_url) ? (
+          <p className="nd-field-warn" data-gemini-compat-note="">
+            {t("settings.form.geminiCompatNote")}
+          </p>
+        ) : null}
       </Field>
       <fieldset className="nd-fieldset" aria-describedby={protocolHintId}>
         <legend className="nd-field-label">{t("settings.form.protocol")}</legend>

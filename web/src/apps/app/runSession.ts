@@ -515,6 +515,17 @@ export function canStart(snap: RunSnapshot): boolean {
   return snap.phase.kind === "stopped" || snap.phase.kind === "exited";
 }
 
+/**
+ * Spec 131 T05: a spec não declara como executar (`runDeclared` falso no guia, ou o início recusado
+ * com `app_no_run_command`) e nada roda: as janelas App e Execução abrem no Console, com o "Como
+ * usar" e as provas, sem "Iniciar" nem o erro.
+ */
+export function consoleOnly(snap: RunSnapshot, runDeclared: boolean): boolean {
+  const refused = snap.problem?.failure?.code === "app_no_run_command";
+  if (runDeclared && !refused) return false;
+  return canStart(snap) && !snap.confirming;
+}
+
 interface RunActions {
   /** Abre a confirmação de início (o diálogo fica na Execução). */
   requestStart: () => void;

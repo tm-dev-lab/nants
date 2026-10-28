@@ -12,6 +12,8 @@
 //! - apontamento declarado `new` (ou sem estado com id desconhecido) com o mesmo local e a mesma
 //!   primeira frase de um aberto é esse aberto (ex.: o critério não atendido gerado pelo runner);
 //! - id de um resolvido volta como novo (recorrência 1), mantendo o id;
+//! - spec 131 T02: o apontamento com `continues: F-xx` (id que existe no registro, ver
+//!   [`apply_continues`]) é esse apontamento, aberto ou resolvido: o id é reaberto e a recorrência sobe;
 //! - id que colide com outro do registro ganha o próximo número livre: id novo nunca repete um antigo;
 //! - aberto que não volta nesta revisão fica `resolved`;
 //! - a decisão do Arquiteto sobre uma contestação (spec 124 T02) segue o id, inclusive quando um
@@ -62,18 +64,38 @@ pub fn same_problem(a: &Finding, b: &Finding) -> bool {
     norm(&a.location) == norm(&b.location) && first_sentence(&a.description) == first_sentence(&b.description)
 }
 
-/// Arquivo do local, sem a linha e a coluna (`src/a.rs:42:7` vira `src/a.rs`), normalizado.
-fn location_file(location: &str) -> String {
-    let flat = norm(location);
-    let mut file = flat.as_str();
-    while let Some((head, tail)) = file.rsplit_once(':') {
-        if tail.chars().all(|c| c.is_ascii_digit() || c == '-') {
-            file = head;
-        } else {
-            break;
+/// Arquivos do local, sem a linha e a coluna, normalizados (spec 131 T02). Usa a mesma separação de
+/// [`crate::agents::runner::parse_locations`], então um local com vários trechos
+/// (`a.py:46-48, a.py:150-176`) vira o conjunto `{a.py}`. Sem nenhum caminho analisável (ex.:
+/// `critérios de aceitação`), o local inteiro normalizado é o único elemento; vazio, nenhum.
+fn location_files(location: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for (path, _) in crate::agents::runner::parse_locations(location) {
+        let path = path.trim().trim_start_matches("./").trim_start_matches('/').to_lowercase();
+        if !path.is_empty() && !files.contains(&path) {
+            files.push(path);
         }
     }
-    file.trim().to_string()
+    if files.is_empty() {
+        let flat = norm(location);
+        if !flat.is_empty() {
+            files.push(flat);
+        }
+    }
+    files
+}
+
+/// Mesmo caminho, com tolerância a prefixo de pasta (`src/a.rs` e `a.rs` não; `x/src/a.rs` e `src/a.rs` sim).
+fn same_path(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// Mesmo conjunto de arquivos: cada arquivo de um lado está no outro (spec 131 T02).
+fn same_files(a: &[String], b: &[String]) -> bool {
+    !a.is_empty()
+        && !b.is_empty()
+        && a.iter().all(|x| b.iter().any(|y| same_path(x, y)))
+        && b.iter().all(|y| a.iter().any(|x| same_path(x, y)))
 }
 
 /// Palavras de 3 letras ou mais do título curto (sem pontuação), em minúsculas.
@@ -86,15 +108,16 @@ fn title_words(description: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Spec 124 T03: o mesmo problema com outro texto. Mesmo arquivo do local (linha ignorada) e títulos
-/// com ao menos metade das palavras em comum, ou o mesmo problema de [`same_problem`]. Pega o
-/// resolvido que volta como `new` com id novo, que a recorrência pelo id não vê.
+/// Spec 124 T03: o mesmo problema com outro texto. Mesmos arquivos do local (linhas ignoradas;
+/// spec 131 T02: o conjunto dos arquivos, com vários trechos no mesmo local) e títulos com ao menos
+/// metade das palavras em comum, ou o mesmo problema de [`same_problem`]. Pega o resolvido que volta
+/// como `new` com id novo, que a recorrência pelo id não vê. Não há ligação pelo critério: a
+/// continuação com outro assunto vem declarada pelo Revisor ([`apply_continues`]).
 pub fn similar(a: &Finding, b: &Finding) -> bool {
     if same_problem(a, b) {
         return true;
     }
-    let file = location_file(&a.location);
-    if file.is_empty() || file != location_file(&b.location) {
+    if !same_files(&location_files(&a.location), &location_files(&b.location)) {
         return false;
     }
     let (wa, wb) = (title_words(&a.description), title_words(&b.description));
@@ -181,11 +204,42 @@ pub fn next_review(registry: &[Finding]) -> u32 {
 /// resolvido). Não é novo: o id de um apontamento do registro reutilizado sem `"status": "new"`, ou um
 /// apontamento parecido com um do registro ([`similar`]: mesmo arquivo, linha ignorada, e títulos
 /// próximos), inclusive o resolvido que volta com id novo e outra redação. Na dúvida, não é novo.
+/// Spec 131 T02: a continuação declarada (`continues` com um id do registro) também não é nova.
 pub fn is_new(registry: &[Finding], f: &Finding) -> bool {
     let id = f.id.trim();
-    !registry
-        .iter()
-        .any(|e| (f.state != Some(FindingState::New) && !id.is_empty() && e.id == id) || similar(e, f))
+    let continues = f.continues.trim();
+    !registry.iter().any(|e| {
+        (f.state != Some(FindingState::New) && !id.is_empty() && e.id == id)
+            || (!continues.is_empty() && e.id == continues)
+            || similar(e, f)
+    })
+}
+
+/// Spec 131 T02: aplica o `continues` que o Revisor declarou. Só é aceito quando o id existe no
+/// registro (aberto ou resolvido, sem dispensa do Arquiteto) e ainda não foi tomado por outro apontamento desta revisão: o
+/// apontamento passa a ter esse id e o estado `open`, e o [`track`] o reabre contando a
+/// recorrência. Id desconhecido, fora do formato ou repetido é ignorado (o campo fica vazio e vale
+/// o resto do que o Revisor declarou). A ligação é só a declarada: nada é ligado pelo critério.
+pub fn apply_continues(registry: &[Finding], findings: Vec<Finding>) -> Vec<Finding> {
+    let mut taken: HashSet<String> = HashSet::new();
+    findings
+        .into_iter()
+        .map(|mut f| {
+            let target = f.continues.trim().to_string();
+            // Spec 131 T02 (F-02 da revisão): o id dispensado pelo Arquiteto não é alvo, senão o
+            // defeito novo herdaria a dispensa e viraria observação.
+            let waived = |e: &Finding| e.arbitration.as_ref().is_some_and(|a| a.decision.waives());
+            let known = id_number(&target).is_some() && registry.iter().any(|e| e.id.trim() == target && !waived(e));
+            if known && taken.insert(target.clone()) {
+                f.id = target.clone();
+                f.state = Some(FindingState::Open);
+                f.continues = target;
+            } else {
+                f.continues.clear();
+            }
+            f
+        })
+        .collect()
 }
 
 /// Aplica a revisão (`current`, os bloqueantes depois da convergência) ao registro. `attempt` é a
@@ -229,7 +283,10 @@ pub fn track_with_observations(
         let is_open = |e: &Finding| e.state.is_some_and(FindingState::is_pending);
         let by_id = reg.iter().position(|e| e.id == f.id).filter(|_| !claimed.contains(&f.id));
         let reuses_id = declared != Some(FindingState::New) && by_id.is_some_and(|i| is_open(&reg[i]));
-        let target = if reuses_id {
+        // Spec 131 T02: a continuação declarada ([`apply_continues`]) segue o id, aberto ou resolvido.
+        let continued = !f.continues.is_empty() && by_id.is_some_and(|i| reg[i].id == f.continues);
+        f.continues.clear();
+        let target = if reuses_id || continued {
             by_id
         } else {
             reg.iter()
@@ -237,7 +294,8 @@ pub fn track_with_observations(
                 .or_else(|| by_id.filter(|&i| declared != Some(FindingState::New) && !is_open(&reg[i])))
         };
         match target {
-            Some(i) if is_open(&reg[i]) => {
+            Some(i) if is_open(&reg[i]) || continued => {
+                // Spec 131 T02: o resolvido que o Revisor declara continuado é reaberto e conta a recorrência.
                 let prior = &reg[i];
                 f.id = prior.id.clone();
                 f.state = Some(FindingState::Open);
@@ -382,6 +440,64 @@ mod tests {
         assert!(!is_new(&r2.registry, &back));
         // No mesmo arquivo, mas outro assunto: é novo.
         assert!(is_new(&r2.registry, &with_state(f("F-08", "tests/api/plays.test.ts:200", "Ordem do histórico sem desempate"), FindingState::New)));
+    }
+
+    const T9_F02: (&str, &str) = (
+        "tests/test_reporting.py:20-89",
+        "The tests do not prove CSV and Markdown agree on ranked transaction IDs or uncategorized IDs. They also do not check the expected category values.",
+    );
+    const T9_F03_LOCATION: &str = "tests/test_reporting.py:46-48, tests/test_reporting.py:150-176";
+    const T9_F03: &str = "The renderer test inserts a description that is already normalized, so it does not verify behavior for descriptions requiring whitespace normalization. The IDs are compared to each other only.";
+
+    /// Spec 131 T02 (Test 9, T05): o local com vários trechos vira o conjunto dos arquivos, igual ao
+    /// do F-02. Antes, `location_file` devolvia "tests/test_reporting.py:46-48, tests/test_reporting.py".
+    #[test]
+    fn several_locations_become_the_set_of_files() {
+        assert_eq!(location_files(T9_F03_LOCATION), vec!["tests/test_reporting.py".to_string()]);
+        assert!(same_files(&location_files(T9_F03_LOCATION), &location_files(T9_F02.0)));
+        assert_eq!(location_files("`src/a.rs:5:3`, web/b.tsx"), vec!["src/a.rs".to_string(), "web/b.tsx".to_string()]);
+        assert_eq!(location_files("Critérios de aceitação"), vec!["critérios de aceitação".to_string()]);
+        assert!(!same_files(&location_files("src/a.rs:1, src/b.rs:2"), &location_files("src/a.rs:9")));
+        // O F-02 reescrito nos trechos do F-03 casa com o F-02 (com o local antigo, não casava).
+        let f02 = with_state(f("F-02", T9_F02.0, T9_F02.1), FindingState::Resolved);
+        let rewritten = with_state(f("F-03", T9_F03_LOCATION, "The tests do not prove CSV and Markdown agree on ranked IDs"), FindingState::New);
+        assert!(similar(&rewritten, &f02));
+        assert!(!is_new(&[f02.clone()], &rewritten));
+        // O F-03 real fala de outro assunto: sem ligação automática (nem pelo critério); só o `continues`.
+        let real = with_state(f("F-03", T9_F03_LOCATION, T9_F03), FindingState::New);
+        assert!(!similar(&real, &f02));
+        assert!(is_new(&[f02.clone()], &real));
+        let declared = Finding { continues: "F-02".into(), ..real };
+        assert!(!is_new(&[f02], &declared));
+    }
+
+    /// Spec 131 T02: `continues` aceito só com um id do registro; reabre o resolvido contando a
+    /// recorrência e segue o aberto como o mesmo apontamento.
+    #[test]
+    fn continues_reopens_the_declared_id_with_recurrence() {
+        let r1 = track(&[], &[], vec![f("F-01", "tests/test_reporting.py:49-89", "Tie order"), f("F-02", T9_F02.0, T9_F02.1)], 1);
+        // Revisão 2 da T05: o F-03 continua o F-02, ainda aberto.
+        let f03 = Finding { continues: "F-02".into(), ..with_state(f("F-03", T9_F03_LOCATION, T9_F03), FindingState::New) };
+        let current = apply_continues(&r1.registry, vec![f03]);
+        assert_eq!((current[0].id.as_str(), current[0].state), ("F-02", Some(FindingState::Open)));
+        let r2 = track(&r1.registry, &r1.open, current, 2);
+        assert_eq!(ids(&r2.open), vec!["F-02"]);
+        assert_eq!((r2.open[0].recurrence, r2.open[0].first_review, r2.open[0].description.as_str()), (2, 1, T9_F03));
+        assert_eq!(ids(&r2.resolved), vec!["F-01"]);
+        assert!(r2.registry.iter().all(|e| e.continues.is_empty()), "o registro não grava o campo");
+        // Resolvido continuado: reabre com o mesmo id e a recorrência conta.
+        let r3 = track(&r2.registry, &pending(&r2.registry), vec![], 3);
+        let back = Finding { continues: "F-02".into(), ..with_state(f("F-09", "tests/x.py:1", "Outro texto"), FindingState::New) };
+        let r4 = track(&r3.registry, &[], apply_continues(&r3.registry, vec![back]), 4);
+        assert_eq!((r4.open[0].id.as_str(), r4.open[0].state, r4.open[0].recurrence), ("F-02", Some(FindingState::Open), 3));
+        assert_eq!(r4.open[0].first_review, 1);
+        // Id fora do registro, fora do formato ou repetido na mesma revisão: ignorado.
+        let unknown = Finding { continues: "F-77".into(), ..with_state(f("F-09", "src/z.rs:1", "Novo"), FindingState::New) };
+        let bad = Finding { continues: "F02".into(), ..with_state(f("F-10", "src/y.rs:1", "Outro"), FindingState::New) };
+        let twice = Finding { continues: "F-01".into(), ..with_state(f("F-11", "src/w.rs:1", "Terceiro"), FindingState::New) };
+        let first = Finding { continues: "F-01".into(), ..with_state(f("F-12", "src/v.rs:1", "Quarto"), FindingState::New) };
+        let out = apply_continues(&r4.registry, vec![unknown, bad, first, twice]);
+        assert_eq!(out.iter().map(|x| (x.id.as_str(), x.continues.as_str())).collect::<Vec<_>>(), vec![("F-09", ""), ("F-10", ""), ("F-01", "F-01"), ("F-11", "")]);
     }
 
     #[test]

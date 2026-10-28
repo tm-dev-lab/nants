@@ -164,10 +164,10 @@ describe("Configurações em en", () => {
     });
     // Spec 116: o primeiro passo pergunta como conectar.
     expect(within(win()).getByText("How to connect")).toBeTruthy();
-    expect(within(win()).getByText("Use the plan on your ChatGPT account, no key needed.")).toBeTruthy();
+    expect(within(win()).getByText("Use the Plus or Pro plan on your ChatGPT account, no key needed.")).toBeTruthy();
     expect(within(win()).getByRole("button", { name: "Continue with ChatGPT" })).toBeTruthy();
     expectNoPortuguese();
-    fireEvent.click(within(win()).getByRole("button", { name: /^API key/ }));
+    fireEvent.click(within(win()).getByRole("button", { name: /^OpenAI or compatible/ }));
     const form = within(win()).getByRole("region", { name: "New connection" });
     for (const label of ["Identifier", "Name", "Base URL", "API key"]) expect(within(form).getByLabelText(label)).toBeTruthy();
     expect(within(form).getByText("Protocol")).toBeTruthy();

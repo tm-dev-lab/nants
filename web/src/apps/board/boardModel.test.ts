@@ -168,6 +168,13 @@ describe("tarefa pausada (spec 114 T04)", () => {
     expect(translate("en", "board.pause.planLimit")).toBe("plan usage limit reached");
     expect(translate("en", "board.pause.planNotEligible")).toBe("account not eligible for the plan");
     expect(translate("en", "board.pause.planNeedsLogin")).toBe("needs you to sign in to ChatGPT again");
+    // Spec 132 T09: o teto de gasto e a cota diária pausam com o motivo próprio.
+    expect(runStopReason([sys(1, "run.spend_limit")], "s1")).toBe("spend_limit");
+    expect(runStopReason([sys(1, "run.daily_quota")], "s1")).toBe("daily_quota");
+    expect(pauseReasonText("spend_limit")).toBe("teto de gasto atingido");
+    expect(pauseReasonText("daily_quota")).toBe("cota diária esgotada");
+    expect(translate("en", "board.pause.spendLimit")).toBe("spend limit reached");
+    expect(translate("en", "board.pause.dailyQuota")).toBe("daily quota used up");
     // Outras mensagens do sistema e a conversa com o Arquiteto não contam como retomada.
     const chat = { id: 3, role: "architect", text: "ok", at: 3 } as ChatMessage;
     expect(runStopReason([sys(1, "run.stopped"), chat], "s1")).toBe("stopped");

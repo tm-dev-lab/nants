@@ -269,8 +269,8 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.install.skipped", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde {since} ({locks})."),
     ("runner.install.skipped_no_date", "Instalação pulada: `{command}` não rodou de novo, trava sem mudança desde a última instalação nesta pasta ({locks})."),
     // Spec 129 T02: conferência da persistência da instalação, na seção do Arquiteto do spec.md.
-    ("runner.install_footprint.record.one", "Conferência da instalação na base (`{command}`, código {code}): {count} entrada gravada fora de /work, em {secs} s (limite do aviso: {limit})."),
-    ("runner.install_footprint.record.other", "Conferência da instalação na base (`{command}`, código {code}): {count} entradas gravadas fora de /work, em {secs} s (limite do aviso: {limit})."),
+    ("runner.install_footprint.record.one", "Conferência da instalação (`{command}`, código {code}): {count} entrada gravada fora de /work, em {secs} s (aviso acima de {limit} entradas)."),
+    ("runner.install_footprint.record.other", "Conferência da instalação (`{command}`, código {code}): {count} entradas gravadas fora de /work, em {secs} s (aviso acima de {limit} entradas)."),
     ("runner.install_footprint.warning", "A instalação gravou fora da pasta do projeto; isso se perde entre comandos. Caminhos principais: {paths}."),
     ("runner.install_footprint.cleanup_failed", "O container da conferência ({name}) não foi removido: {error}"),
     ("runner.install.repeated", "Aviso: o {field} (`{command}`) começa com o install_command (`{install}`), que o Nants já roda antes dos testes, então a instalação se repete a cada rodada. O comando não foi alterado; tire a instalação do {field} em .sdd/settings.yaml."),
@@ -300,6 +300,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("survey.failed", "Não consegui concluir o levantamento da arquitetura ({code}). O projeto segue normalmente: ao planejar a primeira especificação com o Arquiteto na conversa, ele lê o código e cria o ARCHITECTURE.md junto com o plano."),
     // Rótulos da interface citados ao modelo (o mesmo texto do botão na interface).
     ("ui.app_start", "Iniciar o app"),
+    ("ui.app_open_console", "Abrir o Console"),
     // Runner: formatação automática (spec 078) na conversa, agente `tests`.
     ("runner.format.failed", "formatação automática falhou (não bloqueia): {why}"),
     ("runner.format.tool_failed", "formatação automática ({name}) falhou (não bloqueia): {why}"),
@@ -396,6 +397,12 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "system.plan.consensus_round_open",
         "Revisão do plano, rodada {round}: o Revisor apontou {issues}; o Arquiteto ajustou {accepted}, manteve {kept} e deixou {open} sem resposta.",
     ),
+    // Spec 131 T03: o ajuste deduzido da mudança da tarefa e a lista final do plano.
+    (
+        "system.plan.consensus_round_inferred",
+        "Revisão do plano, rodada {round}: o Revisor apontou {issues}; o Arquiteto ajustou {accepted} ({inferred} pela mudança na tarefa, sem resposta escrita) e manteve {kept}.",
+    ),
+    ("system.plan.final_plan", "Plano final da spec {spec}, depois da revisão:"),
     ("system.plan.renumbered", "Tarefas renumeradas na ordem de execução: {map}."),
     (
         "system.final.still_unmet",
@@ -408,6 +415,8 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
         "system.run.yolo_ignored",
         "Aprovação automática ignorada: .sdd/settings.yaml está inválido e não pôde ser lido; os pedidos de permissão vão para você até corrigir o arquivo.",
     ),
+    // Spec 131 T06: a linha do pedido liberado pela aprovação automática (o detalhe é o pedido).
+    ("system.run.auto_approved", "aprovada automaticamente: {detail}"),
     // Runner: findings gerados e notas da convergência na mensagem do Revisor (spec 115 T03), no
     // idioma do projeto (o Desenvolvedor também lê, no corpo da tarefa).
     // Spec 129 T04: marcadores estruturais das mensagens do Desenvolvedor e do Revisor, escritos no
@@ -460,6 +469,23 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("plan_review.too_large_dense.one", "{count} critério de aceitação, que vale por {weight} pelo tamanho do texto (critério com mais de {words} palavras conta como mais de um): grande demais para uma revisão. Escreva um critério por comportamento observável, numa frase curta, e divida a tarefa se ela continuar grande."),
     ("plan_review.too_large_dense.other", "{count} critérios de aceitação, que valem por {weight} pelo tamanho do texto (critério com mais de {words} palavras conta como mais de um): grande demais para uma revisão. Escreva um critério por comportamento observável, numa frase curta, e divida a tarefa se ela continuar grande."),
     // Spec 128 T04: ciclo de dependências e renumeração das tarefas na aprovação.
+    // Spec 131 T06: linhas do "o que mudou no plano" (`plan-changes.json`), pelo código da linha.
+    ("plan_review.change.spec_title", "Título da spec alterado"),
+    ("plan_review.change.test_command", "test_command alterado"),
+    ("plan_review.change.global_criteria", "Critérios globais: {delta}"),
+    ("plan_review.change.task_removed", "{id} removida"),
+    ("plan_review.change.task_new", "{id} nova: {title}"),
+    ("plan_review.change.task_title", "{id}: título alterado"),
+    ("plan_review.change.task_depends", "{id}: dependências alteradas"),
+    ("plan_review.change.task_scope", "{id}: escopo alterado"),
+    ("plan_review.change.task_criteria", "{id}: critérios alterados ({delta})"),
+    ("plan_review.change.task_covers", "{id}: cobertura alterada"),
+    ("plan_review.change.more", "e mais mudanças além destas"),
+    ("plan_review.change.added.one", "{count} novo"),
+    ("plan_review.change.added.other", "{count} novos"),
+    ("plan_review.change.removed.one", "{count} removido"),
+    ("plan_review.change.removed.other", "{count} removidos"),
+    ("plan_review.change.reordered", "reordenados"),
     ("plan_review.dependency_cycle", "As tarefas {tasks} dependem umas das outras em ciclo pelo depends_on, e assim não há ordem de execução. Desfaça o ciclo."),
     ("runs.renumber.heading", "Renumeração"),
     ("runs.renumber.body", "Na aprovação, as tarefas foram renumeradas na ordem de execução: {map}. Os registros do planejamento (usage.jsonl, tools.jsonl, .context.jsonl e .chat.jsonl) mantêm os ids antigos, e este mapa explica a correspondência."),
@@ -473,6 +499,28 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     (
         "runner.review.late_new_demoted",
         "{summary} (apontamentos MEDIUM ou LOW novos a partir da revisão {review} viraram observações e seguem para a verificação final.)",
+    ),
+    (
+        "runner.review.untouched_gap_demoted",
+        "{summary} (a partir da revisão {review}, lacunas MEDIUM ou LOW novas em linhas que não mudaram desde a reprovação anterior, sem cenário de falha concreto, viraram observações e seguem para a verificação final.)",
+    ),
+    ("runner.review.gap_criterion_note", "lacuna em código que não mudou, segue como observação para a verificação final: {ids}"),
+    (
+        "runner.review.missing_field_demoted",
+        "{summary} (o que cita um campo que a spec não declara não volta ao Desenvolvedor: virou observação para a verificação final.)",
+    ),
+    ("runner.review.missing_field_location", "critérios de aceitação"),
+    (
+        "runner.review.missing_field_criterion",
+        "O critério \"{criterion}\" cita {fields}, que a spec não declara; não foi julgado nesta revisão.",
+    ),
+    (
+        "runner.review.missing_field_finding",
+        "O apontamento cita {fields}, que a spec não declara: {description}",
+    ),
+    (
+        "runner.review.missing_field_recommendation",
+        "A verificação final confere o comportamento pelo que a spec declara, sem o campo ausente.",
     ),
     (
         "runner.review.untouched_code_demoted",
@@ -644,6 +692,9 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("serverError.connection_missing", "{role}: connection_id não existe"),
     ("serverError.connection_not_found", "conexão não encontrada"),
     ("serverError.connection_kind_fixed", "o tipo da conexão não pode ser trocado"),
+    ("serverError.connection_kind_invalid", "tipo de conexão desconhecido"),
+    ("serverError.base_url_override_invalid", "endereço avançado inválido: use http ou https, com host, sem usuário, senha, consulta nem fragmento"),
+    ("serverError.base_url_override_not_allowed", "o endereço avançado só vale nas conexões com a Anthropic e o Google Gemini"),
     ("serverError.content_type_json", "Content-Type deve ser application/json"),
     ("serverError.data_dir_unavailable", "diretório de dados do Nants indisponível"),
     ("serverError.decision_invalid", "decision deve ser \"once\", \"run\", \"always\" ou \"deny\""),

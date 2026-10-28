@@ -146,12 +146,12 @@ describe("Primeiros passos em en", () => {
     await open("en");
     await goTo(/^Connection/);
     expect(within(win()).getByRole("heading", { name: "2. Connection" })).toBeTruthy();
-    expect(win().textContent).toContain("A connection, by API key or through your ChatGPT plan, is what lets you talk to the Architect.");
+    expect(win().textContent).toContain("A connection, by API key (OpenAI or compatible, Anthropic or Google Gemini) or through your ChatGPT plan, is what lets you talk to the Architect.");
     // Spec 116: o primeiro passo pergunta como conectar (chave de API ou plano ChatGPT).
     expect(win().textContent).toContain("How to connect");
     expect(within(win()).getByRole("button", { name: "Continue with ChatGPT" })).toBeTruthy();
     expectNoPortuguese();
-    fireEvent.click(within(win()).getByRole("button", { name: /^API key/ }));
+    fireEvent.click(within(win()).getByRole("button", { name: /^OpenAI or compatible/ }));
     expect(within(win()).getByLabelText("Identifier")).toBeTruthy();
     expectNoPortuguese();
 

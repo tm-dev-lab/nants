@@ -221,8 +221,9 @@ pub struct AgentSetup {
     pub effort: Effort,
     /// Teto de passos configurado (spec 081 T01), já ajustado à faixa; `None` = padrão do papel.
     pub max_steps: Option<usize>,
-    /// Janela de entrada do modelo pelo catálogo de preços em cache (spec 122 T04), base do limiar
-    /// do resumo do histórico; `None` = o padrão declarado.
+    /// Janela de entrada do modelo, base do limiar do resumo do histórico: a da lista de modelos do
+    /// provedor nativo (spec 132 T08), senão a do catálogo de preços em cache (spec 122 T04);
+    /// `None` = o padrão declarado.
     pub context_window: Option<usize>,
 }
 
@@ -1096,8 +1097,9 @@ async fn launch(
     .await
     .unwrap_or_default();
     let window = |i: usize| windows.get(i).copied().flatten().and_then(|w| usize::try_from(w).ok());
-    developer.context_window = window(0);
-    reviewer.context_window = window(1);
+    // Spec 132 T08: a janela informada pela lista de modelos do provedor nativo vem antes.
+    developer.context_window = developer.context_window.or(window(0));
+    reviewer.context_window = reviewer.context_window.or(window(1));
     // Spec 090 T02: com backend substituto (testes), nenhum gerador real chega à rede.
     let images = match state.llm_backend() {
         Some(_) => None,
@@ -2164,6 +2166,12 @@ fn terminal_events(
             system_message_coded(project_id, &ProviderFailure::Plan(plan).describe(), plan_pause_code(plan), Map::new()),
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
+        // Spec 132 T09: o teto de gasto da Anthropic e a cota diária do Gemini pausam do mesmo
+        // jeito, com o código próprio: esperar alguns segundos não resolve.
+        RunEnd::Provider(ProviderFailure::Limit(limit)) => vec![
+            system_message_coded(project_id, &ProviderFailure::Limit(limit).describe(), limit_pause_code(limit), Map::new()),
+            status_event(project_id, json!({"status": "idle", "reason": "error"})),
+        ],
         RunEnd::Provider(failure) => vec![
             {
                 // Params neutros de idioma (spec 102): a interface monta o motivo pelo dicionário.
@@ -2219,6 +2227,19 @@ fn plan_pause_code(plan: crate::agents::llm_client::PlanError) -> &'static str {
         PlanError::UsageLimit => CODE_PLAN_LIMIT,
         PlanError::NotEligible => CODE_PLAN_NOT_ELIGIBLE,
         PlanError::NeedsLogin => CODE_PLAN_NEEDS_LOGIN,
+    }
+}
+/// Execução pausada pelo teto de gasto da conta na Anthropic (spec 132 T09).
+pub const CODE_SPEND_LIMIT: &str = "run.spend_limit";
+/// Execução pausada pela cota diária do Gemini esgotada (spec 132 T09).
+pub const CODE_DAILY_QUOTA: &str = "run.daily_quota";
+
+/// Código da pausa por um limite do provedor.
+fn limit_pause_code(limit: crate::agents::llm_client::ProviderLimit) -> &'static str {
+    use crate::agents::llm_client::ProviderLimit;
+    match limit {
+        ProviderLimit::SpendLimit => CODE_SPEND_LIMIT,
+        ProviderLimit::DailyQuota => CODE_DAILY_QUOTA,
     }
 }
 /// Relançamento em modo docker recusado (`params.message`).
@@ -2738,7 +2759,7 @@ fn commit_environment(root: &Path, paths: &[String], spec_id: &str, lang: crate:
     Git::new(root.to_path_buf())
         .commit_paths(paths, &msg)
         .map(|_| ())
-        .map_err(|_| conflict_reason(ENV_COMMIT_MSG, REASON_ENV_INVALID))
+        .map_err(|_| conflict(ENV_COMMIT_MSG))
 }
 
 /// Marca `environment: docker` e o hash aprovado no settings (escrita atômica). Exige o `PERSIST_LOCK`.
@@ -2845,13 +2866,13 @@ fn adopt_architecture(root: &Path, spec_id: &str, secrets: &super::events::Secre
         let clean = super::projects::scrub_text(secrets, &raw);
         if clean != raw {
             super::architecture::write_atomic(root, &clean)
-                .ok_or_else(|| conflict_reason(ARCH_COMMIT_MSG, REASON_ENV_INVALID))?;
+                .ok_or_else(|| conflict(ARCH_COMMIT_MSG))?;
         }
     }
     let key = if git.is_tracked(ARCH_FILE) { "commit.architecture_update" } else { "commit.architecture_initial" };
     let msg = crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), key);
     git.commit_paths(&[ARCH_FILE.to_string()], &msg)
-        .map_err(|_| conflict_reason(ARCH_COMMIT_MSG, REASON_ENV_INVALID))?;
+        .map_err(|_| conflict(ARCH_COMMIT_MSG))?;
     Ok(())
 }
 
@@ -2877,7 +2898,7 @@ fn adopt_skills(root: &Path, spec_id: &str, secrets: &super::events::SecretSet, 
         let clean = super::projects::scrub_text(secrets, &raw);
         if clean != raw {
             replace_atomic(root, &rel, clean.as_bytes())
-                .map_err(|_| conflict_reason(SKILLS_COMMIT_MSG, REASON_ENV_INVALID))?;
+                .map_err(|_| conflict(SKILLS_COMMIT_MSG))?;
         }
         crate::sdd::skills::validate(role, &clean, None)
             .map_err(|_| conflict_reason(SKILLS_INVALID_MSG, REASON_ENV_INVALID))?;
@@ -2887,7 +2908,7 @@ fn adopt_skills(root: &Path, spec_id: &str, secrets: &super::events::SecretSet, 
         return Ok(());
     }
     git.commit_paths(&paths, &crate::i18n::commit_subject(lang, &format!("docs({spec_id}): "), "commit.skills"))
-        .map_err(|_| conflict_reason(SKILLS_COMMIT_MSG, REASON_ENV_INVALID))?;
+        .map_err(|_| conflict(SKILLS_COMMIT_MSG))?;
     Ok(())
 }
 
@@ -3055,16 +3076,8 @@ fn initial_commit(git: &Git, lang: crate::i18n::Lang) -> Result<(), Rejection> {
     {
         return Err(internal(INITIAL_COMMIT_ERROR));
     }
-    // Identidade de fallback por chave e só nesta invocação: nunca altera a config do usuário.
-    let fallback: Vec<(&str, &str)> = git
-        .missing_identity()
-        .into_iter()
-        .map(|key| {
-            let value = if key == "user.name" { "Nants" } else { "nants@localhost" };
-            (key, value)
-        })
-        .collect();
-    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.initial"), &fallback)
+    // Identidade de reserva por chave e só nesta invocação (`commit_empty`): nunca altera a config.
+    git.commit_empty(&crate::i18n::commit_subject(lang, INITIAL_COMMIT_PREFIX, "commit.initial"))
         .map_err(|_| internal(INITIAL_COMMIT_ERROR))
 }
 
@@ -3211,7 +3224,13 @@ fn agent_setup(
         model: agent.model.clone(),
         effort: agent.effort,
         max_steps: agent.max_steps_clamped(),
-        context_window: None,
+        // Spec 132 T08: a janela da última lista de modelos da conexão nativa, quando houver.
+        context_window: connection
+            .kind
+            .is_native()
+            .then(|| super::models_native::known_input_window(connection.endpoint(), &agent.model))
+            .flatten()
+            .and_then(|w| usize::try_from(w).ok()),
     })
 }
 
@@ -3511,6 +3530,7 @@ mod tests {
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }
     }
 
@@ -3536,6 +3556,26 @@ mod tests {
             created_at: "2026-10-13T00:00:00Z".into(),
         });
         cfg
+    }
+
+    /// Spec 132 T08: na conexão nativa, a janela vem da última lista de modelos do provedor (por
+    /// endereço e modelo); na conexão por chave, fica para o catálogo.
+    #[test]
+    fn agent_setup_takes_the_native_input_window_from_the_models_list() {
+        let mut cfg = config_for(Path::new("/tmp/x"));
+        let mut native = crate::config::Connection::native("nat", "Nativa", crate::config::ConnectionKind::Anthropic, "chave-literal");
+        native.base_url_override = Some("https://janela-t08.example.com".into());
+        native.normalize();
+        cfg.connections.push(native);
+        cfg.agents.developer.connection_id = "nat".into();
+        super::super::models_native::remember_input_window("https://janela-t08.example.com", "modelo-dev", 400_000);
+        super::super::models_native::remember_input_window(&cfg.connections[0].base_url, "modelo-rev", 123_456);
+        let dev = agent_setup(&cfg, &cfg.agents.developer, "developer", None, None).expect("dev");
+        assert_eq!(dev.context_window, Some(400_000));
+        let rev = agent_setup(&cfg, &cfg.agents.reviewer, "reviewer", None, None).expect("rev");
+        assert_eq!(rev.context_window, None, "por chave: o catálogo decide");
+        cfg.agents.developer.model = "outro".into();
+        assert_eq!(agent_setup(&cfg, &cfg.agents.developer, "developer", None, None).expect("dev").context_window, None);
     }
 
     #[test]
@@ -5404,6 +5444,60 @@ mod tests {
         );
     }
 
+    /// Spec 132 T12 (A1): instalação nova, sem identidade Git no repositório nem no HOME (isolado).
+    /// O cadastro, o commit inicial, o do ambiente, o do `ARCHITECTURE.md` e o dos perfis usam a
+    /// identidade de reserva, e o plano é aprovado (antes: 409 `architecture_commit_failed`).
+    #[tokio::test]
+    async fn e2e_approval_without_git_identity_commits_with_the_fallback() {
+        let root = real_repo("e2e-sem-identidade", false);
+        let home = root.parent().expect("base").join("home");
+        fs::create_dir_all(&home).expect("home");
+        let home_text = home.to_str().expect("utf8").to_string();
+        crate::harness::git::isolate_env_for_tests(
+            &root,
+            &[("HOME", &home_text), ("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")],
+        );
+        assert_eq!(Git::new(&root).missing_identity(), vec!["user.name", "user.email"]);
+        let (state, id) = created_project(&root).await;
+        make_unborn(&root);
+        architect_writes_plan(&root, "node --test").await;
+        fs::write(root.join("ARCHITECTURE.md"), ARCH_OK).expect("arquitetura");
+        fs::create_dir_all(root.join(".sdd/skills")).expect("skills");
+        fs::write(root.join(".sdd/skills/developer.md"), SKILL_OK).expect("perfil");
+        let (status, body) = call(&state, approve_req(&id, SPEC, "")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let authors = git_out(&root, &["log", "--format=%s|%an <%ae>"]);
+        let lines: Vec<&str> = authors.lines().collect();
+        assert_eq!(lines.len(), 4, "{authors}");
+        for prefix in ["chore: commit inicial", &format!("chore({SPEC}): "), &format!("docs({SPEC}): ")] {
+            assert!(lines.iter().any(|l| l.starts_with(prefix)), "{prefix}: {authors}");
+        }
+        assert!(lines.iter().all(|l| l.ends_with("|Nants <nants@localhost>")), "{authors}");
+        let local = git_out(&root, &["config", "--local", "--list"]);
+        assert!(!local.contains("user."), "{local}");
+        wait_project_idle(&state, &id).await;
+    }
+
+    /// Falha no commit do `ARCHITECTURE.md` (aqui, um hook `pre-commit` que recusa) tem o código
+    /// próprio, sem o `reason` `environment_invalid` do ambiente docker.
+    #[test]
+    fn architecture_commit_failure_has_its_own_code_without_the_environment_reason() {
+        let root = setup("arch-commit-falha", true);
+        fs::write(root.join("ARCHITECTURE.md"), ARCH_OK).expect("w");
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("hooks");
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("hook");
+        let mut perms = fs::metadata(&hook).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&hook, perms).expect("chmod");
+        let err = adopt_architecture(&root, "s1", &SecretSet::new(Vec::new()), Lang::PtBr).expect_err("hook recusa");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(err.code(), Some(ARCH_COMMIT_MSG));
+        assert_eq!(err.reason(), None, "{}", err.body());
+        assert!(err.body().get("reason").is_none(), "{}", err.body());
+    }
+
     #[tokio::test]
     async fn e2e_plain_directory_is_not_git() {
         let root = temp_dir("e2e-nogit").join("dir");
@@ -6594,6 +6688,27 @@ mod tests {
         }
         let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Plan(PlanError::UsageLimit) };
         assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit))));
+    }
+
+    /// Spec 132 T09: o teto de gasto da Anthropic e a cota diária do Gemini pausam a execução com o
+    /// código próprio, como o limite do plano.
+    #[test]
+    fn provider_limits_pause_with_their_own_code() {
+        use crate::agents::llm_client::ProviderLimit;
+        let secrets = SecretSet::new(vec![SECRET.to_string()]);
+        for (limit, code, text) in [
+            (ProviderLimit::SpendLimit, CODE_SPEND_LIMIT, "provider_spend_limit"),
+            (ProviderLimit::DailyQuota, CODE_DAILY_QUOTA, "provider_daily_quota"),
+        ] {
+            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Limit(limit)));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].payload["code"], json!(code));
+            assert_eq!(events[0].payload["params"], json!({}));
+            assert_eq!(events[0].payload["text"], json!(text));
+            assert_eq!(events[1].payload["status"], "idle");
+        }
+        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Limit(ProviderLimit::SpendLimit) };
+        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit))));
     }
 
     #[test]

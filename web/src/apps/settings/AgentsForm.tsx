@@ -4,6 +4,8 @@
  * Desenvolvedor e Revisor seguem a conexão e o modelo do Arquiteto (o esforço continua por papel).
  * Usado pelos Primeiros passos (T05) e pela janela Configurações (T08).
  *
+ * O esforço tem três níveis e, abaixo, uma dica curta pelo provedor da conexão do papel (spec 132).
+ *
  * O campo Modelo é um combobox: a lista vem de `GET .../models` da conexão salva (uma carga por
  * endpoint, compartilhada entre papéis); a entrada manual é sempre permitida.
  */
@@ -13,9 +15,11 @@ import type { AgentConfig, Agents, ConnectionView, Effort, ModelsResult } from "
 import { Icon } from "../../desktop/Icon";
 import type { Tone } from "../../desktop/theme/tokens";
 import {
+  connectionKindOf,
   DEFAULT_MAX_STEPS,
   describeModelsError,
   EFFORT_OPTIONS,
+  effortHint,
   hasStepsLimit,
   MAX_STEPS_MAX,
   MAX_STEPS_MIN,
@@ -354,7 +358,8 @@ function RoleCard({
   const stepsHelpId = useId();
   const modelId = useId();
   const effortName = useId();
-  const missing = agent.connection_id !== "" && !connections.some((c) => c.id === agent.connection_id);
+  const conn = connections.find((c) => c.id === agent.connection_id);
+  const missing = agent.connection_id !== "" && conn === undefined;
   const [switched, setSwitched] = useState(false);
   const loading = modelsEntry?.status === "loading";
   const ready = modelsEntry?.status === "ready" ? modelsEntry : null;
@@ -453,6 +458,11 @@ function RoleCard({
             </label>
           ))}
         </div>
+        {conn !== undefined ? (
+          <p className="nd-field-hint" data-effort-hint={connectionKindOf(conn)}>
+            {effortHint(connectionKindOf(conn))}
+          </p>
+        ) : null}
       </div>
       {hasStepsLimit(role) && steps !== undefined && onStepsChange !== undefined ? (
         <div className="nd-field">

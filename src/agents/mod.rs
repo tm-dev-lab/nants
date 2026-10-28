@@ -39,4 +39,12 @@ pub enum LlmError {
     /// conta não elegível ou precisa entrar de novo. Não se repete.
     #[error("plano ChatGPT: {}", .0.as_str())]
     Plan(llm_client::PlanError),
+    /// Limite do provedor que pausa a execução (spec 132 T09): o teto de gasto da Anthropic ou a
+    /// cota diária do Gemini. Não se repete.
+    #[error("limite do provedor: {}", .0.as_str())]
+    Limit(llm_client::ProviderLimit),
+    /// Tipo de conexão ainda sem adaptador (spec 132 T01): Anthropic e Google Gemini até as tarefas
+    /// que ligam os adaptadores nativos. Não se repete.
+    #[error("tipo de conexão ainda sem adaptador: {}", .0.as_str())]
+    KindNotSupported(crate::config::ConnectionKind),
 }

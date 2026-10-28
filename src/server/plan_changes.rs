@@ -19,7 +19,7 @@ use super::projects::{read_spec, read_task, real_children, scrub_text};
 use super::report::exclude_guaranteed;
 use super::safe_fs;
 use super::spec_result::validate_spec_id;
-use crate::sdd::plan_diff::{diff_lines, PlanSnapshot, MAX_CHANGE_LINES};
+use crate::sdd::plan_diff::{diff_lines, ChangeLine, PlanSnapshot, MAX_CHANGE_LINES};
 use crate::sdd::{Spec, SpecStatus};
 
 /// Nome do arquivo do resumo, dentro de `.sdd/specs/<id>/`.
@@ -38,7 +38,31 @@ const MAX_LINE_BYTES: usize = 200;
 pub struct PlanChangesRecord {
     /// Assinatura do plano (spec 086 T08) da versão descrita.
     pub signature: String,
-    pub lines: Vec<String>,
+    pub lines: Vec<PlanChangeLine>,
+}
+
+/// Uma linha do resumo, como gravada e como vai ao estado: com `code` e `params` desde a spec 131
+/// T06 (a web traduz), ou o texto em pt-BR dos arquivos gravados antes, que continua sendo lido.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlanChangeLine {
+    Coded(ChangeLine),
+    Text(String),
+}
+
+impl PlanChangeLine {
+    /// Texto da linha no idioma (a linha antiga sai como foi gravada).
+    pub fn render(&self, lang: crate::i18n::Lang) -> String {
+        match self {
+            Self::Coded(line) => line.render(lang),
+            Self::Text(text) => text.clone(),
+        }
+    }
+}
+
+/// Código de linha aceito na leitura (o formato dos códigos de `plan_diff`).
+fn valid_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= 40 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// Retratos do plano por spec, tirados antes do turno: assinatura do plano (T08) e retrato.
@@ -116,7 +140,7 @@ pub fn record_changes(root: &Path, before: &Snapshots, secrets: &SecretSet) -> V
                 return None;
             }
             let new = snapshot_of(root, &id, &spec, secrets);
-            let record = PlanChangesRecord { signature, lines: diff_lines(old, &new) };
+            let record = PlanChangesRecord { signature, lines: diff_lines(old, &new).into_iter().map(PlanChangeLine::Coded).collect() };
             let body = serde_json::to_string_pretty(&record).ok()?;
             write_local_file(root, &record_rel(&id), PLAN_CHANGES_FILE, &body)?;
             Some(id)
@@ -154,20 +178,40 @@ fn clean_line(secrets: &SecretSet, text: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// Linha lida de novo: texto e parâmetros redigidos e cortados; código fora do formato descarta a
+/// linha, e o parâmetro que não é texto nem número sai.
+fn clean_entry(secrets: &SecretSet, line: &PlanChangeLine) -> Option<PlanChangeLine> {
+    match line {
+        PlanChangeLine::Text(text) => {
+            let line = clean_line(secrets, text);
+            (!line.is_empty()).then_some(PlanChangeLine::Text(line))
+        }
+        PlanChangeLine::Coded(coded) => {
+            if !valid_code(&coded.code) {
+                return None;
+            }
+            let params = coded
+                .params
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    serde_json::Value::String(s) => Some((clean_line(secrets, k), serde_json::Value::from(clean_line(secrets, s)))),
+                    serde_json::Value::Number(_) => Some((clean_line(secrets, k), v.clone())),
+                    _ => None,
+                })
+                .collect();
+            Some(PlanChangeLine::Coded(ChangeLine { code: coded.code.clone(), params }))
+        }
+    }
+}
+
 /// `plan_changes` de uma spec: as linhas gravadas, só se a assinatura bate com o conteúdo atual e
 /// há ao menos uma linha (redigidas de novo na leitura, no máximo [`MAX_CHANGE_LINES`]).
-pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<Vec<String>> {
+pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<Vec<PlanChangeLine>> {
     let record = read_record(root, spec_id)?;
     if plan_signature(root, spec_id)? != record.signature {
         return None;
     }
-    let lines: Vec<String> = record
-        .lines
-        .iter()
-        .map(|l| clean_line(secrets, l))
-        .filter(|l| !l.is_empty())
-        .take(MAX_CHANGE_LINES)
-        .collect();
+    let lines: Vec<PlanChangeLine> = record.lines.iter().filter_map(|l| clean_entry(secrets, l)).take(MAX_CHANGE_LINES).collect();
     (!lines.is_empty()).then_some(lines)
 }
 
@@ -210,6 +254,43 @@ mod tests {
 
     fn record(root: &Path) -> Option<PlanChangesRecord> {
         read_record(root, SPEC)
+    }
+
+    /// Linhas em pt-BR.
+    fn texts(lines: &[PlanChangeLine]) -> Vec<String> {
+        lines.iter().map(|l| l.render(crate::i18n::Lang::PtBr)).collect()
+    }
+
+    /// Spec 131 T06: a linha nova é gravada com `code` e `params` (sem idioma) e sai assim no estado.
+    #[test]
+    fn lines_are_written_with_code_and_params() {
+        let root = tmp("coded");
+        write_plan(&root, EXAMPLE_SPEC_MD, &[("T01.md", EXAMPLE_TASK_MD)]);
+        let before = snapshots(&root, &secrets());
+        fs::remove_file(spec_dir(&root).join("tasks/T01.md")).expect("rm");
+        record_changes(&root, &before, &secrets());
+        let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(spec_dir(&root).join(PLAN_CHANGES_FILE)).expect("raw")).expect("json");
+        assert_eq!(raw["lines"], serde_json::json!([{"code": "task_removed", "params": {"id": "T01"}}]));
+        let lines = view(&root, SPEC, &secrets()).expect("linhas");
+        assert_eq!(serde_json::to_value(&lines).expect("estado"), raw["lines"]);
+        assert_eq!(lines[0].render(crate::i18n::Lang::En), "T01 removed");
+    }
+
+    /// Spec 131 T06: o arquivo gravado antes, com as linhas em texto (o do Test 9), continua lido,
+    /// e uma linha com código fora do formato é descartada.
+    #[test]
+    fn old_text_record_is_still_read() {
+        let root = tmp("old-text");
+        write_plan(&root, EXAMPLE_SPEC_MD, &[("T01.md", EXAMPLE_TASK_MD)]);
+        let signature = plan_signature(&root, SPEC).expect("assinatura");
+        let body = serde_json::json!({
+            "lines": ["T07: dependências alteradas", "T06 nova: Provide executable launcher with CLI parity", {"code": "Inválido!", "params": {}}],
+            "signature": signature,
+        });
+        fs::write(spec_dir(&root).join(PLAN_CHANGES_FILE), body.to_string()).expect("grava");
+        let lines = view(&root, SPEC, &secrets()).expect("linhas");
+        assert_eq!(texts(&lines), vec!["T07: dependências alteradas", "T06 nova: Provide executable launcher with CLI parity"]);
+        assert_eq!(serde_json::to_value(&lines).expect("estado")[0], "T07: dependências alteradas");
     }
 
     #[test]
@@ -259,7 +340,7 @@ mod tests {
         let t02 = replace_title(&t02, &format!("Usa {SECRET} no deploy"));
         write_plan(&root, EXAMPLE_SPEC_MD, &[("T02.md", &t02)]);
         record_changes(&root, &before, &secrets());
-        let lines = view(&root, SPEC, &secrets()).expect("linhas");
+        let lines = texts(&view(&root, SPEC, &secrets()).expect("linhas"));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("T02 nova: Usa "), "{lines:?}");
         assert!(!lines[0].contains(SECRET), "redigido: {lines:?}");
@@ -280,7 +361,7 @@ mod tests {
         let spec = with_test_command(EXAMPLE_SPEC_MD, "npm test -- --run");
         write_plan(&root, &spec, &[]);
         record_changes(&root, &before, &secrets());
-        let lines = view(&root, SPEC, &secrets()).expect("linhas");
+        let lines = texts(&view(&root, SPEC, &secrets()).expect("linhas"));
         assert!(lines.contains(&"test_command alterado".to_string()), "{lines:?}");
         assert!(lines.iter().any(|l| l.ends_with(" removida")), "{lines:?}");
     }
@@ -294,7 +375,7 @@ mod tests {
         fs::remove_file(spec_dir(&root).join("tasks/T01.md")).expect("rm");
         record_changes(&root, &before, &secrets());
         let lines = view(&root, SPEC, &secrets()).expect("resumo");
-        assert_eq!(lines, vec!["T01 removida"]);
+        assert_eq!(texts(&lines), vec!["T01 removida"]);
 
         // Novo turno com `artifacts_touched` que mexe só em outra spec.
         let before = snapshots(&root, &secrets());

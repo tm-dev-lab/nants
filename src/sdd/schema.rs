@@ -386,6 +386,34 @@ pub fn check_test_command_shape(raw: &str) -> Result<String, TestCommandError> {
     Ok(command.to_string())
 }
 
+/// Tamanho máximo do `run_command` (caracteres, após `trim`; spec 131 T04). Maior que o do
+/// `test_command`: no Test 9 o comando que mostra um CLI funcionando (instalação, importação e
+/// relatório encadeados) tinha cerca de 315 caracteres, e o limite de 200 o descartava. Um fluxo
+/// mais longo vai para um script do projeto, que o `run_command` chama.
+pub const RUN_COMMAND_MAX_CHARS: usize = 500;
+
+/// Forma do `run_command`: a do `test_command`, com o limite de [`RUN_COMMAND_MAX_CHARS`].
+pub fn check_run_command_shape(raw: &str) -> Result<String, TestCommandError> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err(TestCommandError::Empty);
+    }
+    if command.chars().count() > RUN_COMMAND_MAX_CHARS || command.chars().any(char::is_control) {
+        return Err(TestCommandError::Invalid);
+    }
+    Ok(command.to_string())
+}
+
+/// Campo opcional do frontmatter da spec que a leitura tolerante descartaria, inteiro ou em parte
+/// (spec 131 T04): a gravação pelo Arquiteto recusa a spec e devolve o campo e o motivo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldIssue {
+    /// Nome do campo no frontmatter (ex.: `run_command`).
+    pub field: &'static str,
+    /// Motivo, dirigido ao Arquiteto (texto de prompt, não de tela).
+    pub reason: String,
+}
+
 /// Frontmatter de `spec.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecMeta {
@@ -439,6 +467,11 @@ pub struct SpecMeta {
     /// desktop): a janela de execução explica isso em vez de falhar. Inválido é ignorado.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_in_sandbox: Option<String>,
+    /// Decisão de que não há o que executar (spec 131 T04), numa frase do Arquiteto (ex.: uma
+    /// biblioteca usada só pelos testes): sem `run_command`, o plano registra o porquê aqui.
+    /// Mesma forma do `not_in_sandbox`; inválido é ignorado na leitura.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nothing_to_run: Option<String>,
 }
 
 /// Valida `run_url`: só `http://localhost`, `http://127.0.0.1` ou `http://[::1]`, porta explícita
@@ -606,6 +639,11 @@ pub struct Finding {
     /// esgotar as tentativas. Vale uma vez por apontamento; 0 = nunca.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub early_review: u32,
+    /// Spec 131 T02: id de um apontamento do registro (aberto ou resolvido) de que este é a
+    /// continuação, declarado pelo Revisor (`continues`). Só vale se o id existe no registro
+    /// ([`crate::agents::finding_track::apply_continues`]); vazio não é gravado.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub continues: String,
 }
 
 /// Decisão do Arquiteto sobre um apontamento contestado (spec 124 T02).

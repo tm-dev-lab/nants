@@ -22,6 +22,9 @@ pub struct WorktreeInfo {
 /// squash (o commit de integração só carrega o que está staged).
 pub const LOCAL_SETTINGS: &str = ".sdd/settings.yaml";
 
+/// Identidade de reserva dos commits do Nants quando falta `user.name`/`user.email` efetivos.
+pub const FALLBACK_IDENTITY: [(&str, &str); 2] = [("user.name", "Nants"), ("user.email", "nants@localhost")];
+
 const SCRUBBED_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -531,7 +534,7 @@ impl Git {
 
     /// Cria um commit com a mensagem `msg` a partir do índice atual.
     pub fn commit(&self, msg: &str) -> Result<(), GitError> {
-        self.run(["commit", "-m", msg])?;
+        self.run(self.with_identity(["commit", "-m", msg]))?;
         Ok(())
     }
 
@@ -539,7 +542,7 @@ impl Git {
     pub fn commit_path(&self, path: &str, msg: &str) -> Result<(), GitError> {
         check_arg("path", path)?;
         self.run(["add", "--", path])?;
-        let result = self.run(["commit", "-m", msg, "--", path]);
+        let result = self.run(self.with_identity(["commit", "-m", msg, "--", path]));
         if result.is_err() {
             let _ = self.run(["reset", "-q", "--", path]);
         }
@@ -560,7 +563,7 @@ impl Git {
         }
         let mut commit = vec!["commit".to_string(), "-m".to_string(), msg.to_string(), "--".to_string()];
         commit.extend(paths.iter().cloned());
-        let result = self.run(commit);
+        let result = self.run(self.with_identity(commit));
         if result.is_err() {
             let mut reset = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
             reset.extend(paths.iter().cloned());
@@ -632,7 +635,7 @@ impl Git {
 
     /// Commit de integração sem alterações no índice (`--allow-empty`), args fixos.
     pub fn commit_allow_empty(&self, msg: &str) -> Result<(), GitError> {
-        self.run(["commit", "--allow-empty", "-m", msg])?;
+        self.run(self.with_identity(["commit", "--allow-empty", "-m", msg]))?;
         Ok(())
     }
 
@@ -667,18 +670,36 @@ impl Git {
             .collect()
     }
 
+    /// Identidade de reserva ([`FALLBACK_IDENTITY`]) só para as chaves sem valor efetivo
+    /// ([`Git::missing_identity`]): a configuração do repositório, a global e a do sistema continuam
+    /// prevalecendo quando existem.
+    pub fn identity_fallback(&self) -> Vec<(&'static str, &'static str)> {
+        let missing = self.missing_identity();
+        FALLBACK_IDENTITY.into_iter().filter(|(key, _)| missing.contains(key)).collect()
+    }
+
+    /// `args` precedidos de `-c chave=valor` da [`Git::identity_fallback`]: vale só nesta invocação e
+    /// nunca altera a config. Todo commit que o Nants faz passa por aqui (spec 132 T12).
+    fn with_identity<I, S>(&self, args: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut full: Vec<String> = Vec::new();
+        for (key, value) in self.identity_fallback() {
+            full.push("-c".into());
+            full.push(format!("{key}={value}"));
+        }
+        full.extend(args.into_iter().map(Into::into));
+        full
+    }
+
     /// Cria um commit vazio (`--allow-empty`) sem adicionar arquivos. É um commit do servidor, sem
-    /// conteúdo a validar: `--no-verify` e `commit.gpgsign=false` evitam hooks do usuário e GPG.
-    /// `fallback` são pares `chave, valor` passados com `-c` só nesta invocação (nunca altera a config).
-    pub fn commit_empty(&self, msg: &str, fallback: &[(&str, &str)]) -> Result<(), GitError> {
+    /// conteúdo a validar: `--no-verify` e `commit.gpgsign=false` evitam hooks do usuário e GPG. A
+    /// identidade de reserva entra como em todo commit ([`Git::identity_fallback`]).
+    pub fn commit_empty(&self, msg: &str) -> Result<(), GitError> {
         let mut args: Vec<String> = vec!["-c".into(), "commit.gpgsign=false".into()];
-        for (key, value) in fallback {
-            args.push("-c".into());
-            args.push(format!("{key}={value}"));
-        }
-        for part in ["commit", "--allow-empty", "--no-verify", "-m", msg] {
-            args.push(part.into());
-        }
+        args.extend(self.with_identity(["commit", "--allow-empty", "--no-verify", "-m", msg]));
         self.run(args)?;
         Ok(())
     }
@@ -846,11 +867,39 @@ impl Git {
         for var in SCRUBBED_ENV {
             cmd.env_remove(var);
         }
+        #[cfg(test)]
+        for (key, value) in test_env_for(&self.root) {
+            cmd.env(key, value);
+        }
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
         cmd
     }
+}
+
+/// Testes: variáveis extras para todo [`Git`] cuja raiz fica sob a pasta registrada. Isola o HOME e a
+/// config global nos fluxos de produção (aprovação, integração) sem mexer no ambiente do processo,
+/// que os outros testes compartilham.
+#[cfg(test)]
+static TEST_ENV: std::sync::Mutex<Vec<(PathBuf, Vec<(String, String)>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Registra `env` para os comandos `git` sob `root` (e sob o caminho canônico dele).
+#[cfg(test)]
+pub(crate) fn isolate_env_for_tests(root: &Path, env: &[(&str, &str)]) {
+    let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let mut list = TEST_ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.push((root.to_path_buf(), pairs.clone()));
+    if let Ok(canonical) = root.canonicalize() {
+        list.push((canonical, pairs));
+    }
+}
+
+/// Variáveis registradas por [`isolate_env_for_tests`] para a raiz `root`.
+#[cfg(test)]
+fn test_env_for(root: &Path) -> Vec<(String, String)> {
+    let list = TEST_ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.iter().filter(|(prefix, _)| root.starts_with(prefix)).flat_map(|(_, env)| env.clone()).collect()
 }
 
 /// Interpreta o exit code de `git check-ignore -q`: 1 = não ignorado; o resto = ignorado.
@@ -954,6 +1003,81 @@ mod tests {
         git.run(["add", "."]).unwrap();
         git.commit("chore: commit inicial").unwrap();
         (base, repo)
+    }
+
+    /// Repositório com um arquivo novo, sem identidade local, e um `Git` com o HOME isolado e a config
+    /// global em `global` (ou em `/dev/null`), sem a do sistema.
+    fn repo_without_identity(tag: &str, global: Option<&str>) -> (PathBuf, Git) {
+        let base = env::temp_dir().join(format!("nants-git-{}-{}", process::id(), tag));
+        let _ = fs::remove_dir_all(&base);
+        let (repo, home) = (base.join("repo"), base.join("home"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let global_path = match global {
+            Some(text) => {
+                let path = home.join("gitconfig");
+                fs::write(&path, text).unwrap();
+                path.to_str().unwrap().to_string()
+            }
+            None => "/dev/null".to_string(),
+        };
+        let git = Git::new(&repo)
+            .with_env("HOME", home.to_str().unwrap())
+            .with_env("GIT_CONFIG_GLOBAL", &global_path)
+            .with_env("GIT_CONFIG_NOSYSTEM", "1");
+        git.run(["init", "-q", "-b", "main"]).unwrap();
+        git.run(["config", "commit.gpgsign", "false"]).unwrap();
+        git.commit_empty("chore: inicial").unwrap();
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        (repo, git)
+    }
+
+    fn author(git: &Git) -> String {
+        git.run(["log", "-1", "--format=%an <%ae>|%cn <%ce>"]).unwrap().trim().to_string()
+    }
+
+    /// Sem identidade efetiva, todo commit do Nants usa a reserva, e a config não é alterada.
+    #[test]
+    fn every_commit_uses_the_fallback_identity_without_one() {
+        let (repo, git) = repo_without_identity("ident-reserva", None);
+        assert_eq!(git.identity_fallback(), FALLBACK_IDENTITY.to_vec());
+        assert!(git.commit_paths(&["a.txt".to_string()], "docs: a").unwrap());
+        let fallback = "Nants <nants@localhost>|Nants <nants@localhost>";
+        assert_eq!(author(&git), fallback);
+        fs::write(repo.join("b.txt"), "b\n").unwrap();
+        git.commit_path("b.txt", "docs: b").unwrap();
+        assert_eq!(author(&git), fallback);
+        fs::write(repo.join("c.txt"), "c\n").unwrap();
+        git.run(["add", "c.txt"]).unwrap();
+        git.commit("feat: c").unwrap();
+        assert_eq!(author(&git), fallback);
+        git.commit_allow_empty("feat: vazio").unwrap();
+        assert_eq!(author(&git), fallback);
+        git.commit_empty("chore: vazio").unwrap();
+        assert_eq!(author(&git), fallback);
+        let local = git.run(["config", "--local", "--list"]).unwrap();
+        assert!(!local.contains("user."), "{local}");
+    }
+
+    /// A identidade do repositório e a global prevalecem sobre a reserva, chave a chave.
+    #[test]
+    fn repo_and_global_identity_win_over_the_fallback() {
+        let (_repo, git) = repo_without_identity("ident-repo", None);
+        git.run(["config", "user.name", "Dev Repo"]).unwrap();
+        git.run(["config", "user.email", "repo@example.com"]).unwrap();
+        assert!(git.identity_fallback().is_empty());
+        git.commit_paths(&["a.txt".to_string()], "docs: a").unwrap();
+        assert_eq!(author(&git), "Dev Repo <repo@example.com>|Dev Repo <repo@example.com>");
+
+        let (_repo, git) = repo_without_identity("ident-global", Some("[user]\n\tname = Dev Global\n\temail = global@example.com\n"));
+        assert!(git.identity_fallback().is_empty());
+        git.commit_paths(&["a.txt".to_string()], "docs: a").unwrap();
+        assert_eq!(author(&git), "Dev Global <global@example.com>|Dev Global <global@example.com>");
+
+        let (_repo, git) = repo_without_identity("ident-parcial", Some("[user]\n\tname = Dev Global\n"));
+        assert_eq!(git.identity_fallback(), vec![("user.email", "nants@localhost")]);
+        git.commit_paths(&["a.txt".to_string()], "docs: a").unwrap();
+        assert_eq!(author(&git), "Dev Global <nants@localhost>|Dev Global <nants@localhost>");
     }
 
     #[test]

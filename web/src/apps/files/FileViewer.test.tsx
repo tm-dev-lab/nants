@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { AppearanceContext } from "../../desktop/theme/appearanceContext";
 import { DEFAULT_APPEARANCE } from "../../desktop/theme/appearance";
+import { setLanguage } from "../../i18n";
 import { HIGHLIGHT_MAX_BYTES, HIGHLIGHT_MAX_LINES } from "./filesModel";
 import { FileViewer } from "./FileViewer";
 
@@ -109,6 +110,29 @@ describe("FileViewer: estados", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copiar" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("# Titulo\n"));
     await screen.findByText("Copiado");
+  });
+
+  it("spec 131 T06: em en, os títulos da tarefa saem traduzidos na tela; o Copiar leva o arquivo gravado", async () => {
+    const raw = "## Objetivo\nShip it.\n## Critérios de Aceitação\n- [ ] ok\n";
+    stubFetch(() => text(raw));
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    setLanguage("en", { persist: false });
+    try {
+      const view = themed(<FileViewer projectId="p1" source="base" path=".sdd/specs/001-ledger/tasks/T01.md" refreshKey={0} />);
+      const editor = await screen.findByTestId("cm-mock");
+      expect(editor.textContent).toContain("## Objective");
+      expect(editor.textContent).toContain("## Acceptance Criteria");
+      expect(editor.textContent).not.toContain("Objetivo");
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(raw));
+      view.unmount();
+      // Fora do spec.md e das tarefas, o texto aparece como está.
+      themed(<FileViewer projectId="p1" source="base" path="notes/T01.md" refreshKey={0} />);
+      expect((await screen.findByTestId("cm-mock")).textContent).toContain("## Objetivo");
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
   });
 
   it("nova atualização relê com If-None-Match; 304 mantém o conteúdo", async () => {

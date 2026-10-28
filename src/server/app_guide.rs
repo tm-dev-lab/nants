@@ -3,8 +3,10 @@
 //! - **Conteúdo** (`GET /api/projects/:id/app/guide/:spec_id`): o "Como usar" do relatório final (as
 //!   seções "Como executar" e "Primeiros passos", em qualquer idioma do relatório) ou o README quando
 //!   não houver relatório, o resumo das provas (tarefas DONE, a verificação final na base e as
-//!   capturas) e o aviso do que não roda no sandbox (`not_in_sandbox` do frontmatter da spec). Tudo
-//!   redigido e limitado, em leitura somente.
+//!   capturas) e o aviso do que não roda no sandbox (`not_in_sandbox` do frontmatter da spec). Spec
+//!   131 T05: `run` diz se a spec declara `run_command` e traz a decisão `nothing_to_run`; sem
+//!   `run_command`, a janela abre no Console (`open_console`). Tudo redigido e limitado, em leitura
+//!   somente.
 //! - **Próximo passo de todo erro** ([`attach_action`]): toda resposta de erro das rotas da janela
 //!   (`/app`, `/app/start`, `/app/stop`, `/app/logs`, `/app/exec*`, `/app/guide`, `/app/fix`) ganha o
 //!   campo `action`, pelo `code` ([`error_action`]). Os avisos do resultado do Console levam o mesmo
@@ -339,6 +341,10 @@ fn build_guide(root: &Path, project_id: &str, spec_id: &str, secrets: &SecretSet
         .map_or(Value::Null, |text| json!({"passed": verification_passed(&text), "text": text}));
     let (capture_list, captures_total) = captures(root, project_id, spec_id);
     let note = spec.frontmatter.not_in_sandbox.as_deref().map(|n| scrub_text(secrets, n));
+    // Spec 131 T05: sem `run_command` (com ou sem a decisão `nothing_to_run`), as janelas abrem no
+    // Console, sem "Iniciar" nem o erro de não haver como executar.
+    let declared = spec.frontmatter.run_command.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let nothing_to_run = spec.frontmatter.nothing_to_run.as_deref().map(|n| scrub_text(secrets, n));
     Ok(json!({
         "spec_id": spec_id,
         "how_to_use": how_to_use(root, spec_id, secrets),
@@ -350,6 +356,7 @@ fn build_guide(root: &Path, project_id: &str, spec_id: &str, secrets: &SecretSet
             "captures_total": captures_total,
         },
         "sandbox": {"runs_here": note.is_none(), "note": note},
+        "run": {"declared": declared, "nothing_to_run": nothing_to_run},
     }))
 }
 

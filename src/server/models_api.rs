@@ -39,13 +39,25 @@ pub const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 const GATES_PRUNE_AT: usize = 64;
 
 /// Modelo listado (o esforço é decidido pela UI).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ModelInfo {
     /// O que vai no pedido (no plano ChatGPT, o `slug`).
     pub id: String,
     /// Nome mostrado (no plano ChatGPT, o `display_name`); ausente nas conexões por chave.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Janela de entrada em tokens, quando o provedor a informa (Anthropic e Gemini, spec 132 T08).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Limite de saída em tokens, quando o provedor o informa (spec 132 T08).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// O modelo raciocina (thinking), quando o provedor diz (spec 132 T08).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// O modelo aceita imagem na entrada, quando o provedor diz (Anthropic, spec 132 T08).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 /// Resultado de uma consulta de modelos: ids ordenados, sem duplicatas, até o teto.
@@ -82,12 +94,17 @@ pub(super) struct Failure {
     pub(super) status: Option<u16>,
 }
 
-const INVALID_CONFIG: Failure = Failure {
+pub(super) const INVALID_CONFIG: Failure = Failure {
     code: "invalid_config",
     status: None,
 };
-const BAD_RESPONSE: Failure = Failure {
+pub(super) const BAD_RESPONSE: Failure = Failure {
     code: "bad_response",
+    status: None,
+};
+/// Tipo de conexão ainda sem adaptador (spec 132 T01): Anthropic e Google Gemini.
+pub(super) const KIND_NOT_SUPPORTED: Failure = Failure {
+    code: "connection_kind_not_supported_yet",
     status: None,
 };
 
@@ -119,6 +136,12 @@ pub(super) fn classify(err: &LlmError) -> Failure {
             code: plan.as_str(),
             status: None,
         },
+        // Spec 132 T09: o teto de gasto (`spend_limit`) ou a cota diária (`daily_quota`).
+        LlmError::Limit(limit) => Failure {
+            code: limit.as_str(),
+            status: None,
+        },
+        LlmError::KindNotSupported(_) => KIND_NOT_SUPPORTED,
     }
 }
 
@@ -222,7 +245,7 @@ fn validate_saved_key(key: &str) -> Result<(), ApiError> {
 
 /// Id aceito: não vazio, até `MODEL_ID_MAX_CHARS` caracteres, sem controle, sem cara
 /// de URL e sem a chave de API (o provedor não pode ecoar segredo na listagem).
-fn valid_model_id(id: &str, secret: &str) -> bool {
+pub(super) fn valid_model_id(id: &str, secret: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= MODEL_ID_MAX_CHARS
         && !id.chars().any(char::is_control)
@@ -267,7 +290,7 @@ pub fn normalize_models(body: &Value, secret: &str) -> Option<ModelList> {
     let models = unique
         .into_iter()
         .take(MODELS_MAX)
-        .map(|id| ModelInfo { id: id.to_string(), name: None })
+        .map(|id| ModelInfo { id: id.to_string(), ..ModelInfo::default() })
         .collect();
     Some(ModelList { models, truncated })
 }
@@ -290,11 +313,15 @@ pub(super) async fn fetch_plan(state: &AppState, conn: &Connection, timeout: Dur
 }
 
 /// Consulta `{base_url}/models` da conexão salva. A chave só vai ao `base_url` salvo.
+/// A Anthropic e o Google Gemini usam a Models API própria ([`super::models_native`], spec 132 T08).
 pub(super) async fn fetch(
     conn: &Connection,
     base_url: &str,
     timeout: Duration,
 ) -> Result<ModelList, Failure> {
+    if conn.kind.is_native() {
+        return super::models_native::fetch(conn, base_url, timeout).await;
+    }
     let api_key = conn.resolve_api_key().map_err(|_| INVALID_CONFIG)?;
     let client = LlmClient::new(base_url, api_key.clone())
         .and_then(|c| c.with_timeout(timeout))
@@ -341,7 +368,7 @@ pub async fn list_models(
     }
     .ok_or_else(|| ApiError::coded(StatusCode::NOT_FOUND, "connection_not_found", Map::new()))?;
     // Conexão salva à mão fora do padrão atual: não usar a chave nesse endpoint.
-    let base_url = validate_base_url(&saved.base_url)
+    let base_url = validate_base_url(saved.endpoint())
         .map_err(|_| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_saved_invalid", Map::new()))?;
     validate_saved_key(&saved.api_key)?;
 
@@ -401,6 +428,7 @@ mod tests {
             api_key: key.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }
     }
 

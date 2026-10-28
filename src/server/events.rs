@@ -1074,6 +1074,7 @@ mod tests {
             api_key: api_key.into(),
             wire_api: crate::config::WireApi::default(),
             kind: Default::default(),
+            base_url_override: None,
         }
     }
 

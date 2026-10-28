@@ -85,6 +85,7 @@ fn config(root: &Path, architect: bool) -> Config {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     if architect {
         cfg.agents.architect = AgentConfig {
@@ -685,6 +686,35 @@ fn facts_environment_lists_images_services_ports_and_commands() {
     assert!(facts.contains("Docker com Compose"), "{facts}");
 }
 
+/// Spec 131 T05 (C-10): sem `run_command`, os fatos dizem que a spec não o declara e que, no Nants,
+/// o produto é usado pelo Console, onde App e Execução abrem (no Test 9, o relatório inventou
+/// "Start the app"); com a decisão `nothing_to_run`, ela vem junto. Com `run_command`, nada disso.
+#[test]
+fn facts_without_run_command_say_the_console_is_the_way_in_nants() {
+    let secrets = SecretSet::new(vec![SECRET.to_string()]);
+    let compose = "services:\n  workspace:\n    build: .\n";
+    let root = docker_project("env-no-run", compose);
+    let spec = root.join(".sdd/specs").join(SPEC).join("spec.md");
+    let raw = fs::read_to_string(&spec).expect("spec");
+    fs::write(&spec, raw.replace("run_command: \"npm start\"\n", "")).expect("spec");
+    let facts = build_facts(&root, SPEC, &secrets).expect("fatos");
+    let line = "- Executar: a spec não declara run_command. No Nants, o produto é usado pelo Console do projeto, onde as janelas App e Execução abrem";
+    assert!(facts.contains(line), "{facts}");
+    assert!(!facts.contains("Executar fora do Nants"), "{facts}");
+    assert!(facts.contains("Testar fora do Nants"), "{facts}");
+    let raw = fs::read_to_string(&spec).expect("spec");
+    let decided = raw.replacen("---\n", "---\nnothing_to_run: \"Biblioteca: o uso é pelos testes e pelo README.\"\n", 1);
+    fs::write(&spec, decided).expect("spec");
+    let facts = build_facts(&root, SPEC, &secrets).expect("fatos");
+    assert!(
+        facts.contains("a spec não declara run_command (decisão do plano, nothing_to_run: Biblioteca: o uso é pelos testes e pelo README.). No Nants"),
+        "{facts}"
+    );
+    let with_run = docker_project("env-with-run", compose);
+    let facts = build_facts(&with_run, SPEC, &secrets).expect("fatos");
+    assert!(!facts.contains("não declara run_command"), "{facts}");
+}
+
 #[test]
 fn facts_environment_without_nants_is_host_and_has_no_docker_lines() {
     let secrets = SecretSet::new(vec![SECRET.to_string()]);
@@ -783,6 +813,7 @@ async fn traceability_redacts_long_secret_before_cutting_the_criterion() {
         api_key: LONG.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     let state = AppState::new(root.join("config.toml"), cfg, PORT)
         .with_report_backend(Scripted::new(vec![text(GOOD_REPORT)]));

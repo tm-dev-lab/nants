@@ -45,6 +45,7 @@ fn config_for(root: &Path, reviewer: bool) -> Config {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     if reviewer {
         cfg.agents.reviewer = AgentConfig { connection_id: "c".into(), model: "rev".into(), effort: Effort::Medium, max_steps: None };
@@ -693,9 +694,22 @@ fn internal_turns(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Linhas do sistema com `code` (a linha de cada rodada).
+/// Linhas do sistema da rodada (`plan.consensus_round*`).
 fn round_lines(root: &Path) -> Vec<serde_json::Value> {
+    system_lines(root)
+        .into_iter()
+        .filter(|v| v["notice"]["code"].as_str().is_some_and(|c| c.starts_with("plan.consensus_round")))
+        .collect()
+}
+
+/// Linhas do sistema com `code`.
+fn system_lines(root: &Path) -> Vec<serde_json::Value> {
     chat_lines(root).into_iter().filter(|v| v["role"] == "system" && v["notice"]["code"].is_string()).collect()
+}
+
+/// Linhas da lista final do plano (spec 131 T03).
+fn final_plan_lines(root: &Path) -> Vec<serde_json::Value> {
+    system_lines(root).into_iter().filter(|v| v["notice"]["code"] == FINAL_PLAN_CODE).collect()
 }
 
 fn consensus(root: &Path) -> ConsensusView {
@@ -738,6 +752,15 @@ async fn consensus_in_the_first_round() {
     assert_eq!(lines[0]["notice"]["code"], ROUND_CODE);
     assert_eq!(lines[0]["notice"]["params"], json!({"round": 1, "issues": 1, "accepted": 1, "kept": 0}));
     assert_eq!(lines[0]["text"], "Revisão do plano, rodada 1: o Revisor apontou 1; o Arquiteto ajustou 1 e manteve 0.");
+    // Spec 131 T03: o pedido traz o texto atual da tarefa apontada e pede as gravações juntas.
+    assert!(turns[0].contains("TEXTO ATUAL DAS TAREFAS APONTADAS"), "{}", turns[0]);
+    assert!(turns[0].contains(&format!("=== .sdd/specs/{SPEC}/tasks/T01.md (INTEIRA) ===\n{}", EXAMPLE_TASK_MD.trim_end())), "{}", turns[0]);
+    assert!(turns[0].contains("INTEIRA não precisa de read_file") && turns[0].contains("numa única resposta"), "{}", turns[0]);
+    // Spec 131 T03: depois do consenso, a lista final das tarefas, pelo dicionário.
+    let finals = final_plan_lines(&root);
+    assert_eq!(finals.len(), 1, "{finals:?}");
+    assert_eq!(finals[0]["text"], format!("Plano final da spec {SPEC}, depois da revisão:\n- T01: Título da tarefa"));
+    assert_eq!(finals[0]["notice"]["params"], json!({"spec": SPEC}));
 
     // O Revisor revisou a versão nova com a memória da rodada anterior.
     let reqs = reviewer.requests();
@@ -788,6 +811,8 @@ async fn rejection_is_respected() {
     assert_eq!(view.kept_points[0].reason.as_deref(), Some("A tarefa não escreve em docs/."));
     assert_eq!(view.kept_points[0].reason_kind.as_deref(), Some("not_worth_cost"));
     assert_eq!(round_lines(&root)[0]["notice"]["params"]["kept"], 1);
+    // Spec 131 T03 (F-03): a rodada só com recusas não muda o plano: nenhuma lista final.
+    assert!(final_plan_lines(&root).is_empty(), "{:?}", final_plan_lines(&root));
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1209,5 +1234,285 @@ async fn the_review_records_the_dependency_cycle() {
     assert_eq!(run(&st, &root).await, 1);
     let rec = record(&root);
     assert!(rec.issues.iter().any(|i| i.kind == CYCLE_KIND && i.text.contains("T01, T02")), "{:?}", rec.issues);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03: abertura do pedido curto do bloco (o Arquiteto falso o reconhece pela mensagem).
+const DECISIONS_ASK: &str = "APONTAMENTOS SEM DECISÃO";
+
+/// Pedidos ao Arquiteto que são o pedido curto do bloco.
+fn decision_asks(architect: &Architect) -> Vec<ChatRequest> {
+    architect
+        .requests()
+        .into_iter()
+        .filter(|r| r.messages.last().is_some_and(|m| m.content.starts_with(DECISIONS_ASK)))
+        .collect()
+}
+
+/// Resposta com texto e chamadas de ferramenta na mesma mensagem.
+fn said_with_calls(content: &str, call: Reply) -> Reply {
+    call.map(|mut r| {
+        r.message.content = content.to_string();
+        r
+    })
+}
+
+/// Spec 131 T03 (critério 1): o bloco numa mensagem intermediária do turno (a que acompanhou a
+/// gravação) vale; a resposta final sem ele não vira pedido extra nem ponto sem resposta.
+#[tokio::test]
+async fn decisions_block_in_an_intermediate_message_counts() {
+    let root = plan_root("consensus-intermediate");
+    let reviewer = Scripted::new(vec![review(&[("T01", "untestable", "Critério vago.", None, false)]), review(&[])]);
+    let adjusted = EXAMPLE_TASK_MD.replace("Critério verificável.", "GET /health responde 200.");
+    let block = "Vou reescrever o critério.\n```nants-plan-decisions\n{\"decisions\": [{\"id\": \"P1\", \"decision\": \"accept\", \"reason_kind\": \"agree\", \"reason\": \"Critério reescrito.\"}]}\n```";
+    let architect = Architect::new(vec![vec![said_with_calls(block, write_task_reply("a1", "T01", &adjusted)), text("Critério da T01 reescrito.")]]);
+    let st = consensus_state(&root, reviewer, architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    assert!(decision_asks(&architect).is_empty(), "o bloco do turno basta");
+    let rec = record(&root);
+    let decision = &rec.rounds[1].decisions[0];
+    assert_eq!((decision.decision.as_str(), decision.inferred), (DECISION_ACCEPT, false));
+    assert_eq!(decision.reason.as_deref(), Some("Critério reescrito."));
+    let lines = round_lines(&root);
+    assert_eq!(lines[0]["notice"]["code"], ROUND_CODE);
+    assert_eq!(lines[0]["notice"]["params"], json!({"round": 1, "issues": 1, "accepted": 1, "kept": 0}));
+    // O bloco nunca aparece nas respostas gravadas do Arquiteto.
+    let replies: Vec<_> = chat_lines(&root).into_iter().filter(|l| l["role"] == "architect").collect();
+    assert!(!replies.is_empty() && replies.iter().all(|l| !l["text"].as_str().unwrap_or_default().contains("nants-plan-decisions")), "{replies:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (critério 1): sem o bloco no turno e sem mudança nas tarefas citadas, um pedido
+/// curto, sem ferramentas, com só os pontos e o texto final, pede o bloco uma vez.
+#[tokio::test]
+async fn missing_block_is_asked_once_without_tools() {
+    let root = plan_root("consensus-ask-block");
+    let reviewer = Scripted::new(vec![review(&[("T01", "scope", "Precisa de arquivos em docs/.", None, false)]), review(&[])]);
+    let architect = Architect::new(vec![vec![
+        text("Mantive o plano: a tarefa não escreve em docs/."),
+        decided(&[("P1", DECISION_REJECT, "not_worth_cost", "A tarefa não escreve em docs/.")]),
+    ]]);
+    let st = consensus_state(&root, reviewer, architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    let asks = decision_asks(&architect);
+    assert_eq!(asks.len(), 1, "uma vez");
+    let ask = &asks[0];
+    assert!(ask.tools.is_empty(), "sem ferramentas");
+    assert_eq!(ask.messages.len(), 2);
+    assert_eq!(ask.messages[0].content, crate::agents::prompts::PLAN_DECISIONS_ONLY_SYSTEM);
+    let body = &ask.messages[1].content;
+    assert!(body.contains("- P1 (T01, scope): Precisa de arquivos em docs/."), "{body}");
+    assert!(body.contains("Mantive o plano: a tarefa não escreve em docs/."), "{body}");
+    assert!(body.contains("```nants-plan-decisions"), "{body}");
+    assert!(!body.contains("## Objetivo") && !body.contains(PLAN_CONSENSUS_INTRO), "só os pontos e o texto final: {body}");
+    let rec = record(&root);
+    let decision = &rec.rounds[1].decisions[0];
+    assert_eq!((decision.decision.as_str(), decision.reason_kind.as_deref()), (DECISION_REJECT, Some("not_worth_cost")));
+    assert_eq!(round_lines(&root)[0]["notice"]["code"], ROUND_CODE);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (critério 1): o pedido do bloco que também não traz decisão deixa o ponto em
+/// aberto, sem novo pedido na mesma rodada.
+#[tokio::test]
+async fn unanswered_block_request_leaves_the_point_open() {
+    let root = plan_root("consensus-ask-empty");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "scope", "Precisa de arquivos em docs/.", None, false)]),
+        review(&[("T01", "scope", "Precisa de arquivos em docs/.", Some("P1"), false)]),
+        review(&[]),
+    ]);
+    let architect = Architect::new(vec![
+        vec![text("Pensei sobre o ponto."), text("Sem bloco de novo.")],
+        vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "A tarefa não escreve em docs/.")])],
+    ]);
+    let st = consensus_state(&root, reviewer, architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(decision_asks(&architect).len(), 1);
+    let lines = round_lines(&root);
+    assert_eq!(lines[0]["notice"]["code"], ROUND_OPEN_CODE);
+    assert_eq!(lines[1]["notice"]["code"], ROUND_CODE);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (critério 2): sem bloco, o ponto cuja tarefa mudou (ou foi dividida) no turno
+/// conta como ajustado por inferência, sem pedido extra; a linha da rodada não é alerta. Se o
+/// ponto volta na revisão seguinte, ele volta ao Arquiteto em aberto.
+#[tokio::test]
+async fn point_without_decision_is_adjusted_when_its_task_changed() {
+    let root = plan_root("consensus-inferred");
+    let reviewer = Scripted::new(vec![review(&[("T01", "too_large", "Mistura servidor e cliente.", None, false)]), review(&[])]);
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"").replace("Título da tarefa", "Cliente");
+    let t01 = EXAMPLE_TASK_MD.replace("O que implementar.", "Só o servidor.");
+    let architect = Architect::new(vec![vec![
+        write_task_reply("a1", "T02", &t02),
+        write_task_reply("a2", "T01", &t01),
+        text("Dividi a T01: o cliente foi para a T02."),
+    ]]);
+    let st = consensus_state(&root, reviewer, architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    assert!(decision_asks(&architect).is_empty(), "a inferência resolveu");
+    let rec = record(&root);
+    let decision = &rec.rounds[1].decisions[0];
+    assert_eq!((decision.decision.as_str(), decision.inferred), (DECISION_ACCEPT, true));
+    assert_eq!((rec.rounds[1].accepted, rec.rounds[1].inferred, rec.rounds[1].unanswered), (1, 1, 0));
+    let lines = round_lines(&root);
+    assert_eq!(lines[0]["notice"]["code"], ROUND_INFERRED_CODE);
+    assert_eq!(lines[0]["notice"]["params"], json!({"round": 1, "issues": 1, "accepted": 1, "kept": 0, "inferred": 1}));
+    assert_eq!(
+        lines[0]["text"],
+        "Revisão do plano, rodada 1: o Revisor apontou 1; o Arquiteto ajustou 1 (1 pela mudança na tarefa, sem resposta escrita) e manteve 0."
+    );
+    let view = consensus(&root);
+    assert_eq!((view.outcome.as_deref(), view.adjusted, view.unanswered), (Some(OUTCOME_CONSENSUS), 1, 0));
+    // A lista final traz as duas tarefas.
+    let finals = final_plan_lines(&root);
+    assert!(finals[0]["text"].as_str().unwrap_or_default().ends_with("- T01: Título da tarefa\n- T02: Cliente"), "{finals:?}");
+    let _ = fs::remove_dir_all(&root);
+
+    // O ponto que volta na revisão seguinte não fica ajustado: volta ao Arquiteto em aberto.
+    let root = plan_root("consensus-inferred-back");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "untestable", "Critério vago.", None, false)]),
+        review(&[("T01", "untestable", "Critério ainda vago.", Some("P1"), false)]),
+        review(&[]),
+    ]);
+    let edited = EXAMPLE_TASK_MD.replace("Critério verificável.", "Critério reescrito.");
+    let architect = Architect::new(vec![
+        vec![write_task_reply("a1", "T01", &edited), text("Reescrevi o critério.")],
+        vec![decided(&[("P1", DECISION_ACCEPT, "agree", "GET /health responde 200.")])],
+    ]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let turns = internal_turns(&root);
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert!(turns[1].contains("- P1 (T01, untestable): Critério ainda vago."), "{}", turns[1]);
+    let memory = &reviewer.requests()[1].messages[2].content;
+    assert!(memory.contains("Arquiteto: accept (deduzido"), "{memory}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (critério 3): sem rodada de ajuste (o plano passou de primeira), nenhuma lista final.
+#[tokio::test]
+async fn no_final_plan_line_without_an_adjustment_round() {
+    let root = plan_root("consensus-no-final");
+    let reviewer = Scripted::new(vec![review(&[])]);
+    let st = consensus_state(&root, reviewer, Architect::new(Vec::new()));
+    assert_eq!(run(&st, &root).await, 1);
+    assert!(final_plan_lines(&root).is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (critério 4): passos e entrada por passo do turno do consenso com o Arquiteto falso.
+/// Antes (o caminho do Test 9: ler a spec e a tarefa, gravar uma a uma e responder sem o bloco) e
+/// depois (o texto da tarefa no pedido, as gravações juntas numa resposta e o bloco). Imprime os
+/// números (`--nocapture`) e confere que o caminho novo tem menos passos e menos entrada.
+#[tokio::test]
+async fn consensus_turn_steps_and_input_per_step() {
+    async fn measure(tag: &str, script: Vec<Reply>) -> Vec<u64> {
+        let root = plan_root(tag);
+        let reviewer = Scripted::new(vec![review(&[("T01", "too_large", "Mistura servidor e cliente.", None, false)]), review(&[])]);
+        let architect = Architect::new(vec![script.into_iter().map(with_usage).collect()]);
+        let st = consensus_state(&root, reviewer, architect);
+        assert_eq!(run(&st, &root).await, 1);
+        let usage = fs::read_to_string(root.join(".sdd/specs/.usage.jsonl")).unwrap_or_default();
+        let bytes: Vec<u64> = usage
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|l| l["agent"] == "architect" && l["stage"] == "plan_consensus")
+            .filter_map(|l| l["context_bytes"].as_u64())
+            .collect();
+        assert_eq!(record(&root).outcome.as_deref(), Some(OUTCOME_CONSENSUS), "{tag}");
+        let _ = fs::remove_dir_all(&root);
+        bytes
+    }
+    let t01 = EXAMPLE_TASK_MD.replace("Título da tarefa", "Servidor");
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"").replace("Título da tarefa", "Cliente");
+    let read = |id: &str, path: &str| crate::agents::architect::testing::calls(&[(id, "read_file", &json!({"path": path}).to_string())]);
+    let before = measure(
+        "steps-before",
+        vec![
+            read("r1", &format!(".sdd/specs/{SPEC}/spec.md")),
+            read("r2", &format!(".sdd/specs/{SPEC}/tasks/T01.md")),
+            write_task_reply("w1", "T01", &t01),
+            write_task_reply("w2", "T02", &t02),
+            text("Dividi a T01 em servidor e cliente."),
+        ],
+    )
+    .await;
+    let path = |id: &str| format!(".sdd/specs/{SPEC}/tasks/{id}.md");
+    let both = crate::agents::architect::testing::calls(&[
+        ("w1", "write_sdd_artifacts", &json!({"path": path("T01"), "content": t01}).to_string()),
+        ("w2", "write_sdd_artifacts", &json!({"path": path("T02"), "content": t02}).to_string()),
+    ]);
+    let after = measure("steps-after", vec![both, decided(&[("P1", DECISION_ACCEPT, "agree", "Dividi em T01 e T02.")])]).await;
+    let report = |name: &str, steps: &[u64]| {
+        let total: u64 = steps.iter().sum();
+        println!("consenso {name}: {} passos, bytes de contexto por passo {steps:?}, total {total} (~{} tokens)", steps.len(), total / 4);
+    };
+    report("antes", &before);
+    report("depois", &after);
+    assert!(after.len() < before.len(), "antes {before:?}, depois {after:?}");
+    assert!(after.iter().sum::<u64>() < before.iter().sum::<u64>(), "antes {before:?}, depois {after:?}");
+}
+
+/// Spec 131 T03 (F-01): a tarefa acima de `MAX_TASK_BYTES` vai cortada no pedido com a marca de
+/// incompleta (ler antes de regravar), nunca como o arquivo inteiro; a tarefa íntegra vai como inteira.
+#[tokio::test]
+async fn cut_task_text_is_marked_incomplete_in_the_request() {
+    let root = plan_root("consensus-cut");
+    let long = EXAMPLE_TASK_MD.replace("O que implementar.", &format!("O que implementar. {}", "palavra ".repeat(MAX_TASK_BYTES / 4)));
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T01.md")), &long).expect("T01");
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"");
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")), &t02).expect("T02");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "too_large", "Mistura servidor e cliente.", None, false), ("T02", "untestable", "Critério vago.", None, false)]),
+        review(&[]),
+    ]);
+    let architect = Architect::new(vec![vec![decided(&[
+        ("P1", DECISION_REJECT, "not_worth_cost", "Fica assim."),
+        ("P2", DECISION_REJECT, "not_worth_cost", "Fica assim."),
+    ])]]);
+    let st = consensus_state(&root, reviewer, architect.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    // O pedido que o Arquiteto recebe (a cópia gravada na conversa é limitada).
+    let asked = architect.requests()[0].messages.last().map(|m| m.content.clone()).unwrap_or_default();
+    let t01 = format!(".sdd/specs/{SPEC}/tasks/T01.md");
+    assert!(
+        asked.contains(&format!("=== {t01} (INCOMPLETA: cortada ou com trecho redigido; leia com read_file antes de regravar) ===")),
+        "{asked}"
+    );
+    assert!(!asked.contains(&format!("=== {t01} (INTEIRA) ===")) && !asked.contains("o arquivo inteiro"), "{asked}");
+    assert!(asked.contains(&format!("=== .sdd/specs/{SPEC}/tasks/T02.md (INTEIRA) ===")), "{asked}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 131 T03 (F-02): dois `too_large` sem decisão em tarefas diferentes e só uma dividida: só o
+/// da tarefa alterada conta como ajustado; o outro segue sem resposta (a tarefa nova não basta).
+#[tokio::test]
+async fn only_the_split_task_too_large_is_inferred() {
+    let root = plan_root("consensus-two-large");
+    let t02 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T02\"").replace("Título da tarefa", "Outra");
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")), &t02).expect("T02");
+    let reviewer = Scripted::new(vec![
+        review(&[("T01", "too_large", "Mistura servidor e cliente.", None, false), ("T02", "too_large", "Mistura fila e banco.", None, false)]),
+        review(&[]),
+    ]);
+    let t01 = EXAMPLE_TASK_MD.replace("O que implementar.", "Só o servidor.");
+    let t03 = EXAMPLE_TASK_MD.replace("id: \"T01\"", "id: \"T03\"").replace("Título da tarefa", "Cliente");
+    let architect = Architect::new(vec![vec![
+        write_task_reply("a1", "T03", &t03),
+        write_task_reply("a2", "T01", &t01),
+        text("Dividi a T01."),
+        text("Sem bloco."),
+    ]]);
+    let st = consensus_state(&root, reviewer, architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    let by_id = |id: &str| rec.rounds[1].decisions.iter().find(|d| d.id == id).cloned().expect("decisão");
+    assert!(by_id("P1").inferred && by_id("P1").decision == DECISION_ACCEPT);
+    assert_eq!(by_id("P2").decision, crate::server::plan_consensus::DECISION_OPEN);
+    assert_eq!((rec.rounds[1].inferred, rec.rounds[1].unanswered), (1, 1));
+    assert_eq!(round_lines(&root)[0]["notice"]["code"], ROUND_OPEN_CODE);
     let _ = fs::remove_dir_all(&root);
 }

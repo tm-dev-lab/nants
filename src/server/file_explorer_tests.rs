@@ -65,6 +65,7 @@ fn state(root: &Path) -> AppState {
         api_key: SECRET.into(),
         wire_api: WireApi::default(),
         kind: Default::default(),
+        base_url_override: None,
     });
     cfg.projects.push(Project {
         id: PROJECT.into(),

@@ -95,7 +95,11 @@ pub fn cut_reason(err: &LlmError) -> Option<&'static str> {
             BadKind::ProviderError | BadKind::Throttled => None,
             kind => Some(kind.as_str()),
         },
-        LlmError::Http { .. } | LlmError::Config(_) | LlmError::Plan(_) => None,
+        LlmError::Http { .. }
+        | LlmError::Config(_)
+        | LlmError::Plan(_)
+        | LlmError::Limit(_)
+        | LlmError::KindNotSupported(_) => None,
     }
 }
 
@@ -114,6 +118,8 @@ pub(super) struct StreamDiag {
     head_truncated: bool,
     tail_truncated: bool,
     usage: Option<Usage>,
+    /// Uso da Anthropic acumulado de `message_start` e `message_delta` (spec 132 T04).
+    anthropic_usage: serde_json::Map<String, Value>,
 }
 
 impl StreamDiag {
@@ -131,6 +137,7 @@ impl StreamDiag {
             head_truncated: false,
             tail_truncated: false,
             usage: None,
+            anthropic_usage: serde_json::Map::new(),
         }
     }
 
@@ -150,6 +157,19 @@ impl StreamDiag {
             self.count("invalid_json");
             return;
         };
+        if let Some(kind) = v["event_type"].as_str() {
+            // Gemini (spec 132 T07): `step.delta` com o texto, o resumo do raciocínio ou os argumentos
+            // da chamada; o uso só vem no `interaction.completed`.
+            self.count(kind);
+            let delta = &v["delta"];
+            for piece in [delta["text"].as_str(), delta["content"]["text"].as_str(), delta["arguments"].as_str()].into_iter().flatten() {
+                self.text(piece);
+            }
+            if let Some(u) = super::gemini::usage(&v["interaction"]["usage"]) {
+                self.usage = Some(u);
+            }
+            return;
+        }
         if let Some(kind) = v["type"].as_str().or((!event.is_empty()).then_some(event)) {
             // Responses: `type` (ou o nome do evento SSE), `delta` e o `usage` da resposta.
             self.count(kind);
@@ -158,6 +178,16 @@ impl StreamDiag {
             }
             if let Some(u) = v["response"].get("usage").filter(|u| u.is_object()) {
                 self.usage = Some(responses_usage(u));
+            }
+            // Anthropic (spec 132 T04): o `delta` é um objeto com o texto, o thinking ou o JSON
+            // parcial da ferramenta, e o uso vem em `message_start` e `message_delta`.
+            for key in ["text", "thinking", "partial_json"] {
+                if let Some(piece) = v["delta"][key].as_str() {
+                    self.text(piece);
+                }
+            }
+            if let Some(u) = super::anthropic::stream_usage(&mut self.anthropic_usage, kind, &v) {
+                self.usage = Some(u);
             }
             return;
         }
@@ -271,6 +301,7 @@ fn responses_usage(u: &Value) -> Usage {
         completion: n("output_tokens"),
         cached: nested_tokens(u, "input_tokens_details", "cached_tokens"),
         reasoning: nested_tokens(u, "output_tokens_details", "reasoning_tokens"),
+        cache_write: None,
     }
 }
 
@@ -282,6 +313,7 @@ fn chat_usage(u: &Value) -> Usage {
         completion: n("completion_tokens"),
         cached: nested_tokens(u, "prompt_tokens_details", "cached_tokens"),
         reasoning: nested_tokens(u, "completion_tokens_details", "reasoning_tokens"),
+        cache_write: None,
     }
 }
 
@@ -400,7 +432,7 @@ mod tests {
         let ev = r#"{"type":"response.incomplete","response":{"usage":{"input_tokens":50,"output_tokens":7,"output_tokens_details":{"reasoning_tokens":3}}}}"#;
         d.observe("response.incomplete", ev);
         let cut = d.finish(&LlmError::Parse(BadReason::new(BadKind::Incomplete)), "").expect("corte");
-        assert_eq!(cut.usage(), Some((Usage { prompt: 50, completion: 7, cached: None, reasoning: Some(3) }, false)));
+        assert_eq!(cut.usage(), Some((Usage { prompt: 50, completion: 7, cached: None, reasoning: Some(3), cache_write: None }, false)));
         let d = StreamDiag::new(10);
         assert!(d.finish(&LlmError::Parse(BadReason::new(BadKind::ProviderError)), "").is_none());
         let d = StreamDiag::new(10);

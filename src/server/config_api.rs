@@ -89,8 +89,12 @@ struct ConnectionView {
     base_url: String,
     api_key_masked: String,
     wire_api: &'static str,
-    /// Como a conexão se autentica (spec 116): `api_key` ou `chatgpt_plan`.
+    /// Como a conexão se autentica (spec 116): `api_key` ou `chatgpt_plan`; e, desde a spec 132,
+    /// `anthropic` ou `google_gemini`.
     kind: &'static str,
+    /// Endereço avançado das conexões nativas (spec 132), quando houver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url_override: Option<String>,
     /// Estado do login da conexão pelo plano ChatGPT (spec 116), sem segredos.
     #[serde(skip_serializing_if = "Option::is_none")]
     chatgpt: Option<super::chatgpt::PlanStatus>,
@@ -109,10 +113,15 @@ struct ConnectionInput {
     /// Ausente em atualização mantém o valor salvo (`chat` em conexão nova).
     #[serde(default)]
     wire_api: Option<WireApi>,
-    /// Ausente = por chave. A conexão pelo plano ChatGPT só nasce do login (spec 116); por aqui,
-    /// ela só troca de nome.
+    /// Ausente = o tipo salvo (por chave em conexão nova). A conexão pelo plano ChatGPT só nasce do
+    /// login (spec 116); por aqui, ela só troca de nome. Texto livre para que um tipo desconhecido
+    /// dê o código próprio (`connection_kind_invalid`).
     #[serde(default)]
-    kind: Option<ConnectionKind>,
+    kind: Option<String>,
+    /// Endereço avançado das conexões nativas (spec 132): vazio volta ao oficial; ausente mantém o
+    /// salvo. Recusado nos outros tipos.
+    #[serde(default)]
+    base_url_override: Option<String>,
 }
 
 /// Corpo de `POST /api/config/connections/test`: `{id}` testa uma conexão salva;
@@ -124,6 +133,13 @@ struct TestInput {
     api_key: Option<String>,
     /// Sem modelo, o teste consulta a listagem; com modelo, faz uma chat completion.
     model: Option<String>,
+    /// Tipo da conexão ainda não salva (spec 132 T08): `anthropic` ou `google_gemini` testam pelo
+    /// endereço oficial (ou pelo avançado), sem `base_url`. Ausente = o tipo salvo, ou por chave.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Endereço avançado da conexão nativa a testar (spec 132 T08); ausente mantém o salvo.
+    #[serde(default)]
+    base_url_override: Option<String>,
 }
 
 /// Resultado do teste de conexão. `error` é sempre um código fixo; nenhum texto
@@ -189,6 +205,7 @@ fn connection_view(conn: &Connection) -> ConnectionView {
         api_key_masked: if conn.is_chatgpt_plan() { String::new() } else { mask_api_key(&conn.api_key) },
         wire_api: conn.wire_api.as_str(),
         kind: conn.kind.as_str(),
+        base_url_override: conn.base_url_override.as_deref().map(display_base_url),
         chatgpt: None,
     }
 }
@@ -403,20 +420,31 @@ pub async fn put_connection(
     validate_connection_id(&input.id)?;
     validate_text_field("name", &input.name)?;
 
+    let requested_kind = match input.kind.as_deref() {
+        Some(raw) => Some(ConnectionKind::parse(raw).ok_or_else(|| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_invalid", Map::new())
+        })?),
+        None => None,
+    };
+
     let mut guard = state.config().write().await;
     let mut next = guard.clone();
     let position = next.connections.iter().position(|c| c.id == input.id);
-    let saved_plan = position.and_then(|i| next.connections.get(i)).is_some_and(Connection::is_chatgpt_plan);
+    let saved_kind = position.and_then(|i| next.connections.get(i)).map(|c| c.kind);
+    let kind = requested_kind.or(saved_kind).unwrap_or_default();
     // Spec 116: a conexão pelo plano ChatGPT nasce do login e, por aqui, só troca de nome; o tipo
-    // de uma conexão salva não muda.
-    match (input.kind, saved_plan) {
-        (Some(ConnectionKind::ChatgptPlan), false) => {
-            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "chatgpt_plan_needs_login", Map::new()));
-        }
-        (Some(ConnectionKind::ApiKey), true) => {
-            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_fixed", Map::new()));
-        }
-        (_, true) => {
+    // de uma conexão salva não muda (spec 132: vale também para a Anthropic e o Gemini).
+    if kind == ConnectionKind::ChatgptPlan && saved_kind != Some(ConnectionKind::ChatgptPlan) {
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "chatgpt_plan_needs_login", Map::new()));
+    }
+    if saved_kind.is_some_and(|saved| saved != kind) {
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_fixed", Map::new()));
+    }
+    if !kind.is_native() && input.base_url_override.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_override_not_allowed", Map::new()));
+    }
+    match kind {
+        ConnectionKind::ChatgptPlan => {
             let Some(conn) = position.and_then(|i| next.connections.get_mut(i)) else {
                 return Err(ApiError::coded(StatusCode::NOT_FOUND, "connection_not_found", Map::new()));
             };
@@ -427,7 +455,12 @@ pub async fn put_connection(
             *guard = next;
             return Ok((StatusCode::OK, Json(view)).into_response());
         }
-        _ => {}
+        ConnectionKind::Anthropic | ConnectionKind::GoogleGemini => {
+            let saved = position.and_then(|i| next.connections.get(i));
+            let connection = native_connection(input, kind, saved)?;
+            return save_connection(&state, guard, next, position, connection).await;
+        }
+        ConnectionKind::ApiKey => {}
     }
     let base_url = validate_base_url(&input.base_url)?;
     let provided_key = input.api_key.trim();
@@ -453,7 +486,6 @@ pub async fn put_connection(
         provided_key.to_string()
     };
 
-    let connection_id = input.id.clone();
     let connection = Connection {
         id: input.id,
         name: input.name,
@@ -461,14 +493,63 @@ pub async fn put_connection(
         api_key,
         wire_api,
         kind: Default::default(),
+        base_url_override: None,
     };
+    save_connection(&state, guard, next, position, connection).await
+}
+
+/// Conexão nativa (Anthropic ou Google Gemini, spec 132) a partir do corpo do `PUT`: endereço
+/// oficial fixo, protocolo do tipo e o endereço avançado opcional validado. A chave salva só é
+/// mantida para o mesmo endereço efetivo, como na conexão por chave.
+fn native_connection(input: ConnectionInput, kind: ConnectionKind, saved: Option<&Connection>) -> Result<Connection, ApiError> {
+    let base_url_override = match input.base_url_override.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(raw) => Some(validate_base_url(raw).map_err(|_| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_override_invalid", Map::new())
+        })?),
+        None => saved.and_then(|c| c.base_url_override.clone()),
+    };
+    let mut connection = Connection {
+        id: input.id,
+        name: input.name,
+        base_url: String::new(),
+        api_key: String::new(),
+        wire_api: WireApi::Chat,
+        kind,
+        base_url_override,
+    };
+    connection.normalize();
+    let provided_key = input.api_key.trim();
+    connection.api_key = if provided_key.is_empty() {
+        let saved = saved.ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_new", Map::new()))?;
+        if saved.endpoint() != connection.endpoint() {
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_base_url", Map::new()));
+        }
+        saved.api_key.clone()
+    } else {
+        validate_api_key(provided_key)?;
+        provided_key.to_string()
+    };
+    Ok(connection)
+}
+
+/// Grava a conexão criada ou atualizada (na posição `position`, ou no fim) e responde com a vista
+/// dela, sem segredo.
+async fn save_connection(
+    state: &AppState,
+    mut guard: tokio::sync::RwLockWriteGuard<'_, Config>,
+    mut next: Config,
+    position: Option<usize>,
+    connection: Connection,
+) -> Result<Response, ApiError> {
+    let connection_id = connection.id.clone();
     let view = connection_view(&connection);
     match position {
         Some(i) if i < next.connections.len() => next.connections[i] = connection,
         _ => next.connections.push(connection),
     }
 
-    persist(&state, &next).await?;
+    persist(state, &next).await?;
     *guard = next;
     // Listagens em cache da conexão deixam de valer após a troca de endpoint ou chave.
     state.models_cache().invalidate_connection(&connection_id);
@@ -570,12 +651,24 @@ pub async fn put_agents(State(state): State<AppState>, body: Bytes) -> Result<Re
     Ok(response)
 }
 
-/// Modelos em uso pelos três agentes (sem repetição, sem vazios).
-fn models_in_use(cfg: &Config) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for m in [&cfg.agents.architect.model, &cfg.agents.developer.model, &cfg.agents.reviewer.model] {
-        if !m.trim().is_empty() && !out.contains(m) {
-            out.push(m.clone());
+/// Modelos em uso pelos três agentes (sem repetição, sem vazios), com o tipo da conexão de cada um
+/// (spec 132 T02: o preço do catálogo segue o provedor). O mesmo modelo em conexões de tipos
+/// diferentes fica com o tipo nativo, quando houver.
+fn models_in_use(cfg: &Config) -> Vec<(String, ConnectionKind)> {
+    let mut out: Vec<(String, ConnectionKind)> = Vec::new();
+    for agent in [&cfg.agents.architect, &cfg.agents.developer, &cfg.agents.reviewer] {
+        if agent.model.trim().is_empty() {
+            continue;
+        }
+        let kind = cfg
+            .connections
+            .iter()
+            .find(|c| c.id == agent.connection_id)
+            .map_or(ConnectionKind::ApiKey, |c| c.kind);
+        match out.iter_mut().find(|(m, _)| *m == agent.model) {
+            Some(entry) if kind.is_native() && !entry.1.is_native() => entry.1 = kind,
+            Some(_) => {}
+            None => out.push((agent.model.clone(), kind)),
         }
     }
     out
@@ -607,6 +700,10 @@ pub struct EstimateQuery {
     models: String,
     #[serde(default)]
     refresh: bool,
+    /// Tipo da conexão dos modelos pedidos (spec 132 T10: a sugestão de modelo de uma conexão nova,
+    /// cujos modelos ainda não estão em uso). Ausente = o tipo da conexão do agente que usa o modelo.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 /// `GET /api/config/pricing/estimate?models=a,b`: estimativas do catálogo para os modelos
@@ -620,10 +717,20 @@ pub async fn get_estimate(
     for name in &names {
         validate_text_field("model", name)?;
     }
+    let requested_kind = match q.kind.as_deref() {
+        Some(raw) => Some(ConnectionKind::parse(raw).ok_or_else(|| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_invalid", Map::new())
+        })?),
+        None => None,
+    };
+    let in_use = models_in_use(&*state.config().read().await);
     let dir = state.config_path().parent().map(Path::to_path_buf).unwrap_or_default();
     if let Some(catalog) = price_catalog::current_catalog(state.price_fetcher(), &dir, q.refresh).await {
         for name in names {
-            if let Some(p) = catalog.lookup(name) {
+            // Spec 132 T02: o modelo em uso por um agente segue o tipo da conexão dele.
+            // Com `kind` no pedido, ele vale para todos os modelos (spec 132 T10).
+            let kind = requested_kind.unwrap_or_else(|| in_use.iter().find(|(m, _)| m == name).map_or(ConnectionKind::ApiKey, |(_, k)| *k));
+            if let Some(p) = catalog.lookup_for(name, kind) {
                 out.insert(name.to_string(), p);
             }
         }
@@ -722,11 +829,27 @@ async fn resolve_test_target(
     if let Some(model) = input.model.as_deref() {
         validate_text_field("model", model)?;
     }
+    let requested_kind = match input.kind.as_deref() {
+        Some(raw) => Some(ConnectionKind::parse(raw).ok_or_else(|| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_invalid", Map::new())
+        })?),
+        None => None,
+    };
     let guard = state.config().read().await;
     let saved = input
         .id
         .as_deref()
         .and_then(|id| guard.connections.iter().find(|c| c.id == id));
+    if let (Some(kind), Some(saved)) = (requested_kind, saved) {
+        if kind != saved.kind {
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_kind_fixed", Map::new()));
+        }
+    }
+    if !requested_kind.or(saved.map(|c| c.kind)).is_some_and(ConnectionKind::is_native)
+        && input.base_url_override.as_deref().is_some_and(|u| !u.trim().is_empty())
+    {
+        return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_override_not_allowed", Map::new()));
+    }
 
     let conn = match (&input.base_url, saved) {
         // Plano ChatGPT (spec 116 T02): endereço fixo e sem chave; testa a conexão salva, com o
@@ -734,6 +857,13 @@ async fn resolve_test_target(
         (_, Some(saved)) if saved.is_chatgpt_plan() => {
             let model = input.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
             return Ok((saved.clone(), model));
+        }
+        // Anthropic e Google Gemini (spec 132): o endereço é o oficial ou o avançado, nunca o
+        // `base_url` do corpo; a chave do corpo, quando houver, substitui a salva.
+        (_, Some(saved)) if saved.kind.is_native() => native_test_target(&input, saved.kind, Some(saved))?,
+        // Conexão nativa ainda não salva (spec 132 T08): o tipo vem no corpo, com a chave.
+        (_, None) if requested_kind.is_some_and(ConnectionKind::is_native) => {
+            native_test_target(&input, requested_kind.unwrap_or_default(), None)?
         }
         (None, Some(saved)) => {
             // Conexão salva antes da validação atual (ex.: editada à mão): não usar.
@@ -771,6 +901,7 @@ async fn resolve_test_target(
                 api_key,
                 wire_api: saved.map(|c| c.wire_api).unwrap_or_default(),
                 kind: Default::default(),
+                base_url_override: None,
             }
         }
     };
@@ -788,31 +919,86 @@ async fn resolve_test_target(
     Ok((conn, model))
 }
 
+/// Conexão nativa a testar (spec 132 T08): o tipo `kind`, o endereço avançado do corpo (vazio volta
+/// ao oficial; ausente mantém o salvo) e a chave do corpo ou a salva. A chave salva só vale para o
+/// mesmo endereço.
+fn native_test_target(input: &TestInput, kind: ConnectionKind, saved: Option<&Connection>) -> Result<Connection, ApiError> {
+    let base_url_override = match input.base_url_override.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(raw) => Some(validate_base_url(raw).map_err(|_| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "base_url_override_invalid", Map::new())
+        })?),
+        None => saved.and_then(|c| c.base_url_override.clone()),
+    };
+    let mut conn = Connection::native(input.id.clone().unwrap_or_default(), String::new(), kind, String::new());
+    conn.base_url_override = base_url_override;
+    conn.normalize();
+    conn.api_key = match (input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()), saved) {
+        (Some(key), _) => {
+            validate_api_key(key)?;
+            key.to_string()
+        }
+        (None, Some(saved)) if saved.endpoint() == conn.endpoint() => saved.api_key.clone(),
+        (None, Some(_)) => {
+            return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required_other_url", Map::new()))
+        }
+        (None, None) => return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "api_key_required", Map::new())),
+    };
+    if let Some(saved) = saved {
+        conn.name = saved.name.clone();
+    }
+    Ok(conn)
+}
+
 /// Teste pela listagem (sem modelo) com timeout `TEST_TIMEOUT`.
 async fn run_models_probe(conn: &Connection) -> TestResult {
     run_models_probe_with(conn, TEST_TIMEOUT).await
 }
 
-/// Teste sem modelo: `GET {base_url}/models` pelo mesmo caminho e parser da listagem.
-/// Não usa nem grava o cache de modelos. Códigos fixos, sem eco de corpo ou URL.
+/// Teste sem modelo: a listagem pelo mesmo caminho e parser de `GET .../models`, no endereço da
+/// conexão ([`Connection::endpoint`], que respeita o avançado das nativas). Não usa nem grava o
+/// cache de modelos. Códigos fixos, sem eco de corpo ou URL.
 pub async fn run_models_probe_with(conn: &Connection, timeout: Duration) -> TestResult {
+    models_probe_listing(conn, timeout).await.0
+}
+
+/// O teste pela listagem e, no sucesso, os modelos listados (na ordem do provedor nas conexões
+/// nativas).
+async fn models_probe_listing(conn: &Connection, timeout: Duration) -> (TestResult, Option<Vec<models_api::ModelInfo>>) {
     let started = Instant::now();
-    match models_api::fetch(conn, &conn.base_url, timeout).await {
-        Ok(list) => TestResult {
-            ok: true,
-            latency_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            error: None,
-            status: None,
-            models_count: Some(list.models.len()),
-        },
-        Err(failure) => TestResult {
-            ok: false,
-            latency_ms: None,
-            error: Some(failure.code),
-            status: failure.status,
-            models_count: None,
-        },
+    match models_api::fetch(conn, conn.endpoint(), timeout).await {
+        Ok(list) => (
+            TestResult {
+                ok: true,
+                latency_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                error: None,
+                status: None,
+                models_count: Some(list.models.len()),
+            },
+            Some(list.models),
+        ),
+        Err(failure) => (
+            TestResult {
+                ok: false,
+                latency_ms: None,
+                error: Some(failure.code),
+                status: failure.status,
+                models_count: None,
+            },
+            None,
+        ),
     }
+}
+
+/// Resposta do teste sem modelo das conexões nativas (spec 132 T10): o resultado de sempre e a
+/// lista de modelos, para a tela de nova conexão mostrar o que a chave alcança antes de salvar.
+/// Os ids passam pelo mesmo filtro da listagem (`valid_model_id`), que recusa o segredo.
+#[derive(Serialize)]
+struct NativeProbeBody {
+    #[serde(flatten)]
+    result: TestResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<models_api::ModelInfo>>,
 }
 
 /// Handshake mínimo com timeout `TEST_TIMEOUT`.
@@ -848,11 +1034,28 @@ pub async fn run_handshake_with(conn: &Connection, model: String, timeout: Durat
         Ok(client) => client.with_throttle_delays(Vec::new()).without_pacing(),
         Err(e) => return classify_error(&e),
     };
-    handshake(&client, model).await
+    // Spec 132 T08: nos nativos, a chave recusada, a falta de permissão, o modelo inexistente, o
+    // limite de taxa e o teto de gasto têm códigos próprios.
+    match ping(&client, model).await {
+        Ok(result) => result,
+        Err(e) if conn.kind.is_native() => native_result(&e),
+        Err(e) => classify_error(&e),
+    }
+}
+
+/// Resultado do teste nativo pelo código de [`super::models_native::classify`] (com modelo).
+fn native_result(err: &LlmError) -> TestResult {
+    let failure = super::models_native::classify(err, true);
+    TestResult { ok: false, latency_ms: None, error: Some(failure.code), status: failure.status, models_count: None }
 }
 
 /// Uma chamada "ping" pelo cliente pronto; só códigos fixos no resultado.
 async fn handshake(client: &LlmClient, model: String) -> TestResult {
+    ping(client, model).await.unwrap_or_else(|e| classify_error(&e))
+}
+
+/// A chamada "ping": o resultado de sucesso, ou o erro para quem escolhe o código.
+async fn ping(client: &LlmClient, model: String) -> Result<TestResult, LlmError> {
     let req = ChatRequest {
         model,
         messages: vec![ChatMessage::text(Role::User, "ping")],
@@ -861,18 +1064,17 @@ async fn handshake(client: &LlmClient, model: String) -> TestResult {
         response_json: false,
         web_search: false,
         cache_key: None,
+        web_search_max_uses: None,
     };
     let started = Instant::now();
-    match client.chat(&req).await {
-        Ok(_) => TestResult {
-            ok: true,
-            latency_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            error: None,
-            status: None,
-            models_count: None,
-        },
-        Err(e) => classify_error(&e),
-    }
+    client.chat(&req).await?;
+    Ok(TestResult {
+        ok: true,
+        latency_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        error: None,
+        status: None,
+        models_count: None,
+    })
 }
 
 /// Mapeia `LlmError` para código fixo. Nunca usa a mensagem do erro.
@@ -885,6 +1087,10 @@ fn classify_error(err: &LlmError) -> TestResult {
         LlmError::Parse(_) => ("bad_response", None),
         // Plano ChatGPT (spec 116 T02): `plan_limit`, `plan_not_eligible` ou `plan_needs_login`.
         LlmError::Plan(plan) => (plan.as_str(), None),
+        // Spec 132 T09: `spend_limit` ou `daily_quota`.
+        LlmError::Limit(limit) => (limit.as_str(), None),
+        // Spec 132 T01: Anthropic e Google Gemini ainda sem adaptador.
+        LlmError::KindNotSupported(_) => (models_api::KIND_NOT_SUPPORTED.code, None),
     };
     TestResult {
         ok: false,
@@ -908,6 +1114,10 @@ pub async fn test_connection(
     }
     let result = match model {
         Some(model) => run_handshake(&conn, model).await,
+        None if conn.kind.is_native() => {
+            let (result, models) = models_probe_listing(&conn, TEST_TIMEOUT).await;
+            return Ok((StatusCode::OK, Json(NativeProbeBody { result, models })).into_response());
+        }
         None => run_models_probe(&conn).await,
     };
     Ok((StatusCode::OK, Json(result)).into_response())
@@ -938,6 +1148,7 @@ mod tests {
                     api_key: KEY.to_string(),
                     wire_api: WireApi::default(),
                     kind: Default::default(),
+                    base_url_override: None,
                 }],
                 ..Config::default()
             };
@@ -964,6 +1175,7 @@ mod tests {
                     api_key: KEY.to_string(),
                     wire_api: wire,
                     kind: Default::default(),
+                    base_url_override: None,
                 }],
                 ..Config::default()
             };
@@ -1271,7 +1483,7 @@ mod pricing_estimate_tests {
         if let Some((m, v)) = manual {
             cfg.pricing.insert(
                 m.to_string(),
-                Pricing { input_per_mtok: v, output_per_mtok: v, cached_input_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None },
+                Pricing { input_per_mtok: v, output_per_mtok: v, cached_input_per_mtok: None, cache_write_per_mtok: None, web_search_per_call: None, image_per_unit: None, source: Default::default(), estimated_at: None },
             );
         }
         let body = net.then(|| FIXTURE.as_bytes().to_vec());
@@ -1284,7 +1496,7 @@ mod pricing_estimate_tests {
     }
 
     fn q(models: &str) -> axum::extract::Query<EstimateQuery> {
-        axum::extract::Query(EstimateQuery { models: models.to_string(), refresh: false })
+        axum::extract::Query(EstimateQuery { models: models.to_string(), refresh: false, kind: None })
     }
 
     #[tokio::test]
@@ -1310,6 +1522,49 @@ mod pricing_estimate_tests {
         assert!(v.get("desconhecido").is_none());
         let saved = std::fs::read_to_string(st.config_path()).expect("persistido");
         assert!(saved.contains("estimated"));
+    }
+
+    /// Spec 132 T02: o modelo de um agente numa conexão nativa usa o preço do próprio provedor
+    /// (`gemini/<id>`, `anthropic/<id>`), no autofill e na estimativa; fora de uso, o id exato.
+    #[tokio::test]
+    async fn conexao_nativa_usa_o_preco_do_proprio_provedor() {
+        const NATIVOS: &str = r#"{
+          "gemini-y":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000004},
+          "gemini/gemini-y":{"input_cost_per_token":0.0000003,"output_cost_per_token":0.0000025},
+          "claude-y":{"input_cost_per_token":0.000009,"output_cost_per_token":0.00002},
+          "anthropic/claude-y":{"input_cost_per_token":0.000003,"output_cost_per_token":0.000015,"cache_creation_input_token_cost":0.00000375}}"#;
+        let dir = std::env::temp_dir().join(format!("nants-est-nativo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut cfg = Config::default();
+        cfg.connections.push(Connection::native("g", "Gemini", ConnectionKind::GoogleGemini, "env:NANTS_TESTE_G"));
+        cfg.connections.push(Connection::native("a", "Anthropic", ConnectionKind::Anthropic, "env:NANTS_TESTE_A"));
+        cfg.agents.architect.model = "gemini-y".into();
+        cfg.agents.architect.connection_id = "g".into();
+        cfg.agents.developer.model = "claude-y".into();
+        cfg.agents.developer.connection_id = "a".into();
+        cfg.agents.reviewer.model = "gemini-y".into();
+        let st = AppState::new(dir.join("config.toml"), cfg, 3000)
+            .with_price_fetcher(Arc::new(StaticPriceFetcher(Some(NATIVOS.as_bytes().to_vec()))));
+        let est = json_of(get_estimate(State(st.clone()), q("gemini-y,claude-y")).await.expect("ok")).await;
+        assert_eq!(est["gemini-y"]["input_per_mtok"], 0.3, "o tipo nativo vence o revisor sem conexão");
+        assert_eq!(est["claude-y"]["input_per_mtok"], 3.0);
+        assert_eq!(est["claude-y"]["cache_write_per_mtok"], 3.75);
+        // Spec 132 T10: com o `kind` no pedido, o modelo fora de uso usa o preço do provedor.
+        let by_kind = |models: &str, kind: &str| axum::extract::Query(EstimateQuery { models: models.into(), refresh: false, kind: Some(kind.into()) });
+        let est = json_of(get_estimate(State(st.clone()), by_kind("gemini-y", "google_gemini")).await.expect("ok")).await;
+        assert_eq!(est["gemini-y"]["input_per_mtok"], 0.3);
+        let est = json_of(get_estimate(State(st.clone()), by_kind("claude-y", "api_key")).await.expect("ok")).await;
+        assert_eq!(est["claude-y"]["input_per_mtok"], 9.0, "o kind do pedido vence o do agente");
+        // Spec 132 T11: o `kind` desconhecido é um 422 com o código, não só um erro qualquer.
+        let Err(err) = get_estimate(State(st.clone()), by_kind("claude-y", "azure")).await else {
+            panic!("kind inválido aceito");
+        };
+        assert_eq!((err.status(), err.code()), (StatusCode::UNPROCESSABLE_ENTITY, Some("connection_kind_invalid")));
+        let v = json_of(post_autofill(State(st.clone()), q("")).await.expect("ok")).await;
+        assert_eq!(v["gemini-y"]["input_per_mtok"], 0.3);
+        assert_eq!(v["claude-y"]["output_per_mtok"], 15.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1343,6 +1598,7 @@ mod pricing_estimate_tests {
                 id: "c".into(), name: "n".into(), base_url: "https://a.example/v1".into(),
                 api_key: "k".into(), wire_api: WireApi::default(),
                 kind: Default::default(),
+                base_url_override: None,
             });
         }
         let body = r#"{"architect":{"connection_id":"c","model":"gpt-4o","effort":"low"},
@@ -1379,6 +1635,7 @@ mod pricing_estimate_tests {
                 id: "c".into(), name: "n".into(), base_url: "https://a.example/v1".into(),
                 api_key: "k".into(), wire_api: WireApi::default(),
                 kind: Default::default(),
+                base_url_override: None,
             });
         }
         let body = |dev: &str| format!(
@@ -1407,5 +1664,179 @@ mod pricing_estimate_tests {
         // Sem o campo: volta ao padrão do papel.
         put_agents(State(st.clone()), Bytes::from(body(""))).await.expect("ok");
         assert_eq!(st.config().read().await.agents.developer.max_steps, None);
+    }
+
+    /// Spec 132 T01: conexões Anthropic e Google Gemini pelas rotas de configuração.
+    mod native_kinds {
+        use super::*;
+        use crate::config::{ANTHROPIC_BASE_URL, GOOGLE_GEMINI_BASE_URL};
+        use serde_json::json;
+
+        const ENV_KEY: &str = "env:NANTS_T132_ANTHROPIC";
+        const LITERAL: &str = "valor-literal-qualquer-7788";
+
+        fn empty_state() -> AppState {
+            let dir = std::env::temp_dir().join(format!(
+                "nants-t132-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).expect("dir");
+            AppState::new(dir.join("config.toml"), Config::default(), 3000)
+        }
+
+        async fn put(state: &AppState, body: serde_json::Value) -> Result<serde_json::Value, ApiError> {
+            let resp = put_connection(State(state.clone()), Bytes::from(body.to_string())).await?;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("corpo");
+            Ok(serde_json::from_slice(&bytes).expect("json"))
+        }
+
+        async fn put_code(state: &AppState, body: serde_json::Value) -> Option<&'static str> {
+            let err = put(state, body).await.expect_err("recusa");
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            err.code()
+        }
+
+        async fn view(state: &AppState) -> String {
+            let resp = get_config(State(state.clone())).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("corpo");
+            String::from_utf8(bytes.to_vec()).expect("utf8")
+        }
+
+        fn saved(state: &AppState, id: &str) -> Option<Connection> {
+            state.config().try_read().expect("leitura").connections.iter().find(|c| c.id == id).cloned()
+        }
+
+        #[tokio::test]
+        async fn cria_anthropic_e_gemini_com_url_fixa_e_get_mostra_o_tipo_sem_segredo() {
+            let st = empty_state();
+            let v = put(&st, json!({"id":"anth","name":"Claude","kind":"anthropic","base_url":"https://outro.example.com","api_key":ENV_KEY,"wire_api":"responses"}))
+                .await
+                .expect("anthropic");
+            assert_eq!((v["kind"].as_str(), v["base_url"].as_str()), (Some("anthropic"), Some(ANTHROPIC_BASE_URL)));
+            put(&st, json!({"id":"gem","name":"Gemini","kind":"google_gemini","api_key":LITERAL})).await.expect("gemini");
+
+            let anth = saved(&st, "anth").expect("salva");
+            assert_eq!(
+                (anth.kind, anth.base_url.as_str(), anth.wire_api, anth.api_key.as_str()),
+                (ConnectionKind::Anthropic, ANTHROPIC_BASE_URL, WireApi::Chat, ENV_KEY)
+            );
+            let gem = saved(&st, "gem").expect("salva");
+            assert_eq!((gem.kind, gem.base_url.as_str()), (ConnectionKind::GoogleGemini, GOOGLE_GEMINI_BASE_URL));
+
+            let body = view(&st).await;
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let conns = json["connections"].as_array().expect("lista");
+            assert_eq!(conns[0]["kind"], "anthropic", "{body}");
+            assert_eq!(conns[0]["api_key_masked"], ENV_KEY, "{body}");
+            assert_eq!(conns[1]["kind"], "google_gemini", "{body}");
+            assert_eq!(conns[1]["api_key_masked"], "********7788", "{body}");
+            assert!(conns.iter().all(|c| c.get("api_key").is_none() && c.get("base_url_override").is_none()), "{body}");
+            assert!(!body.contains(LITERAL), "{body}");
+
+            let toml = std::fs::read_to_string(st.config_path()).expect("gravado");
+            assert!(toml.contains("kind = \"anthropic\"") && toml.contains("kind = \"google_gemini\""), "{toml}");
+            let current = st.config().try_read().expect("leitura").clone();
+            assert_eq!(Config::load_from(st.config_path()).expect("recarrega"), current);
+        }
+
+        #[tokio::test]
+        async fn tipo_invalido_da_422_com_codigo_e_nao_grava() {
+            let st = empty_state();
+            for kind in ["azure", "", "Anthropic"] {
+                let code = put_code(&st, json!({"id":"x","name":"x","kind":kind,"base_url":"https://h.example.com","api_key":ENV_KEY})).await;
+                assert_eq!(code, Some("connection_kind_invalid"), "{kind:?}");
+            }
+            let code = put_code(&st, json!({"id":"x","name":"x","kind":7,"api_key":ENV_KEY})).await;
+            assert_eq!(code, Some("json_invalid_fields"));
+            assert!(st.config().try_read().expect("leitura").connections.is_empty());
+            assert!(!st.config_path().exists());
+        }
+
+        #[tokio::test]
+        async fn endereco_avancado_e_validado_e_so_vale_nas_nativas() {
+            let st = empty_state();
+            put(&st, json!({"id":"gem","name":"G","kind":"google_gemini","api_key":ENV_KEY,"base_url_override":"HTTPS://Proxy.Example.com/gemini/"}))
+                .await
+                .expect("ok");
+            let gem = saved(&st, "gem").expect("salva");
+            assert_eq!(gem.base_url_override.as_deref(), Some("https://proxy.example.com/gemini"));
+            assert_eq!(gem.base_url, GOOGLE_GEMINI_BASE_URL);
+            assert!(view(&st).await.contains("\"base_url_override\":\"https://proxy.example.com/gemini\""));
+
+            for bad in ["ftp://h.example.com", "https://u:p@h.example.com", "https://h.example.com/?q=1", "nada"] {
+                let code = put_code(&st, json!({"id":"gem","name":"G","api_key":ENV_KEY,"base_url_override":bad})).await;
+                assert_eq!(code, Some("base_url_override_invalid"), "{bad}");
+            }
+            let code = put_code(
+                &st,
+                json!({"id":"k","name":"K","base_url":"https://h.example.com/v1","api_key":ENV_KEY,"base_url_override":"https://p.example.com"}),
+            )
+            .await;
+            assert_eq!(code, Some("base_url_override_not_allowed"));
+
+            // Sem o campo, o salvo fica; vazio volta ao oficial (com a chave, porque o endereço mudou).
+            put(&st, json!({"id":"gem","name":"Outro nome","api_key":""})).await.expect("mantém");
+            assert_eq!(saved(&st, "gem").expect("salva").endpoint(), "https://proxy.example.com/gemini");
+            let code = put_code(&st, json!({"id":"gem","name":"G","api_key":"","base_url_override":""})).await;
+            assert_eq!(code, Some("api_key_required_base_url"));
+            put(&st, json!({"id":"gem","name":"G","api_key":ENV_KEY,"base_url_override":""})).await.expect("oficial");
+            let gem = saved(&st, "gem").expect("salva");
+            assert_eq!((gem.base_url_override.as_deref(), gem.endpoint()), (None, GOOGLE_GEMINI_BASE_URL));
+        }
+
+        #[tokio::test]
+        async fn tipo_salvo_nao_muda_e_chave_vazia_mantem_a_salva() {
+            let st = empty_state();
+            let code = put_code(&st, json!({"id":"anth","name":"A","kind":"anthropic","api_key":""})).await;
+            assert_eq!(code, Some("api_key_required_new"));
+            let code = put_code(&st, json!({"id":"anth","name":"A","kind":"anthropic","api_key":"env:1INVALIDA"})).await;
+            assert_eq!(code, Some("api_key_env_invalid"));
+            put(&st, json!({"id":"anth","name":"A","kind":"anthropic","api_key":ENV_KEY})).await.expect("cria");
+            for kind in ["google_gemini", "api_key"] {
+                let code = put_code(&st, json!({"id":"anth","name":"A","kind":kind,"base_url":"https://h.example.com","api_key":ENV_KEY})).await;
+                assert_eq!(code, Some("connection_kind_fixed"), "{kind}");
+            }
+            let code = put_code(&st, json!({"id":"anth","name":"A","kind":"chatgpt_plan"})).await;
+            assert_eq!(code, Some("chatgpt_plan_needs_login"));
+            put(&st, json!({"id":"anth","name":"Novo","api_key":""})).await.expect("renomeia");
+            let anth = saved(&st, "anth").expect("salva");
+            assert_eq!((anth.name.as_str(), anth.kind, anth.api_key.as_str()), ("Novo", ConnectionKind::Anthropic, ENV_KEY));
+            // A conexão por chave também não vira nativa.
+            put(&st, json!({"id":"k","name":"K","base_url":"https://h.example.com/v1","api_key":ENV_KEY})).await.expect("por chave");
+            let code = put_code(&st, json!({"id":"k","name":"K","kind":"anthropic","api_key":ENV_KEY})).await;
+            assert_eq!(code, Some("connection_kind_fixed"));
+        }
+
+        #[tokio::test]
+        async fn teste_e_listagem_das_nativas_dao_codigo_sem_ir_a_rede() {
+            let st = empty_state();
+            put(&st, json!({"id":"anth","name":"A","kind":"anthropic","api_key":ENV_KEY})).await.expect("cria");
+            put(&st, json!({"id":"gem","name":"G","kind":"google_gemini","api_key":ENV_KEY})).await.expect("cria");
+            let cases = [
+                json!({"id":"anth"}),
+                json!({"id":"gem","base_url":"https://outro.example.com"}),
+            ];
+            for body in cases {
+                let resp = test_connection(State(st.clone()), Bytes::from(body.to_string())).await.expect("ok");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("corpo");
+                let result: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(result["ok"], false, "{body}");
+                // Spec 132 T08: a lista já vai pela Models API do provedor; a chave `env:` indefinida
+                // para antes da rede, como configuração inválida.
+                assert_eq!(result["error"], "invalid_config", "{body}");
+            }
+            // Spec 132: com modelo, os nativos já vão pelo adaptador (Anthropic na T03, Gemini na T06);
+            // a chave `env:` indefinida para antes da rede, como configuração inválida.
+            for body in [json!({"id":"anth","model":"m"}), json!({"id":"gem","model":"m","api_key":ENV_KEY})] {
+                let resp = test_connection(State(st.clone()), Bytes::from(body.to_string())).await.expect("ok");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("corpo");
+                let result: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!((result["ok"].clone(), result["error"].clone()), (json!(false), json!("invalid_config")), "{body}");
+            }
+            let anth = saved(&st, "anth").expect("salva");
+            let failure = models_api::fetch(&anth, anth.endpoint(), Duration::from_secs(1)).await.expect_err("sem listagem");
+            assert_eq!(failure.code, "invalid_config");
+        }
     }
 }

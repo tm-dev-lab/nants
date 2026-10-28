@@ -44,7 +44,8 @@ const ACTIVITY_CODES = [
   "tool.read_file", "tool.list_dir", "tool.search_code", "tool.write_file", "tool.write_sdd_artifacts", "tool.run_command",
   "tool.fetch_url", "tool.package_versions", "tool.web_source", "tool.web_search_unavailable", "tool.view_reference",
   "tool.view_screenshot", "tool.images_refused", "tool.generate_image", "tool.image_failed", "tool.other",
-  "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry",
+  "tool.read_spec_section", "tool.read_spec_index",
+  "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry", "provider.web_search_retry",
 ];
 const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable", "task.recurring_arbitration", "task.recurring_recovery", "task.recurring_unavailable"];
 

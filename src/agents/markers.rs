@@ -92,6 +92,26 @@ pub fn contains_any(line: &str, key: &str) -> bool {
     i18n::forms(key).iter().any(|form| text.contains(&fold(form)))
 }
 
+/// Spec 131 T02: situação de uma linha de critério do Desenvolvedor (`- critério: atendido: evidência`),
+/// em qualquer idioma do dicionário: `Some((true, evidência))` no atendido, `Some((false, resto))`
+/// no não atendido e `None` sem a marca. O texto devolvido sai normalizado (minúsculas, sem acentos).
+pub fn criterion_status(line: &str) -> Option<(bool, String)> {
+    let text = fold(line);
+    for form in i18n::forms(NOT_MET) {
+        let pattern = format!(": {}", fold(form));
+        if let Some(at) = text.find(&pattern) {
+            return Some((false, text[at + pattern.len()..].to_string()));
+        }
+    }
+    for form in i18n::forms(MET) {
+        let pattern = format!(": {}:", fold(form));
+        if let Some(at) = text.find(&pattern) {
+            return Some((true, text[at + pattern.len()..].trim().to_string()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +140,15 @@ mod tests {
             assert_ne!(text(Lang::PtBr, key), key, "{key} sem texto");
         }
         assert_eq!(i18n::forms(&format!("{STATE_OPEN}.other")).len(), 2);
+    }
+
+    #[test]
+    fn criterion_status_reads_both_languages() {
+        assert_eq!(criterion_status("- A: met: `tests/a.py::t`"), Some((true, "`tests/a.py::t`".into())));
+        assert_eq!(criterion_status("- Critério B: atendido: src/b.rs:3"), Some((true, "src/b.rs:3".into())));
+        assert!(matches!(criterion_status("- A: not met: falta X"), Some((false, _))));
+        assert!(matches!(criterion_status("- B: não atendido: falta Y"), Some((false, _))));
+        assert_eq!(criterion_status("- só texto"), None);
     }
 
     #[test]

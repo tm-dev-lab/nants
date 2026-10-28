@@ -600,13 +600,15 @@ impl ComposeEnv {
     /// Spec 129 T02: roda `command` no `workspace` num container que NÃO é removido ao fim (`run`
     /// sem `--rm`, nome do Nants e rótulo `nants.project`), lista com [`Self::container_diff`] o que
     /// ele gravou e remove o container logo depois, também quando a execução ou a listagem falham.
-    /// `Err` = falha do Docker (o código de saída do comando vai no resultado).
-    pub fn run_kept(&self, dir: &Path, command: &str, timeout: Duration) -> Result<KeptRun, String> {
+    /// `Err` = falha do Docker (o código de saída do comando vai no resultado). Spec 131 T05: a
+    /// listagem que falha não apaga o resultado do comando (ele é a instalação de verdade); vai em
+    /// [`KeptRun::diff`]. `progress` recebe a saída enquanto roda, como em [`Self::exec_watched`].
+    pub fn run_kept(&self, dir: &Path, command: &str, timeout: Duration, progress: Option<&Arc<CommandProgress>>) -> Result<KeptRun, String> {
         let (_, ov, _) = self.load(dir)?;
         let name = kept_container_name(&self.project_name());
         let label = format!("nants.project={}", self.project_id);
         let tail = ["run", "--name", name.as_str(), "--label", label.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
-        let ran = self.runner.run(&self.call(dir, &ov, &tail, timeout));
+        let ran = self.runner.run_watched(&self.call(dir, &ov, &tail, timeout), progress);
         let diff = match &ran {
             Ok(_) => self.container_diff(dir, &name),
             Err(e) => Err(e.clone()),
@@ -616,7 +618,7 @@ impl ComposeEnv {
         if !output.success() && is_docker_failure(&output.output) {
             return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&output)));
         }
-        Ok(KeptRun { output, diff: diff?, container: name, cleanup_error })
+        Ok(KeptRun { output, diff, container: name, cleanup_error })
     }
 
     /// Spec 130 T03 (Console): roda o comando digitado pelo usuário no `workspace` num container
@@ -821,8 +823,8 @@ impl ComposeEnv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeptRun {
     pub output: ComposeOutput,
-    /// O que o container gravou, pelo `docker diff`.
-    pub diff: Vec<DiffEntry>,
+    /// O que o container gravou, pelo `docker diff`; `Err` com o motivo quando a listagem falhou.
+    pub diff: Result<Vec<DiffEntry>, String>,
     /// Nome do container (já removido, salvo `cleanup_error`).
     pub container: String,
     /// Motivo, quando a remoção do container falhou.
@@ -2524,9 +2526,9 @@ mod tests {
         fake.reply("run", 0, "instalado");
         fake.reply("diff", 0, DIFF_TEST8);
         let env = env_with(&fake);
-        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5), None).expect("run_kept");
         assert!(kept.output.success() && kept.cleanup_error.is_none());
-        assert_eq!(kept.diff.len(), 13);
+        assert_eq!(kept.diff.as_ref().map(Vec::len), Ok(13));
         assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
         let calls = fake.calls.lock().expect("lock");
         let run = &calls[0].args[7..];
@@ -2546,13 +2548,15 @@ mod tests {
         let fake = Arc::new(FakeRunner::default());
         fake.reply("run", 1, "erro da instalação");
         let env = env_with(&fake);
-        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        let kept = env.run_kept(&dir, "make deps", Duration::from_secs(5), None).expect("run_kept");
         assert_eq!(kept.output.code, Some(1));
         assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
-        // O diff falha: o container é removido e o erro volta.
+        // O diff falha: o container é removido, o resultado do comando fica e o erro vai no diff.
         let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "instalado");
         fake.reply("diff", 1, "No such container");
-        assert!(env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5)).is_err());
+        let kept = env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5), None).expect("run_kept");
+        assert!(kept.output.success() && kept.diff.is_err_and(|e| e.contains("No such container")));
         assert_eq!(fake.subcommands(), vec!["run", "diff", "rm"]);
         // O docker não sobe o comando (erro do executor): a remoção ainda é tentada.
         struct FailRun(Mutex<Vec<String>>);
@@ -2568,12 +2572,12 @@ mod tests {
         }
         let failing = Arc::new(FailRun(Mutex::new(Vec::new())));
         let env = super::fake::test_env("p1", failing.clone());
-        assert!(env.run_kept(&dir, "make deps", Duration::from_secs(5)).is_err());
+        assert!(env.run_kept(&dir, "make deps", Duration::from_secs(5), None).is_err());
         assert_eq!(*failing.0.lock().expect("lock"), vec!["run".to_string(), "rm".to_string()]);
         // A remoção falha: o resultado volta com o motivo, para o registro.
         let fake = Arc::new(FakeRunner::default());
         fake.reply("rm", 1, "device busy");
-        let kept = env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5)).expect("run_kept");
+        let kept = env_with(&fake).run_kept(&dir, "make deps", Duration::from_secs(5), None).expect("run_kept");
         assert!(kept.cleanup_error.is_some_and(|e| e.contains("device busy")));
         let _ = fs::remove_dir_all(&dir);
     }

@@ -123,6 +123,19 @@
 }
 
 /*
+ * Controle segmentado (131/T07): todo item tem o alvo de 44 px (o rótulo de rádio também), e o raio
+ * acompanha a faixa mais alta: barra `--r-lg`, item `--r-lg` − `--sp-1` = `--r-md`.
+ */
+.nd-root[data-mobile="true"] .nd-segment {
+  border-radius: var(--r-lg);
+}
+
+.nd-root[data-mobile="true"] .nd-segment-item {
+  min-height: 44px;
+  border-radius: var(--r-md);
+}
+
+/*
  * Ação na linha do rótulo (113/T05): a caixa fica na altura do rótulo, para não desalinhar rótulo e
  * campo; o alvo de toque de 44 px vem de uma área invisível centrada no botão.
  */

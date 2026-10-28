@@ -555,8 +555,13 @@ impl crate::agents::runner::FinalGate for ProjectApprover {
     }
 }
 
-/// Prefixo fixo da mensagem de aprovação automática (evento e linha de diálogo).
+/// Prefixo das linhas de aprovação automática gravadas antes da spec 131 T06, sempre em pt-BR; a
+/// web ainda o reconhece nesses registros. A linha nova sai com [`CODE_AUTO_APPROVED`].
 pub const YOLO_AUTO_PREFIX: &str = "aprovada automaticamente";
+/// Código (spec 131 T06) da linha de aprovação automática, com `params.detail` = o pedido já
+/// redigido; a interface a traduz, e o texto de reserva é `system.run.auto_approved` no idioma do
+/// projeto.
+pub const CODE_AUTO_APPROVED: &str = "run.auto_approved";
 /// Código (spec 102) do aviso de aprovação automática ignorada (uma linha de sistema por run,
 /// quando `.sdd/settings.yaml` está inválido); a interface o traduz, e o texto de reserva é
 /// `system.run.yolo_ignored` no idioma do projeto (spec 115 T03).
@@ -715,7 +720,8 @@ impl ProjectApprover {
     }
 
     /// Evento SSE `agent_message` (`yolo_auto: true`, `kind`: `command`|`environment`) e linha de
-    /// diálogo "aprovada automaticamente: ..." com o pedido já redigido.
+    /// diálogo com o pedido já redigido: `code` [`CODE_AUTO_APPROVED`] e `params.detail` (spec 131
+    /// T06), o texto de reserva no idioma do projeto e a tarefa em curso.
     fn announce_auto(&self, role: Role, task_id: Option<&str>, kind: &str, detail: &str) {
         let detail = truncate_command(&scrub_text(&self.secrets, detail));
         deliver(
@@ -726,7 +732,9 @@ impl ProjectApprover {
                 Some(self.project_id.clone()),
                 json!({
                     "agent": role_name(role),
-                    "text": format!("{YOLO_AUTO_PREFIX}: {detail}"),
+                    "text": self.tr(&format!("system.{CODE_AUTO_APPROVED}"), &[("detail", &detail)]),
+                    "code": CODE_AUTO_APPROVED,
+                    "params": { "detail": detail },
                     "task_id": task_id.map(|t| scrub_text(&self.secrets, t)),
                     "attempt": Value::Null,
                     "seq": Value::Null,
@@ -1915,6 +1923,31 @@ mod tests {
         }
     }
 
+    /// Spec 131 T06: a aprovação automática de um comando da tarefa sai com o `code`, o pedido nos
+    /// `params` e o `task_id` da tarefa em curso (antes ia nulo).
+    #[tokio::test]
+    async fn yolo_line_from_the_tool_carries_code_and_current_task() {
+        let h = harness("tool-yolo-task");
+        set_yolo(&h, true, &[]);
+        let mut rx = h.state.events().subscribe();
+        let host = ToolHost::new(
+            Role::Developer,
+            h.root.clone(),
+            Vec::new(),
+            Policy::new(Vec::new(), Vec::new()),
+            Arc::new(h.approver(Some(Duration::from_millis(80))).with_lang(crate::i18n::SharedLang::new(crate::i18n::Lang::En))),
+        )
+        .with_task("T04");
+        let out = host.call(ToolName::RunCommand, json!({"command": "echo yolo-tarefa"})).await;
+        assert!(out.is_ok(), "{out:?}");
+        let msgs = drain_agent_messages(&mut rx);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0]["code"], CODE_AUTO_APPROVED);
+        assert_eq!(msgs[0]["params"]["detail"], "echo yolo-tarefa");
+        assert_eq!(msgs[0]["task_id"], "T04");
+        assert_eq!(msgs[0]["text"], "approved automatically: echo yolo-tarefa", "reserva no idioma do projeto");
+    }
+
     #[tokio::test]
     async fn once_through_tool_executes_command() {
         let h = harness("tool-once");
@@ -2527,6 +2560,9 @@ mod tests {
         assert_eq!(msgs[0]["yolo_auto"], true);
         assert_eq!(msgs[0]["agent"], "developer");
         assert!(msgs[0]["text"].as_str().unwrap_or("").starts_with("aprovada automaticamente: pip install"));
+        // Spec 131 T06: a linha sai com o código e o pedido nos parâmetros, para a web traduzir.
+        assert_eq!(msgs[0]["code"], CODE_AUTO_APPROVED);
+        assert_eq!(msgs[0]["params"]["detail"], "pip install requests");
         // Redação do segredo no texto publicado.
         let mut rx = h.state.events().subscribe();
         approve_now(&approver, Role::Developer, &cmd).await;
@@ -2589,7 +2625,7 @@ mod tests {
     }
 
     /// Spec 114 T02 (achado 11): a aprovação automática da correção final sai no idioma do
-    /// projeto; o prefixo (marcador lido pela web) e o `kind` não mudam.
+    /// projeto; o `kind` não muda. Desde a spec 131 T06 a web a reconhece pelo `code`.
     #[tokio::test]
     async fn yolo_final_fix_line_follows_project_language() {
         use crate::i18n::{Lang, SharedLang};
@@ -2597,7 +2633,7 @@ mod tests {
             (
                 Lang::En,
                 "yolo-final-en",
-                "aprovada automaticamente: Create a fix task for the unmet global criteria. Reason: Final verification: 1 of 2 criteria met. Create a fix task?",
+                "approved automatically: Create a fix task for the unmet global criteria. Reason: Final verification: 1 of 2 criteria met. Create a fix task?",
             ),
             (
                 Lang::PtBr,
@@ -2661,12 +2697,12 @@ mod tests {
         assert_eq!(
             texts,
             vec![
-                "aprovada automaticamente: change the Docker environment (.nants/Dockerfile). Reason: need curl".to_string(),
-                "aprovada automaticamente: Change the project test command (test_command/checks). Reason: tests need deps".to_string(),
+                "approved automatically: change the Docker environment (.nants/Dockerfile). Reason: need curl".to_string(),
+                "approved automatically: Change the project test command (test_command/checks). Reason: tests need deps".to_string(),
             ]
         );
         for t in &texts {
-            let rest = t.trim_start_matches(YOLO_AUTO_PREFIX);
+            let rest = t.trim_start_matches("approved automatically");
             for word in ["alterar", "motivo", "ambiente", "comando", "não"] {
                 assert!(!rest.to_lowercase().contains(word), "pt no caminho en ({word}): {t}");
             }
@@ -2802,6 +2838,8 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["kind"], "environment");
         assert!(msgs[0]["text"].as_str().unwrap_or("").starts_with(YOLO_AUTO_PREFIX));
+        assert_eq!(msgs[0]["code"], CODE_AUTO_APPROVED);
+        assert_eq!(msgs[0]["task_id"], "T01", "a tarefa em curso vai na linha");
     }
 
     #[tokio::test]

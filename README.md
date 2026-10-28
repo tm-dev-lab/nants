@@ -51,6 +51,12 @@ and you decide at every step.
 
 - **Agents with roles.** Architect, Developer and Reviewer work from a specification with
   acceptance criteria, and every task runs in an isolated Git worktree.
+- **The whole spec for every role.** The Architect writes in each task the titles of the spec
+  sections it implements. Each Developer and Reviewer briefing carries the spec's index (every
+  heading and its size) and whole sections, never cut in the middle: first the ones the task cites,
+  then the assumptions, then the rest. A section that does not fit stays in the index, and the
+  Developer, the Reviewer and the final check read it whole with a read-only tool, shown in the
+  Activity as "reading the spec section".
 - **Docker for every project.** Tests, checks and the running app live in containers, with
   nothing installed on your system and no `sudo`. Each command runs in a fresh container, and the
   home folder lives inside the task folder (`.nants-home/`, with `~/.local/bin` on the `PATH`), so
@@ -59,13 +65,20 @@ and you decide at every step.
   (only the download cache is kept) and goes away with the task folder. Before the first task of
   a spec, Nants runs the install command once and lists what it wrote outside the project folder;
   if that goes past a small limit, the conversation, the spec and every Developer briefing get a
-  warning with the main paths, since those files are lost between commands.
+  warning with the main paths, since those files are lost between commands. An install that
+  fails leaves that check inconclusive: it is never recorded as done.
 - **Review findings with a history.** Each Reviewer finding keeps its id from one review to the
   next and shows as new, still open (for how many reviews) or resolved, and the Developer gets the
   oldest open ones first. Before delivering, the Developer answers each one: fixed, test added or
   contested with a reason. The Architect rules on a contest once: keep the finding, adjust the
   criterion to what the environment can prove, or turn it into a documented manual check. The
-  ruling is recorded in the spec and the Reviewer follows it.
+  ruling is recorded in the spec and the Reviewer follows it. A finding that comes back is the same
+  one, reopened with its old id, when it points to the same files or when the Reviewer says it
+  continues an earlier one. From the third review on, a new MEDIUM or LOW gap in code that has not
+  changed since the last rejection, on a criterion that was already met, no longer holds the task
+  back: it becomes a note for the final check. A finding with a concrete failure scenario (an input
+  and the wrong result) still blocks. The Developer also gets the spec's guidance for the Reviewer,
+  and for each criterion it marks as met it names the evidence (a test, or a file and line).
 - **Recovery with more options.** When a task gets stuck, the Architect can retry with a new
   strategy, split the task into smaller ones (keeping the work already on the branch), adjust the
   criteria to what the environment proves, or ask you a question in the Conversation.
@@ -77,7 +90,15 @@ and you decide at every step.
   were adjusted and kept (with the Architect's reasons, folded), the size of the plan against its
   first version, and any point still open or in dispute, with both positions. **Ask for a fix**
   sends only those points to the Architect, or you approve anyway. With nothing open, the plan
-  shows as ready.
+  shows as ready. When the back and forth changed the plan, the Conversation also shows the final
+  list of tasks.
+- **A plan that says how to see it working.** No field the Architect writes in the spec header is
+  dropped in silence: one that would be lost (for example, a `run_command` over 500 characters) is
+  refused with the reason in the same turn. With no `run_command`, the Architect is asked how you
+  will see the product working, and asks you when it does not know, unless the plan records that
+  there is nothing to run (`nothing_to_run`, for example a library used only by its tests). A
+  criterion that cites a spec field the plan does not declare is flagged too; during the run, such
+  a criterion becomes a note for the final check and never goes back to the Developer.
 - **Tasks numbered in run order.** The plan lists the tasks in the order they will run. When you
   approve, they are renumbered in that order (T01 runs first), every reference follows, and the
   map from old to new ids goes into the spec and the Conversation.
@@ -117,7 +138,9 @@ and you decide at every step.
   program that ends with code 0 is not a failure. For anything else there is the project
   **Console**: you type a project command and it runs inside the approved `workspace` container,
   one command at a time, after a confirmation, with no interactive input, a time limit, live output
-  and a local history. The window is never just an error: it shows the final report's "How to use"
+  and a local history. When the plan declares no command to start the product (no `run_command`),
+  the App and Run windows open straight in the Console, and the final report says the product is
+  used there. The window is never just an error: it shows the final report's "How to use"
   and what was proven (tasks, final check and screenshots). When the environment does not start,
   it shows the end of the log and **Ask the Architect to fix it**, which sends that diagnosis to
   the Architect in the Conversation; any environment change still goes through your approval. An
@@ -133,8 +156,10 @@ and you decide at every step.
   the answer shows in the Conversation. If the Architect cannot answer (for example, the provider
   refused the request), the Conversation shows the reason, and the task record notes it too.
 - **The project's language.** The labels the agents and Nants write in messages (criteria, met or
-  not met, findings, resolved, screenshots reviewed) follow the project's language. Older records,
-  in Portuguese or English, are still read.
+  not met, findings, resolved, screenshots reviewed) follow the project's language, and so do the
+  automatic approval line and the list of plan changes. The standard headings of `spec.md` and of
+  the task files show in the interface language; the files themselves do not change. Older
+  records, in Portuguese or English, are still read.
 - **A project that runs without Nants.** The generated `.nants/compose.yaml` mounts the project
   with `${NANTS_WORKTREE:-..}`, so from the project root
   `docker compose -f .nants/compose.yaml run --rm workspace sh -lc '<command>'` works with no
@@ -150,7 +175,8 @@ and you decide at every step.
   losing what matters, and the Context area of the Costs window shows the effect, with an
   estimate of the tokens that later calls no longer resend.
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
-- **Your provider.** Any OpenAI compatible provider, or your ChatGPT plan, with one model per role.
+- **Your provider.** Any OpenAI compatible provider, Anthropic (Claude), Google Gemini (AI Studio)
+  or your ChatGPT plan, with one model per role.
 - **No telemetry.** Your keys and your code stay on your computer.
 
 ## Requirements
@@ -158,7 +184,8 @@ and you decide at every step.
 - Linux, or Windows with WSL2 (x86_64 or aarch64)
 - [Docker](https://docs.docker.com/engine/install/) with Compose v2, usable without `sudo`
 - Git
-- An API key for an OpenAI compatible provider, or a ChatGPT Plus or Pro plan
+- An API key for an OpenAI compatible provider, Anthropic or Google AI Studio, or a ChatGPT Plus
+  or Pro plan
 
 ## Install
 
@@ -199,12 +226,43 @@ gh attestation verify nants-X.Y.Z-x86_64-linux.tar.gz --repo tm-dev-lab/nants
 2. Create a project: just give it a name. Nants creates a Git repository in `~/NantsProjects`.
 3. Describe your idea in the Conversation, answer the Architect and approve the plan.
 
+## Connect Anthropic or Google Gemini
+
+Nants talks to the Anthropic API (Claude) and to the Google Gemini API (AI Studio) natively, with
+reasoning, tools, images, web search for the Architect, prompt cache and costs.
+
+1. Get a key: Anthropic at <https://console.anthropic.com/settings/keys>, Google AI Studio at
+   <https://aistudio.google.com/apikey>.
+2. In **Settings**, click **New connection** and pick **Anthropic (Claude)** or
+   **Google Gemini (AI Studio)**. The same choice is in **Getting started**.
+3. Give it a name and paste the key, or an `env:NAME` reference (for example
+   `env:ANTHROPIC_API_KEY`), so the key is read from an environment variable. No address or
+   protocol is needed: **Advanced address** is only for a company proxy.
+4. Click **Test** to see the models the key can reach, then **Save connection**. On the first
+   connection of a provider, Nants suggests a model for each role: the lowest cost model in the
+   price catalog among those with reasoning and images (without prices, the first in the
+   provider's list), and you can change any of them.
+
+The effort keeps its three levels: on Anthropic it sets how much Claude reasons, and on Gemini it
+becomes the thinking level. To price the cache writes that Anthropic bills separately, fill
+**Cache write** under **Settings > Pricing**; the Costs window shows the tokens read from and
+written to the cache.
+
+When the Anthropic account reaches its spend limit, or the Gemini daily quota runs out, the run
+pauses and the Conversation says what to do: raise the limit in the Anthropic console, or wait for
+the quota to renew or switch the connection, then click **Continue**.
+
+**Gemini through the OpenAI compatible layer.** An API key connection to
+`https://generativelanguage.googleapis.com/v1beta/openai/` (protocol Chat Completions) also works,
+but without web search and without the reasoning on screen. The recommended path is the native
+**Google Gemini (AI Studio)** connection.
+
 ## Use your ChatGPT plan
 
 With a ChatGPT Plus or Pro subscription, a connection can use the plan on your account instead of
 an API key. This feature is in preview.
 
-1. In **Settings**, click **New connection** and pick **ChatGPT plan (Plus or Pro)**. The same
+1. In **Settings**, click **New connection** and pick **ChatGPT plan**. The same
    choice is in **Getting started**.
 2. Click **Continue with ChatGPT** and sign in. The sign-in happens in the browser of the computer
    running Nants, because OpenAI returns to `127.0.0.1`. In network mode, that includes the browser
@@ -302,6 +360,9 @@ scripts/test.sh cargo test
 (cd web && npm ci && ../scripts/test.sh npx vitest run)
 ```
 
+The optional live tests against Anthropic and Gemini, with your own key and a spend ceiling, are
+described in [docs/live-tests.md](docs/live-tests.md).
+
 After changing `web/`, rebuild the interface with `(cd web && npm run build)` and then the
 executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized.
 
@@ -310,8 +371,8 @@ executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized
 - **No telemetry.** Nants sends nothing to us. It talks to the providers you configure, to
   `nants.tmdevlab.com` to check for a new version and, for cost estimates, downloads a public
   price catalog.
-- **Your keys stay local.** API keys are stored only in your configuration file and are never
-  shown in full, logged or sent to the browser. The ChatGPT plan sign-in stays in the data folder,
+- **Your keys stay local.** API keys, including the Anthropic and Google Gemini ones, are stored
+  only in your configuration file and are never shown in full, logged or sent to the browser. The ChatGPT plan sign-in stays in the data folder,
   readable only by your user, and is never logged or sent to the browser.
 - The server listens only on your computer (`127.0.0.1`) by default.
 

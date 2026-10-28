@@ -37,13 +37,14 @@ export function running(extra: Record<string, unknown> = {}) {
 
 export const STOPPED = { state: "stopped", spec_id: null, url: null, started_at: null, exit_code: null };
 
-/** "Como usar" e provas padrão (spec 130): roda aqui, com relatório. */
+/** "Como usar" e provas padrão (spec 130): roda aqui, com relatório e `run_command` declarado (131 T05). */
 export function guide(extra: Record<string, unknown> = {}) {
   return {
     spec_id: S,
     how_to_use: { source: "report", markdown: "## Como executar\nRode `ledger report --month 2026-09`.", truncated: false },
     proofs: { tasks_done: 7, tasks_total: 7, final_verification: { passed: true, text: "6 de 6 critérios" }, captures: [], captures_total: 0 },
     sandbox: { runs_here: true, note: null },
+    run: { declared: true, nothing_to_run: null },
     ...extra,
   };
 }

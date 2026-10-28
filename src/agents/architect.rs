@@ -138,6 +138,20 @@ pub struct ArchitectReply {
     pub text: String,
     /// `true` quando alguma escrita via `write_sdd_artifacts` teve sucesso neste turno.
     pub artifacts_touched: bool,
+    /// Spec 131 T03: o texto de todas as mensagens do assistente no turno, na ordem, inclusive as
+    /// que acompanharam chamadas de ferramenta e a resposta antes da continuação dos avisos do
+    /// plano. Só para o servidor (o bloco das decisões do consenso); nunca vai à Conversa.
+    pub said: Vec<String>,
+}
+
+/// Textos não vazios das mensagens do assistente a partir de `start` (as do turno).
+fn assistant_texts(messages: &[ChatMessage], start: usize) -> Vec<String> {
+    messages
+        .iter()
+        .skip(start.min(messages.len()))
+        .filter(|m| m.role == ChatRole::Assistant && !m.content.trim().is_empty())
+        .map(|m| m.content.clone())
+        .collect()
 }
 
 /// Falhas do turno. Códigos fixos: nunca carregam texto de LLM ou de transporte.
@@ -241,8 +255,11 @@ impl<'a> InternetBackend<'a> {
     }
 
     fn prepare(&self, req: &ChatRequest) -> ChatRequest {
-        let on = self.web.load(Ordering::SeqCst) && self.used.load(Ordering::SeqCst) < self.max_searches;
-        ChatRequest { web_search: on, ..req.clone() }
+        let used = self.used.load(Ordering::SeqCst);
+        let on = self.web.load(Ordering::SeqCst) && used < self.max_searches;
+        // O que resta do limite da fase vira o `max_uses` da Anthropic (spec 132 T05).
+        let left = on.then(|| self.max_searches.saturating_sub(used));
+        ChatRequest { web_search: on, web_search_max_uses: left, ..req.clone() }
     }
 
     fn observe(&self, resp: &ChatResponse) {
@@ -570,6 +587,7 @@ impl LlmArchitect {
                 first.content = format!("{}\n\n{}", first.content, image_generation_note(available));
             }
         }
+        let start = messages.len();
         let text = tool_loop(&ctx, &mut messages, self.max_steps)
             .await
             .map_err(backend_failure)?;
@@ -587,7 +605,7 @@ impl LlmArchitect {
                 if let Some(slot) = &self.first_reply {
                     let first = if guarded.refused() { format!("{IMAGES_REFUSED_NOTICE}\n\n{text}") } else { text.clone() };
                     *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(ArchitectReply { text: first, artifacts_touched: true });
+                        Some(ArchitectReply { text: first, artifacts_touched: true, said: assistant_texts(&messages, start) });
                 }
                 let run = self.scope().begin();
                 run.notice(PLAN_CHECK_ACTIVITY);
@@ -604,6 +622,7 @@ impl LlmArchitect {
         Ok(ArchitectReply {
             text,
             artifacts_touched: host.sdd_writes_ok() > 0,
+            said: assistant_texts(&messages, start),
         })
     }
 }
@@ -1979,6 +1998,9 @@ mod tests {
         architect(backend.clone()).with_internet(net).reply(&root, &[], "oi", SNAPSHOT).await.expect("resposta");
         let flags: Vec<bool> = backend.requests().iter().map(|r| r.web_search).collect();
         assert_eq!(flags, vec![true, true, false]);
+        // Spec 132 T05: o pedido leva o que resta do limite da fase (o `max_uses` da Anthropic).
+        let left: Vec<Option<u32>> = backend.requests().iter().map(|r| r.web_search_max_uses).collect();
+        assert_eq!(left, vec![Some(2), Some(1), None]);
         // As ferramentas de internet continuam (têm limite próprio).
         assert_eq!(net_tool_names(&backend.requests()[2]).len(), 2);
     }

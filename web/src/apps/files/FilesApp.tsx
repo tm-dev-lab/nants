@@ -411,18 +411,18 @@ const FilesExplorer = memo(function FilesExplorer({ projectId, size, savedSource
       <WindowTools inlineOutsideWindow>
         <div className="nd-files-toolbar" data-files-toolbar="">
           <div role="group" aria-label={t("files.source")} className="nd-segment nd-chrome nd-files-segment">
-            <button type="button" className="nd-segment-btn" aria-pressed={source === "base"} onClick={() => choose("base")}>
-              {t("files.base")}
+            <button type="button" className="nd-segment-item" aria-pressed={source === "base"} onClick={() => choose("base")}>
+              <span>{t("files.base")}</span>
             </button>
             <button
               type="button"
-              className="nd-segment-btn"
+              className="nd-segment-item"
               aria-pressed={source === "task"}
               disabled={!taskAvailable}
               aria-describedby={!taskAvailable ? reasonId : undefined}
               onClick={() => choose("task")}
             >
-              {taskLabel}
+              <span>{taskLabel}</span>
             </button>
           </div>
           {!taskAvailable ? (

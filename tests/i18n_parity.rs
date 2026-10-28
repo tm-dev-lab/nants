@@ -129,6 +129,8 @@ const CODE_CONST_FAMILIES: &[(&str, &str)] = &[
     ("server/approvals.rs", "system"),
     ("server/image_gen.rs", "system"),
     ("server/report.rs", "report.failure"),
+    // Spec 131 T06: as linhas do "o que mudou no plano" (`plan-changes.json`).
+    ("sdd/plan_diff.rs", "planChange"),
 ];
 
 /// Famílias de mensagem do sistema (`system.<família>.<nome>`): todo literal com essa forma no
@@ -321,7 +323,7 @@ fn every_server_code_has_a_web_key_in_both_languages() {
     let en = web_dict("en.ts");
     assert_eq!(pt.keys().collect::<Vec<_>>(), en.keys().collect::<Vec<_>>(), "ptBR.ts e en.ts com chaves diferentes");
     let codes = emitted_codes(&production_sources());
-    for family in ["serverError", "system", "report.failure", "activity.code", "settings.test.error", "prereq.detail"] {
+    for family in ["serverError", "system", "report.failure", "activity.code", "settings.test.error", "prereq.detail", "planChange"] {
         assert!(codes.iter().any(|c| c.family == family), "nenhum código da família {family}: a varredura se perdeu");
     }
     let mut used = BTreeSet::new();
@@ -348,11 +350,14 @@ fn every_server_code_has_a_web_key_in_both_languages() {
 // --- mesmo texto no servidor e na web ---
 
 /// Chaves com o mesmo texto no servidor e na web, por idioma: (chave do servidor, chave da web).
-const SAME_TEXT: &[(&str, &str, &str)] = &[(
-    "ui.app_start",
-    "app.start",
-    "o servidor cita ao modelo o rótulo do botão de iniciar o app, que precisa ser o da tela",
-)];
+const SAME_TEXT: &[(&str, &str, &str)] = &[
+    ("ui.app_start", "app.start", "o servidor cita ao modelo o rótulo do botão de iniciar o app, que precisa ser o da tela"),
+    (
+        "ui.app_open_console",
+        "app.openConsole",
+        "sem run_command, o servidor cita ao modelo o rótulo do botão que abre o Console, que precisa ser o da tela",
+    ),
+];
 
 /// Famílias com o mesmo texto: (prefixo do servidor, prefixo da web, motivo). Toda chave do
 /// servidor com par na web entra; a família precisa ter ao menos um par.
@@ -373,6 +378,11 @@ const SAME_TEXT_FAMILIES: &[(&str, &str, &str)] = &[
         "system.",
         "system.",
         "texto de reserva da mensagem do sistema com code (spec 115 T03): o servidor grava o mesmo texto que a web monta pelo código",
+    ),
+    (
+        "plan_review.change.",
+        "planChange.",
+        "linha do resumo do que mudou no plano (spec 131 T06): o servidor a escreve ao Revisor no idioma do projeto e a web a monta pelo mesmo código",
     ),
     (
         "runner.marker.",
@@ -510,4 +520,65 @@ fn helpers_read_the_web_and_match_server_literals() {
     assert!(!helpers.contains_key("note"), "função que não devolve erro da API não conta");
     let open = toks.iter().position(|t| t.is_ident("coded")).map_or(0, |k| k + 1);
     assert_eq!(call_args(&toks, open).len(), 3);
+}
+
+// --- títulos canônicos do spec.md e das tarefas na web (spec 131 T06) ---
+
+/// Títulos que o servidor grava ou procura no `spec.md` e nas tarefas, sempre em pt-BR (a gravação
+/// no idioma do projeto ficou para uma spec futura): (texto do servidor, chave da web). A web os
+/// reconhece por `sddHeading.*` para mostrar no idioma ativo, então o texto pt-BR da chave precisa
+/// ser o mesmo do servidor.
+fn server_headings() -> Vec<(String, &'static str)> {
+    use nants::agents::{finding_reply, finding_track, runner};
+    use nants::sdd::{role_guidance, spec_sections};
+    let fixed: [(&str, &'static str); 19] = [
+        (runner::OBJECTIVE, "sddHeading.objective"),
+        (runner::ACCEPTANCE, "sddHeading.criteria"),
+        (runner::FINDINGS, "sddHeading.findings"),
+        (runner::FINDINGS_LOG, "sddHeading.findingsLog"),
+        (runner::GUIDANCE_SECTION, "sddHeading.humanGuidance"),
+        (runner::FLAKY_SECTION, "sddHeading.flaky"),
+        (runner::REUSE_SECTION, "sddHeading.reuse"),
+        (runner::FORMAT_SECTION, "sddHeading.format"),
+        (runner::INSTALL_SECTION, "sddHeading.install"),
+        (runner::INSTALL_FOOTPRINT_SECTION, "sddHeading.installFootprint"),
+        (runner::ADVICE_SECTION, "sddHeading.advice"),
+        (runner::GLOBAL_CRITERIA, "sddHeading.globalCriteria"),
+        (runner::HISTORY, "sddHeading.history"),
+        (finding_track::REGISTRY, "sddHeading.registry"),
+        (finding_reply::RESPONSES, "sddHeading.responses"),
+        (spec_sections::PREMISES, "sddHeading.premises"),
+        (role_guidance::ROLE_GUIDANCE_SECTION, "sddHeading.roleGuidance"),
+        (role_guidance::ROLE_DEVELOPER, "sddHeading.roleDeveloper"),
+        (role_guidance::ROLE_REVIEWER, "sddHeading.roleReviewer"),
+    ];
+    let mut out: Vec<(String, &'static str)> = fixed.iter().map(|(text, key)| ((*text).to_string(), *key)).collect();
+    out.push((format!("{}{{n}}", runner::RECOVERY_PREFIX), "sddHeading.numbered.recovery"));
+    out
+}
+
+/// Títulos do exemplo de spec que o Arquiteto recebe (não há constante no servidor): o exemplo
+/// precisa continuar usando o mesmo texto da web.
+const EXAMPLE_HEADINGS: [&str; 2] = ["sddHeading.context", "sddHeading.approach"];
+
+#[test]
+fn canonical_sdd_headings_on_the_web_match_the_server() {
+    let pt = web_dict("ptBR.ts");
+    let en = web_dict("en.ts");
+    for (text, key) in server_headings() {
+        assert_eq!(pt.get(key).map(String::as_str), Some(text.as_str()), "{key}: o pt-BR da web difere do título do servidor");
+        let english = en.get(key).unwrap_or_else(|| panic!("{key} sem en"));
+        assert_ne!(english, &text, "{key}: sem tradução em en");
+    }
+    let example = nants::agents::prompts::EXAMPLE_SPEC_MD;
+    for key in EXAMPLE_HEADINGS {
+        let text = pt.get(key).unwrap_or_else(|| panic!("{key} sem pt"));
+        assert!(example.contains(&format!("## {text}\n")), "{key}: o exemplo do Arquiteto não usa mais {text:?}");
+    }
+    // Toda chave `sddHeading.*` da web tem os dois idiomas e está na tabela de `sddHeadings.ts`.
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/i18n/sddHeadings.ts")).expect("sddHeadings.ts");
+    for key in pt.keys().filter(|k| k.starts_with("sddHeading.")) {
+        assert!(en.contains_key(key), "{key} sem en");
+        assert!(source.contains(&format!("\"{key}\"")), "{key} fora da tabela de sddHeadings.ts");
+    }
 }

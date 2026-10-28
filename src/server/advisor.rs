@@ -192,6 +192,7 @@ impl ArchitectAdvisor {
             response_json: true,
             web_search: false,
             cache_key: None,
+            web_search_max_uses: None,
         };
         match tokio::time::timeout(ASK_TIMEOUT, metered.complete(&req)).await {
             Ok(Ok(resp)) => Ok(resp.message.content),
@@ -414,7 +415,7 @@ mod tests {
                     citations: Vec::new(),
                     web_search_rejected: false,
                     billing: Default::default(),
-                    usage: Some(crate::agents::llm_client::Usage { prompt: 10, completion: 5, cached: None, reasoning: None }),
+                    usage: Some(crate::agents::llm_client::Usage { prompt: 10, completion: 5, cached: None, reasoning: None, cache_write: None }),
                 })
             })
         }

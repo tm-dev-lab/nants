@@ -251,16 +251,24 @@ pub enum ToolName {
     /// Gera uma imagem com o modelo do agente (spec 090 T02; só Desenvolvedor, só via
     /// [`spec_generate_image`] quando a geração está disponível e há gerador ligado).
     GenerateImage,
+    /// Lê uma seção inteira da spec da execução (spec 131 T01; Desenvolvedor e Revisor, só via
+    /// [`spec_read_spec_section`] quando o host tem o texto da spec).
+    ReadSpecSection,
 }
 
 impl ToolName {
     /// Ferramentas de internet: oferecidas somente por [`specs_internet`].
     pub const INTERNET: [ToolName; 2] = [ToolName::FetchUrl, ToolName::PackageVersions];
 
-    /// Ferramentas oferecidas só sob condição (fora de [`specs`]): internet, capturas de tela e geração
-    /// de imagens.
-    pub const CONDITIONAL: [ToolName; 4] =
-        [ToolName::FetchUrl, ToolName::PackageVersions, ToolName::ViewScreenshot, ToolName::GenerateImage];
+    /// Ferramentas oferecidas só sob condição (fora de [`specs`]): internet, capturas de tela, geração
+    /// de imagens e leitura da spec.
+    pub const CONDITIONAL: [ToolName; 5] = [
+        ToolName::FetchUrl,
+        ToolName::PackageVersions,
+        ToolName::ViewScreenshot,
+        ToolName::GenerateImage,
+        ToolName::ReadSpecSection,
+    ];
 
     /// Todas as ferramentas, na ordem da matriz §6.1.
     pub const ALL: [ToolName; 11] = [
@@ -295,6 +303,7 @@ impl ToolName {
             ToolName::PackageVersions => "package_versions",
             ToolName::ViewScreenshot => "view_screenshot",
             ToolName::GenerateImage => "generate_image",
+            ToolName::ReadSpecSection => crate::sdd::spec_sections::TOOL_NAME,
         }
     }
 
@@ -304,7 +313,7 @@ impl ToolName {
             ToolName::ListDir => "Lista entradas de um diretório relativo à raiz (diretórios terminam em /).",
             ToolName::SearchCode => "Busca um trecho literal recursivamente nos arquivos de texto. Opcional: max_results (até 200); ao bater o limite, a saída termina com a contagem por arquivo.",
             ToolName::WriteSddArtifacts => {
-                "Grava um artefato SDD dentro de .sdd/specs/. O frontmatter da spec aceita `formatters` (opcional): lista de {name, command, workdir, paths}. name: [a-z0-9_-], até 32, único. command: uma linha que só escreve e deve funcionar numa worktree nova, sem dependências instaladas (instale na versão travada, ex.: npm ci --no-audit --no-fund && npx prettier --write .). workdir: pasta relativa à raiz (padrão .), sem .. nem caminho absoluto. paths: globs relativos à raiz que o formatador cobre (padrão [\"**\"]). Itens inválidos são ignorados. Aceita também `failure_artifacts` (opcional): lista de até 8 globs relativos à raiz (sem .. nem caminho absoluto) dos arquivos de diagnóstico que a suíte grava ao falhar (ex.: test-results/**/error-context.md do Playwright); o Nants anexa os gerados na execução que falhou à evidência da falha. Globs inválidos são ignorados. Aceita também `screenshots` (opcional): até 8 globs relativos à raiz, com a mesma regra, das capturas de tela PNG/JPEG que os testes e2e gravam (ex.: test-results/screens/**/*.png); o Revisor e o Desenvolvedor veem as geradas na execução com view_screenshot. Aceita também `references` (opcional): até 4 nomes das imagens do chat (os de `[imagem anexada: <nome>]`) que definem o visual esperado; o Nants as copia na aprovação e o Desenvolvedor e o Revisor as veem com view_screenshot. O frontmatter da tarefa aceita `covers` (opcional): ids G<n> dos critérios globais que ela entrega (G1 = 1º item de \"## Critérios de Aceitação Globais\"); ids malformados são ignorados."
+                "Grava um artefato SDD dentro de .sdd/specs/. O frontmatter da spec aceita `formatters` (opcional): lista de {name, command, workdir, paths}. name: [a-z0-9_-], até 32, único. command: uma linha que só escreve e deve funcionar numa worktree nova, sem dependências instaladas (instale na versão travada, ex.: npm ci --no-audit --no-fund && npx prettier --write .). workdir: pasta relativa à raiz (padrão .), sem .. nem caminho absoluto. paths: globs relativos à raiz que o formatador cobre (padrão [\"**\"]). Item inválido devolve o motivo e a spec não é gravada (vale para todo campo opcional da spec). Aceita também `failure_artifacts` (opcional): lista de até 8 globs relativos à raiz (sem .. nem caminho absoluto) dos arquivos de diagnóstico que a suíte grava ao falhar (ex.: test-results/**/error-context.md do Playwright); o Nants anexa os gerados na execução que falhou à evidência da falha. Aceita também `screenshots` (opcional): até 8 globs relativos à raiz, com a mesma regra, das capturas de tela PNG/JPEG que os testes e2e gravam (ex.: test-results/screens/**/*.png); o Revisor e o Desenvolvedor veem as geradas na execução com view_screenshot. Aceita também `references` (opcional): até 4 nomes das imagens do chat (os de `[imagem anexada: <nome>]`) que definem o visual esperado; o Nants as copia na aprovação e o Desenvolvedor e o Revisor as veem com view_screenshot. O frontmatter da tarefa aceita `covers` (opcional): ids G<n> dos critérios globais que ela entrega (G1 = 1º item de \"## Critérios de Aceitação Globais\"); ids malformados são ignorados."
             }
             ToolName::WriteFile => "Cria ou sobrescreve um arquivo dentro do allowed_scope da tarefa. Para sobrescrever um arquivo existente, leia-o antes nesta sessão (read_file); para mudar parte dele, prefira apply_patch.",
             ToolName::ApplyPatch => "Substitui o trecho `old` por `new` num arquivo dentro do allowed_scope. `old` deve ser único: inclua 3 linhas de contexto; espaço no fim da linha e CRLF são tolerados. replace_all (opcional) troca todas as ocorrências exatas. A resposta mostra as linhas editadas com contexto.",
@@ -327,6 +336,9 @@ impl ToolName {
             }
             ToolName::GenerateImage => {
                 "Gera uma ilustração com o modelo e grava em path (relativo, dentro do allowed_scope, terminado em .webp, .png ou .jpg; prefira .webp, arquivo menor, e .png só quando precisar de fundo transparente). prompt: descrição da imagem (até 2000 caracteres); o guia de arte da spec, se houver, é anteposto. Opcionais: size (1024x1024, 1536x1024, 1024x1536 ou auto), background (transparent, opaque ou auto; transparente exige .png ou .webp) e quality (low, medium ou high; padrão medium). A mesma combinação é reaproveitada do cache sem gerar de novo. Número de imagens por spec limitado; a imagem chega na mensagem seguinte para você conferir."
+            }
+            ToolName::ReadSpecSection => {
+                "Lê a spec desta execução (as worktrees não têm .sdd/specs). title: o título exato de uma seção do índice do briefing, de qualquer nível, sem diferenciar maiúsculas; devolve a seção inteira, com as subseções. title \"list\" devolve o índice. Só lê a spec: caminho de arquivo ou título fora do índice é recusado."
             }
             ToolName::RequestEnvironmentChange => {
                 "Pede ao humano para alterar o ambiente docker (.nants/compose.yaml e .nants/Dockerfile*): informe os arquivos com o conteúdo completo e o motivo. Nunca instale pacotes em container vivo."
@@ -357,6 +369,7 @@ impl ToolName {
             ToolName::RunCommand | ToolName::RunBrowserTests => schema(json!({"command": string_prop()}), &["command"]),
             ToolName::AskArchitect => schema(json!({"question": string_prop()}), &["question"]),
             ToolName::ViewScreenshot => schema(json!({"name": string_prop()}), &["name"]),
+            ToolName::ReadSpecSection => schema(json!({"title": string_prop()}), &["title"]),
             ToolName::GenerateImage => schema(
                 json!({
                     "path": string_prop(),
@@ -411,9 +424,9 @@ pub fn is_allowed(role: Role, tool: ToolName) -> bool {
         ),
         Role::Developer => matches!(
             tool,
-            ReadFile | ListDir | SearchCode | WriteFile | ApplyPatch | RunCommand | RequestEnvironmentChange | RunBrowserTests | AskArchitect | ViewScreenshot | GenerateImage
+            ReadFile | ListDir | SearchCode | WriteFile | ApplyPatch | RunCommand | RequestEnvironmentChange | RunBrowserTests | AskArchitect | ViewScreenshot | GenerateImage | ReadSpecSection
         ),
-        Role::Reviewer => matches!(tool, ReadFile | ListDir | SearchCode | DiffFile | AskArchitect | ViewScreenshot),
+        Role::Reviewer => matches!(tool, ReadFile | ListDir | SearchCode | DiffFile | AskArchitect | ViewScreenshot | ReadSpecSection),
     }
 }
 
@@ -444,6 +457,12 @@ pub fn spec_view_screenshot() -> ToolSpec {
 /// geração disponível para o par (conexão, modelo) e um gerador ligado ao host.
 pub fn spec_generate_image() -> ToolSpec {
     tool_spec(&ToolName::GenerateImage)
+}
+
+/// `read_spec_section` (spec 131 T01): nunca faz parte de [`specs`]; o chamador a acrescenta ao
+/// Desenvolvedor, ao Revisor e à verificação final quando liga o texto da spec ao host.
+pub fn spec_read_spec_section() -> ToolSpec {
+    tool_spec(&ToolName::ReadSpecSection)
 }
 
 /// Ferramentas de internet do Arquiteto (spec 076): nunca fazem parte de [`specs`]; o chamador as
@@ -849,6 +868,12 @@ pub struct ToolHost {
     /// Idioma do projeto dos textos que o host grava para a pessoa (ex.: o motivo de uma tarefa
     /// BLOQUEADA com a definição revisada, spec 114 T02). Padrão pt-BR.
     lang: crate::i18n::Lang,
+    /// spec.md da execução, já redigido, lido por `read_spec_section` (spec 131 T01); ausente →
+    /// ferramenta indisponível.
+    spec_text: Option<Arc<str>>,
+    /// Tarefa em curso (spec 131 T06): vai nos pedidos de permissão e nas aprovações automáticas;
+    /// ausente fora de uma tarefa.
+    task_id: Option<String>,
 }
 
 /// Marca de um arquivo na sessão: data de modificação (quando o sistema informa) e tamanho.
@@ -977,7 +1002,31 @@ impl ToolHost {
             seen: Mutex::new(HashMap::new()),
             permission_denials: AtomicUsize::new(0),
             lang: crate::i18n::Lang::default(),
+            spec_text: None,
+            task_id: None,
         }
+    }
+
+    /// Tarefa em curso (spec 131 T06): os pedidos de permissão e as aprovações automáticas deste
+    /// host saem com ela; id vazio não liga nada.
+    pub fn with_task(mut self, task_id: &str) -> Self {
+        let id = task_id.trim();
+        self.task_id = (!id.is_empty()).then(|| id.to_string());
+        self
+    }
+
+    /// Liga `read_spec_section` (spec 131 T01) com o spec.md da execução, já redigido; texto vazio
+    /// não liga nada.
+    pub fn with_spec_text(mut self, text: &str) -> Self {
+        if !text.trim().is_empty() {
+            self.spec_text = Some(Arc::from(text));
+        }
+        self
+    }
+
+    /// `true` com o texto da spec ligado: o chamador oferece `read_spec_section`.
+    pub fn has_spec_text(&self) -> bool {
+        self.spec_text.is_some()
     }
 
     /// Idioma do projeto dos textos gravados para a pessoa (spec 114 T02).
@@ -1228,6 +1277,7 @@ impl ToolHost {
             ToolName::DiffFile => self.diff_file(&args)?,
             ToolName::AskArchitect => self.ask_architect(&args).await?,
             ToolName::ViewScreenshot => self.view_screenshot(&args)?,
+            ToolName::ReadSpecSection => self.read_spec_section(&args)?,
             ToolName::GenerateImage => self.generate_image(&args, on_notice).await?,
             // Saída externa: rotulada, com scrub e truncada pelo próprio módulo web.
             ToolName::FetchUrl | ToolName::PackageVersions => return self.internet_call(tool, &args).await,
@@ -1273,6 +1323,19 @@ impl ToolHost {
             Ok(text) => Ok(format!("{EXTERNAL_LABEL}\n\n{}", net.secrets.scrub_exact(&text))),
             Err(e) => Err(ToolError::Denied(format!("{}: {e}", tool.name()))),
         }
+    }
+
+    /// `read_spec_section {title}` (spec 131 T01): só a spec ligada ao host, nada fora dela. A seção
+    /// sai inteira até o teto do módulo; título fora do índice é recusado com o índice.
+    fn read_spec_section(&self, args: &Value) -> Result<String, ToolError> {
+        let Some(text) = &self.spec_text else {
+            return Err(ToolError::Denied(format!(
+                "{} indisponível: a spec desta execução não foi carregada",
+                ToolName::ReadSpecSection.name()
+            )));
+        };
+        let title = arg(args, "title")?;
+        crate::sdd::spec_sections::read_section(text, title).map_err(ToolError::InvalidArgs)
     }
 
     /// `view_screenshot {name}` (spec 082 T03): só nomes da lista da sessão (ou o nome de arquivo de
@@ -1853,7 +1916,7 @@ impl ToolHost {
         }
         let proposed: Vec<(String, String)> = plan.iter().map(|(k, _, c, _)| (k.clone(), c.clone())).collect();
         environment::check_build_paths(&self.root, &proposed).map_err(ToolError::InvalidArgs)?;
-        let req = EnvChangeRequest { role: self.role, task_id: None, reason, files: changes };
+        let req = EnvChangeRequest { role: self.role, task_id: self.task_id.clone(), reason, files: changes };
         if self.approver.approve_environment(&req).await == ApprovalDecision::Deny {
             return Err(self.permission_denied(ENV_DENY_MESSAGE.to_string()));
         }
@@ -2215,7 +2278,7 @@ impl ToolHost {
             Decision::NeedsApproval => {
                 let req = ApprovalRequest {
                     role: self.role,
-                    task_id: None,
+                    task_id: self.task_id.clone(),
                     command: command.to_string(),
                     in_container: self.compose.is_some() && self.role == Role::Developer,
                 };
@@ -2700,16 +2763,31 @@ fn is_draft_spec(status: SpecStatus) -> bool {
     matches!(status, SpecStatus::Draft | SpecStatus::AwaitingApproval)
 }
 
+/// Recusa da spec com campo opcional que a leitura descartaria (spec 131 T04): um item por campo,
+/// com o motivo, para o Arquiteto corrigir no mesmo turno.
+fn field_issues_message(issues: &[crate::sdd::FieldIssue]) -> String {
+    let items: Vec<String> = issues.iter().map(|i| format!("{}: {}", i.field, i.reason)).collect();
+    format!(
+        "spec não gravada: o servidor descartaria estes campos do frontmatter; corrija-os (ou remova o campo) e grave de \
+         novo. {}",
+        items.join(" | ")
+    )
+}
+
 /// Conteúdo novo: interpreta, bate com o caminho, está em rascunho e sem campos de execução.
 /// Spec que vai a AWAITING_APPROVAL exige `test_command` válido na spec ou `human_command`
 /// (settings do projeto com comando). Rascunho pode ser gravado sem comando.
 fn validate_new_content(kind: &SddKind, content: &str, human_command: bool) -> Result<(), ToolError> {
     match kind {
         SddKind::Spec { id } => {
-            let spec = Spec::parse(content).map_err(|e| match e {
+            let (spec, issues) = Spec::parse_with_issues(content).map_err(|e| match e {
                 SddError::InvalidTestCommand => sdd_err(SDD_TEST_COMMAND_INVALID_MSG),
                 _ => sdd_err(SDD_INVALID_MSG),
             })?;
+            // Spec 131 T04: campo opcional que a leitura descartaria volta ao Arquiteto com o motivo.
+            if !issues.is_empty() {
+                return Err(ToolError::InvalidArgs(field_issues_message(&issues)));
+            }
             if spec.frontmatter.id != *id {
                 return Err(sdd_err(SDD_ID_MSG));
             }
@@ -6359,7 +6437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdd_spec_accepts_valid_formatters_and_ignores_invalid_items() {
+    async fn sdd_spec_accepts_valid_formatters_and_refuses_invalid_items() {
         let root = sdd_root("sdd-formatters");
         write_settings_command(&root, "");
         let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
@@ -6368,11 +6446,18 @@ mod tests {
                      \x20 - name: bad-workdir\n    command: cargo fmt\n    workdir: ../fora\n\
                      \x20 - name: web\n    command: dup\n\
                      \x20 - name: api\n    command: ruff format .\n    workdir: api\n";
-        write_art(&h, SPEC_PATH, &with(items)).await.expect("lista com itens inválidos é aceita");
+        // Spec 131 T04: itens que a leitura descartaria voltam ao Arquiteto, cada um com o motivo.
+        let out = write_art(&h, SPEC_PATH, &with(items)).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        assert!(msg.contains("formatters: `bad-workdir` inválido; `web` repetido"), "{msg}");
+        assert!(!root.join(SPEC_PATH).exists());
+        let valid = "  - name: web\n    command: npx prettier --write .\n    workdir: web\n    paths: [\"web/**\"]\n\
+                     \x20 - name: api\n    command: ruff format .\n    workdir: api\n";
+        write_art(&h, SPEC_PATH, &with(valid)).await.expect("lista válida");
         let saved = fs::read_to_string(root.join(SPEC_PATH)).expect("lida");
         let spec = Spec::parse(&saved).expect("spec gravada");
         let names: Vec<String> = spec.frontmatter.formatters.expect("formatters").into_iter().map(|f| f.name).collect();
-        assert_eq!(names, ["web", "api"], "workdir com .. e nome duplicado são ignorados");
+        assert_eq!(names, ["web", "api"]);
         assert!(ToolName::WriteSddArtifacts.description().contains("workdir"));
         assert!(ToolName::WriteSddArtifacts.description().contains("paths"));
         let d = ToolName::WriteSddArtifacts.description();
@@ -6381,7 +6466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdd_spec_accepts_failure_artifacts_and_ignores_invalid_globs() {
+    async fn sdd_spec_accepts_failure_artifacts_and_refuses_invalid_globs() {
         let root = sdd_root("sdd-failure-artifacts");
         write_settings_command(&root, "");
         let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
@@ -6389,7 +6474,12 @@ mod tests {
             "created_at",
             "failure_artifacts: [\"test-results/**/error-context.md\", \"../fora/*.md\", \"/abs/x\"]\ncreated_at",
         );
-        write_art(&h, SPEC_PATH, &spec).await.expect("globs inválidos são ignorados");
+        let out = write_art(&h, SPEC_PATH, &spec).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        assert!(msg.contains("failure_artifacts: itens inválidos descartados: `../fora/*.md`, `/abs/x`"), "{msg}");
+        let spec = awaiting_spec(Some("npm test"))
+            .replace("created_at", "failure_artifacts: [\"test-results/**/error-context.md\"]\ncreated_at");
+        write_art(&h, SPEC_PATH, &spec).await.expect("globs válidos");
         let saved = fs::read_to_string(root.join(SPEC_PATH)).expect("lida");
         let spec = Spec::parse(&saved).expect("spec gravada");
         assert_eq!(spec.frontmatter.failure_artifacts, Some(vec!["test-results/**/error-context.md".to_string()]));
@@ -6398,7 +6488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdd_spec_accepts_screenshots_and_ignores_invalid_globs() {
+    async fn sdd_spec_accepts_screenshots_and_refuses_invalid_globs() {
         let root = sdd_root("sdd-screenshots");
         write_settings_command(&root, "");
         let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
@@ -6406,7 +6496,11 @@ mod tests {
             "created_at",
             "screenshots: [\"test-results/screens/**/*.png\", \"../fora/*.png\"]\ncreated_at",
         );
-        write_art(&h, SPEC_PATH, &spec).await.expect("globs inválidos são ignorados");
+        let out = write_art(&h, SPEC_PATH, &spec).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        assert!(msg.contains("screenshots: itens inválidos descartados: `../fora/*.png`"), "{msg}");
+        let spec = awaiting_spec(Some("npm test")).replace("created_at", "screenshots: [\"test-results/screens/**/*.png\"]\ncreated_at");
+        write_art(&h, SPEC_PATH, &spec).await.expect("glob válido");
         let saved = fs::read_to_string(root.join(SPEC_PATH)).expect("lida");
         let spec = Spec::parse(&saved).expect("spec gravada");
         assert_eq!(spec.frontmatter.screenshots, Some(vec!["test-results/screens/**/*.png".to_string()]));
@@ -6415,15 +6509,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdd_spec_accepts_references_and_ignores_invalid_names() {
-        // Spec 084 T02: `references` leva nomes de anexos do chat; inválidos ignorados.
+    async fn sdd_spec_accepts_references_and_refuses_invalid_names() {
+        // Spec 084 T02: `references` leva nomes de anexos do chat. Spec 131 T04: inválidos voltam com o motivo.
         let root = sdd_root("sdd-references");
         write_settings_command(&root, "");
         let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
         let good = format!("{}.webp", "a".repeat(32));
         let spec = awaiting_spec(Some("npm test"))
             .replace("created_at", &format!("references: [\"{good}\", \"../x.png\"]\ncreated_at"));
-        write_art(&h, SPEC_PATH, &spec).await.expect("nomes inválidos são ignorados");
+        let out = write_art(&h, SPEC_PATH, &spec).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        assert!(msg.contains("references: itens inválidos descartados: `../x.png`"), "{msg}");
+        let spec = awaiting_spec(Some("npm test")).replace("created_at", &format!("references: [\"{good}\"]\ncreated_at"));
+        write_art(&h, SPEC_PATH, &spec).await.expect("nome válido");
         let saved = fs::read_to_string(root.join(SPEC_PATH)).expect("lida");
         assert_eq!(Spec::parse(&saved).expect("spec gravada").frontmatter.references, Some(vec![good]));
         let d = ToolName::WriteSddArtifacts.description();
@@ -6496,16 +6594,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdd_draft_accepts_run_fields_and_ignores_invalid_ones() {
+    async fn sdd_draft_accepts_run_fields_and_refuses_invalid_ones_with_the_reason() {
         let root = sdd_root("sdd-run-fields");
         let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
         let good = awaiting_spec(Some("node --test"))
             .replace("created_at", "run_command: \"node server.js\"\nrun_url: \"http://localhost:3000/\"\ncreated_at");
         write_art(&h, SPEC_PATH, &good).await.expect("campos de execução em rascunho");
+        // Spec 131 T04: a run_url inválida não é mais descartada em silêncio; volta com o motivo.
         let bad = awaiting_spec(Some("node --test"))
             .replace("created_at", "run_url: \"https://evil.com\"\ncreated_at");
-        write_art(&h, SPEC_PATH, &bad).await.expect("run_url inválida é ignorada, spec válida");
-        assert_eq!(h.sdd_writes_ok(), 2);
+        let out = write_art(&h, SPEC_PATH, &bad).await;
+        assert!(
+            matches!(&out, Err(ToolError::InvalidArgs(m)) if m.contains("run_url: use http://localhost")),
+            "{out:?}"
+        );
+        assert_eq!(h.sdd_writes_ok(), 1);
+        assert!(fs::read_to_string(root.join(SPEC_PATH)).expect("spec").contains("node server.js"), "a anterior fica");
+    }
+
+    /// Spec 131 T04: o `run_command` longo do Test 9 (cerca de 315 caracteres) agora cabe; acima do
+    /// limite novo, a gravação volta ao Arquiteto com o tamanho, o limite e a saída pelo script.
+    #[tokio::test]
+    async fn sdd_long_run_command_fits_the_new_limit_or_returns_the_reason() {
+        let root = sdd_root("sdd-run-long");
+        let h = host(Role::Architect, &root, &[], &[], &[], ApprovalDecision::Deny);
+        let with_run = |rc: &str| {
+            let line = format!("run_command: {}\ncreated_at", serde_json::to_string(rc).expect("json"));
+            awaiting_spec(Some("python -m pytest -q")).replace("created_at", &line)
+        };
+        let step = "python -m ledger --config examples/ledger.yaml --db .local/demo.sqlite3 report --month 2026-09";
+        let test9 = format!("python -m pip install --no-compile -r requirements.lock && {step} && {step} && {step}");
+        assert!(test9.chars().count() > crate::sdd::TEST_COMMAND_MAX_CHARS, "{}", test9.len());
+        write_art(&h, SPEC_PATH, &with_run(&test9)).await.expect("comando real do Test 9 cabe");
+        let saved = Spec::parse(&fs::read_to_string(root.join(SPEC_PATH)).expect("spec")).expect("spec");
+        assert_eq!(saved.frontmatter.run_command.as_deref(), Some(test9.as_str()), "não é descartado na leitura");
+
+        let long = "x".repeat(crate::sdd::RUN_COMMAND_MAX_CHARS + 1);
+        let out = write_art(&h, SPEC_PATH, &with_run(&long)).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        assert!(msg.contains("run_command: tem 501 caracteres, acima do limite de 500"), "{msg}");
+        assert!(msg.contains("script do projeto"), "{msg}");
+        assert_eq!(h.sdd_writes_ok(), 1);
+
+        // Os demais campos opcionais também voltam com o motivo, um item por campo.
+        let many = awaiting_spec(Some("python -m pytest -q")).replace(
+            "created_at",
+            "environment: podman\nnothing_to_run: \"a\\nb\"\nfailure_artifacts: [\"../fora.log\", \"ok.log\"]\ncreated_at",
+        );
+        let out = write_art(&h, SPEC_PATH, &many).await;
+        let Err(ToolError::InvalidArgs(msg)) = &out else { panic!("{out:?}") };
+        for needle in ["environment: use `docker` ou `host`", "nothing_to_run: uma frase só", "failure_artifacts: itens inválidos descartados: `../fora.log`"] {
+            assert!(msg.contains(needle), "falta {needle}: {msg}");
+        }
     }
 
     #[tokio::test]

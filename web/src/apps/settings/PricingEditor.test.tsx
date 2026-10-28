@@ -136,6 +136,30 @@ describe("PricingEditor", () => {
     expect((screen.getByLabelText("Entrada de gpt-x") as HTMLInputElement).value).toBe("1");
     expect(fetchMock.mock.calls.some(([u]) => String(u).includes("refresh=true"))).toBe(true);
   });
+
+  // Spec 132 T10: o campo opcional "escrita de cache", com o valor salvo e enviado como cache_write_per_mtok.
+  it("escrita de cache é opcional, validada, mostra o salvo e vai como cache_write_per_mtok", async () => {
+    resetStore({ config: makeConfig([]) });
+    const fetchMock = installFetch((method, _u, body) => ({ body: method === "PUT" ? body : {} }));
+    render(<PricingEditor agents={agents} pricing={{ "gpt-x": { input_per_mtok: 3, output_per_mtok: 15, cache_write_per_mtok: 3.75 } }} />);
+    expect(screen.getByText("Escrita de cache (opcional)")).toBeTruthy();
+    const field = screen.getByLabelText("Escrita de cache de gpt-x") as HTMLInputElement;
+    expect(field.value).toBe("3,75");
+    await userEvent.clear(field);
+    await userEvent.type(field, "abc");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar preços" }));
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("Preço inválido"));
+    expect(puts(fetchMock)).toHaveLength(0);
+    await userEvent.clear(field);
+    await userEvent.type(field, "4,5");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar preços" }));
+    await waitFor(() => expect(puts(fetchMock)).toHaveLength(1));
+    expect(bodyOf(puts(fetchMock)[0])).toEqual({ "gpt-x": { input_per_mtok: 3, output_per_mtok: 15, cache_write_per_mtok: 4.5, source: "manual" } });
+    await userEvent.clear(field);
+    await userEvent.click(screen.getByRole("button", { name: "Salvar preços" }));
+    await waitFor(() => expect(puts(fetchMock)).toHaveLength(2));
+    expect(bodyOf(puts(fetchMock)[1])).toEqual({ "gpt-x": { input_per_mtok: 3, output_per_mtok: 15, source: "manual" } });
+  });
 });
 
 describe("valores pequenos", () => {
