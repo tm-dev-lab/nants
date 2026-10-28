@@ -28,6 +28,10 @@ import { approveProblem, recoveryProblem, type RunProblem } from "../shared/runP
 import { ESCALATION_KIND_LABELS } from "../conversation/PausedRunCard";
 import { permissionTitle } from "../conversation/PermissionMessage";
 import { attentionGroups, attentionTotal, type AttentionGroup, type AttentionItem } from "./attentionModel";
+import { t } from "../../i18n";
+import { ROLE_INFO } from "../../settings/rules";
+import { pauseReasonOf, pauseReasonText } from "../board/boardModel";
+import { roleOf } from "../shared/roleConnection";
 
 const NO_PERMISSIONS: readonly PendingPermission[] = [];
 
@@ -256,6 +260,17 @@ function PermissionItem({ projectId, item, onOpen }: { projectId: string; item: 
   );
 }
 
+/**
+ * Título da execução parada: com a parada pelo provedor (spec 133 T02), o papel e o motivo
+ * ("Desenvolvedor pausado: sem crédito no provedor"); sem papel, "Execução parada".
+ */
+function stalledTitle(item: Extract<AttentionItem, { kind: "stalled" }>): string {
+  const role = roleOf(item.role);
+  const reason = item.stopCode === null ? null : pauseReasonOf(item.stopCode);
+  if (role === null || reason === null) return t("attention.run.stalled");
+  return t("attention.run.rolePaused", { role: ROLE_INFO[role].label, reason: pauseReasonText(reason) });
+}
+
 function RunItem({ projectId, item, onOpen }: { projectId: string; item: Extract<AttentionItem, { kind: "paused" | "stalled" }>; onOpen: () => void }) {
   const shell = useShell();
   const { t } = useT();
@@ -292,7 +307,7 @@ function RunItem({ projectId, item, onOpen }: { projectId: string; item: Extract
     <div className="nd-attention-item" data-attention-item={item.kind}>
       <p className="nd-attention-item-title" data-tone="amber">
         <Icon name={stalled ? "stop" : "alert"} size={14} />
-        {stalled ? t("attention.run.stalled") : t("attention.run.paused", { task: item.taskId })}
+        {stalled ? stalledTitle(item) : t("attention.run.paused", { task: item.taskId })}
       </p>
       {blocked && shell.readiness !== null ? <ReadinessNotice title={t("attention.run.missing")} missing={shell.readiness.execute.missing} /> : null}
       {options.length > 0 && analysis !== undefined && task !== undefined ? (

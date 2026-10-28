@@ -8,6 +8,11 @@
 //! - fora do Git: `.gitignore` próprio com `*` e a linha [`EXCLUDE_LINE`] no `.git/info/exclude`;
 //! - o `.profile` dela põe `$HOME/.local/bin` na frente do `PATH` dos shells de login (`sh -lc`),
 //!   sem mexer no `PATH` da imagem;
+//! - spec 133 T12: antes disso, o `.profile` devolve o `PATH` da imagem, que o `/etc/profile` de
+//!   várias distribuições (Alpine, Debian) refaz nos shells de login e perde (`/usr/local/go/bin`, o
+//!   `ENV PATH` do Dockerfile). O `PATH` da imagem vem do ambiente inicial do próprio shell
+//!   (`/proc/$$/environ`, o que o `docker run` entregou: o `Env` da imagem mais o `environment` do
+//!   Compose), sem tabela por distribuição e sem chamada extra ao Docker;
 //! - ciclo de vida igual ao da instalação da pasta: [`reset`] apaga tudo menos [`KEEP_ON_RESET`]
 //!   quando o estado da instalação é esquecido (rodada limpa, instalação que falhou), e a remoção
 //!   da worktree a leva junto.
@@ -31,6 +36,11 @@ pub const EXCLUDE_LINE: &str = ".nants-home/";
 pub const KEEP_ON_RESET: &str = ".cache";
 /// Arquivo lido pelos shells de login (`sh -lc`) da pasta pessoal.
 const PROFILE: &str = ".profile";
+/// Spec 133 T12: primeira linha do `.profile`. Lê o `PATH` do ambiente inicial do shell de login
+/// (`/proc/$$/environ`: o que o contêiner recebeu, antes do `/etc/profile`), põe esse `PATH` na
+/// frente e mantém depois dele, uma vez só, as pastas que o `/etc/profile` acrescentou. Sem o
+/// arquivo, sem `tr`/`sed` ou sem `PATH` nele, não muda nada. Só variáveis `nants_*`, apagadas no fim.
+pub const IMAGE_PATH_LINE: &str = r#"nants_ip=$(tr '\000' '\n' < "/proc/$$/environ" 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1); if [ -n "$nants_ip" ]; then nants_r=$PATH; PATH=$nants_ip; while [ -n "$nants_r" ]; do nants_d=${nants_r%%:*}; case "$nants_r" in *:*) nants_r=${nants_r#*:} ;; *) nants_r= ;; esac; if [ -n "$nants_d" ]; then case ":$PATH:" in *":$nants_d:"*) ;; *) PATH="$PATH:$nants_d" ;; esac; fi; done; export PATH; fi; unset nants_ip nants_r nants_d"#;
 /// Linha do `.profile`: `$HOME/.local/bin` na frente do `PATH`, uma vez só.
 pub const PATH_LINE: &str = r#"case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH"; export PATH ;; esac"#;
 
@@ -39,9 +49,11 @@ pub fn is_home_path(rel: &str) -> bool {
     rel.trim_start_matches("./").split('/').next() == Some(HOME_DIR)
 }
 
-/// Garante a pasta pessoal em `dir` com o `.gitignore` (`*`) e o `.profile` com [`PATH_LINE`].
-/// Recusa symlink ou entrada que não seja diretório no lugar dela. Idempotente; o `.profile` que
-/// uma ferramenta já alterou só recebe a linha que falta, no fim.
+/// Garante a pasta pessoal em `dir` com o `.gitignore` (`*`) e o `.profile` com [`IMAGE_PATH_LINE`]
+/// e [`PATH_LINE`], nessa ordem. Recusa symlink ou entrada que não seja diretório no lugar dela.
+/// Idempotente; o `.profile` que uma ferramenta já alterou só recebe a linha que falta:
+/// [`IMAGE_PATH_LINE`] no começo (o `PATH` da imagem é a base do que as outras linhas acrescentam)
+/// e [`PATH_LINE`] no fim.
 pub fn ensure(dir: &Path) -> io::Result<PathBuf> {
     let home = dir.join(HOME_DIR);
     match fs::symlink_metadata(&home) {
@@ -57,14 +69,24 @@ pub fn ensure(dir: &Path) -> io::Result<PathBuf> {
     write_new(&home.join(".gitignore"), "*\n")?;
     let profile = home.join(PROFILE);
     match fs::symlink_metadata(&profile) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => write_new(&profile, &format!("{PATH_LINE}\n"))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => write_new(&profile, &format!("{IMAGE_PATH_LINE}\n{PATH_LINE}\n"))?,
         Ok(m) if m.is_file() => {
             let mut text = String::new();
             OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&profile)?.read_to_string(&mut text)?;
-            if !text.lines().any(|l| l.trim() == PATH_LINE) {
-                let mut f = OpenOptions::new().append(true).custom_flags(libc::O_NOFOLLOW).open(&profile)?;
-                let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-                f.write_all(format!("{sep}{PATH_LINE}\n").as_bytes())?;
+            let has = |line: &str| text.lines().any(|l| l.trim() == line);
+            let (image, local) = (has(IMAGE_PATH_LINE), has(PATH_LINE));
+            if !image || !local {
+                let mut next = if image { String::new() } else { format!("{IMAGE_PATH_LINE}\n") };
+                next.push_str(&text);
+                if !local {
+                    if !next.is_empty() && !next.ends_with('\n') {
+                        next.push('\n');
+                    }
+                    next.push_str(PATH_LINE);
+                    next.push('\n');
+                }
+                let mut f = OpenOptions::new().write(true).truncate(true).custom_flags(libc::O_NOFOLLOW).open(&profile)?;
+                f.write_all(next.as_bytes())?;
             }
         }
         // Symlink ou outra coisa: não segue nem substitui.
@@ -130,13 +152,41 @@ mod tests {
         let uid = fs::metadata("/proc/self").expect("self").uid();
         assert_eq!(fs::metadata(&home).expect("meta").uid(), uid);
         assert_eq!(fs::read_to_string(home.join(".gitignore")).expect("gi"), "*\n");
-        assert_eq!(fs::read_to_string(home.join(".profile")).expect("profile"), format!("{PATH_LINE}\n"));
-        // Idempotente; o `.profile` alterado por uma ferramenta só ganha a linha que falta.
+        assert_eq!(fs::read_to_string(home.join(".profile")).expect("profile"), format!("{IMAGE_PATH_LINE}\n{PATH_LINE}\n"));
+        // Idempotente; o `.profile` alterado por uma ferramenta só ganha a linha que falta: a do
+        // `PATH` da imagem no começo, a do `.local/bin` no fim.
         fs::write(home.join(".profile"), ". \"$HOME/.tool/env\"").expect("w");
         ensure(&d).expect("de novo");
         ensure(&d).expect("de novo");
         let text = fs::read_to_string(home.join(".profile")).expect("profile");
-        assert_eq!(text, format!(". \"$HOME/.tool/env\"\n{PATH_LINE}\n"));
+        assert_eq!(text, format!("{IMAGE_PATH_LINE}\n. \"$HOME/.tool/env\"\n{PATH_LINE}\n"));
+        // O `.profile` da spec 129 (só a linha do `.local/bin`) ganha a do `PATH` da imagem antes dela.
+        fs::write(home.join(".profile"), format!("{PATH_LINE}\n")).expect("w");
+        ensure(&d).expect("de novo");
+        assert_eq!(fs::read_to_string(home.join(".profile")).expect("profile"), format!("{IMAGE_PATH_LINE}\n{PATH_LINE}\n"));
+        fs::remove_dir_all(&d).expect("rm");
+    }
+
+    /// Spec 133 T12: o `.profile` gerado, lido por um shell cujo `PATH` foi refeito (como o
+    /// `/etc/profile` do Alpine faz no shell de login), devolve o `PATH` com que o processo nasceu
+    /// na frente, mantém as pastas que o perfil acrescentou (uma vez só) e põe `$HOME/.local/bin`
+    /// antes de tudo. Não deixa variável auxiliar para trás.
+    #[test]
+    fn profile_restores_the_path_the_shell_started_with() {
+        let d = dir("image-path");
+        let home = ensure(&d).expect("ensure");
+        let script = "PATH=/usr/local/sbin:/usr/bin:/bin:/usr/bin; . \"$HOME/.profile\"; printf '%s|%s' \"$PATH\" \"${nants_ip-livre}${nants_r-}${nants_d-}\"";
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/opt/imagem/bin:/usr/local/go/bin:/usr/bin:/bin")
+            .output()
+            .expect("sh");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let local = format!("{}/.local/bin", home.display());
+        let want = format!("{local}:/opt/imagem/bin:/usr/local/go/bin:/usr/bin:/bin:/usr/local/sbin|livre");
+        assert_eq!(text, want, "{}", String::from_utf8_lossy(&out.stderr));
         fs::remove_dir_all(&d).expect("rm");
     }
 

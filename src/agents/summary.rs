@@ -27,7 +27,8 @@ use std::path::{Component, Path};
 use serde_json::Value;
 
 use crate::agents::llm_client::{ChatMessage, Role, ToolCall};
-use crate::agents::prompts::{SUMMARY_FILES_INTRO, SUMMARY_INTRO, SUMMARY_NO_FILES, SUMMARY_RESUME};
+use crate::agents::prompts::{summary_files_intro, summary_intro, summary_no_files, summary_resume};
+use crate::i18n::Lang;
 use crate::agents::LlmError;
 
 /// Fração da janela do modelo (em %) a partir da qual o histórico é resumido.
@@ -137,6 +138,13 @@ impl Summarizer {
             .is_some_and(|p| tokens > p.threshold.max(self.next_at))
     }
 
+    /// Contexto estimado (tokens) acima do qual o próximo resumo dispara; `None` sem resumo (ou
+    /// com o disjuntor aberto). É o fim do horizonte da regra de custo da compactação (spec 133
+    /// T04): depois dele, o histórico é refeito de qualquer forma.
+    pub fn threshold(&self) -> Option<usize> {
+        self.policy.filter(|_| self.enabled()).map(|p| p.threshold.max(self.next_at))
+    }
+
     /// Resumo feito: zera as falhas; o próximo só depois de o contexto crescer metade do limiar.
     pub fn succeeded(&mut self, after_tokens: usize) {
         self.failures = 0;
@@ -204,7 +212,7 @@ fn clean_path(raw: &str) -> Option<String> {
 }
 
 /// Lista dos arquivos tocados que ainda existem, com o tamanho atual em bytes.
-pub fn files_section(root: &Path, touched: &BTreeSet<String>) -> String {
+pub fn files_section(root: &Path, touched: &BTreeSet<String>, lang: Lang) -> String {
     let files: Vec<String> = touched
         .iter()
         .filter_map(|p| {
@@ -213,9 +221,9 @@ pub fn files_section(root: &Path, touched: &BTreeSet<String>) -> String {
         })
         .collect();
     if files.is_empty() {
-        return SUMMARY_NO_FILES.to_string();
+        return summary_no_files(lang);
     }
-    let mut lines = vec![SUMMARY_FILES_INTRO.to_string()];
+    let mut lines = vec![summary_files_intro(lang)];
     lines.extend(files.iter().take(FILES_MAX).cloned());
     if files.len() > FILES_MAX {
         lines.push(format!("- ... (+{})", files.len() - FILES_MAX));
@@ -305,14 +313,15 @@ pub fn snapshot_text(raw: &str) -> Result<String, SummaryFailure> {
 }
 
 /// Histórico novo: prefixo intacto, o retrato com os arquivos e o fecho, a cauda (par pendente) e,
-/// com `reminder`, o lembrete da tarefa no fim.
-pub fn rebuild(messages: &[ChatMessage], snapshot: &str, files: &str, reminder: Option<String>) -> Vec<ChatMessage> {
+/// com `reminder`, o lembrete da tarefa no fim. A abertura e o fecho no idioma do projeto (spec 133
+/// T11).
+pub fn rebuild(messages: &[ChatMessage], snapshot: &str, files: &str, reminder: Option<String>, lang: Lang) -> Vec<ChatMessage> {
     let prefix = prefix_end(messages);
     let tail = tail_start(messages).max(prefix);
     let mut out: Vec<ChatMessage> = messages[..prefix].to_vec();
     out.push(ChatMessage::text(
         Role::User,
-        format!("{SUMMARY_INTRO}\n\n{snapshot}\n\n{files}\n\n{SUMMARY_RESUME}"),
+        format!("{}\n\n{snapshot}\n\n{files}\n\n{}", summary_intro(lang), summary_resume(lang)),
     ));
     out.extend_from_slice(&messages[tail..]);
     if let Some(text) = reminder {
@@ -428,11 +437,15 @@ mod tests {
             result("c2", "ok"),
         ];
         assert_eq!((prefix_end(&history), tail_start(&history)), (3, 6));
-        let new = rebuild(&history, "<state_snapshot>x</state_snapshot>", "FILES", Some("lembrete".into()));
+        let new = rebuild(&history, "<state_snapshot>x</state_snapshot>", "FILES", Some("lembrete".into()), Lang::PtBr);
         let roles: Vec<Role> = new.iter().map(|m| m.role).collect();
         assert_eq!(roles, [Role::System, Role::System, Role::User, Role::User, Role::Assistant, Role::Tool, Role::User]);
         assert_eq!(new[2].content, "briefing");
-        assert!(new[3].content.starts_with(SUMMARY_INTRO) && new[3].content.contains("FILES") && new[3].content.ends_with(SUMMARY_RESUME));
+        assert!(
+            new[3].content.starts_with(&summary_intro(Lang::PtBr))
+                && new[3].content.contains("FILES")
+                && new[3].content.ends_with(&summary_resume(Lang::PtBr))
+        );
         assert_eq!(new[4].tool_calls[0].id, "c2", "par pendente preservado");
         assert_eq!(new[5].tool_call_id.as_deref(), Some("c2"));
         assert_eq!(new[6].content, "lembrete");
@@ -461,9 +474,9 @@ mod tests {
         ]);
         let listed: Vec<&str> = s.touched().iter().map(String::as_str).collect();
         assert_eq!(listed, ["src", "src/a.rs", "src/gone.rs"]);
-        let text = files_section(&root, s.touched());
-        assert_eq!(text, format!("{SUMMARY_FILES_INTRO}\n- src/a.rs (5 bytes)"), "pasta e arquivo apagado ficam fora");
-        assert_eq!(files_section(&root, &BTreeSet::new()), SUMMARY_NO_FILES);
+        let text = files_section(&root, s.touched(), Lang::PtBr);
+        assert_eq!(text, format!("{}\n- src/a.rs (5 bytes)", summary_files_intro(Lang::PtBr)), "pasta e arquivo apagado ficam fora");
+        assert_eq!(files_section(&root, &BTreeSet::new(), Lang::PtBr), summary_no_files(Lang::PtBr));
         let _ = std::fs::remove_dir_all(&root);
     }
 

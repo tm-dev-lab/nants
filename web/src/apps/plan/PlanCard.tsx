@@ -38,6 +38,7 @@ import { ARCHITECT_COMPLETE_PLAN_MESSAGE } from "../../copy";
 import { Icon } from "../../desktop/Icon";
 import { t, tp, type MessageKey } from "../../i18n";
 import { planChangeText } from "../../i18n/planChanges";
+import { providerStopText } from "../../i18n/providerEvidence";
 import { useT } from "../../i18n/react";
 import { localizeHeadingTitle } from "../../i18n/sddHeadings";
 import { useShell } from "../../desktop/shellContext";
@@ -47,6 +48,7 @@ import { appStore, useAppStore } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { MarkdownText } from "../shared/ReportMarkdown";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
+import { ProviderEvidenceDetails } from "../shared/ProviderEvidenceDetails";
 import { renumberMap, tasksInExecutionOrder } from "../shared/executionOrder";
 import { approveProblem, type RunProblem } from "../shared/runProblems";
 import { SPEC_STATUS_LABELS } from "./summary";
@@ -214,13 +216,27 @@ function ReviewProgress({ review }: { review: PlanReviewView }) {
 }
 
 function ReviewerStatus({ review }: { review: PlanReviewView }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   if (review.status === "incomplete") return <p className="nd-muted">{t("plan.review.incomplete")}</p>;
   if (review.status === "running" || review.status === "pending") return <ReviewProgress review={review} />;
   if (review.status === "stale") return <p className="nd-muted">{t("plan.review.stale")}</p>;
-  if (review.status === "unavailable") return <p className="nd-muted">{t("plan.review.unavailable")}</p>;
+  if (review.status === "unavailable") {
+    // Spec 133 T11: com a evidência da falha, quem falhou (papel, conexão e modelo) e o motivo
+    // traduzido; os códigos crus no detalhe recolhível.
+    const failure = providerStopText(PLAN_REVIEW_FAILED_CODE, review.failure, null, lang);
+    if (failure === null) return <p className="nd-muted">{t("plan.review.unavailable")}</p>;
+    return (
+      <div className="nd-stack-xs" data-plan-review-failure="">
+        <p className="nd-muted">{t("plan.review.unavailableBy", { failure })}</p>
+        <ProviderEvidenceDetails code={PLAN_REVIEW_FAILED_CODE} params={review.failure} />
+      </div>
+    );
+  }
   return <p className="nd-muted">{t("plan.review.clean")}</p>;
 }
+
+/** Código com a frase da falha do provedor (o mesmo da conversa), para a revisão do plano. */
+const PLAN_REVIEW_FAILED_CODE = "chat.provider_failed";
 
 /** Situação curta do Revisor no detalhe (a frase completa fica na vista principal). */
 function reviewerDetail(review: PlanReviewView, issues: number): string {
@@ -616,7 +632,7 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
     setCompleting(false);
     if (!result.ok) {
       // Queda da conexão de novo: o aviso fica gravado na Conversa.
-      if (result.error.reason === "connection_lost") void loadChatHistory(projectId);
+      if (result.error.reason === "connection_lost" || result.error.reason === "failure_recorded") void loadChatHistory(projectId);
       setProblem({ message: chatFailureMessage(result.error, architectWireApi(config)), missing: null });
       await onApproved();
       return;

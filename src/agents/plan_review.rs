@@ -117,6 +117,8 @@ impl PlanReviewer {
             cancel: None,
             usage,
             summary: Some(SummaryPolicy::for_window(None)),
+            cache_prices: None,
+            lang: self.lang.get(),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, plan_review_system_for(self.lang.get())),
@@ -237,12 +239,14 @@ mod tests {
             assert!(p.contains(kind), "{kind}");
         }
         assert!(p.contains("Preferência") && p.contains("lista vazia") && p.contains("No máximo 8"));
+        // Spec 133 T08: +~180 bytes (regra do idioma: título criado pelo agente sai no idioma do
+        // projeto, os estruturais sem traduzir; teto 3150 -> 3350).
         // Spec 128 T03: +~550 bytes (ação fora do sandbox no untestable, critérios longos no
         // too_large, poucos apontamentos importantes e a memória do consenso; teto 2850 -> 3150).
         // Spec 124 T06: +~230 bytes (too_large com sugestão de divisão; teto 2600 -> 2850).
         // Spec 124 T04: +~170 bytes (critério que depende de capacidade ausente é untestable; teto 2400 -> 2600).
         // Spec 122 T05: +~200 bytes (ações independentes na mesma resposta; teto 2200 -> 2400).
         // Spec 122 T02: +~200 bytes (íntegra das saídas cortadas; teto 2000 -> 2200).
-        assert!(p.len() < 3150, "{}", p.len());
+        assert!(p.len() < 3350, "{}", p.len());
     }
 }

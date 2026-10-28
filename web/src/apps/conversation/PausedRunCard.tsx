@@ -20,10 +20,17 @@ import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
 import { approveProblem, recoveryProblem, type RunProblem } from "../shared/runProblems";
 import { ChatCard, ChatCardHead } from "./ChatCard";
-import { runStopCode } from "../board/boardModel";
+import { runStopMessage } from "../board/boardModel";
+import { PROVIDER_STOP_CODES, providerEvidence } from "../../i18n/providerEvidence";
+import { ProviderEvidenceDetails } from "../shared/ProviderEvidenceDetails";
 import { PLAN_USAGE_URL, planConnectionToReconnect } from "../settings/chatgptPlan";
 import { useChatgptStart } from "../settings/PlanConnection";
-import { ANTHROPIC_LIMITS_URL } from "../../settings/rules";
+import { putAgents } from "../../api/client";
+import { apiFailureText } from "../../i18n/serverCodes";
+import { ANTHROPIC_LIMITS_URL, ROLE_INFO } from "../../settings/rules";
+import { appStore } from "../../store";
+import { initialChoice, RoleConnectionSwitch, RoleFacts, type RoleConnectionChoice } from "../shared/RoleConnectionSwitch";
+import { providerPage, readyConnections, roleOf, withRoleConnection } from "../shared/roleConnection";
 
 /** Rótulo de cada tipo de opção de escalada, no idioma ativo. */
 export const ESCALATION_KIND_LABELS: Readonly<Record<string, string>> = localized({
@@ -176,7 +183,7 @@ interface Props {
 
 export function PausedRunCard({ projectId, spec, onResumed }: Props) {
   const shell = useShell();
-  const { t } = useT();
+  const { t, lang } = useT();
   const titleId = useId();
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<RunProblem | null>(null);
@@ -212,11 +219,30 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
   const guidanceTooLong = guidanceBytes > RECOVERY_GUIDANCE_MAX_BYTES;
   const blockedByReadiness = gateBlocked(shell.readiness, "execute");
   // Pausa pelo plano ChatGPT (spec 116 T03): limite de uso ou novo login, com o cartão próprio.
-  const stopCode = useAppStore((s) => (stalled ? runStopCode(s.messages[projectId], spec.id, s.runStarts[projectId]) : null));
+  const stopMessage = useAppStore((s) => (stalled ? runStopMessage(s.messages[projectId], spec.id, s.runStarts[projectId]) : null));
+  const stopCode = stopMessage?.code ?? null;
+  // Spec 133 T01: a parada pelo provedor diz o papel, a conexão, o modelo e o motivo.
+  const providerStop = stopMessage !== null && stopCode !== null && PROVIDER_STOP_CODES.has(stopCode) ? providerEvidence(stopMessage.params, lang) : null;
+  const providerFailed = stopCode === "run.provider_failed" || stopCode === "run.provider_failed_detail";
   const planPause = stopCode === "run.plan_limit" ? "limit" : stopCode === "run.plan_needs_login" ? "sign_in" : null;
   // Limites do provedor que pausam (spec 132 T09/T10), no mesmo padrão: o teto de gasto da Anthropic
   // e a cota diária do Gemini.
-  const limitPause = stopCode === "run.spend_limit" ? "spend" : stopCode === "run.daily_quota" ? "quota" : null;
+  const limitPause = stopCode === "run.spend_limit" ? "spend" : stopCode === "run.daily_quota" ? "quota" : stopCode === "run.billing" ? "billing" : null;
+  // Spec 133 T02: o papel que parou, com a troca da conexão só dele ali mesmo.
+  const stopRole = providerStop !== null && planPause !== "sign_in" ? roleOf(stopMessage?.params?.role) : null;
+  const agents = useAppStore((s) => s.config?.agents ?? null);
+  const connections = useAppStore((s) => s.config?.connections ?? null);
+  const [choice, setChoice] = useState<RoleConnectionChoice | null>(null);
+  // A escolha começa de novo a cada parada (outro papel ou outra mensagem), não a cada gravação.
+  const choiceKey = stopRole === null || stopMessage === null ? null : `${stopMessage.id}:${stopRole}`;
+  const configLoaded = agents !== null && connections !== null;
+  useEffect(() => {
+    setChoice(stopRole !== null && agents !== null && connections !== null ? initialChoice(stopRole, agents, connections) : null);
+  }, [choiceKey, configLoaded]);
+  const otherReady = stopRole !== null && agents !== null && connections !== null && readyConnections(connections).some((c) => c.id !== agents[stopRole].connection_id);
+  const stopParams = stopMessage?.params ?? {};
+  const stopConnection = connections?.find((c) => c.id === stopParams.connection_id) ?? null;
+  const page = stopRole === null || (limitPause === null && planPause !== "limit") ? null : providerPage(stopConnection, stopParams.connection_kind, limitPause === "billing" ? "billing" : "limits");
   const reconnectTarget = useAppStore((s) => (planPause === "sign_in" ? (planConnectionToReconnect(s.config?.agents, s.config?.connections)?.id ?? null) : null));
   const reconnect = useChatgptStart(reconnectTarget ?? undefined);
   const locked = busy || blockedByReadiness;
@@ -260,6 +286,24 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
     setBusy(false);
   }
 
+  /** Grava a nova conexão (e o modelo) só do papel que parou e continua a execução. */
+  async function switchAndContinue(): Promise<void> {
+    if (inFlight.current || stopRole === null || agents === null || choice === null) return;
+    inFlight.current = true;
+    setBusy(true);
+    setProblem(null);
+    const saved = await putAgents(withRoleConnection(agents, stopRole, choice.connectionId, choice.model));
+    inFlight.current = false;
+    if (!saved.ok) {
+      setBusy(false);
+      setProblem({ message: apiFailureText(saved.error), missing: null });
+      return;
+    }
+    appStore.setState((s) => ({ config: s.config === null ? null : { ...s.config, agents: saved.data } }));
+    setBusy(false);
+    await resume();
+  }
+
   const parsed = analysis === null ? null : parseEscalation(analysis);
   const resumeLabel = busy
     ? stalled
@@ -271,16 +315,46 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
         ? t("recovery.resumeManually")
         : t("run.resume");
 
+  const canSwitch = stopRole !== null && otherReady;
+  const choiceChanged =
+    choice !== null && agents !== null && stopRole !== null && choice.model.trim() !== "" && (choice.connectionId !== agents[stopRole].connection_id || choice.model !== agents[stopRole].model);
+  // Nos limites (cobrança, teto, cota, plano), trocar a conexão é a saída principal; na falha do
+  // provedor, Continuar.
+  const switchFirst = canSwitch && !providerFailed;
+  const resumeButton = (
+    <button
+      type="button"
+      className="nd-btn"
+      data-variant={canSwitch && !switchFirst ? "primary" : undefined}
+      onClick={() => void resume()}
+      disabled={locked}
+      aria-busy={busy}
+      data-resume=""
+    >
+      <Icon name="play" size={14} />
+      {switchFirst && !busy ? t("roleConn.continueWithout") : resumeLabel}
+    </button>
+  );
+
+
   return (
     <ChatCard as="article" aria-labelledby={titleId} tone="amber" data-paused-card="">
       <ChatCardHead
-        agent="architect"
+        agent={stopRole ?? "architect"}
         nameId={titleId}
-        extra={blocked.map((task) => (
-          <span key={task.id} className="nd-task-tag nd-mono">
-            {task.id}
-          </span>
-        ))}
+        extra={
+          blocked.length > 0 ? (
+            blocked.map((task) => (
+              <span key={task.id} className="nd-task-tag nd-mono">
+                {task.id}
+              </span>
+            ))
+          ) : stopRole !== null && typeof stopParams.task === "string" ? (
+            <span className="nd-task-tag nd-mono" data-stop-task="">
+              {stopParams.task}
+            </span>
+          ) : null
+        }
       />
       <div className="nd-chat-card-body nd-stack">
         <h3 className="nd-callout-title" data-plan-pause={planPause ?? undefined} data-limit-pause={limitPause ?? undefined}>
@@ -292,7 +366,9 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
                 ? t("paused.spendLimitTitle")
                 : limitPause === "quota"
                   ? t("paused.dailyQuotaTitle")
-                  : stalled
+                  : limitPause === "billing"
+                    ? t("paused.billingTitle")
+                    : stalled
                 ? t("paused.stalledTitle")
                 : environmental
                   ? t("envBlock.title")
@@ -306,6 +382,8 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
           <p className="nd-muted">{t("paused.spendLimitHint")}</p>
         ) : limitPause === "quota" ? (
           <p className="nd-muted">{t("paused.dailyQuotaHint")}</p>
+        ) : limitPause === "billing" ? (
+          <p className="nd-muted">{t("paused.billingHint")}</p>
         ) : stalled ? (
           <p className="nd-muted">{t("paused.stalledHint")}</p>
         ) : environmental ? (
@@ -313,6 +391,37 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
         ) : (
           <p className="nd-muted">{t("paused.hint")}</p>
         )}
+
+        {providerStop !== null && stopMessage !== null ? (
+          <div className="nd-stack-sm" data-provider-stop="">
+            {providerFailed ? <p className="nd-strong">{t("paused.providerReason", { reason: providerStop.reason })}</p> : null}
+            {stopRole !== null ? (
+              <RoleFacts
+                role={stopRole}
+                connectionName={typeof stopParams.connection_name === "string" ? stopParams.connection_name : t("provider.evidence.noConnection")}
+                connectionKind={stopParams.connection_kind}
+                model={typeof stopParams.model === "string" ? stopParams.model : "?"}
+              />
+            ) : (
+              <p className="nd-muted">{providerStop.who}</p>
+            )}
+            <ProviderEvidenceDetails code={stopMessage.code} params={stopMessage.params} />
+          </div>
+        ) : null}
+
+        {stopRole !== null && agents !== null && connections !== null ? (
+          otherReady && choice !== null ? (
+            <section className="nd-stack-sm" aria-label={t("roleConn.switchTitle", { role: ROLE_INFO[stopRole].label })} data-stop-switch="">
+              <h4 className="nd-section-label">{t("roleConn.switchTitle", { role: ROLE_INFO[stopRole].label })}</h4>
+              <RoleConnectionSwitch role={stopRole} agents={agents} connections={connections} value={choice} onChange={setChoice} disabled={busy} />
+              <p className="nd-field-hint">{t("roleConn.switchHint", { role: ROLE_INFO[stopRole].label })}</p>
+            </section>
+          ) : (
+            <p className="nd-muted" data-no-other-connection="">
+              {t("roleConn.noOther")}
+            </p>
+          )
+        ) : null}
 
         {escalatedTask !== undefined || analysis !== null ? (
           <div className="nd-stack-sm">
@@ -432,23 +541,51 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
       </div>
       <div className="nd-chat-card-foot nd-stack-sm">
         <div className="nd-actions">
-          {planPause === "limit" ? (
-            <a className="nd-btn" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="">
-              <Icon name="external" size={14} />
-              {t("chatgpt.manageUsage")}
-            </a>
+          {/* Na falha do provedor, que pode passar sozinha, Continuar é a ação principal (spec 133 T02). */}
+          {switchFirst ? null : resumeButton}
+          {canSwitch ? (
+            <button
+              type="button"
+              className="nd-btn"
+              data-variant={switchFirst ? "primary" : undefined}
+              data-switch-continue=""
+              disabled={locked || !choiceChanged}
+              aria-busy={busy}
+              onClick={() => void switchAndContinue()}
+            >
+              <Icon name="refresh" size={14} />
+              {busy ? t("paused.continuing") : t("roleConn.switchAndContinue")}
+            </button>
           ) : null}
-          {limitPause === "spend" ? (
+          {/* Mensagens antigas, sem papel: as saídas de antes (o console da Anthropic, Agentes). */}
+          {stopRole === null && limitPause === "spend" ? (
             <a className="nd-btn" href={ANTHROPIC_LIMITS_URL} target="_blank" rel="noopener noreferrer" data-provider-limits="">
               <Icon name="external" size={14} />
               {t("paused.openAnthropicLimits")}
             </a>
           ) : null}
-          {limitPause === "quota" ? (
+          {stopRole === null && (limitPause === "quota" || limitPause === "billing") ? (
             <button type="button" className="nd-btn" data-switch-connection="" onClick={() => shell.openSettings("agents")}>
               <Icon name="users" size={14} />
               {t("paused.switchConnection")}
             </button>
+          ) : null}
+          {stopRole !== null && !otherReady ? (
+            <button type="button" className="nd-btn" data-add-connection="" onClick={() => shell.openSettings("connections")}>
+              <Icon name="plus" size={14} />
+              {t("roleConn.addConnection")}
+            </button>
+          ) : null}
+          {page !== null ? (
+            <a className="nd-btn" href={page.url} target="_blank" rel="noopener noreferrer" data-provider-page="">
+              <Icon name="external" size={14} />
+              {page.label}
+            </a>
+          ) : planPause === "limit" ? (
+            <a className="nd-btn" href={PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" data-plan-usage="">
+              <Icon name="external" size={14} />
+              {t("chatgpt.manageUsage")}
+            </a>
           ) : null}
           {planPause === "sign_in" ? (
             <button
@@ -464,10 +601,7 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
               {reconnect.busy ? t("chatgpt.opening") : t("chatgpt.reconnect")}
             </button>
           ) : null}
-          <button type="button" className="nd-btn" onClick={() => void resume()} disabled={locked} aria-busy={busy} data-resume="">
-            <Icon name="play" size={14} />
-            {resumeLabel}
-          </button>
+          {switchFirst ? resumeButton : null}
         </div>
         {reconnect.notice}
         {problem !== null ? <ProblemNotice message={problem.message} missing={problem.missing} prereq={problem.prereq} /> : null}

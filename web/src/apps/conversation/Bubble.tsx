@@ -13,12 +13,13 @@ import { looksLikeChoicesAnswer, parseChoices } from "../../choices";
 import { Icon } from "../../desktop/Icon";
 import { useT } from "../../i18n/react";
 import { isInfoSystemMessage, systemMessageText } from "../../i18n/serverCodes";
-import { localizeRecoveryAnalysis } from "../../recoveryAnalysis";
+import { recoveryMessageText } from "../../recoveryAnalysis";
 import { parseReviewMessage } from "../../reviewMessage";
 import type { ChatMessage } from "../../store";
 import { AgentAvatar } from "../shared/AgentAvatar";
 import { CaptureThumbnails } from "../shared/CaptureThumbnails";
 import { MarkdownText } from "../shared/ReportMarkdown";
+import { ProviderEvidenceDetails } from "../shared/ProviderEvidenceDetails";
 import {
   ReviewDecisionList,
   ReviewerChecklist,
@@ -162,6 +163,7 @@ function BubbleView({
             <p role="status" className="nd-system-text" data-tone={info ? "info" : undefined}>
               {systemMessageText(message)}
             </p>
+            <ProviderEvidenceDetails code={message.code} params={message.params} />
             {onRetryTurn !== undefined ? (
               <div className="nd-row">
                 <button type="button" className="nd-btn nd-btn-sm" data-retry-turn="" disabled={retryDisabled} onClick={onRetryTurn}>
@@ -201,7 +203,7 @@ function BubbleView({
     message.role === "agent" && message.agent === "system"
       ? systemMessageText(message)
       : fromArchitect
-        ? withCurrentRoundMarker(localizeRecoveryAnalysis(message.text, lang), marker)
+        ? withCurrentRoundMarker(recoveryMessageText(message, lang), marker)
         : message.text;
   const parsed = message.role === "architect" ? parseChoices(body) : { text: body, questions: null };
   const showChoices = parsed.questions !== null && choices !== undefined && (choices.interactive || choices.answered !== null || choices.unanswered);
@@ -229,6 +231,7 @@ function BubbleView({
         {checklist !== null && checklist.verdict !== null ? <ReviewVerdictBadge verdict={checklist.verdict} /> : null}
         {checklist !== null ? <ReviewStateSummary review={checklist} /> : null}
         <MarkdownText text={checklist?.summary ?? parsed.text} keepLineBreaks={message.role === "agent"} />
+        {message.role === "agent" && message.agent === "system" ? <ProviderEvidenceDetails code={message.code} params={message.params} /> : null}
         {checklist !== null ? <ReviewFindingList findings={checklist.findings} kind="blocking" /> : null}
         {checklist !== null ? <ReviewFindingList findings={checklist.observations} kind="observation" /> : null}
         {checklist !== null ? <ReviewFindingList findings={checklist.resolved} kind="resolved" /> : null}

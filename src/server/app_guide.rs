@@ -428,7 +428,7 @@ pub async fn post_fix(State(state): State<AppState>, AxPath(id): AxPath<String>,
     let root = PathBuf::from(&project.path);
     let (spec, job_secrets) = (input.spec_id.clone(), Arc::clone(&secrets));
     let run_command = tokio::task::spawn_blocking(move || run_command_of(&root, &spec, &job_secrets)).await.ok().flatten();
-    let message = crate::agents::prompts::app_fix_request(&input.spec_id, failure.code, run_command.as_deref(), &log);
+    let message = crate::agents::prompts::app_fix_request(&input.spec_id, failure.code, run_command.as_deref(), &log, state.project_lang(&id).get());
     match super::chat::internal_turn(&state, &id, message).await {
         Ok(resp) => resp,
         Err(e) => e.into_response(),

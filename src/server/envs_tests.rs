@@ -169,12 +169,16 @@ fn cleanup_test_runs_down_with_volumes_only_in_docker_mode() {
 fn teardown_downs_both_projects_and_removes_run_volumes_only_when_confirmed() {
     let root = tmp("t");
     docker_project(&root);
-    for (confirm, run_args) in [(false, vec!["down", "--timeout", "5", "--remove-orphans"]), (true, vec!["down", "--timeout", "5", "-v", "--remove-orphans"])] {
+    // Spec 133 T12: a remoção do projeto apaga também as imagens construídas para ele.
+    for (confirm, run_args) in [
+        (false, vec!["down", "--timeout", "5", "--rmi", "local", "--remove-orphans"]),
+        (true, vec!["down", "--timeout", "5", "-v", "--rmi", "local", "--remove-orphans"]),
+    ] {
         let rec = Rec::with_ports();
         assert!(teardown(&provider(&rec), &root, "p", true, confirm).is_empty());
         let calls = rec.compose_calls();
         assert_eq!(calls[0].0, "nants-p-test");
-        assert_eq!(calls[0].1, ["down", "-v", "--remove-orphans"]);
+        assert_eq!(calls[0].1, ["down", "-v", "--rmi", "local", "--remove-orphans"]);
         assert_eq!(calls[1].0, "nants-p-run");
         assert_eq!(calls[1].1, run_args);
     }

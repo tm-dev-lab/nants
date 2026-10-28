@@ -46,6 +46,29 @@ describe("checklist do Revisor", () => {
     expect(within(items[1] as HTMLElement).getByRole("img", { name: "não atendido" })).toBeTruthy();
     expect(findForbiddenGlyphs(container)).toEqual([]);
   });
+
+  it("mostra o critério não verificado (spec 133 T06) com marca própria, distinta de não atendido", () => {
+    const text = "Aprovado: ok\n\nCritérios:\n✓ A: src/a.rs:1\n? B: não verificado: a evidência cita o que não existe (x.js:9)";
+    expect(splitChecklist(text)?.items).toEqual([
+      { met: true, text: "A: src/a.rs:1" },
+      { met: false, unverified: true, text: "B: não verificado: a evidência cita o que não existe (x.js:9)" },
+    ]);
+    const { container } = renderMessage(text);
+    const items = within(screen.getByRole("list", { name: "Critérios de aceitação" })).getAllByRole("listitem");
+    expect(items[1]?.getAttribute("data-met")).toBe("unverified");
+    expect(within(items[1] as HTMLElement).getByRole("img", { name: "não verificado" })).toBeTruthy();
+    expect(within(items[1] as HTMLElement).queryByRole("img", { name: "não atendido" })).toBeNull();
+    expect(findForbiddenGlyphs(container)).toEqual([]);
+    cleanup();
+    setLanguage("en", { persist: false });
+    try {
+      renderMessage(text.replace("Aprovado", "Approved").replace("Critérios", "Criteria"));
+      const enItems = within(screen.getByRole("list", { name: "Acceptance criteria" })).getAllByRole("listitem");
+      expect(within(enItems[1] as HTMLElement).getByRole("img", { name: "not verified" })).toBeTruthy();
+    } finally {
+      setLanguage("pt-BR", { persist: false });
+    }
+  });
 });
 
 const FULL =

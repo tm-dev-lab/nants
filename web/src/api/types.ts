@@ -5,6 +5,8 @@
  * envio (putConnection/testConnection); nunca voltam nas respostas.
  */
 
+import type { CodeParams } from "./codes";
+
 // ---------- Enums ----------
 
 export type Effort = "low" | "medium" | "high";
@@ -502,6 +504,11 @@ export interface PlanReviewView {
   issues: PlanIssue[];
   /** Ciclo de consenso (spec 128); ausente nos registros antigos. */
   consensus?: ConsensusView;
+  /**
+   * Revisão indisponível por falha do provedor (spec 133 T11): a evidência (papel, conexão,
+   * modelo, categoria e os códigos do provedor), nos mesmos `params` do `run.provider_failed`.
+   */
+  failure?: CodeParams;
 }
 
 interface SkillProfileView {

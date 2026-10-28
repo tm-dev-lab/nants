@@ -183,6 +183,27 @@ describe("painel do sino", () => {
     expect(screen.getByRole("region", { name: "Plano" })).toBeTruthy();
   });
 
+  it("execução parada por limite de conta: o sino diz o papel e o motivo (spec 133 T02)", async () => {
+    const stalled = (extra: Partial<Extract<AttentionProject["paused_or_stalled"], { kind: "stalled" }>>) =>
+      entry("p1", "Loja", { paused_or_stalled: { kind: "stalled", spec_id: "s1", ...extra } });
+    await renderShell({
+      url: "/?space=p1",
+      projects: [P1],
+      states: { p1: makeProjectState({ id: "p1", name: "Loja", specs: [makeSpec("s1", "Loja", "IN_PROGRESS", [makeTask("T02", "Carrinho", "IN_PROGRESS")])] }) },
+      attention: { setup_incomplete: false, projects: [stalled({ stop_code: "run.billing", role: "developer" })] },
+    });
+    fireEvent.click(bell());
+    await settle();
+    const item = panel().querySelector<HTMLElement>("[data-attention-item='stalled']");
+    expect(item?.textContent).toContain("Desenvolvedor pausado: sem crédito no provedor");
+    expect(findForbiddenGlyphs(panel())).toEqual([]);
+    // Sem papel (parada antiga ou que não é do provedor): o título de sempre.
+    expect(projectItems(stalled({}))[0]).toMatchObject({ kind: "stalled", stopCode: null, role: null });
+    setLanguage("en", { persist: false });
+    await settle();
+    expect(document.querySelector("[data-attention-item='stalled']")?.textContent).toContain("Developer paused: out of credit at the provider");
+  });
+
   it("Esc fecha e devolve o foco ao sino; sem nada, a frase de vazio", async () => {
     await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: makeProjectState({ id: "p1", name: "Loja" }) } });
     fireEvent.click(bell());

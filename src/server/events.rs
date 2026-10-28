@@ -486,8 +486,9 @@ pub fn message_text(secrets: &SecretSet, text: &str) -> String {
 
 /// Teto de bytes de cada parâmetro de texto de uma mensagem com `code` (spec 102).
 pub const MAX_PARAM_BYTES: usize = 512;
-/// Teto de parâmetros de uma mensagem com `code`.
-const MAX_PARAMS: usize = 8;
+/// Teto de parâmetros de uma mensagem com `code` (spec 133 T01: a falha do provedor leva o papel,
+/// a conexão, o modelo, a tarefa e os códigos do provedor).
+const MAX_PARAMS: usize = 20;
 
 /// `code` estável de mensagem (spec 102): `[a-z0-9_.]`, de 1 a 64 caracteres, começando por letra.
 pub fn valid_message_code(code: &str) -> bool {

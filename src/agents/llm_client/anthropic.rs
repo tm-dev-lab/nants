@@ -299,6 +299,23 @@ impl Opts {
         (budget < self.max_tokens).then_some(budget)
     }
 
+    /// Degrau aplicado desde `before` (spec 133 T01), para o registro de uso.
+    pub fn step_since(&self, before: &Self) -> &'static str {
+        if self.web != before.web || self.history_tool != before.history_tool {
+            "web_search"
+        } else if self.thinking != before.thinking {
+            "thinking"
+        } else if self.display != before.display {
+            "thinking_display"
+        } else if self.max_tokens != before.max_tokens {
+            "max_tokens"
+        } else if self.output_effort != before.output_effort {
+            "effort"
+        } else {
+            "other"
+        }
+    }
+
     /// Relaxa o campo que o 400 `error_body` recusou. `false` quando não há o que relaxar (o erro
     /// sobe). Ordem: o `budget_tokens` do thinking `enabled`, o `max_tokens`, o thinking e o
     /// `output_config`. O 400 que cita o contexto ("input length and `max_tokens` exceed context
@@ -616,7 +633,7 @@ fn unwrap_json_fence(text: &str) -> Option<String> {
 pub(super) fn parse(body: &str, fallback_used: bool, response_json: bool) -> Result<ChatResponse, LlmError> {
     let v: Value = serde_json::from_str(body).map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)))?;
     if v["type"] == "error" || v.get("error").is_some_and(|e| !e.is_null()) {
-        return Err(LlmError::Parse(BadReason::provider_error(&v)));
+        return Err(super::limit::event_error(&v));
     }
     let Some(content) = v["content"].as_array() else {
         return Err(LlmError::Parse(BadReason::new(BadKind::InvalidJson)));
@@ -827,6 +844,15 @@ pub fn rewrite_tool_use(items: &mut Vec<Value>, id: &str, arguments: &str) -> bo
     changed
 }
 
+/// Tira os blocos de raciocínio (`thinking`/`redacted_thinking`) de um turno do assistente cujo
+/// prefixo mudou (spec 133 T04, C-03): a assinatura deles vale para a conversa em que nasceram. Os
+/// demais blocos ficam inalterados. `true` quando algo saiu.
+pub fn drop_thinking(items: &mut Vec<Value>) -> bool {
+    let before = items.len();
+    items.retain(|i| !is_thinking(i));
+    items.len() != before
+}
+
 /// Acumulador do stream da Messages API: os blocos por `index`, o JSON parcial dos `tool_use`, o
 /// uso (o de `message_start` com os totais de `message_delta`) e o `stop_reason`.
 #[derive(Default)]
@@ -992,7 +1018,7 @@ impl StreamAcc {
             }
             "error" => {
                 let error = if v["error"].is_object() { &v["error"] } else { &v };
-                return Err(LlmError::Parse(BadReason::provider_error(error)));
+                return Err(super::limit::event_error(error));
             }
             _ => {}
         }
@@ -1059,7 +1085,7 @@ impl LlmClient {
                 {
                     wasted = add_usage(wasted, resp.usage);
                     remember_basic_web(&self.base_url, &req.model);
-                    self.note_resend(&req.model);
+                    self.note_resend(&req.model, "web_search");
                     continue;
                 }
                 let resp = match prior.take() {
@@ -1086,13 +1112,14 @@ impl LlmClient {
     /// Relaxa o degrau pelo 400 `text` e, se a busca dinâmica caiu, guarda isso para o modelo.
     fn relax_noting(&self, opts: &mut Opts, text: &str, model: &str) -> bool {
         let was_dynamic = opts.web == Web::Dynamic;
+        let before = *opts;
         if !opts.relax(text) {
             return false;
         }
         if was_dynamic && opts.web != Web::Dynamic {
             remember_basic_web(&self.base_url, model);
         }
-        self.note_resend(model);
+        self.note_resend(model, opts.step_since(&before));
         true
     }
 
@@ -1169,7 +1196,7 @@ impl LlmClient {
                     if opts.relax_web_input() {
                         wasted = add_usage(wasted, r.usage);
                         remember_basic_web(&self.base_url, &req.model);
-                        self.note_resend(&req.model);
+                        self.note_resend(&req.model, "web_search");
                         // Os deltas já mostrados desta tentativa são descartados na tela.
                         on_delta(StreamDelta::Retry(WEB_SEARCH_RETRY_NOTICE.into()));
                         continue;
@@ -1191,7 +1218,7 @@ impl LlmClient {
                 if let Some(r) = refused.filter(|_| prior.is_none() && opts.relax_web_input()) {
                     wasted = add_usage(wasted, r.usage);
                     remember_basic_web(&self.base_url, &req.model);
-                    self.note_resend(&req.model);
+                    self.note_resend(&req.model, "web_search");
                     continue;
                 }
                 parsed

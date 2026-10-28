@@ -109,6 +109,8 @@ export function finalVerificationCounts(prefix: string): { met: number; total: n
 
 export interface ChecklistItem {
   met: boolean;
+  /** Spec 133 T06: `?` na matriz, a evidência citou caminhos que não existem (distinto de não atendido). */
+  unverified?: true;
   text: string;
 }
 
@@ -119,6 +121,10 @@ export function splitChecklist(text: string): { summary: string; items: Checklis
   const items: ChecklistItem[] = [];
   for (const line of text.slice(found.index + found[0].length).split("\n")) {
     const mark = line[0];
+    if (mark === "?") {
+      items.push({ met: false, unverified: true, text: line.slice(1).trim() });
+      continue;
+    }
     if (mark !== "✓" && mark !== "✗") continue;
     items.push({ met: mark === "✓", text: line.slice(1).trim() });
   }

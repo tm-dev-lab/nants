@@ -3,8 +3,10 @@
 pub mod activity;
 pub mod arch_memory;
 pub mod architect;
+pub mod cache_cost;
 pub mod chat;
 pub mod finding_reply;
+pub mod evidence_paths;
 pub mod finding_track;
 pub mod llm_agents;
 pub mod llm_client;

@@ -83,7 +83,7 @@ const PROVIDER_REASON_FNS: &[(&str, &str)] = &[
     ("agents/llm_client.rs", "retry_notice"),
     ("agents/llm_client.rs", "described_params"),
     ("server/error.rs", "provider_failure_params"),
-    ("server/chat.rs", "architect_error"),
+    ("server/chat.rs", "failed_turn"),
 ];
 
 /// Spec 129 T04: funções (arquivo, nome) que escrevem ou leem os marcadores estruturais que chegam

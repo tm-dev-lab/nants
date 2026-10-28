@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use crate::agents::runner::{final_base_prefix, manual_criteria, section_text, ACCEPTANCE, FINAL_BASE_PREFIX};
+use crate::agents::runner::{final_base_prefix, manual_criteria, pending_lines, section_text, ACCEPTANCE, FINAL_BASE_PREFIX, PENDING};
 use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
@@ -211,6 +211,11 @@ async fn generate(
     let lang = state.project_lang(project_id);
     let lang_now = lang.get();
     let trace = blocking(move || traceability(&trace_root, &sid, &trace_secrets, lang_now)).await.flatten();
+    // Spec 133 T07: pendências conhecidas que a verificação final não resolveu, montadas pelo servidor.
+    let sid = spec_id.to_string();
+    let pending_root = root.clone();
+    let pending_secrets = Arc::clone(&secrets);
+    let pending = blocking(move || pending_section(&pending_root, &sid, &pending_secrets, lang_now)).await.flatten();
 
     let (model, effort, client) = architect_client(state)
         .await
@@ -254,6 +259,9 @@ async fn generate(
     let mut tail = String::new();
     if env_clean {
         tail.push_str(&format!("\n{}\n", env_clean_line(lang_now)));
+    }
+    if let Some(section) = &pending {
+        tail.push_str(&format!("\n{}\n", section.trim_end()));
     }
     if let Some(section) = &trace {
         tail.push_str(&format!("\n{}\n", section.trim_end()));
@@ -438,6 +446,36 @@ pub(super) fn build_facts(root: &Path, spec_id: &str, secrets: &SecretSet) -> Op
 /// tarefas que o declaram em `covers` → commit de integração `feat(<spec>): Txx - ` na base (o mais
 /// recente da tarefa). `None` se a spec não pode ser lida ou o plano não declara `covers`.
 /// Redigida e limitada a [`MAX_TRACEABILITY_BYTES`], cortada em fim de linha.
+/// Teto da seção de pendências conhecidas (spec 133 T07); o corte é em fim de linha.
+const MAX_PENDING_BYTES: usize = 6 * 1024;
+
+/// Spec 133 T07: seção "Pendências conhecidas" do relatório, no idioma do projeto, com as pendências
+/// das tarefas ([`PENDING`]) que a verificação final não resolveu, `- Txx P-yy: texto`, redigidas.
+/// `None` sem nenhuma: a seção não aparece.
+pub(super) fn pending_section(root: &Path, spec_id: &str, secrets: &SecretSet, lang: Lang) -> Option<String> {
+    let tasks = read_tasks(root, &format!("{SPECS_REL}/{spec_id}"));
+    let mut lines = String::new();
+    let mut omitted = 0usize;
+    for t in &tasks {
+        let id = scrub_text(secrets, &t.frontmatter.id);
+        for (pid, text) in pending_lines(&section_text(&t.body, PENDING).unwrap_or_default()) {
+            let line = format!("- {id} {}: {}\n", scrub_text(secrets, &pid), scrub_text(secrets, &text));
+            if lines.len() + line.len() > MAX_PENDING_BYTES {
+                omitted += 1;
+            } else {
+                lines.push_str(&line);
+            }
+        }
+    }
+    if lines.is_empty() && omitted == 0 {
+        return None;
+    }
+    if omitted > 0 {
+        lines.push_str(&format!("- (+{omitted})\n"));
+    }
+    Some(format!("{}\n\n{lines}", crate::i18n::text(lang, "report.pending.title")))
+}
+
 pub(super) fn traceability(root: &Path, spec_id: &str, secrets: &SecretSet, lang: Lang) -> Option<String> {
     let spec_rel = format!("{SPECS_REL}/{spec_id}");
     let text = safe_fs::read_regular(root, &format!("{spec_rel}/{SPEC_FILE}"), MAX_READ_BYTES).ok()?;
@@ -905,5 +943,55 @@ mod observation_tests {
     fn review_facts_without_observations_or_attempts_is_empty() {
         let secrets = SecretSet::new(Vec::new());
         assert_eq!(review_facts(&[task("T01", "## Objetivo\nx\n", 0)], &secrets), "");
+    }
+}
+
+/// Spec 133 T07: seção de pendências conhecidas do relatório, montada pelo servidor.
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    const SPEC: &str = "001-exemplo";
+    const SECRET: &str = "sk-SEGREDO-PEND-555";
+
+    fn root(tag: &str, tasks: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nants-report-pending-{}-{tag}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let tasks_dir = dir.join(SPECS_REL).join(SPEC).join(TASKS_DIR);
+        fs::create_dir_all(&tasks_dir).expect("tasks");
+        for (id, body) in tasks {
+            let text = format!(
+                "---\nid: \"{id}\"\nspec_id: \"{SPEC}\"\ntitle: \"t\"\nstatus: \"DONE\"\ndepends_on: []\nallowed_scope: [\"src/**\"]\nbranch: \"\"\nattempts: 0\nmax_attempts: 3\nlast_review_verdict: \"APPROVED\"\n---\n{body}"
+            );
+            fs::write(tasks_dir.join(format!("{id}.md")), text).expect("tarefa");
+        }
+        dir
+    }
+
+    #[test]
+    fn report_lists_open_pending_in_the_project_language_scrubbed() {
+        let secrets = SecretSet::new(vec![SECRET.to_string()]);
+        let t07 = format!(
+            "## Objetivo\nx\n\n## Pendências conhecidas\n- P-01: Aviso do Desenvolvedor: o link Entrar falta {SECRET}\n\
+             - P-02: Critério 2 (parcial), o ambiente não permite provar: coluna. Motivo: sem GPU\n\n\
+             ## Pendências resolvidas na verificação final\n- P-03: já resolvida\n"
+        );
+        let dir = root("abertas", &[("T07", &t07), ("T08", "## Objetivo\ny\n")]);
+        let pt = pending_section(&dir, SPEC, &secrets, Lang::PtBr).expect("seção");
+        assert!(pt.starts_with("## Pendências conhecidas\n\n"), "{pt}");
+        assert!(pt.contains("- T07 P-01: Aviso do Desenvolvedor: o link Entrar falta"), "{pt}");
+        assert!(pt.contains("- T07 P-02: Critério 2 (parcial)"), "{pt}");
+        assert!(!pt.contains(SECRET) && !pt.contains("P-03") && !pt.contains("T08"), "{pt}");
+        let en = pending_section(&dir, SPEC, &secrets, Lang::En).expect("section");
+        assert!(en.starts_with("## Known issues\n\n"), "{en}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_without_pending_has_no_section() {
+        let secrets = SecretSet::new(Vec::new());
+        let dir = root("sem", &[("T01", "## Objetivo\nx\n\n## Pendências resolvidas na verificação final\n- P-01: resolvida\n")]);
+        assert_eq!(pending_section(&dir, SPEC, &secrets, Lang::PtBr), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

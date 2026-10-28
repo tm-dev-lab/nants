@@ -346,3 +346,94 @@ async fn output_tokens_429_citing_a_larger_limit_keeps_the_single_reduction() {
     assert_eq!(max, vec![4_000, 4_000, 4_000, 2_000]);
     assert_eq!(pacer.output_ceiling(CONN, ANTHROPIC_MODEL), Some(2_000));
 }
+
+// --- Spec 133 T02: cobrança e crédito esgotado pausam, em qualquer provedor ---
+
+const ANTHROPIC_BILLING_402: &str = r#"{"type":"error","error":{"type":"billing_error","message":"Your account has an outstanding payment."}}"#;
+const ANTHROPIC_CREDIT_400: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+const ANTHROPIC_WORKSPACE_SPEND_400: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"This workspace has reached its spend limit for the month."}}"#;
+const GEMINI_PAYMENT_402: &str = r#"{"error":{"code":"payment_required","message":"billing account required"}}"#;
+const OPENAI_INSUFFICIENT_QUOTA: &str = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#;
+
+/// Todo 402, de qualquer tipo de conexão, pausa por cobrança: sem nova tentativa e sem ensinar o
+/// ritmo.
+#[tokio::test]
+async fn http_402_pauses_as_billing_for_every_kind() {
+    for (kind, model, body) in [
+        (ConnectionKind::Anthropic, ANTHROPIC_MODEL, ANTHROPIC_BILLING_402),
+        (ConnectionKind::GoogleGemini, GEMINI_MODEL, GEMINI_PAYMENT_402),
+        (ConnectionKind::ApiKey, "modelo-x", "corpo que não é json"),
+    ] {
+        let (base, bodies) = server(vec![json_reply(402, "", body), json_reply(402, "", body)]).await;
+        let (pacer, sleep, waits) = paced_parts();
+        let c = client(&base, kind, &pacer, sleep);
+        let err = c.chat(&req(model)).await.expect_err("402");
+        assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{kind:?}: {err:?}");
+        assert_eq!(provider_failure(&err).to_string(), "provider_billing");
+        let err = c.chat_stream(&req(model), &|_| {}).await.expect_err("402 no stream");
+        assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{kind:?}: {err:?}");
+        assert_eq!(bodies.lock().expect("lock").len(), 2, "{kind:?}: sem nova tentativa");
+        assert!(waits_of(&waits).is_empty());
+        assert_eq!(pacer.ceilings(CONN, model), (None, None), "{kind:?}: não é limite de ritmo");
+    }
+}
+
+/// O 400 da Anthropic pelo crédito esgotado pausa por cobrança; o 400 pelo teto de gasto do
+/// workspace pausa pelo teto. Nenhum dos dois se repete.
+#[tokio::test]
+async fn anthropic_400_credit_and_spend_limit_pause() {
+    let (base, bodies) = server(vec![json_reply(400, "", ANTHROPIC_CREDIT_400), json_reply(400, "", ANTHROPIC_WORKSPACE_SPEND_400)]).await;
+    let (pacer, sleep, waits) = paced_parts();
+    let c = client(&base, ConnectionKind::Anthropic, &pacer, sleep);
+    let err = c.chat(&req(ANTHROPIC_MODEL)).await.expect_err("crédito");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{err:?}");
+    let err = c.chat_stream(&req(ANTHROPIC_MODEL), &|_| {}).await.expect_err("teto do workspace");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::SpendLimit)), "{err:?}");
+    assert_eq!(bodies.lock().expect("lock").len(), 2);
+    assert!(waits_of(&waits).is_empty());
+}
+
+/// Negativo (C-10): um 400 comum que fala em crédito fora do `error.message` (repetindo o que foi
+/// enviado) não é limite; nem o texto de crédito numa conexão de outro tipo.
+#[tokio::test]
+async fn plain_400_mentioning_credit_outside_the_message_is_not_a_limit() {
+    let echoed = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: prompt is too long"},"request":{"echo":"Your credit balance is too low"},"credit balance":"too low"}"#;
+    let other_kind = r#"{"error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}"#;
+    let (base, _) = server(vec![json_reply(400, "", echoed), json_reply(400, "", other_kind)]).await;
+    let (pacer, sleep, _) = paced_parts();
+    let c = client(&base, ConnectionKind::Anthropic, &pacer, Arc::clone(&sleep));
+    let err = c.chat(&req(ANTHROPIC_MODEL)).await.expect_err("400 comum");
+    assert!(matches!(err, LlmError::Http { status: 400, .. }), "{err:?}");
+    let c = client(&base, ConnectionKind::GoogleGemini, &pacer, sleep);
+    let err = c.chat(&req(GEMINI_MODEL)).await.expect_err("texto de crédito fora do escopo");
+    assert!(matches!(err, LlmError::Http { status: 400, .. }), "{err:?}");
+}
+
+/// O `insufficient_quota` da OpenAI pausa por cobrança no HTTP 429 (sem esperar nem repetir) e no
+/// meio do stream, no Chat Completions e no `response.failed` do Responses.
+#[tokio::test]
+async fn openai_insufficient_quota_pauses_on_http_and_stream() {
+    let chat_stream = "data: {\"error\":{\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\",\"message\":\"quota\"}}\n\n";
+    let failed = ev(
+        "response.failed",
+        &json!({"type":"response.failed","response":{"status":"failed","error":{"code":"credit_balance_exhausted","message":"no credit"}}}).to_string(),
+    );
+    let (base, bodies) = server(vec![
+        json_reply(429, "retry-after: 5\r\n", OPENAI_INSUFFICIENT_QUOTA),
+        http(200, "", "text/event-stream", chat_stream),
+        http(200, "", "text/event-stream", &failed),
+    ])
+    .await;
+    let (pacer, sleep, waits) = paced_parts();
+    let c = client(&base, ConnectionKind::ApiKey, &pacer, Arc::clone(&sleep));
+    let err = c.chat(&req("gpt-x")).await.expect_err("429 insufficient_quota");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{err:?}");
+    let err = c.chat_stream(&req("gpt-x"), &|_| {}).await.expect_err("erro no stream do chat");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{err:?}");
+    let c = client(&base, ConnectionKind::ApiKey, &pacer, sleep).with_wire_api(WireApi::Responses);
+    let err = c.chat_stream(&req("gpt-x"), &|_| {}).await.expect_err("response.failed");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{err:?}");
+    assert_eq!(bodies.lock().expect("lock").len(), 3, "sem nova tentativa");
+    assert!(waits_of(&waits).is_empty(), "não espera o retry-after");
+    assert_eq!(pacer.ceilings(CONN, "gpt-x"), (None, None), "não ensina o ritmo");
+}

@@ -169,6 +169,7 @@ export type PauseReason =
   | "plan_sign_in"
   | "spend_limit"
   | "daily_quota"
+  | "billing"
   | "stopped"
   | "failed"
   | "interrupted"
@@ -189,6 +190,7 @@ const STOP_CODES: Readonly<Record<string, PauseReason>> = {
   // Limites do provedor que pausam (spec 132 T09).
   "run.spend_limit": "spend_limit",
   "run.daily_quota": "daily_quota",
+  "run.billing": "billing",
   "run.failed": "failed",
   "run.failed_cause": "failed",
 };
@@ -211,6 +213,14 @@ export function runStopReason(messages: readonly ChatMessage[] | undefined, spec
  * interrompida). A Conversa usa para o cartão próprio das pausas do plano ChatGPT (spec 116 T03).
  */
 export function runStopCode(messages: readonly ChatMessage[] | undefined, specId: string, since?: RunStart): string | null {
+  return runStopMessage(messages, specId, since)?.code ?? null;
+}
+
+/**
+ * Mensagem do sistema da parada ATUAL do run da spec (a mesma regra de `runStopCode`), ou `null`.
+ * O cartão da execução parada lê dela a evidência da falha do provedor (spec 133 T01).
+ */
+export function runStopMessage(messages: readonly ChatMessage[] | undefined, specId: string, since?: RunStart): ChatMessage | null {
   if (messages === undefined) return null;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
@@ -218,7 +228,7 @@ export function runStopCode(messages: readonly ChatMessage[] | undefined, specId
     if (since !== undefined && (m.seq !== undefined ? m.seq <= since.seq : m.at < since.at)) return null;
     // Um agente falou depois: a execução foi retomada depois de qualquer parada mais antiga.
     if (m.agent !== "system") return null;
-    if (m.code !== undefined && STOP_CODES[m.code] !== undefined) return m.code;
+    if (m.code !== undefined && STOP_CODES[m.code] !== undefined) return m;
   }
   return null;
 }
@@ -246,11 +256,17 @@ const PAUSE_REASON_KEY: Readonly<Record<PauseReason, MessageKey>> = {
   plan_sign_in: "board.pause.planNeedsLogin",
   spend_limit: "board.pause.spendLimit",
   daily_quota: "board.pause.dailyQuota",
+  billing: "board.pause.billing",
   stopped: "board.pause.stopped",
   failed: "board.pause.failed",
   interrupted: "board.pause.interrupted",
   decision: "board.pause.decision",
 };
+
+/** Motivo da pausa pelo `code` da mensagem de parada, ou `null` se o código não para o run. */
+export function pauseReasonOf(code: string): PauseReason | null {
+  return STOP_CODES[code] ?? null;
+}
 
 export function pauseReasonText(reason: PauseReason): string {
   return t(PAUSE_REASON_KEY[reason]);

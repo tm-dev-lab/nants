@@ -220,6 +220,28 @@ pub fn count_criteria(acceptance: &str) -> usize {
         .count()
 }
 
+/// Spec 133 T07: os itens de primeiro nível de [`count_criteria`], na ordem, com o número de cada
+/// um: o número explícito do item (`1. `, `- 2. `) quando há, senão a posição (1, 2, ...). É o
+/// pareamento entre o critério da tarefa, a linha do Desenvolvedor e a resposta do Revisor.
+pub fn criterion_items(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| is_top_item(l))
+        .enumerate()
+        .map(|(i, line)| {
+            let rest = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).unwrap_or(line).trim_start();
+            let explicit = rest
+                .split_once(['.', ')'])
+                .filter(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|(n, after)| Some((n.parse::<usize>().ok()?, after.trim_start())));
+            match explicit {
+                Some((n, after)) if n > 0 => (n, after.to_string()),
+                _ => (i + 1, rest.to_string()),
+            }
+        })
+        .collect()
+}
+
 /// Primeiro nível da lista de critérios: `- `, `* ` ou `1. ` sem recuo.
 fn is_top_item(line: &str) -> bool {
     !line.starts_with([' ', '\t'])
@@ -500,6 +522,9 @@ pub(crate) mod tests {
         assert_eq!(waived_line(&[("F-03".into(), ArbitrationDecision::Manual)]).as_deref(), Some("- Apontamentos dispensados: F-03 [manual]"));
         assert!(waived_line(&[]).is_none());
         assert_eq!(count_criteria("- a\n1. b\n* c\ntexto\n10. d"), 4);
+        // Spec 133 T07: o número do item (explícito ou a posição) pareia os critérios.
+        let items = criterion_items("- a\n  - sub\n- 3. c: met: x\n* d\n10. e");
+        assert_eq!(items, vec![(1, "a".into()), (3, "c: met: x".into()), (3, "d".into()), (10, "e".into())]);
         // Subitens recuados (espaço ou tabulação) detalham o critério de cima: não contam.
         assert_eq!(count_criteria("1. a\n   - detalhe\n   - outro\n2. b\n\t* sub\n  3. recuado\n- c"), 3);
     }

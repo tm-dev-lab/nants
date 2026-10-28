@@ -8,8 +8,9 @@
 use super::Task;
 use crate::harness::tools::glob_match_path;
 
-const OBJECTIVE: &str = "Objetivo";
-const ACCEPTANCE: &str = "Critérios de Aceitação";
+// Títulos estruturais (`sdd::section_titles`): os mesmos que o runner lê.
+const OBJECTIVE: &str = crate::agents::runner::OBJECTIVE;
+const ACCEPTANCE: &str = crate::agents::runner::ACCEPTANCE;
 
 /// Com mais avisos de caminho que isto na mesma tarefa, [`grouped_scope_warnings`] os junta numa
 /// linha só.

@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use super::chat::ChatBackend;
-use super::llm_client::{Billing, ChatMessage, ChatRequest, ChatResponse, StreamCut, StreamDelta, Usage};
+use super::llm_client::{evidence, Billing, ChatMessage, ChatRequest, ChatResponse, StreamCut, StreamDelta, Usage};
+use crate::config::Effort;
 use super::LlmError;
 
 /// Uso de uma chamada ao modelo, com o contexto do agente.
@@ -36,6 +37,49 @@ pub struct UsageEvent {
     /// Tamanho do contexto enviado e o passo da sessão (spec 122 T01); `None` fora de uma sessão
     /// (geração de imagem).
     pub context: Option<ContextStats>,
+    /// Como a chamada correu (spec 133 T01): novas tentativas, relaxamentos, término e esforço.
+    pub call: CallMeta,
+}
+
+/// Como uma chamada correu (spec 133 T01), para o `usage.jsonl`. Tudo opcional: vazio = nada a
+/// registrar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallMeta {
+    /// Novas tentativas do mesmo pedido (falhas transitórias, limite, resposta ruim).
+    pub retries: u32,
+    /// O pedido só passou sem o raciocínio pedido.
+    pub fallback_used: bool,
+    /// Degraus de relaxamento aplicados (campos opcionais recusados e retirados), em ordem.
+    pub relaxed: Vec<String>,
+    /// Motivo de término (`stop`, `length`, `tool_calls`, `cut` ou o do provedor saneado).
+    pub finish: Option<String>,
+    /// Esforço de raciocínio efetivo: o pedido (`low|medium|high`) ou `off` quando a escada o
+    /// retirou; `None` quando o pedido não pediu esforço.
+    pub effort: Option<String>,
+}
+
+impl CallMeta {
+    /// Rastro da chamada que acabou de terminar, com a resposta (quando houver) e o pedido.
+    pub fn of(req: &ChatRequest, resp: Option<&ChatResponse>, cut: bool) -> Self {
+        let trace = evidence::call_trace().unwrap_or_default();
+        let fallback_used = resp.is_some_and(|r| r.fallback_used);
+        Self {
+            retries: trace.retries,
+            fallback_used,
+            relaxed: trace.relaxed.iter().map(|s| (*s).to_string()).collect(),
+            finish: if cut { Some("cut".to_string()) } else { evidence::finish_label(resp.and_then(|r| r.finish_reason.as_deref())) },
+            effort: req.effort.map(|e| if fallback_used { "off" } else { effort_label(e) }.to_string()),
+        }
+    }
+}
+
+/// Nome estável do esforço.
+fn effort_label(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+    }
 }
 
 /// Medida do contexto de uma chamada (spec 122 T01): só números e o id da sessão.
@@ -173,6 +217,14 @@ pub enum ContextKind {
     Dedup,
     Summary,
     SummaryFailed,
+    /// Spec 133 T06: conferência dos caminhos citados pelo Revisor como evidência. Não mexe no
+    /// contexto: `items` são os itens com evidência inválida; `tools` leva as contagens `cited`,
+    /// `missing` e `past_end`; `reason` é `ok`, `reask`, `fixed` ou `unverified`.
+    EvidenceCheck,
+    /// Spec 133 T13 (D7): compactação recusada pela regra de custo. Não mexe no contexto: `items`
+    /// são os itens que sairiam; `tools` leva `removed` (R), `invalidated` (I) e `horizon` (H), em
+    /// tokens; `reason` é `cost` ou `session_ending`.
+    CompactRefused,
 }
 
 impl ContextKind {
@@ -183,6 +235,8 @@ impl ContextKind {
             Self::Dedup => "dedup",
             Self::Summary => "summary",
             Self::SummaryFailed => "summary_failed",
+            Self::EvidenceCheck => "evidence_check",
+            Self::CompactRefused => "compact_refused",
         }
     }
 }
@@ -339,12 +393,15 @@ impl<'a> UsageBackend<'a> {
         Self { inner, scope }
     }
 
-    /// Passo e medida do contexto da chamada que começa; `None` sem escopo.
+    /// Passo e medida do contexto da chamada que começa; `None` sem escopo. Zera o rastro da
+    /// chamada anterior (spec 133 T01).
     fn begin(&self, req: &ChatRequest) -> Option<ContextStats> {
+        evidence::begin_call();
         self.scope.as_ref().map(|s| s.begin_call(req))
     }
 
-    fn note(&self, model: &str, resp: &ChatResponse, context: Option<ContextStats>) {
+    fn note(&self, req: &ChatRequest, resp: &ChatResponse, context: Option<ContextStats>) {
+        let model = req.model.as_str();
         let usage = resp.usage.or_else(|| (resp.web_search_calls > 0).then(|| Usage::new(0, 0)));
         if let (Some(scope), Some(usage)) = (&self.scope, usage) {
             scope.sink.record(UsageEvent {
@@ -360,13 +417,15 @@ impl<'a> UsageBackend<'a> {
                 cut: None,
                 billing: resp.billing,
                 context,
+                call: CallMeta::of(req, Some(resp), false),
             });
         }
     }
 
     /// Resposta cortada (spec 114 T05): a linha no log, o diagnóstico e o custo conhecido ou
     /// estimado, mesmo sem a resposta final.
-    fn note_cut(&self, model: &str, cut: &Arc<StreamCut>, context: Option<&ContextStats>) {
+    fn note_cut(&self, req: &ChatRequest, cut: &Arc<StreamCut>, context: Option<&ContextStats>) {
+        let model = req.model.as_str();
         let agent = self.scope.as_ref().map_or("?", |s| s.agent.as_str());
         eprintln!("{}", cut_log_line(agent, model, cut));
         let Some(scope) = &self.scope else {
@@ -393,6 +452,7 @@ impl<'a> UsageBackend<'a> {
                 cut: Some(cut.reason.to_string()),
                 billing: cut.billing,
                 context: context.cloned(),
+                call: CallMeta::of(req, None, true),
             });
         }
     }
@@ -403,12 +463,12 @@ impl ChatBackend for UsageBackend<'_> {
         &'a self,
         req: &'a ChatRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(evidence::with_trace_scope(async move {
             let context = self.begin(req);
             let resp = self.inner.complete(req).await?;
-            self.note(&req.model, &resp, context);
+            self.note(req, &resp, context);
             Ok(resp)
-        })
+        }))
     }
 
     fn complete_stream<'a>(
@@ -416,18 +476,18 @@ impl ChatBackend for UsageBackend<'_> {
         req: &'a ChatRequest,
         on_delta: &'a (dyn Fn(StreamDelta) + Send + Sync),
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(evidence::with_trace_scope(async move {
             let context = self.begin(req);
             let wrapped = |d: StreamDelta| {
                 if let StreamDelta::Cut(cut) = &d {
-                    self.note_cut(&req.model, cut, context.as_ref());
+                    self.note_cut(req, cut, context.as_ref());
                 }
                 on_delta(d);
             };
             let resp = self.inner.complete_stream(req, &wrapped).await?;
-            self.note(&req.model, &resp, context);
+            self.note(req, &resp, context);
             Ok(resp)
-        })
+        }))
     }
 }
 
@@ -616,5 +676,47 @@ mod tests {
         let some = Fake(Some(Usage::new(1, 1)));
         UsageBackend::new(&some, None).complete(&req()).await.expect("ok");
         assert!(sink.0.lock().expect("lock").is_empty());
+    }
+
+    /// Spec 133 T01: a chamada que passou depois de uma nova tentativa (500) e de um degrau de
+    /// relaxamento (o esforço recusado num 400) registra as novas tentativas, o degrau, o
+    /// `fallback_used`, o esforço efetivo e o motivo de término.
+    #[tokio::test]
+    async fn records_retries_relaxation_fallback_and_finish() {
+        use crate::agents::llm_client::{tests::spawn_server, LlmClient};
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+        let refused = r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort","type":"invalid_request_error","param":"reasoning_effort"}}"#;
+        let (base, _) = spawn_server(vec![(500, "{}"), (400, refused), (200, ok)]).await;
+        let client = LlmClient::new(base, "chave-local".into()).expect("cliente");
+        let sink = Arc::new(MemSink::default());
+        let b = UsageBackend::new(&client, Some(scope(&sink)));
+        let mut request = req();
+        request.messages = vec![ChatMessage::text(Role::User, "oi")];
+        request.effort = Some(Effort::High);
+        let resp = b.complete(&request).await.expect("ok");
+        assert!(resp.fallback_used);
+        let ev = sink.0.lock().expect("lock");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].call,
+            CallMeta {
+                retries: 1,
+                fallback_used: true,
+                relaxed: vec!["effort".to_string()],
+                finish: Some("length".to_string()),
+                effort: Some("off".to_string()),
+            }
+        );
+        drop(ev);
+        // Sem relaxamento nem nova tentativa: só o término e o esforço pedido.
+        let (base, _) = spawn_server(vec![(200, ok)]).await;
+        let client = LlmClient::new(base, "chave-local".into()).expect("cliente");
+        let b = UsageBackend::new(&client, Some(scope(&sink)));
+        request.effort = Some(Effort::Low);
+        b.complete(&request).await.expect("ok");
+        let ev = sink.0.lock().expect("lock");
+        assert_eq!(ev[1].call.retries, 0);
+        assert!(ev[1].call.relaxed.is_empty() && !ev[1].call.fallback_used);
+        assert_eq!(ev[1].call.effort.as_deref(), Some("low"));
     }
 }

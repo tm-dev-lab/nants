@@ -67,7 +67,7 @@ use super::safe_fs::{self, SafeFsError, MAX_READ_BYTES, O_NOFOLLOW};
 use super::state::{AppState, ReserveError, INTERNAL_RESERVATION_PREFIX, REPORT_BUSY_CODE, REPORT_RESERVATION};
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_agents::{LlmDeveloper, LlmReviewer};
-use crate::agents::llm_client::{LlmClient, ProviderFailure};
+use crate::agents::llm_client::{ConnectionRef, FailureEvidence, LlmClient, ProviderFailure};
 use crate::agents::runner::{
     is_integrated, BlockKind, Fut, RunnerError, ShellTestExecutor, SpecOutcome, TaskRunner,
 };
@@ -225,6 +225,12 @@ pub struct AgentSetup {
     /// provedor nativo (spec 132 T08), senão a do catálogo de preços em cache (spec 122 T04);
     /// `None` = o padrão declarado.
     pub context_window: Option<usize>,
+    /// Tipo da conexão do papel: escolhe o preço do modelo no catálogo (spec 133 T04).
+    pub kind: crate::config::ConnectionKind,
+    /// Preços de cache do modelo (spec 133 T04, C-01): os da tabela de preços, senão os do catálogo
+    /// em cache ([`resolve_cache_prices`]); pesam o custo de
+    /// compactar o histórico. `None` = a regra só pelo tamanho.
+    pub cache_prices: Option<crate::agents::cache_cost::CachePrices>,
 }
 
 /// Entradas para montar o runner de um projeto. Já validadas pelo handler.
@@ -457,6 +463,7 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         .with_cancel(Arc::clone(&job.cancel))
         .with_lang(job.lang.clone())
         .with_context_window(job.developer.context_window)
+        .with_cache_prices(job.developer.cache_prices)
         .with_browser(Arc::new(crate::harness::browser::BrowserTests::real(job.project_id.clone())));
         let developer = match job.developer.max_steps {
             Some(n) => developer.with_max_steps(n),
@@ -494,7 +501,8 @@ impl RunnerFactory for ConfiguredRunnerFactory {
         .with_memory(Arc::clone(&job.secrets))
         .with_cancel(Arc::clone(&job.cancel))
         .with_lang(job.lang.clone())
-        .with_context_window(job.reviewer.context_window);
+        .with_context_window(job.reviewer.context_window)
+        .with_cache_prices(job.reviewer.cache_prices);
         let reviewer = match job.reviewer.max_steps {
             Some(n) => reviewer.with_max_steps(n),
             None => reviewer,
@@ -1100,6 +1108,19 @@ async fn launch(
     // Spec 132 T08: a janela informada pela lista de modelos do provedor nativo vem antes.
     developer.context_window = developer.context_window.or(window(0));
     reviewer.context_window = reviewer.context_window.or(window(1));
+    // Spec 133 T04 (C-01): os preços de cache pelo modelo e pelo tipo da conexão, do mesmo cache.
+    let price_dir = state.config_path().parent().map(Path::to_path_buf).unwrap_or_default();
+    let price_models = [(developer.model.clone(), developer.kind), (reviewer.model.clone(), reviewer.kind)];
+    let prices = blocking(move || {
+        let models: Vec<(&str, crate::config::ConnectionKind)> = price_models.iter().map(|(m, k)| (m.as_str(), *k)).collect();
+        Ok(super::price_catalog::cached_cache_prices(&price_dir, &models))
+    })
+    .await
+    .unwrap_or_default();
+    // A mesma fonte do custo da tela: o `cfg.pricing` do modelo (estimativa ou edição manual)
+    // vem antes; o catálogo em cache só sem ele.
+    developer.cache_prices = resolve_cache_prices(cfg.pricing.get(&developer.model), developer.kind, prices.first().copied().flatten());
+    reviewer.cache_prices = resolve_cache_prices(cfg.pricing.get(&reviewer.model), reviewer.kind, prices.get(1).copied().flatten());
     // Spec 090 T02: com backend substituto (testes), nenhum gerador real chega à rede.
     let images = match state.llm_backend() {
         Some(_) => None,
@@ -1425,6 +1446,7 @@ async fn launch(
         grace: state.shutdown_grace(),
         notes,
         state: state.clone(),
+        roles: role_connections(&cfg),
     });
     if !started {
         // Shutdown acionado antes do disparo: o runner não começou; a compensação desfaz IN_PROGRESS.
@@ -1771,6 +1793,34 @@ struct Background {
     notes: Vec<String>,
     /// Estado do processo: o relatório final da spec (após `integrated`) usa reservas e configuração.
     state: AppState,
+    /// Conexão de cada papel na configuração desta execução (spec 133 T01), para a evidência das
+    /// falhas do provedor.
+    roles: Vec<(&'static str, ConnectionRef)>,
+}
+
+/// Conexão de cada papel na configuração `cfg` (id, nome e tipo).
+fn role_connections(cfg: &Config) -> Vec<(&'static str, ConnectionRef)> {
+    [("architect", &cfg.agents.architect), ("developer", &cfg.agents.developer), ("reviewer", &cfg.agents.reviewer)]
+        .into_iter()
+        .filter_map(|(role, agent)| {
+            let conn = cfg.connections.iter().find(|c| c.id == agent.connection_id)?;
+            Some((role, ConnectionRef { id: conn.id.clone(), name: conn.name.clone(), kind: conn.kind.as_str().to_string() }))
+        })
+        .collect()
+}
+
+/// Falha do provedor (spec 133 T01): completa a evidência com a conexão do papel e grava a linha
+/// no registro persistente da spec, fora do Git.
+async fn record_provider_end(end: &mut RunEnd, roles: &[(&'static str, ConnectionRef)], root: &Path, project_id: &str, spec_id: &str, secrets: &Arc<SecretSet>) {
+    let RunEnd::Provider(failure, Some(evidence)) = end else {
+        return;
+    };
+    if evidence.connection.is_none() {
+        evidence.connection = roles.iter().find(|(role, _)| *role == evidence.role).map(|(_, conn)| conn.clone());
+    }
+    let record = super::provider_errors::record_of(project_id, Some(spec_id), None, failure, evidence, secrets);
+    let root = root.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || super::provider_errors::append(&root, &record)).await;
 }
 
 /// Desfecho da execução em segundo plano, antes de virar eventos.
@@ -1778,8 +1828,9 @@ enum RunEnd {
     Outcome(SpecOutcome),
     /// Erro do runner; carrega a causa (`Display` do `RunnerError`, ainda sem scrub) quando conhecida.
     Failed(Option<String>),
-    /// Falha do provedor LLM de um papel: a causa fixa vai como mensagem do sistema.
-    Provider(ProviderFailure),
+    /// Falha do provedor LLM de um papel: a causa fixa vai como mensagem do sistema, com a
+    /// evidência (spec 133 T01) quando houver.
+    Provider(ProviderFailure, Option<Box<FailureEvidence>>),
     Panicked,
     Cancelled,
     /// Cancelamento pedido pelo usuário (botão "Parar", spec 086 T04), sem shutdown.
@@ -1815,6 +1866,7 @@ fn spawn_run(bg: Background) -> bool {
             grace,
             notes,
             state,
+            roles,
         } = bg;
         // Recuperação e diagnóstico do Arquiteto param no shutdown OU na parada pelo usuário.
         let mut halt = halt_signal(shutdown.clone(), stop.subscribe());
@@ -1972,6 +2024,7 @@ fn spawn_run(bg: Background) -> bool {
             drop(guard.take());
             None
         };
+        record_provider_end(&mut end, &roles, &root, &project_id, &spec_id, &secrets).await;
         // Mensagens do sistema vão ao diálogo da spec; o status segue na mesma ordem.
         for ev in terminal_events(&project_id, &secrets, &spec_id, end) {
             deliver(&events, Some(&dialog), ev);
@@ -1995,7 +2048,8 @@ async fn run_once(
 ) -> RunEnd {
     let worker_runner = Arc::clone(runner);
     let worker_spec = spec_id.to_string();
-    let mut worker = tokio::spawn(async move { worker_runner.run(&worker_spec).await });
+    // Spec 133 T01: o rastro das chamadas vale para a execução inteira (a evidência da falha final).
+    let mut worker = tokio::spawn(crate::agents::llm_client::evidence::with_trace_scope(async move { worker_runner.run(&worker_spec).await }));
     tokio::select! {
         biased;
         _ = wait_shutdown(shutdown) => {
@@ -2019,7 +2073,7 @@ fn run_end(
     match joined {
         Ok(Ok(outcome)) => RunEnd::Outcome(outcome),
         Ok(Err(RunnerError::Cancelled)) => RunEnd::Cancelled,
-        Ok(Err(RunnerError::Provider { failure, .. })) => RunEnd::Provider(failure),
+        Ok(Err(RunnerError::Provider { failure, evidence, .. })) => RunEnd::Provider(failure, evidence),
         Ok(Err(err)) => RunEnd::Failed(Some(err.to_string())),
         Err(_) => RunEnd::Panicked,
     }
@@ -2162,22 +2216,32 @@ fn terminal_events(
         // Plano ChatGPT (spec 116 T02): limite de uso, conta não elegível ou precisa entrar de novo
         // pausam a execução com o código próprio; o "Continuar" retoma. Sem nova tentativa
         // automática e sem horário de liberação.
-        RunEnd::Provider(ProviderFailure::Plan(plan)) => vec![
-            system_message_coded(project_id, &ProviderFailure::Plan(plan).describe(), plan_pause_code(plan), Map::new()),
+        RunEnd::Provider(ProviderFailure::Plan(plan), evidence) => vec![
+            system_message_coded(
+                project_id,
+                &ProviderFailure::Plan(plan).describe(),
+                plan_pause_code(plan),
+                evidence_params(secrets, evidence.as_deref(), Map::new()),
+            ),
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
         // Spec 132 T09: o teto de gasto da Anthropic e a cota diária do Gemini pausam do mesmo
         // jeito, com o código próprio: esperar alguns segundos não resolve.
-        RunEnd::Provider(ProviderFailure::Limit(limit)) => vec![
-            system_message_coded(project_id, &ProviderFailure::Limit(limit).describe(), limit_pause_code(limit), Map::new()),
+        RunEnd::Provider(ProviderFailure::Limit(limit), evidence) => vec![
+            system_message_coded(
+                project_id,
+                &ProviderFailure::Limit(limit).describe(),
+                limit_pause_code(limit),
+                evidence_params(secrets, evidence.as_deref(), Map::new()),
+            ),
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
-        RunEnd::Provider(failure) => vec![
+        RunEnd::Provider(failure, evidence) => vec![
             {
                 // Params neutros de idioma (spec 102): a interface monta o motivo pelo dicionário.
                 let params = super::error::provider_failure_params(&failure);
                 let code = if params.contains_key("kind") { CODE_PROVIDER_FAILED_DETAIL } else { CODE_PROVIDER_FAILED };
-                system_message_coded(project_id, &failure.describe(), code, params)
+                system_message_coded(project_id, &failure.describe(), code, evidence_params(secrets, evidence.as_deref(), params))
             },
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
@@ -2194,6 +2258,15 @@ fn terminal_events(
             json!({"status": "idle", "reason": "shutdown_forced"}),
         )],
     }
+}
+
+/// `params` da falha do provedor com a evidência (spec 133 T01), quando houver: papel, conexão,
+/// modelo, tarefa, tentativa, categoria e os códigos do provedor, somados aos `base`.
+fn evidence_params(secrets: &SecretSet, evidence: Option<&FailureEvidence>, mut base: Map<String, Value>) -> Map<String, Value> {
+    if let Some(evidence) = evidence {
+        base.extend(super::provider_errors::evidence_params(secrets, evidence));
+    }
+    base
 }
 
 fn status_event(project_id: &str, payload: Value) -> ApiEvent {
@@ -2233,6 +2306,8 @@ fn plan_pause_code(plan: crate::agents::llm_client::PlanError) -> &'static str {
 pub const CODE_SPEND_LIMIT: &str = "run.spend_limit";
 /// Execução pausada pela cota diária do Gemini esgotada (spec 132 T09).
 pub const CODE_DAILY_QUOTA: &str = "run.daily_quota";
+/// Execução pausada pela cobrança do provedor: crédito esgotado ou pagamento pendente (spec 133 T02).
+pub const CODE_BILLING: &str = "run.billing";
 
 /// Código da pausa por um limite do provedor.
 fn limit_pause_code(limit: crate::agents::llm_client::ProviderLimit) -> &'static str {
@@ -2240,6 +2315,7 @@ fn limit_pause_code(limit: crate::agents::llm_client::ProviderLimit) -> &'static
     match limit {
         ProviderLimit::SpendLimit => CODE_SPEND_LIMIT,
         ProviderLimit::DailyQuota => CODE_DAILY_QUOTA,
+        ProviderLimit::Billing => CODE_BILLING,
     }
 }
 /// Relançamento em modo docker recusado (`params.message`).
@@ -3231,7 +3307,23 @@ fn agent_setup(
             .then(|| super::models_native::known_input_window(connection.endpoint(), &agent.model))
             .flatten()
             .and_then(|w| usize::try_from(w).ok()),
+        kind: connection.kind,
+        cache_prices: None,
     })
+}
+
+/// Preços de cache da regra de compactação (spec 133 T04, C-01): os de `pricing` (a tabela que
+/// também dá o custo da tela, com as estimativas do catálogo e as edições do usuário), senão os do
+/// catálogo em cache (`catalog`). O plano ChatGPT não cobra por token: `None`.
+fn resolve_cache_prices(
+    pricing: Option<&crate::config::Pricing>,
+    kind: crate::config::ConnectionKind,
+    catalog: Option<crate::agents::cache_cost::CachePrices>,
+) -> Option<crate::agents::cache_cost::CachePrices> {
+    if kind == crate::config::ConnectionKind::ChatgptPlan {
+        return None;
+    }
+    pricing.and_then(crate::agents::cache_cost::CachePrices::from_pricing).or(catalog)
 }
 
 /// Grava `IN_PROGRESS` somente se `spec.md` ainda contém `original` (lido na inspeção).
@@ -3560,6 +3652,39 @@ mod tests {
 
     /// Spec 132 T08: na conexão nativa, a janela vem da última lista de modelos do provedor (por
     /// endereço e modelo); na conexão por chave, fica para o catálogo.
+    /// Spec 133 T04 (C-01): a regra de compactação usa a mesma tabela do custo da tela; o preço
+    /// manual vem antes do catálogo e muda a decisão. O plano ChatGPT fica sem preço.
+    #[test]
+    fn manual_price_drives_the_compaction_decision() {
+        use crate::agents::cache_cost::CachePrices;
+        use crate::config::{ConnectionKind, PriceSource, Pricing};
+        let catalog = Some(CachePrices { read: 0.1, rewrite: 1.25 });
+        // Tirar 500 tokens invalidando 25 mil, num horizonte de 10 chamadas.
+        let decide = |p: Option<CachePrices>| p.map(|p| p.worth(500, 25_000, 10, true));
+        let by_catalog = resolve_cache_prices(None, ConnectionKind::Anthropic, catalog);
+        assert_eq!(by_catalog, catalog, "sem preço na tabela: o catálogo");
+        assert_eq!(decide(by_catalog), Some(false));
+        // O usuário editou o preço do modelo: sem desconto de cache, compactar sempre compensa.
+        let manual = Pricing {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+            web_search_per_call: None,
+            image_per_unit: None,
+            source: PriceSource::Manual,
+            estimated_at: None,
+        };
+        let by_manual = resolve_cache_prices(Some(&manual), ConnectionKind::Anthropic, catalog);
+        assert_eq!(by_manual, Some(CachePrices { read: 1.0, rewrite: 1.0 }));
+        assert_eq!(decide(by_manual), Some(true), "o preço manual muda a decisão");
+        // Com os campos de cache na tabela, eles valem.
+        let cached = Pricing { cached_input_per_mtok: Some(0.2), cache_write_per_mtok: Some(2.0), ..manual.clone() };
+        assert_eq!(resolve_cache_prices(Some(&cached), ConnectionKind::Anthropic, None), Some(CachePrices { read: 0.2, rewrite: 2.0 }));
+        assert_eq!(resolve_cache_prices(Some(&manual), ConnectionKind::ChatgptPlan, catalog), None, "plano: sem preço");
+        assert_eq!(resolve_cache_prices(None, ConnectionKind::ApiKey, None), None);
+    }
+
     #[test]
     fn agent_setup_takes_the_native_input_window_from_the_models_list() {
         let mut cfg = config_for(Path::new("/tmp/x"));
@@ -4386,6 +4511,7 @@ mod tests {
             grace: TEST_GRACE,
             notes: Vec::new(),
             state: AppState::new(PathBuf::from("/nonexistent-nants-root/config.toml"), Config::default(), PORT),
+            roles: Vec::new(),
         });
         assert!(!started.load(Ordering::SeqCst), "runner não deve iniciar");
         assert!(registry.active(PROJECT).is_none(), "reserva liberada");
@@ -5881,6 +6007,64 @@ mod tests {
         assert!(wait_idle(&state).await);
     }
 
+    /// Fábrica que anota a conexão de cada papel (o modelo montado) e segue como a [`Scripted`].
+    #[derive(Debug)]
+    struct RoleRecorder(Arc<Mutex<Vec<(String, String, Option<String>)>>>);
+
+    impl RunnerFactory for RoleRecorder {
+        fn build(&self, job: RunJob) -> Result<Box<dyn SpecRunner>, RunnerError> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).push((
+                job.developer.model.clone(),
+                job.reviewer.model.clone(),
+                job.architect.as_ref().map(|a| a.model.clone()),
+            ));
+            Scripted(Script::Hang).build(job)
+        }
+    }
+
+    /// Spec 133 T02: a troca no cartão da pausa grava só a conexão daquele papel (o mesmo
+    /// `PUT /api/config/agents` da tela de Agentes, com os outros papéis como estavam) e o
+    /// Continuar monta a execução com a nova conexão desse papel; os outros papéis seguem iguais.
+    #[tokio::test]
+    async fn switch_in_the_pause_card_applies_on_continue_only_for_that_role() {
+        let root = blocked_project("troca-papel", false).await;
+        let mut cfg = config_for(&root);
+        cfg.connections.push(connection("conta-b", "chave-b-literal"));
+        cfg.agents.architect = AgentConfig { connection_id: "literal".into(), model: "modelo-arq".into(), effort: Effort::Low, max_steps: None };
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let compose = crate::server::envs::ComposeProvider::with_runner(
+            Arc::new(crate::server::envs::tests::Rec::default()),
+            root.with_file_name("compose-overrides"),
+        );
+        let state = AppState::new(root.with_file_name("config.toml"), crate::server::readiness::chat_ready(cfg), PORT)
+            .with_runner_factory(Arc::new(RoleRecorder(Arc::clone(&built))))
+            .with_shutdown_grace(TEST_GRACE)
+            .with_compose_provider(compose);
+
+        // O que o cartão envia: os papéis de hoje com só o Desenvolvedor na nova conexão.
+        let agents = json!({
+            "architect": {"connection_id": "literal", "model": "modelo-arq", "effort": "low"},
+            "developer": {"connection_id": "conta-b", "model": "modelo-b", "effort": "low"},
+            "reviewer": {"connection_id": "literal", "model": "modelo-rev", "effort": "medium"},
+        });
+        let (status, body) = call(&state, request(Method::PUT, "/api/config/agents", &agents.to_string(), Some("application/json"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        {
+            let cfg = state.config().read().await;
+            assert_eq!((cfg.agents.developer.connection_id.as_str(), cfg.agents.developer.model.as_str()), ("conta-b", "modelo-b"));
+            assert_eq!((cfg.agents.reviewer.connection_id.as_str(), cfg.agents.reviewer.model.as_str()), ("literal", "modelo-rev"));
+            assert_eq!((cfg.agents.architect.connection_id.as_str(), cfg.agents.architect.model.as_str()), ("literal", "modelo-arq"));
+        }
+
+        let (status, body) = call(&state, resume_req(PROJECT, SPEC, "")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let runs = built.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(runs, vec![("modelo-b".to_string(), "modelo-rev".to_string(), Some("modelo-arq".to_string()))]);
+
+        state.trigger_shutdown();
+        assert!(wait_idle(&state).await);
+    }
+
     /// Spec 073: o resume simples (sem revisão) também é intervenção humana e zera a contagem; antes
     /// só a tarefa revisada zerava (esperado 3 no caso simples). O histórico segue preservado.
     #[tokio::test]
@@ -6040,6 +6224,7 @@ mod tests {
             cut: None,
             billing: Default::default(),
             context: None,
+            call: Default::default(),
         });
         fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
         let before = fs::read_to_string(root.join(TASK_T01)).expect("T01");
@@ -6626,9 +6811,10 @@ mod tests {
         let err = RunnerError::Provider {
             role: "developer",
             failure: ProviderFailure::Http(400, None),
+            evidence: None,
         };
         let end = run_end(Ok(Err(err)));
-        assert!(matches!(end, RunEnd::Provider(ProviderFailure::Http(400, None))));
+        assert!(matches!(end, RunEnd::Provider(ProviderFailure::Http(400, None), None)));
         let other = run_end(Ok(Err(RunnerError::Config("x".into()))));
         assert!(matches!(other, RunEnd::Failed(Some(ref c)) if c == "configuração inválida: x"));
     }
@@ -6652,13 +6838,13 @@ mod tests {
         assert!(failed[0].payload["text"].as_str().unwrap_or_default().contains(cause));
         let panicked = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Panicked);
         assert_eq!(code_of(&panicked[0]).0, json!(CODE_RUN_FAILED));
-        let provider = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Http(400, None)));
+        let provider = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Http(400, None), None));
         assert_eq!(code_of(&provider[0]), (json!(CODE_PROVIDER_FAILED), json!({"provider": "provider_http_400"})));
         let reason = crate::agents::llm_client::BadReason::with_code(
             crate::agents::llm_client::BadKind::Incomplete,
             Some("content_filter"),
         );
-        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason)));
+        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
         assert_eq!(
             code_of(&bad[0]),
             (json!(CODE_PROVIDER_FAILED_DETAIL), json!({"provider": "provider_bad_response", "kind": "incomplete", "provider_code": "content_filter"}))
@@ -6679,15 +6865,89 @@ mod tests {
             (PlanError::NotEligible, CODE_PLAN_NOT_ELIGIBLE, "provider_plan_not_eligible"),
             (PlanError::NeedsLogin, CODE_PLAN_NEEDS_LOGIN, "provider_plan_needs_login"),
         ] {
-            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Plan(plan)));
+            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Plan(plan), None));
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].payload["code"], json!(code));
             assert_eq!(events[0].payload["params"], json!({}));
             assert_eq!(events[0].payload["text"], json!(text));
             assert_eq!(events[1].payload["status"], "idle");
         }
-        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Plan(PlanError::UsageLimit) };
-        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit))));
+        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Plan(PlanError::UsageLimit), evidence: None };
+        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit), None)));
+    }
+
+    /// Spec 133 T01: a falha do provedor com evidência leva os `params` completos (papel, conexão,
+    /// modelo, tarefa, tentativa, status, códigos, `request-id` e categoria) à mensagem do sistema e
+    /// ao `dialog.jsonl`, e grava o registro persistente da spec sem a chave; a pausa do limite
+    /// também leva a evidência.
+    #[tokio::test]
+    async fn provider_failure_with_evidence_has_full_params_and_persistent_record() {
+        use crate::agents::llm_client::{FailureCategory, HttpEvidence, ProviderLimit};
+        let root = setup("provider-evidence", true);
+        let secrets = Arc::new(SecretSet::new(vec![SECRET.to_string()]));
+        let evidence = FailureEvidence {
+            role: "reviewer".into(),
+            model: "gemini-x".into(),
+            task: Some("T03".into()),
+            attempt: Some(1),
+            category: Some(FailureCategory::BadRequest),
+            retries: 0,
+            http: Some(HttpEvidence {
+                status: 400,
+                error_type: Some("invalid_argument".into()),
+                error_code: Some("400".into()),
+                error_param: None,
+                request_id: Some("req_77".into()),
+                message: Some(format!("chave {SECRET} inválida")),
+            }),
+            connection: None,
+        };
+        let roles = vec![("reviewer", ConnectionRef { id: "gem".into(), name: "Gemini do Ana".into(), kind: "google_gemini".into() })];
+        let mut end = RunEnd::Provider(ProviderFailure::Http(400, None), Some(Box::new(evidence.clone())));
+        record_provider_end(&mut end, &roles, &root, PROJECT, SPEC, &secrets).await;
+        let events = terminal_events(PROJECT, &secrets, SPEC, end);
+        let dialog = DialogTarget::new(root.clone(), SPEC.to_string());
+        let bus = EventBus::new();
+        for ev in events.iter().cloned() {
+            deliver(&bus, Some(&dialog), ev);
+        }
+        crate::server::dialog::flush_project(&root, Duration::from_secs(5));
+        let params = events[0].payload["params"].clone();
+        assert_eq!(events[0].payload["code"], json!(CODE_PROVIDER_FAILED));
+        let expected = json!({
+            "provider": "provider_http_400",
+            "role": "reviewer",
+            "model": "gemini-x",
+            "connection_id": "gem",
+            "connection_name": "Gemini do Ana",
+            "connection_kind": "google_gemini",
+            "task": "T03",
+            "attempt": 1,
+            "category": "bad_request",
+            "status": 400,
+            "error_type": "invalid_argument",
+            "error_code": "400",
+            "request_id": "req_77",
+        });
+        assert_eq!(params, expected);
+        let line = fs::read_to_string(root.join(format!(".sdd/specs/{SPEC}/dialog.jsonl"))).expect("diálogo");
+        let saved: Value = serde_json::from_str(line.lines().find(|l| l.contains("provider_http_400")).expect("linha")).expect("json");
+        assert_eq!(saved["params"], expected, "o diálogo guarda os params inteiros");
+        let rows = super::super::provider_errors::load(&root, Some(SPEC));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].connection_name.as_deref(), rows[0].request_id.as_deref()), (Some("Gemini do Ana"), Some("req_77")));
+        let raw = fs::read_to_string(root.join(format!(".sdd/specs/{SPEC}/provider-errors.jsonl"))).expect("registro");
+        assert!(raw.contains("inválida") && !raw.contains(SECRET), "{raw}");
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
+        assert!(exclude.contains(super::super::provider_errors::PROVIDER_ERRORS_EXCLUDE_LINE), "{exclude}");
+
+        let mut limit = RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit), Some(Box::new(evidence)));
+        record_provider_end(&mut limit, &roles, &root, PROJECT, SPEC, &secrets).await;
+        let events = terminal_events(PROJECT, &secrets, SPEC, limit);
+        assert_eq!(events[0].payload["code"], json!(CODE_SPEND_LIMIT));
+        assert_eq!(events[0].payload["params"]["role"], "reviewer");
+        assert_eq!(events[0].payload["params"]["connection_name"], "Gemini do Ana");
+        assert_eq!(super::super::provider_errors::load(&root, Some(SPEC)).len(), 2);
     }
 
     /// Spec 132 T09: o teto de gasto da Anthropic e a cota diária do Gemini pausam a execução com o
@@ -6699,16 +6959,17 @@ mod tests {
         for (limit, code, text) in [
             (ProviderLimit::SpendLimit, CODE_SPEND_LIMIT, "provider_spend_limit"),
             (ProviderLimit::DailyQuota, CODE_DAILY_QUOTA, "provider_daily_quota"),
+            (ProviderLimit::Billing, CODE_BILLING, "provider_billing"),
         ] {
-            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Limit(limit)));
+            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Limit(limit), None));
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].payload["code"], json!(code));
             assert_eq!(events[0].payload["params"], json!({}));
             assert_eq!(events[0].payload["text"], json!(text));
             assert_eq!(events[1].payload["status"], "idle");
         }
-        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Limit(ProviderLimit::SpendLimit) };
-        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit))));
+        let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Limit(ProviderLimit::SpendLimit), evidence: None };
+        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit), None)));
     }
 
     #[test]
@@ -6724,7 +6985,7 @@ mod tests {
             PROJECT,
             &secrets,
             SPEC,
-            RunEnd::Provider(ProviderFailure::Http(400, None)),
+            RunEnd::Provider(ProviderFailure::Http(400, None), None),
         );
         assert_eq!(provider.len(), 2);
         assert_eq!(provider[0].payload["text"], "provider_http_400");
@@ -6733,7 +6994,7 @@ mod tests {
             crate::agents::llm_client::BadKind::Incomplete,
             Some("content_filter"),
         );
-        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason)));
+        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
         assert_eq!(bad[0].payload["text"], "provider_bad_response (incompleta: content_filter)");
         assert_eq!(bad[1].payload["reason"], "error");
         let blocked = terminal_events(
@@ -7027,6 +7288,12 @@ mod tests {
         assert!(updated.iter().any(|p| p["task_id"] == "T03" && p["status"] == "TODO"), "{updated:?}");
         assert!(architect_text(&events).contains("Análise de recuperação #1 (SPLIT)"), "{}", architect_text(&events));
         assert!(architect_text(&events).contains("Tarefas novas: T03"));
+        // Spec 133 T11: a análise chega com `code` e `params` neutros, para a tela traduzir.
+        let analysis = payloads(&events, "agent_message")
+            .into_iter()
+            .find(|p| p["agent"] == "architect" && p["code"] == crate::server::recovery::CODE_ANALYSIS)
+            .expect("análise com código");
+        assert_eq!(analysis["params"], json!({"cycle": 1, "decision": "SPLIT", "autonomous": 0}), "{analysis}");
         let facts = backend.requests()[0].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
         assert!(facts.contains("## Sinais para a decisão") && facts.contains("Critérios de aceitação: 1"), "{facts}");
     }
@@ -7428,6 +7695,7 @@ mod tests {
                 cut: None,
                 billing: Default::default(),
                 context: None,
+                call: Default::default(),
             });
             fs::write(root.join(format!(".sdd/specs/{SPEC}/budget.json")), r#"{"max_tokens":1000}"#).expect("budget");
             let (task_before, settings_before) = (fs::read_to_string(t01_path(&root)).expect("T01"), settings_text(&root));
@@ -8159,8 +8427,10 @@ mod tests {
         let said = payloads(&events, "agent_message").iter().any(|p| {
             p["agent"] == "architect"
                 && p["text"].as_str().is_some_and(|t| t.contains("Diagnóstico de ambiente #1"))
+                && p["code"] == crate::server::recovery::CODE_DIAGNOSIS
+                && p["params"] == json!({"n": 1})
         });
-        assert!(said, "mensagem do Arquiteto");
+        assert!(said, "mensagem do Arquiteto, com o código do diagnóstico (spec 133 T11)");
         // Retomar com o mesmo motivo: bloqueia de novo, sem novo diagnóstico.
         let mut rx = state.events().subscribe();
         let (code, body) = call(&state, resume_req(PROJECT, SPEC, "")).await;

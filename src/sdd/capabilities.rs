@@ -454,6 +454,54 @@ pub fn failing_lines(output: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Spec 133 T05: as linhas de falha ([`failing_lines`]) com as durações trocadas por `<t>`, para
+/// comparar duas rodadas da mesma falha (a duração muda a cada rodada, em qualquer stack).
+pub fn failure_signature(output: &str, max: usize) -> Vec<String> {
+    failing_lines(output, max).iter().map(|l| without_durations(l)).collect()
+}
+
+/// Troca cada número seguido de unidade de tempo (`1.23s`, `0,5 s`, `120ms`, `3 min`, `2µs`...) por
+/// `<t>`. O resto da linha fica igual.
+fn without_durations(line: &str) -> String {
+    const UNITS: &[&str] = &[
+        "ns", "us", "µs", "μs", "ms", "s", "sec", "secs", "second", "seconds", "m", "min", "mins", "minute", "minutes", "h",
+        "hr", "hrs", "hour", "hours",
+    ];
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_number = c.is_ascii_digit() && (i == 0 || !chars[i - 1].is_alphanumeric());
+        if !starts_number {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && (chars[j].is_ascii_digit() || ((chars[j] == '.' || chars[j] == ',') && chars.get(j + 1).is_some_and(char::is_ascii_digit))) {
+            j += 1;
+        }
+        let mut k = j;
+        while k < chars.len() && chars[k] == ' ' {
+            k += 1;
+        }
+        let mut end = k;
+        while end < chars.len() && chars[end].is_alphabetic() {
+            end += 1;
+        }
+        let unit: String = chars[k..end].iter().collect::<String>().to_lowercase();
+        if end > k && UNITS.contains(&unit.as_str()) {
+            out.push_str("<t>");
+            i = end;
+        } else {
+            out.extend(&chars[i..j]);
+            i = j;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +617,24 @@ mod tests {
         assert_eq!(lines, vec!["test b ... FAILED", "✘ [chromium] › e2e/two.spec.ts:10 two clients", "×  render matches"]);
         assert_eq!(failing_lines(out, 1).len(), 1);
         assert!(failing_lines("tudo certo", 5).is_empty());
+    }
+
+    /// Spec 133 T05: a mesma falha com outra duração tem a mesma assinatura (cargo e pytest); outro
+    /// teste falhando, não.
+    #[test]
+    fn failure_signature_ignores_durations_only() {
+        let cargo = |secs: &str, name: &str| {
+            format!("test {name} ... FAILED\nfailures:\n    {name}\ntest result: FAILED. 3 passed; 1 failed; 0 ignored; finished in {secs}\n")
+        };
+        assert_eq!(failure_signature(&cargo("1.23s", "a::b"), 10), failure_signature(&cargo("0.98s", "a::b"), 10));
+        assert_ne!(failure_signature(&cargo("1.23s", "a::b"), 10), failure_signature(&cargo("1.23s", "a::c"), 10));
+        let pytest = |secs: &str, name: &str| {
+            format!("FAILED tests/test_api.py::{name} - assert 1 == 2\n=== 1 failed, 3 passed in {secs} ===\n")
+        };
+        assert_eq!(failure_signature(&pytest("0.52s", "test_x"), 10), failure_signature(&pytest("12.07s", "test_x"), 10));
+        assert_ne!(failure_signature(&pytest("0.52s", "test_x"), 10), failure_signature(&pytest("0.52s", "test_y"), 10));
+        // Outras durações e números que não são tempo.
+        assert_eq!(without_durations("✘ two.spec.ts:10 (1.5 s) [120ms] 3 min v2"), "✘ two.spec.ts:10 (<t>) [<t>] <t> v2");
+        assert_eq!(without_durations("1 failed, 3 passed"), "1 failed, 3 passed");
     }
 }

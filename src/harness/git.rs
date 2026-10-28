@@ -626,6 +626,27 @@ impl Git {
         self.run(["show".to_string(), format!("HEAD:{rel}")]).ok()
     }
 
+    /// Spec 133 T06: arquivos e diretórios da árvore de `rev` (`ls-tree -r -t --name-only -z`).
+    /// Nomes que não são UTF-8 são descartados.
+    pub fn ls_tree_all(&self, rev: &str) -> Result<Vec<String>, GitError> {
+        check_arg("rev", rev)?;
+        let args: Vec<OsString> =
+            ["ls-tree", "-r", "-t", "--name-only", "-z", rev, "--"].iter().map(OsString::from).collect();
+        let out = self.run_bytes(&args)?;
+        Ok(out
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| String::from_utf8(p.to_vec()).ok())
+            .collect())
+    }
+
+    /// Spec 133 T06: conteúdo bruto de `rel` em `rev` (`git show rev:rel`); `None` se ausente ou inválido.
+    pub fn show_bytes(&self, rev: &str, rel: &str) -> Option<Vec<u8>> {
+        check_arg("rev", rev).ok()?;
+        check_arg("path", rel).ok()?;
+        self.run_bytes(&[OsString::from("show"), OsString::from(format!("{rev}:{rel}"))]).ok()
+    }
+
     /// Número de arquivos rastreados em HEAD (0 em repositório sem commits).
     pub fn head_file_count(&self) -> usize {
         self.run(["ls-tree", "-r", "--name-only", "HEAD"])

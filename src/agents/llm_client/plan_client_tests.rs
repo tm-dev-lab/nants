@@ -680,7 +680,76 @@ async fn plan_live_text_and_tool() {
             failures.push(label);
         }
     }
+    // Spec 133 T09 (C-13): o cache do plano, só medido (o backend decide; nada aqui falha o teste).
+    live_cache_probe(&client, &model).await;
     assert!(failures.is_empty(), "segundo turno recusado na forma de hoje: {failures:?}");
+}
+
+/// Spec 133 T09 (C-13), teste real: três chamadas seguidas com o mesmo prefixo grande (instruções de
+/// uns 6 mil tokens, novas a cada execução) e a mesma `prompt_cache_key`, cada uma começando com a
+/// anterior; a partir da segunda, o `cached` deveria passar de 0. Mede com a chave sozinha e com a
+/// chave mais o cabeçalho `session_id` (a hipótese da afinidade de sessão do cliente oficial, que o
+/// produto não envia) e se o plano aceita o `tool_choice: allowed_tools` (a busca nativa listada, mas
+/// fora das permitidas, sem mudar as ferramentas). Imprime só os números e os códigos, nunca o token.
+async fn live_cache_probe(base: &LlmClient, model: &str) {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    for (label, header) in [("prompt_cache_key", false), ("prompt_cache_key + session_id", true)] {
+        let key = format!("nants-live-cache-{nonce}-{}", u8::from(header));
+        let rules: Vec<String> = (0..400).map(|i| format!("Rule {i:04}: keep every answer short and plain.")).collect();
+        let system = format!("Run {key}.\n{}", rules.join("\n"));
+        let client = LlmClient {
+            test_headers: if header { vec![("session_id", key.clone())] } else { Vec::new() },
+            ..base.clone()
+        };
+        let mut messages = vec![ChatMessage::text(Role::System, system), ChatMessage::text(Role::User, "Say OK.")];
+        let mut cached = Vec::new();
+        for _ in 0..3 {
+            let req = ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: vec![live_get_time()],
+                effort: None,
+                response_json: false,
+                web_search: false,
+                cache_key: Some(key.clone()),
+                web_search_max_uses: None,
+            };
+            match client.chat_stream(&req, &|_| {}).await {
+                Ok(resp) => {
+                    cached.push(format!("{:?}", resp.usage.map(|u| (u.prompt, u.cached))));
+                    messages.push(resp.message);
+                    messages.push(ChatMessage::text(Role::User, "Say OK again."));
+                }
+                Err(e) => {
+                    cached.push(format!("falhou: {}", provider_failure(&e)));
+                    break;
+                }
+            }
+        }
+        eprintln!("cache ({label}): (input, cached) por chamada = {cached:?}");
+    }
+    let allowed = LlmClient {
+        test_tool_choice: Some(json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "get_time"}]})),
+        ..base.clone()
+    };
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage::text(Role::User, "What time is it?")],
+        tools: vec![live_get_time()],
+        effort: None,
+        response_json: false,
+        web_search: true,
+        cache_key: None,
+        web_search_max_uses: None,
+    };
+    match allowed.chat_stream(&req, &|_| {}).await {
+        Ok(resp) => eprintln!(
+            "allowed_tools: aceito; chamadas={:?} buscas={}",
+            resp.message.tool_calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            resp.web_search_calls
+        ),
+        Err(e) => eprintln!("allowed_tools: recusado: {}", provider_failure(&e)),
+    }
 }
 
 fn live_get_time() -> ToolSpec {

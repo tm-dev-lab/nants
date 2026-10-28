@@ -52,7 +52,9 @@ import { AttachmentPreview, imageFiles, useChatAttachments } from "./ChatAttachm
 import { setChatSending, takeChatRequest, useChatRequestCount } from "./chatChannel";
 import { dayKey, dayLabel, hasTime } from "./chatTime";
 import { PausedRunCard } from "./PausedRunCard";
-import { PlanIndicator } from "./PlanIndicator";
+import { RoleConnectionFooter } from "./RoleConnectionFooter";
+import { runStopMessage } from "../board/boardModel";
+import { PROVIDER_STOP_CODES, providerEvidence } from "../../i18n/providerEvidence";
 import { PermissionMessage } from "./PermissionMessage";
 import { ResultMessage } from "./ResultMessage";
 
@@ -96,7 +98,7 @@ const CONNECTION_LOST_CODES: ReadonlySet<string> = new Set(["chat.connection_los
 
 /** Turno que caiu com o aviso já gravado no histórico: a tela o lê de lá, sem repetir aqui. */
 function noticeRecorded(error: ApiFailure): boolean {
-  return error.reason === "connection_lost";
+  return error.reason === "connection_lost" || error.reason === "failure_recorded";
 }
 
 interface PendingSend {
@@ -246,9 +248,18 @@ export function Conversation({
 
   const specId = spec?.id ?? null;
   const taskIds = useMemo(() => new Set(spec?.tasks.map((task) => task.id) ?? []), [spec]);
+  // Spec 133 T02: a mensagem do sistema da parada atual pelo provedor fica só no cartão logo em
+  // seguida (a evidência aparece uma vez só), ao vivo e na reconstrução pelo `dialog.jsonl`.
+  const stallCard = pausedRun && spec !== null && !spec.tasks.some((task) => task.status === "BLOCKED");
+  const cardStopId = useAppStore((s) => {
+    if (!stallCard || spec === null) return null;
+    const stop = runStopMessage(s.messages[projectId], spec.id, s.runStarts[projectId]);
+    // Só quando o cartão mostra a evidência (com o papel); a parada antiga, sem papel, fica na tela.
+    return stop !== null && stop.code !== undefined && PROVIDER_STOP_CODES.has(stop.code) && providerEvidence(stop.params) !== null ? stop.id : null;
+  });
   const shown = useMemo(
-    () => byTime(messages.filter((m) => (m.role === "agent" ? specId !== null && belongsToSpec(m, specId) : true))),
-    [messages, specId],
+    () => byTime(messages.filter((m) => m.id !== cardStopId && (m.role === "agent" ? specId !== null && belongsToSpec(m, specId) : true))),
+    [messages, specId, cardStopId],
   );
   const entries = permissionEntries(pending, resolved, (entry) => entry.taskId === null || taskIds.has(entry.taskId));
   const timeline = interleave(shown, entries);
@@ -643,7 +654,7 @@ export function Conversation({
             </button>
           </div>
         </form>
-        <PlanIndicator />
+        <RoleConnectionFooter projectId={projectId} pausedSpecId={pausedRun && spec !== null ? spec.id : null} />
       </div>
       {dragging ? (
         <div className="nd-drop-overlay" aria-hidden="true">

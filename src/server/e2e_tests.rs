@@ -21,7 +21,6 @@ use tower::ServiceExt;
 
 use crate::agents::architect::testing::{calls, text, Reply};
 use crate::agents::chat::ChatBackend;
-use crate::agents::llm_agents::FINAL_CHECK_INTRO;
 use crate::agents::llm_client::{ChatRequest, Role};
 use crate::agents::prompts::{architect_system, architecture_update_system, plan_review_system, report_system, reviewer_system};
 use crate::config::{AgentConfig, Config, Connection, Effort, Project, WireApi};
@@ -128,7 +127,7 @@ impl RoleLlm {
                     _ => text("Arquivos criados.\n\nCritérios\n- O arquivo existe: src/t01.txt"),
                 });
             }
-            if after_tool || req.messages.last().is_some_and(|m| m.content.starts_with(FINAL_CHECK_INTRO)) {
+            if after_tool || req.messages.last().is_some_and(|m| crate::i18n::forms("agent.final_check.intro").iter().any(|f| m.content.starts_with(f))) {
                 return ("developer", text("Arquivo criado.\n\nCritérios\n- O arquivo existe: src/*.txt"));
             }
             let all: String = req.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");

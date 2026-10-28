@@ -187,6 +187,21 @@ describe("PlanCard: checagens do plano", () => {
     expect(approveButton().disabled).toBe(false);
   });
 
+  it("spec 133 T11: revisão indisponível pelo provedor diz o papel, a conexão, o modelo e o motivo, nos dois idiomas", () => {
+    const failure = { provider: "provider_http_404", role: "reviewer", model: "gemini-x", connection_id: "gem", connection_name: "Gemini", category: "bad_request", status: 404, error_type: "not_found" };
+    renderWith({ review: { status: "unavailable", issues: [], failure } });
+    const line = document.querySelector("[data-plan-review-failure]");
+    expect(line?.textContent).toContain("Revisão indisponível.");
+    expect(line?.textContent).toContain("Revisor");
+    expect(line?.textContent).toContain("gemini-x");
+    expect(line?.querySelector("[data-provider-evidence]")?.textContent).toContain("not_found");
+    expect(approveButton().disabled).toBe(false);
+    act(() => setLanguage("en", { persist: false }));
+    expect(document.querySelector("[data-plan-review-failure]")?.textContent).toContain("Review unavailable.");
+    expect(document.querySelector("[data-plan-review-failure]")?.textContent).toContain("Reviewer");
+    act(() => setLanguage("pt-BR", { persist: false }));
+  });
+
   it("monta a mensagem a partir dos avisos e das issues", () => {
     expect(planReviewFixMessage([SCOPE], ISSUES)).toBe(
       `Corrija estes pontos das checagens do plano:\n- ${SCOPE}\n- T02: Pontuação de 0 a 5, mas as regras só permitem 5.\n- spec: G3 não é coberto por nenhuma tarefa.`,

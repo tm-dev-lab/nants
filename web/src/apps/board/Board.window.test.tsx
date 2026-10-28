@@ -12,6 +12,7 @@ import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { renderShell, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
+import { setLanguage } from "../../i18n";
 import { appStore, recoveryKey } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 
@@ -165,6 +166,28 @@ describe("Quadro: colunas, cartões e resumo", () => {
     expect(resumed.querySelector("[data-paused]")).toBeNull();
     expect(board().querySelector("[data-pause-action]")).toBeNull();
     expect(findForbiddenGlyphs(board())).toEqual([]);
+  });
+
+  it("pausa por limite de conta: o motivo diz o papel que parou (spec 133 T02)", async () => {
+    const s = spec([makeTask("T01", "Base", "DONE"), makeTask("T02", "Carrinho", "IN_PROGRESS")]);
+    const stopped = makeProjectState({ id: "p1", name: "Loja", specs: [s], running: false, run: null });
+    await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: stopped } });
+    await act(async () => {
+      appStore.appendMessage("p1", {
+        role: "agent",
+        agent: "system",
+        specId: "s1",
+        text: "provider_billing",
+        code: "run.billing",
+        params: { role: "developer", task: "T02", connection_id: "anthropic", connection_name: "Claude", connection_kind: "anthropic", model: "claude-x", category: "billing", status: 402 },
+      });
+    });
+    const pause = board().querySelector('[data-task-id="T02"] [data-paused="billing"]') as HTMLElement;
+    expect(pause.textContent).toBe("PausadaDesenvolvedor: sem crédito no provedor");
+    setLanguage("en", { persist: false });
+    await settle();
+    expect(document.querySelector('[data-task-id="T02"] [data-paused="billing"]')?.textContent).toContain("Developer: out of credit at the provider");
+    setLanguage("pt-BR", { persist: false });
   });
 
   it("parada antiga, retomada e queda sem mensagem: mostra 'execução interrompida', não o motivo antigo", async () => {

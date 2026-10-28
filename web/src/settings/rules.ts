@@ -251,6 +251,7 @@ const TEST_ERROR_MESSAGES: Readonly<Record<string, string>> = localized({
   rate_limited: "settings.test.error.rate_limited",
   spend_limit: "settings.test.error.spend_limit",
   daily_quota: "settings.test.error.daily_quota",
+  billing: "settings.test.error.billing",
 });
 
 /** Texto do erro HTTP do provedor (com o status quando houver), no idioma ativo. */

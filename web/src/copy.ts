@@ -156,6 +156,7 @@ const PROVIDER_FIXED_CODES: ReadonlySet<string> = new Set([
   "provider_plan_needs_login",
   "provider_spend_limit",
   "provider_daily_quota",
+  "provider_billing",
 ]);
 
 /** Dica de limite (spec 089) para `provider_bad_response` com detalhe "provedor no limite…" (reserva pt-BR). */
@@ -278,6 +279,8 @@ export function providerFailureMessage(
       return t("providerMsg.spendLimit");
     case "provider_daily_quota":
       return t("providerMsg.dailyQuota");
+    case "provider_billing":
+      return t("providerMsg.billing");
     default:
       return null;
   }

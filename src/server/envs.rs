@@ -78,18 +78,19 @@ pub fn cleanup_test(provider: &ComposeProvider, root: &Path, project_id: &str) -
     }
 }
 
-/// Derruba `-test` e `-run` do projeto. `run_volumes` só com confirmação do usuário (remoção);
-/// `test_volumes` apaga os volumes (temporários) do `-test`.
+/// Derruba `-test` e `-run` do projeto (remoção do projeto). `run_volumes` só com confirmação do
+/// usuário; `test_volumes` apaga os volumes (temporários) do `-test`. Spec 133 T12: as imagens que o
+/// Compose construiu para o projeto (rótulo `nants.project`) saem junto.
 /// Ambos são tentados sempre; devolve os erros.
 pub fn teardown(provider: &ComposeProvider, root: &Path, project_id: &str, test_volumes: bool, run_volumes: bool) -> Vec<String> {
     let mut errors = Vec::new();
     if let Some(env) = provider.for_project(root, project_id, ComposeKind::Test) {
-        if let Err(e) = env.down_with(root, test_volumes) {
+        if let Err(e) = env.down_removing_images(root, test_volumes) {
             errors.push(e);
         }
     }
     if let Some(env) = provider.for_project(root, project_id, ComposeKind::Run) {
-        if let Err(e) = env.down_with(root, run_volumes) {
+        if let Err(e) = env.down_removing_images(root, run_volumes) {
             errors.push(e);
         }
     }

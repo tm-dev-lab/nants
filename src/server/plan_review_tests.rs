@@ -147,6 +147,30 @@ async fn invalid_json_and_provider_failure_are_unavailable() {
     assert!(rec.detail.as_deref().is_some_and(|d| d.starts_with("provider_")), "{:?}", rec.detail);
     let view = view(&root, SPEC, &SecretSet::default()).expect("view");
     assert_eq!(view.status, STATUS_UNAVAILABLE);
+    // Spec 133 T11: a revisão do plano leva a mesma evidência da conversa (papel, conexão, modelo
+    // e categoria), gravada e exposta na vista; o JSON inválido não tem evidência de provedor.
+    let failure = view.failure.expect("evidência");
+    assert_eq!(failure.get("provider").and_then(|v| v.as_str()), rec.detail.as_deref());
+    assert_eq!(failure.get("role").and_then(|v| v.as_str()), Some("reviewer"));
+    assert!(failure.contains_key("model") && failure.contains_key("connection_id") && failure.contains_key("category"), "{failure:?}");
+    assert_eq!(rec.failure.as_ref().map(|f| f.len()), Some(failure.len()));
+    let json = serde_json::to_value(view_of(&root)).expect("json");
+    assert_eq!(json["failure"]["role"], "reviewer", "{json}");
+}
+
+/// Vista da revisão do plano da spec de exemplo.
+fn view_of(root: &Path) -> Option<PlanReviewView> {
+    view(root, SPEC, &SecretSet::default())
+}
+
+#[tokio::test]
+async fn invalid_json_has_no_provider_evidence() {
+    let root = tmp("invalid-no-evidence");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    let st = state(&root, true, Scripted::new(vec![text("não é JSON")]));
+    run(&st, &root).await;
+    assert!(record(&root).failure.is_none());
+    assert!(view_of(&root).expect("view").failure.is_none());
 }
 
 #[test]
@@ -393,6 +417,7 @@ fn current_result_and_running_win_over_pending() {
         status: STATUS_OK.into(),
         issues: Vec::new(),
         detail: None,
+        failure: None,
         rounds: Vec::new(),
         outcome: None,
         points: Vec::new(),

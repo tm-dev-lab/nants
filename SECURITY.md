@@ -49,6 +49,26 @@ worktree; like any file the agent reads, only the parts it reads go to your mode
 the session ends. Command output may contain whatever the command printed, so treat the folder like
 the project itself.
 
+## Provider failure log
+
+When a model provider fails for good (after the retries), Nants appends one JSON line to
+`.sdd/specs/<spec>/provider-errors.jsonl` in the project, or to `.sdd/specs/.provider-errors.jsonl`
+for a failure outside a spec (the conversation with the Architect).
+
+- **What it keeps:** the time, the project, the spec or stage, the role, the connection (id, name
+  and type), the model, the task and attempt, the Nants reason and category, the HTTP status, the
+  provider's error type, code and parameter, the request id, the number of retries and the
+  provider's error message.
+- **What it does not write:** Nants does not write the request it sent. The provider's message
+  may quote parts of it; it is cut at 600 characters, and the message, the model and the
+  connection go through the same redaction of the configured secrets (`SecretSet`: the API keys
+  and the credentials in URLs) as logs and events. That redaction does not cover arbitrary
+  content quoted by the provider, so treat the file like the project itself.
+- **Where it shows:** the provider's message stays only in this file; the screen gets the fixed
+  reason and the structured fields (status, error type, code and parameter, request id).
+- **Where it lives:** the files are kept out of the project's repository (`.git/info/exclude`) and
+  stop growing at 1 MiB each.
+
 ## Workspace home folder
 
 Each command in the `workspace` container runs with your user id and a home folder inside the

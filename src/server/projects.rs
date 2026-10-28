@@ -518,6 +518,8 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         super::usage::CUTS_CHAT_EXCLUDE_LINE,
         super::usage::CONTEXT_EXCLUDE_LINE,
         super::usage::CONTEXT_CHAT_EXCLUDE_LINE,
+        super::provider_errors::PROVIDER_ERRORS_EXCLUDE_LINE,
+        super::provider_errors::PROVIDER_ERRORS_CHAT_EXCLUDE_LINE,
         CAPTURES_EXCLUDE_LINE,
         OUTPUTS_EXCLUDE_LINE,
         crate::harness::home::EXCLUDE_LINE,
@@ -1392,14 +1394,20 @@ pub(super) fn disk_attention(
             task_id: Some(task.id.clone()),
             analysis: task.recovery_options_analysis.filter(|_| !options.is_empty()),
             escalation_options: (!options.is_empty()).then_some(options),
+            stop_code: None,
+            role: None,
         });
     } else if active.tasks.iter().any(|t| t.status != Some(TaskStatus::Done)) {
+        // Spec 133 T02: a parada pelo provedor diz o motivo e o papel no sino.
+        let (stop_code, role) = super::attention::provider_stop(root, &active.id);
         out.paused_or_stalled = Some(PausedOrStalled {
             kind: "stalled",
             spec_id: active.id.clone(),
             task_id: None,
             analysis: None,
             escalation_options: None,
+            stop_code,
+            role,
         });
     }
     out

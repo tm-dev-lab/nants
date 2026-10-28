@@ -14,6 +14,7 @@ pub mod plan_diff;
 pub mod references;
 pub mod role_guidance;
 pub mod scope_warnings;
+pub mod section_titles;
 pub mod screenshots;
 pub mod skills;
 pub mod spec_sections;

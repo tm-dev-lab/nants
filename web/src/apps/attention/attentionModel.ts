@@ -27,7 +27,7 @@ export type AttentionItem =
   | { kind: "choices"; key: string }
   | { kind: "plan"; key: string }
   | { kind: "paused"; key: string; specId: string; taskId: string; options: NonNullable<Extract<PausedOrStalled, { kind: "paused" }>["escalation_options"]> }
-  | { kind: "stalled"; key: string; specId: string };
+  | { kind: "stalled"; key: string; specId: string; stopCode: string | null; role: string | null };
 
 export interface AttentionGroup {
   projectId: string;
@@ -53,7 +53,7 @@ export function projectItems(project: AttentionProject): AttentionItem[] {
     out.push(
       paused.kind === "paused"
         ? { kind: "paused", key: `paused:${paused.spec_id}:${paused.task_id}`, specId: paused.spec_id, taskId: paused.task_id, options: paused.escalation_options ?? [] }
-        : { kind: "stalled", key: `stalled:${paused.spec_id}`, specId: paused.spec_id },
+        : { kind: "stalled", key: `stalled:${paused.spec_id}`, specId: paused.spec_id, stopCode: paused.stop_code ?? null, role: paused.role ?? null },
     );
   }
   return out;

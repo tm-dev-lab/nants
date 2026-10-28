@@ -6,6 +6,7 @@ import type { ApiFailure } from "./api/client";
 import type { WireApi } from "./api/types";
 import { localizeProviderDetail, prereqMissingMessage, providerFailureDetail, providerFailureMessage, providerReasonText } from "./copy";
 import { t } from "./i18n";
+import { CHAT_FAILED_CODE, providerEvidence, providerSpecificMessage, providerStopText } from "./i18n/providerEvidence";
 import { apiFailureText } from "./i18n/serverCodes";
 
 /**
@@ -31,6 +32,16 @@ export function chatFailureMessage(error: ApiFailure, architectWire: WireApi | n
     return error.reason === "draft_saved" ? t("chat.timeoutDraftSaved") : t("chat.timeout");
   }
   if (error.kind === "timeout") return t("chat.clientTimeout");
+  // Spec 133 T11: com a evidência nos `params`, a orientação específica da causa (plano, limites,
+  // ritmo, protocolo) seguida de quem falhou; sem orientação própria, a frase com o papel, a
+  // conexão, o modelo e o motivo pela categoria.
+  const evidence = error.providerCode !== undefined ? providerEvidence(error.params) : null;
+  if (error.providerCode !== undefined && evidence !== null) {
+    const specific = providerSpecificMessage(error.providerCode, architectWire);
+    if (specific !== null) return `${specific}\n${evidence.who}`;
+    const withEvidence = providerStopText(CHAT_FAILED_CODE, error.params, null);
+    if (withEvidence !== null) return withEvidence;
+  }
   if (error.providerCode !== undefined) {
     return providerFailureMessage(error.providerCode, architectWire, providerDetailOf(error)) ?? t("chat.fallback");
   }

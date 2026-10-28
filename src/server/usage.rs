@@ -101,6 +101,43 @@ pub struct UsageRecord {
     /// Rodada da etapa (no consenso, 0 = revisão inicial).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
+    /// Como a chamada correu (spec 133 T01); campos ausentes nos registros antigos.
+    #[serde(flatten, default)]
+    pub call: CallRecord,
+}
+
+/// Como a chamada correu (spec 133 T01): novas tentativas, `fallback_used`, degraus de
+/// relaxamento, motivo de término e o esforço efetivo. Tudo opcional e omitido quando vazio.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRecord {
+    /// Novas tentativas do mesmo pedido; ausente = nenhuma.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
+    /// O pedido só passou sem o raciocínio pedido; ausente = não.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_used: Option<bool>,
+    /// Degraus de relaxamento aplicados, em ordem; ausente = nenhum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxed: Vec<String>,
+    /// Motivo de término (`stop`, `length`, `tool_calls`, `cut` ou o do provedor saneado).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
+    /// Esforço efetivo (`low|medium|high`, ou `off` quando a escada o retirou).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl CallRecord {
+    /// Registro do rastro da chamada, só com rótulos seguros.
+    fn of(meta: crate::agents::usage::CallMeta) -> Self {
+        Self {
+            retries: (meta.retries > 0).then_some(meta.retries),
+            fallback_used: meta.fallback_used.then_some(true),
+            relaxed: meta.relaxed.iter().filter_map(|s| safe_label(s)).take(16).collect(),
+            finish: meta.finish.and_then(|f| safe_label(&f)),
+            effort: meta.effort.and_then(|e| safe_label(&e)),
+        }
+    }
 }
 
 /// Valor de `billing` das chamadas pelo plano ChatGPT.
@@ -211,6 +248,7 @@ impl UsageSink for FileUsageSink {
             session: event.context.and_then(|c| safe_label(&c.session)),
             stage: self.stage.as_ref().map(|(stage, _)| stage.clone()),
             round: self.stage.as_ref().map(|(_, round)| *round),
+            call: CallRecord::of(event.call),
         };
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = safe_fs::append_bounded(&self.root, &rel, &line, MAX_USAGE_BYTES);
@@ -274,7 +312,8 @@ fn safe_label(s: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextLine {
     pub at: String,
-    /// `compact`, `spill`, `dedup`, `summary` ou `summary_failed`.
+    /// `compact`, `spill`, `dedup`, `summary`, `summary_failed`, `evidence_check` (spec 133 T06) ou
+    /// `compact_refused` (spec 133 T13).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
@@ -694,7 +733,12 @@ pub fn reinjection_avoided_tokens(records: &[UsageRecord], events: &[ContextLine
     // Eventos de cada histórico: (passo, bytes tirados, é resumo).
     let mut per_history: BTreeMap<(Key, usize), Vec<(u32, u64, bool)>> = BTreeMap::new();
     for e in events {
-        if e.kind == ContextKind::SummaryFailed.as_str() {
+        // Spec 133 T06: a conferência da evidência não mexe no histórico.
+        // Spec 133 T13: a compactação recusada também não.
+        if e.kind == ContextKind::SummaryFailed.as_str()
+            || e.kind == ContextKind::EvidenceCheck.as_str()
+            || e.kind == ContextKind::CompactRefused.as_str()
+        {
             continue;
         }
         let key = (e.spec.clone(), e.session.clone());
@@ -1102,6 +1146,7 @@ mod tests {
             cut: None,
             billing: Default::default(),
             context: None,
+            call: Default::default(),
         }
     }
 
@@ -1135,7 +1180,7 @@ mod tests {
             session: None,
             summary: None,
             stage: None,
-            round: None,
+            round: None, call: Default::default(),
         };
         let pr = BTreeMap::from([("m".to_string(), Pricing { input_per_mtok: 0.0, output_per_mtok: 0.0, cached_input_per_mtok: None, cache_write_per_mtok: None, web_search_per_call: Some(0.5), image_per_unit: None, source: Default::default(), estimated_at: None })]);
         let v = aggregate(&[mk(Some(2)), mk(Some(1)), mk(None)], &pr);
@@ -1213,7 +1258,7 @@ mod tests {
     fn cached_without_cached_price_bills_as_input() {
         let r = UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, cache_write: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 0, cached: Some(400), reasoning: None, cache_write: None, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None, call: Default::default(),
         };
         let c = cost_of(&r, &price(1.0, 1.0, None)).expect("preço");
         assert!((c - 0.001).abs() < 1e-12);
@@ -1226,7 +1271,7 @@ mod tests {
     fn cache_write_is_billed_with_its_own_price() {
         let rec = |input: u64, cached: Option<u64>, write: Option<u64>| UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input, output: 100, cached, reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+            agent: "a".into(), model: "m".into(), input, output: 100, cached, reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None, call: Default::default(),
         };
         let mut pr = price(3.0, 15.0, Some(0.3));
         if let Some(p) = pr.get_mut("m") {
@@ -1253,7 +1298,7 @@ mod tests {
     fn totals_sum_cache_write() {
         let rec = |write: Option<u64>| UsageRecord {
             at: String::new(), project: String::new(), spec: None, task: None,
-            agent: "a".into(), model: "m".into(), input: 1000, output: 10, cached: Some(200), reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+            agent: "a".into(), model: "m".into(), input: 1000, output: 10, cached: Some(200), reasoning: None, cache_write: write, web_search_calls: None, images: None, image_quality: None, estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None, call: Default::default(),
         };
         let pr = price(3.0, 15.0, None);
         let mut totals = Totals::default();
@@ -1289,7 +1334,7 @@ mod tests {
         let img = |n: u64, q: Option<&str>| UsageRecord {
             at: String::new(), project: String::new(), spec: Some("s1".into()), task: Some("T01".into()),
             agent: "developer".into(), model: "m".into(), input: 1_000_000, output: 0, cached: None, reasoning: None, cache_write: None,
-            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None,
+            web_search_calls: None, images: Some(n), image_quality: q.map(String::from), estimated: None, cut: None, billing: None, context_bytes: None, messages: None, step: None, session: None, summary: None, stage: None, round: None, call: Default::default(),
         };
         // Sem image_per_unit: padrão por qualidade, estimado; soma ao custo dos tokens (US$ 1).
         let pr = price(1.0, 1.0, None);
@@ -1493,7 +1538,7 @@ mod tests {
             session: None,
             summary: None,
             stage: None,
-            round: None,
+            round: None, call: Default::default(),
         };
         let mut pricing = price(1.0, 1.0, None);
         let c = cost_of(&r, &pricing).expect("preço");
@@ -1610,7 +1655,7 @@ mod tests {
             session: None,
             summary: None,
             stage: None,
-            round: None,
+            round: None, call: Default::default(),
         }
     }
 
@@ -1795,6 +1840,44 @@ mod tests {
         assert_eq!(view.total.calls, 1);
     }
 
+    /// Spec 133 T01: o rastro da chamada vai ao `usage.jsonl` só quando há o que registrar, e as
+    /// linhas antigas (sem os campos) continuam carregando.
+    #[test]
+    fn call_trace_fields_are_recorded_and_old_lines_still_load() {
+        let root = tmp("call-trace");
+        FileUsageSink::new(&root, "p").record(ev(Some("s1"), None, "a", "m", Usage::new(1, 1)));
+        let mut e = ev(Some("s1"), Some("T02"), "developer", "m", Usage::new(2, 1));
+        e.call = crate::agents::usage::CallMeta {
+            retries: 2,
+            fallback_used: true,
+            relaxed: vec!["effort".into(), "com espaço".into()],
+            finish: Some("tool_calls".into()),
+            effort: Some("off".into()),
+        };
+        FileUsageSink::new(&root, "p").record(e);
+        let text = fs::read_to_string(root.join(".sdd/specs/s1/usage.jsonl")).expect("uso");
+        let first = text.lines().next().expect("linha antiga");
+        for key in ["retries", "fallback_used", "relaxed", "finish", "effort"] {
+            assert!(!first.contains(key), "sem rastro, nenhum campo: {first}");
+        }
+        let records = load_records(&root, Some("s1"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].call, CallRecord::default());
+        assert_eq!(
+            records[1].call,
+            CallRecord {
+                retries: Some(2),
+                fallback_used: Some(true),
+                relaxed: vec!["effort".into()],
+                finish: Some("tool_calls".into()),
+                effort: Some("off".into()),
+            }
+        );
+        let old = r#"{"at":"2026-10-01T00:00:00Z","project":"p","agent":"a","model":"m","input":1,"output":1}"#;
+        let parsed: UsageRecord = serde_json::from_str(old).expect("linha antiga");
+        assert_eq!(parsed.call, CallRecord::default());
+    }
+
     #[test]
     fn usage_record_without_cut_fields_keeps_old_shape() {
         let root = tmp("cut-shape");
@@ -1975,7 +2058,7 @@ mod tests {
             session: Some(session.into()),
             summary: None,
             stage: None,
-            round: None,
+            round: None, call: Default::default(),
         }
     }
 

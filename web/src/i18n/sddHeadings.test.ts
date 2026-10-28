@@ -55,6 +55,15 @@ describe("títulos canônicos na exibição", () => {
     expect(localizeHeadingTitle("Outra seção", "en")).toBe("Outra seção");
   });
 
+  it("as seções de pendências da tarefa (spec 133 T07) saem no idioma ativo", () => {
+    const task = "## Pendências conhecidas\n- P-01: x\n\n## Pendências resolvidas na verificação final\n- P-02: y";
+    expect(localizeSddHeadings(task, "en")).toBe(
+      "## Known issues\n- P-01: x\n\n## Issues resolved in the final verification\n- P-02: y",
+    );
+    expect(localizeSddHeadings(task, "pt-BR")).toBe(task);
+    expect(localizeHeadingTitle("Known issues", "pt-BR")).toBe("Pendências conhecidas");
+  });
+
   it("só o spec.md e as tarefas de uma spec contam", () => {
     expect(isSddDocumentPath(".sdd/specs/001-ledger/spec.md")).toBe(true);
     expect(isSddDocumentPath(".sdd/specs/001-ledger/tasks/T06.md")).toBe(true);

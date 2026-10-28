@@ -126,6 +126,80 @@ fn project<'a>(body: &'a Value, id: &str) -> Option<&'a Value> {
     body["projects"].as_array().expect("projects").iter().find(|p| p["project_id"] == id)
 }
 
+/// Spec 133 T02: a execução parada pelo provedor diz no sino o código da parada e o papel, lidos
+/// do diálogo da spec; depois que um agente volta a falar, a parada antiga não conta, e a parada
+/// que não é do provedor não traz papel.
+#[tokio::test]
+async fn stalled_by_the_provider_names_the_code_and_the_role() {
+    let dir = temp_dir("provider-stop");
+    let state = state_with(&dir, &["billing", "resumed", "stopped"]);
+    let line = |seq: u64, agent: &str, code: Option<&str>| {
+        let mut v = json!({"seq": seq, "ts": 1, "agent": agent, "task_id": "T02", "attempt": 1, "text": "x"});
+        if let Some(code) = code {
+            v["code"] = json!(code);
+            v["params"] = json!({"role": "developer", "connection_id": "anthropic", "model": "claude-x", "category": "billing"});
+        }
+        v.to_string()
+    };
+    for (id, lines) in [
+        ("billing", vec![line(1, "developer", None), line(2, "system", Some("run.billing"))]),
+        ("resumed", vec![line(1, "system", Some("run.billing")), line(2, "developer", None)]),
+        ("stopped", vec![line(1, "system", Some("run.billing")), line(2, "system", Some("run.stopped"))]),
+    ] {
+        let root = dir.join(id);
+        sdd_project(&root, "IN_PROGRESS", &[("T01", "DONE", ""), ("T02", "TODO", "")]);
+        fs::write(root.join(".sdd/specs/001-demo/dialog.jsonl"), lines.join("\n") + "\n").expect("diálogo");
+    }
+    let (body, text) = attention(&state).await;
+    assert_eq!(
+        project(&body, "billing").expect("billing")["paused_or_stalled"],
+        json!({"kind": "stalled", "spec_id": "001-demo", "stop_code": "run.billing", "role": "developer"}),
+        "{text}"
+    );
+    for id in ["resumed", "stopped"] {
+        assert_eq!(project(&body, id).expect(id)["paused_or_stalled"], json!({"kind": "stalled", "spec_id": "001-demo"}), "{id}: {text}");
+    }
+    assert!(!text.contains("claude-x") && !text.contains("anthropic"), "só o código e o papel: {text}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Spec 133 T02 (F-03): num diálogo grande, a parada é achada lendo a cauda; quando a cauda só tem
+/// avisos do sistema, a leitura volta mais para trás até achar a parada.
+#[tokio::test]
+async fn provider_stop_reads_the_tail_of_a_large_dialog() {
+    let dir = temp_dir("provider-stop-large");
+    let state = state_with(&dir, &["tail", "deep"]);
+    let filler = "y".repeat(900);
+    let line = |seq: u64, agent: &str, code: Option<&str>| {
+        let mut v = json!({"seq": seq, "ts": 1, "agent": agent, "task_id": "T02", "attempt": 1, "text": filler});
+        if let Some(code) = code {
+            v["code"] = json!(code);
+            v["params"] = json!({"role": "reviewer"});
+        }
+        v.to_string()
+    };
+    // tail: ~1 MB de mensagens do Desenvolvedor e a parada no fim.
+    let mut tail: Vec<String> = (1..=1100).map(|i| line(i, "developer", None)).collect();
+    tail.push(line(1101, "system", Some("run.daily_quota")));
+    // deep: a parada e, depois dela, ~200 KB de avisos do sistema sem parada.
+    let mut deep = vec![line(1, "developer", None), line(2, "system", Some("run.daily_quota"))];
+    deep.extend((3..=220).map(|i| line(i, "system", Some("run.pace_notice"))));
+    for (id, lines) in [("tail", tail), ("deep", deep)] {
+        let root = dir.join(id);
+        sdd_project(&root, "IN_PROGRESS", &[("T01", "DONE", ""), ("T02", "TODO", "")]);
+        fs::write(root.join(".sdd/specs/001-demo/dialog.jsonl"), lines.join("\n") + "\n").expect("diálogo");
+    }
+    let (body, text) = attention(&state).await;
+    for id in ["tail", "deep"] {
+        assert_eq!(
+            project(&body, id).expect(id)["paused_or_stalled"],
+            json!({"kind": "stalled", "spec_id": "001-demo", "stop_code": "run.daily_quota", "role": "reviewer"}),
+            "{id}: {text}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn lists_only_projects_with_items_and_each_kind_of_item() {
     let dir = temp_dir("kinds");

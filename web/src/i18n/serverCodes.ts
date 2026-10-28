@@ -11,6 +11,7 @@
 import type { ApiFailure } from "../api/client";
 import { parseCodeParams, type CodeParams } from "../api/codes";
 import { DICTIONARIES, getLanguage, translate, type Lang, type MessageKey } from "./index";
+import { providerStopText } from "./providerEvidence";
 import { localizeHeadingTitle } from "./sddHeadings";
 
 const PARAM_RE = /\{(\w+)\}/g;
@@ -145,7 +146,7 @@ export function apiFailureText(failure: ApiFailure, lang: Lang = getLanguage()):
  * (lista de critérios não atendidos, erro): ele não cabe num param (o servidor corta em 512 bytes)
  * e aparece inteiro, como veio, abaixo da frase fixa traduzida.
  */
-const SYSTEM_CODES_WITH_TAIL: ReadonlySet<string> = new Set(["final.unavailable", "final.still_unmet", "final.fix_refused", "plan.final_plan"]);
+const SYSTEM_CODES_WITH_TAIL: ReadonlySet<string> = new Set(["final.unavailable", "final.still_unmet", "final.fix_refused", "final.unverified", "plan.final_plan"]);
 
 /**
  * Avisos do sistema que só informam (spec 131 T03): a rodada do consenso sem ponto em aberto e a
@@ -166,6 +167,9 @@ export function systemMessageText(
   if (message.code === undefined) return message.text;
   if (message.code === "run.relaunch_failed") return relaunchFailedText(message, lang);
   const fixed = translateCode("system", message.code, message.params, lang);
+  // Spec 133 T01: a falha do provedor diz o papel, a conexão, o modelo e o motivo pela categoria.
+  const withEvidence = providerStopText(message.code, message.params, fixed, lang);
+  if (withEvidence !== null) return withEvidence;
   if (fixed === null) return message.text;
   if (!SYSTEM_CODES_WITH_TAIL.has(message.code)) return fixed;
   const at = message.text.indexOf("\n");

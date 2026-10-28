@@ -40,7 +40,7 @@ interface EscalationOptionRef {
 
 export type PausedOrStalled =
   | { kind: "paused"; spec_id: string; task_id: string; analysis?: string; escalation_options?: EscalationOptionRef[] }
-  | { kind: "stalled"; spec_id: string };
+  | { kind: "stalled"; spec_id: string; stop_code?: string; role?: AttentionAgent };
 
 export interface AttentionProject {
   project_id: string;
@@ -81,7 +81,14 @@ function parsePaused(value: unknown): PausedOrStalled | null {
   if (!isRecord(value)) return null;
   const specId = str(value.spec_id, 128);
   if (specId === null) return null;
-  if (value.kind === "stalled") return { kind: "stalled", spec_id: specId };
+  if (value.kind === "stalled") {
+    // Spec 133 T02: a parada pelo provedor com o código fixo e o papel.
+    const out: PausedOrStalled = { kind: "stalled", spec_id: specId };
+    const code = str(value.stop_code, 64);
+    if (code !== null && /^run\.[a-z_]+$/.test(code)) out.stop_code = code;
+    if (typeof value.role === "string" && AGENTS.includes(value.role)) out.role = value.role as AttentionAgent;
+    return out;
+  }
   if (value.kind !== "paused") return null;
   const taskId = str(value.task_id, 64);
   if (taskId === null) return null;

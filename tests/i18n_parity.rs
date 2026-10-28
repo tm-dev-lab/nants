@@ -128,6 +128,8 @@ const CODE_CONST_FAMILIES: &[(&str, &str)] = &[
     ("server/runs.rs", "system"),
     ("server/approvals.rs", "system"),
     ("server/image_gen.rs", "system"),
+    // Spec 133 T11: a análise de recuperação e o diagnóstico de ambiente na conversa.
+    ("server/recovery.rs", "system"),
     ("server/report.rs", "report.failure"),
     // Spec 131 T06: as linhas do "o que mudou no plano" (`plan-changes.json`).
     ("sdd/plan_diff.rs", "planChange"),

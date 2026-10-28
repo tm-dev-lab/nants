@@ -681,6 +681,87 @@ pub fn read_page(root: &Path, spec_id: &str, after: u64, limit: usize) -> Page {
     }
 }
 
+/// `code` das mensagens do sistema que encerram a execução (o mesmo vocabulário da web,
+/// `STOP_CODES` do Quadro).
+const RUN_STOP_CODES: [&str; 11] = [
+    "run.stopped",
+    "run.failed",
+    "run.failed_cause",
+    "run.provider_failed",
+    "run.provider_failed_detail",
+    "run.plan_limit",
+    "run.plan_not_eligible",
+    "run.plan_needs_login",
+    "run.spend_limit",
+    "run.daily_quota",
+    "run.billing",
+];
+
+/// Primeira leitura da cauda do diálogo em [`last_run_stop`]; sem decisão, a cauda dobra até
+/// [`DIALOG_MAX_BYTES`].
+const STOP_TAIL_BYTES: u64 = 64 * 1024;
+
+/// O que a cauda do diálogo diz sobre a parada atual.
+enum TailScan {
+    /// A parada atual (ou `None`: um agente falou depois, ou a última parada não é de execução).
+    Decided(Option<DialogLine>),
+    /// Só mensagens do sistema sem parada na cauda: é preciso ler mais para trás.
+    Undecided,
+}
+
+/// Percorre as linhas completas de `bytes` de trás para a frente. `partial_first`: a primeira
+/// linha pode estar cortada (a cauda não começa no início do arquivo) e é descartada.
+fn scan_tail(bytes: &[u8], partial_first: bool) -> TailScan {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if partial_first && !lines.is_empty() {
+        lines.remove(0);
+    }
+    for raw in lines.into_iter().rev() {
+        let Ok(line) = serde_json::from_str::<DialogLine>(raw) else { continue };
+        if line.agent != "system" {
+            return TailScan::Decided(None);
+        }
+        if line.code.as_deref().is_some_and(|c| RUN_STOP_CODES.contains(&c)) {
+            return TailScan::Decided(Some(line));
+        }
+    }
+    TailScan::Undecided
+}
+
+/// Os últimos `want` bytes do arquivo (sem seguir symlink) e se a leitura começou no início dele.
+fn read_tail(file: &mut fs::File, len: u64, want: u64) -> Option<(Vec<u8>, bool)> {
+    let start = len.saturating_sub(want);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(len - start).read_to_end(&mut bytes).ok()?;
+    Some((bytes, start == 0))
+}
+
+/// A parada ATUAL da execução da spec (spec 133 T02): a última mensagem do sistema com um `code`
+/// de parada, desde que nenhum agente tenha falado depois (o que só acontece se a execução voltou).
+///
+/// O sino chama a cada consulta, para cada projeto parado: lê só a cauda do diálogo (64 KB, de trás
+/// para a frente), ampliando enquanto só houver mensagens do sistema sem parada.
+pub fn last_run_stop(root: &Path, spec_id: &str) -> Option<DialogLine> {
+    let path = safe_fs::check_chain(root, &dialog_rel(spec_id)).ok()?;
+    let mut file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let mut want = STOP_TAIL_BYTES;
+    loop {
+        let (bytes, from_start) = read_tail(&mut file, len, want)?;
+        match scan_tail(&bytes, !from_start) {
+            TailScan::Decided(found) => return found,
+            TailScan::Undecided if from_start || want >= DIALOG_MAX_BYTES => return None,
+            TailScan::Undecided => want = want.saturating_mul(2).min(DIALOG_MAX_BYTES),
+        }
+    }
+}
+
 /// Query de `GET .../dialog`. Valores brutos: a validação devolve 422 estático.
 #[derive(Debug, Deserialize)]
 pub struct DialogQuery {

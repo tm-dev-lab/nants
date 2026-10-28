@@ -449,9 +449,10 @@ async fn up_failure_is_reported_and_rolled_back() {
 #[tokio::test]
 async fn removing_the_project_downs_both_and_run_volumes_need_confirmation() {
     for (body, run_args) in [
-        ("{}", vec!["down", "--timeout", "5", "--remove-orphans"]),
-        ("", vec!["down", "--timeout", "5", "--remove-orphans"]),
-        (r#"{"remove_volumes":true}"#, vec!["down", "--timeout", "5", "-v", "--remove-orphans"]),
+        // Spec 133 T12: a remoção apaga também as imagens construídas para o projeto.
+        ("{}", vec!["down", "--timeout", "5", "--rmi", "local", "--remove-orphans"]),
+        ("", vec!["down", "--timeout", "5", "--rmi", "local", "--remove-orphans"]),
+        (r#"{"remove_volumes":true}"#, vec!["down", "--timeout", "5", "-v", "--rmi", "local", "--remove-orphans"]),
     ] {
         let rec = Rec::with_ports();
         let state = state_rec(&root_with("d-remove", "COMPLETED", &run_cmd("npm run dev")), &rec);
@@ -464,7 +465,7 @@ async fn removing_the_project_downs_both_and_run_volumes_need_confirmation() {
         let downs: Vec<_> = calls.iter().filter(|(_, a)| a[0] == "down").collect();
         // Parar do app (-run), depois -test (-v) e -run (conforme a confirmação).
         let test = downs.iter().find(|(p, _)| p == "nants-proj-app-test").expect("down -test");
-        assert_eq!(test.1, ["down", "-v", "--remove-orphans"]);
+        assert_eq!(test.1, ["down", "-v", "--rmi", "local", "--remove-orphans"]);
         let last_run = downs.iter().rfind(|(p, _)| p == "nants-proj-app-run").expect("down -run");
         assert_eq!(last_run.1, run_args, "body={body:?}");
         let events = drain(&mut rx);

@@ -39,6 +39,8 @@ const FIXED_KEYS: readonly MessageKey[] = [
   "sddHeading.responses",
   "sddHeading.advice",
   "sddHeading.humanGuidance",
+  "sddHeading.pending",
+  "sddHeading.pendingResolved",
 ];
 
 /** Títulos com um valor no meio ("Tentativa 2", "Pergunta (developer)"). */

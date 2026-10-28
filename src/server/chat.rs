@@ -517,7 +517,9 @@ async fn run_turn_body(
     turn_id: String,
     secrets: Arc<SecretSet>,
 ) -> Result<Response, ApiError> {
-    let (model, effort, client) = architect_client(state).await?;
+    let (model, effort, client, connection) = architect_client_with_connection(state).await?;
+    // Spec 133 T01: o papel como foi montado no disparo, para a evidência de uma falha.
+    let stage = super::provider_errors::StageSetup { role: "architect", model: model.clone(), connection: Some(connection) };
     let backend: Arc<dyn ChatBackend> = match backend {
         Some(backend) => backend,
         None => Arc::new(client),
@@ -612,11 +614,16 @@ async fn run_turn_body(
         }))
         .with_first_reply_slot(Arc::clone(&first_reply));
 
-    let outcome = with_idle_deadline(
-        architect.reply_with_attachments(root.as_path(), &history, &incoming.message, &incoming.attachments, &snapshot),
-        timeout,
-        &progress,
-    )
+    // Spec 133 T01: o rastro das chamadas do turno dá a evidência da falha final do provedor.
+    let (outcome, trace) = Box::pin(crate::agents::llm_client::evidence::with_trace_scope(async {
+        let outcome = with_idle_deadline(
+            architect.reply_with_attachments(root.as_path(), &history, &incoming.message, &incoming.attachments, &snapshot),
+            timeout,
+            &progress,
+        )
+        .await;
+        (outcome, super::provider_errors::StageTrace::current())
+    }))
     .await;
     let reply = match outcome {
         None => {
@@ -631,7 +638,12 @@ async fn run_turn_body(
             }
         }
         Some(Ok(reply)) => reply,
-        Some(Err(err)) => return Err(failed_turn(state, id, &secrets, root, turn_id, &plans_before, err).await),
+        Some(Err(err)) => {
+            let ArchitectError::Backend(failure) = &err;
+            let evidence = super::provider_errors::record_stage_failure(&secrets, id, &root, None, "chat", &stage, failure, trace).await;
+            let failed = FailedTurn { turn_id, plans_before: &plans_before, evidence };
+            return Err(failed_turn(state, id, &secrets, root, failed, err).await);
+        }
     };
     let kind = TurnKind { consensus: incoming.consensus_round.is_some(), user_mark: incoming.user_mark };
     Ok(finish_turn(state, id, &secrets, root, reply, turn_id, plans_before, kind).await)
@@ -652,6 +664,12 @@ pub const CONNECTION_LOST_CODE: &str = "chat.connection_lost";
 pub const CONNECTION_LOST_SAVED_CODE: &str = "chat.connection_lost_saved";
 /// `reason` do 502 quando a mensagem de sistema foi gravada: a tela recarrega o histórico.
 pub const CONNECTION_LOST_REASON: &str = "connection_lost";
+/// Código da mensagem de sistema gravada quando o provedor recusou o turno (spec 133 T11), com a
+/// evidência nos `params` (papel, conexão, modelo, status, tipo, código e categoria).
+pub const PROVIDER_FAILED_NOTICE_CODE: &str = "chat.provider_failed";
+/// `reason` do 502 quando a falha do provedor ficou gravada no histórico (spec 133 T11): a tela
+/// recarrega o histórico em vez de repetir o aviso.
+pub const FAILURE_RECORDED_REASON: &str = "failure_recorded";
 
 /// Falha que é queda da conexão com o provedor: conexão perdida (inclusive no meio da resposta,
 /// depois das novas tentativas), tempo esgotado ou transmissão sem evento final.
@@ -672,32 +690,36 @@ fn saved_specs(root: &Path, before: &std::collections::BTreeMap<String, String>,
         .collect()
 }
 
-/// Turno que falhou pelo provedor (spec 127 T01). Queda da conexão: grava no histórico uma
-/// mensagem de sistema com `code` (o que ficou gravado vai nos `params`; a reserva no idioma do
-/// projeto) e devolve o 502 com `reason: connection_lost`. Outras falhas: só o 502, como antes.
-#[allow(clippy::too_many_arguments)]
-async fn failed_turn(
-    state: &AppState,
-    id: &str,
-    secrets: &Arc<SecretSet>,
-    root: PathBuf,
+/// O turno que falhou: o id, o retrato do plano antes dele e a evidência da falha do provedor.
+struct FailedTurn<'a> {
     turn_id: String,
-    plans_before: &super::plan_changes::Snapshots,
-    err: ArchitectError,
-) -> ApiError {
+    plans_before: &'a super::plan_changes::Snapshots,
+    evidence: crate::agents::llm_client::FailureEvidence,
+}
+
+/// Turno que falhou pelo provedor. O 502 leva nos `params` a causa fixa e a evidência da T01 (spec
+/// 133 T11: papel, conexão, modelo, status, tipo, código e categoria). Queda da conexão (spec 127
+/// T01): grava no histórico o aviso `chat.connection_lost*` (o que ficou gravado vai nos `params`)
+/// e devolve `reason: connection_lost`. Outras falhas (spec 133 T11): grava a mensagem de sistema
+/// `chat.provider_failed` com os mesmos `params` e devolve `reason: failure_recorded`. A reserva do
+/// texto gravado sai no idioma do projeto; a tela traduz pelo `code`.
+async fn failed_turn(state: &AppState, id: &str, secrets: &Arc<SecretSet>, root: PathBuf, failed: FailedTurn<'_>, err: ArchitectError) -> ApiError {
     let ArchitectError::Backend(failure) = &err;
     let lost = is_connection_lost(failure);
-    let api = architect_error(err);
-    if !lost {
-        return api;
-    }
+    let params = super::provider_errors::stage_failure_params(secrets, failure, &failed.evidence);
+    let api = ApiError::coded(StatusCode::BAD_GATEWAY, CODE_PROVIDER_FAILED, params.clone());
     let lang = state.project_lang(id).get();
     let before: std::collections::BTreeMap<String, String> =
-        plans_before.iter().map(|(spec, (sig, _))| (spec.clone(), sig.clone())).collect();
+        failed.plans_before.iter().map(|(spec, (sig, _))| (spec.clone(), sig.clone())).collect();
     let secrets = Arc::clone(secrets);
+    let turn_id = failed.turn_id;
     let saved = tokio::task::spawn_blocking(move || {
-        let spec = saved_specs(&root, &before, &secrets).into_iter().next();
-        let notice = connection_lost_notice(spec.as_deref());
+        let notice = if lost {
+            let spec = saved_specs(&root, &before, &secrets).into_iter().next();
+            connection_lost_notice(spec.as_deref())
+        } else {
+            TurnNotice { code: PROVIDER_FAILED_NOTICE_CODE.to_string(), params }
+        };
         let text = output_text(&secrets, &crate::i18n::tr(lang, &format!("system.{}", notice.code), &notice_pairs(&notice)));
         let turn = ChatTurn {
             role: TurnRole::System,
@@ -712,10 +734,10 @@ async fn failed_turn(
     })
     .await
     .unwrap_or(false);
-    if saved {
-        api.with_reason(CONNECTION_LOST_REASON)
-    } else {
-        api
+    match (saved, lost) {
+        (true, true) => api.with_reason(CONNECTION_LOST_REASON),
+        (true, false) => api.with_reason(FAILURE_RECORDED_REASON),
+        (false, _) => api,
     }
 }
 
@@ -760,7 +782,7 @@ pub async fn post_chat_continue(
     if let Some(spec) = &input.spec_id {
         super::spec_result::validate_spec_id(spec)?;
     }
-    let message = crate::agents::prompts::continue_turn_request(input.spec_id.as_deref());
+    let message = crate::agents::prompts::continue_turn_request(input.spec_id.as_deref(), state.project_lang(&id).get());
     internal_turn_response(&state, &id, message).await
 }
 
@@ -962,6 +984,14 @@ async fn find_project(state: &AppState, id: &str) -> Result<Project, ApiError> {
 
 /// Modelo, esforço e cliente do Arquiteto. Qualquer falha de configuração vira 422 estático.
 pub(super) async fn architect_client(state: &AppState) -> Result<(String, Effort, LlmClient), ApiError> {
+    architect_client_with_connection(state).await.map(|(model, effort, client, _)| (model, effort, client))
+}
+
+/// [`architect_client`] com a conexão usada (spec 133 T01): lidos na mesma leitura da
+/// configuração, para a evidência de uma falha registrar a conexão e o modelo do disparo.
+async fn architect_client_with_connection(
+    state: &AppState,
+) -> Result<(String, Effort, LlmClient, crate::agents::llm_client::ConnectionRef), ApiError> {
     let (agent, connection) = {
         let cfg = state.config().read().await;
         let agent = cfg.agents.architect.clone();
@@ -978,20 +1008,13 @@ pub(super) async fn architect_client(state: &AppState) -> Result<(String, Effort
         return Err(not_configured());
     }
     let client = super::chatgpt::plan_client::llm_client(state, &connection).map_err(|_| not_configured())?;
-    Ok((agent.model, agent.effort, client))
-}
-
-/// Mapeia falhas do Arquiteto para códigos fixos, com o motivo fechado nos `params` neutros
-/// (`kind`, `provider_code`) quando houver (spec 088 e 102). Spec 119: sem o `detail` em pt-BR; a
-/// tela monta o motivo pelo dicionário, no idioma dela.
-fn architect_error(err: ArchitectError) -> ApiError {
-    let ArchitectError::Backend(failure) = err;
-    let params = super::error::provider_failure_params(&failure);
-    ApiError::coded(StatusCode::BAD_GATEWAY, CODE_PROVIDER_FAILED, params)
+    Ok((agent.model, agent.effort, client, super::provider_errors::connection_ref(&connection)))
 }
 
 /// Código (spec 102) da falha do provedor no turno do Arquiteto (`params.provider`: a causa fixa,
-/// ex.: `provider_http_400`; `params.kind`/`params.provider_code`: o motivo neutro, quando houver).
+/// ex.: `provider_http_400`; `params.kind`/`params.provider_code`: o motivo neutro, quando houver;
+/// spec 133 T11: a evidência, ver [`failed_turn`]). Spec 119: sem o `detail` em pt-BR; a tela
+/// monta o motivo pelo dicionário, no idioma dela.
 pub const CODE_PROVIDER_FAILED: &str = "provider_failed";
 
 /// Internet do Arquiteto (spec 076) para um turno de plano/recuperação: `None` com o interruptor do
@@ -1567,7 +1590,7 @@ mod tests {
         let reqs = scripted.requests();
         assert_eq!(reqs.len(), 5);
         let asked = &reqs[3].messages.last().expect("mensagem").content;
-        assert!(asked.starts_with(crate::agents::architect::PLAN_CHECK_INTRO), "{asked}");
+        assert!(asked.starts_with(&crate::agents::architect::plan_check_intro(crate::i18n::Lang::PtBr)), "{asked}");
         assert!(asked.contains("T01: critério cita `deps.edn`, fora do escopo"), "{asked}");
         assert_eq!(body["reply"], "Plano corrigido.");
         assert_eq!(body["draft_updated"], true);
@@ -2267,7 +2290,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["params"]["provider"], "provider_connect_failed");
         assert_eq!(body["code"], CODE_PROVIDER_FAILED);
-        assert_eq!(body["params"], json!({"provider": "provider_connect_failed"}));
+        // Spec 133 T11: com a evidência do papel, da conexão e do modelo.
+        assert_eq!(
+            body["params"],
+            json!({"provider": "provider_connect_failed", "role": "architect", "model": "gpt-4o", "connection_id": "literal",
+                   "connection_name": "Conexão literal", "connection_kind": "api_key", "category": "transport"})
+        );
     }
 
     #[tokio::test]
@@ -2282,8 +2310,11 @@ mod tests {
         assert!(body.get("detail").is_none(), "{body}");
         // Spec 102: `code` estável e `params` com a causa e o motivo.
         assert_eq!(body["code"], CODE_PROVIDER_FAILED);
-        assert_eq!(body["params"], json!({"provider": "provider_bad_response", "kind": "empty"}));
-        assert_eq!(chat_lines(&root).len(), 1); // só a mensagem do usuário, persistida no início
+        assert_eq!((&body["params"]["provider"], &body["params"]["kind"]), (&json!("provider_bad_response"), &json!("empty")));
+        // Spec 133 T11: a mensagem do usuário e a falha, como mensagem do sistema com código.
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["notice"]["code"], PROVIDER_FAILED_NOTICE_CODE);
     }
 
     #[tokio::test]
@@ -2303,7 +2334,137 @@ mod tests {
         assert!(!text.contains(SECRET), "{text}");
         assert!(!text.contains("api.exemplo"), "{text}");
         assert!(!text.contains("chat/completions"), "{text}");
-        assert_eq!(chat_lines(&root).len(), 1); // só a mensagem do usuário, persistida no início
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 2, "a mensagem do usuário e a falha");
+        assert!(!lines[1].to_string().contains(SECRET) && !lines[1].to_string().contains("api.exemplo"), "{}", lines[1]);
+    }
+
+    /// Servidor local que responde, em ordem, cada resposta HTTP bruta (uma por conexão).
+    async fn raw_server(responses: Vec<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("endereço");
+        tokio::spawn(async move {
+            for raw in responses {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = sock.read(&mut tmp).await else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                            .unwrap_or(0);
+                        if rest.len() >= len {
+                            break;
+                        }
+                    }
+                }
+                let _ = sock.write_all(raw.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// Spec 133 T11 (D5): o 404 do provedor na conversa (modelo inexistente) volta com os `params`
+    /// completos da evidência (papel, conexão, modelo, status, tipo, código e categoria), sem a
+    /// mensagem do provedor, e fica no histórico como mensagem do sistema com o código.
+    #[tokio::test]
+    async fn chat_404_carries_the_full_evidence_and_stays_in_the_history() {
+        let root = tmp_root("chat-404-evidence");
+        std::fs::create_dir_all(root.join(".sdd/specs")).expect("sdd");
+        let body = r#"{"error":{"code":404,"message":"models/modelo-x is not found for API version v1","status":"NOT_FOUND"}}"#;
+        let raw = format!(
+            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nx-request-id: req-404\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut cfg = config_for(&root, true);
+        cfg.connections[0].base_url = raw_server(vec![raw]).await;
+        let state = state_for(&root, cfg);
+        let (status, resp) = turn(&state, PROJECT_ID, "oi", None, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{resp}");
+        assert_eq!(resp["code"], CODE_PROVIDER_FAILED);
+        assert_eq!(resp["reason"], FAILURE_RECORDED_REASON, "{resp}");
+        let params = resp["params"].clone();
+        assert_eq!(params["provider"], "provider_http_404", "{params}");
+        assert_eq!((&params["role"], &params["model"]), (&json!("architect"), &json!("gpt-4o")), "{params}");
+        assert_eq!((&params["connection_id"], &params["connection_name"]), (&json!("literal"), &json!("Conexão literal")), "{params}");
+        assert_eq!((&params["status"], &params["category"]), (&json!(404), &json!("bad_request")), "{params}");
+        assert_eq!((&params["error_type"], &params["error_code"]), (&json!("not_found"), &json!("404")), "{params}");
+        assert_eq!(params["request_id"], "req-404", "{params}");
+        assert!(!resp.to_string().contains("is not found"), "a mensagem do provedor não vai à tela: {resp}");
+        // A mesma evidência no registro do projeto.
+        let rows = super::super::provider_errors::load(&root, None);
+        assert_eq!(rows.last().and_then(|r| r.error_type.clone()).as_deref(), Some("not_found"));
+        // No histórico: a mensagem do sistema com o código, os mesmos `params` e a reserva no idioma do projeto.
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 2, "mensagem do usuário + falha");
+        let notice = &lines[1];
+        assert_eq!(notice["role"], "system");
+        assert_eq!(notice["turn_id"], lines[0]["turn_id"]);
+        assert_eq!(notice["notice"]["code"], PROVIDER_FAILED_NOTICE_CODE);
+        assert_eq!(notice["notice"]["params"], params);
+        let lang = state.project_lang(PROJECT_ID).get();
+        assert_eq!(notice["text"], crate::i18n::tr(lang, "system.chat.provider_failed", &[("provider", "provider_http_404")]));
+        // O GET devolve o `code` e os `params`, para a tela traduzir.
+        let (status, hist) = get_history(&state, PROJECT_ID, HOST).await;
+        assert_eq!(status, StatusCode::OK);
+        let last = hist["turns"].as_array().and_then(|t| t.last().cloned()).expect("falha");
+        assert_eq!((&last["role"], &last["code"]), (&json!("system"), &json!(PROVIDER_FAILED_NOTICE_CODE)));
+        assert_eq!(last["params"], params);
+        // A falha fica fora do contexto do próximo turno do modelo.
+        assert!(read_history(&root).iter().all(|t| t.role != TurnRole::System));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Backend que troca o modelo e a conexão do Arquiteto na configuração durante a chamada e
+    /// depois falha com 400 (spec 133 T01, F-01).
+    struct SwitchThenFail(AppState);
+
+    impl ChatBackend for SwitchThenFail {
+        fn complete<'a>(
+            &'a self,
+            _req: &'a crate::agents::llm_client::ChatRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::agents::llm_client::ChatResponse, LlmError>> + Send + 'a>> {
+            Box::pin(async move {
+                {
+                    let mut cfg = self.0.config().write().await;
+                    cfg.agents.architect.model = "modelo-trocado".into();
+                    for conn in &mut cfg.connections {
+                        conn.name = "Conexão trocada".into();
+                    }
+                }
+                Err(LlmError::Http { status: 400, body_snippet: String::new(), code: None })
+            })
+        }
+    }
+
+    /// Spec 133 T01 (F-01): a falha da conversa grava a conexão e o modelo do disparo, mesmo que a
+    /// configuração mude durante o turno.
+    #[tokio::test]
+    async fn chat_failure_records_the_connection_and_model_of_the_dispatch() {
+        let root = tmp_root("chat-evidence-switch");
+        std::fs::create_dir_all(root.join(".sdd/specs")).expect("sdd");
+        let state = state_for(&root, config_for(&root, true));
+        let dynb: Arc<dyn ChatBackend> = Arc::new(SwitchThenFail(state.clone()));
+        let (status, _) = turn(&state, PROJECT_ID, "oi", Some(dynb), CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(state.config().read().await.agents.architect.model, "modelo-trocado", "a troca aconteceu");
+        let rows = super::super::provider_errors::load(&root, None);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!((row.role.as_str(), row.stage.as_deref()), ("architect", Some("chat")));
+        assert_eq!(row.model, "gpt-4o");
+        assert_eq!((row.connection_id.as_deref(), row.connection_name.as_deref()), (Some("literal"), Some("Conexão literal")));
+        assert_eq!((row.provider.as_str(), row.category.as_deref(), row.retries), ("provider_http_400", Some("bad_request"), 0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -2336,8 +2497,11 @@ mod tests {
             // com caractere inválido é omitido).
             assert!(body.get("detail").is_none(), "caso {code}: {body}");
             if code == "provider_bad_response" {
-                assert_eq!(body["params"], json!({"provider": "provider_bad_response", "kind": "incomplete"}), "{body}");
+                assert_eq!(body["params"]["kind"], "incomplete", "{body}");
+                assert!(body["params"].get("provider_code").is_none(), "{body}");
             }
+            // Spec 133 T11: toda falha leva o papel, a conexão e o modelo.
+            assert_eq!((&body["params"]["role"], &body["params"]["model"]), (&json!("architect"), &json!("gpt-4o")), "caso {code}: {body}");
         }
     }
 
@@ -3084,15 +3248,21 @@ mod tests {
         }
     }
 
+    /// Spec 133 T11: as outras falhas do provedor também ficam no histórico, com o próprio código
+    /// (sem o "Tentar de novo" da queda) e `reason: failure_recorded`.
     #[tokio::test]
-    async fn other_provider_failures_record_no_notice() {
+    async fn other_provider_failures_record_a_coded_failure_notice() {
         let root = tmp_root("chat-conn-other");
         let state = state_for(&root, config_for(&root, true));
         let (_, dynb) = backend(vec![Err(LlmError::Http { status: 401, body_snippet: String::new(), code: None })]);
         let (status, body) = turn(&state, PROJECT_ID, "oi", dynb, CHAT_TIMEOUT).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(body.get("reason").is_none(), "{body}");
-        assert_eq!(chat_lines(&root).len(), 1);
+        assert_eq!(body["reason"], FAILURE_RECORDED_REASON, "{body}");
+        assert_eq!(body["params"]["category"], "auth", "{body}");
+        let lines = chat_lines(&root);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["notice"]["code"], PROVIDER_FAILED_NOTICE_CODE);
+        assert_eq!(lines[1]["notice"]["params"], body["params"]);
     }
 
     #[tokio::test]
@@ -3111,7 +3281,7 @@ mod tests {
         let reqs = scripted.requests();
         let messages = &reqs[0].messages;
         let last = messages.last().expect("pedido");
-        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(None));
+        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(None, crate::i18n::Lang::PtBr));
         let lang = state.project_lang(PROJECT_ID).get();
         let notice_text = crate::i18n::text(lang, "system.chat.connection_lost");
         assert!(messages.iter().all(|m| !m.content.contains(&notice_text)), "o aviso é da pessoa, não do modelo");
@@ -3139,7 +3309,7 @@ mod tests {
         let (status, body) = post_raw(&state, &uri, r#"{"spec_id": "001-exemplo"}"#).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let last = scripted.requests()[0].messages.last().cloned().expect("pedido");
-        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(Some("001-exemplo")));
+        assert_eq!(last.content, crate::agents::prompts::continue_turn_request(Some("001-exemplo"), crate::i18n::Lang::PtBr));
         assert!(last.content.ends_with("Spec: 001-exemplo"));
     }
 }

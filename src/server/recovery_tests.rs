@@ -1095,7 +1095,8 @@ mod internet {
             dialog: &dialog,
         };
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
-        let answer = ask_raw(&scope, "fatos", "T01", &mut rx, diagnosis).await;
+        let turn = if diagnosis { Turn::Diagnose } else { Turn::Recover };
+        let answer = ask_raw(&scope, "fatos", "T01", &mut rx, turn).await;
         assert!(answer.is_ok(), "pergunta ao Arquiteto falhou");
     }
 
@@ -1420,4 +1421,157 @@ fn recovery_facts_carry_the_install_rule_and_env_note_follows_it() {
     assert!(!with.contains("autossuficiente"), "{with}");
     let without = env_note("npm test", "127", "x", None);
     assert!(without.contains("autossuficiente"), "{without}");
+}
+
+// ---- Spec 133 T13 (D2): proposta recusada volta ao Arquiteto uma vez ----
+
+mod refused_config {
+    use super::*;
+    use crate::agents::architect::testing::{text, Scripted};
+    use crate::config::{AgentConfig, Config, Connection, Effort, WireApi};
+
+    const SETTINGS: &str = "base_branch: main\nmerge_strategy: squash\ntest_command: npm test\nyolo: true\nenvironment: docker\n";
+
+    fn setup(tag: &str, replies: Vec<&str>) -> (AppState, Arc<Scripted>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("nants-rec-refused-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".sdd")).expect("mkdir");
+        std::fs::write(root.join(".sdd/settings.yaml"), SETTINGS).expect("settings");
+        let mut cfg = Config::default();
+        cfg.connections.push(Connection {
+            id: "c1".into(),
+            name: "C".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "k".into(),
+            wire_api: WireApi::Responses,
+            kind: Default::default(),
+            base_url_override: None,
+        });
+        cfg.agents.architect = AgentConfig { connection_id: "c1".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
+        let scripted = Scripted::new(replies.into_iter().map(text).collect());
+        let state = AppState::new(root.join("config.toml"), cfg, 3000).with_report_backend(scripted.clone());
+        (state, scripted, root)
+    }
+
+    fn loaded() -> Loaded {
+        Loaded {
+            facts: "fatos".into(),
+            allowed_scope: Vec::new(),
+            cycles: 0,
+            environmental: false,
+            config_suspect: false,
+            yolo: true,
+            rounds: 0,
+            env_fixes: 0,
+            command: "npm test".into(),
+            exit_code: "1".into(),
+            error_tail: String::new(),
+            env_note: String::new(),
+        }
+    }
+
+    /// A proposta do Test 10: um `$` que a lista de comandos recusa ("expansão não suportada").
+    fn refused() -> Decision {
+        parse_decision(r#"{"decision":"REVISE_CONFIG","root_cause":"porta","test_command":"PORT=$PORT npm test"}"#).expect("decisão")
+    }
+
+    async fn run(state: &AppState, root: &Path, decision: Decision) -> Decision {
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(root, "s1");
+        let events = state.events().clone();
+        let scope = Scope { state, project_id: "p1", spec_id: "s1", root, secrets: &secrets, events: &events, dialog: &dialog };
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let loaded = loaded();
+        let job = config_with_feedback(&scope, &loaded, "T01", decision, &mut rx, "fatos da análise");
+        match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(_)) => panic!("parou sem decisão"),
+            Err(_) => panic!("esperou o humano"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_proposal_returns_once_and_the_valid_second_one_is_applied() {
+        let second = r#"{"decision":"REVISE_CONFIG","root_cause":"porta","test_command":"npm ci && npm test"}"#;
+        let (state, scripted, root) = setup("ok", vec![second]);
+        let decision = run(&state, &root, refused()).await;
+        // O ciclo segue sem humano: a segunda proposta foi validada, aprovada sozinha e gravada.
+        assert!(decision.retry && decision.config.is_some(), "{decision:?}");
+        let settings = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings");
+        assert!(settings.contains("npm ci && npm test"), "{settings}");
+        // Uma volta só, na mesma sessão: a abertura de sempre, a resposta recusada e a correção.
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 1, "uma única nova pergunta");
+        let messages = &requests[0].messages;
+        let n = messages.len();
+        assert_eq!(messages[n - 2].role, crate::agents::llm_client::Role::Assistant);
+        assert!(messages[n - 2].content.contains("PORT=$PORT npm test"), "{}", messages[n - 2].content);
+        let correction = &messages[n - 1].content;
+        assert!(correction.contains("expansão não suportada"), "motivo exato: {correction}");
+        assert!(correction.contains("`&&`") && correction.contains("`$`"), "o que é aceito: {correction}");
+        assert!(messages.iter().any(|m| m.content.contains("fatos da análise")), "mesma abertura");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn second_refusal_escalates_with_the_exact_reason() {
+        let again = r#"{"decision":"REVISE_CONFIG","root_cause":"porta","test_command":"npm test > out.txt"}"#;
+        let (state, scripted, root) = setup("again", vec![again]);
+        let decision = run(&state, &root, refused()).await;
+        assert!(!decision.retry && decision.config.is_none(), "{decision:?}");
+        assert!(decision.root_cause.starts_with(CAUSE_CONFIG_INVALID), "{}", decision.root_cause);
+        assert_eq!(scripted.requests().len(), 1, "sem laço: uma volta só");
+        let settings = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings");
+        assert_eq!(settings, SETTINGS, "nada gravado");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn refusal_without_a_new_answer_escalates_as_before() {
+        let (state, scripted, root) = setup("silent", vec![]);
+        let decision = run(&state, &root, refused()).await;
+        assert!(!decision.retry && decision.root_cause.contains("expansão não suportada"), "{decision:?}");
+        assert!(scripted.requests().len() <= 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-01: no modo Automático, a proposta recusada saiu da 2ª pergunta, a reforçada. A continuação
+    /// abre exatamente com os fatos dela (com a nota que proíbe o ESCALATE), não com os da 1ª.
+    #[tokio::test]
+    async fn followup_opens_with_the_facts_of_the_reinforced_question() {
+        let replies = vec![
+            r#"{"decision":"ESCALATE","root_cause":"sem saída"}"#,
+            r#"{"decision":"REVISE_CONFIG","root_cause":"porta","test_command":"PORT=$PORT npm test"}"#,
+            r#"{"decision":"REVISE_CONFIG","root_cause":"porta","test_command":"npm ci && npm test"}"#,
+        ];
+        let (state, scripted, root) = setup("reinforced", replies);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = Scope { state: &state, project_id: "p1", spec_id: "s1", root: &root, secrets: &secrets, events: &events, dialog: &dialog };
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let loaded = loaded();
+        let (decision, facts) = decide(&scope, "fatos", "T01", &mut rx, true, false).await.ok().expect("decisão");
+        assert!(decision.config.is_some() && facts.contains(YOLO_REINFORCED_NOTE), "{facts}");
+        let job = config_with_feedback(&scope, &loaded, "T01", decision, &mut rx, &facts);
+        let decision = match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
+            Ok(Ok(decision)) => decision,
+            _ => panic!("sem decisão"),
+        };
+        assert!(decision.retry && decision.config.is_some(), "{decision:?}");
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 3);
+        let (asked, followup) = (&requests[1].messages, &requests[2].messages);
+        assert!(asked.iter().any(|m| m.content.contains(YOLO_REINFORCED_NOTE)));
+        assert_eq!(&followup[..asked.len()], &asked[..], "a mesma abertura da pergunta reforçada");
+        assert!(followup[asked.len()].content.contains("PORT=$PORT npm test"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn correction_follows_the_project_language() {
+        let en = refusal_correction(Lang::En, "expansão não suportada");
+        assert!(en.starts_with("The server refused") && en.contains("expansão não suportada"), "{en}");
+        assert!(refusal_correction(Lang::PtBr, "x").starts_with("O servidor recusou"));
+    }
 }

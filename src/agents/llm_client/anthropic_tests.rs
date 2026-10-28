@@ -1290,3 +1290,23 @@ async fn anthropic_live_web_search() {
     assert!(!second.message.content.is_empty());
     live.report();
 }
+
+/// Spec 133 T04 (C-03): o turno cujo prefixo mudou volta sem os blocos de raciocínio; o resto dos
+/// blocos (as chamadas) segue inalterado.
+#[test]
+fn released_turn_goes_without_thinking() {
+    let tool_use = json!({ "type": "tool_use", "id": "t1", "name": "read_file", "input": { "path": "a" } });
+    let mut msg = ChatMessage::text(Role::Assistant, "");
+    msg.tool_calls = vec![ToolCall { id: "t1".into(), name: "read_file".into(), arguments: r#"{"path":"a"}"#.into() }];
+    msg.provider_items = Some(vec![
+        json!({ "type": "thinking", "thinking": "pensando", "signature": "SIG" }),
+        json!({ "type": "redacted_thinking", "data": "X" }),
+        tool_use.clone(),
+    ]);
+    let mut items = msg.provider_items.clone().expect("itens");
+    assert!(anthropic::drop_thinking(&mut items));
+    assert!(!anthropic::drop_thinking(&mut items), "nada mais a tirar");
+    assert_eq!(items, vec![tool_use]);
+    release_prefix_reasoning(&mut msg);
+    assert_eq!(msg.provider_items.as_ref(), Some(&items));
+}

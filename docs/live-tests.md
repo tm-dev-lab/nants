@@ -103,4 +103,10 @@ provoke them; the fake-server tests cover the handling:
 
 - the Anthropic `pause_turn` (the server tool loop limit) and its continuation;
 - a Gemini 400 that refuses the Google Search tool;
-- the Gemini `429` quotas (per minute and per day) and the Anthropic spend limit.
+- the Gemini `429` quotas (per minute and per day) and the Anthropic spend limit;
+- billing at any provider (a `402`, a billing error code, or the Anthropic "credit balance" in a
+  `400`), which pauses the run with the card that switches the connection of the role.
+
+A real failure of this kind is recorded in the project, in
+`.sdd/specs/<spec>/provider-errors.jsonl`, with the status, the provider's error codes and the
+request id (see [SECURITY.md](../SECURITY.md#provider-failure-log)).

@@ -61,13 +61,14 @@ pub const MAX_HISTORY_IMAGES: usize = 4;
 /// Aviso no início da resposta quando o provedor recusou as imagens do turno (spec 082 T05).
 pub const IMAGES_REFUSED_NOTICE: &str =
     "Aviso: o modelo do Arquiteto não aceitou imagens; respondi só com o texto.";
-/// Nota que substitui as imagens removidas de uma mensagem após a recusa do provedor.
-const IMAGES_DROPPED_NOTE: &str = "[imagens omitidas: o modelo não aceitou imagens]";
 
 /// Avisos do plano mostrados ao Arquiteto por mensagem de correção (spec 092 T01).
 pub const MAX_PLAN_WARNINGS: usize = 10;
-/// Pedido de correção dos avisos determinísticos do plano, no mesmo turno (spec 092 T01).
-pub const PLAN_CHECK_INTRO: &str = "Verificação automática do plano (DADO do Nants). Antes de concluir, corrija estes avisos do plano (ou explique por que não se aplicam):";
+/// Pedido de correção dos avisos determinísticos do plano, no mesmo turno (spec 092 T01), no
+/// idioma do projeto (spec 133 T11).
+pub fn plan_check_intro(lang: crate::i18n::Lang) -> String {
+    crate::i18n::text(lang, "agent.plan_check.intro")
+}
 /// Texto da atividade ao vivo durante a correção dos avisos do plano.
 pub const PLAN_CHECK_ACTIVITY: &str = "Arquiteto revisando avisos do plano";
 
@@ -413,8 +414,8 @@ impl LlmArchitect {
     fn net_note(&self, phase: NetPhase) -> Option<String> {
         let setup = self.internet.as_ref()?;
         Some(match phase {
-            NetPhase::Plan => internet_plan_note(setup.web_search),
-            NetPhase::Recovery => internet_recovery_note(setup.web_search),
+            NetPhase::Plan => internet_plan_note(setup.web_search, self.lang.get()),
+            NetPhase::Recovery => internet_recovery_note(setup.web_search, self.lang.get()),
         })
     }
 
@@ -543,7 +544,7 @@ impl LlmArchitect {
         };
         // Recusa de imagens tratada antes do laço: vale em qualquer caminho de pedido e preserva o
         // texto das mensagens (só as imagens saem).
-        let guarded = ImageGuard::new(&metered);
+        let guarded = ImageGuard::new(&metered, self.lang.get());
         let ctx = AgentCtx {
             backend: &guarded,
             model: &self.model,
@@ -556,6 +557,8 @@ impl LlmArchitect {
             usage,
             // Spec 122 T04: a conversa já limita os turnos; fica sem resumo do histórico.
             summary: None,
+            cache_prices: None,
+            lang: self.lang.get(),
         };
         let load = |name: &str| crate::server::chat_attachments::load_attachment(root, name);
         let mut messages = build_messages(history, user_message, attachments, snapshot, &load, self.lang.get());
@@ -610,7 +613,7 @@ impl LlmArchitect {
                 let run = self.scope().begin();
                 run.notice(PLAN_CHECK_ACTIVITY);
                 run.end();
-                messages.push(ChatMessage::text(ChatRole::User, plan_check_text(&warnings)));
+                messages.push(ChatMessage::text(ChatRole::User, plan_check_text(&warnings, self.lang.get())));
                 match tool_loop(&ctx, &mut messages, self.max_steps).await {
                     Ok(fixed) if !fixed.trim().is_empty() => text = fixed.trim().to_string(),
                     Ok(_) => log_plan_check_failure("resposta vazia"),
@@ -633,14 +636,15 @@ pub fn log_plan_check_failure(reason: &str) {
 }
 
 /// Mensagem de correção dos avisos do plano: até [`MAX_PLAN_WARNINGS`] itens, o resto resumido.
-fn plan_check_text(warnings: &[String]) -> String {
-    let mut out = PLAN_CHECK_INTRO.to_string();
+fn plan_check_text(warnings: &[String], lang: crate::i18n::Lang) -> String {
+    let mut out = plan_check_intro(lang);
     for w in warnings.iter().take(MAX_PLAN_WARNINGS) {
         out.push_str("\n- ");
         out.push_str(w);
     }
     if warnings.len() > MAX_PLAN_WARNINGS {
-        out.push_str(&format!("\n- … e mais {}", warnings.len() - MAX_PLAN_WARNINGS));
+        let more = (warnings.len() - MAX_PLAN_WARNINGS).to_string();
+        out.push_str(&format!("\n- {}", crate::i18n::tr(lang, "agent.plan_check.more", &[("n", &more)])));
     }
     out
 }
@@ -651,11 +655,13 @@ fn plan_check_text(warnings: &[String]) -> String {
 struct ImageGuard<'a> {
     inner: &'a dyn ChatBackend,
     refused: AtomicBool,
+    /// Idioma da nota que substitui as imagens (spec 133 T11).
+    lang: crate::i18n::Lang,
 }
 
 impl<'a> ImageGuard<'a> {
-    fn new(inner: &'a dyn ChatBackend) -> Self {
-        Self { inner, refused: AtomicBool::new(false) }
+    fn new(inner: &'a dyn ChatBackend, lang: crate::i18n::Lang) -> Self {
+        Self { inner, refused: AtomicBool::new(false), lang }
     }
 
     fn refused(&self) -> bool {
@@ -667,12 +673,13 @@ fn has_images(req: &ChatRequest) -> bool {
     req.messages.iter().any(|m| !m.images.is_empty())
 }
 
-/// Cópia do pedido sem imagens; cada mensagem que as tinha ganha [`IMAGES_DROPPED_NOTE`].
-fn without_images(req: &ChatRequest) -> ChatRequest {
+/// Cópia do pedido sem imagens; cada mensagem que as tinha ganha a nota `agent.images.dropped`.
+fn without_images(req: &ChatRequest, lang: crate::i18n::Lang) -> ChatRequest {
     let mut out = req.clone();
+    let note = crate::i18n::text(lang, "agent.images.dropped");
     for msg in out.messages.iter_mut().filter(|m| !m.images.is_empty()) {
         msg.images.clear();
-        msg.content = format!("{}\n{IMAGES_DROPPED_NOTE}", msg.content);
+        msg.content = format!("{}\n{note}", msg.content);
     }
     out
 }
@@ -691,12 +698,12 @@ impl ChatBackend for ImageGuard<'_> {
                 return self.inner.complete(req).await;
             }
             if self.refused() {
-                return self.inner.complete(&without_images(req)).await;
+                return self.inner.complete(&without_images(req, self.lang)).await;
             }
             match self.inner.complete(req).await {
                 Err(e) if is_client_error(&e) => {
                     self.refused.store(true, Ordering::Relaxed);
-                    self.inner.complete(&without_images(req)).await
+                    self.inner.complete(&without_images(req, self.lang)).await
                 }
                 other => other,
             }
@@ -713,12 +720,12 @@ impl ChatBackend for ImageGuard<'_> {
                 return self.inner.complete_stream(req, on_delta).await;
             }
             if self.refused() {
-                return self.inner.complete_stream(&without_images(req), on_delta).await;
+                return self.inner.complete_stream(&without_images(req, self.lang), on_delta).await;
             }
             match self.inner.complete_stream(req, on_delta).await {
                 Err(e) if is_client_error(&e) => {
                     self.refused.store(true, Ordering::Relaxed);
-                    self.inner.complete_stream(&without_images(req), on_delta).await
+                    self.inner.complete_stream(&without_images(req, self.lang), on_delta).await
                 }
                 other => other,
             }
@@ -752,6 +759,8 @@ impl LlmArchitect {
             cancel: None,
             usage,
             summary: Some(SummaryPolicy::for_window(None)),
+            cache_prices: None,
+            lang: self.lang.get(),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, report_system_for(self.lang.get())),
@@ -794,7 +803,7 @@ impl LlmArchitect {
     /// Devolve o texto bruto (JSON `{"root_cause","what_to_do"}` a validar pelo servidor).
     pub async fn diagnose(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
         let request = TurnRequest { text: DIAGNOSIS_REQUEST, structured: Some(structured::DIAGNOSIS) };
-        self.read_only_turn(root, diagnosis_system_for(self.lang.get()), facts, request, true, None).await
+        self.read_only_turn(root, diagnosis_system_for(self.lang.get()), facts, request, true, None, &[]).await
     }
 
     /// Turno de recuperação de uma tarefa bloqueada por qualidade: somente leitura (mesmo host do
@@ -804,7 +813,18 @@ impl LlmArchitect {
     /// escolhe), senão a raiz do projeto. O host continua `report_only` (sem escrita nem comandos).
     pub async fn recover(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
         let request = TurnRequest { text: RECOVERY_REQUEST, structured: Some(structured::RECOVERY) };
-        self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, request, true, Some(NetPhase::Recovery))
+        self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, request, true, Some(NetPhase::Recovery), &[])
+            .await
+    }
+
+    /// Spec 133 T13 (D2): continuação do turno de recuperação quando o servidor recusou a decisão.
+    /// A abertura é a mesma do [`Self::recover`] (o prefixo do cache fica), seguida da resposta
+    /// recusada (`previous`) e da `correction` com o motivo exato e o que é aceito, como turno do
+    /// usuário. Devolve o texto bruto da nova decisão.
+    pub async fn recover_followup(&self, root: &Path, facts: &str, previous: &str, correction: &str) -> Result<String, ArchitectError> {
+        let request = TurnRequest { text: RECOVERY_REQUEST, structured: Some(structured::RECOVERY) };
+        let follow = [ChatMessage::text(ChatRole::Assistant, previous), ChatMessage::text(ChatRole::User, correction)];
+        self.read_only_turn(root, recovery_system_for(self.lang.get()), facts, request, true, Some(NetPhase::Recovery), &follow)
             .await
     }
 
@@ -813,7 +833,7 @@ impl LlmArchitect {
     /// worktree da tarefa como raiz de leitura. Devolve o texto bruto (JSON a validar pelo runner).
     pub async fn arbitrate(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
         let request = TurnRequest { text: ARBITRATION_REQUEST, structured: Some(structured::ARBITRATION) };
-        self.read_only_turn(root, arbitration_system_for(self.lang.get()), facts, request, false, None).await
+        self.read_only_turn(root, arbitration_system_for(self.lang.get()), facts, request, false, None, &[]).await
     }
 
     async fn read_only_turn(
@@ -824,6 +844,7 @@ impl LlmArchitect {
         request: TurnRequest,
         with_memory: bool,
         net: Option<NetPhase>,
+        follow: &[ChatMessage],
     ) -> Result<String, ArchitectError> {
         let mut host = ToolHost::new(
             ToolRole::Architect,
@@ -866,6 +887,8 @@ impl LlmArchitect {
             cancel: None,
             usage,
             summary: Some(SummaryPolicy::for_window(None)),
+            cache_prices: None,
+            lang: self.lang.get(),
         };
         let mut messages = vec![
             ChatMessage::text(ChatRole::System, system),
@@ -875,6 +898,7 @@ impl LlmArchitect {
         if let Some(mem) = self.memory_message(root).filter(|_| with_memory) {
             messages.insert(1, mem);
         }
+        messages.extend_from_slice(follow);
         let text = tool_loop(&ctx, &mut messages, REPORT_MAX_STEPS)
             .await
             .map_err(backend_failure)?;
@@ -894,7 +918,7 @@ impl LlmArchitect {
     /// Turno de atualização da memória de arquitetura: somente leitura; devolve o NOVO conteúdo
     /// completo do ARCHITECTURE.md (o servidor valida, grava e commita).
     pub async fn update_architecture(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, architecture_update_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_UPDATE_REQUEST, structured: None }, false, None)
+        self.read_only_turn(root, architecture_update_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_UPDATE_REQUEST, structured: None }, false, None, &[])
             .await
     }
 }
@@ -907,7 +931,7 @@ impl LlmArchitect {
     /// Levantamento inicial de projeto existente: somente leitura; devolve o ARCHITECTURE.md
     /// (opcionalmente precedido de `TEST_COMMAND: ...`). O servidor valida, grava e commita.
     pub async fn survey_architecture(&self, root: &Path, facts: &str) -> Result<String, ArchitectError> {
-        self.read_only_turn(root, architecture_survey_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_SURVEY_REQUEST, structured: None }, false, None)
+        self.read_only_turn(root, architecture_survey_system_for(self.lang.get()), facts, TurnRequest { text: ARCH_SURVEY_REQUEST, structured: None }, false, None, &[])
             .await
     }
 }
@@ -1217,13 +1241,20 @@ mod tests {
         }
     }
 
+    /// Spec 133 T12: nos dois idiomas do projeto, a porta do Nants chega como instrução interna,
+    /// com o pedido de não documentá-la nos arquivos do projeto.
     #[tokio::test]
     async fn prompt_carries_nants_port() {
+        use crate::i18n::{Lang, SharedLang};
         let root = tmp_root("arch-port");
-        let backend = Scripted::new(vec![text("ok")]);
-        architect(backend.clone()).with_nants_port(3456).reply(&root, &[], "oi", SNAPSHOT).await.expect("resposta");
-        let first = &backend.requests()[0].messages[0].content;
-        assert!(first.contains("porta 3456") && first.contains("NÃO publique"), "{first}");
+        for lang in [Lang::PtBr, Lang::En] {
+            let backend = Scripted::new(vec![text("ok")]);
+            architect(backend.clone()).with_lang(SharedLang::new(lang)).with_nants_port(3456).reply(&root, &[], "oi", SNAPSHOT).await.expect("resposta");
+            let first = backend.requests()[0].messages[0].content.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(first.contains("porta 3456") && first.contains("NÃO publique"), "{first}");
+            assert!(first.contains("INSTRUÇÃO INTERNA DO NANTS (não é requisito do projeto)"), "{lang:?}: {first}");
+            assert!(first.contains("Não documente esta porta no projeto: não a cite no README, no spec.md, no ARCHITECTURE.md"), "{lang:?}: {first}");
+        }
     }
 
     /// Spec 090 T03: a disponibilidade da geração de imagens chega ao turno como uma linha de DADO.
@@ -1455,7 +1486,7 @@ mod tests {
         let state = format!("{STATE_BLOCK_LABEL}\nestado do projeto");
         let cut: Vec<&ChatRequest> = reqs
             .iter()
-            .filter(|r| r.messages.iter().any(|m| m.content == crate::agents::llm_agents::TRUNCATED_NOTE))
+            .filter(|r| r.messages.iter().any(|m| m.content == crate::agents::llm_agents::truncated_note(crate::i18n::Lang::PtBr)))
             .collect();
         assert!(cut.len() > 1, "o histórico passou do teto e foi cortado mais de uma vez");
         let systems = reqs[0].messages.iter().take_while(|m| m.role == ChatRole::System).count();
@@ -1466,7 +1497,7 @@ mod tests {
             assert_eq!(msgs.iter().filter(|m| m.content == state).count(), 1, "o estado segue, uma vez");
             let at = msgs.iter().position(|m| m.content == state).expect("estado");
             assert_eq!(msgs[at + 1].content, "o pedido do turno", "o pedido segue logo depois do estado");
-            assert_eq!(msgs[at + 2].content, crate::agents::llm_agents::TRUNCATED_NOTE, "antes do aviso de corte");
+            assert_eq!(msgs[at + 2].content, crate::agents::llm_agents::truncated_note(crate::i18n::Lang::PtBr), "antes do aviso de corte");
             assert_eq!(msgs.iter().filter(|m| m.content == "o pedido do turno").count(), 1);
             assert!(msgs.iter().all(|m| m.role != ChatRole::Tool || m.tool_call_id.is_some()));
         }
@@ -1841,7 +1872,7 @@ mod tests {
         assert_eq!(reqs.len(), 4, "uma continuação, sem segunda volta");
         let asked = reqs[2].messages.last().expect("mensagem");
         assert_eq!(asked.role, ChatRole::User);
-        assert_eq!(asked.content, format!("{PLAN_CHECK_INTRO}\n- {PLAN_WARNING}"));
+        assert_eq!(asked.content, format!("{}\n- {PLAN_WARNING}", plan_check_intro(crate::i18n::Lang::PtBr)));
         assert_eq!(reqs[2].messages[reqs[2].messages.len() - 2].content, "Plano pronto.");
         let ev = rec.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         assert!(ev.iter().any(|e| e.text.as_deref() == Some(PLAN_CHECK_ACTIVITY)), "{ev:?}");
@@ -1885,8 +1916,8 @@ mod tests {
     #[test]
     fn plan_check_text_lists_at_most_ten_warnings() {
         let warnings: Vec<String> = (1..=12).map(|n| format!("aviso {n}")).collect();
-        let text = plan_check_text(&warnings);
-        assert!(text.starts_with(PLAN_CHECK_INTRO));
+        let text = plan_check_text(&warnings, crate::i18n::Lang::PtBr);
+        assert!(text.starts_with(&plan_check_intro(crate::i18n::Lang::PtBr)));
         assert!(text.contains("- aviso 10\n- … e mais 2") && !text.contains("aviso 11"), "{text}");
     }
 

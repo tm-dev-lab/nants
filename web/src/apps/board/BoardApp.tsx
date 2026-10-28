@@ -65,6 +65,7 @@ import {
   pauseReasonText,
   pickActiveTask,
   recoveryLabel,
+  runStopMessage,
   runStopReason,
   statusLabel,
   STATUS_TONE,
@@ -74,6 +75,8 @@ import {
   type BoardColumn,
   type PauseReason,
 } from "./boardModel";
+import { ROLE_INFO, type AgentRole } from "../../settings/rules";
+import { roleOf } from "../shared/roleConnection";
 import { ToolActionsSheet } from "./ToolActionsSheet";
 
 type Recovery = Pick<RecoveryEntry, "phase" | "cycle">;
@@ -167,6 +170,8 @@ function Board({ projectId, spec, halted, permissions, size, selectedTask, board
   // mensagem de parada posterior ao início ou à retomada mais recente) e o acesso à ação na Conversa. O seletor devolve um texto
   // estável: a rajada de mensagens não re-renderiza o Quadro.
   const stopReason = useAppStore((s) => (halted ? runStopReason(s.messages[projectId], spec.id, s.runStarts[projectId]) : "interrupted"));
+  // Spec 133 T02: o papel que parou pelo provedor (dos `params` da parada), no motivo do cartão.
+  const stopRole = useAppStore((s) => (halted ? roleOf(runStopMessage(s.messages[projectId], spec.id, s.runStarts[projectId])?.params?.role) : null));
   const waiting = useMemo(() => new Set(permissions.flatMap((p) => (p.taskId === null ? [] : [p.taskId]))), [permissions]);
   const pauses = useMemo(() => taskPauses(spec.tasks, halted, stopReason, waiting), [spec.tasks, halted, stopReason, waiting]);
   const openConversation = useCallback(() => shell.openWindow("conversation"), [shell]);
@@ -302,6 +307,7 @@ function Board({ projectId, spec, halted, permissions, size, selectedTask, board
                   onKeyDown={(event) => onCardKeyDown(event, col, row)}
                   recovery={recoveryOf(task.id)}
                   pause={pauses.get(task.id)}
+                  pauseRole={stopRole}
                   decide={halted && task.status === "BLOCKED"}
                   onOpenConversation={openConversation}
                   realStatus={column.kind === "flow" && task.status !== null && task.status !== column.key ? task.status : null}
@@ -381,6 +387,8 @@ interface CardProps {
   recovery: Recovery | undefined;
   /** Tarefa pausada (spec 114 T04): motivo curto; o cartão ganha o acesso à ação na Conversa. */
   pause: PauseReason | undefined;
+  /** Papel que parou pelo provedor (spec 133 T02), dito junto do motivo. */
+  pauseRole: AgentRole | null;
   /** Tarefa bloqueada com a execução parada: a decisão fica na Conversa. */
   decide: boolean;
   onOpenConversation: () => void;
@@ -395,7 +403,7 @@ interface CardProps {
   costAlert: CostAlertView | undefined;
 }
 
-function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, pause, decide, onOpenConversation, realStatus, actions, onOpenActions, usage, operations, costAlert }: CardProps) {
+function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDown, recovery, pause, pauseRole, decide, onOpenConversation, realStatus, actions, onOpenActions, usage, operations, costAlert }: CardProps) {
   const { t } = useT();
   const verdict =
     task.last_review_verdict === "APPROVED" || task.last_review_verdict === "CHANGES_REQUESTED" ? task.last_review_verdict : null;
@@ -491,7 +499,9 @@ function TaskCard({ task, active, focused, animate, register, onSelect, onKeyDow
             <span className="nd-section-label" data-tone="amber">
               {t(pause === "decision" ? "board.waiting" : "board.paused")}
             </span>
-            <span className="nd-break">{pauseReasonText(pause)}</span>
+            <span className="nd-break">
+              {pause !== "decision" && pauseRole !== null ? t("board.pause.byRole", { role: ROLE_INFO[pauseRole].label, reason: pauseReasonText(pause) }) : pauseReasonText(pause)}
+            </span>
           </span>
         ) : null}
         {task.error !== undefined ? <span className="nd-prewrap nd-muted nd-break">{task.error}</span> : null}

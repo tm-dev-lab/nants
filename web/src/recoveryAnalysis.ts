@@ -11,6 +11,7 @@
  * (`recoveryText.*`, iterando `DICTIONARIES`), nunca por uma lista avulsa: a análise gravada em pt
  * ou em inglês aparece no idioma ativo, e no mesmo idioma volta idêntica.
  */
+import type { CodeParams } from "./api/codes";
 import { DICTIONARIES, translate, type Lang, type MessageKey } from "./i18n";
 
 /** Formas da chave em todos os idiomas do dicionário, sem repetição. */
@@ -90,7 +91,11 @@ const LABEL_KEYS: readonly MessageKey[] = [
   "recoveryText.command",
   "recoveryText.exitCode",
   "recoveryText.whyNot",
+  "recoveryText.reason",
+  "recoveryText.whatToDo",
 ];
+/** Rótulos cujo valor pode ser uma causa fixa do servidor (traduzida por `localizeRecoveryCause`). */
+const CAUSE_LABELS: ReadonlySet<MessageKey> = new Set(["recoveryText.rootCause", "recoveryText.whyNot", "recoveryText.reason"]);
 /** `- <rótulo>: ` de cada idioma, com a chave. */
 const LABELS: readonly (readonly [string, MessageKey])[] = LABEL_KEYS.flatMap((key) =>
   forms(key).map((label): readonly [string, MessageKey] => [`- ${label}: `, key]),
@@ -191,7 +196,7 @@ function line(raw: string, lang: Lang): string {
   for (const [label, key] of LABELS) {
     if (!body.startsWith(label)) continue;
     const value = body.slice(label.length);
-    const shown = key === "recoveryText.rootCause" || key === "recoveryText.whyNot" ? localizeRecoveryCause(value, lang) : value;
+    const shown = CAUSE_LABELS.has(key) ? localizeRecoveryCause(value, lang) : value;
     return `${indent}- ${translate(lang, key)}: ${shown}`;
   }
   return raw;
@@ -202,6 +207,38 @@ export function localizeAttempted(value: string, lang: Lang): string {
   const values = matchTemplate(value.trim(), ATTEMPTED_VALUE);
   if (values === null) return value;
   return translate(lang, "recoveryText.attemptedValue", values);
+}
+
+/** `code` da análise de recuperação e do diagnóstico de ambiente na conversa (`server/recovery.rs`). */
+export const RECOVERY_ANALYSIS_CODE = "recovery.analysis";
+export const RECOVERY_DIAGNOSIS_CODE = "recovery.diagnosis";
+
+function paramText(params: CodeParams | undefined, name: string): string {
+  const v = params?.[name];
+  return typeof v === "number" ? String(v) : typeof v === "string" ? v : "";
+}
+
+/**
+ * Mensagem do Arquiteto com a análise de recuperação ou o diagnóstico de ambiente (spec 133 T11):
+ * com o `code` do servidor, o título sai do dicionário pelos `params` (ciclo, decisão e a marca da
+ * rodada autônoma, ou o número do diagnóstico) e cada linha fixa pelo rótulo, no idioma `lang`; o
+ * que o agente escreveu fica como veio. Sem `code` (registros antigos), pelo cabeçalho do texto.
+ */
+export function recoveryMessageText(message: { text: string; code?: string; params?: CodeParams }, lang: Lang): string {
+  const { text, code, params } = message;
+  if (code !== RECOVERY_ANALYSIS_CODE && code !== RECOVERY_DIAGNOSIS_CODE) return localizeRecoveryAnalysis(text, lang);
+  const head =
+    code === RECOVERY_ANALYSIS_CODE
+      ? translate(lang, "system.recovery.analysis", { cycle: paramText(params, "cycle"), decision: paramText(params, "decision") }) +
+        (params?.autonomous === 1 ? ` [${translate(lang, "conversation.roundMarker")}]` : "")
+      : translate(lang, "system.recovery.diagnosis", { n: paramText(params, "n") });
+  const at = text.indexOf("\n");
+  if (at < 0) return head;
+  return `${head}\n${text
+    .slice(at + 1)
+    .split("\n")
+    .map((l) => line(l, lang))
+    .join("\n")}`;
 }
 
 /** Análise de recuperação com os textos fixos em `lang`; outro texto volta igual. */

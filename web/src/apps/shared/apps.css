@@ -121,6 +121,26 @@
   transform: rotate(90deg);
 }
 
+/* Spec 133 T01: os códigos crus da falha do provedor, em pares rótulo e valor. */
+.nd-provider-evidence {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-3);
+  margin: 0;
+}
+
+.nd-provider-evidence > div {
+  display: contents;
+}
+
+.nd-provider-evidence dt {
+  color: var(--muted);
+}
+
+.nd-provider-evidence dd {
+  margin: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nd-details > summary .nd-details-chevron {
     transition: none;
@@ -861,6 +881,10 @@
 
 .nd-criterion[data-met="false"] {
   color: var(--danger-ink);
+}
+
+.nd-criterion[data-met="unverified"] {
+  color: var(--pill-amber-ink);
 }
 
 .nd-criterion-text {
@@ -1904,6 +1928,137 @@
   .nd-attention {
     border-width: 2px;
   }
+}
+
+/*
+ * Conexão por papel (spec 133 T02 e T03). O rodapé da Conversa é uma linha discreta, como o selo
+ * do plano que ela substitui: o papel, o modelo e a conexão, num botão sem fundo que abre o painel.
+ */
+.nd-role-conn {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-3);
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-role-conn .nd-role-conn-trigger {
+  flex-wrap: wrap;
+  gap: 0 var(--sp-1);
+  max-width: 100%;
+  color: var(--ink3);
+  font-weight: var(--fw-regular);
+  text-align: left;
+  text-decoration: none;
+}
+
+.nd-role-conn-trigger .nd-strong {
+  font-size: inherit;
+  color: var(--ink2);
+}
+
+.nd-role-conn-trigger .nd-dot {
+  margin-right: var(--sp-1);
+}
+
+.nd-role-conn-alert {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--pill-amber-ink);
+}
+
+/* Papel, conexão e modelo do cartão de pausa: rótulo em cima, valor embaixo, lado a lado. */
+.nd-role-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+}
+
+.nd-role-facts > div {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-role-facts dt {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-role-facts dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink2);
+}
+
+.nd-role-facts-role {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* Seletor de troca: a conexão e o modelo, em duas colunas no desktop e empilhados no celular. */
+.nd-role-switch {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: var(--sp-2) var(--sp-3);
+}
+
+/* Painel "Conexões em uso": um papel por linha, separados por divisórias, sem caixa. */
+.nd-conn-use-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-conn-use {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.nd-conn-use:first-child {
+  padding-top: 0;
+}
+
+.nd-conn-use:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.nd-conn-use-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-conn-use-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-label);
+  color: var(--ink3);
+}
+
+.nd-conn-use-state[data-state="paused"],
+.nd-conn-use-state[data-state="reauth"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-conn-use-meta .nd-conn-use-name {
+  color: var(--ink2);
+}
+
+.nd-conn-use-actions {
+  justify-content: flex-start;
 }
 
 /* Indicador do plano ChatGPT perto do campo da Conversa (spec 116 T03): uma linha discreta. */

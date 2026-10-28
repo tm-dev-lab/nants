@@ -210,6 +210,8 @@ const KNOWN_REASONS: ReadonlySet<string> = new Set([
   "plan_review_running",
   // 502 do chat com a queda da conexão gravada no histórico (spec 127 T01).
   "connection_lost",
+  // 502 do chat com a falha do provedor gravada no histórico, com a evidência (spec 133 T11).
+  "failure_recorded",
   "prereq_missing",
 ]);
 
@@ -1088,8 +1090,10 @@ export function getToolActions(projectId: string, specId: string, opts: ToolActi
 /**
  * Falha HTTP de um turno do Arquiteto (`POST /chat` e `POST /chat/continue`).
  * 504 `code: "chat_timeout"`: o servidor cancelou o turno (chat.rs). Kind "timeout" com status 504.
- * 502 com causa fixa do provedor (chat.rs `architect_error`): mensagem específica + código; com
- * `reason: "connection_lost"` (spec 127 T01), o aviso da queda já está gravado no histórico.
+ * 502 com causa fixa do provedor (chat.rs `failed_turn`): mensagem específica + código; com
+ * `reason: "connection_lost"` (spec 127 T01) ou `"failure_recorded"` (spec 133 T11), o aviso já está
+ * gravado no histórico. Os `params` levam a evidência (papel, conexão, modelo, categoria e os
+ * códigos do provedor), para a mensagem dizer quem falhou e por quê.
  */
 function chatHttpError(status: number, body: unknown): ApiFailure | null {
   if (status === 504 && serverErrorCode(body) === "chat_timeout") {
@@ -1106,6 +1110,8 @@ function chatHttpError(status: number, body: unknown): ApiFailure | null {
     const reason = providerCode !== null ? providerReasonOf(body) : null;
     const legacy = providerCode !== null && reason === null && isRecord(body) ? providerFailureDetail(body.detail) : null;
     const providerDetail = reason?.text ?? (legacy === null ? null : localizeProviderDetail(legacy));
+    const params = providerCode !== null && isRecord(body) ? parseCodeParams(body.params) : null;
+    const recorded = serverReason(body);
     return {
       kind: "http",
       status: 502,
@@ -1116,7 +1122,8 @@ function chatHttpError(status: number, body: unknown): ApiFailure | null {
       ...(legacy === null ? {} : { providerDetail: legacy }),
       ...(reason === null ? {} : { providerKind: reason.kind }),
       ...(reason?.code === undefined ? {} : { providerKindCode: reason.code }),
-      ...(serverReason(body) === "connection_lost" ? { reason: "connection_lost" } : {}),
+      ...(params === null ? {} : { params }),
+      ...(recorded === "connection_lost" || recorded === "failure_recorded" ? { reason: recorded } : {}),
     };
   }
   return null;

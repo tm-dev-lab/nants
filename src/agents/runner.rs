@@ -204,6 +204,8 @@ pub fn failure_header(exit_code: Option<i32>, timed_out: bool) -> String {
 pub const CHECKS_MARK: &str = "\n\n## Checagens\n";
 /// Separa, em `test_evidence`, a seção "Critérios" do Desenvolvedor (matriz critério → evidência).
 pub const DEV_CRITERIA_MARK: &str = "\n\n## Critérios do Desenvolvedor\n";
+/// Spec 133 T07: separa, em `test_evidence`, os avisos explícitos do Desenvolvedor (depois dos critérios).
+pub const DEV_PENDING_MARK: &str = "\n\n## Pendências do Desenvolvedor\n";
 /// Limite da seção "Critérios" repassada ao Revisor.
 const DEV_CRITERIA_MAX_BYTES: usize = 4096;
 /// Cauda máxima (bytes) guardada por checagem.
@@ -581,11 +583,14 @@ pub enum RunnerError {
     Docker(String),
     #[error("falha do papel {role}: {message}")]
     Port { role: &'static str, message: String },
-    /// Falha do provedor LLM de um papel. Carrega só a causa fixa (sem corpo, URL ou chave).
+    /// Falha do provedor LLM de um papel. Carrega a causa fixa (sem corpo, URL ou chave) e, quando
+    /// houver, a evidência (spec 133 T01): modelo, tarefa, tentativa, categoria e os códigos do
+    /// provedor, com a mensagem redigida só para o registro persistente.
     #[error("falha do papel {role}: {failure}")]
     Provider {
         role: &'static str,
         failure: ProviderFailure,
+        evidence: Option<Box<crate::agents::llm_client::FailureEvidence>>,
     },
     /// Arquivo de estado alterado por outro processo desde a última leitura/gravação do runner.
     #[error("{path} modificado externamente")]
@@ -693,6 +698,9 @@ pub struct DevBrief {
     /// Progresso da sessão anterior da mesma tentativa, quando ela esgotou o limite de passos
     /// (spec 081 T01): resumo redigido + `diff --stat`, ≤ ~3 KiB; vazio nos demais casos.
     pub previous_progress: String,
+    /// Spec 133 T05: a sessão é a retomada automática de uma sessão parada por `DevStop` (a causa
+    /// vai ao briefing e a sessão de uso ganha o sufixo `:resume`); `None` nas demais.
+    pub resumed: Option<DevStop>,
     /// Formatadores que o Nants roda depois do Developer (spec 081 T02; o mesmo
     /// `formatting::briefing_list` do Revisor, redigido); vazio sem formatadores.
     pub formatters: String,
@@ -732,8 +740,41 @@ pub struct DevBrief {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevReport {
     pub summary: String,
-    /// A sessão esgotou o limite de passos (ou parou sem progresso) antes da resposta final.
-    pub exhausted: bool,
+    /// Por que a sessão parou antes da resposta final (limite de passos, repetição ou negações);
+    /// `None` = terminou com a resposta final.
+    pub exhausted: Option<DevStop>,
+}
+
+/// Spec 133 T05: por que a sessão do Desenvolvedor parou antes da resposta final (o motivo do
+/// LoopGuard e do teto de passos, sem leitura de texto).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevStop {
+    /// Teto de passos atingido.
+    Steps,
+    /// A mesma chamada repetida (LoopGuard).
+    Repeated,
+    /// Repetição depois de 2/3 do teto.
+    Stalled,
+    /// Negações de permissão repetidas.
+    Denials,
+}
+
+impl DevStop {
+    /// A parada que vale uma retomada automática da sessão: só as mecânicas de progresso. As
+    /// negações ficam fora (uma sessão nova esbarraria nas mesmas permissões).
+    pub fn resumable(self) -> bool {
+        matches!(self, Self::Steps | Self::Repeated | Self::Stalled)
+    }
+
+    /// Código estável (aviso `system.task.dev_resumed_*` e prompt).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Steps => "steps",
+            Self::Repeated => "repeated",
+            Self::Stalled => "stalled",
+            Self::Denials => "denials",
+        }
+    }
 }
 
 /// Entrada enviada ao Revisor (somente leitura).
@@ -969,6 +1010,17 @@ pub struct CriterionCheck {
     pub criterion: String,
     pub met: bool,
     pub evidence: String,
+    /// Spec 133 T06: a evidência citou caminhos que não existem na árvore revisada, mesmo depois
+    /// de voltar ao Revisor. Distinto de "não cumprido": `met` é `false`, mas não bloqueia nem
+    /// vira tarefa sozinho; vai para as observações da tarefa e para a verificação final.
+    pub unverified: bool,
+}
+
+impl CriterionCheck {
+    /// Critério não cumprido que bloqueia: `not_met`, nem `(manual)` nem "não verificado".
+    pub fn unmet(&self) -> bool {
+        !self.met && !self.unverified && !is_manual_criterion(&self.criterion)
+    }
 }
 
 /// Extrai (limitada) a seção "Critérios" da resposta final do Desenvolvedor: do título até o
@@ -981,7 +1033,8 @@ pub fn extract_dev_criteria(summary: &str) -> String {
     }
     let mut out = String::new();
     for line in lines {
-        if line.trim_start().starts_with('#') {
+        // Spec 133 T07: os títulos sem `#` dos avisos e das respostas também fecham a seção.
+        if line.trim_start().starts_with('#') || markers::is_heading(line, markers::DEV_PENDING) || markers::is_heading(line, markers::DEV_RESPONSES) {
             break;
         }
         out.push_str(line);
@@ -1003,11 +1056,18 @@ fn tail_bytes_head(text: &str, max: usize) -> String {
 }
 
 /// Texto da matriz para o diálogo: uma linha `✓|✗ critério: evidência` por critério (sem travessão, 095/T08).
+/// Spec 133 T06: o critério "não verificado" sai com `?` (a evidência já traz o motivo, no idioma do projeto).
 pub fn render_criteria(criteria: &[CriterionCheck]) -> String {
     criteria
         .iter()
         .map(|c| {
-            let mark = if c.met { "✓" } else { "✗" };
+            let mark = if c.met {
+                "✓"
+            } else if c.unverified {
+                "?"
+            } else {
+                "✗"
+            };
             if c.evidence.trim().is_empty() {
                 format!("{mark} {}", c.criterion)
             } else {
@@ -1083,7 +1143,7 @@ pub fn enforce_criteria(lang: Lang, mut result: ReviewResult) -> ReviewResult {
     if result.verdict != Verdict::Approved {
         return result;
     }
-    let unmet: Vec<&CriterionCheck> = result.criteria.iter().filter(|c| !c.met && !is_manual_criterion(&c.criterion)).collect();
+    let unmet: Vec<&CriterionCheck> = result.criteria.iter().filter(|c| c.unmet()).collect();
     if unmet.is_empty() {
         return result;
     }
@@ -1151,7 +1211,7 @@ fn norm_path(p: &str) -> &str {
     p.trim().trim_start_matches("./").trim_start_matches('/')
 }
 
-fn same_file_path(a: &str, b: &str) -> bool {
+pub(crate) fn same_file_path(a: &str, b: &str) -> bool {
     let (a, b) = (norm_path(a), norm_path(b));
     !a.is_empty() && !b.is_empty() && (a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}")))
 }
@@ -1341,6 +1401,15 @@ pub const CONVERGENCE_FROM_REVIEW: u32 = 3;
 /// Seção do corpo da tarefa com as observações rebaixadas por [`demote_late_new`]: além de entrarem
 /// em [`OBSERVATIONS`], seguem para a verificação final da spec, que pode reabrir trabalho.
 pub const FINAL_OBSERVATIONS: &str = "Observações para a verificação final";
+/// Spec 133 T07: seção do corpo da tarefa com as pendências conhecidas, uma por linha
+/// (`- P-01: texto`, no idioma do projeto), registradas na aprovação: os critérios declarados não
+/// resolvidos (motivo de ambiente), os avisos explícitos do Desenvolvedor e os "não verificados".
+/// Chegam à verificação final pelo `task_observations` e, as que ela não resolve, ao relatório.
+pub const PENDING: &str = "Pendências conhecidas";
+/// Spec 133 T07: pendências que a verificação final resolveu, com a evidência dela.
+pub const PENDING_RESOLVED: &str = "Pendências resolvidas na verificação final";
+/// Teto da seção de avisos do Desenvolvedor guardada na evidência.
+const DEV_PENDING_MAX_BYTES: usize = 2048;
 /// Teto das observações das tarefas nos FATOS da verificação final.
 const FINAL_OBSERVATIONS_MAX_BYTES: usize = 6 * 1024;
 
@@ -1356,7 +1425,7 @@ pub fn demote_late_new(lang: Lang, mut result: ReviewResult, registry: &[Finding
     if review < CONVERGENCE_FROM_REVIEW || result.verdict != Verdict::ChangesRequested {
         return (result, Vec::new());
     }
-    let all_met = !result.criteria.is_empty() && result.criteria.iter().all(|c| c.met || is_manual_criterion(&c.criterion));
+    let all_met = !result.criteria.is_empty() && result.criteria.iter().all(|c| !c.unmet());
     if !all_met {
         return (result, Vec::new());
     }
@@ -1378,6 +1447,237 @@ pub fn demote_late_new(lang: Lang, mut result: ReviewResult, registry: &[Finding
         result = enforce_criteria(lang, result);
     }
     (result, demoted)
+}
+
+/// Spec 133 T06: uma observação por critério "não verificado" (a evidência citou caminhos que não
+/// existem na árvore revisada, mesmo depois de voltar ao Revisor), no idioma do projeto. Não
+/// bloqueia nem vira tarefa: vai à seção que a verificação final recebe ([`FINAL_OBSERVATIONS`]).
+/// O id vazio ganha o próximo número livre em [`renumber_demoted`].
+pub fn unverified_observations(lang: Lang, criteria: &[CriterionCheck]) -> Vec<Finding> {
+    criteria
+        .iter()
+        .filter(|c| c.unverified)
+        .map(|c| Finding {
+            id: String::new(),
+            severity: "MEDIUM".into(),
+            location: i18n::text(lang, "runner.review.unmet_location"),
+            description: i18n::tr(
+                lang,
+                "runner.review.unverified_description",
+                &[("criterion", c.criterion.trim()), ("evidence", c.evidence.trim())],
+            ),
+            recommendation: i18n::text(lang, "runner.review.unverified_recommendation"),
+            state: Some(FindingState::New),
+            ..Finding::default()
+        })
+        .collect()
+}
+
+/// Spec 133 T07: critério que o Desenvolvedor declarou não atendido ou parcial na seção
+/// "Critérios", com o número do critério da tarefa ([`crate::agents::recovery_plan::criterion_items`],
+/// a mesma contagem de [`crate::agents::recovery_plan::count_criteria`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredCriterion {
+    pub number: usize,
+    pub partial: bool,
+    pub criterion: String,
+    /// O que o Desenvolvedor disse que falta (texto original).
+    pub detail: String,
+}
+
+/// Spec 133 T07: os critérios declarados não atendidos ou parciais da seção "Critérios" do
+/// Desenvolvedor, um por número (o primeiro vale).
+pub fn declared_criteria(dev_criteria: &str) -> Vec<DeclaredCriterion> {
+    let mut out: Vec<DeclaredCriterion> = Vec::new();
+    for (number, item) in crate::agents::recovery_plan::criterion_items(dev_criteria) {
+        let partial = match markers::criterion_status(&item) {
+            Some((markers::CriterionMark::NotMet, _)) => false,
+            Some((markers::CriterionMark::Partial, _)) => true,
+            _ => continue,
+        };
+        if out.iter().any(|d| d.number == number) {
+            continue;
+        }
+        let mut parts = item.splitn(3, ':');
+        let criterion = parts.next().unwrap_or_default().trim().to_string();
+        let _status = parts.next();
+        let detail = parts.next().unwrap_or_default().trim().to_string();
+        out.push(DeclaredCriterion { number, partial, criterion, detail });
+    }
+    out
+}
+
+/// Spec 133 T07: regra única de destino dos critérios declarados pelo Desenvolvedor, pareados com
+/// a resposta do Revisor (`result.declared`) pelo número:
+/// - o Revisor contradiz com evidência (`met` com evidência): vale o Revisor;
+/// - o Revisor confirma (`not_met`): vale o Revisor. A decisão olha a matriz, não o veredito: sem
+///   nenhum critério não atendido nela, o confirmado entra na matriz como `not_met` e vira finding,
+///   para o `enforce_criteria` e a convergência (que rebaixa MEDIUM novo com a matriz atendida)
+///   respeitarem a confirmação;
+/// - o motivo é de ambiente (`environment`): vira pendência que não bloqueia (devolvida);
+/// - sem resposta (ou `met` sem evidência): vira finding com a declaração do Desenvolvedor.
+///
+/// Os findings gerados são HIGH e reprovam. Devolve as pendências de ambiente, no idioma do projeto.
+pub fn apply_declared(lang: Lang, mut result: ReviewResult, declared: &[DeclaredCriterion]) -> (ReviewResult, Vec<String>) {
+    let mut pending = Vec::new();
+    let mut generated = Vec::new();
+    let matrix_met = !result.criteria.iter().any(CriterionCheck::unmet);
+    let mut confirmed = Vec::new();
+    for d in declared {
+        let status = i18n::text(lang, if d.partial { "runner.review.declared_partial" } else { "runner.review.declared_not_met" });
+        let number = d.number.to_string();
+        let reply = result.declared.iter().find(|r| r.number == d.number);
+        let evidence = reply.map(|r| r.evidence.trim()).filter(|e| !e.is_empty());
+        let description = match reply.map(|r| r.status) {
+            Some(DeclaredStatus::Met) if evidence.is_some() => None,
+            Some(DeclaredStatus::Environment) => {
+                let evidence = evidence.map_or_else(|| i18n::text(lang, "runner.review.no_evidence"), str::to_string);
+                pending.push(i18n::tr(
+                    lang,
+                    "runner.pending.environment",
+                    &[("number", &number), ("status", &status), ("criterion", &d.criterion), ("evidence", &evidence)],
+                ));
+                None
+            }
+            Some(DeclaredStatus::NotMet) if !matrix_met => None,
+            Some(DeclaredStatus::NotMet) => {
+                let evidence = evidence.map_or_else(|| i18n::text(lang, "runner.review.no_evidence"), str::to_string);
+                confirmed.push(CriterionCheck { criterion: d.criterion.clone(), met: false, evidence: evidence.clone(), unverified: false });
+                Some(i18n::tr(
+                    lang,
+                    "runner.review.declared_confirmed",
+                    &[("number", &number), ("status", &status), ("criterion", &d.criterion), ("evidence", &evidence)],
+                ))
+            }
+            _ => {
+                let detail = if d.detail.is_empty() { i18n::text(lang, "runner.review.no_evidence") } else { d.detail.clone() };
+                Some(i18n::tr(
+                    lang,
+                    "runner.review.declared_unanswered",
+                    &[("number", &number), ("status", &status), ("criterion", &d.criterion), ("detail", &detail)],
+                ))
+            }
+        };
+        if let Some(description) = description {
+            generated.push(description);
+        }
+    }
+    result.criteria.extend(confirmed);
+    if generated.is_empty() {
+        return (result, pending);
+    }
+    let number = |id: &str| id.trim().strip_prefix("F-").and_then(|n| n.parse::<u32>().ok());
+    let mut next = result.findings.iter().filter_map(|f| number(&f.id)).max().unwrap_or(0);
+    for description in generated {
+        next += 1;
+        result.findings.push(Finding {
+            id: format!("F-{next:02}"),
+            severity: "HIGH".into(),
+            location: i18n::text(lang, "runner.review.unmet_location"),
+            description,
+            recommendation: i18n::text(lang, "runner.review.declared_recommendation"),
+            state: Some(FindingState::New),
+            ..Finding::default()
+        });
+    }
+    result.verdict = Verdict::ChangesRequested;
+    (result, pending)
+}
+
+/// Spec 133 T07: avisos explícitos da resposta final do Desenvolvedor, os itens de lista da seção
+/// [`markers::DEV_PENDING`] (título em qualquer idioma do dicionário), até o próximo título; vazio
+/// sem a seção.
+pub fn extract_dev_pending(summary: &str) -> String {
+    let mut lines = summary.lines();
+    if !lines.by_ref().any(|l| markers::is_heading(l, markers::DEV_PENDING)) {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with('#') || markers::is_heading(t, markers::CRITERIA) || markers::is_heading(t, markers::DEV_RESPONSES) {
+            break;
+        }
+        if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+            if !item.trim().is_empty() {
+                out.push_str(&format!("- {}\n", item.trim()));
+            }
+        }
+    }
+    tail_bytes_head(out.trim_end(), DEV_PENDING_MAX_BYTES)
+}
+
+/// Spec 133 T07: acrescenta `items` (texto já no idioma do projeto) à seção [`PENDING`] da tarefa,
+/// cada um com o próximo id `P-xx` livre. Devolve o corpo novo.
+pub fn append_pending(body: &str, items: &[String]) -> String {
+    let items: Vec<&String> = items.iter().filter(|i| !i.trim().is_empty()).collect();
+    if items.is_empty() {
+        return body.to_string();
+    }
+    let existing = section_text(body, PENDING).unwrap_or_default();
+    let mut next = pending_lines(&existing)
+        .iter()
+        .chain(pending_lines(&section_text(body, PENDING_RESOLVED).unwrap_or_default()).iter())
+        .filter_map(|(id, _)| id.strip_prefix("P-")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    let mut out = existing.trim_end().to_string();
+    for item in items {
+        next += 1;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("- P-{next:02}: {}", one_line_text(item)));
+    }
+    replace_section(body, PENDING, Some(out))
+}
+
+/// Texto numa linha só (as quebras viram espaço).
+fn one_line_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Spec 133 T07: linhas `- P-xx: texto` de uma seção de pendências, como `(id, texto)`.
+pub fn pending_lines(section: &str) -> Vec<(String, String)> {
+    section
+        .lines()
+        .filter_map(|l| {
+            let (id, text) = l.trim().strip_prefix("- ")?.split_once(':')?;
+            let id = id.trim();
+            (id.starts_with("P-") && id.len() > 2).then(|| (id.to_string(), text.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Spec 133 T07: aplica a resposta da verificação final às pendências de uma tarefa (`task_id`):
+/// a resolvida com evidência sai de [`PENDING`] e vai para [`PENDING_RESOLVED`] com a evidência;
+/// a aberta ou sem resposta fica. `None` quando nada muda.
+pub fn settle_pending(lang: Lang, body: &str, task_id: &str, replies: &[PendingReply]) -> Option<String> {
+    let open = pending_lines(&section_text(body, PENDING).unwrap_or_default());
+    let resolved_reply = |id: &str| {
+        replies.iter().find(|r| {
+            r.task.trim().eq_ignore_ascii_case(task_id) && r.id.trim().eq_ignore_ascii_case(id) && r.resolved && !r.evidence.trim().is_empty()
+        })
+    };
+    if !open.iter().any(|(id, _)| resolved_reply(id).is_some()) {
+        return None;
+    }
+    let mut keep = Vec::new();
+    let mut done = section_text(body, PENDING_RESOLVED).unwrap_or_default().trim_end().to_string();
+    for (id, text) in &open {
+        match resolved_reply(id) {
+            Some(r) => {
+                if !done.is_empty() {
+                    done.push('\n');
+                }
+                let line = i18n::tr(lang, "runner.pending.resolved", &[("item", text), ("evidence", &one_line_text(&r.evidence))]);
+                done.push_str(&format!("- {id}: {line}"));
+            }
+            None => keep.push(format!("- {id}: {text}")),
+        }
+    }
+    let body = replace_section(body, PENDING, (!keep.is_empty()).then(|| keep.join("\n")));
+    Some(replace_section(&body, PENDING_RESOLVED, Some(done)))
 }
 
 /// Ids das observações rebaixadas na convergência: o que colide com o registro ou com um bloqueante
@@ -1449,7 +1749,7 @@ pub fn demote_untouched_gaps(
         return (result, Vec::new());
     }
     // Com todos os critérios atendidos, vale a regra da 127 ([`demote_late_new`]), que já rebaixa o novo.
-    if !result.criteria.iter().any(|c| !c.met && !is_manual_criterion(&c.criterion)) {
+    if !result.criteria.iter().any(CriterionCheck::unmet) {
         return (result, Vec::new());
     }
     // Algum local (caminho com linha; sem linha, o arquivo) cai num hunk desde a reprovação anterior.
@@ -1500,7 +1800,7 @@ pub fn demote_untouched_gaps(
     let mut spare: Vec<&str> = gaps.iter().map(|g| g.id.trim()).collect();
     let mut flips = Vec::new();
     for (i, c) in result.criteria.iter().enumerate() {
-        if c.met || is_manual_criterion(&c.criterion) {
+        if !c.unmet() {
             continue;
         }
         let evidence_locs = parse_locations(&c.evidence);
@@ -1624,18 +1924,31 @@ pub fn demote_missing_fields(
 
 /// Spec 127 T02: FATOS da verificação final com as observações das tarefas ([`FINAL_OBSERVATIONS`]),
 /// `- Txx: linha`, até [`FINAL_OBSERVATIONS_MAX_BYTES`]; vazio sem nenhuma.
+///
+/// Spec 133 T07: as pendências das tarefas ([`PENDING`]) vêm primeiro, `- Txx P-yy: texto`, para a
+/// verificação final responder a cada uma pelo par tarefa e id.
 pub fn final_observations_facts(tasks: &[Task]) -> String {
     let mut out = String::new();
     let mut omitted = 0usize;
-    for t in tasks {
+    let pending = tasks.iter().flat_map(|t| {
+        pending_lines(&section_text(&t.body, PENDING).unwrap_or_default())
+            .into_iter()
+            .map(move |(id, text)| format!("- {} {id}: {text}\n", t.frontmatter.id))
+    });
+    let observations = tasks.iter().flat_map(|t| {
         let section = section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default();
-        for line in section.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let item = format!("- {}: {}\n", t.frontmatter.id, line.trim_start_matches("- "));
-            if out.len() + item.len() > FINAL_OBSERVATIONS_MAX_BYTES {
-                omitted += 1;
-            } else {
-                out.push_str(&item);
-            }
+        section
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|line| format!("- {}: {}\n", t.frontmatter.id, line.trim_start_matches("- ")))
+            .collect::<Vec<_>>()
+    });
+    for item in pending.chain(observations) {
+        if out.len() + item.len() > FINAL_OBSERVATIONS_MAX_BYTES {
+            omitted += 1;
+        } else {
+            out.push_str(&item);
         }
     }
     if omitted > 0 {
@@ -1815,7 +2128,7 @@ fn converge_findings(lang: Lang, mut result: ReviewResult, previous: &[Finding],
                     || hunks.iter().any(|h| same_file_path(&h.path, path) && lines.is_none_or(|(a, b)| a <= h.end && b >= h.start))
             })
     };
-    let unmet = result.criteria.iter().any(|c| !c.met && !is_manual_criterion(&c.criterion));
+    let unmet = result.criteria.iter().any(CriterionCheck::unmet);
     let has_blocking = result.findings.iter().any(|f| blocks(f));
     let demotable = result.findings.iter().any(|f| !blocks(f));
     // Rebaixar sem aprovar só esconderia apontamentos do Desenvolvedor (spec 082): tudo bloqueia.
@@ -1985,6 +2298,40 @@ pub struct ReviewResult {
     /// Capturas de tela vistas pelo Revisor com `view_screenshot` (spec 082 T03), na ordem; vazio
     /// sem capturas ou depois da recusa de imagens pelo provedor.
     pub screenshots_viewed: Vec<String>,
+    /// Spec 133 T07: resposta do Revisor a cada critério que o Desenvolvedor declarou não atendido
+    /// ou parcial (campo `declared`), pelo número do critério; vazia sem resposta.
+    pub declared: Vec<DeclaredReply>,
+    /// Spec 133 T07: só na verificação final, a resposta a cada pendência das tarefas (campo
+    /// `pending`); vazia sem resposta.
+    pub pending: Vec<PendingReply>,
+}
+
+/// Spec 133 T07: o que o Revisor respondeu sobre um critério declarado pelo Desenvolvedor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredStatus {
+    /// O Revisor contradiz: o critério está atendido (vale com evidência).
+    Met,
+    /// O Revisor confirma: o critério não está atendido.
+    NotMet,
+    /// O motivo é de ambiente (a contestação `environment`): vira pendência que não bloqueia.
+    Environment,
+}
+
+/// Spec 133 T07: resposta do Revisor a um critério declarado, pareada pelo número do critério.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredReply {
+    pub number: usize,
+    pub status: DeclaredStatus,
+    pub evidence: String,
+}
+
+/// Spec 133 T07: resposta da verificação final a uma pendência (`task` + `id`, ex.: `T05` e `P-01`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReply {
+    pub task: String,
+    pub id: String,
+    pub resolved: bool,
+    pub evidence: String,
 }
 
 /// Resultado de `test_command`.
@@ -2555,9 +2902,13 @@ impl TaskRunner {
             .git()
             .diff_stat(&settings.base_branch, &task.frontmatter.branch)
             .unwrap_or_default();
+        // Spec 133 T11: vai ao briefing da sessão retomada; os rótulos no idioma do projeto.
+        let lang = self.lang.get();
         format!(
-            "Resumo da sessão:\n{}\n\ndiff --stat da branch:\n{}",
+            "{}\n{}\n\n{}\n{}",
+            crate::i18n::text(lang, "agent.progress.summary"),
             indent_headings(&tail_bytes_head(self.scrub(summary).trim(), HISTORY_SUMMARY_BYTES)),
+            crate::i18n::text(lang, "agent.progress.stat"),
             indent_headings(&tail_bytes_head(self.scrub(&stat).trim(), HISTORY_STAT_BYTES)),
         )
     }
@@ -3165,6 +3516,10 @@ impl TaskRunner {
         let mut failed_runs: u32 = 0;
         // Spec 124 T04: a repetição da rodada instável acontece no máximo uma vez por tentativa.
         let mut rerun_used = false;
+        // Spec 133 T05: a sessão parada por repetição ou passos é retomada uma vez por tentativa,
+        // antes dos testes e da revisão; `resume_cause` vai ao briefing da sessão retomada.
+        let mut resume_used = false;
+        let mut resume_cause: Option<DevStop> = None;
         let max_cycles = settings.max_test_cycles;
         // Spec 092 T03: a falha de geração vale para a tentativa inteira (todas as sessões).
         self.developer.begin_attempt(&task.frontmatter.id);
@@ -3185,11 +3540,14 @@ impl TaskRunner {
             self.suite_ledger.watch(test_levels::watched_commands(settings), test_levels::environment_key(settings));
             let mut brief = self.brief(task, &wt, test_output.clone(), settings)?;
             brief.previous_progress = std::mem::take(&mut previous_progress);
+            brief.resumed = resume_cause.take();
             let report = self.developer.implement(&brief).await?;
             let exhausted = report.exhausted;
             self.sync_advice(task);
             self.record_responses(task, &report.summary)?;
             let dev_criteria = extract_dev_criteria(&report.summary);
+            // Spec 133 T07: os avisos explícitos do Desenvolvedor viram pendências na aprovação.
+            let dev_pending = extract_dev_pending(&report.summary);
             let history_summary = report.summary.clone();
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "developer".into(),
@@ -3208,8 +3566,24 @@ impl TaskRunner {
             // Formatação automática (spec 078): vira commit próprio, antes do HEAD testado e revisado.
             self.format_delivery(settings, task, &wt, attempt).await?;
             self.record_attempt(settings, task, &history_summary)?;
-            if exhausted {
+            if exhausted.is_some() {
                 previous_progress = self.progress_note(settings, task, &history_summary);
+            }
+            // Spec 133 T05: parada mecânica (repetição ou passos, nunca negações) volta ao topo do
+            // laço numa sessão nova com o progresso e a causa, sem testes, revisão nem tentativa
+            // nova. Uma vez por tentativa; o topo do laço confere o orçamento antes da sessão. Se a
+            // retomada também parar, segue o fluxo de sempre (testes e revisão). Custo: com `Steps`,
+            // o pior caso de uma tentativa dobra (o teto de passos da sessão parada mais o da
+            // retomada).
+            if let Some(stop) = exhausted.filter(|s| s.resumable() && !resume_used) {
+                if let Some(step) = self.budget_stop(task)? {
+                    return Ok(step);
+                }
+                resume_used = true;
+                resume_cause = Some(stop);
+                let id = task.frontmatter.id.clone();
+                self.notice(&id, &format!("task.dev_resumed_{}", stop.code()), &[("task", &id), ("attempt", &attempt.to_string())]);
+                continue;
             }
 
             // Início da execução: artefatos de falha (spec 079) e capturas de tela (spec 082 T03) mais
@@ -3241,7 +3615,7 @@ impl TaskRunner {
                         dispensed.push(settings.test_command.clone());
                         None
                     }
-                    None => match self.suite_round(settings, task, &wt, attempt, &settings.test_command, false, &mut fast_note, &mut rerun_used, &mut flaky).await? {
+                    None => match self.suite_round(settings, task, &wt, attempt, &settings.test_command, tree.as_deref(), false, &mut fast_note, &mut rerun_used, &mut flaky).await? {
                         Ok(t) => Some(t),
                         Err(step) => return Ok(step),
                     },
@@ -3257,7 +3631,7 @@ impl TaskRunner {
                 }
                 _ => {
                     self.check_cancel()?;
-                    match self.suite_round(settings, task, &wt, attempt, &suite_label, true, &mut final_note, &mut rerun_used, &mut flaky).await? {
+                    match self.suite_round(settings, task, &wt, attempt, &suite_label, tree.as_deref(), true, &mut final_note, &mut rerun_used, &mut flaky).await? {
                         Ok(t) => t,
                         Err(step) => return Ok(step),
                     }
@@ -3355,6 +3729,7 @@ impl TaskRunner {
             }
             if test.passed {
                 let crit = if dev_criteria.is_empty() { String::new() } else { format!("{DEV_CRITERIA_MARK}{dev_criteria}") };
+                let pend = if dev_pending.is_empty() { String::new() } else { format!("{DEV_PENDING_MARK}{dev_pending}") };
                 let silent = if silent_suite {
                     format!("\n{SILENT_PASS_WARNING}\n")
                 } else {
@@ -3364,7 +3739,7 @@ impl TaskRunner {
                     Some((command, lines)) => format!("\n{}{}\n", flaky_pass_warning(&self.scrub(command)), flaky_list(lines)),
                     None => String::new(),
                 };
-                task.frontmatter.test_evidence = Some(format!("{}{silent}{flaky_note}{checks_text}{crit}", test.output));
+                task.frontmatter.test_evidence = Some(format!("{}{silent}{flaky_note}{checks_text}{crit}{pend}", test.output));
                 // Vincula a evidência ao sha e ao que foi rodado: só então a base pode reaproveitá-la.
                 task.frontmatter.tested_sha = Git::new(wt.clone()).rev_parse("HEAD").ok();
                 task.frontmatter.tested_signature = Some(test_signature(settings));
@@ -3476,6 +3851,7 @@ impl TaskRunner {
         wt: &Path,
         attempt: u32,
         command: &str,
+        tree: Option<&str>,
         clean: bool,
         install_note: &mut Option<String>,
         rerun_used: &mut bool,
@@ -3492,6 +3868,19 @@ impl TaskRunner {
             Err(e) => return Err(e),
         };
         self.budget_notice(task, attempt, elapsed, self.round_limit(settings));
+        // Spec 133 T05: a mesma falha já vista pelo Desenvolvedor (mesmo comando, mesma árvore, mesmas
+        // linhas de falha) não é instável: a repetição é pulada, sem gastar a vez da tentativa.
+        if !test.passed && !test.timed_out && !*rerun_used && self.known_failure(settings, command, tree, &test.output) {
+            self.tests_message(task, attempt, i18n::text(self.lang.get(), "runner.tests.rerun_skipped"));
+            return Ok(Ok(test));
+        }
+        // Spec 133 T12: 126/127 é programa ausente ou não executável (o diagnóstico de
+        // [`Self::after_failed_round`]): falha de ambiente, não instabilidade. Sem repetição.
+        if let Some(code) = test.exit_code.filter(|c| !test.passed && !test.timed_out && matches!(c, 126 | 127)) {
+            let note = i18n::tr(self.lang.get(), "runner.tests.rerun_skipped_missing_program", &[("code", &code.to_string())]);
+            self.tests_message(task, attempt, note);
+            return Ok(Ok(test));
+        }
         // Spec 124 T04: rodada que falha é repetida uma vez por tentativa, sem mudança na árvore,
         // só se a repetição couber no que sobra do limite. Passou na repetição: instável.
         if !test.passed && !test.timed_out && !*rerun_used && capabilities::rerun_fits(elapsed, self.round_limit(settings)) {
@@ -3659,6 +4048,26 @@ impl TaskRunner {
         self.after_failed_round(settings, dir, &mut out);
         let output = format!("{INSTALL_FAILED_MARK} (`{}`):\n{}", self.scrub(command), out.output);
         Ok(Install::Failed(TestResult { output, ..out }, started.elapsed()))
+    }
+
+    /// Spec 133 T05: o registro de rodadas tem uma do Desenvolvedor de `command` sobre a mesma árvore
+    /// (`tree`), no mesmo ambiente e lugar, que falhou com as mesmas linhas de falha
+    /// ([`capabilities::failure_signature`]: as linhas de falha sem as durações) desta `output`, e
+    /// nenhuma rodada dele sobre a árvore passou. Sem árvore ou sem linhas de falha, `false`.
+    fn known_failure(&self, settings: &Settings, command: &str, tree: Option<&str>, output: &str) -> bool {
+        let Some(tree) = tree else { return false };
+        let lines = capabilities::failure_signature(&self.scrub(output), FLAKY_MAX_LINES);
+        if lines.is_empty() {
+            return false;
+        }
+        self.suite_ledger
+            .same_failure(
+                command,
+                tree,
+                &test_levels::environment_key(settings),
+                settings.environment == Environment::Docker,
+                &|out| capabilities::failure_signature(&self.scrub(out), FLAKY_MAX_LINES) == lines,
+            )
     }
 
     /// Spec 124 T05: a rodada do Desenvolvedor de `command` que vale pela do runner sobre a árvore
@@ -4114,6 +4523,11 @@ impl TaskRunner {
             .unwrap_or(crate::sdd::DEFAULT_REVIEW_DIFF_BUDGET);
         let diff = review_diff(&root, &settings.base_branch, &branch, budget)?;
         let evidence = task.frontmatter.test_evidence.clone().unwrap_or_default();
+        // Spec 133 T07: os avisos explícitos do Desenvolvedor vêm por último na evidência.
+        let (evidence, dev_pending) = match evidence.rsplit_once(DEV_PENDING_MARK) {
+            Some((e, p)) => (e.to_string(), p.to_string()),
+            None => (evidence, String::new()),
+        };
         let (evidence, dev_criteria) = match evidence.split_once(DEV_CRITERIA_MARK) {
             Some((e, c)) => (e.to_string(), c.to_string()),
             None => (evidence, String::new()),
@@ -4225,6 +4639,9 @@ impl TaskRunner {
             Some(meta) => demote_missing_fields(self.lang.get(), reviewed, meta, Some(settings), &registry),
             None => (reviewed, Vec::new()),
         };
+        // Spec 133 T07: cada critério que o Desenvolvedor declarou não atendido ou parcial tem destino
+        // pela resposta do Revisor, pareada pelo número; o de ambiente vira pendência na aprovação.
+        let (reviewed, declared_pending) = apply_declared(self.lang.get(), reviewed, &declared_criteria(&input.dev_criteria));
         self.sync_advice(task);
         // Spec 087 T05: tamanho do diff de código desta tentativa (informativo; falha do git não registra).
         if let Ok(lines) = code_diff_lines(&root, &settings.base_branch, &branch) {
@@ -4265,6 +4682,12 @@ impl TaskRunner {
         // Spec 127 T02: a partir da 3ª revisão, MEDIUM/LOW novo vira observação (sem critério não atendido).
         let (result, late_new) = demote_late_new(self.lang.get(), result, &registry, input.review_number);
         let mut late = cited_missing;
+        // Spec 133 T06: o critério "não verificado" não bloqueia; fica nas observações da tarefa e,
+        // na aprovação, vira pendência (spec 133 T07), que chega à verificação final.
+        let unverified_from = late.len();
+        let unverified = unverified_observations(self.lang.get(), &result.criteria);
+        let unverified_to = unverified_from + unverified.len();
+        late.extend(unverified);
         late.extend(gaps);
         late.extend(late_new);
         // Cada rebaixamento numerou os seus; juntos, um id repetido ganha o próximo livre.
@@ -4272,6 +4695,9 @@ impl TaskRunner {
         let mut observations = observations;
         observations.extend(dispensed);
         observations.extend(late.iter().cloned());
+        let unverified_pending: Vec<String> = late[unverified_from..unverified_to].iter().map(|f| f.description.clone()).collect();
+        let late: Vec<Finding> =
+            late.into_iter().enumerate().filter(|(i, _)| !(unverified_from..unverified_to).contains(i)).map(|(_, f)| f).collect();
         // Spec 124 T01: identidade, estado e recorrência dos apontamentos (aprovação resolve todos).
         // Spec 126 T04: o id de uma observação desta revisão não vai para nenhum bloqueante.
         let mut tracked =
@@ -4319,6 +4745,20 @@ impl TaskRunner {
                 task.frontmatter.reviewed_sha = Some(root.rev_parse(&branch)?);
                 task.frontmatter.rejected_sha = None;
                 task.body = replace_section(&task.body, FINDINGS, None);
+                // Spec 133 T07: aprovada mesmo assim, as pendências ficam registradas na tarefa: o
+                // critério declarado com motivo de ambiente, os avisos explícitos do Desenvolvedor e
+                // os "não verificados" (spec 133 T06).
+                let lang = self.lang.get();
+                let mut pending = declared_pending;
+                pending.extend(
+                    dev_pending
+                        .lines()
+                        .filter_map(|l| l.trim().strip_prefix("- "))
+                        .map(|t| i18n::tr(lang, "runner.pending.dev_warning", &[("text", t.trim())])),
+                );
+                pending.extend(unverified_pending);
+                let pending: Vec<String> = pending.iter().map(|p| self.scrub(p)).collect();
+                task.body = append_pending(&task.body, &pending);
                 self.transition(task, TaskStatus::Approved, "integrar")?;
                 Ok(Step::Next)
             }
@@ -4952,6 +5392,7 @@ impl TaskRunner {
             )),
             ask_epoch: ask_epoch(task),
             previous_progress: String::new(),
+            resumed: None,
             formatters: self.scrub(&formatters_brief(&settings.formatters, &task.body)),
             screenshot_globs: settings.screenshots.clone(),
             references: self.references(&task.frontmatter.spec_id),
@@ -5131,6 +5572,8 @@ impl TaskRunner {
                 // sobrescrever as cópias da 1ª.
                 let round = if tasks.iter().any(is_final_fix) { 2 } else { 1 };
                 let captures = self.copy_captures(&input, "FINAL", round, &r.screenshots_viewed);
+                // Spec 133 T07: a pendência que a verificação final resolveu com evidência sai da lista.
+                self.settle_task_pending(tasks, &r.pending)?;
                 (converge(self.lang.get(), enforce_criteria(self.lang.get(), consolidate_visual(r, &[])), &[], &[]), captures)
             }
             Err(RunnerError::Cancelled) => return Err(RunnerError::Cancelled),
@@ -5161,13 +5604,24 @@ impl TaskRunner {
         let (met_text, total_text) = (met.to_string(), total.to_string());
         let heading = i18n::tr(lang, markers::FINAL_VERIFICATION, &[("met", &met_text), ("total", &total_text)]);
         self.say(format!("{heading}\n\n{matrix}"));
+        // Spec 133 T06: o critério "não verificado" não vira tarefa sozinho; vai à decisão de quem
+        // acompanha, num aviso com a lista.
+        let unverified: Vec<String> = result
+            .criteria
+            .iter()
+            .filter(|c| c.unverified)
+            .map(|c| format!("- {}: {}", c.criterion, c.evidence.trim()))
+            .collect();
+        if !unverified.is_empty() {
+            self.final_notice("final.unverified", &[], Some(&unverified.join("\n")));
+        }
         if passed {
             return Ok(FinalStep::Complete);
         }
         let unmet: Vec<String> = result
             .criteria
             .iter()
-            .filter(|c| !c.met && !is_manual_criterion(&c.criterion))
+            .filter(|c| c.unmet())
             .map(|c| format!("- {}: {}", c.criterion, c.evidence.trim()))
             .chain(result.findings.iter().map(|f| format!("- {}: {}", f.location, f.description)))
             .collect();
@@ -5394,6 +5848,25 @@ impl TaskRunner {
         if spec.frontmatter.status != SpecStatus::Completed {
             spec.frontmatter.status = SpecStatus::Completed;
             self.write_guarded(&path, &spec.render()?)?;
+        }
+        Ok(())
+    }
+
+    /// Spec 133 T07: aplica a resposta da verificação final às pendências de cada tarefa
+    /// ([`settle_pending`]), relida do disco; só grava a tarefa que muda.
+    fn settle_task_pending(&self, tasks: &[Task], replies: &[PendingReply]) -> Result<(), RunnerError> {
+        if replies.is_empty() {
+            return Ok(());
+        }
+        let replies: Vec<PendingReply> = replies.iter().map(|r| PendingReply { evidence: self.scrub(&r.evidence), ..r.clone() }).collect();
+        let replies = replies.as_slice();
+        for t in tasks {
+            let path = self.task_path(&t.frontmatter.spec_id, &t.frontmatter.id);
+            let mut task = read_task(&path)?;
+            if let Some(body) = settle_pending(self.lang.get(), &task.body, &task.frontmatter.id, replies) {
+                task.body = body;
+                self.persist(&task)?;
+            }
         }
         Ok(())
     }
@@ -6796,6 +7269,8 @@ mod tests {
             findings,
             criteria: Vec::new(),
             screenshots_viewed: Vec::new(),
+            declared: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -6806,6 +7281,8 @@ mod tests {
             findings,
             criteria: Vec::new(),
             screenshots_viewed: Vec::new(),
+            declared: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -6815,8 +7292,8 @@ mod tests {
         briefs: Arc<Mutex<Vec<DevBrief>>>,
         /// Não escreve nada a partir da 2ª chamada (simula Desenvolvedor sem alterações).
         idle_after_first: bool,
-        /// A 1ª sessão termina esgotada (limite de passos), com o segredo no resumo.
-        exhaust_first: bool,
+        /// Spec 133 T05: a sessão `n` (a partir de 1) para com `stops[n - 1]`; além da lista, termina.
+        stops: Vec<Option<DevStop>>,
         /// Geração de imagens informada à revisão (spec 092 T03); `None` = padrão do trait.
         image_status: Option<crate::sdd::images::GenerationStatus>,
         /// Tarefas de cada `begin_attempt` recebido, em ordem.
@@ -6846,17 +7323,18 @@ mod tests {
                     )
                     .unwrap();
                 }
-                if self.exhaust_first && n == 1 {
+                let stop = self.stops.get(n - 1).copied().flatten();
+                if let Some(stop) = stop {
                     return Ok(DevReport {
-                        summary: "Limite de passos atingido (150 passos).\n\nfiz metade; usei sk-SEGREDO-123456".into(),
-                        exhausted: true,
+                        summary: format!("Limite de passos atingido ({}).\n\nfiz metade da sessão {n}; usei sk-SEGREDO-123456", stop.code()),
+                        exhausted: Some(stop),
                     });
                 }
                 let summary = match &self.summary {
                     Some(f) => f(n, brief),
                     None => format!("dev {n}\n\n## Critérios\n1. ok — src/a.rs:{n}\n\n## Outro\nx"),
                 };
-                Ok(DevReport { summary, exhausted: false })
+                Ok(DevReport { summary, exhausted: None })
             })
         }
 
@@ -7464,8 +7942,8 @@ mod tests {
     fn approved_with_not_met_becomes_changes_requested_with_generated_finding() {
         let mut r = approved(vec![]);
         r.criteria = vec![
-            CriterionCheck { criterion: "a".into(), met: true, evidence: "t1".into() },
-            CriterionCheck { criterion: "b".into(), met: false, evidence: String::new() },
+            CriterionCheck { criterion: "a".into(), met: true, evidence: "t1".into(), unverified: false },
+            CriterionCheck { criterion: "b".into(), met: false, evidence: String::new(), unverified: false },
         ];
         let out = enforce_criteria(Lang::PtBr, r.clone());
         assert_eq!(out.verdict, Verdict::ChangesRequested);
@@ -7482,7 +7960,7 @@ mod tests {
         assert!(is_manual_criterion("2. (manual) testar no celular"));
         assert!(!is_manual_criterion("1. node --test verde (manual não)"));
         let mut r = approved(vec![]);
-        r.criteria = vec![CriterionCheck { criterion: "(manual) olhar no navegador".into(), met: false, evidence: String::new() }];
+        r.criteria = vec![CriterionCheck { criterion: "(manual) olhar no navegador".into(), met: false, evidence: String::new(), unverified: false }];
         assert_eq!(enforce_criteria(Lang::PtBr, r).verdict, Verdict::Approved);
         let marked = mark_manual_criteria(Lang::PtBr, "1. teste verde\n- [ ] (manual) ver no navegador");
         assert!(marked.contains(&format!("(manual) ver no navegador [{HUMAN_CHECK_MARK}]")), "{marked}");
@@ -7502,7 +7980,7 @@ mod tests {
         let dev = FakeDev::default();
         let rev = FakeReviewer::new(|n, _| {
             let mut r = if n == 0 { approved(vec![]) } else { approved(vec![]) };
-            r.criteria = vec![CriterionCheck { criterion: "c1".into(), met: n != 0, evidence: "e".into() }];
+            r.criteria = vec![CriterionCheck { criterion: "c1".into(), met: n != 0, evidence: "e".into(), unverified: false }];
             r
         });
         let rec = Recorder::default();
@@ -7542,7 +8020,7 @@ mod tests {
     }
 
     fn met(criterion: &str, met: bool) -> CriterionCheck {
-        CriterionCheck { criterion: criterion.into(), met, evidence: "e".into() }
+        CriterionCheck { criterion: criterion.into(), met, evidence: "e".into(), unverified: false }
     }
 
     #[test]
@@ -7857,8 +8335,8 @@ mod tests {
             movement("F-15", "The reach tests pass custom limits of 1.49 and 1.5."),
         ]);
         reviewed.criteria = vec![
-            CriterionCheck { criterion: "Fast tests cover nonfinite input rejection".into(), met: false, evidence: "only NaN position".into() },
-            CriterionCheck { criterion: "DDA ray tests cover the six-block maximum reach".into(), met: false, evidence: "custom limits".into() },
+            CriterionCheck { criterion: "Fast tests cover nonfinite input rejection".into(), met: false, evidence: "only NaN position".into(), unverified: false },
+            CriterionCheck { criterion: "DDA ray tests cover the six-block maximum reach".into(), met: false, evidence: "custom limits".into(), unverified: false },
         ];
         let previous = vec![Finding { location: "tests/e2e/movement.spec.ts:106-122".into(), ..tracked("F-13", 1) }];
         let mut registry: Vec<Finding> = (1..=12)
@@ -8411,7 +8889,7 @@ mod tests {
     #[test]
     fn generated_findings_and_convergence_notes_follow_the_project_language() {
         let unmet = |evidence: &str| ReviewResult {
-            criteria: vec![CriterionCheck { criterion: "c1".into(), met: false, evidence: evidence.into() }],
+            criteria: vec![CriterionCheck { criterion: "c1".into(), met: false, evidence: evidence.into(), unverified: false }],
             ..approved(vec![])
         };
         for (lang, evidence, location, description, recommendation) in [
@@ -8618,6 +9096,7 @@ mod tests {
             criterion: T05_CLI.into(),
             met: false,
             evidence: "tests/test_reporting.py::test_report_cli_strict_month_output_replacement_and_read_only_database; ledger/reporting.py:35".into(),
+            unverified: false,
         });
         ReviewResult { criteria, ..rejected(vec![f04]) }
     }
@@ -8670,7 +9149,7 @@ mod tests {
         // o Revisor marca o C ✗ de novo sem relistar o HIGH e traz só uma MEDIUM nova fora dos hunks.
         let generated = enforce_criteria(
             Lang::En,
-            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: "missing".into() }], ..approved(vec![]) },
+            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: "missing".into(), unverified: false }], ..approved(vec![]) },
         );
         let r1 = finding_track::track(&[], &[], vec![t05_finding("F-01", T05_F01.0, T05_F01.1)], 1);
         let r2 = finding_track::track(&r1.registry, &r1.open, generated.findings, 2);
@@ -8683,7 +9162,7 @@ mod tests {
         // O mesmo com o pendente em pt e com um aberto citado na evidência.
         let pt = enforce_criteria(
             Lang::PtBr,
-            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: String::new() }], ..approved(vec![]) },
+            ReviewResult { criteria: vec![CriterionCheck { criterion: T05_CLI.into(), met: false, evidence: String::new(), unverified: false }], ..approved(vec![]) },
         );
         let r2pt = finding_track::track(&r1.registry, &r1.open, pt.findings, 2);
         let (result, _) = demote_untouched_gaps(Lang::PtBr, again, &r2pt.registry, 3, Some(&hunks));
@@ -8697,7 +9176,7 @@ mod tests {
         let registry = t05_registry();
         let mut two = t05_review3("");
         two.criteria[4].evidence = "sem teste".into();
-        two.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "falta".into() };
+        two.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "falta".into(), unverified: false };
         let (result, gaps) = demote_untouched_gaps(Lang::PtBr, two, &registry, 3, Some(&hunks));
         assert_eq!((result.verdict, gaps.len()), (Verdict::ChangesRequested, 0));
         assert!(!result.criteria[0].met && !result.criteria[4].met);
@@ -8773,7 +9252,7 @@ mod tests {
         // Outro critério ✗ que não é da lacuna (é do HIGH): nada muda, como na convergência da 127.
         let mut other = t05_review3("");
         other.findings.push(Finding { failure_scenario: "x → y".into(), ..finding("F-05") });
-        other.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "src/lib.rs:1".into() };
+        other.criteria[0] = CriterionCheck { criterion: "c1".into(), met: false, evidence: "src/lib.rs:1".into(), unverified: false };
         let (result, gaps) = demote_untouched_gaps(Lang::PtBr, other, &registry, 3, Some(&hunks));
         assert_eq!((result.verdict, result.findings.len(), gaps.len()), (Verdict::ChangesRequested, 2, 0));
         assert!(!result.criteria[4].met);
@@ -8792,7 +9271,7 @@ mod tests {
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let dev = FakeDev::default();
         let rev = FakeReviewer::new(move |n, _| {
-            let unmet = |evidence: &str| vec![CriterionCheck { criterion: "arquivo criado".into(), met: false, evidence: evidence.into() }];
+            let unmet = |evidence: &str| vec![CriterionCheck { criterion: "arquivo criado".into(), met: false, evidence: evidence.into(), unverified: false }];
             match n {
                 0 => ReviewResult { criteria: unmet("out-T01-1.txt:1"), ..rejected(vec![Finding { state: Some(FindingState::New), ..medium("F-01", "out-T01-1.txt:1") }]) },
                 1 => {
@@ -8867,7 +9346,7 @@ mod tests {
     fn criterion_citing_a_missing_field_is_not_judged_and_becomes_a_final_observation() {
         let spec = spec_without_run_command();
         let cites = "the spec run_command imports the sample statement";
-        let crit = |c: &str, met: bool| CriterionCheck { criterion: c.into(), met, evidence: "src/cli.py:10".into() };
+        let crit = |c: &str, met: bool| CriterionCheck { criterion: c.into(), met, evidence: "src/cli.py:10".into(), unverified: false };
         // B4: o Revisor deu ✓ ao critério com o inexistente.
         let ok = ReviewResult { criteria: vec![crit(cites, true), crit("arquivo criado", true)], ..approved(vec![]) };
         let (out, obs) = demote_missing_fields(Lang::PtBr, ok, &spec, None, &[]);
@@ -8923,8 +9402,8 @@ mod tests {
             let about = Finding { description: "There is no `run_command` in the spec.".into(), ..medium("F-01", "spec.md:1") };
             ReviewResult {
                 criteria: vec![
-                    CriterionCheck { criterion: "arquivo criado".into(), met: true, evidence: "out-T01-1.txt:1".into() },
-                    CriterionCheck { criterion: "the spec run_command imports the sample".into(), met: false, evidence: "sem run_command".into() },
+                    CriterionCheck { criterion: "arquivo criado".into(), met: true, evidence: "out-T01-1.txt:1".into(), unverified: false },
+                    CriterionCheck { criterion: "the spec run_command imports the sample".into(), met: false, evidence: "sem run_command".into(), unverified: false },
                 ],
                 ..rejected(vec![about])
             }
@@ -9265,7 +9744,7 @@ mod tests {
         fn implement<'a>(&'a self, brief: &'a DevBrief) -> Fut<'a, Result<DevReport, RunnerError>> {
             Box::pin(async move {
                 fs::write(brief.worktree.join("sk-SEGREDO-123456.txt"), "x\n").unwrap();
-                Ok(DevReport { summary: "usei sk-SEGREDO-123456 aqui".into(), exhausted: false })
+                Ok(DevReport { summary: "usei sk-SEGREDO-123456 aqui".into(), exhausted: None })
             })
         }
     }
@@ -9288,7 +9767,8 @@ mod tests {
         let fx = Fixture::new("progresso", "true");
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let secrets = Arc::new(crate::server::events::SecretSet::new(vec!["sk-SEGREDO-123456".to_string()]));
-        let dev = FakeDev { exhaust_first: true, ..FakeDev::default() };
+        // Spec 133 T05: negações não retomam; a sessão parada segue o fluxo de testes.
+        let dev = FakeDev { stops: vec![Some(DevStop::Denials)], ..FakeDev::default() };
         let rev = FakeReviewer::new(|_, _| approved(vec![]));
         let rec = Recorder::default();
         let runner = TaskRunner::new(
@@ -9328,6 +9808,116 @@ mod tests {
             .expect("ok");
         assert_eq!(outcome, Outcome::Done);
         assert!(dev.briefs().iter().all(|b| b.previous_progress.is_empty()));
+    }
+
+    fn resume_notices(rec: &Recorder) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        notices(rec).into_iter().filter(|(c, _)| c.starts_with("task.dev_resumed_")).collect()
+    }
+
+    /// Spec 133 T05: o LoopGuard (chamada repetida) retoma o Desenvolvedor uma vez, numa sessão
+    /// nova com o progresso e a causa, antes de testes e revisão, sem contar a tentativa.
+    #[tokio::test]
+    async fn loop_guard_stop_resumes_once_without_counting_the_attempt() {
+        let fx = Fixture::new("retoma", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let secrets = Arc::new(crate::server::events::SecretSet::new(vec!["sk-SEGREDO-123456".to_string()]));
+        let dev = FakeDev { stops: vec![Some(DevStop::Repeated)], ..FakeDev::default() };
+        let rev = FakeReviewer::new(|prior, _| if prior == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
+        let rec = Recorder::default();
+        let tests = ScriptedTests::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(dev.clone()),
+            Box::new(rev.clone()),
+            Box::new(tests.clone()),
+            Box::new(rec.clone()),
+        )
+        .with_secrets(secrets);
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let briefs = dev.briefs();
+        // Sessão parada, retomada (sem testes no meio), revisão reprovada, nova tentativa, aprovada.
+        assert_eq!(briefs.len(), 3);
+        assert_eq!(rev.inputs().len(), 2);
+        assert_eq!(*tests.calls.lock().unwrap(), 2, "uma rodada por revisão");
+        let resumed = &briefs[1];
+        assert_eq!(resumed.resumed, Some(DevStop::Repeated));
+        assert!(resumed.previous_progress.contains("fiz metade da sessão 1"), "{}", resumed.previous_progress);
+        assert!(!resumed.previous_progress.contains("sk-SEGREDO-123456"));
+        assert!(resumed.test_output.is_none(), "a retomada vem antes dos testes");
+        assert_eq!(briefs[0].ask_epoch, resumed.ask_epoch, "a retomada é a mesma tentativa");
+        assert_ne!(briefs[2].ask_epoch, resumed.ask_epoch, "a reprovação conta a tentativa");
+        assert_eq!(briefs[2].resumed, None);
+        let found = resume_notices(&rec);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "task.dev_resumed_repeated");
+        assert_eq!(found[0].1.get("task").and_then(|v| v.as_str()), Some("T01"));
+        assert_eq!(found[0].1.get("attempt").and_then(|v| v.as_str()), Some("1"));
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Done);
+    }
+
+    /// Spec 133 T05: a retomada que também para segue o fluxo de hoje (testes e revisão); o limite
+    /// de passos também retoma, uma vez só.
+    #[tokio::test]
+    async fn second_stop_after_the_resume_goes_to_tests_and_review() {
+        let fx = Fixture::new("retoma-2x", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev { stops: vec![Some(DevStop::Steps), Some(DevStop::Repeated)], ..FakeDev::default() };
+        let rev = FakeReviewer::new(|_, _| approved(vec![]));
+        let (rec, tests) = (Recorder::default(), ScriptedTests::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(dev.briefs().len(), 2);
+        assert_eq!(dev.briefs()[1].resumed, Some(DevStop::Steps));
+        assert_eq!(*tests.calls.lock().unwrap(), 1);
+        assert_eq!(rev.inputs().len(), 1);
+        let found = resume_notices(&rec);
+        assert_eq!(found.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), vec!["task.dev_resumed_steps"]);
+    }
+
+    /// Spec 133 T05: negações de permissão não retomam (a sessão nova esbarraria nelas de novo).
+    #[tokio::test]
+    async fn denials_stop_does_not_resume() {
+        let fx = Fixture::new("retoma-negacoes", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev { stops: vec![Some(DevStop::Denials)], ..FakeDev::default() };
+        let rev = FakeReviewer::new(|_, _| approved(vec![]));
+        let (rec, tests) = (Recorder::default(), ScriptedTests::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert_eq!(dev.briefs().len(), 1);
+        assert_eq!(*tests.calls.lock().unwrap(), 1);
+        assert_eq!(rev.inputs().len(), 1);
+        assert!(resume_notices(&rec).is_empty());
+    }
+
+    /// Orçamento esgotado depois da primeira sessão do Desenvolvedor.
+    struct OverAfterFirstSession(Arc<Mutex<Vec<DevBrief>>>);
+
+    impl BudgetGuard for OverAfterFirstSession {
+        fn exceeded(&self, _spec: &str, _lang: crate::i18n::Lang) -> Option<String> {
+            (!self.0.lock().unwrap().is_empty()).then(|| "orçamento da spec atingido: 10 de 5 tokens".into())
+        }
+    }
+
+    /// Spec 133 T05: com o orçamento esgotado, a retomada não acontece: a tarefa bloqueia por
+    /// orçamento, sem a sessão nova, sem testes e sem revisão.
+    #[tokio::test]
+    async fn exhausted_budget_does_not_resume() {
+        let fx = Fixture::new("retoma-orcamento", "true");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev { stops: vec![Some(DevStop::Repeated)], ..FakeDev::default() };
+        let rev = FakeReviewer::new(|_, _| approved(vec![]));
+        let (rec, tests) = (Recorder::default(), ScriptedTests::default());
+        let runner = fx
+            .runner(&dev, &rev, tests.clone(), &rec)
+            .with_budget(Arc::new(OverAfterFirstSession(Arc::clone(&dev.briefs))));
+        match runner.run_task(SPEC, "T01").await.unwrap() {
+            Outcome::Blocked { kind, .. } => assert_eq!(kind, BlockKind::Budget),
+            other => panic!("esperava Blocked: {other:?}"),
+        }
+        assert_eq!(dev.briefs().len(), 1);
+        assert_eq!(*tests.calls.lock().unwrap(), 0);
+        assert!(rev.inputs().is_empty());
+        assert!(resume_notices(&rec).is_empty());
     }
 
     #[tokio::test]
@@ -9691,7 +10281,7 @@ mod tests {
                     fs::create_dir_all(path.parent().unwrap()).unwrap();
                     fs::write(path, content).unwrap();
                 }
-                Ok(DevReport { summary: "feito".into(), exhausted: false })
+                Ok(DevReport { summary: "feito".into(), exhausted: None })
             })
         }
     }
@@ -10144,7 +10734,7 @@ mod tests {
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let dev = FakeDev::default();
         let rev = FakeReviewer::new(|_, input| ReviewResult {
-            criteria: vec![CriterionCheck { criterion: "c1".into(), met: true, evidence: "e".into() }],
+            criteria: vec![CriterionCheck { criterion: "c1".into(), met: true, evidence: "e".into(), unverified: false }],
             screenshots_viewed: input.screenshots.iter().filter(|c| c.usable()).map(|c| c.name.clone()).collect(),
             ..approved(vec![])
         });
@@ -11796,7 +12386,7 @@ mod tests {
     }
 
     fn matrix(met: bool) -> ReviewResult {
-        let c = vec![CriterionCheck { criterion: "tudo funciona".into(), met, evidence: "visto".into() }];
+        let c = vec![CriterionCheck { criterion: "tudo funciona".into(), met, evidence: "visto".into(), unverified: false }];
         if met {
             ReviewResult { criteria: c, ..approved(vec![]) }
         } else {
@@ -11820,6 +12410,255 @@ mod tests {
         let said = rec.events().into_iter().any(|e| matches!(e, RunnerEvent::AgentMessage { text, .. } if text.starts_with("Verificação final: 2 de 2 critérios atendidos") || text.starts_with("Verificação final: 1 de 1 critérios atendidos")));
         assert!(said, "{:?}", rec.events());
         assert_eq!(read_spec_file(&fx).frontmatter.status, SpecStatus::Completed);
+    }
+
+    /// Critério "não verificado" (spec 133 T06): a evidência citou caminhos que não existem, mesmo
+    /// depois de voltar ao Revisor (marcado pelo [`crate::agents::evidence_paths`]).
+    fn unverified(criterion: &str) -> CriterionCheck {
+        let mut r = ReviewResult {
+            criteria: vec![CriterionCheck { criterion: criterion.into(), met: true, evidence: "src/x.js:9".into(), unverified: false }],
+            ..approved(vec![])
+        };
+        let audit = crate::agents::evidence_paths::Audit {
+            issues: vec![crate::agents::evidence_paths::Issue {
+                item: crate::agents::evidence_paths::Item::Criterion(0),
+                label: criterion.into(),
+                problems: vec![crate::agents::evidence_paths::Problem::Missing("src/x.js:9".into())],
+            }],
+            ..Default::default()
+        };
+        crate::agents::evidence_paths::mark_unverified(Lang::PtBr, &mut r, &audit);
+        r.criteria.remove(0)
+    }
+
+    /// Spec 133 T06: "não verificado" é distinto de "não cumprido": não reprova, não vira tarefa
+    /// sozinho, aparece na matriz com marca própria e vai às observações para a verificação final.
+    #[tokio::test]
+    async fn unverified_criterion_does_not_block_and_reaches_the_final_verification() {
+        let c = unverified("lista pagina");
+        assert!(!c.met && c.unverified && !c.unmet());
+        let kept = enforce_criteria(Lang::PtBr, ReviewResult { criteria: vec![c.clone()], ..approved(vec![]) });
+        assert_eq!(kept.verdict, Verdict::Approved);
+        let en = unverified_observations(Lang::En, std::slice::from_ref(&c));
+        assert!(en[0].description.starts_with("Criterion without real evidence: lista pagina."), "{}", en[0].description);
+
+        let fx = Fixture::new("nao-verificado", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rec) = (FakeDev::default(), Recorder::default());
+        let rev = FakeReviewer::new(move |_, i| {
+            let criteria = vec![if i.task_id == "FINAL" { unverified("tudo funciona") } else { c.clone() }];
+            ReviewResult { criteria, ..approved(vec![]) }
+        });
+        let out = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_spec(SPEC).await.unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        let texts = reviewer_texts(&rec);
+        assert!(texts[0].starts_with("Aprovado: "), "{}", texts[0]);
+        assert!(texts[0].contains("? lista pagina: não verificado: a evidência cita o que não existe na árvore revisada (src/x.js:9)"), "{}", texts[0]);
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Done);
+        // Spec 133 T07: na aprovação, o "não verificado" vira pendência da tarefa (não observação solta).
+        let kept = section_text(&t.body, PENDING).unwrap_or_default();
+        assert!(kept.contains("- P-01: Critério sem evidência real: lista pagina."), "{kept}");
+        assert!(section_text(&t.body, FINAL_OBSERVATIONS).unwrap_or_default().is_empty());
+        let last = rev.inputs().pop().unwrap();
+        assert!(last.task_observations.contains("- T01 P-01: Critério sem evidência real: lista pagina"), "{}", last.task_observations);
+        // Na verificação final: não conta como atendido, não cria tarefa e vira aviso com a lista.
+        let said = rec.events().into_iter().any(|e| matches!(e, RunnerEvent::AgentMessage { text, .. } if text.starts_with("Verificação final: 1 de 2 critérios atendidos") || text.starts_with("Verificação final: 0 de 1 critérios atendidos")));
+        assert!(said, "{:?}", rec.events());
+        assert!(rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { code, text, .. } if code == "final.unverified" && text.contains("- tudo funciona: não verificado"))));
+        assert!(!rec.events().into_iter().any(|e| matches!(e, RunnerEvent::SystemNotice { code, .. } if code == "final.fix_created")));
+    }
+
+    fn reply(number: usize, status: DeclaredStatus, evidence: &str) -> DeclaredReply {
+        DeclaredReply { number, status, evidence: evidence.into() }
+    }
+
+    const DECLARED_DEV: &str = "- 1. lista: met: src/a.rs:1\n- 2. coluna: partly met: falta o celular\n\
+         - 3. entrar: not met: sem link\n- 4. gpu: não atendido: sem GPU no container";
+
+    /// Spec 133 T07: o pareamento é pelo número do critério da tarefa (explícito ou a posição), nunca
+    /// pelo texto: a resposta com outro número não vale para o critério.
+    #[test]
+    fn declared_criteria_pair_by_number_not_by_text() {
+        let declared = declared_criteria(DECLARED_DEV);
+        let numbers: Vec<(usize, bool)> = declared.iter().map(|d| (d.number, d.partial)).collect();
+        assert_eq!(numbers, vec![(2, true), (3, false), (4, false)]);
+        assert_eq!((declared[0].criterion.as_str(), declared[0].detail.as_str()), ("coluna", "falta o celular"));
+        // Sem número explícito, vale a posição na lista (a contagem do `count_criteria`).
+        let by_position = declared_criteria("- a: met: x.rs:1\n  - detalhe\n- b: parcial: falta y");
+        assert_eq!((by_position[0].number, by_position[0].partial), (2, true));
+        // A resposta do critério 5 com o texto do critério 2 não responde o 2.
+        let mut r = ReviewResult { declared: vec![reply(5, DeclaredStatus::Met, "coluna: src/col.rs:3")], ..approved(vec![]) };
+        r.criteria = vec![met("coluna", true)];
+        let (out, pending) = apply_declared(Lang::PtBr, r, &declared_criteria("- 2. coluna: parcial: falta o celular"));
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert!(pending.is_empty());
+        assert!(out.findings[0].description.contains("critério 2 parcial"), "{}", out.findings[0].description);
+    }
+
+    /// Spec 133 T07: a regra única de destino. Sem resposta vira finding com a declaração; o motivo de
+    /// ambiente vira pendência que não bloqueia; a contradição com evidência aprova.
+    #[test]
+    fn declared_criteria_follow_the_single_destination_rule() {
+        let declared = declared_criteria(DECLARED_DEV);
+        // Sem resposta para o 2: finding HIGH com a declaração; o 3 contradito com evidência e o 4 de ambiente.
+        let r = ReviewResult {
+            declared: vec![reply(3, DeclaredStatus::Met, "src/entrar.rs:4"), reply(4, DeclaredStatus::Environment, "o container não tem GPU")],
+            ..approved(vec![finding("F-03")])
+        };
+        let r = ReviewResult { findings: vec![Finding { severity: "MEDIUM".into(), ..finding("F-03") }], ..r };
+        let (out, pending) = apply_declared(Lang::PtBr, r, &declared);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert_eq!(out.findings.len(), 2);
+        let generated = &out.findings[1];
+        assert_eq!((generated.id.as_str(), generated.severity.as_str()), ("F-04", "HIGH"));
+        assert_eq!(
+            generated.description,
+            "O Desenvolvedor declarou o critério 2 parcial e o Revisor não respondeu: coluna. Declaração: falta o celular"
+        );
+        assert_eq!(pending, vec!["Critério 4 (não atendido), o ambiente não permite provar: gpu. Motivo: o container não tem GPU".to_string()]);
+
+        // Todos respondidos: contradição com evidência e ambiente aprovam; o ambiente vira pendência.
+        let r = ReviewResult {
+            declared: vec![
+                reply(2, DeclaredStatus::Met, "tests/col.spec.ts::celular"),
+                reply(3, DeclaredStatus::Met, "src/entrar.rs:4"),
+                reply(4, DeclaredStatus::Environment, "sem GPU"),
+            ],
+            ..approved(vec![])
+        };
+        let (out, pending) = apply_declared(Lang::En, r, &declared);
+        assert_eq!(out.verdict, Verdict::Approved);
+        assert!(out.findings.is_empty());
+        assert_eq!(pending, vec!["Criterion 4 (not met), the environment cannot prove it: gpu. Reason: sem GPU".to_string()]);
+
+        // `met` sem evidência conta como sem resposta.
+        let r = ReviewResult { declared: vec![reply(2, DeclaredStatus::Met, " ")], ..approved(vec![]) };
+        let (out, _) = apply_declared(Lang::En, r, &declared_criteria("- 2. coluna: partly met: falta o celular"));
+        assert!(out.findings[0].description.starts_with("The Developer declared criterion 2 partly met and the Reviewer did not answer"));
+
+        // Confirmado `not_met` num APPROVED sem critério não atendido: vale o Revisor, e reprova.
+        let r = ReviewResult { declared: vec![reply(3, DeclaredStatus::NotMet, "não há link")], ..approved(vec![]) };
+        let (out, _) = apply_declared(Lang::PtBr, r, &declared_criteria("- 3. entrar: não atendido: sem link"));
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert!(out.findings[0].description.contains("o Revisor confirmou: entrar. Evidência: não há link"), "{}", out.findings[0].description);
+        assert!(out.criteria.iter().any(|c| c.criterion == "entrar" && c.unmet()), "{:?}", out.criteria);
+        // Com um critério não atendido na matriz, o enforce e a convergência já bloqueiam: nada é acrescentado.
+        let r = ReviewResult {
+            declared: vec![reply(3, DeclaredStatus::NotMet, "não há link")],
+            criteria: vec![met("entrar", false)],
+            ..rejected(vec![finding("F-01")])
+        };
+        let (out, _) = apply_declared(Lang::PtBr, r, &declared_criteria("- 3. entrar: não atendido: sem link"));
+        assert_eq!((out.findings.len(), out.criteria.len()), (1, 1));
+        // Sem critério declarado, nada muda.
+        let (out, pending) = apply_declared(Lang::PtBr, approved(vec![]), &declared_criteria("- 1. a: met: x.rs:1"));
+        assert_eq!((out.verdict, pending.len()), (Verdict::Approved, 0));
+    }
+
+    /// Spec 133 T07 (F-03): na 3ª revisão, CHANGES_REQUESTED só por MEDIUM novo com a matriz toda
+    /// atendida e o critério declarado confirmado `not_met`: a convergência não aprova em silêncio.
+    #[test]
+    fn confirmed_declared_criterion_survives_the_convergence() {
+        let r = ReviewResult {
+            declared: vec![reply(3, DeclaredStatus::NotMet, "não há link")],
+            criteria: vec![met("lista", true), met("entrar", true)],
+            ..rejected(vec![Finding { severity: "MEDIUM".into(), state: Some(FindingState::New), ..finding("F-07") }])
+        };
+        let (r, _) = apply_declared(Lang::PtBr, r, &declared_criteria("- 3. entrar: não atendido: sem link"));
+        let (out, demoted) = demote_late_new(Lang::PtBr, enforce_criteria(Lang::PtBr, r), &[], CONVERGENCE_FROM_REVIEW);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert!(demoted.is_empty(), "{demoted:?}");
+        assert!(out.findings.iter().any(|f| f.severity == "HIGH" && f.description.contains("o Revisor confirmou: entrar")), "{:?}", out.findings);
+    }
+
+    /// Spec 133 T07: os avisos explícitos do Desenvolvedor saem da seção dele, em qualquer idioma.
+    #[test]
+    fn dev_pending_reads_the_warning_section_in_both_languages() {
+        let pt = "feito\n\n## Critérios\n- 1. a: met: x.rs:1\n\n## Pendências\n- o link Entrar fica para depois\n* coluna vazia no landing\n\n## Outro\n- não é aviso";
+        assert_eq!(extract_dev_pending(pt), "- o link Entrar fica para depois\n- coluna vazia no landing");
+        assert_eq!(extract_dev_pending("done\n\nKnown issues:\n- history items run together"), "- history items run together");
+        assert_eq!(extract_dev_pending("sem seção\n- item solto"), "");
+        // Títulos sem `#` fecham a seção "Critérios": o aviso não vira critério declarado.
+        for title in ["Pendências:", "**Known issues**", "Respostas aos apontamentos"] {
+            let s = format!("feito\nCritérios\n- 1. a: met: x.rs:1\n{title}\n- coluna: parcial: vazia no landing");
+            let criteria = extract_dev_criteria(&s);
+            assert_eq!(criteria, "- 1. a: met: x.rs:1", "{title}");
+            assert!(declared_criteria(&criteria).is_empty(), "{title}");
+        }
+    }
+
+    /// Spec 133 T07: a pendência é registrada na aprovação com id próprio, e a resolvida pela
+    /// verificação final sai da lista com a evidência.
+    #[test]
+    fn pending_is_numbered_and_settled_by_the_final_verification() {
+        let body = append_pending("## Objetivo\nx\n", &["Aviso do Desenvolvedor: a".into(), "linha\nquebrada".into()]);
+        let body = append_pending(&body, &["terceira".into()]);
+        assert_eq!(section_text(&body, PENDING).unwrap_or_default().trim(), "- P-01: Aviso do Desenvolvedor: a\n- P-02: linha quebrada\n- P-03: terceira");
+        let replies = vec![
+            PendingReply { task: "T07".into(), id: "P-02".into(), resolved: true, evidence: "src/x.rs:3".into() },
+            PendingReply { task: "T07".into(), id: "P-03".into(), resolved: true, evidence: String::new() },
+            PendingReply { task: "T08".into(), id: "P-01".into(), resolved: true, evidence: "outra tarefa".into() },
+        ];
+        let settled = settle_pending(Lang::PtBr, &body, "T07", &replies).expect("muda");
+        assert_eq!(section_text(&settled, PENDING).unwrap_or_default().trim(), "- P-01: Aviso do Desenvolvedor: a\n- P-03: terceira");
+        assert_eq!(
+            section_text(&settled, PENDING_RESOLVED).unwrap_or_default().trim(),
+            "- P-02: linha quebrada (resolvida na verificação final: src/x.rs:3)"
+        );
+        // Um id novo nunca repete o resolvido.
+        let more = append_pending(&settled, &["quarta".into()]);
+        assert!(section_text(&more, PENDING).unwrap_or_default().contains("- P-04: quarta"));
+        assert_eq!(settle_pending(Lang::PtBr, &body, "T07", &[]), None);
+    }
+
+    /// Spec 133 T07, de ponta a ponta: o critério declarado sem resposta reprova; respondido com motivo
+    /// de ambiente, a tarefa é aprovada e a pendência (com o aviso do Desenvolvedor) fica registrada,
+    /// chega à verificação final, e a que ela resolve sai da lista.
+    #[tokio::test]
+    async fn declared_pending_reaches_the_final_verification() {
+        let fx = Fixture::new("pendencias", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, _brief: &DevBrief| {
+                format!("dev {n}\n\n## Critérios\n- 1. arquivo criado: não atendido: sem GPU no container\n\n## Pendências\n- o link Entrar fica para depois\n")
+            })),
+            ..FakeDev::default()
+        };
+        let rec = Recorder::default();
+        let rev = FakeReviewer::new(|n, i| {
+            if i.task_id == "FINAL" {
+                assert!(i.task_observations.contains("- T01 P-01: Critério 1 (não atendido), o ambiente não permite provar"), "{}", i.task_observations);
+                assert!(i.task_observations.contains("- T01 P-02: Aviso do Desenvolvedor: o link Entrar fica para depois"), "{}", i.task_observations);
+                let resolved = PendingReply { task: "T01".into(), id: "P-02".into(), resolved: true, evidence: "src/entrar.rs:2".into() };
+                return ReviewResult { pending: vec![resolved], ..matrix(true) };
+            }
+            assert!(i.dev_criteria.contains("- 1. arquivo criado: não atendido"), "{}", i.dev_criteria);
+            if n == 0 {
+                // A 1ª revisão aprova sem responder o critério declarado.
+                return ReviewResult { criteria: vec![met("arquivo criado", true)], ..approved(vec![]) };
+            }
+            ReviewResult {
+                criteria: vec![met("arquivo criado", true)],
+                declared: vec![reply(1, DeclaredStatus::Environment, "o container não tem GPU")],
+                ..approved(vec![])
+            }
+        });
+        let out = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_spec(SPEC).await.unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        let texts = reviewer_texts(&rec);
+        assert!(texts[0].contains("o Revisor não respondeu: arquivo criado. Declaração: sem GPU no container"), "{}", texts[0]);
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.status, t.frontmatter.attempts), (TaskStatus::Done, 1));
+        let open = section_text(&t.body, PENDING).unwrap_or_default();
+        assert_eq!(
+            open.trim(),
+            "- P-01: Critério 1 (não atendido), o ambiente não permite provar: arquivo criado. Motivo: o container não tem GPU"
+        );
+        let resolved = section_text(&t.body, PENDING_RESOLVED).unwrap_or_default();
+        assert!(resolved.contains("- P-02: Aviso do Desenvolvedor: o link Entrar fica para depois (resolvida na verificação final: src/entrar.rs:2)"), "{resolved}");
     }
 
     /// Executor que só interfere na base (`dir == root`): falha a checagem `fail_cmd` ou não executa
@@ -12142,7 +12981,7 @@ mod tests {
             if i.task_id != "FINAL" {
                 return approved(vec![]);
             }
-            let c = vec![CriterionCheck { criterion: "tudo funciona".into(), met: false, evidence: evidence.clone() }];
+            let c = vec![CriterionCheck { criterion: "tudo funciona".into(), met: false, evidence: evidence.clone(), unverified: false }];
             enforce_criteria(Lang::PtBr, ReviewResult { criteria: c, ..approved(vec![]) })
         });
         let gate = Arc::new(Gate(false, Default::default()));
@@ -12951,7 +13790,7 @@ mod tests {
             Box::pin(async move {
                 Ok(DevReport {
                     summary: "nada a fazer".into(),
-                    exhausted: false,
+                    exhausted: None,
                 })
             })
         }
@@ -13830,6 +14669,55 @@ mod tests {
         assert!(review.test_output.contains(&flaky_pass_warning("make test")) && review.test_output.contains("- test dois_clientes ... FAILED"), "{}", review.test_output);
     }
 
+    /// Spec 133 T12: executor com limite conhecido cuja primeira rodada sai com `code` (programa
+    /// ausente ou não executável); as outras passam.
+    #[derive(Clone)]
+    struct MissingOnce {
+        code: i32,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestExecutor for MissingOnce {
+        fn run<'a>(&'a self, _dir: &'a Path, _command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                Ok(if *calls == 1 {
+                    TestResult { passed: false, output: "sh: go: not found".into(), exit_code: Some(self.code), timed_out: false }
+                } else {
+                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false }
+                })
+            })
+        }
+
+        fn time_limit(&self) -> Option<Duration> {
+            Some(Duration::from_secs(600))
+        }
+    }
+
+    /// Spec 133 T12: a rodada que sai com 126 ou 127 (programa ausente ou não executável) não é
+    /// repetida para conferir instabilidade: volta ao Desenvolvedor com o diagnóstico, e a conversa
+    /// diz por que não houve repetição.
+    #[tokio::test]
+    async fn missing_program_round_is_not_rerun_as_flaky() {
+        for code in [127, 126] {
+            let fx = Fixture::new(&format!("missing-rerun-{code}"), "make test");
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let tests = MissingOnce { code, calls: Arc::default() };
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let outcome = fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap();
+            assert_eq!(outcome, Outcome::Done);
+            assert_eq!(dev.briefs().len(), 2, "sem repetição: a falha volta ao Desenvolvedor");
+            let back = dev.briefs()[1].test_output.clone().unwrap_or_default();
+            assert!(back.contains("sh: go: not found") && back.contains(&format!("Diagnóstico: o comando saiu com o código {code}")), "{back}");
+            let texts = tests_texts(&rec);
+            assert!(!texts.iter().any(|t| t.starts_with("A rodada de testes falhou. Repetindo")), "{texts:?}");
+            let skipped = format!("A rodada de testes falhou com o código {code}, que indica programa ausente ou não executável. É falha do ambiente, não teste instável");
+            assert_eq!(texts.iter().filter(|t| t.starts_with(&skipped)).count(), 1, "{texts:?}");
+            assert!(section_text(&fx.read_task("T01").body, FLAKY_SECTION).is_none());
+        }
+    }
+
     /// Spec 124 T04: falha nas duas rodadas conta como uma falha e volta ao Desenvolvedor; na mesma
     /// tentativa, a repetição acontece no máximo uma vez. O alerta da instabilidade chega ao
     /// Desenvolvedor quando a tarefa volta a ele.
@@ -13858,6 +14746,125 @@ mod tests {
         assert_eq!(fx.runner(&dev, &rev, tests, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let second = &dev.briefs()[1];
         assert!(second.flaky_tests.contains("✘ two clients converge"), "{}", second.flaky_tests);
+    }
+
+    /// Spec 133 T05: Desenvolvedor que, na 1ª sessão, registra uma rodada de `make test` que falhou
+    /// com `output`; com `touch_after`, mexe na árvore depois de rodar.
+    fn dev_failed_run(output: &'static str, touch_after: bool) -> FakeDev {
+        FakeDev {
+            summary: Some(Arc::new(move |n, brief: &DevBrief| {
+                if n == 1 {
+                    let tree = test_levels::tree_hash(&brief.worktree);
+                    brief.suite_ledger.record(test_levels::SuiteRun {
+                        command: "make test".into(),
+                        tree_before: tree.clone(),
+                        tree_after: tree,
+                        in_container: false,
+                        passed: false,
+                        elapsed: Duration::from_millis(10),
+                        started: std::time::SystemTime::now(),
+                        output: format!("exit: 1\n{output}"),
+                    });
+                    if touch_after {
+                        fs::write(brief.worktree.join("depois.txt"), "mudou depois do teste\n").unwrap();
+                    }
+                }
+                format!("dev {n}")
+            })),
+            ..FakeDev::default()
+        }
+    }
+
+    /// Spec 133 T05: a falha que o Desenvolvedor já viu (mesmo comando, mesma árvore, mesmas linhas)
+    /// não é repetida para checar instabilidade: volta direto ao Desenvolvedor.
+    #[tokio::test]
+    async fn rerun_is_skipped_for_the_failure_the_developer_already_saw() {
+        let fx = Fixture::new("rerun-pulado", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fail = (false, "test a ... ok\nFAIL e2e/render.spec.ts\n", Duration::ZERO);
+        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, (true, "ok", Duration::ZERO)]);
+        let dev = dev_failed_run("compilando\nFAIL e2e/render.spec.ts\n", false);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let texts = tests_texts(&rec);
+        assert!(!texts.iter().any(|t| t.contains("Repetindo")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("A rodada de testes falhou com as mesmas linhas de falha")), "{texts:?}");
+        assert_eq!(tests.calls(), 2, "a falha e a rodada depois da correção");
+        assert_eq!(dev.briefs().len(), 2);
+    }
+
+    /// Spec 133 T05: o Desenvolvedor passou e depois falhou com as mesmas linhas sobre a mesma
+    /// árvore: é sinal de instabilidade, e o runner repete a rodada que falhou.
+    #[tokio::test]
+    async fn rerun_is_kept_when_the_developer_also_passed_on_the_same_tree() {
+        let fx = Fixture::new("rerun-passou-falhou", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, brief: &DevBrief| {
+                if n == 1 {
+                    let tree = test_levels::tree_hash(&brief.worktree);
+                    for (passed, output) in [(true, "exit: 0\nok"), (false, "exit: 1\nFAIL e2e/render.spec.ts")] {
+                        brief.suite_ledger.record(test_levels::SuiteRun {
+                            command: "make test".into(),
+                            tree_before: tree.clone(),
+                            tree_after: tree.clone(),
+                            in_container: false,
+                            passed,
+                            elapsed: Duration::from_millis(10),
+                            started: std::time::SystemTime::now(),
+                            output: output.into(),
+                        });
+                    }
+                }
+                format!("dev {n}")
+            })),
+            ..FakeDev::default()
+        };
+        let fail = (false, "FAIL e2e/render.spec.ts\n", Duration::ZERO);
+        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, (true, "ok", Duration::ZERO)]);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let texts = tests_texts(&rec);
+        assert_eq!(texts.iter().filter(|t| t.starts_with("A rodada de testes falhou. Repetindo")).count(), 1, "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("mesmas linhas de falha")), "{texts:?}");
+        assert_eq!(dev.briefs().len(), 1, "passou na repetição: instável, sem voltar ao Desenvolvedor");
+    }
+
+    /// Spec 133 T05: a mesma falha com outra duração (formato do cargo) continua sendo a mesma: o
+    /// reteste é pulado.
+    #[tokio::test]
+    async fn rerun_is_skipped_when_only_the_duration_changes() {
+        let fx = Fixture::new("rerun-duracao", "make test");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fail = (false, "test a::b ... FAILED\ntest result: FAILED. 3 passed; 1 failed; finished in 1.23s\n", Duration::ZERO);
+        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, (true, "ok", Duration::ZERO)]);
+        let dev = dev_failed_run("test a::b ... FAILED\ntest result: FAILED. 3 passed; 1 failed; finished in 0.98s\n", false);
+        let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let texts = tests_texts(&rec);
+        assert!(!texts.iter().any(|t| t.contains("Repetindo")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("A rodada de testes falhou com as mesmas linhas de falha")), "{texts:?}");
+    }
+
+    /// Spec 133 T05: com outras linhas de falha, ou com a árvore mudada depois da rodada do
+    /// Desenvolvedor, a repetição para checar instabilidade continua.
+    #[tokio::test]
+    async fn rerun_is_kept_when_the_tree_or_the_lines_change() {
+        for (name, dev_output, touch) in [
+            ("rerun-linhas", "FAIL e2e/outro.spec.ts\n", false),
+            ("rerun-arvore", "FAIL e2e/render.spec.ts\n", true),
+        ] {
+            let fx = Fixture::new(name, "make test");
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let fail = (false, "FAIL e2e/render.spec.ts\n", Duration::ZERO);
+            let tests = TimedTests::new(Duration::from_secs(600), vec![fail, fail, (true, "ok", Duration::ZERO)]);
+            let dev = dev_failed_run(dev_output, touch);
+            let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            assert_eq!(fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+            let texts = tests_texts(&rec);
+            assert_eq!(texts.iter().filter(|t| t.starts_with("A rodada de testes falhou. Repetindo")).count(), 1, "{name}: {texts:?}");
+            assert!(!texts.iter().any(|t| t.contains("mesmas linhas de falha")), "{name}: {texts:?}");
+        }
     }
 
     /// Spec 124 T04: sem tempo restante no limite, a rodada que falhou não se repete; a duração

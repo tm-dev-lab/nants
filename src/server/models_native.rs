@@ -53,6 +53,8 @@ pub(super) const MODEL_NOT_FOUND: Failure = Failure { code: "model_not_found", s
 pub(super) const RATE_LIMITED: Failure = Failure { code: "rate_limited", status: None };
 /// Teto de gasto da conta atingido (429 da Anthropic com `enforced_spend_limit_reached`).
 pub(super) const SPEND_LIMIT: Failure = Failure { code: "spend_limit", status: None };
+/// Cobrança do provedor: crédito esgotado ou pagamento pendente (402, spec 133 T02).
+pub(super) const BILLING: Failure = Failure { code: "billing", status: None };
 
 /// Janelas de entrada conhecidas por (endereço, modelo), da lista de modelos.
 fn input_windows() -> &'static Mutex<HashMap<(String, String), u64>> {
@@ -86,6 +88,7 @@ pub(super) fn classify(err: &LlmError, with_model: bool) -> Failure {
     };
     match *status {
         401 => AUTH_INVALID,
+        402 => BILLING,
         400 if key_rejected(body_snippet) => AUTH_INVALID,
         403 => FORBIDDEN,
         404 if with_model => MODEL_NOT_FOUND,

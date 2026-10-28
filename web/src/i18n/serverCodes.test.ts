@@ -45,6 +45,7 @@ const SYSTEM_CODES = [
   "run.plan_limit",
   "run.spend_limit",
   "run.daily_quota",
+  "run.billing",
   "image.unavailable",
   "image.failed",
   "image.suspended",

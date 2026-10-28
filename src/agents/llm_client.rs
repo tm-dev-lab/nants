@@ -36,6 +36,8 @@ mod plan;
 pub use plan::{Billing, PlanError, PlanFuture, PlanTokenError, PlanTokens, PLAN_FORBIDDEN_FIELDS, PLAN_UNSUPPORTED_TOOLS, PLAN_USAGE_URL};
 pub mod limit;
 pub use limit::ProviderLimit;
+pub mod evidence;
+pub use evidence::{CallTrace, ConnectionRef, FailureCategory, FailureEvidence, HttpEvidence};
 mod pace;
 pub use pace::{pace_notice, pace_notice_secs, parse_reset, PaceClock, Pacer, Quota, PACE_MAX_WAIT, PACE_NOTICE_AFTER, PACE_WINDOW};
 
@@ -610,6 +612,10 @@ pub struct LlmClient {
     /// [`plan::replay_without_ids`] ao corpo do modo plano.
     #[cfg(test)]
     test_plan_replay_fix: bool,
+    /// Só nos testes (spec 133 T09, teste real): cabeçalhos extras do pedido em stream, para medir
+    /// a hipótese da afinidade de sessão (`session_id`) do cliente oficial. O produto não os envia.
+    #[cfg(test)]
+    test_headers: Vec<(&'static str, String)>,
 }
 
 /// Limitador compartilhado e o id da conexão (a chave é completada pelo modelo do pedido).
@@ -676,6 +682,8 @@ impl LlmClient {
             test_tool_choice: None,
             #[cfg(test)]
             test_plan_replay_fix: false,
+            #[cfg(test)]
+            test_headers: Vec::new(),
         })
     }
 
@@ -928,6 +936,7 @@ impl LlmClient {
                 // O limite é a causa mais informativa: vale como erro final se os transitórios
                 // seguintes se esgotarem.
                 first = Some(failed.err);
+                evidence::note_retry();
                 continue;
             }
             let bad = match &failed.err {
@@ -945,6 +954,7 @@ impl LlmClient {
                 if self.pause(delay, cancel).await {
                     return Err(failed.err);
                 }
+                evidence::note_retry();
                 continue;
             }
             if !is_transient(&failed.err) || final_now() {
@@ -961,6 +971,7 @@ impl LlmClient {
                 first = Some(failed.err);
             }
             attempt += 1;
+            evidence::note_retry();
         }
     }
 
@@ -1053,7 +1064,8 @@ impl LlmClient {
     /// Reenvio interno do mesmo pedido (recusa de um campo opcional com HTTP 400): conta mais uma
     /// requisição na janela do par, sem espera e sem custo em tokens (o `usage` fica com a vaga da
     /// tentativa).
-    fn note_resend(&self, model: &str) {
+    fn note_resend(&self, model: &str, step: &'static str) {
+        evidence::note_relax(step);
         if let Some(link) = &self.pace {
             link.pacer.record(&link.conn, model, 0);
         }
@@ -1096,6 +1108,7 @@ impl LlmClient {
 
     /// Cabeçalhos de cota de uma resposta do `model` para o limitador, quando ligado.
     fn observe_quota(&self, model: &str, headers: &reqwest::header::HeaderMap) {
+        evidence::note_headers(headers);
         if let Some(link) = &self.pace {
             if let Some(quota) = Quota::from_headers(headers) {
                 link.pacer.observe(&link.conn, model, &quota);
@@ -1189,6 +1202,7 @@ impl LlmClient {
         // Spec 122 T05: a chave de cache recusada sai uma vez (só existe no corpo Responses).
         let mut cache = req.cache_key.is_some();
         loop {
+            let step;
             let cache_key = if cache { req.cache_key.clone() } else { None };
             let attempt = ChatRequest { web_search: web, cache_key, ..req.clone() };
             let builder = self
@@ -1202,14 +1216,17 @@ impl LlmClient {
             }
             if status.as_u16() == 400 && cache && rejects_cache_key(&body) {
                 cache = false;
+                step = "cache_key";
             } else if status.as_u16() == 400 && web && rejects_web_search(&body) {
                 web = false;
+                step = "web_search";
             } else if status.as_u16() == 400 && effort.is_some() && rejected(&body) {
                 effort = None;
+                step = "effort";
             } else {
                 return Err(Failed { err: self.http_error(status.as_u16(), &body), retry_after: after });
             }
-            self.note_resend(&req.model);
+            self.note_resend(&req.model, step);
         }
     }
 
@@ -1320,6 +1337,7 @@ impl LlmClient {
             .await
             .map_err(transport_error)?;
         let status = resp.status();
+        evidence::note_headers(resp.headers());
         if let Some(model) = model {
             self.observe_quota(model, resp.headers());
         }
@@ -1452,6 +1470,8 @@ impl LlmClient {
             // Spec 114 T05: o diagnóstico conta o tempo desde o envio do pedido.
             let mut diag = StreamDiag::new(prompt_estimate);
             let authorized = self.authorize(builder, &token).map_err(Failed::from)?;
+            #[cfg(test)]
+            let authorized = self.test_headers.iter().fold(authorized, |b, (name, value)| b.header(*name, value));
             let mut resp = tokio::time::timeout(self.timeout, authorized.send())
                 .await
                 .map_err(|_| LlmError::Timeout)?
@@ -1467,7 +1487,7 @@ impl LlmClient {
                     if let Some(param) = unsupported_param(&body, &text).filter(|_| removed.is_none()) {
                         *removed_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(param.clone());
                         removed = Some(param);
-                        self.note_resend(&req.model);
+                        self.note_resend(&req.model, "param");
                         continue;
                     }
                     return Err(Failed { err: self.fail(400, &text).await, retry_after: after });
@@ -1475,8 +1495,9 @@ impl LlmClient {
                 if self.renew_after_401(status.as_u16(), &text, &mut renewed).await {
                     continue;
                 }
+                let before = opts;
                 if status.as_u16() == 400 && opts.relax(&text, responses) {
-                    self.note_resend(&req.model);
+                    self.note_resend(&req.model, opts.step_since(&before));
                     continue;
                 }
                 return Err(Failed { err: self.fail(status.as_u16(), &text).await, retry_after: after });
@@ -1623,6 +1644,9 @@ impl LlmClient {
     /// Erro de uma resposta HTTP de falha. No modo plano (spec 116 T02), os códigos do plano viram
     /// o erro próprio ([`plan::class_error`]) e um 401 é sempre "precisa entrar de novo".
     fn http_error(&self, status: u16, body: &str) -> LlmError {
+        // Spec 133 T01: a evidência do erro (status, códigos, request-id e a mensagem redigida)
+        // fica no rastro da chamada, para a falha final do papel.
+        evidence::note_http_error(status, body, &self.secret());
         if self.plan.is_some() {
             let (code, _) = plan::body_error_parts(body);
             if let Some(err) = code.as_deref().and_then(|c| plan::class_error(&plan::classify(c)?, c)) {
@@ -1866,7 +1890,7 @@ fn parse_response(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmEr
     let wire: WireResponse =
         serde_json::from_str(body).map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)))?;
     if let Some(error) = wire.error.as_ref().filter(|e| !e.is_null()) {
-        return Err(LlmError::Parse(BadReason::provider_error(error)));
+        return Err(limit::event_error(error));
     }
     let choice = wire
         .choices
@@ -2114,6 +2138,15 @@ pub(crate) fn rewrite_call_arguments(msg: &mut ChatMessage, id: &str, arguments:
     gemini::rewrite_function_call(items, id, arguments);
 }
 
+/// Spec 133 T04 (C-03): o histórico foi alterado antes desta mensagem do assistente (compactação).
+/// Os blocos de raciocínio da Anthropic ficam presos ao prefixo em que nasceram e saem do item
+/// guardado ([`anthropic::drop_thinking`]); os demais itens ficam como estão.
+pub(crate) fn release_prefix_reasoning(msg: &mut ChatMessage) {
+    if let Some(items) = msg.provider_items.as_mut() {
+        anthropic::drop_thinking(items);
+    }
+}
+
 /// Texto dos `arguments` de um item `function_call`: ausente/null vira vazio.
 fn responses_arguments(item: &Value) -> String {
     match &item["arguments"] {
@@ -2182,7 +2215,7 @@ fn parse_responses(body: &str, fallback_used: bool) -> Result<ChatResponse, LlmE
     let wire: WireResponsesReply = serde_json::from_str(body)
         .map_err(|_| LlmError::Parse(BadReason::new(BadKind::InvalidJson)))?;
     if let Some(error) = wire.error.as_ref().filter(|e| !e.is_null()) {
-        return Err(LlmError::Parse(BadReason::provider_error(error)));
+        return Err(limit::event_error(error));
     }
     let truncated = match wire.status.as_deref() {
         Some("completed") => false,
@@ -2385,6 +2418,7 @@ pub fn retry_notice(reason: &BadReason, attempt: usize) -> String {
 }
 
 /// Campos opcionais do pedido em streaming; cada um é removido no máximo uma vez.
+#[derive(Debug, Clone, Copy)]
 struct StreamOpts {
     stream: bool,
     usage: bool,
@@ -2408,6 +2442,25 @@ impl StreamOpts {
         }
         if responses && self.summary && self.effort.is_some() {
             body["reasoning"]["summary"] = json!("auto");
+        }
+    }
+
+    /// Degrau aplicado desde `before` (spec 133 T01), para o registro de uso.
+    fn step_since(&self, before: &Self) -> &'static str {
+        if self.cache != before.cache {
+            "cache_key"
+        } else if self.web != before.web {
+            "web_search"
+        } else if self.summary != before.summary {
+            "reasoning_summary"
+        } else if self.usage != before.usage {
+            "stream_usage"
+        } else if self.stream != before.stream {
+            "stream"
+        } else if self.effort != before.effort {
+            "effort"
+        } else {
+            "other"
         }
     }
 
@@ -2599,12 +2652,12 @@ impl SseAcc {
                         return Ok(true);
                     }
                     "response.failed" => {
-                        return Err(LlmError::Parse(BadReason::provider_error(&v["response"]["error"])));
+                        return Err(limit::event_error(&v["response"]["error"]));
                     }
                     // `error` traz `code` no topo (ou, em alguns provedores, dentro de `error`).
                     "error" => {
                         let error = if v["error"].is_object() { &v["error"] } else { &v };
-                        return Err(LlmError::Parse(BadReason::provider_error(error)));
+                        return Err(limit::event_error(error));
                     }
                     _ => {}
                 }
@@ -2621,7 +2674,7 @@ impl SseAcc {
                     return Ok(false);
                 };
                 if let Some(error) = v.get("error").filter(|e| !e.is_null()) {
-                    return Err(LlmError::Parse(BadReason::provider_error(error)));
+                    return Err(limit::event_error(error));
                 }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     let n = |k: &str| u32::try_from(u[k].as_u64().unwrap_or(0)).unwrap_or(u32::MAX);

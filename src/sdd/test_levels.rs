@@ -187,6 +187,40 @@ impl SuiteLedger {
     }
 }
 
+impl SuiteLedger {
+    /// Spec 133 T05: há uma rodada de `command` sobre a árvore `tree` (antes e depois iguais), no
+    /// mesmo ambiente e lugar, que falhou e cuja saída satisfaz `same` (as mesmas linhas de falha), e
+    /// nenhuma dessas rodadas passou (passou e depois falhou é sinal de instabilidade: na dúvida,
+    /// o runner repete).
+    pub fn same_failure(
+        &self,
+        command: &str,
+        tree: &str,
+        environment: &str,
+        in_container: bool,
+        same: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        let command = command.trim();
+        if tree.is_empty() || command.is_empty() {
+            return false;
+        }
+        let state = self.state();
+        let runs: Vec<&SuiteRun> = state
+            .runs
+            .iter()
+            .filter(|r| {
+                r.run.command == command
+                    && r.run.tree_before.as_deref() == Some(tree)
+                    && r.run.tree_after.as_deref() == Some(tree)
+                    && r.environment == environment
+                    && r.run.in_container == in_container
+            })
+            .map(|r| &r.run)
+            .collect();
+        !runs.iter().any(|r| r.passed) && runs.iter().any(|r| same(&r.output))
+    }
+}
+
 /// Hash dos arquivos de trava em `dir` (caminho, tamanho e conteúdo de cada um; o ausente conta
 /// como ausente): muda quando qualquer um muda, aparece ou some.
 pub fn lock_hash(dir: &Path, lockfiles: &[String]) -> String {

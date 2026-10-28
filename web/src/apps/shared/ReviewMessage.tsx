@@ -192,15 +192,19 @@ export function ReviewDecisionList({ decisions }: { decisions: readonly ReviewDe
   );
 }
 
-/** Matriz de critérios: ícone de atendido ou não atendido, com o nome acessível. */
+/** Matriz de critérios: ícone de atendido, não atendido ou não verificado (spec 133 T06), com o nome acessível. */
 export function ReviewerChecklist({ items }: { items: readonly ChecklistItem[] }) {
   const { t } = useT();
+  const state = (item: ChecklistItem) => (item.unverified === true ? "unverified" : item.met ? "true" : "false");
+  const label = (item: ChecklistItem) =>
+    item.unverified === true ? t("review.unverified") : item.met ? t("review.met") : t("review.unmet");
+  const icon = (item: ChecklistItem) => (item.unverified === true ? "alert" : item.met ? "check" : "close");
   return (
     <ul aria-label={t("review.criteria")} className="nd-criteria">
       {items.map((item, index) => (
-        <li key={index} className="nd-criterion" data-met={item.met ? "true" : "false"}>
-          <span role="img" aria-label={item.met ? t("review.met") : t("review.unmet")} className="nd-criterion-mark">
-            <Icon name={item.met ? "check" : "close"} size={14} />
+        <li key={index} className="nd-criterion" data-met={state(item)}>
+          <span role="img" aria-label={label(item)} className="nd-criterion-mark">
+            <Icon name={icon(item)} size={14} />
           </span>
           <span className="nd-criterion-text">{item.text}</span>
         </li>

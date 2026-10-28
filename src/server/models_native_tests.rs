@@ -307,6 +307,9 @@ async fn cada_erro_vira_codigo_fixo_sem_a_chave() {
     let spend = format!(
         r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"enforced_spend_limit_reached: {KEY}"}}}}"#
     );
+    let credit = format!(
+        r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"Your credit balance is too low {KEY}"}}}}"#
+    );
     let gemini_key = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#;
     let gemini_daily = format!(r#"{{"error":{{"code":"quota_exceeded","message":"cota do dia {KEY}"}}}}"#);
     let gemini_404 = format!(r#"{{"error":{{"message":"Model 'x' not found {KEY}","code":"not_found"}}}}"#);
@@ -316,6 +319,10 @@ async fn cada_erro_vira_codigo_fixo_sem_a_chave() {
         (ConnectionKind::Anthropic, 404, anthropic_error("not_found_error"), "model_not_found", "unsupported"),
         (ConnectionKind::Anthropic, 429, anthropic_error("rate_limit_error"), "rate_limited", "rate_limited"),
         (ConnectionKind::Anthropic, 429, spend.clone(), "spend_limit", "spend_limit"),
+        // Spec 133 T02: a cobrança (402) e o crédito esgotado (400 "credit balance") da Anthropic.
+        (ConnectionKind::Anthropic, 402, anthropic_error("billing_error"), "billing", "billing"),
+        (ConnectionKind::Anthropic, 400, credit.clone(), "billing", "billing"),
+        (ConnectionKind::GoogleGemini, 402, gemini_error(402, "PAYMENT_REQUIRED", "x"), "billing", "billing"),
         (ConnectionKind::GoogleGemini, 400, gemini_key.to_string(), "auth_invalid", "auth_invalid"),
         (ConnectionKind::GoogleGemini, 401, gemini_error(401, "UNAUTHENTICATED", "x"), "auth_invalid", "auth_invalid"),
         (ConnectionKind::GoogleGemini, 403, gemini_error(403, "PERMISSION_DENIED", "x"), "forbidden", "forbidden"),
@@ -346,7 +353,9 @@ fn classificacao_mantem_o_vocabulario_de_sempre_fora_dos_codigos_novos() {
     assert_eq!(classify(&http(400, "campo recusado"), true).code, "http_error");
     assert_eq!(classify(&http(400, "campo recusado"), true).status, Some(400));
     assert_eq!(classify(&http(500, ""), false).code, "http_error");
-    assert_eq!(classify(&http(429, "Spend limit reached for the org"), false), SPEND_LIMIT);
+    assert_eq!(classify(&http(429, r#"{"type":"error","error":{"type":"rate_limit_error","message":"Spend limit reached for the org"}}"#), false), SPEND_LIMIT);
+    assert_eq!(classify(&http(429, "Spend limit reached for the org"), false), RATE_LIMITED, "só o error.message do JSON conta");
+    assert_eq!(classify(&http(402, ""), false), BILLING);
     assert_eq!(classify(&LlmError::Timeout, true).code, "timeout");
     assert_eq!(classify(&LlmError::Config("x".into()), true).code, "invalid_config");
 }

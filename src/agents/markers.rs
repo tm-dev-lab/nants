@@ -17,6 +17,11 @@ pub const CRITERIA: &str = "runner.marker.criteria";
 pub const MET: &str = "runner.marker.met";
 /// Situação do critério não atendido na linha do Desenvolvedor.
 pub const NOT_MET: &str = "runner.marker.not_met";
+/// Spec 133 T07: situação do critério atendido só em parte na linha do Desenvolvedor.
+pub const PARTIAL: &str = "runner.marker.partial";
+/// Spec 133 T07: título da seção da resposta final do Desenvolvedor com os avisos explícitos
+/// (o que fica conhecido e sem resolver fora dos critérios).
+pub const DEV_PENDING: &str = "runner.marker.dev_pending";
 /// Título da seção da resposta final do Desenvolvedor com as respostas aos apontamentos.
 pub const DEV_RESPONSES: &str = "runner.marker.dev_responses";
 /// Rótulos do veredito na primeira linha da mensagem do Revisor (spec 078).
@@ -92,21 +97,36 @@ pub fn contains_any(line: &str, key: &str) -> bool {
     i18n::forms(key).iter().any(|form| text.contains(&fold(form)))
 }
 
+/// Spec 133 T07: situação que o Desenvolvedor declara para um critério.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriterionMark {
+    Met,
+    Partial,
+    NotMet,
+}
+
 /// Spec 131 T02: situação de uma linha de critério do Desenvolvedor (`- critério: atendido: evidência`),
-/// em qualquer idioma do dicionário: `Some((true, evidência))` no atendido, `Some((false, resto))`
-/// no não atendido e `None` sem a marca. O texto devolvido sai normalizado (minúsculas, sem acentos).
-pub fn criterion_status(line: &str) -> Option<(bool, String)> {
+/// em qualquer idioma do dicionário: atendido com a evidência, parcial (spec 133 T07) ou não
+/// atendido com o resto da linha, e `None` sem a marca. O texto devolvido sai normalizado
+/// (minúsculas, sem acentos).
+pub fn criterion_status(line: &str) -> Option<(CriterionMark, String)> {
     let text = fold(line);
-    for form in i18n::forms(NOT_MET) {
-        let pattern = format!(": {}", fold(form));
-        if let Some(at) = text.find(&pattern) {
-            return Some((false, text[at + pattern.len()..].to_string()));
+    for (key, mark) in [(NOT_MET, CriterionMark::NotMet), (PARTIAL, CriterionMark::Partial)] {
+        for form in i18n::forms(key) {
+            let pattern = format!(": {}", fold(form));
+            if let Some(at) = text.find(&pattern) {
+                let rest = &text[at + pattern.len()..];
+                // A forma precisa terminar ali (`: parcial:` ou fim), para "partly metal" não contar.
+                if rest.is_empty() || rest.starts_with([':', ' ', ',', '.', ';', '(']) {
+                    return Some((mark, rest.trim_start_matches(':').trim().to_string()));
+                }
+            }
         }
     }
     for form in i18n::forms(MET) {
         let pattern = format!(": {}:", fold(form));
         if let Some(at) = text.find(&pattern) {
-            return Some((true, text[at + pattern.len()..].trim().to_string()));
+            return Some((CriterionMark::Met, text[at + pattern.len()..].trim().to_string()));
         }
     }
     None
@@ -132,7 +152,7 @@ mod tests {
 
     #[test]
     fn every_marker_has_a_form_per_language() {
-        for key in [CRITERIA, MET, NOT_MET, DEV_RESPONSES, VERDICT_APPROVED, VERDICT_CHANGES, FINDINGS, OBSERVATIONS, RESOLVED]
+        for key in [CRITERIA, MET, NOT_MET, PARTIAL, DEV_PENDING, DEV_RESPONSES, VERDICT_APPROVED, VERDICT_CHANGES, FINDINGS, OBSERVATIONS, RESOLVED]
             .into_iter()
             .chain([RESPONSES, DECISIONS, CAPTURES, SCENARIO, LOW_CONFIDENCE, UNCHANGED_FILE, STATE_NEW, FINAL_VERIFICATION, HUMAN_CHECK, STEP_LIMIT, UNVERIFIED_STEP_LIMIT])
         {
@@ -144,11 +164,25 @@ mod tests {
 
     #[test]
     fn criterion_status_reads_both_languages() {
-        assert_eq!(criterion_status("- A: met: `tests/a.py::t`"), Some((true, "`tests/a.py::t`".into())));
-        assert_eq!(criterion_status("- Critério B: atendido: src/b.rs:3"), Some((true, "src/b.rs:3".into())));
-        assert!(matches!(criterion_status("- A: not met: falta X"), Some((false, _))));
-        assert!(matches!(criterion_status("- B: não atendido: falta Y"), Some((false, _))));
+        use CriterionMark::*;
+        assert_eq!(criterion_status("- A: met: `tests/a.py::t`"), Some((Met, "`tests/a.py::t`".into())));
+        assert_eq!(criterion_status("- Critério B: atendido: src/b.rs:3"), Some((Met, "src/b.rs:3".into())));
+        assert_eq!(criterion_status("- A: not met: falta X"), Some((NotMet, "falta x".into())));
+        assert!(matches!(criterion_status("- B: não atendido: falta Y"), Some((NotMet, _))));
         assert_eq!(criterion_status("- só texto"), None);
+    }
+
+    /// Spec 133 T07: o parcial nos dois idiomas, distinto do atendido e do não atendido.
+    #[test]
+    fn criterion_status_reads_partial_in_both_languages() {
+        use CriterionMark::*;
+        assert_eq!(criterion_status("- 2. A: partly met: falta o celular"), Some((Partial, "falta o celular".into())));
+        assert_eq!(criterion_status("- 3. Critério B: Parcial: falta a coluna"), Some((Partial, "falta a coluna".into())));
+        assert_eq!(criterion_status("- C: parcial"), Some((Partial, String::new())));
+        assert_eq!(text(Lang::PtBr, PARTIAL), "parcial");
+        assert_eq!(text(Lang::En, PARTIAL), "partly met");
+        // "parcialmente" na evidência de um atendido não vira parcial.
+        assert_eq!(criterion_status("- D: met: parcialmente coberto em src/d.rs:1").map(|(m, _)| m), Some(Met));
     }
 
     #[test]

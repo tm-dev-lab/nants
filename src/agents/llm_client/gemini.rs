@@ -192,6 +192,21 @@ impl Opts {
         false
     }
 
+    /// Degrau aplicado desde `before` (spec 133 T01), para o registro de uso.
+    pub fn step_since(&self, before: &Self) -> &'static str {
+        if self.web != before.web {
+            "web_search"
+        } else if self.thinking != before.thinking {
+            "thinking"
+        } else if self.summaries != before.summaries {
+            "thinking_summary"
+        } else if self.max_tokens != before.max_tokens {
+            "max_tokens"
+        } else {
+            "other"
+        }
+    }
+
     /// O pedido queria raciocínio e a escada desceu até sem ele.
     pub fn fallback_used(&self) -> bool {
         self.effort.is_some() && !self.thinking
@@ -435,7 +450,7 @@ pub(super) fn parse(body: &str, fallback_used: bool) -> Result<ChatResponse, Llm
 /// [`parse`] sobre o JSON já lido (a resposta sem stream ou a remontada do stream).
 fn parse_value(v: &Value, fallback_used: bool) -> Result<ChatResponse, LlmError> {
     if v.get("error").is_some_and(|e| !e.is_null()) {
-        return Err(LlmError::Parse(BadReason::provider_error(v)));
+        return Err(super::limit::event_error(v));
     }
     let status = v["status"].as_str();
     if !matches!(status, Some("completed" | "requires_action" | "incomplete")) {
@@ -518,8 +533,9 @@ impl LlmClient {
                 resp.billing = self.billing();
                 return Ok(resp);
             }
+            let before = opts;
             if status.as_u16() == 400 && opts.relax(&text) {
-                self.note_resend(&req.model);
+                self.note_resend(&req.model, opts.step_since(&before));
                 continue;
             }
             return Err(gemini_failed(self.http_error(status.as_u16(), &text), status.as_u16(), &text, after));
@@ -558,8 +574,9 @@ impl LlmClient {
             if !status.is_success() {
                 let after = retry_after(resp.headers());
                 let text = self.read_capped(&mut resp).await?;
+                let before = opts;
                 if status.as_u16() == 400 && opts.relax(&text) {
-                    self.note_resend(&req.model);
+                    self.note_resend(&req.model, opts.step_since(&before));
                     continue;
                 }
                 return Err(gemini_failed(self.http_error(status.as_u16(), &text), status.as_u16(), &text, after));
@@ -771,7 +788,7 @@ impl StreamAcc {
                 if super::limit::is_daily_quota_code(error) {
                     return Err(LlmError::Limit(super::ProviderLimit::DailyQuota));
                 }
-                return Err(LlmError::Parse(BadReason::provider_error(error)));
+                return Err(super::limit::event_error(error));
             }
             _ => {}
         }

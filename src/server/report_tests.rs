@@ -825,3 +825,27 @@ async fn traceability_redacts_long_secret_before_cutting_the_criterion() {
         assert!(!stored.contains(&LONG[..n]), "prefixo de {n} caracteres vazou: {stored}");
     }
 }
+
+/// Spec 133 T07: a pendência que a verificação final não resolveu chega ao relatório, na seção
+/// montada pelo servidor; a resolvida não.
+#[tokio::test]
+async fn report_appends_known_issues_left_open() {
+    let root = project("pending", false);
+    let spec_dir = root.join(".sdd/specs").join(SPEC);
+    let task = format!(
+        "{TASK_MD}\n## Pendências conhecidas\n- P-02: Aviso do Desenvolvedor: o link Entrar fica para depois\n\n\
+         ## Pendências resolvidas na verificação final\n- P-01: resolvida\n"
+    );
+    fs::write(spec_dir.join("tasks/T01.md"), task).expect("task");
+    let state = state(&root, true, Some(Scripted::new(vec![text(GOOD_REPORT)])));
+    let mut rx = state.events().subscribe();
+    let events = generate(&state, &mut rx).await;
+    assert_eq!(events[0].0, "report_ready", "{events:?}");
+    let stored = fs::read_to_string(report_path(&root)).expect("relatório");
+    assert!(stored.starts_with(GOOD_REPORT.trim_end()), "{stored}");
+    assert!(
+        stored.ends_with("## Pendências conhecidas\n\n- T01 P-02: Aviso do Desenvolvedor: o link Entrar fica para depois\n"),
+        "{stored}"
+    );
+    assert!(!stored.contains("P-01"), "{stored}");
+}

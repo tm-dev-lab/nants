@@ -718,6 +718,17 @@ impl ComposeEnv {
 
     /// `down --remove-orphans`, com `-v` só se `volumes`. Imagens são sempre mantidas. Idempotente.
     pub fn down_with(&self, dir: &Path, volumes: bool) -> Result<(), String> {
+        self.down_full(dir, volumes, false)
+    }
+
+    /// Spec 133 T12: como [`Self::down_with`], e apaga também as imagens que o Compose construiu
+    /// para o projeto (`--rmi local`: as do `build` sem `image` próprio, como
+    /// `nants-<id>-test-workspace`, que levam o rótulo `nants.project`). Só na remoção do projeto.
+    pub fn down_removing_images(&self, dir: &Path, volumes: bool) -> Result<(), String> {
+        self.down_full(dir, volumes, true)
+    }
+
+    fn down_full(&self, dir: &Path, volumes: bool, images: bool) -> Result<(), String> {
         let (_, ov, _) = self.load(dir)?;
         let mut tail = vec!["down"];
         if self.kind == ComposeKind::Run {
@@ -726,6 +737,9 @@ impl ComposeEnv {
         }
         if volumes {
             tail.push("-v");
+        }
+        if images {
+            tail.extend(["--rmi", "local"]);
         }
         tail.push("--remove-orphans");
         self.step(&self.call(dir, &ov, &tail, PREPARE_TIMEOUT), "down")
@@ -1337,6 +1351,13 @@ fn override_yaml_with(
     for name in service_names(doc) {
         let mut svc = Mapping::new();
         svc.insert("labels".into(), label.clone());
+        // Spec 133 T12: a imagem que o Compose constrói para o serviço também leva o rótulo (o
+        // Compose junta este `build` ao do arquivo do projeto, que segue com o contexto).
+        if doc.get("services").and_then(|s| s.get(name.as_str())).is_some_and(|s| s.get("build").is_some()) {
+            let mut build = Mapping::new();
+            build.insert("labels".into(), label.clone());
+            svc.insert("build".into(), Value::Mapping(build));
+        }
         if name == WORKSPACE_SERVICE {
             let mut bind = Mapping::new();
             bind.insert("type".into(), "bind".into());
@@ -1905,6 +1926,11 @@ mod tests {
         assert_eq!(ws["volumes"][0]["source"].as_str(), dir.canonicalize().expect("c").to_str());
         assert_eq!(v["services"]["db"]["labels"][0].as_str(), Some("nants.project=p1"));
         assert_eq!(v["volumes"]["data"]["labels"][0].as_str(), Some("nants.project=p1"));
+        // Spec 133 T12: a imagem construída para o projeto leva o rótulo; o contexto segue o do
+        // arquivo do projeto, e o serviço sem `build` não ganha um.
+        assert_eq!(ws["build"]["labels"][0].as_str(), Some("nants.project=p1"));
+        assert!(ws["build"].get("context").is_none() && ws["build"].get("dockerfile").is_none());
+        assert!(v["services"]["db"].get("build").is_none());
     }
 
     /// Spec 129 T05 (C-14): o padrão `${NANTS_WORKTREE:-..}` vale só para o uso manual; no Nants, o
@@ -2285,6 +2311,40 @@ mod tests {
         let out = result.expect("docker");
         assert!(out.success() && out.output.contains("ola") && out.output.contains("ok"), "{}", out.output);
     }
+    /// Teste real (spec 133 T12): imagem Alpine com `ENV PATH` próprio, construída pelo Compose. O
+    /// `/etc/profile` do Alpine refaz o `PATH` no `sh -lc`; o `.profile` da pasta pessoal o devolve,
+    /// e o programa do `PATH` da imagem é achado. A imagem construída leva o rótulo `nants.project`
+    /// e sai na remoção do projeto (`down --rmi local`).
+    /// `NANTS_TEST_REAL_DOCKER=1 cargo test -- --ignored real_login_shell_keeps_the_image_path`.
+    #[test]
+    #[ignore]
+    fn real_login_shell_keeps_the_image_path() {
+        let compose = "services:\n  workspace:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    command: sleep infinity\n    volumes:\n      - ${NANTS_WORKTREE}:/work\n";
+        let dir = project("realpath", compose);
+        fs::write(
+            dir.join(".nants/Dockerfile"),
+            "FROM alpine:3\nRUN mkdir -p /opt/nants-sonda/bin && printf '#!/bin/sh\\necho sonda-ok\\n' > /opt/nants-sonda/bin/nants-sonda && chmod +x /opt/nants-sonda/bin/nants-sonda\nENV PATH=/opt/nants-sonda/bin:$PATH\n",
+        )
+        .expect("Dockerfile");
+        let env = ComposeEnv::real(format!("itestpath{}", std::process::id()));
+        let env = env.with_approved_hashes(vec![env_hash(&dir).expect("hash")]);
+        let image = format!("{}-workspace", env.project_name());
+        let result = env.prepare(&dir).and_then(|()| env.exec(&dir, "command -v nants-sonda && nants-sonda && echo \"$PATH\"", Duration::from_secs(120)));
+        let label = Command::new("docker")
+            .args(["image", "inspect", "--format", "{{index .Config.Labels \"nants.project\"}}", image.as_str()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let down = env.down_removing_images(&dir, true);
+        let left = Command::new("docker").args(["image", "inspect", image.as_str()]).output().map(|o| o.status.success());
+        let out = result.expect("docker");
+        down.expect("down");
+        assert!(out.success() && out.output.contains("/opt/nants-sonda/bin/nants-sonda") && out.output.contains("sonda-ok"), "{}", out.output);
+        assert!(out.output.contains("/work/.nants-home/.local/bin:/opt/nants-sonda/bin:"), "{}", out.output);
+        assert_eq!(label.expect("inspect").as_str(), format!("itestpath{}", std::process::id()));
+        assert!(!left.expect("inspect"), "a imagem construída saiu com o down --rmi local");
+        fs::remove_dir_all(&dir).expect("apagável");
+    }
+
     /// Teste real: precisa de docker. O workspace roda com o uid do host e o reparo devolve a posse
     /// de arquivos criados como root. `NANTS_TEST_REAL_DOCKER=1 cargo test -- --ignored real_workspace_uid_and_repair`.
     #[test]

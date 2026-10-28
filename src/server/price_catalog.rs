@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::projects::format_utc;
+use crate::agents::cache_cost::CachePrices;
 use crate::config::{ConnectionKind, PriceSource, Pricing};
 
 pub const CATALOG_URL: &str =
@@ -284,6 +285,21 @@ pub fn cached_context_windows(dir: &Path, models: &[&str]) -> Vec<Option<u64>> {
     models.iter().map(|m| catalog.as_ref().and_then(|c| c.context_window(m))).collect()
 }
 
+/// Preços de cache dos modelos pelo catálogo já em cache (spec 133 T04, C-01), sem rede: a decisão
+/// de compactar pesa o custo de invalidar o cache do provedor. Cada modelo vai com o tipo da conexão
+/// dele ([`Catalog::lookup_for`]). O plano ChatGPT não cobra por token: `None`, como sem cache ou
+/// sem o modelo (vale a regra de compactar só pelo tamanho). Bloqueante: chamar fora do executor.
+pub fn cached_cache_prices(dir: &Path, models: &[(&str, ConnectionKind)]) -> Vec<Option<CachePrices>> {
+    let catalog = read_cache(dir);
+    models
+        .iter()
+        .map(|(model, kind)| {
+            let catalog = catalog.as_ref().filter(|_| *kind != ConnectionKind::ChatgptPlan)?;
+            catalog.lookup_for(model, *kind).as_ref().and_then(CachePrices::from_pricing)
+        })
+        .collect()
+}
+
 /// Atalho com o relógio real.
 pub async fn current_catalog(fetcher: &dyn PriceFetcher, dir: &Path, force: bool) -> Option<Catalog> {
     load_catalog(fetcher, dir, now_secs(), force).await
@@ -437,6 +453,28 @@ mod tests {
         }
         assert!(c.lookup("claude-sonnet").is_none(), "sem aproximação");
         assert!(c.lookup("gemini-flash").is_none(), "sem aproximação");
+        // Spec 133 T04: os preços de cache saem do catálogo em cache pelo modelo e pelo tipo; o
+        // plano ChatGPT não tem preço por token.
+        let dir = tmp("cache-prices");
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(cached_cache_prices(&dir, &[("claude-haiku-x", ConnectionKind::Anthropic)]), vec![None], "sem cache");
+        write_cache(&dir, &c);
+        let found = cached_cache_prices(
+            &dir,
+            &[
+                ("claude-haiku-x", ConnectionKind::Anthropic),
+                ("gemini-flash-x", ConnectionKind::GoogleGemini),
+                ("claude-haiku-x", ConnectionKind::ChatgptPlan),
+                ("outro", ConnectionKind::ApiKey),
+            ],
+        );
+        let near = |p: Option<CachePrices>, read: f64, rewrite: f64| {
+            p.is_some_and(|p| (p.read - read).abs() < 1e-9 && (p.rewrite - rewrite).abs() < 1e-9)
+        };
+        assert!(near(found[0], 0.1, 1.25), "{:?}", found[0]);
+        assert!(near(found[1], 0.03, 0.3), "Gemini sem escrita cobrada: a entrada; {:?}", found[1]);
+        assert_eq!(&found[2..], &[None, None]);
+        let _ = std::fs::remove_dir_all(&dir);
         // O cache antigo, sem o campo, continua carregando.
         let old: CatalogEntry = serde_json::from_str(r#"{"input":1.0,"output":2.0}"#).expect("antigo");
         assert_eq!(old.cache_write, None);

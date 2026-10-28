@@ -49,6 +49,17 @@ describe("queda da conexão no turno do Arquiteto", () => {
     expect(result.error.providerCode).toBe("provider_connect_failed");
   });
 
+  it("spec 133 T11: o 502 com failure_recorded leva o reason e os params da evidência", async () => {
+    const params = { provider: "provider_http_404", role: "architect", model: "m", connection_id: "c", category: "bad_request", status: 404, error_type: "not_found" };
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(502, { error: "x", code: "provider_failed", params, reason: "failure_recorded" })));
+    const result = await postChat("p1", "oi");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.reason).toBe("failure_recorded");
+    expect(result.error.providerCode).toBe("provider_http_404");
+    expect(result.error.params).toEqual(params);
+  });
+
   it("postChatContinue chama /chat/continue, com a spec quando houver, e lê a mesma resposta", async () => {
     const spy = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(200, { reply: "ok", draft_updated: false, turn_id: "ab" }));
     vi.stubGlobal("fetch", spy);

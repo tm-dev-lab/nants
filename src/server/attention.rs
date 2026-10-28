@@ -48,6 +48,42 @@ pub struct PausedOrStalled {
     pub analysis: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_options: Option<Vec<EscalationOption>>,
+    /// Parada pelo provedor (spec 133 T02): o `code` fixo da pausa ou da falha (`run.billing`,
+    /// `run.provider_failed`...), para o sino dizer o motivo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_code: Option<String>,
+    /// Papel que parou pelo provedor (`architect`, `developer` ou `reviewer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+}
+
+/// `code` das paradas pelo provedor, que o sino detalha com o papel.
+const PROVIDER_STOP_CODES: [&str; 8] = [
+    "run.provider_failed",
+    "run.provider_failed_detail",
+    "run.plan_limit",
+    "run.plan_not_eligible",
+    "run.plan_needs_login",
+    "run.spend_limit",
+    "run.daily_quota",
+    "run.billing",
+];
+
+/// O código e o papel da parada atual pelo provedor, lidos do diálogo da spec (só ids fixos).
+pub fn provider_stop(root: &Path, spec_id: &str) -> (Option<String>, Option<&'static str>) {
+    let Some(line) = super::dialog::last_run_stop(root, spec_id) else {
+        return (None, None);
+    };
+    let Some(code) = line.code.filter(|c| PROVIDER_STOP_CODES.contains(&c.as_str())) else {
+        return (None, None);
+    };
+    let role = line.params.as_ref().and_then(|p| p.get("role")).and_then(|v| v.as_str()).and_then(|r| match r {
+        "architect" => Some("architect"),
+        "developer" => Some("developer"),
+        "reviewer" => Some("reviewer"),
+        _ => None,
+    });
+    (Some(code), role)
 }
 
 /// Pendências lidas do disco de um projeto.

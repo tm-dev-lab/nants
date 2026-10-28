@@ -11,7 +11,7 @@ const CODE_RE = /^[a-z][a-z0-9_.]{0,63}$/;
 /** Nome de parâmetro: `[a-z0-9_]`, até 32 caracteres. */
 const PARAM_NAME_RE = /^[a-z0-9_]{1,32}$/;
 /** Teto de parâmetros e de cada texto (o servidor já corta em 512 bytes). */
-const MAX_PARAMS = 8;
+const MAX_PARAMS = 20;
 const MAX_PARAM_CHARS = 512;
 
 /** Texto com `code` e `params` neutros de idioma (rótulo da atividade, etapa). */

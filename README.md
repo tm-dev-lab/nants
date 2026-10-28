@@ -113,7 +113,21 @@ and you decide at every step.
   video device, display, cores, memory and how long the test suite takes) and tells the agents, so
   a criterion that needs something missing becomes a documented manual check. When the suite gets
   close to its time limit, you get a warning to split or focus it. A failed round is run once more
-  with no change, and if it passes the task goes on with a flaky test alert.
+  with no change, and if it passes the task goes on with a flaky test alert. When the round fails
+  with the same failure lines the Developer already saw on the same code, there is no extra round.
+- **A stopped Developer picks up where it left off.** When the Developer stops before finishing
+  (the step limit, the same call repeated with no progress, or no progress at all), Nants resumes
+  the work once, in a new session with what was done and what is left, before tests and review.
+  The resumption does not count as an attempt.
+- **Evidence that exists.** Nants checks every path the Reviewer cites as evidence against the
+  reviewed tree. When a cited file or line does not exist, the list goes back to the Reviewer once;
+  what is still invalid shows as **not verified** in the review and goes to the final check. The
+  final check is held to the same rule, and the Conversation warns about the criteria it left not
+  verified. A criterion the Developer declares not met or partly met needs an explicit answer from
+  the Reviewer.
+- **Known issues in the report.** What the Developer reports as pending, the criteria confirmed as
+  not met or partly met and those the environment cannot prove go into the task file, and the
+  ones the final check does not resolve show in the final report under **Known issues**.
 - **Tests that are not repeated for nothing.** When the Developer runs the project's exact quick
   test command or a blocking check and it passes on the code it delivers, Nants skips that run and
   says so in the task and the conversation. The full suite always runs once more by Nants, with
@@ -176,7 +190,8 @@ and you decide at every step.
   estimate of the tokens that later calls no longer resend.
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
 - **Your provider.** Any OpenAI compatible provider, Anthropic (Claude), Google Gemini (AI Studio)
-  or your ChatGPT plan, with one model per role.
+  or your ChatGPT plan, with one connection and one model per role. See
+  [Connections per role](#connections-per-role).
 - **No telemetry.** Your keys and your code stay on your computer.
 
 ## Requirements
@@ -248,9 +263,9 @@ becomes the thinking level. To price the cache writes that Anthropic bills separ
 **Cache write** under **Settings > Pricing**; the Costs window shows the tokens read from and
 written to the cache.
 
-When the Anthropic account reaches its spend limit, or the Gemini daily quota runs out, the run
-pauses and the Conversation says what to do: raise the limit in the Anthropic console, or wait for
-the quota to renew or switch the connection, then click **Continue**.
+When the account reaches a limit (credit, billing, the Anthropic spend limit or the Gemini daily
+quota), the run pauses with a card that lets you switch the connection of that role and continue.
+See [Connections per role](#connections-per-role).
 
 **Gemini through the OpenAI compatible layer.** An API key connection to
 `https://generativelanguage.googleapis.com/v1beta/openai/` (protocol Chat Completions) also works,
@@ -275,11 +290,47 @@ an API key. This feature is in preview.
 Usage counts against your plan, with no cost in dollars; the Costs window shows it as
 **ChatGPT plan**, in tokens. On Plus, the 5-hour usage limit is shared with your other apps that
 use the plan. Check it with **Manage usage** (<https://chatgpt.com/settings/usage>). When the limit
-is reached, the run pauses until you click **Continue**.
+is reached, the run pauses until you click **Continue**, or until you switch the connection of the
+role that reached it (see [Connections per role](#connections-per-role)).
 
 The sign-in is stored in the Nants data folder (`~/.local/share/nants`), in files readable only by
 your user. **Sign out**, on the connection row, revokes the access at OpenAI and deletes the
 sign-in from this computer. If Nants asks you to sign in again, use **Reconnect**.
+
+## Connections per role
+
+Each role (Architect, Developer and Reviewer) has its own connection and model, set in
+**Settings > Agents**, and they can be on different providers.
+
+- **In the Conversation.** The footer shows the role you are talking to, its model and its
+  connection (the name and the type). Click it to open **Connections in use**: the three roles,
+  each with its connection, model and state (available, or paused with the reason), a **Switch**
+  button and, when the provider has one, a link to the account limits or billing page. A switch is
+  saved in Agents and changes only that role. It applies when the run starts again (on
+  **Continue** or a new start); for the Architect, on the next conversation turn, while its part
+  in the run in progress changes only when the run starts again.
+- **When a provider fails.** The Conversation and the run card say which role failed, in which
+  task, through which connection and model, and why, in plain words: the key or sign-in was
+  refused, billing, quota, rate limit, the request was refused, the conversation no longer fits
+  the context, a failure on the provider side or a dropped connection. **Provider details**,
+  folded, shows the HTTP status, the provider's error type, code and parameter, the request id,
+  the connection type and the attempt. The provider's own message never reaches the screen.
+- **Limits that pause the run.** Waiting a few seconds does not fix these, so Nants pauses instead
+  of retrying: credit used up or a pending payment (any HTTP 402 and the billing error codes, at
+  any provider), the Anthropic spend limit of the account, organization or workspace, the Gemini
+  daily quota and the ChatGPT plan usage limit. The card names the role, the connection and the
+  model, links to the provider page when the provider has one and lets you pick another connection and model for that role
+  only, with **Switch and continue**, or **Continue without switching** once you fixed it at the
+  provider. With no other connection ready, it points you to Settings. Rate limits per minute only
+  slow the run down.
+- **The failure log.** Every final provider failure is recorded in the project, in
+  `.sdd/specs/<spec>/provider-errors.jsonl` (outside a spec, in
+  `.sdd/specs/.provider-errors.jsonl`). Each line has the time, the role, the connection, the
+  model, the task and attempt, the HTTP status, the provider's error type, code and parameter, the
+  request id, the Nants reason and the retries. Nants does not write the request it sent; the
+  provider's message may quote parts of it, and is kept only here, cut at 600 characters, with
+  your configured keys redacted. The file stays out of the project's repository and stops growing
+  at 1 MiB.
 
 ## Use it from your phone (local network)
 
@@ -374,6 +425,10 @@ executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized
 - **Your keys stay local.** API keys, including the Anthropic and Google Gemini ones, are stored
   only in your configuration file and are never shown in full, logged or sent to the browser. The ChatGPT plan sign-in stays in the data folder,
   readable only by your user, and is never logged or sent to the browser.
+- **Provider failures stay in the project.** Each failure is recorded in
+  `.sdd/specs/<spec>/provider-errors.jsonl`, out of the project's repository. Nants does not
+  write the request it sent there; the provider's message may quote parts of it, with your
+  configured keys redacted (see [SECURITY.md](SECURITY.md#provider-failure-log)).
 - The server listens only on your computer (`127.0.0.1`) by default.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).

@@ -428,6 +428,7 @@ fn record_usage(link: &ImageGenLink, usage: Option<Usage>, quality: &str) {
             cut: None,
             billing: Default::default(),
             context: None,
+            call: Default::default(),
         });
     }
 }

@@ -665,19 +665,19 @@ async fn every_throttle_code_is_retried_and_insufficient_quota_is_not() {
         assert_eq!(*count.lock().expect("lock"), 2, "{code}");
         assert_eq!(*waits.lock().expect("lock"), secs(&[5]), "{code}");
     }
-    // Crédito esgotado: falha como erro do provedor da 088 (sem o cronograma de limite).
+    // Crédito esgotado (spec 133 T02): pausa por cobrança, sem o cronograma de limite e sem as
+    // novas tentativas da 088.
     let (base, count) = server(vec![
-        http(200, "", "application/json", &chat_error("insufficient_quota")),
-        http(200, "", "application/json", &chat_error("insufficient_quota")),
         http(200, "", "application/json", &chat_error("insufficient_quota")),
         http(200, "", "application/json", OK_CHAT),
     ])
     .await;
     let (sleep, waits) = recorder();
-    let err = client(base, sleep).chat(&req()).await.expect_err("sem cronograma de limite");
-    assert_eq!(provider_failure(&err).describe(), "provider_bad_response (erro do provedor: insufficient_quota)");
-    assert_eq!(*count.lock().expect("lock"), 3, "só as 2 novas tentativas da 088");
-    assert_eq!(*waits.lock().expect("lock"), secs(&[2, 8]));
+    let err = client(base, sleep).chat(&req()).await.expect_err("pausa por cobrança");
+    assert!(matches!(err, LlmError::Limit(ProviderLimit::Billing)), "{err:?}");
+    assert_eq!(provider_failure(&err).describe(), "provider_billing");
+    assert_eq!(*count.lock().expect("lock"), 1, "sem nova tentativa");
+    assert!(waits.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]

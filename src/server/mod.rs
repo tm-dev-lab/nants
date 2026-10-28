@@ -45,6 +45,7 @@ pub mod price_catalog;
 pub mod prereqs;
 pub mod projects;
 pub mod projects_root;
+pub mod provider_errors;
 pub mod readiness;
 pub mod recovery;
 pub mod report;

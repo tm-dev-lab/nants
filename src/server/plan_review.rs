@@ -255,6 +255,11 @@ pub struct PlanReviewRecord {
     /// Vocabulário fixo; nunca texto remoto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Só com `unavailable` por falha do provedor (spec 133 T11): os `params` da evidência (a causa
+    /// fixa, o papel, a conexão, o modelo, a categoria, o status e os códigos do provedor). Nunca a
+    /// mensagem do provedor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<serde_json::Map<String, Value>>,
     /// Rodadas do ciclo de consenso corrente (spec 128 T02): apontamentos, decisões e motivos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rounds: Vec<ConsensusRound>,
@@ -284,6 +289,7 @@ impl PlanReviewRecord {
             status: status.to_string(),
             issues,
             detail,
+            failure: None,
             rounds: cycle.rounds.clone(),
             outcome: outcome.map(str::to_string),
             points: cycle.points.clone(),
@@ -302,6 +308,10 @@ pub struct PlanReviewView {
     /// Ciclo de consenso (spec 128 T02), para a tela da T05; ausente nos registros antigos.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consensus: Option<ConsensusView>,
+    /// Revisão indisponível por falha do provedor (spec 133 T11): os `params` da evidência, para a
+    /// tela dizer o papel, a conexão, o modelo e o motivo traduzido.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<serde_json::Map<String, Value>>,
 }
 
 /// Estado do ciclo de consenso exposto: rodada, fase, resumo e os pontos em aberto, em disputa e
@@ -365,6 +375,8 @@ struct ReviewerSetup {
     model: String,
     effort: Effort,
     backend: Arc<dyn ChatBackend>,
+    /// O papel como foi montado (spec 133 T01), para a evidência de uma falha.
+    stage: super::provider_errors::StageSetup,
 }
 
 async fn reviewer_setup(state: &AppState) -> Option<ReviewerSetup> {
@@ -383,7 +395,12 @@ async fn reviewer_setup(state: &AppState) -> Option<ReviewerSetup> {
         Some(backend) => backend,
         None => Arc::new(client),
     };
-    Some(ReviewerSetup { model: agent.model, effort: agent.effort, backend })
+    let stage = super::provider_errors::StageSetup {
+        role: "reviewer",
+        model: agent.model.clone(),
+        connection: Some(super::provider_errors::connection_ref(&connection)),
+    };
+    Some(ReviewerSetup { model: agent.model, effort: agent.effort, backend, stage })
 }
 
 /// `true` quando o papel `reviewer` está configurado (a revisão do plano vai rodar).
@@ -551,8 +568,10 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
         let items = match reviewed.items {
             Ok(items) => items,
             Err(detail) => {
-                let record =
-                    PlanReviewRecord::of_cycle(reviewed.signature, STATUS_UNAVAILABLE, Vec::new(), Some(detail), Some(OUTCOME_UNAVAILABLE), &cycle);
+                let record = PlanReviewRecord {
+                    failure: reviewed.failure,
+                    ..PlanReviewRecord::of_cycle(reviewed.signature, STATUS_UNAVAILABLE, Vec::new(), Some(detail), Some(OUTCOME_UNAVAILABLE), &cycle)
+                };
                 if !save(root, spec_id, record).await {
                     return Stop::Failed;
                 }
@@ -1023,6 +1042,8 @@ struct Reviewed {
     signature: String,
     sizes: Vec<TaskSize>,
     items: Result<Vec<ReviewItem>, String>,
+    /// Falha do provedor (spec 133 T11): os `params` da evidência.
+    failure: Option<serde_json::Map<String, Value>>,
 }
 
 /// Uma revisão da versão atual (rodada `round`, com a memória `memo` a partir da rodada 1). `Err` em
@@ -1078,13 +1099,26 @@ async fn review_once(
         .with_usage(usage)
         .with_lang(state.project_lang(project_id));
     let mut shutdown = state.shutdown_signal();
-    let turn = reviewer.review_with_memory(root, &plan, memory_text.as_deref());
+    // Spec 133 T01: o rastro das chamadas da revisão dá a evidência da falha final do provedor.
+    let turn = Box::pin(crate::agents::llm_client::evidence::with_trace_scope(async {
+        let out = reviewer.review_with_memory(root, &plan, memory_text.as_deref()).await;
+        let trace = out.is_err().then(super::provider_errors::StageTrace::current).unwrap_or_default();
+        (out, trace)
+    }));
+    let mut failure_params = None;
     let answer = tokio::select! {
         biased;
         _ = wait_shutdown(&mut shutdown) => return Err(Stop::Shutdown),
         joined = tokio::time::timeout(state.report_timeout(), turn) => match joined {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(failure)) => Err(failure.describe()),
+            Ok((Ok(text), _)) => Ok(text),
+            Ok((Err(failure), trace)) => {
+                let evidence = super::provider_errors::record_stage_failure(
+                    &secrets, project_id, root, Some(spec_id), "plan_review", &setup.stage, &failure, trace,
+                )
+                .await;
+                failure_params = Some(super::provider_errors::stage_failure_params(&secrets, &failure, &evidence));
+                Err(failure.describe())
+            }
             Err(_) => Err(DETAIL_TIMEOUT.to_string()),
         },
     };
@@ -1096,7 +1130,7 @@ async fn review_once(
         },
         Err(why) => Err(why),
     };
-    Ok(Reviewed { signature, sizes, items })
+    Ok(Reviewed { signature, sizes, items, failure: failure_params })
 }
 
 /// Tarefas do plano que formam ciclo pelo `depends_on` (spec 128 T04); vazio sem ciclo. Com ciclo
@@ -1477,7 +1511,7 @@ pub(super) fn write_local_file(root: &Path, rel: &str, file_name: &str, body: &s
 /// gravado, só se a assinatura bate com o conteúdo atual (redigido de novo na leitura).
 pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<PlanReviewView> {
     if task_names(root, spec_id).is_empty() {
-        return Some(PlanReviewView { status: STATUS_INCOMPLETE, at: None, issues: Vec::new(), consensus: None });
+        return Some(PlanReviewView { status: STATUS_INCOMPLETE, at: None, issues: Vec::new(), consensus: None, failure: None });
     }
     if let Some(progress) = running_progress(root, spec_id) {
         let consensus = ConsensusView {
@@ -1487,7 +1521,7 @@ pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<PlanRevie
             evaluating: progress.evaluating,
             ..ConsensusView::default()
         };
-        return Some(PlanReviewView { status: STATUS_RUNNING, at: None, issues: Vec::new(), consensus: Some(consensus) });
+        return Some(PlanReviewView { status: STATUS_RUNNING, at: None, issues: Vec::new(), consensus: Some(consensus), failure: None });
     }
     let record = read_record(root, spec_id)?;
     if plan_signature(root, spec_id)? != record.signature {
@@ -1506,7 +1540,13 @@ pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<PlanRevie
         .map(|i| clean_issue(secrets, i))
         .collect();
     let consensus = consensus_view(&record, &issues, secrets);
-    Some(PlanReviewView { status, at: Some(scrub_text(secrets, &record.at)), issues, consensus })
+    // Spec 133 T11: a evidência da falha, saneada como os `params` das mensagens.
+    let failure = record
+        .failure
+        .as_ref()
+        .filter(|_| status == STATUS_UNAVAILABLE)
+        .map(|params| super::events::message_params(secrets, params));
+    Some(PlanReviewView { status, at: Some(scrub_text(secrets, &record.at)), issues, consensus, failure })
 }
 
 /// Apontamento lido de novo para a vista: tarefa e id válidos, texto redigido.
@@ -1677,7 +1717,7 @@ pub fn view_at(root: &Path, spec_id: &str, secrets: &SecretSet, reviewer: bool, 
         Err(_) => PENDING_WINDOW,
     };
     let status = if age < PENDING_WINDOW { STATUS_PENDING } else { STATUS_STALE };
-    Some(PlanReviewView { status, at: None, issues: Vec::new(), consensus: None })
+    Some(PlanReviewView { status, at: None, issues: Vec::new(), consensus: None, failure: None })
 }
 
 /// Última alteração do plano: maior `mtime` entre o `spec.md` e as `tasks/*.md` (sem symlink).

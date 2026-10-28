@@ -616,6 +616,11 @@ fn tool_label_full(name: &str, arguments: &str) -> String {
         // Spec 131 T06: a leitura de uma seção da spec (ou do índice, com `list`).
         "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => "lendo o índice da spec".to_string(),
         "read_spec_section" => format!("lendo a seção {} da spec", arg("title")),
+        // Spec 133 T08: toda ferramenta registrada tem rótulo próprio; "usando" fica para a desconhecida.
+        "run_browser_tests" => format!("rodando os testes de navegador `{}`", arg("command")),
+        "diff_file" => format!("vendo o diff de {}", arg("path")),
+        "ask_architect" => "perguntando ao Arquiteto".to_string(),
+        "request_environment_change" => "pedindo uma mudança no ambiente".to_string(),
         other => format!("usando {other}"),
     };
     label
@@ -697,6 +702,11 @@ pub fn tool_code(name: &str, arguments: &str) -> ActivityCode {
         // Spec 131 T06: rótulo próprio, com o título da seção (a tela o mostra no idioma dela).
         "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => c("tool.read_spec_index", &[]),
         "read_spec_section" => c("tool.read_spec_section", &[("title", arg("title"))]),
+        // Spec 133 T08: toda ferramenta registrada tem código próprio; `tool.other` só para a desconhecida.
+        "run_browser_tests" => c("tool.run_browser_tests", &[("command", arg("command"))]),
+        "diff_file" => c("tool.diff_file", &[("path", arg("path"))]),
+        "ask_architect" => c("tool.ask_architect", &[]),
+        "request_environment_change" => c("tool.request_environment_change", &[]),
         other => c("tool.other", &[("name", other.to_string())]),
     }
 }
@@ -1177,6 +1187,28 @@ mod tests {
         assert_eq!(tool_label("run_command", r#"{"command":"ls"}"#), "rodando `ls`");
         let long = format!(r#"{{"path":"{}"}}"#, "x".repeat(500));
         assert!(tool_label("write_file", &long).len() <= MAX_LABEL_BYTES);
+    }
+
+    /// Spec 133 T08: toda ferramenta registrada (as fixas e as condicionais) tem rótulo e código
+    /// próprios; `tool.other` e "usando" ficam só para a ferramenta desconhecida.
+    #[test]
+    fn every_registered_tool_has_its_own_label() {
+        use crate::harness::tools::ToolName;
+        let args = r#"{"path":"src/a.rs","command":"npx playwright test","question":"q","name":"home","title":"T","url":"https://x.dev","ecosystem":"npm","pattern":"p","reason":"r"}"#;
+        for tool in ToolName::ALL.iter().chain(ToolName::CONDITIONAL.iter()) {
+            let name = tool.name();
+            assert_ne!(tool_code(name, args).code, "tool.other", "{name}");
+            assert!(!tool_label(name, args).starts_with("usando"), "{name}");
+        }
+        let browser = tool_code("run_browser_tests", r#"{"command":"npx playwright test"}"#);
+        assert_eq!(browser.code, "tool.run_browser_tests");
+        assert_eq!(browser.params.get("command"), Some(&Value::from("npx playwright test")));
+        assert_eq!(tool_label("run_browser_tests", r#"{"command":"npx playwright test"}"#), "rodando os testes de navegador `npx playwright test`");
+        assert_eq!(tool_code("diff_file", r#"{"path":"src/a.rs"}"#).params.get("path"), Some(&Value::from("src/a.rs")));
+        assert_eq!(tool_code("ask_architect", r#"{"question":"q"}"#).code, "tool.ask_architect");
+        assert_eq!(tool_code("request_environment_change", "{}").code, "tool.request_environment_change");
+        assert_eq!(tool_code("misterio", "{}").code, "tool.other");
+        assert_eq!(tool_label("misterio", "{}"), "usando misterio");
     }
 
     /// Spec 131 T06: `read_spec_section` tem rótulo próprio (antes saía "usando read_spec_section").

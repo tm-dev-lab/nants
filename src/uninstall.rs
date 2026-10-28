@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::i18n::{text, tr, Lang};
 
 /// Comando para a pessoa listar os recursos Docker dos projetos do Nants.
-pub const DOCKER_LIST_COMMAND: &str = "docker ps -a --filter label=nants.project && docker volume ls --filter label=nants.project && docker network ls --filter label=nants.project";
+pub const DOCKER_LIST_COMMAND: &str = "docker ps -a --filter label=nants.project && docker volume ls --filter label=nants.project && docker network ls --filter label=nants.project && docker image ls --filter label=nants.project";
 
 /// Comando de instalação, mostrado no fim.
 pub const INSTALL_COMMAND: &str = crate::server::doctor::INSTALL_COMMAND;

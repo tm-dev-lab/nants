@@ -1,7 +1,7 @@
 /*
- * Conversa com o plano ChatGPT (spec 116 T03): o indicador "Usando o plano ChatGPT" perto do campo
- * quando algum papel usa uma conexão pelo plano, e o cartão da pausa pelo plano ("Limite de uso
- * atingido" com Gerenciar uso e Continuar; novo login com Reconectar).
+ * Conversa com o plano ChatGPT (spec 116 T03): o rodapé com a conexão do papel (spec 133, no lugar
+ * do indicador "Usando o plano ChatGPT"), com o uso do plano no painel, e o cartão da pausa pelo
+ * plano ("Limite de uso atingido" com Gerenciar uso e Continuar; novo login com Reconectar).
  */
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -52,24 +52,52 @@ function stopWith(code: string): void {
   });
 }
 
-describe("indicador do plano", () => {
-  it("aparece perto do campo quando um papel usa o plano, com Gerenciar uso", async () => {
+/** Abre o painel "Conexões em uso" pelo rodapé da Conversa. */
+async function openPanel(): Promise<HTMLElement> {
+  const footer = document.querySelector<HTMLElement>("[data-role-conn-footer]");
+  if (footer === null) throw new Error("rodapé ausente");
+  await act(async () => {
+    fireEvent.click(within(footer).getByRole("button"));
+  });
+  await settle();
+  return screen.getByRole("dialog");
+}
+
+describe("rodapé com a conexão do papel (spec 133, no lugar do indicador do plano)", () => {
+  it("diz o papel, o modelo e a conexão; o uso do plano fica no painel", async () => {
     await open([PLAN]);
-    const indicator = document.querySelector<HTMLElement>("[data-plan-indicator]");
-    expect(indicator?.textContent).toBe("Usando o plano ChatGPTGerenciar uso");
-    expect(indicator?.closest(".nd-composer-dock")).not.toBeNull();
-    expect(within(indicator as HTMLElement).getByRole("link", { name: "Gerenciar uso" }).getAttribute("href")).toBe(PLAN_USAGE_URL);
+    const footer = document.querySelector<HTMLElement>("[data-role-conn-footer]");
+    expect(footer?.textContent).toContain("Arquiteto");
+    expect(footer?.textContent).toContain("model");
+    expect(footer?.textContent).toContain("ChatGPT (ana@x.com)");
+    expect(footer?.textContent).toContain("Plano ChatGPT");
+    expect(footer?.closest(".nd-composer-dock")).not.toBeNull();
+    expect(document.querySelector("[data-plan-indicator]")).toBeNull();
+    const panel = await openPanel();
+    expect(within(panel).getByRole("heading", { name: "Conexões em uso" })).toBeTruthy();
+    const architect = panel.querySelector<HTMLElement>("[data-conn-use='architect']");
+    expect(within(architect as HTMLElement).getByRole("link", { name: "Gerenciar uso" }).getAttribute("href")).toBe(PLAN_USAGE_URL);
+    expect(architect?.textContent).toContain("ana@x.com");
+    expect(panel.querySelectorAll("[data-conn-use]")).toHaveLength(3);
+    expect(findForbiddenGlyphs(panel)).toEqual([]);
   });
 
-  it("some sem conexão pelo plano nos papéis", async () => {
+  it("vale para qualquer tipo de conexão, sem o selo do plano", async () => {
     await open([KEY]);
-    expect(document.querySelector("[data-plan-indicator]")).toBeNull();
+    const footer = document.querySelector<HTMLElement>("[data-role-conn-footer]");
+    expect(footer?.textContent).toContain("OpenAI");
+    expect(footer?.textContent).toContain("Chave de API");
+    const panel = await openPanel();
+    expect(within(panel).queryByRole("link", { name: "Gerenciar uso" })).toBeNull();
   });
 
   it("em en", async () => {
     setLanguage("en", { persist: false });
     await open([PLAN]);
-    expect(document.querySelector("[data-plan-indicator]")?.textContent).toBe("Using ChatGPT planManage usage");
+    expect(document.querySelector("[data-role-conn-footer]")?.textContent).toContain("Architect");
+    const panel = await openPanel();
+    expect(within(panel).getByRole("heading", { name: "Connections in use" })).toBeTruthy();
+    expect(within(panel).getAllByRole("link", { name: "Manage usage" }).length).toBeGreaterThan(0);
   });
 });
 
@@ -130,7 +158,7 @@ describe("pausa pelos limites do provedor (spec 132 T09/T10)", () => {
     await settle();
     const article = card();
     expect(within(article).getByRole("heading", { name: "Teto de gasto atingido" })).toBeTruthy();
-    expect(article.textContent).toContain("Aumente o limite no console dela e use Continuar.");
+    expect(article.textContent).toContain("aumente o teto no console do provedor e use Continuar.");
     expect(within(article).getByRole("link", { name: "Abrir os limites da Anthropic" }).getAttribute("href")).toBe(ANTHROPIC_LIMITS_URL);
     expect(within(article).getByRole("button", { name: "Continuar" })).toBeTruthy();
     expect(within(article).queryByRole("link", { name: "Gerenciar uso" })).toBeNull();
@@ -143,7 +171,7 @@ describe("pausa pelos limites do provedor (spec 132 T09/T10)", () => {
     await settle();
     const article = card();
     expect(within(article).getByRole("heading", { name: "Cota diária esgotada" })).toBeTruthy();
-    expect(article.textContent).toContain("quando o dia virar e a cota renovar");
+    expect(article.textContent).toContain("use Continuar quando a cota renovar");
     expect(within(article).getByRole("button", { name: "Continuar" })).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(article).getByRole("button", { name: "Trocar de conexão" }));

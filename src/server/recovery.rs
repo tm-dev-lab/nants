@@ -360,6 +360,8 @@ pub async fn recover(
         && !loaded.environmental
         && loaded.rounds < MAX_AUTONOMOUS_ROUNDS;
     let mut forced = false;
+    // Spec 133 T13 (D2): os fatos da pergunta que gerou a decisão (a reforçada, se foi ela).
+    let mut asked_facts: Option<String> = None;
     let decision = if let Some(reason) = env_fix {
         forced = true;
         env_fix_decision(&scrub_text(scope.secrets, reason))
@@ -375,7 +377,8 @@ pub async fn recover(
         let yolo_mode = loaded.yolo && !loaded.environmental;
         let facts = format!("{}{}", loaded.facts, loaded.env_note);
         match decide(scope, &facts, task_id, shutdown, yolo_mode, autonomous).await {
-            Ok(decision) => {
+            Ok((decision, asked)) => {
+                asked_facts = Some(asked);
                 // Opções do ESCALATE: validadas pelo servidor; em YOLO uma opção `config` válida é
                 // aplicada sozinha (spec 073), dentro do limite de rodadas.
                 let decision = prepare_options(scope, &loaded, decision).await;
@@ -409,8 +412,13 @@ pub async fn recover(
     } else {
         decision
     };
+    // Spec 133 T13 (D2): a continuação da sessão abre com os fatos da pergunta que gerou a
+    // proposta (a reforçada do modo Automático, se foi ela).
+    let followup_facts = asked_facts.unwrap_or_else(|| {
+        model_facts(&format!("{}{}", loaded.facts, loaded.env_note), loaded.yolo && !loaded.environmental, autonomous, false)
+    });
     let decision = if decision.config.is_some() {
-        match apply_config_decision(scope, task_id, decision, shutdown).await {
+        match config_with_feedback(scope, &loaded, task_id, decision, shutdown, &followup_facts).await {
             Ok(decision) => decision,
             Err(Stop::Shutdown) => return Next::Shutdown,
             Err(Stop::Unavailable) => Decision::escalate(CAUSE_UNAVAILABLE),
@@ -517,19 +525,14 @@ pub async fn recover(
     ));
     let yolo_tag = if round && applied_retry { " [rodada autônoma]" } else { "" };
     let message = format!("Análise de recuperação #{cycle} ({announced}){yolo_tag}\n{text}");
+    let params = json!({"cycle": cycle, "decision": announced, "autonomous": u8::from(round && applied_retry)});
     deliver(
         scope.events,
         Some(scope.dialog),
         ApiEvent::new(
             EventType::AgentMessage,
             Some(scope.project_id.to_string()),
-            json!({
-                "agent": ARCHITECT_AGENT,
-                "text": scrub_text(scope.secrets, &message),
-                "task_id": task_id,
-                "attempt": Value::Null,
-                "seq": Value::Null,
-            }),
+            analysis_payload(scope.secrets, task_id, &message, CODE_ANALYSIS, params),
         ),
     );
     if applied_retry && migrated.is_some() {
@@ -942,7 +945,8 @@ fn is_escalate(decision: &Decision) -> bool {
 }
 
 /// Pergunta ao modelo com uma nova tentativa se indisponível/inválido (YOLO ou não) e, em YOLO,
-/// uma 2ª pergunta reforçada se ele escalar. Persistindo, devolve o ESCALATE.
+/// uma 2ª pergunta reforçada se ele escalar. Persistindo, devolve o ESCALATE. Junto da decisão vêm
+/// os fatos da pergunta que a gerou (spec 133 T13: a continuação da sessão abre com eles).
 async fn decide(
     scope: &Scope<'_>,
     base: &str,
@@ -950,7 +954,7 @@ async fn decide(
     shutdown: &mut watch::Receiver<bool>,
     yolo: bool,
     over_limit: bool,
-) -> Result<Decision, Stop> {
+) -> Result<(Decision, String), Stop> {
     let facts = model_facts(base, yolo, over_limit, false);
     let mut first = ask_model(scope, &facts, task_id, shutdown).await;
     // Indisponível: nova tentativa (e, em YOLO, uma 3ª antes de escalar).
@@ -967,25 +971,36 @@ async fn decide(
         .iter()
         .any(|o| o.kind == OptionKind::Config || (o.kind == OptionKind::Environment && o.files.is_some()));
     if !(yolo && is_escalate(&first)) || has_config_option {
-        return Ok(first);
+        return Ok((first, facts));
     }
-    match ask_model(scope, &model_facts(base, yolo, over_limit, true), task_id, shutdown).await {
-        Ok(second) => Ok(second),
+    let reinforced = model_facts(base, yolo, over_limit, true);
+    match ask_model(scope, &reinforced, task_id, shutdown).await {
+        Ok(second) => Ok((second, reinforced)),
         Err(Stop::Shutdown) => Err(Stop::Shutdown),
-        Err(Stop::Unavailable) => Ok(first),
+        Err(Stop::Unavailable) => Ok((first, facts)),
     }
 }
 
+/// Resultado de [`apply_config_decision`].
+enum Applied {
+    /// A decisão segue (correção gravada, ou ESCALATE por negação ou falha ao gravar).
+    Done(Decision),
+    /// Spec 133 T13 (D2): a validação do servidor recusou a proposta (forma, lista de comandos,
+    /// enfraquecimento ou repetição): `reason` é o motivo exato e `escalation` o ESCALATE de sempre.
+    Refused { reason: String, escalation: Decision },
+}
+
 /// Valida a proposta REVISE_CONFIG, pede aprovação (HITL; YOLO aprova sozinho) e grava a correção
-/// em `settings.yaml` (só o servidor grava). Qualquer problema vira ESCALATE com causa fixa.
+/// em `settings.yaml` (só o servidor grava). Qualquer problema vira ESCALATE com causa fixa; a
+/// recusa da validação volta como [`Applied::Refused`], para o Arquiteto corrigir uma vez.
 async fn apply_config_decision(
     scope: &Scope<'_>,
     task_id: &str,
     decision: Decision,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<Decision, Stop> {
+) -> Result<Applied, Stop> {
     let Some(proposal) = decision.config.clone() else {
-        return Ok(decision);
+        return Ok(Applied::Done(decision));
     };
     let (root, secrets) = (scope.root.to_path_buf(), Arc::clone(scope.secrets));
     let checked = tokio::task::spawn_blocking(move || validate_config(&root, &proposal, &secrets))
@@ -994,9 +1009,13 @@ async fn apply_config_decision(
     let change = match checked {
         Ok(change) => change,
         Err(reason) if reason.starts_with(CAUSE_CONFIG_WEAKENS) || reason.starts_with(CAUSE_CONFIG_REPEATS) => {
-            return Ok(Decision::escalate(&reason))
+            let escalation = Decision::escalate(&reason);
+            return Ok(Applied::Refused { reason, escalation });
         }
-        Err(reason) => return Ok(Decision::escalate(&format!("{CAUSE_CONFIG_INVALID}: {reason}"))),
+        Err(reason) => {
+            let escalation = Decision::escalate(&format!("{CAUSE_CONFIG_INVALID}: {reason}"));
+            return Ok(Applied::Refused { reason, escalation });
+        }
     };
     let approver = ProjectApprover::new(
         scope.project_id,
@@ -1018,16 +1037,85 @@ async fn apply_config_decision(
         approval = approver.approve_config_change(Some(task_id), &reason, &change.diff, &change.commands) => approval,
     };
     if approval == ApprovalDecision::Deny {
-        return Ok(Decision::escalate(CAUSE_CONFIG_DENIED));
+        return Ok(Applied::Done(Decision::escalate(CAUSE_CONFIG_DENIED)));
     }
     let (root, secrets) = (scope.root.to_path_buf(), Arc::clone(scope.secrets));
     let applied = tokio::task::spawn_blocking(move || write_config(&root, &change, &secrets))
         .await
         .map_err(|_| Stop::Unavailable)?;
     if applied.is_err() {
-        return Ok(Decision::escalate(CAUSE_CONFIG_SAVE));
+        return Ok(Applied::Done(Decision::escalate(CAUSE_CONFIG_SAVE)));
     }
-    Ok(decision)
+    Ok(Applied::Done(decision))
+}
+
+/// Spec 133 T13 (D2): aplica a proposta REVISE_CONFIG e, se a validação do servidor a recusar
+/// (no Test 10, o `$` recusado pela lista de comandos levou direto ao humano), volta ao Arquiteto
+/// UMA vez, na mesma sessão de recuperação ([`Turn::Followup`]: a mesma abertura, a resposta
+/// recusada e a correção com o motivo exato e o que a lista aceita). A nova resposta passa pelas
+/// mesmas regras (opções, ambiente, rodadas) e, se trouxer outra proposta, pela mesma validação;
+/// recusada de novo, ou sem resposta, escala como antes. Não abre ciclo novo nem conta rodada:
+/// os limites de ciclos e de rodadas autônomas ficam como estão, e não há laço.
+async fn config_with_feedback(
+    scope: &Scope<'_>,
+    loaded: &Loaded,
+    task_id: &str,
+    decision: Decision,
+    shutdown: &mut watch::Receiver<bool>,
+    facts: &str,
+) -> Result<Decision, Stop> {
+    let previous = refused_reply(&decision);
+    let (reason, escalation) = match apply_config_decision(scope, task_id, decision, shutdown).await? {
+        Applied::Done(decision) => return Ok(decision),
+        Applied::Refused { reason, escalation } => (reason, escalation),
+    };
+    let lang = scope.state.project_lang(scope.project_id).get();
+    let correction = refusal_correction(lang, &clean(scope.secrets, &reason));
+    let turn = Turn::Followup { previous: &previous, correction: &correction };
+    let second = match ask_raw(scope, facts, task_id, shutdown, turn).await {
+        Ok(raw) => match parse_decision(&raw) {
+            Some(decision) => decision,
+            None => return Ok(escalation),
+        },
+        Err(Stop::Shutdown) => return Err(Stop::Shutdown),
+        Err(Stop::Unavailable) => return Ok(escalation),
+    };
+    let second = restrict_environmental(loaded.environmental, prepare_options(scope, loaded, second).await);
+    if second.config.is_none() {
+        if is_escalate(&second) {
+            // O Arquiteto escalou: fica a causa da recusa, com as opções válidas que ele trouxe.
+            return Ok(Decision { options: second.options, discarded: second.discarded, ..escalation });
+        }
+        return Ok(second);
+    }
+    if loaded.environmental && loaded.yolo && loaded.rounds >= MAX_AUTONOMOUS_ROUNDS {
+        return Ok(escalation);
+    }
+    match apply_config_decision(scope, task_id, second, shutdown).await? {
+        Applied::Done(decision) => Ok(decision),
+        Applied::Refused { escalation, .. } => Ok(escalation),
+    }
+}
+
+/// A resposta recusada, como o Arquiteto a daria (JSON da decisão REVISE_CONFIG), para a
+/// continuação da sessão.
+fn refused_reply(decision: &Decision) -> String {
+    let mut reply = json!({"decision": "REVISE_CONFIG", "root_cause": decision.root_cause});
+    if let (Some(config), Some(map)) = (&decision.config, reply.as_object_mut()) {
+        if let Some(test) = &config.test_command {
+            map.insert("test_command".into(), Value::from(test.as_str()));
+        }
+        if let Some(checks) = &config.checks {
+            map.insert("checks".into(), serde_json::to_value(checks).unwrap_or(Value::Null));
+        }
+    }
+    reply.to_string()
+}
+
+/// Spec 133 T13 (D2): o turno do usuário que devolve a proposta recusada ao Arquiteto, no idioma
+/// do projeto: o motivo exato da recusa e o que a lista de comandos e a configuração aceitam.
+pub fn refusal_correction(lang: crate::i18n::Lang, reason: &str) -> String {
+    crate::i18n::tr(lang, "agent.recovery.config_refused", &[("reason", reason)])
 }
 
 /// Falha de ambiente admite RETRY (estratégia nova), REVISE_CONFIG ou ESCALATE; REVISE_TASK escala,
@@ -1466,8 +1554,20 @@ async fn ask_model(
     task_id: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Decision, Stop> {
-    let answer = ask_raw(scope, facts, task_id, shutdown, false).await?;
+    let answer = ask_raw(scope, facts, task_id, shutdown, Turn::Recover).await?;
     parse_decision(&answer).ok_or(Stop::Unavailable)
+}
+
+/// Turno somente leitura do Arquiteto pedido por [`ask_raw`].
+#[derive(Clone, Copy)]
+enum Turn<'a> {
+    /// Recuperação de uma tarefa bloqueada.
+    Recover,
+    /// Spec 133 T13 (D2): a mesma recuperação, continuada com a resposta recusada (`previous`) e a
+    /// correção (o motivo exato e o que é aceito).
+    Followup { previous: &'a str, correction: &'a str },
+    /// Diagnóstico de bloqueio de ambiente.
+    Diagnose,
 }
 
 /// Turno somente leitura do Arquiteto (recuperação ou diagnóstico); devolve o texto bruto.
@@ -1476,8 +1576,9 @@ async fn ask_raw(
     facts: &str,
     task_id: &str,
     shutdown: &mut watch::Receiver<bool>,
-    diagnosis: bool,
+    turn: Turn<'_>,
 ) -> Result<String, Stop> {
+    let diagnosis = matches!(turn, Turn::Diagnose);
     let state = scope.state;
     let (model, effort, client) = architect_client(state).await.map_err(|_| Stop::Unavailable)?;
     let backend: Arc<dyn ChatBackend> = match state.report_backend() {
@@ -1519,11 +1620,15 @@ async fn ask_raw(
     }
     let facts = facts.to_string();
     let read_root = read_root(&root, scope.spec_id, task_id);
+    let follow = match turn {
+        Turn::Followup { previous, correction } => Some((previous.to_string(), correction.to_string())),
+        Turn::Recover | Turn::Diagnose => None,
+    };
     let mut job = tokio::spawn(async move {
-        if diagnosis {
-            architect.diagnose(&read_root, &facts).await
-        } else {
-            architect.recover(&read_root, &facts).await
+        match follow {
+            _ if diagnosis => architect.diagnose(&read_root, &facts).await,
+            Some((previous, correction)) => architect.recover_followup(&read_root, &facts, &previous, &correction).await,
+            None => architect.recover(&read_root, &facts).await,
         }
     });
     tokio::select! {
@@ -1687,7 +1792,7 @@ pub async fn diagnose(
     if loaded.already {
         return Next::Stay;
     }
-    let answer = match ask_raw(scope, &loaded.facts, task_id, shutdown, true).await {
+    let answer = match ask_raw(scope, &loaded.facts, task_id, shutdown, Turn::Diagnose).await {
         Ok(answer) => answer,
         Err(Stop::Shutdown) => return Next::Shutdown,
         Err(Stop::Unavailable) => return Next::Stay,
@@ -1721,16 +1826,32 @@ pub async fn diagnose(
         ApiEvent::new(
             EventType::AgentMessage,
             Some(scope.project_id.to_string()),
-            json!({
-                "agent": ARCHITECT_AGENT,
-                "text": scrub_text(scope.secrets, &message),
-                "task_id": task_id,
-                "attempt": Value::Null,
-                "seq": Value::Null,
-            }),
+            analysis_payload(scope.secrets, task_id, &message, CODE_DIAGNOSIS, json!({"n": n})),
         ),
     );
     Next::Stay
+}
+
+/// Código (spec 133 T11) da análise de recuperação na conversa: `params.cycle`, `params.decision`
+/// (o código fixo da decisão, ex.: `RETRY`) e `params.autonomous` (1 na rodada autônoma). A web monta
+/// o título pelo código e traduz os rótulos fixos das linhas; o texto continua o da seção da tarefa,
+/// com os marcadores que o runner lê.
+pub const CODE_ANALYSIS: &str = "recovery.analysis";
+/// Código (spec 133 T11) do diagnóstico de ambiente na conversa: `params.n`.
+pub const CODE_DIAGNOSIS: &str = "recovery.diagnosis";
+
+/// Corpo do `agent_message` do Arquiteto com a análise (ou o diagnóstico): o texto redigido, o
+/// `code` e os `params` neutros de idioma (spec 133 T11).
+fn analysis_payload(secrets: &SecretSet, task_id: &str, message: &str, code: &str, params: Value) -> Value {
+    json!({
+        "agent": ARCHITECT_AGENT,
+        "text": scrub_text(secrets, message),
+        "task_id": task_id,
+        "attempt": Value::Null,
+        "seq": Value::Null,
+        "code": code,
+        "params": params,
+    })
 }
 
 /// Escolha do humano num cartão de escalada (spec 073).
