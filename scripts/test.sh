@@ -27,6 +27,19 @@ trap 'exit 130' INT TERM
 export TMPDIR="$RUN_DIR"
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# Numa worktree ligada (git worktree), o build vai para um target compartilhado dentro do target do
+# checkout principal: cada worktree nova compilava do zero (cerca de 2 min, pico de 5,4 GB de RAM e
+# 6 GB de disco, medido em 2026-10-29). O Cargo identifica o pacote pelo caminho relativo ao
+# workspace, então as dependências e o próprio crate são reaproveitados entre worktrees; uma troca
+# de worktree só recompila o que mudou. Quem já define CARGO_TARGET_DIR continua mandando.
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  GIT_DIR_ABS="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$GIT_DIR_ABS" ] && [ -n "$GIT_COMMON" ] && [ "$GIT_DIR_ABS" != "$GIT_COMMON" ]; then
+    export CARGO_TARGET_DIR="$(dirname "$GIT_COMMON")/target/worktrees"
+  fi
+fi
+
 if [ "$#" -eq 0 ]; then
   set -- cargo test
 fi

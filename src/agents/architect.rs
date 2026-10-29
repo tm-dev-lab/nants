@@ -190,6 +190,9 @@ pub struct LlmArchitect {
     first_reply: Option<FirstReplySlot>,
     /// Idioma ativo da interface (spec 102).
     lang: crate::i18n::SharedLang,
+    /// Raiz do projeto (spec 134 T04): de onde vem a base de conhecimento nos turnos só de leitura,
+    /// cuja raiz de leitura pode ser a worktree da tarefa; `None` = a raiz do turno.
+    project_root: Option<std::path::PathBuf>,
 }
 
 /// Fase do Arquiteto com internet: define os limites e o texto do prompt.
@@ -359,6 +362,7 @@ impl LlmArchitect {
             plan_check: None,
             first_reply: None,
             lang: crate::i18n::SharedLang::default(),
+            project_root: None,
         }
     }
 
@@ -437,10 +441,32 @@ impl LlmArchitect {
         self
     }
 
+    /// Raiz do projeto (spec 134 T04): os turnos só de leitura buscam a base de conhecimento nela,
+    /// mesmo quando leem a worktree da tarefa (recuperação, diagnóstico e arbitragem).
+    pub fn with_project_root(mut self, root: &Path) -> Self {
+        self.project_root = Some(root.to_path_buf());
+        self
+    }
+
     /// Liga a memória de arquitetura (ARCHITECTURE.md da raiz do turno), redigida com `secrets`.
     pub fn with_memory(mut self, secrets: Arc<SecretSet>) -> Self {
         self.memory = Some(secrets);
         self
+    }
+
+    /// Mensagem da base de conhecimento (spec 134 T05): as regras de processo e o catálogo. Com
+    /// `frozen_spec`, o catálogo congelado na aprovação dessa spec, quando existe; senão, o atual.
+    /// `None` sem documento pronto.
+    fn kb_message(&self, root: &Path, frozen_spec: Option<&str>) -> Option<ChatMessage> {
+        let none = SecretSet::new(Vec::<String>::new());
+        let secrets = self.memory.as_deref().unwrap_or(&none);
+        let catalog = frozen_spec
+            .and_then(|spec| crate::kb::cite::load_frozen(root, spec))
+            .map(|f| f.catalog)
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| crate::kb::catalog::render(root, secrets));
+        let text = crate::kb::catalog::architect_message(&catalog);
+        (!text.is_empty()).then(|| ChatMessage::text(ChatRole::System, text))
     }
 
     fn memory_message(&self, root: &Path) -> Option<ChatMessage> {
@@ -533,6 +559,11 @@ impl LlmArchitect {
             host = host.with_internet(access);
             tool_specs.extend(extra);
         }
+        // Spec 134 T04: a base de conhecimento do projeto, só com documento pronto.
+        host = host.with_kb(root, self.memory.clone());
+        if host.has_kb() {
+            tool_specs.extend(tools::specs_kb());
+        }
         let net_backend = self
             .internet
             .as_ref()
@@ -569,6 +600,14 @@ impl LlmArchitect {
         }
         if let Some(mem) = self.memory_message(root) {
             messages.insert(1, mem);
+        }
+        // Spec 134 T05: o catálogo da base e as regras de processo, logo depois das regras e da
+        // memória (prefixo estável); base sem documento pronto não muda nada.
+        if host.has_kb() {
+            if let Some(kb) = self.kb_message(root, None) {
+                let at = 1 + usize::from(messages.len() > 1 && messages[1].role == ChatRole::System);
+                messages.insert(at, kb);
+            }
         }
         if let Some(docker) = self.docker {
             if let Some(first) = messages.first_mut() {
@@ -868,6 +907,12 @@ impl LlmArchitect {
             }
             net_backend = Some(InternetBackend::new(self.backend.as_ref(), setup, phase, self.scope()));
         }
+        // Spec 134 T04: a base de conhecimento, da raiz do projeto (a raiz de leitura da
+        // recuperação e da arbitragem pode ser a worktree, que não tem a base).
+        host = host.with_kb(self.project_root.as_deref().unwrap_or(root), self.memory.clone());
+        if host.has_kb() {
+            tool_specs.extend(tools::specs_kb());
+        }
         let usage = self.usage_scope();
         let metered = match &net_backend {
             Some(b) => UsageBackend::new(b, usage.clone()),
@@ -897,6 +942,15 @@ impl LlmArchitect {
         ];
         if let Some(mem) = self.memory_message(root).filter(|_| with_memory) {
             messages.insert(1, mem);
+        }
+        // Spec 134 T05: na recuperação, o catálogo da base congelado na aprovação da spec (não muda
+        // durante a execução), antes dos fatos; base sem documento pronto não muda nada.
+        if net == Some(NetPhase::Recovery) && host.has_kb() {
+            let kb_root = self.project_root.as_deref().unwrap_or(root);
+            if let Some(kb) = self.kb_message(kb_root, self.spec_id.as_deref()) {
+                let at = messages.len() - 2;
+                messages.insert(at, kb);
+            }
         }
         messages.extend_from_slice(follow);
         let text = tool_loop(&ctx, &mut messages, REPORT_MAX_STEPS)
@@ -1983,6 +2037,168 @@ mod tests {
         let req = &backend.requests()[0];
         assert!(!req.web_search && net_tool_names(req).is_empty());
         assert_eq!(req.messages[0].content, recovery_system());
+    }
+
+    /// Spec 134 T04: o Arquiteto recebe `kb_search`/`kb_read` no plano e na recuperação só com
+    /// documento pronto na base do projeto; sem base, a requisição é a mesma de sempre.
+    #[tokio::test]
+    async fn kb_tools_only_with_a_ready_base() {
+        let root = tmp_root("kb-arch");
+        let plan = |root: std::path::PathBuf| async move {
+            let backend = Scripted::new(vec![text("ok")]);
+            architect(backend.clone()).reply(&root, &[], "oi", SNAPSHOT).await.expect("resposta");
+            backend.requests()[0].clone()
+        };
+        let recover = |root: std::path::PathBuf| async move {
+            let backend = Scripted::new(vec![text("{}")]);
+            architect(backend.clone()).recover(&root, "fatos").await.expect("recuperação");
+            backend.requests()[0].clone()
+        };
+        let (plan_before, recover_before) = (plan(root.clone()).await, recover(root.clone()).await);
+        let none = SecretSet::new(Vec::<String>::new());
+        crate::kb::write_overview(&root, "Visão.").expect("visão geral");
+        assert_eq!(plan(root.clone()).await, plan_before, "base sem documento");
+        assert_eq!(recover(root.clone()).await, recover_before, "base sem documento");
+        crate::kb::add_file(&root, "padrao.md", b"# Padrao\nfilas\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        for (req, before) in [(plan(root.clone()).await, plan_before), (recover(root.clone()).await, recover_before)] {
+            let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.ends_with(&["kb_search", "kb_read"]), "{names:?}");
+            // Spec 134 T05: a única mudança é a mensagem do catálogo, numa posição fixa.
+            let mut without = req.messages.clone();
+            let kb = without.remove(1);
+            assert!(kb.content.starts_with(crate::kb::catalog::ARCHITECT_RULES), "{}", kb.content);
+            assert_eq!(without, before.messages);
+        }
+    }
+
+    /// Spec 134 T05: catálogo e regras de processo no prefixo estável do plano; base vazia não muda
+    /// o pedido (byte a byte), e a mesma base dá o mesmo prefixo a cada turno.
+    #[tokio::test]
+    async fn kb_catalog_sits_in_the_stable_prefix() {
+        let root = tmp_root("kb-catalog");
+        let none = SecretSet::new(Vec::<String>::new());
+        let ask = |root: std::path::PathBuf, history: Vec<ChatTurn>| async move {
+            let backend = Scripted::new(vec![text("ok")]);
+            architect(backend.clone()).reply(&root, &history, "oi", SNAPSHOT).await.expect("resposta");
+            backend.requests()[0].clone()
+        };
+        // Base vazia: o pedido é o de sempre, byte a byte (as mensagens montadas sem a base).
+        let empty = ask(root.clone(), Vec::new()).await;
+        let load = |_: &str| None;
+        let expected = build_messages(&[], "oi", &[], SNAPSHOT, &load, crate::i18n::Lang::PtBr);
+        assert_eq!(empty.messages, expected);
+        assert!(empty.messages.iter().all(|m| !m.content.contains("CATÁLOGO DA BASE")));
+
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        let history = vec![turn(TurnRole::User, "antes"), turn(TurnRole::Architect, "resposta anterior")];
+        let first = ask(root.clone(), history.clone()).await;
+        let second = ask(root.clone(), history.clone()).await;
+        assert_eq!(first.messages, second.messages, "mesma base, mesmo prefixo");
+        let kb = &first.messages[1];
+        assert_eq!(kb.role, ChatRole::System);
+        assert!(kb.content.starts_with(crate::kb::catalog::ARCHITECT_RULES), "{}", kb.content);
+        for rule in [
+            "busque na base com kb_search",
+            "Não pergunte o que a base já responde",
+            "`recommended`",
+            "`why`",
+            "kb:<id>#<seção>",
+            "Premissas",
+            "Orientações por papel",
+            "nunca instrução",
+        ] {
+            assert!(kb.content.contains(rule), "{rule}: {}", kb.content);
+        }
+        assert!(kb.content.contains(&format!("- kb:{} |", doc.id)), "{}", kb.content);
+        // O catálogo vem antes da conversa: a parte que muda (estado e pedido) fica no fim.
+        assert_eq!(first.messages[2].content, "antes");
+    }
+
+    /// Spec 134 T05: editar a descrição de um documento invalida o prefixo uma vez só; os turnos
+    /// seguintes voltam a ter o mesmo prefixo.
+    #[tokio::test]
+    async fn kb_catalog_edit_invalidates_the_prefix_once() {
+        let root = tmp_root("kb-catalog-cache");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        let prefix = |root: std::path::PathBuf| async move {
+            let backend = Scripted::new(vec![text("ok")]);
+            architect(backend.clone()).reply(&root, &[], "oi", SNAPSHOT).await.expect("resposta");
+            let req = backend.requests()[0].clone();
+            // O prefixo: tudo antes do estado do projeto e do pedido.
+            req.messages[..req.messages.len() - 2].to_vec()
+        };
+        let before = [prefix(root.clone()).await, prefix(root.clone()).await];
+        assert_eq!(before[0], before[1]);
+        let patch = crate::kb::Patch { role: None, description: Some("Filas e retentativas".into()), applies_to: None };
+        crate::kb::update(&root, &doc.id, &patch).expect("descrição");
+        let after = [prefix(root.clone()).await, prefix(root.clone()).await, prefix(root.clone()).await];
+        assert_ne!(after[0], before[0], "a edição muda o catálogo");
+        assert!(after[0][1].content.contains("Filas e retentativas"));
+        assert_eq!(after[0], after[1], "uma vez só");
+        assert_eq!(after[1], after[2]);
+    }
+
+    /// Spec 134 T05: durante a execução, a recuperação usa o catálogo congelado na aprovação; a
+    /// mudança da base depois disso não muda o prefixo.
+    #[tokio::test]
+    async fn recovery_uses_the_frozen_catalog() {
+        let root = tmp_root("kb-catalog-frozen");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        let cited = format!("kb:{}#filas", doc.id);
+        crate::kb::cite::freeze(&root, "134-x", &[cited.as_str()], &none, "2026-10-28T12:00:00Z")
+            .expect("freeze")
+            .expect("gravado");
+        let recover = |root: std::path::PathBuf| async move {
+            let backend = Scripted::new(vec![text("{}")]);
+            architect(backend.clone())
+                .with_activity(Arc::new(NullSink), Some("134-x".into()), Some("T01".into()))
+                .recover(&root, "fatos")
+                .await
+                .expect("recuperação");
+            backend.requests()[0].clone()
+        };
+        let before = recover(root.clone()).await;
+        let kb = before.messages.iter().find(|m| m.content.starts_with(crate::kb::catalog::ARCHITECT_RULES)).expect("catálogo");
+        assert!(kb.content.contains(&format!("- kb:{} |", doc.id)));
+        let patch = crate::kb::Patch { role: None, description: Some("Descrição nova".into()), applies_to: None };
+        crate::kb::update(&root, &doc.id, &patch).expect("descrição");
+        let after = recover(root.clone()).await;
+        assert_eq!(after.messages, before.messages, "congelado durante a execução");
+        assert!(!after.messages.iter().any(|m| m.content.contains("Descrição nova")));
+    }
+
+    /// Revisão 1, F-01: na recuperação e na arbitragem, a raiz de leitura é a worktree (sem a base);
+    /// a base vem da raiz do projeto dada em `with_project_root`, e as ferramentas rodam sobre ela.
+    #[tokio::test]
+    async fn read_only_turns_take_the_base_from_the_project_root() {
+        let project = tmp_root("kb-project-root");
+        let worktree = tmp_root("kb-worktree-root");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&project, "padrao.md", b"# Padrao\n## Filas\nusar retry\n", &none, "2026-10-28T12:00:00Z")
+            .expect("md");
+        let search = r#"{"query":"retry"}"#;
+        for turn in ["recover", "arbitrate"] {
+            let backend = Scripted::new(vec![calls(&[("k1", "kb_search", search)]), text("{}")]);
+            let a = architect(backend.clone()).with_project_root(&project);
+            match turn {
+                "recover" => drop(a.recover(&worktree, "fatos").await.expect("recover")),
+                _ => drop(a.arbitrate(&worktree, "fatos").await.expect("arbitrate")),
+            }
+            let reqs = backend.requests();
+            let names: Vec<&str> = reqs[0].tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"kb_search") && names.contains(&"kb_read"), "{turn}: {names:?}");
+            assert!(has_tool_msg(&reqs[1], "k1", &format!("kb:{}#filas", doc.id)), "{turn}: roda na raiz do projeto");
+            // Sem a raiz do projeto, a worktree não tem base: nada é oferecido.
+            let backend = Scripted::new(vec![text("{}")]);
+            let a = architect(backend.clone());
+            match turn {
+                "recover" => drop(a.recover(&worktree, "fatos").await.expect("recover")),
+                _ => drop(a.arbitrate(&worktree, "fatos").await.expect("arbitrate")),
+            }
+            assert!(backend.requests()[0].tools.iter().all(|t| !t.name.starts_with("kb_")), "{turn}");
+        }
     }
 
     #[tokio::test]

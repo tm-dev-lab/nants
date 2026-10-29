@@ -36,6 +36,8 @@ pub struct ArchitectArbiter {
     pub lang: crate::i18n::SharedLang,
     /// Parada pedida pelo usuário: abandona o turno em curso.
     pub stop: Option<watch::Receiver<bool>>,
+    /// Raiz do projeto (spec 134 T04): a base de conhecimento vem dela, não da worktree lida.
+    pub project_root: std::path::PathBuf,
 }
 
 impl ArchitectArbiter {
@@ -43,7 +45,8 @@ impl ArchitectArbiter {
         let architect = LlmArchitect::new(Arc::clone(&self.backend), self.model.clone(), self.effort, self.policy.clone(), Arc::clone(&self.approver))
             .with_lang(self.lang.clone())
             .with_activity(Arc::clone(&self.activity), Some(spec_id.to_string()), Some(task_id.to_string()))
-            .with_memory(Arc::clone(&self.secrets));
+            .with_memory(Arc::clone(&self.secrets))
+            .with_project_root(&self.project_root);
         match &self.usage {
             Some(sink) => architect.with_usage(Arc::clone(sink)),
             None => architect,

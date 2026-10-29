@@ -35,6 +35,8 @@ const FORBIDDEN: Array<{ label: string; pattern: RegExp }> = [
 const STORAGE_ALLOWED: ReadonlySet<string> = new Set([
   // Cache do ui-state (o servidor é a fonte; envelope validado).
   "desktop/uiState.ts",
+  // O acesso em si (try/catch), usado pelo ui-state e pelo espelho do idioma.
+  "desktop/browserStorage.ts",
   // Limpeza na carga das chaves fora do formato do ui-state (lista explícita).
   "staleStorage.ts",
   "staleStorage.test.ts",

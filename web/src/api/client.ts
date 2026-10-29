@@ -63,6 +63,7 @@ import { isAttachmentName, MAX_CHAT_ATTACHMENTS } from "../chatImages";
 // Direto do dicionário pt-BR (sem dependências): o índice do i18n importa o estado da interface,
 // que importa este cliente.
 import { ptBR, type MessageKey } from "../i18n/ptBR";
+import { getRequestLanguage } from "./requestLanguage";
 import { parseCodeParams, parseCoded, isMessageCode, type CodeParams } from "./codes";
 
 type ApiErrorKind = "network" | "timeout" | "http" | "invalid_response";
@@ -342,17 +343,8 @@ export const deviceAuth = {
 function isDeviceRequired(status: number, body: unknown): boolean {
   return status === 401 && isRecord(body) && body.code === "device_required";
 }
-let requestLanguage: "pt-BR" | "en" | null = null;
-
-/** Define o idioma enviado em `X-Nants-Lang` (chamado pelo i18n a cada troca). */
-export function setRequestLanguage(lang: "pt-BR" | "en" | null): void {
-  requestLanguage = lang;
-}
-
-/** Idioma enviado hoje em `X-Nants-Lang` (testes). */
-export function getRequestLanguage(): "pt-BR" | "en" | null {
-  return requestLanguage;
-}
+// O idioma vive em `./requestLanguage` (sem dependências): o i18n o define sem importar o cliente.
+export { getRequestLanguage } from "./requestLanguage";
 
 /**
  * Executa a requisição. Único ponto de `fetch` do cliente.
@@ -369,6 +361,7 @@ export async function request<T>(
     else raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
   }
   const headers: Record<string, string> = { Accept: "application/json", ...raw.headers };
+  const requestLanguage = getRequestLanguage();
   if (requestLanguage !== null) headers[LANG_HEADER] = requestLanguage;
   // O servidor exige JSON em POST/PUT/DELETE: sem corpo, envia `{}` (senão 415).
   const noBody = raw.method === "GET";

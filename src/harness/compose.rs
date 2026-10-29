@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -17,6 +18,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::config::ViewPorts;
 use crate::harness::home;
+use crate::harness::limits::ContainerLimits;
 use crate::harness::progress::CommandProgress;
 
 use crate::sdd::environment::{env_hash, COMPOSE_REL, WORKSPACE_SERVICE, WORKTREE_VAR};
@@ -156,19 +158,26 @@ impl HeadTail {
     }
 }
 
+/// Quanto o executor espera os pipes depois de matar o cliente (tempo esgotado ou parada). Um
+/// processo que herdou os pipes e segue vivo não segura o retorno (spec 134 T08).
+const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+/// Leitura de um pipe numa captura compartilhada: quem espera pode tirar o que já chegou sem
+/// aguardar o fim do pipe ([`take_capture`]).
 fn read_limited(
     mut r: impl Read + Send + 'static,
     progress: Option<Arc<CommandProgress>>,
     sink: Option<(usize, OutputSink)>,
-) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut capture = HeadTail::new(MAX_OUTPUT);
+) -> (thread::JoinHandle<()>, Arc<Mutex<HeadTail>>) {
+    let capture = Arc::new(Mutex::new(HeadTail::new(MAX_OUTPUT)));
+    let shared = Arc::clone(&capture);
+    let handle = thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    capture.push(&buf[..n]);
+                    shared.lock().unwrap_or_else(PoisonError::into_inner).push(&buf[..n]);
                     if let Some(p) = &progress {
                         p.push(&buf[..n]);
                     }
@@ -178,8 +187,37 @@ fn read_limited(
                 }
             }
         }
-        capture.into_bytes()
-    })
+    });
+    (handle, capture)
+}
+
+/// O que a captura tem agora. Com `wait_all`, espera o pipe fechar; sem, espera no máximo até
+/// `until` e devolve o que chegou (a thread de leitura segue sozinha até o pipe fechar).
+fn take_capture(reader: Option<(thread::JoinHandle<()>, Arc<Mutex<HeadTail>>)>, wait_all: bool, until: Instant) -> Vec<u8> {
+    let Some((handle, capture)) = reader else { return Vec::new() };
+    if wait_all {
+        let _ = handle.join();
+    } else {
+        while !handle.is_finished() && Instant::now() < until {
+            thread::sleep(POLL);
+        }
+    }
+    let mut guard = capture.lock().unwrap_or_else(PoisonError::into_inner);
+    std::mem::replace(&mut *guard, HeadTail::new(MAX_OUTPUT)).into_bytes()
+}
+
+/// Mata o cliente e todo o grupo de processos dele (o `docker` roda o plugin `compose` como
+/// filho, e é ele que segura os pipes). Spec 134 T08.
+fn kill_tree(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: `kill` só recebe números; o grupo `pid` foi criado no spawn (`process_group(0)`)
+        // e só contém o cliente e os filhos dele.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Variável que libera o Docker real só nos testes reais marcados `#[ignore]` (`real_*`).
@@ -236,6 +274,8 @@ impl RealComposeRunner {
         let mut child = Command::new(&self.program)
             .args(&call.args)
             .current_dir(&call.cwd)
+            // Grupo de processos próprio: no tempo esgotado, o grupo inteiro morre (kill_tree).
+            .process_group(0)
             .env_clear()
             .envs(call.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
@@ -246,7 +286,7 @@ impl RealComposeRunner {
         let out = child.stdout.take().map(|r| read_limited(r, progress.clone(), sink.clone().map(|s| (STDOUT, s))));
         let err = child.stderr.take().map(|r| read_limited(r, progress, sink.map(|s| (STDERR, s))));
         let deadline = Instant::now() + call.timeout;
-        let (mut code, mut timed_out) = (None, false);
+        let (mut code, mut timed_out, mut killed) = (None, false, false);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -254,23 +294,29 @@ impl RealComposeRunner {
                     break;
                 }
                 Ok(None) => {}
-                Err(e) => return Err(format!("falha ao aguardar o docker: {e}")),
+                Err(e) => {
+                    kill_tree(&mut child);
+                    return Err(format!("falha ao aguardar o docker: {e}"));
+                }
             }
             if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
+                killed = true;
                 break;
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
+                killed = true;
                 break;
             }
             thread::sleep(POLL);
         }
-        let mut bytes = out.and_then(|h| h.join().ok()).unwrap_or_default();
-        bytes.extend(err.and_then(|h| h.join().ok()).unwrap_or_default());
+        // Spec 134 T08: depois de matar o cliente, os pipes não seguram o retorno: quem chama
+        // precisa voltar logo para remover o container (que segue vivo no daemon) pelo nome.
+        let until = Instant::now() + PIPE_GRACE;
+        let mut bytes = take_capture(out, !killed, until);
+        bytes.extend(take_capture(err, !killed, until));
         // Saída crua: quem mostra a saída marca o tempo limite pelo `timed_out`, no idioma de quem lê
         // (o runner, na saída dos testes, spec 115 T04).
         let output = String::from_utf8_lossy(&bytes).into_owned();
@@ -344,6 +390,10 @@ pub struct ComposeEnv {
     lan_ports: Option<ViewPorts>,
     /// Portas do host remapeadas (pedida, usada) no último `up_run` por estarem ocupadas.
     remaps: Mutex<Vec<(u16, u16)>>,
+    /// Spec 134 T08: teto de memória e de processos de cada container (padrão: o da máquina).
+    limits: ContainerLimits,
+    /// Limites efetivos do `workspace` no último override gravado (o teto ou o menor do projeto).
+    applied: Mutex<Option<ContainerLimits>>,
 }
 
 /// Diretório de dados do Nants para os overrides: `$XDG_DATA_HOME/nants/compose` ou
@@ -403,7 +453,21 @@ impl ComposeEnv {
             kind: ComposeKind::Test,
             lan_ports: None,
             remaps: Mutex::new(Vec::new()),
+            limits: ContainerLimits::host(),
+            applied: Mutex::new(None),
         }
+    }
+
+    /// Teto de memória e de processos dos containers (testes; o padrão vem da máquina).
+    pub fn with_limits(mut self, limits: ContainerLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Limites efetivos do `workspace` (spec 134 T08): os do último override gravado ou, antes
+    /// dele, o teto. Para dizer ao modelo qual limite o comando atingiu.
+    pub fn workspace_limits(&self) -> ContainerLimits {
+        self.applied.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or(self.limits)
     }
 
     /// Projeto Compose controlado (padrão: `-test`).
@@ -543,7 +607,10 @@ impl ComposeEnv {
             run_command,
             self.lan_ports.filter(|_| run_command.is_some()),
             &mut remaps,
+            self.limits,
         )?;
+        let workspace = doc.get("services").and_then(|s| s.get(WORKSPACE_SERVICE));
+        *self.applied.lock().unwrap_or_else(PoisonError::into_inner) = Some(self.limits.effective(workspace));
         if run_command.is_some() {
             *self.remaps.lock().unwrap_or_else(PoisonError::into_inner) = remaps;
         }
@@ -589,12 +656,29 @@ impl ComposeEnv {
         progress: Option<&Arc<CommandProgress>>,
     ) -> Result<ComposeOutput, String> {
         let (_, ov, _) = self.load(dir)?;
-        let call = self.call(dir, &ov, &["run", "--rm", "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command], timeout);
-        let out = self.runner.run_watched(&call, progress)?;
+        let name = unique_container_name(&self.project_name(), "exec");
+        let tail = ["run", "--rm", "--name", name.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
+        let ran = self.runner.run_watched(&self.call(dir, &ov, &tail, timeout), progress);
+        let out = self.stop_if_left_running(dir, &name, ran)?;
         if !out.success() && is_docker_failure(&out.output) {
             return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&out)));
         }
         Ok(out)
+    }
+
+    /// Spec 134 T08: o tempo limite (ou a falha do cliente) mata só o processo `docker compose` no
+    /// host; o container segue vivo, com tudo o que roda dentro dele (o `--rm` só age quando ele
+    /// termina sozinho). Nesses casos o container é removido pelo nome (`docker rm -f`, que encerra
+    /// todos os processos dele). O resultado da execução volta como veio.
+    fn stop_if_left_running(&self, dir: &Path, name: &str, ran: Result<ComposeOutput, String>) -> Result<ComposeOutput, String> {
+        let left_running = match &ran {
+            Ok(o) => o.timed_out,
+            Err(_) => true,
+        };
+        if left_running {
+            let _ = self.remove_container(dir, name);
+        }
+        ran
     }
 
     /// Spec 129 T02: roda `command` no `workspace` num container que NÃO é removido ao fim (`run`
@@ -605,7 +689,7 @@ impl ComposeEnv {
     /// [`KeptRun::diff`]. `progress` recebe a saída enquanto roda, como em [`Self::exec_watched`].
     pub fn run_kept(&self, dir: &Path, command: &str, timeout: Duration, progress: Option<&Arc<CommandProgress>>) -> Result<KeptRun, String> {
         let (_, ov, _) = self.load(dir)?;
-        let name = kept_container_name(&self.project_name());
+        let name = unique_container_name(&self.project_name(), "kept");
         let label = format!("nants.project={}", self.project_id);
         let tail = ["run", "--name", name.as_str(), "--label", label.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
         let ran = self.runner.run_watched(&self.call(dir, &ov, &tail, timeout), progress);
@@ -685,8 +769,10 @@ impl ComposeEnv {
     /// workspace -c <script>`, sem subir os serviços de apoio. `Err` = falha do Docker.
     pub fn probe(&self, dir: &Path, script: &str, timeout: Duration) -> Result<ComposeOutput, String> {
         let (_, ov, _) = self.load(dir)?;
-        let call = self.call(dir, &ov, &["run", "--rm", "-T", "--no-deps", "--entrypoint", "sh", WORKSPACE_SERVICE, "-c", script], timeout);
-        self.runner.run(&call)
+        let name = unique_container_name(&self.project_name(), "probe");
+        let tail = ["run", "--rm", "--name", name.as_str(), "-T", "--no-deps", "--entrypoint", "sh", WORKSPACE_SERVICE, "-c", script];
+        let ran = self.runner.run(&self.call(dir, &ov, &tail, timeout));
+        self.stop_if_left_running(dir, &name, ran)
     }
 
     /// Devolve ao uid do host as entradas de `dir` criadas por outro dono (ex.: root de imagens
@@ -911,13 +997,13 @@ pub fn main_paths(paths: &[String], depth: usize, max: usize) -> Vec<(String, us
     groups
 }
 
-/// Nome do container mantido por [`ComposeEnv::run_kept`]: `<projeto>-kept-<pid>-<seq>`, único no
-/// processo e com o prefixo do projeto do Nants.
-fn kept_container_name(project: &str) -> String {
+/// Nome de um container de comando: `<projeto>-<kind>-<pid>-<seq>-<nanos>`, único no processo e
+/// com o prefixo do projeto do Nants (`kept` em [`ComposeEnv::run_kept`], `exec` e `probe`).
+fn unique_container_name(project: &str, kind: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-    format!("{project}-kept-{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst))
+    format!("{project}-{kind}-{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst))
 }
 
 /// Intervalo entre consultas durante a observação pós-`up`.
@@ -1247,7 +1333,7 @@ fn override_yaml(
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
 ) -> Result<String, String> {
-    override_yaml_with(project_id, worktree, doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None)
+    override_yaml_with(project_id, worktree, doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host())
 }
 
 /// Porta do host livre para bind em `ip`?
@@ -1343,6 +1429,7 @@ fn override_yaml_with(
     remaps: &mut Vec<(u16, u16)>,
     free: &dyn Fn(&str, u16) -> bool,
     alloc: &dyn Fn(&str) -> Option<u16>,
+    limits: ContainerLimits,
 ) -> Result<String, String> {
     let label = Value::Sequence(vec![Value::String(format!("nants.project={project_id}"))]);
     let abs = worktree.canonicalize().map_err(|e| format!("worktree inválida: {e}"))?;
@@ -1351,6 +1438,10 @@ fn override_yaml_with(
     for name in service_names(doc) {
         let mut svc = Mapping::new();
         svc.insert("labels".into(), label.clone());
+        // Spec 134 T08: limites de memória e de processos em TODO serviço. O override é juntado por
+        // cima do compose do projeto, então um valor maior (ou nenhum) dele vira o teto.
+        let base = doc.get("services").and_then(|s| s.get(name.as_str()));
+        svc.extend(limits.override_keys(base));
         // Spec 133 T12: a imagem que o Compose constrói para o serviço também leva o rótulo (o
         // Compose junta este `build` ao do arquivo do projeto, que segue com o contexto).
         if doc.get("services").and_then(|s| s.get(name.as_str())).is_some_and(|s| s.get("build").is_some()) {
@@ -1435,6 +1526,7 @@ fn override_yaml_with(
 
 /// Grava o override em `dir` (privado): remove o arquivo anterior (unlink não segue symlink) e
 /// cria um novo com `create_new` (O_EXCL: nunca segue symlink) e modo 0600.
+#[allow(clippy::too_many_arguments)]
 fn write_override(
     dir: &Path,
     project_id: &str,
@@ -1443,8 +1535,9 @@ fn write_override(
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
     remaps: &mut Vec<(u16, u16)>,
+    limits: ContainerLimits,
 ) -> Result<PathBuf, String> {
-    let text = override_yaml_with(project_id, worktree, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc)?;
+    let text = override_yaml_with(project_id, worktree, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc, limits)?;
     let path = dir.join("override.yaml");
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -1613,8 +1706,114 @@ mod tests {
         assert_eq!(&calls[0].args[..5], ["compose", "-p", "nants-p1-test", "-f", ".nants/compose.yaml"]);
         assert_eq!(&calls[0].args[7..], ["down", "-v", "--remove-orphans"]);
         assert_eq!(&calls[2].args[7..], ["up", "-d", "--wait", "db"]);
-        assert_eq!(&calls[3].args[7..], ["run", "--rm", "-T", "--entrypoint", "sh", "workspace", "-lc", "cargo test"]);
+        assert_eq!(&calls[3].args[7..10], ["run", "--rm", "--name"]);
+        assert!(calls[3].args[10].starts_with("nants-p1-test-exec-"), "{:?}", calls[3].args);
+        assert_eq!(&calls[3].args[11..], ["-T", "--entrypoint", "sh", "workspace", "-lc", "cargo test"]);
         assert_eq!(calls[3].cwd, dir);
+    }
+
+    /// Lê o override gravado de uma chamada do Compose (o segundo `-f`).
+    fn override_of(call: &ComposeCall) -> Value {
+        serde_yaml::from_str(&fs::read_to_string(&call.args[6]).expect("override")).expect("yaml")
+    }
+
+    /// Spec 134 T08: todo serviço do override leva memória (sem swap extra), processos e o
+    /// encerramento por falta de memória ligado; o menor valor do projeto vale, o maior vira o teto.
+    #[test]
+    fn override_caps_memory_and_processes_of_every_service() {
+        const MIB: u64 = 1024 * 1024;
+        let compose = "services:\n  workspace:\n    image: alpine\n    mem_limit: 64g\n    pids_limit: -1\n    oom_kill_disable: true\n  db:\n    image: postgres:16\n    mem_limit: 128m\n    pids_limit: 40\n  cache:\n    image: redis\n";
+        let dir = project("limits", compose);
+        let fake = Arc::new(FakeRunner::default());
+        let cap = ContainerLimits { memory: 256 * MIB, pids: 64 };
+        let env = env_with(&fake).with_limits(cap);
+        assert_eq!(env.workspace_limits(), cap, "antes do primeiro override, o teto");
+        let hash_before = env_hash(&dir);
+        env.exec(&dir, "make check", Duration::from_secs(5)).expect("exec");
+        let calls = fake.calls.lock().expect("lock");
+        let ov = override_of(&calls[0]);
+        let limits = |svc: &str| {
+            let s = &ov["services"][svc];
+            (s["mem_limit"].as_u64(), s["memswap_limit"].as_u64(), s["pids_limit"].as_u64(), s["oom_kill_disable"].as_bool())
+        };
+        assert_eq!(limits("workspace"), (Some(256 * MIB), Some(256 * MIB), Some(64), Some(false)));
+        assert_eq!(limits("db"), (Some(128 * MIB), Some(128 * MIB), Some(40), Some(false)));
+        assert_eq!(limits("cache"), (Some(256 * MIB), Some(256 * MIB), Some(64), Some(false)));
+        assert_eq!(env.workspace_limits(), cap);
+        // O override fica fora da worktree e não muda o hash de aprovação do ambiente.
+        assert_eq!(env_hash(&dir), hash_before);
+        assert!(!calls[0].args[6].starts_with(&*dir.to_string_lossy()), "override fora da worktree");
+
+        // Sem `with_limits`, o teto é o da máquina.
+        let doc: Value = serde_yaml::from_str(COMPOSE).expect("yaml");
+        let text = override_yaml("p1", &dir, &doc, Some("npm start"), None).expect("override");
+        let v: Value = serde_yaml::from_str(&text).expect("parse");
+        let host = ContainerLimits::host();
+        for svc in ["workspace", "db"] {
+            assert_eq!(v["services"][svc]["mem_limit"].as_u64(), Some(host.memory), "{svc}");
+            assert_eq!(v["services"][svc]["pids_limit"].as_u64(), Some(host.pids), "{svc}");
+        }
+    }
+
+    /// Spec 134 T08 (critério 2): no tempo limite o `docker compose` do host morre, mas o container
+    /// seguiria vivo; o Nants o remove pelo nome (`docker rm -f`, que encerra todos os processos).
+    #[test]
+    fn timeout_removes_the_named_container_and_its_processes() {
+        let dir = project("timeout", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply_timeout("run", "t/00_runner.t ..\n");
+        let env = env_with(&fake);
+        let out = env.exec(&dir, "perl t/runner.pl", Duration::from_secs(5)).expect("exec");
+        assert!(out.timed_out);
+        let calls = fake.calls.lock().expect("lock").clone();
+        assert_eq!(fake.subcommands(), vec!["run", "rm"]);
+        let name = calls[0].args[10].clone();
+        assert!(name.starts_with("nants-p1-test-exec-"), "{name}");
+        assert_eq!(calls[1].args, ["rm", "-f", name.as_str()]);
+
+        // Sonda das capacidades: o mesmo.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply_timeout("run", "");
+        let env = env_with(&fake);
+        assert!(env.probe(&dir, "uname -a", Duration::from_secs(5)).expect("probe").timed_out);
+        let calls = fake.calls.lock().expect("lock").clone();
+        assert!(calls[0].args[10].starts_with("nants-p1-test-probe-"), "{:?}", calls[0].args);
+        assert_eq!(calls[1].args, ["rm", "-f", calls[0].args[10].as_str()]);
+
+        // Comando que termina no tempo: o `--rm` já removeu; nada a mais.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 1, "falhou");
+        let env = env_with(&fake);
+        assert_eq!(env.exec(&dir, "make", Duration::from_secs(5)).expect("exec").code, Some(1));
+        assert_eq!(fake.subcommands(), vec!["run"]);
+        // Nomes diferentes a cada comando.
+        assert_ne!(unique_container_name("p", "exec"), unique_container_name("p", "exec"));
+    }
+
+    /// Executor que falha ao aguardar o cliente: o container pode ter ficado vivo.
+    struct FailingRunner {
+        calls: Mutex<Vec<ComposeCall>>,
+    }
+
+    impl ComposeRunner for FailingRunner {
+        fn run(&self, call: &ComposeCall) -> Result<ComposeOutput, String> {
+            self.calls.lock().unwrap_or_else(PoisonError::into_inner).push(call.clone());
+            if call.args.first().is_some_and(|a| a == "rm") {
+                return Ok(ComposeOutput { code: Some(0), output: String::new(), timed_out: false });
+            }
+            Err("falha ao aguardar o docker".into())
+        }
+    }
+
+    #[test]
+    fn client_failure_also_removes_the_container() {
+        let dir = project("clientfail", COMPOSE);
+        let runner = Arc::new(FailingRunner { calls: Mutex::new(Vec::new()) });
+        let env = super::fake::test_env("p1", runner.clone());
+        assert!(env.exec(&dir, "make", Duration::from_secs(5)).is_err());
+        let calls = runner.calls.lock().expect("lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].args, ["rm", "-f", calls[0].args[10].as_str()]);
     }
 
     #[test]
@@ -1979,7 +2178,7 @@ mod tests {
         let dir = project("busy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234)).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234), ContainerLimits::host()).expect("ov");
         assert_eq!(remaps, vec![(3000, 41234)]);
         let v: Value = serde_yaml::from_str(&text).expect("parse");
         let Value::Tagged(t) = &v["services"]["workspace"]["ports"] else { panic!("sem tag: {text}") };
@@ -1988,9 +2187,9 @@ mod tests {
         assert_eq!(list[1].as_str(), Some("127.0.0.1:5173:5173"));
         // Tudo livre: nenhum override de portas; sem comando (-test): idem.
         let mut none = Vec::new();
-        let free = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None).expect("ov");
+        let free = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None, ContainerLimits::host()).expect("ov");
         assert!(none.is_empty() && !free.contains("ports"), "{free}");
-        let test = override_yaml_with("p1", &dir, &doc, None, None, &mut none, &|_, _| false, &|_| Some(1)).expect("ov");
+        let test = override_yaml_with("p1", &dir, &doc, None, None, &mut none, &|_, _| false, &|_| Some(1), ContainerLimits::host()).expect("ov");
         assert!(none.is_empty() && !test.contains("ports"), "{test}");
     }
 
@@ -2054,7 +2253,7 @@ mod tests {
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         // A porta pedida (5173) está livre, mas em `--lan` a do host vem da faixa mesmo assim.
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234)).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234), ContainerLimits::host()).expect("ov");
         assert!(text.contains("ports: !override"), "{text}");
         assert!(remaps.is_empty(), "{remaps:?}");
         let list = lan_list(&text);
@@ -2080,7 +2279,7 @@ mod tests {
         let dir = project("lanbusy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let busy = |ip: &str, p: u16| ip == "0.0.0.0" && p != 3001 && p != 3003;
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234)).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234), ContainerLimits::host()).expect("ov");
         let list = lan_list(&text);
         assert_eq!(list.iter().filter_map(Value::as_str).collect::<Vec<_>>(), ["0.0.0.0:3002:5173", "0.0.0.0:3004:8000", "0.0.0.0:3005:8001"]);
     }
@@ -2091,11 +2290,11 @@ mod tests {
         let dir = project("lanfull", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let expected = "Todas as portas de visualização (3001 a 3010) estão em uso. Pare outro app na Execução e tente de novo.";
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234)).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234), ContainerLimits::host()).expect_err("esgotada");
         assert_eq!(err, expected);
         // Uma livre só, duas portas pedidas: também esgota (nunca repete nem sai da faixa).
         let one = |_: &str, p: u16| p == 3010;
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234)).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234), ContainerLimits::host()).expect_err("esgotada");
         assert_eq!(err, expected);
         // No `up_run` real (sonda de verdade): faixa de uma porta ocupada por um listener.
         let l = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind");
@@ -2115,7 +2314,7 @@ mod tests {
         let off = override_yaml("p1", &dir, &doc, Some("npm run dev"), None).expect("ov");
         assert!(!off.contains("ports"), "{off}");
         // Byte a byte igual ao de antes: o `--lan` não interfere sem faixa, e o `-test` ignora a faixa.
-        let with_busy = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234)).expect("ov");
+        let with_busy = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234), ContainerLimits::host()).expect("ov");
         assert_eq!(lan_list(&with_busy)[0].as_str(), Some("127.0.0.1:41234:5173"));
         assert_eq!(lan_list(&with_busy)[1].as_str(), Some("127.0.0.1::8080"));
         let test_kind = override_yaml("p1", &dir, &doc, None, None).expect("ov");
@@ -2274,6 +2473,33 @@ mod tests {
         assert!(out.output.contains("NANTS_WORKTREE="));
     }
 
+    /// Spec 134 T08 (finding F-01): no tempo esgotado, o executor volta logo, mesmo com um processo
+    /// filho do cliente ainda segurando os pipes (como o plugin `compose` do `docker`), e esse
+    /// grupo de processos morre junto; a saída que já chegou volta.
+    #[test]
+    fn timeout_returns_without_waiting_for_pipes_held_by_children() {
+        let dir = std::env::temp_dir().join(format!("nants-compose-pipes-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let marker = format!("nants-pipe-holder-{}", std::process::id());
+        let call = ComposeCall {
+            // O filho em segundo plano herda stdout/stderr e vive 60 s; o `sh` dorme também.
+            args: vec!["-c".into(), format!("echo antes; sh -c 'sleep 60; echo {marker}' & sleep 60")],
+            cwd: dir.clone(),
+            env: controlled_env(std::env::vars(), &dir),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let out = RealComposeRunner::with_program("sh").run(&call).expect("run");
+        assert!(out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5), "esperou os pipes: {:?}", started.elapsed());
+        assert!(out.output.contains("antes"), "{}", out.output);
+        // O grupo morreu: nenhum `sleep 60` do teste sobrou.
+        thread::sleep(Duration::from_millis(200));
+        let ps = Command::new("ps").args(["-eo", "args"]).output().expect("ps");
+        assert!(!String::from_utf8_lossy(&ps.stdout).contains(&marker), "filho do cliente seguiu vivo");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Sentinela (spec 113 T01): nos testes, o executor real recusa o `docker` antes de criar o
     /// processo; outros programas seguem normais.
     #[test]
@@ -2399,6 +2625,72 @@ mod tests {
         assert!(touch.success() && dir.join("x").exists(), "{}", touch.output);
         assert!(dir.join(".nants/a").exists() && dir.join(".git").exists());
         fs::remove_dir_all(&dir).expect("apagável");
+    }
+
+    /// Remove, no fim do teste real, tudo o que leva o rótulo do projeto de teste (também quando o
+    /// teste falha no meio): containers, depois o projeto Compose e a pasta.
+    struct RealCleanup<'a> {
+        env: &'a ComposeEnv,
+        dir: PathBuf,
+        label: String,
+    }
+
+    impl Drop for RealCleanup<'_> {
+        fn drop(&mut self) {
+            let ids = Command::new("docker").args(["ps", "-aq", "--filter", &format!("label={}", self.label)]).output();
+            if let Ok(o) = ids {
+                for id in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+                    let _ = Command::new("docker").args(["rm", "-f", id]).output();
+                }
+            }
+            let _ = self.env.down(&self.dir);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Teste real (spec 134 T08): os limites se aplicam a um container de verdade e o tempo limite
+    /// encerra o container. NÃO roda sem pedido: `NANTS_TEST_REAL_DOCKER=1 scripts/test.sh cargo
+    /// test --lib -- --ignored real_container_limits_stop_fork_and_memory`.
+    ///
+    /// Seguro MESMO SE A PROTEÇÃO FALHAR: os limites de teste são pequenos (256 MiB, 64 processos);
+    /// o próprio script cria no máximo 200 processos (`sleep` curtos, sem recursão) e aloca no
+    /// máximo 384 MiB (um `tail -c` de tamanho fixo), bem abaixo da RAM livre de uma máquina de
+    /// 8 GB; tudo tem tempo limite curto, e a limpeza ([`RealCleanup`]) roda até no pânico.
+    #[test]
+    #[ignore]
+    fn real_container_limits_stop_fork_and_memory() {
+        const MIB: u64 = 1024 * 1024;
+        let compose = "services:\n  workspace:\n    image: alpine:3\n    command: sleep infinity\n    volumes:\n      - ${NANTS_WORKTREE}:/work\n";
+        let dir = project("reallimits", compose);
+        let id = format!("itestlim{}", std::process::id());
+        let cap = ContainerLimits { memory: 256 * MIB, pids: 64 };
+        let env = ComposeEnv::real(id.clone()).with_limits(cap);
+        let env = env.with_approved_hashes(vec![env_hash(&dir).expect("hash")]);
+        let _cleanup = RealCleanup { env: &env, dir: dir.clone(), label: format!("nants.project={id}") };
+        let wait = Duration::from_secs(90);
+
+        // 1. Processos: 200 no máximo, de 3 s cada; com o limite de 64, o fork é recusado.
+        let forks = env
+            .exec(&dir, "i=0; while [ $i -lt 200 ]; do sleep 3 & i=$((i+1)); done; wait; echo fim", wait)
+            .expect("docker");
+        assert!(!forks.timed_out, "{}", forks.output);
+        assert_eq!(crate::harness::limits::detect_hit(forks.code, forks.timed_out, &forks.output), Some(crate::harness::limits::LimitHit::Pids), "{forks:?}");
+
+        // 2. Memória: 384 MiB num buffer de tamanho fixo; com o limite de 256 MiB, o 137.
+        let mem = env.exec(&dir, "head -c 402653184 /dev/zero | tail -c 402653184 > /dev/null; echo \"saida=$?\"", wait).expect("docker");
+        assert!(!mem.timed_out, "{}", mem.output);
+        assert!(mem.output.contains("saida=137") || mem.code == Some(137), "{mem:?}");
+
+        // 3. Tempo limite: o container é encerrado, não só o cliente.
+        let started = Instant::now();
+        let slow = env.exec(&dir, "sleep 600", Duration::from_secs(5)).expect("docker");
+        assert!(slow.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(30), "exec demorou {:?}", started.elapsed());
+        let left = Command::new("docker")
+            .args(["ps", "-q", "--filter", &format!("label=nants.project={id}"), "--filter", "name=exec"])
+            .output()
+            .expect("docker ps");
+        assert!(String::from_utf8_lossy(&left.stdout).trim().is_empty(), "container de comando ainda vivo");
     }
 
     /// Teste real do `-run`: sobe, lê a porta publicada e os logs, derruba com volumes.

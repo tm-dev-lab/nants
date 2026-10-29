@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isConsoleEvent, publishConsoleEvent } from "../api/consoleEvents";
 import { isDeviceEvent, publishDeviceEvent } from "../api/deviceEvents";
+import { applyKbEvent } from "../apps/knowledge/kbStore";
 import type { ApiEvent } from "../api/types";
 import { loadConfig } from "../configLoader";
 import { handleLiveEvent, useLiveStream } from "../liveStream";
@@ -95,6 +96,10 @@ export function useDesktopRuntime(options: DesktopRuntimeOptions = {}): DesktopR
       if (event.event_type === "project_removed") handleSpaceRemovedEvent(event.payload.project_id);
       else if (isDeviceEvent(event)) publishDeviceEvent(event);
       else if (isConsoleEvent(event)) publishConsoleEvent(event);
+      // Base de conhecimento (spec 134 T06): a lista da janela Conhecimento se relê.
+      else if (event.event_type === "kb_updated") {
+        if (event.project_id !== null) applyKbEvent(event.project_id);
+      }
       else handleLiveEvent(event);
       if (isAttentionEvent(event)) feedRef.current?.request();
     },

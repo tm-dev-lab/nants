@@ -21,6 +21,7 @@ use crate::agents::usage::{UsageBackend, UsageScope, UsageSink};
 use crate::config::Effort;
 use crate::harness::allowlist::Policy;
 use crate::harness::tools::{self, Approver, Role as ToolRole, ToolHost};
+use crate::server::events::SecretSet;
 
 /// Pedidos ao modelo na revisão do plano (curta: só confere o que o plano afirma).
 pub const PLAN_REVIEW_MAX_STEPS: usize = 8;
@@ -42,6 +43,8 @@ pub struct PlanReviewer {
     usage: Option<Arc<dyn UsageSink>>,
     /// Idioma ativo da interface (spec 102).
     lang: crate::i18n::SharedLang,
+    /// Segredos redigidos da base de conhecimento (spec 134 T05); `None` = sem a base.
+    kb: Option<Arc<SecretSet>>,
 }
 
 impl PlanReviewer {
@@ -62,7 +65,16 @@ impl PlanReviewer {
             spec_id: None,
             usage: None,
             lang: crate::i18n::SharedLang::default(),
+            kb: None,
         }
+    }
+
+    /// Liga a base de conhecimento do projeto (spec 134 T05): com documento pronto na raiz da
+    /// revisão (a do projeto), o Revisor recebe o catálogo, as regras da revisão com a base e as
+    /// ferramentas `kb_search`/`kb_read`; sem documento pronto, nada muda.
+    pub fn with_kb(mut self, secrets: Arc<SecretSet>) -> Self {
+        self.kb = Some(secrets);
+        self
     }
 
     /// Idioma ativo da interface (spec 102): lido a cada mensagem, então a troca no meio do
@@ -102,6 +114,19 @@ impl PlanReviewer {
             Arc::clone(&self.approver),
         )
         .report_only();
+        let host = match &self.kb {
+            Some(secrets) => host.with_kb(root, Some(Arc::clone(secrets))),
+            None => host,
+        };
+        let mut review_tools = tools::specs_report();
+        let kb_message = match &self.kb {
+            Some(secrets) if host.has_kb() => {
+                review_tools.extend(tools::specs_kb());
+                Some(crate::kb::catalog::plan_review_message(&crate::kb::catalog::render(root, secrets)))
+                    .filter(|m| !m.is_empty())
+            }
+            _ => None,
+        };
         let usage = self.usage.as_ref().map(|sink| UsageScope::new(Arc::clone(sink), PLAN_REVIEW_ROLE, None, None));
         let metered = UsageBackend::new(self.backend.as_ref(), usage.clone());
         let ctx = AgentCtx {
@@ -109,7 +134,7 @@ impl PlanReviewer {
             model: &self.model,
             effort: self.effort,
             host: &host,
-            tools: tools::specs_report(),
+            tools: review_tools,
             role: PLAN_REVIEW_ROLE,
             // Spec 121: a resposta é o JSON da revisão; a Atividade mostra o rótulo, não o texto.
             activity: ActivityScope::new(Arc::clone(&self.activity), PLAN_REVIEW_ROLE, self.spec_id.clone(), None)
@@ -120,10 +145,12 @@ impl PlanReviewer {
             cache_prices: None,
             lang: self.lang.get(),
         };
-        let mut messages = vec![
-            ChatMessage::text(ChatRole::System, plan_review_system_for(self.lang.get())),
-            ChatMessage::text(ChatRole::System, format!("{PLAN_FACTS_LABEL}\n{plan}")),
-        ];
+        let mut messages = vec![ChatMessage::text(ChatRole::System, plan_review_system_for(self.lang.get()))];
+        // Spec 134 T05: o catálogo da base entre as regras e o plano (prefixo estável).
+        if let Some(kb) = kb_message {
+            messages.push(ChatMessage::text(ChatRole::System, kb));
+        }
+        messages.push(ChatMessage::text(ChatRole::System, format!("{PLAN_FACTS_LABEL}\n{plan}")));
         if let Some(memory) = memory.filter(|m| !m.trim().is_empty()) {
             messages.push(ChatMessage::text(ChatRole::System, memory));
         }
@@ -171,6 +198,38 @@ mod tests {
         for n in ["read_file", "list_dir", "search_code"] {
             assert!(names.contains(&n), "{names:?}");
         }
+    }
+
+    /// Spec 134 T05: com documento pronto na raiz do projeto, a revisão do plano recebe o catálogo
+    /// com as regras da revisão (entre as regras e o plano) e as `kb_*`; sem documento pronto, o
+    /// pedido é o de sempre, byte a byte.
+    #[tokio::test]
+    async fn kb_catalog_and_tools_only_with_a_ready_base() {
+        let root = tmp_root("plan-review-kb");
+        let secrets = Arc::new(SecretSet::new(Vec::<String>::new()));
+        let ask = |root: std::path::PathBuf, kb: bool| {
+            let secrets = Arc::clone(&secrets);
+            async move {
+                let scripted = Scripted::new(vec![text("{\"issues\": []}")]);
+                let rev = reviewer(scripted.clone());
+                let rev = if kb { rev.with_kb(secrets) } else { rev };
+                rev.review(&root, "p").await.expect("ok");
+                scripted.requests()[0].clone()
+            }
+        };
+        let plain = ask(root.clone(), false).await;
+        assert_eq!(ask(root.clone(), true).await.messages, plain.messages, "base vazia");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        assert_eq!(ask(root.clone(), false).await.messages, plain.messages, "sem with_kb, nada muda");
+        let req = ask(root.clone(), true).await;
+        assert_eq!(req.messages.len(), plain.messages.len() + 1);
+        let kb = &req.messages[1].content;
+        assert!(kb.starts_with(crate::kb::catalog::PLAN_REVIEW_RULES), "{kb}");
+        assert!(kb.contains("fiel à fonte") && kb.contains("não contradiz") && kb.contains(&format!("- kb:{} |", doc.id)), "{kb}");
+        assert!(req.messages[2].content.starts_with(PLAN_FACTS_LABEL));
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.ends_with(&["kb_search", "kb_read"]), "{names:?}");
     }
 
     /// Spec 128 T02: a memória das rodadas vai numa mensagem de sistema entre o plano e o pedido.

@@ -57,6 +57,7 @@ use crate::agents::finding_track::{self, REGISTRY};
 use crate::agents::llm_client::ProviderFailure;
 use crate::agents::usage::BudgetGuard;
 use crate::harness::compose::{ComposeEnv, KeptRun};
+use crate::harness::limits::{self, ContainerLimits, LimitHit};
 use crate::harness::git::{Git, LOCAL_SETTINGS};
 use crate::harness::GitError;
 use crate::harness::progress::CommandProgress;
@@ -681,6 +682,9 @@ pub struct DevBrief {
     pub human_guidance: String,
     /// Índice da spec e as seções inteiras que cabem no teto (spec 131 T01, já redigido); vazio sem seções.
     pub spec_context: String,
+    /// Bloco da base de conhecimento (spec 134 T05, já redigido): as fontes `kb:` citadas, o índice
+    /// do que não coube e os padrões do escopo; vazio sem documento pronto na base.
+    pub kb_context: String,
     /// spec.md inteiro e redigido, lido por `read_spec_section` (spec 131 T01); vazio = sem a ferramenta.
     pub spec_text: String,
     /// Subseção `### Desenvolvedor` de "Orientações por papel" do spec.md (≤ 1,5 KiB, redigida); vazia sem ela.
@@ -734,6 +738,9 @@ pub struct DevBrief {
     /// Registro das rodadas dos comandos de teste do projeto feitas pelo Desenvolvedor (spec 124
     /// T05), consultado pelo runner na entrega.
     pub suite_ledger: crate::sdd::test_levels::SuiteLedger,
+    /// Raiz do projeto (o repositório principal, não a worktree): de onde vem a base de
+    /// conhecimento de `kb_search`/`kb_read` (spec 134 T04); vazia = sem as ferramentas.
+    pub project_root: PathBuf,
 }
 
 /// Relato do Desenvolvedor após uma rodada.
@@ -812,6 +819,9 @@ pub struct ReviewInput {
     pub changed_files: Option<Vec<String>>,
     /// Índice da spec e as seções inteiras que cabem no teto (spec 131 T01, já redigido); vazio sem seções.
     pub spec_context: String,
+    /// Bloco da base de conhecimento (spec 134 T05, já redigido): as fontes `kb:` citadas, o índice
+    /// do que não coube e os padrões do escopo; vazio sem documento pronto na base.
+    pub kb_context: String,
     /// spec.md inteiro e redigido, lido por `read_spec_section` (spec 131 T01); vazio = sem a ferramenta.
     pub spec_text: String,
     /// Subseção `### Revisor` de "Orientações por papel" do spec.md (≤ 1,5 KiB, redigida); vazia sem ela.
@@ -821,6 +831,9 @@ pub struct ReviewInput {
     /// Formatadores automáticos do projeto (spec 078), um por linha, já redigidos; vazio sem formatadores.
     pub formatters: String,
     pub worktree: PathBuf,
+    /// Raiz do projeto (o repositório principal, não a worktree): de onde vem a base de
+    /// conhecimento de `kb_search`/`kb_read` (spec 134 T04); vazia = sem as ferramentas.
+    pub project_root: PathBuf,
     /// Época da tentativa (ver [`ask_epoch`]): chave do cache de perguntas repetidas ao Arquiteto.
     pub ask_epoch: u64,
     /// Checagens não bloqueantes que passam na base e falham na branch (spec 080 T01), separadas por
@@ -860,6 +873,11 @@ pub fn ask_epoch(task: &Task) -> u64 {
 /// Teto das seções inteiras da spec nos briefings (spec 131 T01); o índice fica fora do teto e o
 /// que não cabe se lê com `read_spec_section`.
 pub const SPEC_CONTEXT_MAX_BYTES: usize = 6 * 1024;
+/// Teto do texto das fontes da base citadas no briefing (spec 134 T05): sai do mesmo teto do
+/// contexto da spec ([`SPEC_CONTEXT_MAX_BYTES`]), no máximo a metade.
+pub const KB_SOURCES_MAX_BYTES: usize = SPEC_CONTEXT_MAX_BYTES / 2;
+/// Código do aviso de fonte citada que mudou depois da aprovação (spec 134 T05).
+pub const KB_SOURCE_CHANGED_CODE: &str = "kb.source_changed";
 /// Tetos da lista de arquivos do projeto no briefing do Desenvolvedor.
 pub const PROJECT_FILES_MAX_LINES: usize = 200;
 pub const PROJECT_FILES_MAX_BYTES: usize = 4 * 1024;
@@ -2678,6 +2696,17 @@ fn timed_out_mark(lang: Lang, timeout: Duration) -> String {
     format!("\n[{}]\n", i18n::tr(lang, "runner.output.timed_out", &[("secs", &secs)]))
 }
 
+/// Spec 134 T08: marca de limite do container atingido (memória ou processos), acrescentada à
+/// saída dos testes no idioma do projeto. A pessoa a vê, e o modelo que lê a saída também.
+fn limit_mark(lang: Lang, hit: LimitHit, limits: ContainerLimits) -> String {
+    let text = match hit {
+        LimitHit::Memory => i18n::tr(lang, "runner.output.memory_limit", &[("mib", &limits.memory_mib().to_string())]),
+        LimitHit::LikelyMemory => i18n::tr(lang, "runner.output.memory_limit_likely", &[("mib", &limits.memory_mib().to_string())]),
+        LimitHit::Pids => i18n::tr(lang, "runner.output.pids_limit", &[("pids", &limits.pids.to_string())]),
+    };
+    format!("\n[{text}]\n")
+}
+
 /// Executa `command` com `sh -c` em `dir`. Após o timeout, mata o processo e não espera os pipes.
 fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang, progress: Option<&CommandProgress>) -> Result<TestResult, RunnerError> {
     let mut child = Command::new("sh")
@@ -2799,6 +2828,8 @@ pub struct TaskRunner {
     /// Spec 131 T05: a spec desta execução, cuja conferência da persistência da instalação vai junto
     /// da primeira instalação real (`ensure_installed`) enquanto o spec.md não a registra.
     footprint_spec: Mutex<Option<String>>,
+    /// Spec 134 T05: fontes da base citadas que mudaram e já foram avisadas nesta execução.
+    kb_warned: Mutex<HashSet<String>>,
 }
 
 /// Resultado do container mantido da instalação que também confere a persistência (spec 131 T05).
@@ -2843,6 +2874,7 @@ impl TaskRunner {
             probed_env: Mutex::new(None),
             suite_ledger: test_levels::SuiteLedger::default(),
             footprint_spec: Mutex::new(None),
+            kb_warned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2994,6 +3026,7 @@ impl TaskRunner {
             .clone()
             .ok_or_else(|| RunnerError::Docker("projeto em modo docker sem executor de compose".into()))?;
         let (dir, command) = (dir.to_path_buf(), command.to_string());
+        let env = Arc::clone(&compose);
         let joined = tokio::task::spawn_blocking(move || {
             if fresh {
                 compose.prepare(&dir)?;
@@ -3015,6 +3048,9 @@ impl TaskRunner {
         let mut out = joined.map_err(RunnerError::Docker)?;
         if out.timed_out {
             out.output.push_str(&timed_out_mark(self.lang.get(), TEST_TIMEOUT));
+        }
+        if let Some(hit) = limits::detect_hit(out.code, out.timed_out, &out.output) {
+            out.output.push_str(&limit_mark(self.lang.get(), hit, env.workspace_limits()));
         }
         Ok(TestResult { passed: out.success(), output: out.output, exit_code: out.code, timed_out: out.timed_out })
     }
@@ -3349,6 +3385,7 @@ impl TaskRunner {
         self.remember(&path)?;
         let mut task = read_task(&path)?;
         self.arm_install_footprint(spec_id);
+        self.kb_source_notices(spec_id, task_id);
         if task.frontmatter.spec_id != spec_id || task.frontmatter.id != task_id {
             return Err(RunnerError::Invalid(format!(
                 "arquivo de {spec_id}/{task_id} declara {}/{}",
@@ -4588,6 +4625,7 @@ impl TaskRunner {
             let list = crate::sdd::screenshots::vanished(&spec_dir, &task.frontmatter.id, &current);
             crate::sdd::screenshots::render_vanished(&list)
         };
+        let kb = self.kb_block(&task.frontmatter.spec_id, Some(task), true);
         let input = ReviewInput {
             prior_findings: self.scrub(&prior_findings),
             finding_responses: self.scrub(&responses.iter().map(|r| format!("- {}", r.line())).collect::<Vec<_>>().join("\n")),
@@ -4597,7 +4635,9 @@ impl TaskRunner {
                 &task_citations(task),
                 &[crate::sdd::role_guidance::ROLE_REVIEWER],
                 false,
+                SPEC_CONTEXT_MAX_BYTES.saturating_sub(kb.used),
             ),
+            kb_context: kb.text,
             spec_text: self.spec_text(&task.frontmatter.spec_id),
             role_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("reviewer"),
@@ -4615,6 +4655,7 @@ impl TaskRunner {
             dev_criteria,
             other_tasks,
             worktree,
+            project_root: self.repo_root.clone(),
             ask_epoch: ask_epoch(task),
             regressions,
             screenshots,
@@ -5293,7 +5334,7 @@ impl TaskRunner {
     /// T01); vazio se ilegível ou sem seções. Não repete o que o mesmo briefing entrega inteiro por
     /// outro caminho, detectado pelos mesmos leitores: a orientação do papel `role` e, com
     /// `global_criteria` (verificação final), os critérios globais.
-    fn spec_context(&self, spec_id: &str, cited: &str, roles: &[&str], global_criteria: bool) -> String {
+    fn spec_context(&self, spec_id: &str, cited: &str, roles: &[&str], global_criteria: bool, max: usize) -> String {
         use crate::sdd::role_guidance::{delivered_whole, ROLE_GUIDANCE_SECTION};
         use crate::sdd::spec_sections::Delivered;
         let text = self.spec_text(spec_id);
@@ -5307,7 +5348,45 @@ impl TaskRunner {
         if global_criteria && section_text(&text, GLOBAL_CRITERIA).is_some_and(|c| !c.trim().is_empty()) {
             delivered.push(Delivered { section: GLOBAL_CRITERIA, sub: None });
         }
-        crate::sdd::spec_sections::briefing_context(&text, cited, SPEC_CONTEXT_MAX_BYTES, &delivered)
+        crate::sdd::spec_sections::briefing_context(&text, cited, max, &delivered)
+    }
+
+    /// Bloco da base de conhecimento do briefing (spec 134 T05): as seções `kb:` citadas na tarefa
+    /// e na spec, dentro de [`KB_SOURCES_MAX_BYTES`], o índice do que não coube e a linha dos padrões
+    /// cujo `applies_to` cruza o escopo da tarefa (os congelados na aprovação, quando há). Vazio sem
+    /// documento pronto na base. `used` sai do teto do contexto da spec.
+    fn kb_block(&self, spec_id: &str, task: Option<&Task>, reviewer: bool) -> crate::kb::catalog::BriefBlock {
+        use crate::kb::catalog::{briefing_block, standards, BriefInput};
+        let none = crate::server::events::SecretSet::new(Vec::<String>::new());
+        let secrets = self.secrets.as_deref().unwrap_or(&none);
+        let spec_text = fs::read_to_string(self.spec_dir(spec_id).join("spec.md")).unwrap_or_default();
+        let standards = match crate::kb::cite::load_frozen(&self.repo_root, spec_id) {
+            Some(frozen) => frozen.standards,
+            None => standards(&crate::kb::load_manifest(&self.repo_root).unwrap_or_default()),
+        };
+        let task_text = task.map(|t| t.body.as_str()).unwrap_or_default();
+        let scope = task.map(|t| t.frontmatter.allowed_scope.clone()).unwrap_or_default();
+        let input = BriefInput { task_text, spec_text: &spec_text, scope: &scope, standards: &standards, reviewer, max: KB_SOURCES_MAX_BYTES };
+        let mut block = briefing_block(&self.repo_root, &input, secrets);
+        block.text = self.scrub(&block.text);
+        block
+    }
+
+    /// Spec 134 T05: fontes citadas pela spec que mudaram desde a aprovação viram um aviso
+    /// codificado (uma vez por fonte nesta execução), sem replanejar.
+    fn kb_source_notices(&self, spec_id: &str, task_id: &str) {
+        let Some(frozen) = crate::kb::cite::load_frozen(&self.repo_root, spec_id) else {
+            return;
+        };
+        let none = crate::server::events::SecretSet::new(Vec::<String>::new());
+        let secrets = self.secrets.as_deref().unwrap_or(&none);
+        for citation in crate::kb::cite::changed(&self.repo_root, &frozen, secrets) {
+            let fresh = self.kb_warned.lock().unwrap_or_else(PoisonError::into_inner).insert(citation.clone());
+            if fresh {
+                let since = frozen.frozen_at.get(..10).unwrap_or(&frozen.frozen_at).to_string();
+                self.notice(task_id, KB_SOURCE_CHANGED_CODE, &[("citation", &citation), ("spec", spec_id), ("since", &since)]);
+            }
+        }
     }
 
     /// spec.md inteiro e redigido, para `read_spec_section` (as worktrees não têm `.sdd/specs`);
@@ -5356,6 +5435,7 @@ impl TaskRunner {
         settings: &Settings,
     ) -> Result<DevBrief, RunnerError> {
         let yolo = settings.yolo;
+        let kb = self.kb_block(&task.frontmatter.spec_id, Some(task), false);
         Ok(DevBrief {
             spec_id: task.frontmatter.spec_id.clone(),
             task_id: task.frontmatter.id.clone(),
@@ -5379,7 +5459,9 @@ impl TaskRunner {
                 // Spec 131 T02: o Desenvolvedor recebe também as orientações do Revisor.
                 &[crate::sdd::role_guidance::ROLE_DEVELOPER, crate::sdd::role_guidance::ROLE_REVIEWER],
                 false,
+                SPEC_CONTEXT_MAX_BYTES.saturating_sub(kb.used),
             ),
+            kb_context: kb.text,
             spec_text: self.spec_text(&task.frontmatter.spec_id),
             role_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_DEVELOPER),
             reviewer_guidance: self.role_guidance(&task.frontmatter.spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
@@ -5398,6 +5480,7 @@ impl TaskRunner {
             references: self.references(&task.frontmatter.spec_id),
             base_branch: settings.base_branch.clone(),
             spec_dir: self.spec_dir(&task.frontmatter.spec_id),
+            project_root: self.repo_root.clone(),
             art_guide: self.art_guide(&task.frontmatter.spec_id),
             environment: self.capabilities_section(capabilities::Audience::Developer),
             flaky_tests: section_text(&task.body, FLAKY_SECTION).unwrap_or_default().trim().to_string(),
@@ -5525,6 +5608,8 @@ impl TaskRunner {
             test_output.push_str(&line);
             test_output.push('\n');
         }
+        // Spec 134 T05: na verificação final, as fontes citadas pela spec (sem tarefa nem escopo).
+        let final_kb = self.kb_block(spec_id, None, true);
         let input = ReviewInput {
             spec_id: spec_id.to_string(),
             task_id: "FINAL".into(),
@@ -5546,12 +5631,20 @@ impl TaskRunner {
             incremental_diff: String::new(),
             changed_files: None,
             // Spec 131 T01: os critérios globais citam as seções que a verificação final recebe primeiro.
-            spec_context: self.spec_context(spec_id, &criteria, &[crate::sdd::role_guidance::ROLE_REVIEWER], true),
+            spec_context: self.spec_context(
+                spec_id,
+                &criteria,
+                &[crate::sdd::role_guidance::ROLE_REVIEWER],
+                true,
+                SPEC_CONTEXT_MAX_BYTES.saturating_sub(final_kb.used),
+            ),
+            kb_context: final_kb.text,
             spec_text: self.spec_text(spec_id),
             role_guidance: self.role_guidance(spec_id, crate::sdd::role_guidance::ROLE_REVIEWER),
             skill_profile: self.skill_profile("reviewer"),
             formatters: String::new(),
             worktree: self.repo_root.clone(),
+            project_root: self.repo_root.clone(),
             ask_epoch: 0,
             regressions: String::new(),
             screenshots,
@@ -7668,6 +7761,68 @@ mod tests {
         }
     }
 
+    /// Spec 134 T05: o bloco da base no briefing traz as fontes citadas na tarefa e na spec e a linha
+    /// dos padrões do escopo; sem documento pronto na base, nada.
+    #[test]
+    fn kb_block_brings_cited_sources_and_scope_standards_only_with_a_base() {
+        use crate::kb::catalog::{BriefBlock, DEV_RULE, REVIEWER_RULE};
+        let fx = Fixture::new("kb-block", "true");
+        let runner = fx.noop_runner(&FakeReviewer::new(|_, _| approved(vec![])));
+        let mut t = task("T01", TaskStatus::Todo, &[]);
+        assert_eq!(runner.kb_block(SPEC, Some(&t), false), BriefBlock::default(), "sem base");
+        let none = crate::server::events::SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&fx.repo, "regras.md", b"# Filas\nUse filas.\n\n# Logs\nLogs em JSON.\n", &none, "2026-10-28T12:00:00Z")
+            .unwrap();
+        let patch = crate::kb::Patch { role: Some(crate::kb::Role::Standard), description: None, applies_to: Some(vec!["src/**".into()]) };
+        crate::kb::update(&fx.repo, &doc.id, &patch).unwrap();
+        assert_eq!(runner.kb_block(SPEC, Some(&t), false).used, 0, "sem citação, nada do teto");
+        let spec_path = fx.repo.join(".sdd/specs/s1/spec.md");
+        let spec = fs::read_to_string(&spec_path).unwrap().replace("teste\n", &format!("teste\n\n## Premissas\n- Logs (kb:{}#logs)\n", doc.id));
+        fs::write(&spec_path, spec).unwrap();
+        t.body.push_str(&format!("- Filas (kb:{}#filas)\n", doc.id));
+        let dev = runner.kb_block(SPEC, Some(&t), false);
+        assert!(dev.text.contains("Use filas.") && dev.text.contains("Logs em JSON.") && dev.text.contains(DEV_RULE), "{}", dev.text);
+        assert!(dev.text.contains(&format!("- kb:{} | ", doc.id)), "padrão do escopo: {}", dev.text);
+        assert!(dev.used > 0 && dev.used <= KB_SOURCES_MAX_BYTES && KB_SOURCES_MAX_BYTES < SPEC_CONTEXT_MAX_BYTES);
+        assert!(runner.kb_block(SPEC, Some(&t), true).text.contains(REVIEWER_RULE));
+        t.frontmatter.allowed_scope = vec!["docs/**".into()];
+        assert!(!runner.kb_block(SPEC, Some(&t), false).text.contains(&format!("- kb:{} | ", doc.id)), "fora do escopo");
+        // Verificação final: as fontes da spec, sem tarefa nem índice de padrões.
+        let last = runner.kb_block(SPEC, None, true);
+        assert!(last.text.contains("Logs em JSON.") && !last.text.contains("Use filas."), "{}", last.text);
+    }
+
+    /// Spec 134 T05: a fonte citada que muda depois da aprovação dá um aviso codificado, uma vez.
+    #[test]
+    fn kb_changed_source_gives_one_coded_notice() {
+        let fx = Fixture::new("kb-changed", "true");
+        let rec = Recorder::default();
+        let runner = fx.runner(&FakeDev::default(), &FakeReviewer::new(|_, _| approved(vec![])), ScriptedTests::default(), &rec);
+        runner.kb_source_notices(SPEC, "T01");
+        assert!(notices(&rec).is_empty(), "sem congelamento, nada");
+        let none = crate::server::events::SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&fx.repo, "regras.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").unwrap();
+        let cited = format!("kb:{}#filas", doc.id);
+        crate::kb::cite::freeze(&fx.repo, SPEC, &[cited.as_str()], &none, "2026-10-28T12:00:00Z").unwrap();
+        runner.kb_source_notices(SPEC, "T01");
+        assert!(notices(&rec).is_empty(), "nada mudou");
+        let note = fx.repo.join(crate::kb::NOTES_REL).join(format!("{}.md", doc.id));
+        fs::write(&note, fs::read_to_string(&note).unwrap().replace("Use filas.", "Use eventos.")).unwrap();
+        crate::kb::index::forget(&fx.repo);
+        runner.kb_source_notices(SPEC, "T01");
+        runner.kb_source_notices(SPEC, "T02");
+        let seen = notices(&rec);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, KB_SOURCE_CHANGED_CODE);
+        assert_eq!(seen[0].1.get("citation"), Some(&serde_json::Value::from(cited.clone())));
+        assert_eq!(seen[0].1.get("since"), Some(&serde_json::Value::from("2026-10-28")));
+        let text = rec.events().into_iter().find_map(|e| match e {
+            RunnerEvent::SystemNotice { text, .. } => Some(text),
+            _ => None,
+        });
+        assert!(text.is_some_and(|t| t.contains(&cited) && t.contains("mudou desde a aprovação")));
+    }
+
     /// Spec 131 T01: o contexto da spec não repete o que o briefing já entrega inteiro (a orientação
     /// do papel e, na verificação final, os critérios globais); a seção fica no índice.
     #[test]
@@ -7680,22 +7835,22 @@ mod tests {
         let runner = fx.noop_runner(&FakeReviewer::new(|_, _| approved(vec![])));
         let elsewhere = "[entregue em outra seção do briefing]";
         // Spec 131 T02: o Desenvolvedor recebe as duas subseções; nenhuma se repete no contexto.
-        let dev = runner.spec_context("s1", "", &[ROLE_DEVELOPER, ROLE_REVIEWER], false);
+        let dev = runner.spec_context("s1", "", &[ROLE_DEVELOPER, ROLE_REVIEWER], false, SPEC_CONTEXT_MAX_BYTES);
         assert!(dev.contains(&format!("### Desenvolvedor (562 B) {elsewhere}")), "{dev}");
         assert!(dev.contains(&format!("### Revisor (535 B) {elsewhere}")), "{dev}");
         assert!(!dev.contains("Use Decimal only at parsing"), "{dev}");
         assert!(!dev.contains("Check overlap multiplicity"), "{dev}");
         assert!(!dev.contains(&format!("Globais (999 B) {elsewhere}")), "{dev}");
-        let task_review = runner.spec_context("s1", "", &[ROLE_REVIEWER], false);
+        let task_review = runner.spec_context("s1", "", &[ROLE_REVIEWER], false, SPEC_CONTEXT_MAX_BYTES);
         assert!(task_review.contains(&format!("### Revisor (535 B) {elsewhere}")), "{task_review}");
         assert!(!task_review.contains("Check overlap multiplicity"), "{task_review}");
-        let last = runner.spec_context("s1", "", &[ROLE_REVIEWER], true);
+        let last = runner.spec_context("s1", "", &[ROLE_REVIEWER], true, SPEC_CONTEXT_MAX_BYTES);
         assert!(last.contains(&format!("## Critérios de Aceitação Globais (999 B) {elsewhere}")), "{last}");
         assert!(!last.contains("G1: The Docker workspace"), "{last}");
         // Orientação cortada pelo leitor não conta como entregue inteira: continua no texto da spec.
         let long = format!("## Orientações por papel\n### Desenvolvedor\n{}\n## Outra\nz\n", "palavra ".repeat(300));
         fs::write(dir.join("spec.md"), long).unwrap();
-        let cut = runner.spec_context("s1", "", &[ROLE_DEVELOPER], false);
+        let cut = runner.spec_context("s1", "", &[ROLE_DEVELOPER], false, SPEC_CONTEXT_MAX_BYTES);
         assert!(!cut.contains(elsewhere) && cut.contains("palavra palavra"), "{cut}");
     }
 
@@ -10122,6 +10277,37 @@ mod tests {
         }
         assert_eq!(fx.read_task("T01").frontmatter.status, TaskStatus::Blocked);
         assert!(rev.inputs().is_empty());
+    }
+
+    /// Spec 134 T08: a suíte que morreu pelo limite de memória ou de processos do container ganha a
+    /// marca do limite, no idioma do projeto e com o valor efetivo.
+    #[tokio::test]
+    async fn docker_limit_mark_follows_the_project_language() {
+        use crate::harness::compose::fake::FakeRunner;
+        const MIB: u64 = 1024 * 1024;
+        let cap = ContainerLimits { memory: 512 * MIB, pids: 64 };
+        for (lang, name, reply, mark) in [
+            (Lang::En, "docker-oom-en", (137, "Killed\n"), "the command was killed with code 137, probably by the container memory limit (512 MiB, no swap)"),
+            (Lang::PtBr, "docker-oom-pt", (137, "Killed\n"), "o comando foi encerrado com o código 137, provavelmente pelo limite de memória do container (512 MiB, sem swap)"),
+            (Lang::En, "docker-oomtxt-en", (1, "out of memory\n"), "the command was stopped by the container memory limit (512 MiB, no swap)"),
+            (Lang::PtBr, "docker-oomtxt-pt", (1, "out of memory\n"), "o comando foi encerrado pelo limite de memória do container (512 MiB, sem swap)"),
+            (Lang::En, "docker-pids-en", (2, "sh: can't fork\n"), "the container refused to create processes (limit of 64 processes and threads)"),
+            (Lang::PtBr, "docker-pids-pt", (2, "sh: can't fork\n"), "o container recusou criar processos (limite de 64 processos e threads)"),
+        ] {
+            let fx = Fixture::new(name, "make test");
+            enable_docker(&fx);
+            let fake = Arc::new(FakeRunner::default());
+            fake.reply("run", reply.0, reply.1);
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let runner = fx
+                .runner(&dev, &rev, ScriptedTests::default(), &rec)
+                .with_compose(Arc::new(crate::harness::compose::fake::test_env(name, fake).with_limits(cap)))
+                .with_lang(i18n::SharedLang::new(lang));
+            let settings = read_settings(&fx.settings_path()).unwrap();
+            let out = runner.exec_cmd(&settings, &fx.repo, "make test", false).await.unwrap();
+            assert!(!out.passed && !out.timed_out);
+            assert!(out.output.starts_with(reply.1) && out.output.contains(&format!("\n[{mark}")), "{}", out.output);
+        }
     }
 
     /// Spec 115 T04: no modo Docker, a marca de tempo limite da saída dos testes sai no idioma do

@@ -122,8 +122,9 @@ describe("Dock no Desktop", () => {
     expect(document.getElementById(dockButtonId("setup"))).not.toBeNull();
   });
 
-  it("095/T03 (C-04): a Execução entra depois do App; Alt+1…9 cobre as nove primeiras; Projeto sem atalho", () => {
-    expect(DOCK_ORDER).toEqual(["conversation", "plan", "board", "activity", "files", "app", "execution", "report", "costs", "project", "settings", "setup"]);
+  it("095/T03 (C-04): a Execução entra depois do App; Alt+1…9 cobre as nove primeiras; Conhecimento e Projeto sem atalho", () => {
+    // Spec 134 T06: o Conhecimento entra depois de Custos, sem Alt (os atalhos não mudam).
+    expect(DOCK_ORDER).toEqual(["conversation", "plan", "board", "activity", "files", "app", "execution", "report", "costs", "knowledge", "project", "settings", "setup"]);
     render(<DesktopHarness layout={{ windows: {} }} />);
     const keys = (kind: string): string | null => document.getElementById(dockButtonId(kind as never))?.getAttribute("aria-keyshortcuts") ?? null;
     expect(keys("conversation")).toBe("Alt+1");
@@ -131,6 +132,7 @@ describe("Dock no Desktop", () => {
     expect(keys("execution")).toBe("Alt+7");
     expect(keys("costs")).toBe("Alt+9");
     // O resto fica pelo lançador (sem Alt+0).
+    expect(keys("knowledge")).toBeNull();
     expect(keys("project")).toBeNull();
     expect(keys("settings")).toBeNull();
     const execution = within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Execução" });

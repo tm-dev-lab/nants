@@ -96,6 +96,9 @@ pub enum EventType {
     DevicesChanged,
     /// Janela de adicionar dispositivo invalidada por tentativas erradas (`reason`; spec 112).
     DeviceCodeLocked,
+    /// Documento da base de conhecimento mudou (spec 134/T02): `id`, `status`, `status_reason` e
+    /// `doc` (a entrada redigida), ou `id` e `removed: true`.
+    KbUpdated,
 }
 
 impl EventType {
@@ -124,6 +127,7 @@ impl EventType {
             Self::ChatTurnEnded => "chat_turn_ended",
             Self::DevicesChanged => "devices_changed",
             Self::DeviceCodeLocked => "device_code_locked",
+            Self::KbUpdated => "kb_updated",
         }
     }
 }

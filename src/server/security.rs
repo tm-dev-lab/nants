@@ -141,8 +141,13 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     let image_upload = req.method() == Method::POST
         && super::chat_attachments::is_upload_path(req.uri().path())
         && super::chat_attachments::is_upload_content_type(req.headers());
+    // Envio de arquivo à base de conhecimento (spec 134 T01): corpo binário, `application/octet-stream`
+    // (também exige preflight de CORS).
+    let kb_upload = req.method() == Method::POST
+        && super::kb::is_upload_path(req.uri().path())
+        && super::kb::is_upload_content_type(req.headers());
     let checked = check_host_and_origin_with(req.headers(), state.bound_port(), state.host_policy())
-        .and_then(|()| if image_upload { Ok(()) } else { check_content_type(req.method(), req.headers()) });
+        .and_then(|()| if image_upload || kb_upload { Ok(()) } else { check_content_type(req.method(), req.headers()) });
     match checked {
         Ok(()) => next.run(req).await,
         Err(err) => err.into_response(),

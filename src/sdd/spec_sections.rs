@@ -30,12 +30,14 @@ pub struct Section {
     pub full: String,
     /// Índice (exclusivo) da última subseção: as seções `i+1..end` são as descendentes.
     end: usize,
+    /// Linha do cabeçalho no texto recebido (contando a partir de 0, com o frontmatter).
+    pub line: usize,
 }
 
-/// Nível e título de uma linha de cabeçalho (`## Título`), de 2 a 6 `#`.
-fn heading(line: &str) -> Option<(usize, &str)> {
+/// Nível e título de uma linha de cabeçalho (`## Título`), de `min_level` a 6 `#`.
+fn heading(line: &str, min_level: usize) -> Option<(usize, &str)> {
     let hashes = line.bytes().take_while(|b| *b == b'#').count();
-    if !(2..=6).contains(&hashes) {
+    if !(min_level.max(1)..=6).contains(&hashes) {
         return None;
     }
     let rest = &line[hashes..];
@@ -51,9 +53,19 @@ fn body_of(spec_md: &str) -> &str {
     split_frontmatter(spec_md).map(|(_, body)| body).unwrap_or(spec_md)
 }
 
-/// Seções da spec na ordem do texto. Cabeçalhos dentro de blocos de código não contam.
+/// Seções da spec na ordem do texto (`##` a `######`; o `#` do título do documento não conta).
+/// Cabeçalhos dentro de blocos de código não contam.
 pub fn parse(spec_md: &str) -> Vec<Section> {
-    let lines: Vec<&str> = body_of(spec_md).lines().collect();
+    parse_levels(spec_md, 2).1
+}
+
+/// Como [`parse`], com os cabeçalhos de `min_level` a 6 `#` (a base de conhecimento usa 1), e o
+/// texto antes do primeiro cabeçalho (sem o frontmatter), sem os espaços do fim.
+pub fn parse_levels(md: &str, min_level: usize) -> (String, Vec<Section>) {
+    let body = body_of(md);
+    // O corpo é um sufixo do texto: as linhas do frontmatter vêm antes dele.
+    let offset = if md.ends_with(body) { md[..md.len() - body.len()].matches('\n').count() } else { 0 };
+    let lines: Vec<&str> = body.lines().collect();
     let mut fence: Option<&str> = None;
     // (linha do cabeçalho, nível, título)
     let mut heads: Vec<(usize, usize, String)> = Vec::new();
@@ -77,7 +89,7 @@ pub fn parse(spec_md: &str) -> Vec<Section> {
         if fence.is_some() {
             continue;
         }
-        if let Some((level, title)) = heading(line) {
+        if let Some((level, title)) = heading(line, min_level) {
             heads.push((i, level, title.to_string()));
         }
     }
@@ -85,6 +97,7 @@ pub fn parse(spec_md: &str) -> Vec<Section> {
         let text = lines[from..to].join("\n");
         text.trim_end().to_string()
     };
+    let preamble = join(0, heads.first().map_or(lines.len(), |h| h.0));
     let mut out = Vec::with_capacity(heads.len());
     for (k, (start, level, title)) in heads.iter().enumerate() {
         let own_end = heads.get(k + 1).map_or(lines.len(), |h| h.0);
@@ -99,9 +112,17 @@ pub fn parse(spec_md: &str) -> Vec<Section> {
             own: join(*start, own_end),
             full: join(*start, full_end),
             end,
+            line: offset + *start,
         });
     }
-    out
+    (preamble, out)
+}
+
+impl Section {
+    /// Índice (exclusivo) da última descendente: as seções `i+1..end` estão dentro desta.
+    pub fn end(&self) -> usize {
+        self.end
+    }
 }
 
 /// Tamanho legível para o índice.
@@ -150,7 +171,7 @@ fn cited(sections: &[Section], cited_text: &str) -> Vec<usize> {
 }
 
 /// Seção mãe de `i` (a anterior mais próxima de nível menor que a contém); `None` no topo.
-fn parent_of(sections: &[Section], i: usize) -> Option<usize> {
+pub fn parent_of(sections: &[Section], i: usize) -> Option<usize> {
     (0..i).rev().find(|j| sections[*j].level < sections[i].level && sections[*j].end > i)
 }
 
@@ -574,5 +595,32 @@ mod tests {
         let big = format!("## Grande\n{}\n### Parte\nfim\n", "linha longa de texto\n".repeat(1500));
         let out = read_section(&big, "Grande").expect("lida");
         assert!(out.len() <= MAX_SECTION_BYTES && out.contains("- Parte") && out.contains("leia as subseções"), "{}", out.len());
+    }
+
+    /// Spec 134/T03: o `parse` ganhou o nível mínimo para a base de conhecimento; a spec continua
+    /// começando em `##`, com o `#` do título como texto comum.
+    #[test]
+    fn spec_parsing_is_unchanged_by_the_level_parameter() {
+        let md = "---\nid: x\n---\n# Spec X\nintro\n## A\na\n### A1\nx\n# Outro H1\ny\n## B\nb\n";
+        let s = parse(md);
+        let titles: Vec<(usize, &str)> = s.iter().map(|x| (x.level, x.title.as_str())).collect();
+        assert_eq!(titles, [(2, "A"), (3, "A1"), (2, "B")]);
+        assert_eq!(s[0].own, "## A\na");
+        assert_eq!(s[0].full, "## A\na\n### A1\nx\n# Outro H1\ny");
+        assert_eq!(s[1].own, "### A1\nx\n# Outro H1\ny");
+        assert_eq!((s[0].end(), s[1].end(), s[2].end()), (2, 2, 3));
+        assert_eq!(parent_of(&s, 1), Some(0));
+        assert!(read_section(md, "Spec X").is_err() && read_section(md, "Outro H1").is_err());
+        assert_eq!(read_section(md, "A1").expect("A1"), "### A1\nx\n# Outro H1\ny");
+        assert_eq!(parse_levels(md, 2).1, s);
+        assert_eq!(parse_levels(TEST9, 2).1, parse(TEST9));
+        // Com o nível 1, o `#` vira seção e o texto antes dele é o preâmbulo.
+        let (pre, all) = parse_levels(md, 1);
+        assert_eq!(pre, "");
+        let titles: Vec<(usize, &str)> = all.iter().map(|x| (x.level, x.title.as_str())).collect();
+        assert_eq!(titles, [(1, "Spec X"), (2, "A"), (3, "A1"), (1, "Outro H1"), (2, "B")]);
+        assert_eq!(all[0].end(), 3);
+        let (pre, _) = parse_levels("texto solto\n\n# T\nx\n", 1);
+        assert_eq!(pre, "texto solto");
     }
 }

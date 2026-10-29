@@ -204,6 +204,9 @@ pub struct AppState {
     exposed: bool,
     /// Login pelo plano ChatGPT (spec 116): tentativas pendentes, JWKS e renovações.
     chatgpt: Arc<super::chatgpt::ChatgptAuth>,
+    /// Fila de extração da base de conhecimento (spec 134/T02). Parada nos testes, que ligam a
+    /// sua com [`Self::with_kb_queue`].
+    kb_queue: super::kb_queue::KbQueue,
     /// IPv4 de rede do Windows conferidos há pouco (spec 112), com o instante da conferência.
     windows_ips: Arc<tokio::sync::Mutex<Option<(Instant, Option<Vec<std::net::Ipv4Addr>>)>>>,
     /// Pausas de teste (vazio em produção).
@@ -216,6 +219,8 @@ impl AppState {
     /// efetivamente ligada, usada na validação de `Host` e `Origin`.
     pub fn new(config_path: PathBuf, config: Config, port: u16) -> Self {
         let events = EventBus::new();
+        #[cfg(not(test))]
+        let events_for_kb = events.clone();
         #[cfg(not(test))]
         let data_dir: Option<Arc<PathBuf>> = crate::config::data_dir().map(Arc::new);
         // Testes nunca escrevem na pasta de dados real do usuário.
@@ -277,6 +282,14 @@ impl AppState {
             devices,
             exposed: false,
             chatgpt: Arc::new(super::chatgpt::ChatgptAuth::default()),
+            #[cfg(not(test))]
+            kb_queue: super::kb_queue::KbQueue::new(
+                events_for_kb,
+                crate::harness::web::WebClient::new(),
+                super::kb_queue::EXTRACT_TIMEOUT,
+            ),
+            #[cfg(test)]
+            kb_queue: super::kb_queue::KbQueue::idle(),
             windows_ips: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             gates: Arc::new(Mutex::new(Vec::new())),
@@ -651,6 +664,17 @@ impl AppState {
             return None;
         }
         self.view_ports.or_else(|| crate::config::ViewPorts::default_for(self.bound_port))
+    }
+
+    /// Fila de extração da base de conhecimento.
+    pub fn kb_queue(&self) -> &super::kb_queue::KbQueue {
+        &self.kb_queue
+    }
+
+    /// Troca a fila de extração (testes: cliente web com loopback e prazo curto).
+    pub fn with_kb_queue(mut self, queue: super::kb_queue::KbQueue) -> Self {
+        self.kb_queue = queue;
+        self
     }
 
     /// Barramento de eventos do processo (SSE e publicação).

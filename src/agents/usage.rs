@@ -225,6 +225,9 @@ pub enum ContextKind {
     /// são os itens que sairiam; `tools` leva `removed` (R), `invalidated` (I) e `horizon` (H), em
     /// tokens; `reason` é `cost` ou `session_ending`.
     CompactRefused,
+    /// Spec 134 T04 (C-18): uma chamada de `kb_search`/`kb_read`. Não tira nada do contexto:
+    /// `after_bytes` são os bytes do resultado, `items` é 1 e `tools` leva o nome da ferramenta.
+    Kb,
 }
 
 impl ContextKind {
@@ -237,6 +240,7 @@ impl ContextKind {
             Self::SummaryFailed => "summary_failed",
             Self::EvidenceCheck => "evidence_check",
             Self::CompactRefused => "compact_refused",
+            Self::Kb => "kb",
         }
     }
 }

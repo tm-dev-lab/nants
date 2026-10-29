@@ -525,6 +525,7 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         crate::harness::home::EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
+        crate::kb::KB_EXCLUDE_LINE,
         crate::sdd::capabilities::CAPABILITIES_EXCLUDE_LINE,
         crate::sdd::capabilities::CAPABILITIES_TMP_EXCLUDE_LINE,
     ] {
@@ -933,6 +934,8 @@ pub async fn remove_project(
     state.apps().stop(&id, super::app::REASON_PROJECT_REMOVED).await;
     // Console (spec 130 T03): o último resultado e o histórico do projeto removido somem.
     state.apps().console().forget(state.data_dir().map(Path::to_path_buf), &id).await;
+    // Base de conhecimento (spec 134/T03): o índice em memória do projeto removido sai do cache.
+    crate::kb::index::forget(&project_root);
     // Ambiente Docker: derruba -test e -run (volumes do -run só com a confirmação do usuário).
     {
         let (provider, root, pid) = (state.compose().clone(), project_root.clone(), id.clone());

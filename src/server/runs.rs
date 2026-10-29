@@ -421,6 +421,7 @@ impl RunnerFactory for ConfiguredRunnerFactory {
                 secrets: Arc::clone(&job.secrets),
                 lang: job.lang.clone(),
                 stop: Some(job.stop.clone()),
+                project_root: job.root.clone(),
             }) as Arc<dyn crate::agents::runner::ArbiterPort>
         });
         // Modo docker (único): testes, checks e run_command no Compose `-test`.
@@ -731,6 +732,20 @@ impl Drop for RunGuard {
 enum Mode {
     Approve,
     Resume,
+}
+
+/// Congela as fontes da base citadas na spec e nas tarefas (spec 134 T05, ver
+/// [`crate::kb::cite::freeze`]). Sem documento pronto e sem citação, nada é gravado.
+fn freeze_kb_sources(root: &Path, spec_id: &str, secrets: &SecretSet) -> Result<bool, crate::kb::KbError> {
+    let spec_dir = format!(".sdd/specs/{spec_id}");
+    let mut texts: Vec<String> = Vec::new();
+    texts.extend(safe_fs::read_regular(root, &format!("{spec_dir}/spec.md"), MAX_READ_BYTES).ok());
+    for name in super::plan_review::task_names(root, spec_id) {
+        texts.extend(safe_fs::read_regular(root, &format!("{spec_dir}/tasks/{name}"), MAX_READ_BYTES).ok());
+    }
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let now = super::projects::now_rfc3339();
+    Ok(crate::kb::cite::freeze(root, spec_id, &refs, secrets, &now)?.is_some())
 }
 
 /// `POST /api/projects/:id/specs/:spec_id/approve`
@@ -1375,6 +1390,16 @@ async fn launch(
     if let Some(names) = spec_references {
         let (ref_root, sid) = (root.clone(), spec_id.clone());
         let _ = tokio::task::spawn_blocking(move || crate::sdd::references::copy_to_spec(&ref_root, &sid, &names)).await;
+    }
+    // (4b6) Spec 134 T05: o SHA-256 de cada fonte da base citada no plano, o catálogo e os padrões
+    // congelados em `.sdd/kb/frozen/<spec>.json` (fora do Git). Melhor esforço: a citação já foi
+    // validada na gravação, e a falha aqui só tira o aviso de fonte alterada.
+    if approving {
+        let (kb_root, sid, kb_secrets) = (root.clone(), spec_id.clone(), Arc::clone(&secrets));
+        let frozen = tokio::task::spawn_blocking(move || freeze_kb_sources(&kb_root, &sid, &kb_secrets)).await;
+        if !matches!(frozen, Ok(Ok(_))) {
+            eprintln!("{}", crate::i18n::tr(crate::i18n::Lang::from_env(), "cli.kb_freeze_failed", &[("spec", &spec_id)]));
+        }
     }
     // (4c) ambiente aprovado junto com o plano: modo docker e hash dos arquivos no settings.
     let settings = match env_adopt {
@@ -4171,6 +4196,34 @@ mod tests {
         assert!(!text.contains(SECRET), "segredo vazou: {text}");
         assert!(text.contains("usei a chave ***"), "{text}");
         assert!(state.runs().active(PROJECT).is_none(), "reserva liberada");
+    }
+
+    /// Spec 134 T05: a aprovação congela o SHA-256 de cada fonte da base citada no plano (com o
+    /// catálogo e os padrões) em `.sdd/kb/frozen/<spec>.json`, fora do Git.
+    #[tokio::test]
+    async fn approve_freezes_the_cited_kb_sources() {
+        let root = setup("approve-kb-freeze", true);
+        // Como a API da base faz antes de gravar: `.sdd/kb/` fora do Git.
+        safe_fs::append_line_once(&root, ".git/info/exclude", crate::kb::KB_EXCLUDE_LINE).expect("exclude");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        let task = root.join(format!(".sdd/specs/{SPEC}/tasks/T01.md"));
+        let text = fs::read_to_string(&task).expect("tarefa");
+        fs::write(&task, format!("{}\n- Filas (kb:{}#filas)\n", text.trim_end(), doc.id)).expect("citar");
+        git(&root, &["add", ".sdd/specs"]);
+        git(&root, &["commit", "-qm", "chore: cita a base"]);
+        let state = state(&root, Script::Complete);
+        let mut rx = state.events().subscribe();
+        let (status, body) = call(&state, approve_req(PROJECT, SPEC, "")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        collect_until(&mut rx, "integrated").await;
+        let frozen = crate::kb::cite::load_frozen(&root, SPEC).expect("congelado");
+        assert_eq!(frozen.sources.len(), 1);
+        assert_eq!(frozen.sources[0].citation, format!("kb:{}#filas", doc.id));
+        assert_eq!(frozen.sources[0].sha256.len(), 64);
+        assert!(frozen.catalog.contains(&format!("- kb:{} |", doc.id)));
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
+        assert!(exclude.lines().any(|l| l == crate::kb::KB_EXCLUDE_LINE), "fora do Git: {exclude}");
     }
 
     /// Backend do relatório que só responde quando o teste libera (F-02).

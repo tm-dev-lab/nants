@@ -27,6 +27,10 @@ sha2 = "0.11"
 # já estavam no Cargo.lock (o `ring` vem do rustls); nenhuma dependência nova de criptografia.
 ring = "0.17"
 base64 = "0.22"
+# Base de conhecimento (spec 134/T02): texto de PDF. Rust puro (MIT), sem C; escolhida por
+# medição em 20 PDFs reais contra pdf-extract, pdf_oxide, oxidize-pdf e lopdf (números na T02).
+# Sem as features padrão (`ai`, `refine`, `fast-parse`): só a leitura do texto.
+unpdf = { version = "0.51", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -1614,7 +1614,9 @@ async fn ask_raw(
         Some(task_id.to_string()),
     )
     .with_usage(super::usage::FileUsageSink::redacting(root.clone(), scope.project_id, Arc::clone(scope.secrets)))
-    .with_memory(Arc::clone(scope.secrets));
+    .with_memory(Arc::clone(scope.secrets))
+    // Spec 134 T04: a base de conhecimento vem da raiz do projeto, não da worktree lida.
+    .with_project_root(&root);
     if let Some(setup) = internet {
         architect = architect.with_internet(setup);
     }

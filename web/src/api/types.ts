@@ -1025,7 +1025,21 @@ export type ApiEvent =
   | ApiEventEnvelope<"app_exec_output", AppExecOutputPayload>
   | ApiEventEnvelope<"app_exec_finished", AppExecFinishedPayload>
   | ApiEventEnvelope<"devices_changed", DevicesChangedPayload>
-  | ApiEventEnvelope<"device_code_locked", DeviceCodeLockedPayload>;
+  | ApiEventEnvelope<"device_code_locked", DeviceCodeLockedPayload>
+  | ApiEventEnvelope<"kb_updated", KbUpdatedPayload>;
+
+/**
+ * `kb_updated` (spec 134 T02): um documento da base de conhecimento mudou de estado
+ * (`pending`, `extracting`, `ready`, `no_text`, `error`, com `status_reason` = código
+ * `kb.reason.*`) ou saiu da base (`removed: true`). A janela Conhecimento (T06) consome.
+ */
+interface KbUpdatedPayload {
+  id: string;
+  status?: string;
+  status_reason?: string | null;
+  doc?: Record<string, unknown>;
+  removed?: boolean;
+}
 
 /** `devices_changed` (spec 112): a lista de dispositivos mudou (`added`, `renamed` ou `revoked`). */
 interface DevicesChangedPayload {

@@ -1,0 +1,98 @@
+{
+  "about": "Perguntas-gabarito da spec 134 T07. Cada pergunta tem o prefixo do id do documento certo e as seções aceitas (nos PDFs, a página como p-N). As bases pdf e html são materiais públicos de terceiros, fora do repositório: o manual do GNU sed 4.10 e do GNU grep (gnu.org) e as páginas json, argparse, pathlib e logging da documentação do Python 3 (docs.python.org), lidas pelo fluxo de link. A base md são as notas de tests/fixtures/kb-eval/notas. A base cruzado faz perguntas em português sobre os documentos em inglês, na base com tudo; a cruzado-traduzido são as mesmas perguntas escritas no idioma do documento, como a regra do kb_search pede.",
+  "bases": {
+    "pdf": {
+      "descriptions": {
+        "sed-": "Manual do GNU sed: opções de linha de comando, comandos, endereços, regex, hold space e scripts de exemplo.",
+        "grep-": "Manual do GNU grep: opções, variáveis de ambiente, expressões regulares, status de saída e desempenho."
+      },
+      "questions": [
+        { "q": "edit a file in place and keep a backup copy with a suffix", "doc": "sed-", "sections": ["p-7"] },
+        { "q": "sed treat input lines as terminated by NUL zero bytes", "doc": "sed-", "sections": ["p-9"] },
+        { "q": "convert the matched text to uppercase in the replacement of the s command", "doc": "sed-", "sections": ["p-13"] },
+        { "q": "exchange the contents of the hold space and the pattern space", "doc": "sed-", "sections": ["p-12", "p-20"] },
+        { "q": "select every third line with a step address", "doc": "sed-", "sections": ["p-26", "p-30"] },
+        { "q": "join lines that end with a backslash into a single line", "doc": "sed-", "sections": ["p-47", "p-48"] },
+        { "q": "sed exit status when an input file cannot be opened", "doc": "sed-", "sections": ["p-9", "p-10"] },
+        { "q": "quit sed early after a given line with the q command", "doc": "sed-", "sections": ["p-12", "p-15"] },
+        { "q": "search all files under a directory recursively", "doc": "grep-", "sections": ["p-12"] },
+        { "q": "print lines of trailing context after each match", "doc": "grep-", "sections": ["p-9"] },
+        { "q": "count the matching lines instead of printing them", "doc": "grep-", "sections": ["p-8"] },
+        { "q": "configure the highlight colors through an environment variable", "doc": "grep-", "sections": ["p-13", "p-14"] },
+        { "q": "what exit status does grep return when no line is selected", "doc": "grep-", "sections": ["p-15"] },
+        { "q": "what happened to egrep and fgrep", "doc": "grep-", "sections": ["p-28"] },
+        { "q": "grep is slow on large files, how to make it faster", "doc": "grep-", "sections": ["p-29"] }
+      ]
+    },
+    "html": {
+      "descriptions": {
+        "docs-python-org-3-library-json-html": "Python json: serializar e desserializar JSON (dumps, loads), encoders, decoders, exceções e linha de comando.",
+        "docs-python-org-3-library-argparse-html": "Python argparse: argumentos de linha de comando, opções, subcomandos, grupos e mensagens de ajuda.",
+        "docs-python-org-3-library-pathlib-html": "Python pathlib: caminhos de arquivos e pastas como objetos, leitura, escrita, glob e diretórios.",
+        "docs-python-org-3-library-logging-html": "Python logging: loggers, níveis, handlers, formatters e registros de log."
+      },
+      "questions": [
+        { "q": "serialize a Python object to a JSON formatted string", "doc": "docs-python-org-3-library-json-html", "sections": ["basic-usage"] },
+        { "q": "subclass JSONEncoder to support custom types", "doc": "docs-python-org-3-library-json-html", "sections": ["encoders-and-decoders", "basic-usage"] },
+        { "q": "error raised when JSON decoding fails", "doc": "docs-python-org-3-library-json-html", "sections": ["exceptions"] },
+        { "q": "allow NaN and Infinity values in JSON output", "doc": "docs-python-org-3-library-json-html", "sections": ["infinite-and-nan-number-values"] },
+        { "q": "validate and pretty-print JSON from the command line", "doc": "docs-python-org-3-library-json-html", "sections": ["command-line-interface", "command-line-options"] },
+        { "q": "positional argument that accepts one or more values", "doc": "docs-python-org-3-library-argparse-html", "sections": ["nargs"] },
+        { "q": "make two command-line options mutually exclusive", "doc": "docs-python-org-3-library-argparse-html", "sections": ["mutual-exclusion"] },
+        { "q": "add subcommands like git commit and git push", "doc": "docs-python-org-3-library-argparse-html", "sections": ["subcommands"] },
+        { "q": "restrict an argument to a fixed set of allowed values", "doc": "docs-python-org-3-library-argparse-html", "sections": ["choices"] },
+        { "q": "read the contents of a file as text with a path object", "doc": "docs-python-org-3-library-pathlib-html", "sections": ["reading-and-writing-files"] },
+        { "q": "find all files matching a glob pattern recursively", "doc": "docs-python-org-3-library-pathlib-html", "sections": ["reading-directories", "pattern-language"] },
+        { "q": "create a directory including missing parents", "doc": "docs-python-org-3-library-pathlib-html", "sections": ["creating-files-and-directories"] },
+        { "q": "configure the format of log messages with a timestamp", "doc": "docs-python-org-3-library-logging-html", "sections": ["formatter-objects", "logrecord-attributes"] },
+        { "q": "numeric values of the logging levels DEBUG INFO WARNING", "doc": "docs-python-org-3-library-logging-html", "sections": ["logging-levels"] },
+        { "q": "send log records to a destination with a handler", "doc": "docs-python-org-3-library-logging-html", "sections": ["handler-objects"] }
+      ]
+    },
+    "md": {
+      "descriptions": {
+        "deploy-": "Deploy em produção: janelas, aprovação de mudança, canário, retorno, migrações e feature flags.",
+        "incidentes-": "Incidentes: severidades SEV1 a SEV4, plantão, status para o cliente, sala de guerra e pós-mortem.",
+        "revisao-codigo-": "Pull requests: tamanho, aprovações, prazo de revisão, nome de branch, commits e checklist.",
+        "dados-": "LGPD: classificação, retenção, anonimização, pedidos do titular, backup e dados de teste.",
+        "acessos-": "Acessos e credenciais: pedido de acesso, senhas, 2FA, cofre de segredos, VPN e desligamento."
+      },
+      "questions": [
+        { "q": "Em que dias e horários posso publicar em produção?", "doc": "deploy-", "sections": ["janelas-de-publicacao"] },
+        { "q": "Quantas aprovações uma mudança no banco de dados precisa?", "doc": "deploy-", "sections": ["aprovacao-da-mudanca"] },
+        { "q": "Quanto tempo o canário espera antes de seguir para mais instâncias?", "doc": "deploy-", "sections": ["implantacao-gradual"] },
+        { "q": "Como remover uma coluna do banco sem quebrar a aplicação?", "doc": "deploy-", "sections": ["migracoes-de-banco"] },
+        { "q": "Qual a diferença entre SEV2 e SEV3?", "doc": "incidentes-", "sections": ["severidades"] },
+        { "q": "Em quanto tempo o plantão precisa atender um alerta crítico?", "doc": "incidentes-", "sections": ["plantao"] },
+        { "q": "Qual o prazo para escrever o pós-mortem?", "doc": "incidentes-", "sections": ["pos-mortem"] },
+        { "q": "Qual o tamanho máximo recomendado de um PR?", "doc": "revisao-codigo-", "sections": ["tamanho-do-pr"] },
+        { "q": "Como devo nomear a branch de uma correção?", "doc": "revisao-codigo-", "sections": ["nome-das-branches"] },
+        { "q": "Por quanto tempo guardamos os logs da aplicação?", "doc": "dados-", "sections": ["prazos-de-retencao"] },
+        { "q": "Posso copiar o banco de produção para o ambiente de teste?", "doc": "dados-", "sections": ["dados-em-ambiente-de-teste"] },
+        { "q": "Onde guardar a senha do banco usada pela aplicação?", "doc": "acessos-", "sections": ["cofre-de-segredos"] },
+        { "q": "O que acontece com os acessos quando alguém sai da empresa?", "doc": "acessos-", "sections": ["desligamento"] },
+        { "q": "Com que frequência roda o backup do banco?", "doc": "dados-", "sections": ["copias-de-seguranca"] }
+      ]
+    },
+    "cruzado-traduzido": {
+      "dir": "all",
+      "questions": [
+        { "q": "edit the file in place with a backup copy in sed", "doc": "sed-", "sections": ["p-7"] },
+        { "q": "search recursively in all files of a directory with grep", "doc": "grep-", "sections": ["p-12"] },
+        { "q": "mutually exclusive options on the command line", "doc": "docs-python-org-3-library-argparse-html", "sections": ["mutual-exclusion"] },
+        { "q": "create a directory together with the missing parent directories", "doc": "docs-python-org-3-library-pathlib-html", "sections": ["creating-files-and-directories"] },
+        { "q": "format of the log messages with date and time", "doc": "docs-python-org-3-library-logging-html", "sections": ["formatter-objects", "logrecord-attributes"] }
+      ]
+    },
+    "cruzado": {
+      "dir": "all",
+      "questions": [
+        { "q": "editar o arquivo no lugar com cópia de segurança no sed", "doc": "sed-", "sections": ["p-7"] },
+        { "q": "buscar recursivamente em todos os arquivos de uma pasta com o grep", "doc": "grep-", "sections": ["p-12"] },
+        { "q": "opções mutuamente exclusivas na linha de comando", "doc": "docs-python-org-3-library-argparse-html", "sections": ["mutual-exclusion"] },
+        { "q": "criar uma pasta junto com as pastas pai que faltam", "doc": "docs-python-org-3-library-pathlib-html", "sections": ["creating-files-and-directories"] },
+        { "q": "formato das mensagens de log com data e hora", "doc": "docs-python-org-3-library-logging-html", "sections": ["formatter-objects", "logrecord-attributes"] }
+      ]
+    }
+  }
+}

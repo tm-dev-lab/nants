@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::compose::{controlled_env, is_docker_failure, ComposeCall, ComposeOutput, ComposeRunner, RealComposeRunner};
 use super::home;
+use super::limits::ContainerLimits;
 use super::progress::CommandProgress;
 
 /// Timeout padrão de uma execução (a primeira pode baixar a imagem).
@@ -63,6 +64,9 @@ pub fn run_args(name: &str, worktree: &Path, version: &str, command: &str, user:
     let mut a: Vec<String> = ["run", "--rm", "--name"].map(String::from).to_vec();
     a.push(name.into());
     a.extend(["--init", "--ipc=host"].map(String::from));
+    // Spec 134 T08: os testes de navegador rodam código do projeto; mesmos limites dos containers
+    // do Compose (memória sem swap extra e processos).
+    a.extend(ContainerLimits::host().docker_run_args());
     if let Some((uid, gid)) = user {
         a.extend(["--user".into(), format!("{uid}:{gid}")]);
     }
@@ -327,6 +331,10 @@ mod tests {
         let a = &run.args;
         assert_eq!(&a[..4], ["run", "--rm", "--name", "nants-p1-browser-1"]);
         assert!(a.contains(&"--init".to_string()) && a.contains(&"--ipc=host".to_string()));
+        // Spec 134 T08: limites de memória e de processos também no container do navegador.
+        for limit in ContainerLimits::host().docker_run_args() {
+            assert!(a.contains(&limit), "{limit} em {a:?}");
+        }
         let mounts: Vec<_> = a.windows(2).filter(|w| w[0] == "-v").collect();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0][1], format!("{}:/work", d.display()));

@@ -397,11 +397,12 @@ mod tests {
         // A spec 119 acrescenta o motivo da resposta ruim do provedor (`provider.`); a spec 124 T06, o
         // apontamento de tarefa grande da revisão do plano (`plan_review.`); a spec 125, os títulos do
         // ARCHITECTURE.md (`architecture.`); a spec 133 T08, os títulos livres da spec (`sdd.`); a spec 133
-        // T11, as mensagens injetadas como turno do usuário na sessão de um modelo (`agent.`).
-        const PREFIXES: [&str; 23] = [
+        // T11, as mensagens injetadas como turno do usuário na sessão de um modelo (`agent.`); a spec 134
+        // T02, o motivo do estado de um documento da base de conhecimento (`kb.`).
+        const PREFIXES: [&str; 24] = [
             "runner.", "advisor.", "survey.", "report.", "ui.", "approvals.", "runs.", "serverError.", "approval.", "system.", "cli.",
             "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.", "plan_review.",
-            "architecture.", "sdd.", "agent.",
+            "architecture.", "sdd.", "agent.", "kb.",
         ];
         const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
         const PT_WORDS: [&str; 19] = [

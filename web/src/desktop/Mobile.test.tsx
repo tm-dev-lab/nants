@@ -254,6 +254,7 @@ describe("Alternador", () => {
       "Execução",
       "Relatório",
       "Custos",
+      "Conhecimento",
       "Projeto",
       "Configurações",
     ]);

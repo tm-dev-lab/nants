@@ -616,6 +616,10 @@ fn tool_label_full(name: &str, arguments: &str) -> String {
         // Spec 131 T06: a leitura de uma seção da spec (ou do índice, com `list`).
         "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => "lendo o índice da spec".to_string(),
         "read_spec_section" => format!("lendo a seção {} da spec", arg("title")),
+        // Spec 134 T04: a base de conhecimento (a busca e a leitura de uma seção ou do índice).
+        "kb_search" => format!("buscando na base de conhecimento: {}", arg("query")),
+        "kb_read" if arg("section") == crate::harness::tools::kb::LIST => format!("lendo o índice de kb:{} na base de conhecimento", arg("id")),
+        "kb_read" => format!("lendo kb:{}#{} na base de conhecimento", arg("id"), arg("section")),
         // Spec 133 T08: toda ferramenta registrada tem rótulo próprio; "usando" fica para a desconhecida.
         "run_browser_tests" => format!("rodando os testes de navegador `{}`", arg("command")),
         "diff_file" => format!("vendo o diff de {}", arg("path")),
@@ -702,6 +706,10 @@ pub fn tool_code(name: &str, arguments: &str) -> ActivityCode {
         // Spec 131 T06: rótulo próprio, com o título da seção (a tela o mostra no idioma dela).
         "read_spec_section" if arg("title") == crate::sdd::spec_sections::LIST => c("tool.read_spec_index", &[]),
         "read_spec_section" => c("tool.read_spec_section", &[("title", arg("title"))]),
+        // Spec 134 T04: a base de conhecimento; a tela monta o rótulo no idioma dela.
+        "kb_search" => c("tool.kb_search", &[("query", arg("query"))]),
+        "kb_read" if arg("section") == crate::harness::tools::kb::LIST => c("tool.kb_index", &[("id", arg("id"))]),
+        "kb_read" => c("tool.kb_read", &[("id", arg("id")), ("section", arg("section"))]),
         // Spec 133 T08: toda ferramenta registrada tem código próprio; `tool.other` só para a desconhecida.
         "run_browser_tests" => c("tool.run_browser_tests", &[("command", arg("command"))]),
         "diff_file" => c("tool.diff_file", &[("path", arg("path"))]),
@@ -1209,6 +1217,24 @@ mod tests {
         assert_eq!(tool_code("request_environment_change", "{}").code, "tool.request_environment_change");
         assert_eq!(tool_code("misterio", "{}").code, "tool.other");
         assert_eq!(tool_label("misterio", "{}"), "usando misterio");
+    }
+
+    /// Spec 134 T04: `kb_search` e `kb_read` têm rótulo e código próprios (a leitura do índice à parte).
+    #[test]
+    fn kb_tools_have_their_own_labels() {
+        let search = r#"{"query":"padrão de erros"}"#;
+        assert_eq!(tool_label("kb_search", search), "buscando na base de conhecimento: padrão de erros");
+        let code = tool_code("kb_search", search);
+        assert_eq!((code.code.as_str(), code.params.get("query")), ("tool.kb_search", Some(&Value::from("padrão de erros"))));
+        let read = r#"{"id":"api-1a2b3c4d","section":"erros"}"#;
+        assert_eq!(tool_label("kb_read", read), "lendo kb:api-1a2b3c4d#erros na base de conhecimento");
+        let code = tool_code("kb_read", read);
+        assert_eq!(code.code, "tool.kb_read");
+        assert_eq!(code.params.get("section"), Some(&Value::from("erros")));
+        let list = r#"{"id":"api-1a2b3c4d","section":"list"}"#;
+        assert_eq!(tool_label("kb_read", list), "lendo o índice de kb:api-1a2b3c4d na base de conhecimento");
+        let code = tool_code("kb_read", list);
+        assert_eq!((code.code.as_str(), code.params.get("id")), ("tool.kb_index", Some(&Value::from("api-1a2b3c4d"))));
     }
 
     /// Spec 131 T06: `read_spec_section` tem rótulo próprio (antes saía "usando read_spec_section").

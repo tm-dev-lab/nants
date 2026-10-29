@@ -47,6 +47,7 @@ import { architectWireApi } from "../../settings/rules";
 import { appStore, useAppStore } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { MarkdownText } from "../shared/ReportMarkdown";
+import { CitedText } from "../knowledge/CitedText";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
 import { ProviderEvidenceDetails } from "../shared/ProviderEvidenceDetails";
 import { renumberMap, tasksInExecutionOrder } from "../shared/executionOrder";
@@ -803,7 +804,9 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
                 </h3>
                 <ul className="nd-bullets">
                   {premises.map((p, i) => (
-                    <li key={`${i}-${p}`}>{p}</li>
+                    <li key={`${i}-${p}`}>
+                      <CitedText projectId={projectId} text={p} />
+                    </li>
                   ))}
                 </ul>
               </section>
@@ -818,7 +821,9 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
                   <div key={g.role} className="nd-stack-xs">
                     {/* O papel é o título da subseção no spec.md (gravado em pt-BR): no idioma ativo. */}
                     <h4 className="nd-section-label">{localizeHeadingTitle(g.role, lang)}</h4>
-                    <p className="nd-prewrap">{g.text}</p>
+                    <p className="nd-prewrap">
+                      <CitedText projectId={projectId} text={g.text} />
+                    </p>
                   </div>
                 ))}
               </section>

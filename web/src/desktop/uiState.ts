@@ -12,6 +12,7 @@
  * - envelope inválido ou de outra versão vira o padrão (`data` vazio), sem erro.
  */
 import { request } from "../api/client";
+import { defaultStorage, type StorageLike } from "./browserStorage";
 import { LAYOUT_CATEGORIES, type LayoutCategory } from "./presets";
 import { isSettingsWindowTab, type SettingsWindowTab } from "./api";
 
@@ -226,7 +227,6 @@ export interface BroadcastLike {
   onmessage: ((event: MessageEvent) => void) | null;
 }
 
-type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export interface UiStateDeps {
   fetchImpl?: typeof fetch;
@@ -246,18 +246,6 @@ interface ChannelMessage {
   sender: string;
   rev: number;
   data: Record<string, unknown>;
-}
-
-/**
- * Armazenamento local do navegador, ou `null` se indisponível. Único acesso a ele fora da
- * limpeza na carga: o cache do ui-state e o espelho do idioma (spec 101) passam por aqui.
- */
-export function defaultStorage(): StorageLike | null {
-  try {
-    return typeof localStorage === "undefined" ? null : localStorage;
-  } catch {
-    return null;
-  }
 }
 
 function defaultChannel(): ((name: string) => BroadcastLike) | null {

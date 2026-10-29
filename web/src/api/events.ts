@@ -65,6 +65,7 @@ export const KNOWN_EVENT_TYPES: readonly ApiEventType[] = [
   "app_exec_finished",
   "devices_changed",
   "device_code_locked",
+  "kb_updated",
 ];
 
 const LAGGED = "lagged";
@@ -313,6 +314,12 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
     case "devices_changed":
     case "device_code_locked":
       return p.reason === undefined || isStr(p.reason);
+    case "kb_updated":
+      return (
+        isStr(p.id) &&
+        (p.removed === true ||
+          (isStr(p.status) && optionalOrNull(p.status_reason, isStr) && isRecord(p.doc)))
+      );
     default:
       return false;
   }

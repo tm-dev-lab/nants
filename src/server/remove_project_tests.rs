@@ -171,6 +171,18 @@ async fn removal_writes_config_without_project_and_keeps_others_in_order() {
     let a = create(&state, "A", &dir.join("a")).await;
     let b = create(&state, "B", &dir.join("b")).await;
     let c = create(&state, "C", &dir.join("c")).await;
+    let root_of = |state: &AppState, id: &str| {
+        let state = state.clone();
+        let id = id.to_string();
+        async move {
+            let cfg = state.config().read().await;
+            PathBuf::from(&cfg.projects.iter().find(|p| p.id == id).expect("projeto").path)
+        }
+    };
+    let b_root = root_of(&state, &b).await;
+    let a_root = root_of(&state, &a).await;
+    crate::kb::index::index_for(&b_root).expect("índice de B");
+    crate::kb::index::index_for(&a_root).expect("índice de A");
     assert_eq!(ids_in_file(&config_path), vec![a.clone(), b.clone(), c.clone()]);
 
     let (status, text) = call(&state, delete(&b)).await;
@@ -178,6 +190,9 @@ async fn removal_writes_config_without_project_and_keeps_others_in_order() {
     assert_eq!(json_of(&text), json!({"ok": true, "removed": b}));
     assert_eq!(ids_in_file(&config_path), vec![a.clone(), c.clone()]);
     assert_eq!(ids_in_memory(&state).await, vec![a.clone(), c.clone()]);
+    assert!(!crate::kb::index::is_cached(&b_root), "o índice da base do projeto removido sai do cache");
+    assert!(crate::kb::index::is_cached(&a_root));
+    crate::kb::index::forget(&a_root);
 
     let (status, _) = call(&state, get(&format!("/api/projects/{b}/state"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

@@ -34,6 +34,9 @@ import { reportSummary } from "./report/summary";
 import { ExecutionContent } from "./execution/ExecutionApp";
 import { executionSummary } from "./execution/executionModel";
 import { FilesContent } from "./files/FilesApp";
+import { KnowledgeContent } from "./knowledge/KnowledgeApp";
+import { kbSummaryText } from "./knowledge/knowledgeModel";
+import type { KbState } from "./knowledge/kbStore";
 import { filesSummary } from "./files/filesModel";
 import { ProjectContent } from "./project/ProjectApp";
 import { projectSummary } from "./project/projectModel";
@@ -55,6 +58,8 @@ export interface AppSummaryInput {
   attention?: AttentionProject | null;
   /** Mensagens novas da Conversa chegadas com a janela fora de vista (T06). */
   conversationUnseen?: number;
+  /** Lista da base de conhecimento do espaço ativo (spec 134 T06), para o subtítulo vivo. */
+  knowledge?: KbState | null;
 }
 
 export interface AppSummary {
@@ -86,6 +91,14 @@ export const DEFAULT_APPS: AppRegistry = {
   report: { Content: ReportContent, summarize: reportSummary, scroll: "app" },
   files: { Content: FilesContent, summarize: filesSummary, scroll: "app" },
   app: { Content: AppContent, summarize: appSummary, scroll: "app" },
+  knowledge: {
+    Content: KnowledgeContent,
+    scroll: "app",
+    summarize: ({ space, knowledge }) => {
+      const subtitle = space === null ? undefined : kbSummaryText(knowledge ?? null);
+      return subtitle === undefined ? {} : { subtitle };
+    },
+  },
   execution: { Content: ExecutionContent, summarize: executionSummary, scroll: "app" },
   settings: { Content: SettingsContent, summarize: settingsSummary, scroll: "app" },
   project: { Content: ProjectContent, summarize: projectSummary, scroll: "app" },

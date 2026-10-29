@@ -110,3 +110,28 @@ provoke them; the fake-server tests cover the handling:
 A real failure of this kind is recorded in the project, in
 `.sdd/specs/<spec>/provider-errors.jsonl`, with the status, the provider's error codes and the
 request id (see [SECURITY.md](../SECURITY.md#provider-failure-log)).
+
+## Knowledge base validation
+
+Two optional tools measure the project knowledge base. Neither runs in the normal suite.
+
+- **Retrieval, no model and no cost:** `scripts/e2e-kb.mjs bases` starts an isolated instance with
+  a fake provider, uploads your PDFs, Markdown notes and links through the API, and records the
+  extraction time of each document, the index build, the process memory and the disk of each
+  `.sdd/kb` (`resources.json`). The ignored test `kb::eval_tests::kb_eval_recall` then reads those
+  bases and the answer key in `tests/fixtures/kb-eval/perguntas.json` and prints hit@1, hit@5 and
+  the document choice with and without descriptions:
+
+  ```sh
+  node scripts/e2e-kb.mjs bases --bin target/release/nants --out <dir> \
+    --pdf <dir with .pdf> --notes tests/fixtures/kb-eval/notas --links <file, one link per line>
+  NANTS_KB_EVAL_DIR=<dir> scripts/test.sh cargo test --lib kb::eval_tests -- --ignored --nocapture --test-threads=1
+  ```
+
+- **With and without the base, real model, real spend:** `scripts/e2e-kb.mjs ab` runs the same
+  request in small projects with and without a standards document and checks how many standards
+  the code follows. It uses a real Gemini key (`NANTS_E2E_GEMINI_KEY_FILE`, passed to the server
+  only as `env:`), runs code written by the model in containers, and spends money. Run it only
+  with the explicit OK of whoever pays for the key. `--max-usd` is required and caps the total
+  spend of the whole run; without the key file or the ceiling it exits before starting anything.
+  One measured run (`api` project, Gemini Flash) cost about US$ 0.24 per arm.

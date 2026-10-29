@@ -31,6 +31,7 @@ import { renderAttentionPanel as renderDefaultAttentionPanel } from "../apps/att
 import { attentionFor } from "../apps/attention/attentionModel";
 import { PermissionToasts } from "../apps/attention/PermissionToasts";
 import { DEFAULT_APPS, type AppRegistry, type AppSummary, type AppSummaryInput } from "../apps/registry";
+import { useKbSnapshot } from "../apps/knowledge/kbStore";
 import { PHASE_LABELS, phaseForProject } from "../phase";
 import { appStore, useAppStore, type ChatMessage } from "../store";
 import { planApprovable } from "../apps/plan/summary";
@@ -604,10 +605,11 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
   const conversationVisible = mobile ? pageVisible && mobileView.view === "conversation" : isWindowVisible(state.layout, "conversation", pageVisible);
   const conversationUnseen = useConversationUnseen(space?.projectId ?? null, conversationVisible);
   const spaceAttention = attentionFor(attention, space?.projectId ?? null);
+  const knowledge = useKbSnapshot(space?.projectId ?? null);
   const summaryInput = useMemo<AppSummaryInput>(
-    () => ({ space, readiness, projectCount: projects.length, attention: spaceAttention, conversationUnseen }),
+    () => ({ space, readiness, projectCount: projects.length, attention: spaceAttention, conversationUnseen, knowledge }),
     // `lang`: os resumos (subtítulos, selos, estados vazios) são refeitos no idioma novo.
-    [space, readiness, projects.length, spaceAttention, conversationUnseen, lang],
+    [space, readiness, projects.length, spaceAttention, conversationUnseen, knowledge, lang],
   );
   const windows = useWindowSpecs(apps, summaryInput);
 

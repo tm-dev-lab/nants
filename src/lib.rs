@@ -2,6 +2,7 @@ pub mod agents;
 pub mod config;
 pub mod harness;
 pub mod i18n;
+pub mod kb;
 pub mod sdd;
 pub mod server;
 pub mod uninstall;

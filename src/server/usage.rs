@@ -312,8 +312,9 @@ fn safe_label(s: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextLine {
     pub at: String,
-    /// `compact`, `spill`, `dedup`, `summary`, `summary_failed`, `evidence_check` (spec 133 T06) ou
-    /// `compact_refused` (spec 133 T13).
+    /// `compact`, `spill`, `dedup`, `summary`, `summary_failed`, `evidence_check` (spec 133 T06),
+    /// `compact_refused` (spec 133 T13) ou `kb` (spec 134 T04: uma chamada de `kb_*`, com os bytes
+    /// do resultado em `after_bytes`).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,

@@ -72,6 +72,7 @@ const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-folder-item", "item da lista de pastas"],
   ["nd-draft-thumb", "miniatura de imagem do rascunho"],
   ["nd-thumb-btn", "miniatura de imagem que amplia"],
+  ["nd-kb-row-btn", "linha da lista do Conhecimento (spec 134): abre a prévia do documento"],
 ]);
 
 /** Abertura de cada `<button …>` no fonte (com expressões `{…}` que podem conter `>`). */

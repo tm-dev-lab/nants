@@ -95,7 +95,9 @@ export type IconName =
   | "tablet"
   | "expand"
   | "home"
-  | "switcher";
+  | "switcher"
+  | "knowledge"
+  | "upload";
 
 const PATHS: Readonly<Record<IconName, ReactNode>> = {
   close: <path d="M18 6 6 18M6 6l12 12" />,
@@ -298,6 +300,13 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
       <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
     </>
   ),
+  knowledge: (
+    <>
+      <path d="M12 7v14" />
+      <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </>
+  ),
+  upload: <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />,
   message: <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />,
   file: (
     <>

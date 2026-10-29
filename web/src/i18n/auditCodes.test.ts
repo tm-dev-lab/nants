@@ -45,10 +45,10 @@ const ACTIVITY_CODES = [
   "tool.fetch_url", "tool.package_versions", "tool.web_source", "tool.web_search_unavailable", "tool.view_reference",
   "tool.view_screenshot", "tool.images_refused", "tool.generate_image", "tool.image_failed", "tool.other",
   "tool.read_spec_section", "tool.read_spec_index", "tool.run_browser_tests", "tool.diff_file", "tool.ask_architect",
-  "tool.request_environment_change",
+  "tool.request_environment_change", "tool.kb_search", "tool.kb_read", "tool.kb_index",
   "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry", "provider.web_search_retry",
 ];
-const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "final.unverified", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable", "task.recurring_arbitration", "task.recurring_recovery", "task.recurring_unavailable", "task.dev_resumed_steps", "task.dev_resumed_repeated", "task.dev_resumed_stalled"];
+const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "final.unverified", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable", "task.recurring_arbitration", "task.recurring_recovery", "task.recurring_unavailable", "task.dev_resumed_steps", "task.dev_resumed_repeated", "task.dev_resumed_stalled", "kb.source_changed", "kb.plan_no_standard", "kb.task_standard_uncited"];
 
 describe("códigos novos do servidor (spec 102 T06)", () => {
   it("cada code tem texto nos dois idiomas, e o en não tem português", () => {

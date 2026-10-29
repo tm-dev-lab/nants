@@ -106,7 +106,7 @@ function withSectionTitle(params: CodeParams, lang: Lang): CodeParams {
  * Famílias de textos com `code`: erros da API, mensagens do sistema, etapas da atividade e rótulos
  * da atividade (ferramentas e avisos fixos do servidor).
  */
-type CodePrefix = "serverError" | "system" | "activity.stage" | "activity.code";
+type CodePrefix = "serverError" | "system" | "activity.stage" | "activity.code" | "kb.reason" | "kb.indicator";
 
 /** Texto de `prefix.code` em `lang`, ou `null` sem chave ou com parâmetro do texto faltando. */
 export function translateCode(prefix: CodePrefix, code: string, params: CodeParams | undefined, lang: Lang = getLanguage()): string | null {

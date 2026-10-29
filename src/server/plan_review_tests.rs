@@ -1541,3 +1541,41 @@ async fn only_the_split_task_too_large_is_inferred() {
     assert_eq!(round_lines(&root)[0]["notice"]["code"], ROUND_OPEN_CODE);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Spec 134 T05: com um padrão marcado na base, o plano que não o cita ganha os dois avisos
+/// codificados (C-17 e, na tarefa cujo escopo cruza o `applies_to`, C-21), sem bloqueio e uma vez
+/// por conjunto; citado na tarefa, os avisos somem e nada se repete.
+#[tokio::test]
+async fn kb_standards_give_coded_plan_warnings_once() {
+    let root = tmp("kb-warnings");
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    let none = SecretSet::default();
+    let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+    let patch = crate::kb::Patch { role: Some(crate::kb::Role::Standard), description: None, applies_to: Some(vec!["src/**".into()]) };
+    crate::kb::update(&root, &doc.id, &patch).expect("padrão");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    let w = kb_plan_warnings(&root, SPEC);
+    assert!(w.no_standard_cited && w.uncited.len() == 1 && w.uncited[0].0 == "T01", "{w:?}");
+    let scripted = Scripted::new(vec![text("{\"issues\": []}"), text("{\"issues\": []}")]);
+    let st = state(&root, true, scripted.clone());
+    assert_eq!(run(&st, &root).await, 1);
+    let codes = |root: &Path| -> Vec<String> {
+        system_lines(root)
+            .into_iter()
+            .filter_map(|v| v["notice"]["code"].as_str().map(str::to_string))
+            .filter(|c| c.starts_with("kb."))
+            .collect()
+    };
+    assert_eq!(codes(&root), [KB_NO_STANDARD_CODE, KB_TASK_UNCITED_CODE]);
+    let line = system_lines(&root).into_iter().find(|v| v["notice"]["code"] == KB_TASK_UNCITED_CODE).expect("aviso");
+    assert_eq!(line["notice"]["params"]["task"], "T01");
+    assert_eq!(line["notice"]["params"]["citation"], format!("kb:{}", doc.id));
+    assert!(line["text"].as_str().is_some_and(|t| t.contains("T01") && t.contains("não o cita")), "{line}");
+    assert_eq!(record(&root).status, STATUS_OK, "sem bloqueio");
+    // A tarefa passa a citar o padrão: nova versão revisada, sem avisos novos.
+    let cited = EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.", &format!("- [ ] Critério verificável (kb:{}#filas).", doc.id));
+    write_plan(&root, "AWAITING_APPROVAL", &cited);
+    assert!(kb_plan_warnings(&root, SPEC).is_empty());
+    assert_eq!(run(&st, &root).await, 1);
+    assert_eq!(codes(&root).len(), 2, "nada se repete");
+}

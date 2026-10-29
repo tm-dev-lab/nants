@@ -10,8 +10,9 @@
  * O armazenamento local do navegador (`nants.lang`) é só o espelho para a primeira pintura não piscar; a preferência
  * de verdade fica na seção global `language` do estado da interface (ver `./uiStateBinding`).
  */
-import { setRequestLanguage } from "../api/client";
-import { defaultStorage } from "../desktop/uiState";
+// Sem o cliente da API nem o ui-state: o i18n não entra em ciclo com eles (spec 134 T06).
+import { setRequestLanguage } from "../api/requestLanguage";
+import { defaultStorage } from "../desktop/browserStorage";
 import { en } from "./en";
 import { detectLanguage, type Lang } from "./lang";
 import { ptBR, type MessageKey } from "./ptBR";

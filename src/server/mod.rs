@@ -31,6 +31,8 @@ pub mod file_explorer;
 pub mod fs_browse;
 pub mod image_gen;
 pub mod judge;
+pub mod kb;
+pub mod kb_queue;
 pub mod lan;
 pub mod lang;
 pub mod live_activity;
@@ -175,6 +177,18 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/:id/chat/attachments/:name",
             get(chat_attachments::get_attachment),
         )
+        // Base de conhecimento (spec 134/T01). O envio tem limite de corpo próprio (32 MiB).
+        .route("/api/projects/:id/kb", get(kb::get_kb))
+        .route(
+            "/api/projects/:id/kb/files",
+            post(kb::post_file).layer(DefaultBodyLimit::max(crate::kb::MAX_UPLOAD_BYTES)),
+        )
+        .route("/api/projects/:id/kb/links", post(kb::post_link))
+        .route(
+            "/api/projects/:id/kb/docs/:doc",
+            get(kb::get_doc).patch(kb::patch_doc).delete(kb::delete_doc),
+        )
+        .route("/api/projects/:id/kb/overview", get(kb::get_overview).put(kb::put_overview))
         // Estado da interface (spec 093): teto de 64 KiB por documento, também no corpo do PUT.
         .route(
             "/api/ui-state",

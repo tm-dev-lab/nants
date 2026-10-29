@@ -378,3 +378,14 @@ describe("contrato: payloads reais do servidor são aceitos", () => {
     });
   }
 });
+
+describe("kb_updated (spec 134 T02)", () => {
+  it("aceita mudança de estado e remoção, recusa payload fora do contrato", () => {
+    const ready = { id: "a-1", status: "no_text", status_reason: "kb_pdf_no_text", doc: { id: "a-1" } };
+    expect(parseApiEvent({ event_type: "kb_updated", project_id: "p", payload: ready })).not.toBeNull();
+    const removed = { id: "a-1", removed: true };
+    expect(parseApiEvent({ event_type: "kb_updated", project_id: "p", payload: removed })).not.toBeNull();
+    expect(parseApiEvent({ event_type: "kb_updated", project_id: "p", payload: { id: "a-1" } })).toBeNull();
+    expect(parseApiEvent({ event_type: "kb_updated", project_id: "p", payload: { status: "ready", doc: {} } })).toBeNull();
+  });
+});

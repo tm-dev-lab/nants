@@ -566,7 +566,11 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
         memory.tasks = Some(reviewed.sizes.iter().map(|s| s.id.clone()).collect());
         memory.changes.clear();
         let items = match reviewed.items {
-            Ok(items) => items,
+            Ok(items) => {
+                // Spec 134 T05: os avisos da base sobre esta versão do plano, sem bloqueio.
+                kb_plan_notices(state, project_id, root, spec_id).await;
+                items
+            }
             Err(detail) => {
                 let record = PlanReviewRecord {
                     failure: reviewed.failure,
@@ -1097,7 +1101,8 @@ async fn review_once(
     let reviewer = PlanReviewer::new(Arc::clone(&setup.backend), setup.model.clone(), Some(setup.effort), policy, approver)
         .with_activity(activity, Some(spec_id.to_string()))
         .with_usage(usage)
-        .with_lang(state.project_lang(project_id));
+        .with_lang(state.project_lang(project_id))
+        .with_kb(Arc::clone(&secrets));
     let mut shutdown = state.shutdown_signal();
     // Spec 133 T01: o rastro das chamadas da revisão dá a evidência da falha final do provedor.
     let turn = Box::pin(crate::agents::llm_client::evidence::with_trace_scope(async {
@@ -1131,6 +1136,78 @@ async fn review_once(
         Err(why) => Err(why),
     };
     Ok(Reviewed { signature, sizes, items, failure: failure_params })
+}
+
+/// Aviso da base (spec 134 T05, C-17): há padrão marcado e o plano não cita nenhum.
+pub const KB_NO_STANDARD_CODE: &str = "kb.plan_no_standard";
+/// Aviso da base (spec 134 T05, C-21): o escopo da tarefa cruza o `applies_to` de um padrão que
+/// ela não cita.
+pub const KB_TASK_UNCITED_CODE: &str = "kb.task_standard_uncited";
+/// Teto dos avisos por tarefa numa versão do plano.
+const MAX_KB_TASK_NOTICES: usize = 12;
+
+/// Último conjunto de avisos da base publicado por spec (raiz e spec): a mesma versão dos avisos
+/// não se repete a cada rodada do consenso.
+static KB_WARNED: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Avisos da base sobre o plano da spec (spec 134 T05): os padrões prontos do manifesto contra a
+/// spec e as tarefas lidas do disco. Sem padrão pronto, nenhum.
+pub fn kb_plan_warnings(root: &Path, spec_id: &str) -> crate::kb::catalog::PlanWarnings {
+    use crate::kb::catalog::{plan_warnings, standards, PlanTask, PlanWarnings};
+    let standards = standards(&crate::kb::load_manifest(root).unwrap_or_default());
+    if standards.is_empty() {
+        return PlanWarnings::default();
+    }
+    let spec_rel = format!("{SPECS_REL}/{spec_id}");
+    let spec = safe_fs::read_regular(root, &format!("{spec_rel}/spec.md"), MAX_READ_BYTES).unwrap_or_default();
+    let mut tasks: Vec<(String, Vec<String>, String)> = Vec::new();
+    for name in task_names(root, spec_id) {
+        let Ok(content) = safe_fs::read_regular(root, &format!("{spec_rel}/tasks/{name}"), MAX_READ_BYTES) else {
+            continue;
+        };
+        let Ok(task) = crate::sdd::Task::parse(&content) else {
+            continue;
+        };
+        tasks.push((task.frontmatter.id.clone(), task.frontmatter.allowed_scope.clone(), content));
+    }
+    let plan: Vec<PlanTask> = tasks.iter().map(|(id, scope, text)| PlanTask { id, scope, text }).collect();
+    plan_warnings(&standards, &spec, &plan)
+}
+
+/// Publica na Conversa os avisos da base sobre a versão atual do plano (C-17 e C-21), uma vez por
+/// conjunto de avisos: o mesmo conjunto numa rodada seguinte não se repete.
+async fn kb_plan_notices(state: &AppState, project_id: &str, root: &Path, spec_id: &str) {
+    let (scan_root, sid) = (root.to_path_buf(), spec_id.to_string());
+    let warnings = tokio::task::spawn_blocking(move || kb_plan_warnings(&scan_root, &sid)).await.unwrap_or_default();
+    let mut fingerprint = format!("{}", warnings.no_standard_cited);
+    for (task, standard) in &warnings.uncited {
+        fingerprint.push_str(&format!("\n{task}\0{}", standard.id));
+    }
+    {
+        let mut warned = KB_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = format!("{}\0{spec_id}", root.display());
+        if warned.get(&key) == Some(&fingerprint) {
+            return;
+        }
+        warned.insert(key, fingerprint);
+    }
+    if warnings.is_empty() {
+        return;
+    }
+    let secrets = state.secret_set().await;
+    if warnings.no_standard_cited {
+        let mut params = serde_json::Map::new();
+        params.insert("spec".into(), json!(spec_id));
+        super::chat::system_notice(state, project_id, root.to_path_buf(), KB_NO_STANDARD_CODE, params).await;
+    }
+    for (task, standard) in warnings.uncited.iter().take(MAX_KB_TASK_NOTICES) {
+        let mut params = serde_json::Map::new();
+        params.insert("spec".into(), json!(spec_id));
+        params.insert("task".into(), json!(task));
+        params.insert("doc".into(), json!(truncate_bytes(&clean_text(&secrets, &standard.title), MAX_FINAL_TITLE_BYTES)));
+        params.insert("citation".into(), json!(format!("kb:{}", standard.id)));
+        super::chat::system_notice(state, project_id, root.to_path_buf(), KB_TASK_UNCITED_CODE, params).await;
+    }
 }
 
 /// Tarefas do plano que formam ciclo pelo `depends_on` (spec 128 T04); vazio sem ciclo. Com ciclo

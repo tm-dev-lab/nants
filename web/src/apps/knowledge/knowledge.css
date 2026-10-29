@@ -1,0 +1,596 @@
+/* Janela Conhecimento (spec 134 T06): só tokens (variáveis do tema), no padrão das janelas enxutas. */
+.nd-kb {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-kb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb > .nd-kb-toolbar {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.nd-kb-scroll {
+  overflow: auto;
+  min-height: 0;
+}
+
+.nd-kb-note {
+  margin: var(--sp-3);
+}
+
+.nd-kb-spacer {
+  flex: 1 1 auto;
+}
+
+/* --- Corpo: lista e prévia lado a lado, ou uma de cada vez --- */
+.nd-kb-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-kb-body[data-arrangement="split"] {
+  flex-direction: row;
+}
+
+.nd-kb-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.nd-kb-body[data-arrangement="split"] > .nd-kb-side {
+  flex: 0 0 42%;
+  min-width: 300px;
+  max-width: 420px;
+  border-right: 1px solid var(--divider);
+}
+
+/*
+ * Barra "Voltar" do estreito: fora da rolagem da prévia, opaca e com o título do documento, que
+ * assim fica sempre à vista; a prévia começa abaixo dela.
+ */
+.nd-kb-back {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  flex-shrink: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--divider);
+  position: relative;
+  z-index: 1;
+}
+
+.nd-kb-back-title {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Envio --- */
+.nd-kb-add {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  flex-shrink: 0;
+}
+
+.nd-kb-drop {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--control);
+  transition: background-color 120ms ease;
+}
+
+.nd-kb-drop[data-over="true"] {
+  background: var(--accent-soft);
+}
+
+.nd-kb-drop-icon {
+  color: var(--icon-cyan);
+}
+
+.nd-kb-drop-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 150px;
+  min-width: 0;
+  font-size: var(--fs-label);
+}
+
+.nd-kb-drop-title {
+  color: var(--ink);
+  font-size: var(--fs-control);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-add[data-empty="true"] .nd-kb-drop {
+  flex-direction: column;
+  text-align: center;
+  padding: var(--sp-6) var(--sp-4);
+  gap: var(--sp-2);
+}
+
+.nd-kb-add[data-empty="true"] .nd-kb-drop-text {
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.nd-kb-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb-link-icon {
+  color: var(--ink3);
+}
+
+.nd-kb-link-input {
+  flex: 1 1 160px;
+}
+
+.nd-kb-link-hint {
+  flex-basis: 100%;
+  font-size: var(--fs-label);
+}
+
+.nd-kb-uploads {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: var(--fs-label);
+}
+
+.nd-kb-upload {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* --- Lista --- */
+.nd-kb-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 var(--sp-3);
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--divider);
+}
+
+.nd-kb-row {
+  border-bottom: 1px solid var(--divider);
+}
+
+.nd-kb-row-btn {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  min-height: 44px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-kb-row-btn:hover {
+  background: var(--state-hover);
+}
+
+.nd-kb-row[aria-current="true"] > .nd-kb-row-btn {
+  background: var(--accent-soft);
+}
+
+.nd-root .nd-kb-row-btn:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--focus-inner);
+}
+
+.nd-kb-kind {
+  color: var(--icon-cyan);
+  margin-top: 2px;
+}
+
+.nd-kb-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-kb-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb-title {
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  font-size: var(--fs-control);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.nd-kb-meta {
+  font-size: var(--fs-label);
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-role-ref {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.nd-kb-reason {
+  font-size: var(--fs-label);
+  color: var(--pill-rose-ink);
+  margin: 0;
+}
+
+.nd-kb-flags {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nd-kb-flag {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--sp-1);
+  font-size: var(--fs-label);
+  color: var(--pill-amber-ink);
+}
+
+.nd-kb-flag > svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.nd-kb-flags-block {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--pill-amber-bg);
+}
+
+.nd-kb-spin {
+  width: 8px;
+  height: 8px;
+  /* 8 px com raio de 4 px: um círculo. */
+  border-radius: var(--r-xs);
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  animation: nd-kb-spin 900ms linear infinite;
+}
+
+@keyframes nd-kb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-kb-spin {
+    animation: none;
+  }
+}
+
+/* --- Prévia --- */
+.nd-kb-preview {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--sp-4) var(--sp-5) var(--sp-6);
+}
+
+.nd-kb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nd-kb-preview-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-kb-preview-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb-heading {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-tight);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-preview-head > .nd-kb-meta {
+  margin-top: calc(-1 * var(--sp-2));
+}
+
+.nd-kb-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.nd-kb-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-height: 28px;
+}
+
+.nd-kb-field-value {
+  margin: 0;
+  color: var(--ink);
+}
+
+.nd-kb-field-value.nd-muted {
+  color: var(--muted);
+}
+
+.nd-kb-globs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.nd-kb-glob {
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--control);
+  color: var(--ink);
+  line-height: 1.8;
+}
+
+.nd-kb-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--danger-soft);
+  color: var(--ink);
+}
+
+.nd-kb-note-body {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--divider);
+}
+
+.nd-kb-cited {
+  margin: var(--sp-2) calc(-1 * var(--sp-3));
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--pill-violet-bg);
+  scroll-margin-top: var(--sp-3);
+}
+
+.nd-kb-cited-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  color: var(--pill-violet-ink);
+}
+
+/* --- Visão geral --- */
+.nd-kb-overview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+}
+
+.nd-kb-overview .nd-field-hint {
+  margin: 0;
+  max-width: 64ch;
+}
+
+.nd-kb-overview-input {
+  flex: 1 1 auto;
+  min-height: 240px;
+  line-height: var(--lh-body);
+}
+
+.nd-kb-overview-foot {
+  align-items: center;
+  font-size: var(--fs-label);
+}
+
+.nd-kb-overview-foot [data-over="true"] {
+  color: var(--danger-ink);
+}
+
+/* --- Vazia --- */
+.nd-kb-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-8) var(--sp-5);
+  text-align: center;
+}
+
+.nd-kb-empty > .nd-kb-add {
+  width: 100%;
+  max-width: 520px;
+  padding: 0;
+  text-align: left;
+}
+
+.nd-kb-empty-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-kb-empty-text {
+  margin: 0 0 var(--sp-2);
+  max-width: 52ch;
+  line-height: var(--lh-body);
+}
+
+.nd-kb-private {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  max-width: 520px;
+  margin: 0;
+  font-size: var(--fs-label);
+  text-align: left;
+}
+
+.nd-kb-private > svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* Estreita: a prévia ocupa a largura toda, com menos respiro. */
+.nd-kb[data-size="narrow"] .nd-kb-preview,
+.nd-kb[data-size="narrow"] .nd-kb-overview {
+  padding: var(--sp-3) var(--sp-4) var(--sp-5);
+}
+
+/* Estreita: o título já está na barra "Voltar"; a prévia mostra só o estado e as ações. */
+.nd-kb[data-size="narrow"] .nd-kb-preview-title > .nd-kb-heading,
+.nd-kb[data-size="narrow"] .nd-kb-preview-title > .nd-kb-kind {
+  display: none;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-empty {
+  padding: var(--sp-5) var(--sp-4);
+}
+
+/* --- Citação do plano (`kb:`) como link para a janela --- */
+.nd-kb-cite {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-1);
+  max-width: 100%;
+  padding: 0 var(--sp-1);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: var(--pill-violet-bg);
+  color: var(--pill-violet-ink);
+  font: inherit;
+  cursor: pointer;
+  vertical-align: baseline;
+  text-align: left;
+  /* Link dentro do texto corrido: no celular, sem a altura mínima de 44 px dos botões. */
+  min-height: 0;
+}
+
+.nd-kb-cite > svg {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.nd-kb-cite:hover {
+  text-decoration: underline;
+}
+
+.nd-kb-cite-section {
+  color: var(--ink3);
+}
+
+.nd-root .nd-kb-cite:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.nd-root[data-mobile="true"] .nd-kb-cite {
+  min-height: 0;
+  padding: 0 var(--sp-1);
+}
+
+/* Na lista, o detalhe fica numa linha (o endereço inteiro aparece na prévia). */
+.nd-kb-row-main > .nd-kb-meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * Estreita (celular): sem arrastar, a área de soltar vira só o botão, com os formatos ao lado;
+ * a lista fica com o espaço.
+ */
+.nd-kb[data-size="narrow"] .nd-kb-add:not([data-empty]) .nd-kb-drop {
+  padding: 0;
+  background: transparent;
+  gap: var(--sp-2);
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-add:not([data-empty]) .nd-kb-drop-icon,
+.nd-kb[data-size="narrow"] .nd-kb-add:not([data-empty]) .nd-kb-drop-title {
+  display: none;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-add:not([data-empty]) .nd-kb-drop-text {
+  order: 2;
+}

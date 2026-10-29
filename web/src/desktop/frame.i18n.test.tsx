@@ -171,7 +171,7 @@ describe("moldura em inglês", () => {
     await renderSpace("en");
     expect(
       DOCK_ORDER.filter((k) => k !== "setup").map((kind) => dock().querySelector(`[data-kind="${kind}"]`)?.getAttribute("aria-label")),
-    ).toEqual(["Conversation", "Plan", "Board", "Activity", "Files", "App", "Run", "Report", "Costs", "Project", "Settings"]);
+    ).toEqual(["Conversation", "Plan", "Board", "Activity", "Files", "App", "Run", "Report", "Costs", "Knowledge", "Project", "Settings"]);
     expect(screen.getByRole("switch", { name: "Auto-approve" }).textContent).toBe("Auto");
     expect(document.querySelector("[data-search]")?.textContent).toContain("Search or ask");
     await walkFrame("en", (where) => {
@@ -221,7 +221,7 @@ describe("moldura em pt-BR (igual a hoje)", () => {
     await renderSpace("pt-BR");
     expect(
       DOCK_ORDER.filter((k) => k !== "setup").map((kind) => dock().querySelector(`[data-kind="${kind}"]`)?.getAttribute("aria-label")),
-    ).toEqual(["Conversa", "Plano", "Quadro", "Atividade", "Arquivos", "App", "Execução", "Relatório", "Custos", "Projeto", "Configurações"]);
+    ).toEqual(["Conversa", "Plano", "Quadro", "Atividade", "Arquivos", "App", "Execução", "Relatório", "Custos", "Conhecimento", "Projeto", "Configurações"]);
     expect(screen.getByRole("switch", { name: "Aprovação automática" }).textContent).toBe("Automático");
     expect(document.querySelector("[data-search]")?.textContent).toContain("Buscar ou pedir");
     // O detector do teste em inglês acha as frases de hoje em cada parte da moldura.

@@ -69,6 +69,42 @@ for a failure outside a spec (the conversation with the Architect).
 - **Where it lives:** the files are kept out of the project's repository (`.git/info/exclude`) and
   stop growing at 1 MiB each.
 
+## Knowledge base
+
+Each project can keep a knowledge base of documents and links in `.sdd/kb/`: the original files
+(`sources/`), the extracted text as markdown notes (`notes/`), the list of documents
+(`manifest.json`) and an optional overview written by you (`overview.md`).
+
+- **Out of Git:** the whole folder is kept out of the project's repository through
+  `.git/info/exclude`; `.gitignore` is not touched. If the exclude cannot be written safely,
+  nothing is stored.
+- **Refused on entry:** typical secret file names (`.env` and its variants, PEM and other private
+  key files, SSH private keys, credential files) and contents with a PEM private key block or one
+  of the configured secrets. Only markdown, text and PDF files are accepted.
+- **Limits:** one file up to 32 MiB (the upload body limit, there to protect the server, not to
+  cap the base) and the overview up to 32 KiB.
+- **Redaction:** the note text goes through the redaction of the configured secrets
+  (`SecretSet`) when it is written and again when it is read. Titles and file names are redacted
+  before they reach the manifest and the note.
+- **Extraction:** PDF files and links are read by one background queue, one document at a time,
+  with a time limit per document (a file that takes too long ends as `error`, and the queue moves
+  on). PDF text is read by a pure Rust library, without C code. A link is read once, through the
+  same web client as the Architect's web access: private and local network addresses are refused,
+  redirects are checked one by one, and the page is read up to 2 MiB. Extracted text that carries a
+  private key or a configured secret is refused and the original is removed.
+- **Files:** nothing is written through a symbolic link; the manifest is replaced atomically.
+  The base content is always data for the agents, never instructions: it reaches the prompts
+  marked as untrusted data, and only the approved spec (which cites it) binds the agents.
+- **Limits of the redaction:** redaction replaces the secrets you configured (API keys and the
+  other values Nants knows) and refuses PEM private key blocks. It does not detect other
+  sensitive data: personal data, credentials you never configured, tokens in an unknown format,
+  text inside images or scanned pages. Treat the base as content that may be sent to your AI
+  provider in the excerpts the agents read, and do not add documents you would not send there.
+  Redaction is a safety net, not a classifier.
+- **Interface:** the Knowledge window shows the note already redacted. Indicators (duplicate,
+  no headings, broken internal link) are computed by the server from the manifest and the index,
+  without a model.
+
 ## Workspace home folder
 
 Each command in the `workspace` container runs with your user id and a home folder inside the
@@ -82,6 +118,32 @@ task folder (`.nants-home/`), so what a tool installs there is still there for t
   through the same secret redaction (`SecretSet`).
 - Do not point credentials (for example a token file or a credential helper of your own) at the
   workspace or its home folder: anything there can be read by the agents' commands.
+
+## Container limits
+
+A command written by a model can go wrong in ways that hurt the computer, such as a test runner
+that is also a test and starts itself again and again until memory runs out. Every container
+Nants starts for a project (the Developer's commands, the tests and checks, the app, the Console
+and the browser tests) has two limits:
+
+- **Memory:** half of the computer's RAM (`MemTotal`), with no swap beyond it. The other half is
+  left for the system, Docker, Nants and your desktop. Above the limit, the kernel stops the
+  process inside the container, not on your computer.
+- **Processes and threads:** one per MiB of that memory, between 1024 and 4096. Normal parallel
+  builds stay well below it; a process recursion stops in seconds.
+- **Project values:** the limits go in an override file Nants passes to Docker Compose after the
+  project's `compose.yaml`. A lower `mem_limit` or `pids_limit` in the project (or in
+  `deploy.resources.limits`) still applies; a higher one, none, `-1` or `oom_kill_disable: true`
+  does not turn the protection off. The override is not part of the environment approval hash.
+- **Time limit:** when a command goes past its time limit, Nants removes its container
+  (`docker rm -f`), which ends every process in it. Stopping only the `docker compose` client is
+  not enough: the container keeps running on the Docker daemon.
+- **Limit reached:** a command that ends with code 137 or an out of memory error, or whose output
+  shows that a process or a thread could not be created, comes back to the agent and in the test
+  output saying which limit it hit and its value.
+- The command for running the project outside Nants
+  (`docker compose -f .nants/compose.yaml run --rm workspace sh -lc '<command>'`) uses only the
+  limits of the project's own `compose.yaml`.
 
 ## Running the app
 

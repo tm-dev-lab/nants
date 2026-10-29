@@ -66,6 +66,22 @@ pub struct WebClient {
 struct Fetched {
     content_type: String,
     body: Vec<u8>,
+    /// Endereço final, depois dos redirecionamentos.
+    url: Url,
+    /// O corpo chegou ao teto e foi cortado.
+    truncated: bool,
+}
+
+/// Página lida inteira (até [`MAX_BODY`]) para a base de conhecimento (spec 134/T02).
+#[derive(Debug, Clone)]
+pub struct Page {
+    /// Endereço final, depois dos redirecionamentos (base dos links relativos).
+    pub url: String,
+    /// `Content-Type` da resposta, em minúsculas (vazio se ausente).
+    pub content_type: String,
+    pub body: Vec<u8>,
+    /// O corpo chegou a [`MAX_BODY`] e foi cortado.
+    pub truncated: bool,
 }
 
 impl WebClient {
@@ -109,6 +125,19 @@ impl WebClient {
             return Err(WebError::Binary(if ct.is_empty() { "sem content-type".into() } else { ct }));
         };
         Ok(cut(out, MAX_OUTPUT))
+    }
+
+    /// Lê uma página pública inteira, com as mesmas proteções de [`Self::fetch_url`], sem
+    /// converter nem cortar a saída (o corpo fica até [`MAX_BODY`]). Usado pela base de
+    /// conhecimento, que lê o link uma vez (spec 134/T02).
+    pub async fn fetch_page(&self, url: &str) -> Result<Page, WebError> {
+        let fetched = self.get(url, None, MAX_BODY).await?;
+        Ok(Page {
+            url: fetched.url.to_string(),
+            content_type: fetched.content_type.to_ascii_lowercase(),
+            body: fetched.body,
+            truncated: fetched.truncated,
+        })
     }
 
     /// Versões publicadas de um pacote/imagem em registro oficial.
@@ -234,15 +263,17 @@ impl WebClient {
                 .unwrap_or("")
                 .to_string();
             let mut body = Vec::new();
+            let mut truncated = false;
             while let Some(chunk) = resp.chunk().await.map_err(|e| WebError::Request(e.without_url().to_string()))? {
                 let room = cap - body.len();
                 if chunk.len() >= room {
                     body.extend_from_slice(&chunk[..room]);
+                    truncated = true;
                     break;
                 }
                 body.extend_from_slice(&chunk);
             }
-            return Ok(Fetched { content_type, body });
+            return Ok(Fetched { content_type, body, url, truncated });
         }
         Err(WebError::TooManyRedirects)
     }
@@ -255,7 +286,7 @@ impl WebClient {
     }
 }
 
-fn textual(ct: &str) -> bool {
+pub(crate) fn textual(ct: &str) -> bool {
     let main = ct.split(';').next().unwrap_or("").trim();
     main.starts_with("text/")
         || main == "application/json"
@@ -333,63 +364,472 @@ const BLOCK_TAGS: &[&str] = &[
     "nav", "main", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "hr", "dt", "dd", "form",
 ];
 
-/// Converte HTML em texto legível: remove script/style/comentários/tags e colapsa espaços.
-pub fn html_to_text(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len() / 2);
+/// Tags sem fechamento.
+const VOID_TAGS: [&str; 14] =
+    ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr", "param"];
+
+/// Entidades nomeadas comuns além das cinco do XML e do `nbsp`: aspas e pontuação tipográficas e
+/// as letras acentuadas do português.
+const NAMED_ENTITIES: &[(&str, char)] = &[
+    ("ldquo", '\u{201C}'), ("rdquo", '\u{201D}'), ("lsquo", '\u{2018}'), ("rsquo", '\u{2019}'),
+    ("laquo", '\u{AB}'), ("raquo", '\u{BB}'), ("hellip", '\u{2026}'), ("mdash", '\u{2014}'),
+    ("ndash", '\u{2013}'), ("bull", '\u{2022}'), ("middot", '\u{B7}'), ("copy", '\u{A9}'),
+    ("reg", '\u{AE}'), ("trade", '\u{2122}'), ("deg", '\u{B0}'), ("times", '\u{D7}'),
+    ("rarr", '\u{2192}'), ("larr", '\u{2190}'), ("para", '\u{B6}'), ("sect", '\u{A7}'),
+    ("ordm", '\u{BA}'), ("ordf", '\u{AA}'), ("euro", '\u{20AC}'), ("zwj", '\u{200D}'),
+    ("aacute", 'á'), ("eacute", 'é'), ("iacute", 'í'), ("oacute", 'ó'), ("uacute", 'ú'),
+    ("Aacute", 'Á'), ("Eacute", 'É'), ("Iacute", 'Í'), ("Oacute", 'Ó'), ("Uacute", 'Ú'),
+    ("agrave", 'à'), ("Agrave", 'À'), ("acirc", 'â'), ("ecirc", 'ê'), ("ocirc", 'ô'),
+    ("Acirc", 'Â'), ("Ecirc", 'Ê'), ("Ocirc", 'Ô'), ("atilde", 'ã'), ("otilde", 'õ'),
+    ("Atilde", 'Ã'), ("Otilde", 'Õ'), ("ccedil", 'ç'), ("Ccedil", 'Ç'), ("uuml", 'ü'),
+    ("Uuml", 'Ü'), ("ntilde", 'ñ'), ("Ntilde", 'Ñ'),
+];
+
+/// Marcadores internos (área de uso privado do Unicode), removidos da entrada antes da conversão:
+/// início e fim de um bloco `pre` e um nível de recuo de lista.
+const PRE_OPEN: char = '\u{E000}';
+const PRE_CLOSE: char = '\u{E001}';
+const INDENT: char = '\u{E002}';
+
+/// Peça do HTML vista pelo [`walk_html`].
+enum HtmlPiece<'a> {
+    /// Texto entre tags (entidades ainda não decodificadas).
+    Text(&'a str),
+    /// Tag de abertura: nome em minúsculas e a tag inteira (`<a href=...>`).
+    Open(&'a str, &'a str),
+    /// Tag de fechamento: nome em minúsculas.
+    Close(&'a str),
+}
+
+/// Percorre o HTML em peças, sem comentários e sem o conteúdo de script/style/noscript/template/svg.
+/// `lower` é `html` em minúsculas ASCII (mesmos índices).
+fn walk_html<'a>(html: &'a str, lower: &'a str, mut on: impl FnMut(HtmlPiece<'a>)) {
     let mut i = 0;
+    let mut text_start = 0;
     while i < html.len() {
         let rest = &html[i..];
-        if rest.starts_with('<') {
-            if lower[i..].starts_with("<!--") {
-                i = lower[i + 4..].find("-->").map(|p| i + 4 + p + 3).unwrap_or(html.len());
-                continue;
-            }
-            let next = rest[1..].chars().next();
-            if !matches!(next, Some(c) if c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?') {
-                out.push('<');
-                i += 1;
-                continue;
-            }
-            let name: String = lower[i + 1..]
-                .trim_start_matches('/')
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
-            let closing = lower[i + 1..].starts_with('/');
-            if !closing && matches!(name.as_str(), "script" | "style" | "noscript" | "template" | "svg") {
-                let close = format!("</{name}");
-                let after = lower[i..].find(&close).map(|p| i + p);
-                i = match after {
-                    Some(p) => lower[p..].find('>').map(|q| p + q + 1).unwrap_or(html.len()),
-                    None => html.len(),
-                };
-                continue;
-            }
-            if BLOCK_TAGS.contains(&name.as_str()) {
-                out.push('\n');
-            }
-            i = match rest.find('>') {
-                Some(p) => i + p + 1,
+        if !rest.starts_with('<') {
+            i += rest.chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let next = rest[1..].chars().next();
+        if !matches!(next, Some(c) if c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?') {
+            i += 1;
+            continue;
+        }
+        if text_start < i {
+            on(HtmlPiece::Text(&html[text_start..i]));
+        }
+        if lower[i..].starts_with("<!--") {
+            i = lower[i + 4..].find("-->").map(|p| i + 4 + p + 3).unwrap_or(html.len());
+            text_start = i;
+            continue;
+        }
+        let closing = lower[i + 1..].starts_with('/');
+        let name_start = if closing { i + 2 } else { i + 1 };
+        let name_len = lower[name_start..].bytes().take_while(u8::is_ascii_alphanumeric).count();
+        let name = &lower[name_start..name_start + name_len];
+        if !closing && matches!(name, "script" | "style" | "noscript" | "template" | "svg") {
+            let close = format!("</{name}");
+            let after = lower[i..].find(&close).map(|p| i + p);
+            i = match after {
+                Some(p) => lower[p..].find('>').map(|q| p + q + 1).unwrap_or(html.len()),
                 None => html.len(),
             };
-        } else if let Some(c) = rest.chars().next() {
-            out.push(c);
-            i += c.len_utf8();
-        } else {
-            break;
+            text_start = i;
+            continue;
+        }
+        let end = rest.find('>').map_or(html.len(), |p| i + p + 1);
+        if !name.is_empty() {
+            if closing {
+                on(HtmlPiece::Close(name));
+            } else {
+                on(HtmlPiece::Open(name, &html[i..end]));
+            }
+        }
+        i = end;
+        text_start = i;
+    }
+    if text_start < html.len() {
+        on(HtmlPiece::Text(&html[text_start..]));
+    }
+}
+
+/// Estado da conversão de [`html_to_text`].
+struct Render {
+    focus: Option<&'static str>,
+    focus_depth: usize,
+    skip_depth: usize,
+    pre_depth: usize,
+    heading: bool,
+    /// Listas abertas: (ordenada, número do próximo item).
+    lists: Vec<(bool, u32)>,
+    /// A saída acabou de receber o marcador de um item e ainda não o texto dele.
+    at_marker: bool,
+    /// Elemento com `role="navigation"` aberto: nome da tag e quantas do mesmo nome estão abertas.
+    role_skip: Option<(String, usize)>,
+    out: String,
+}
+
+impl Render {
+    /// Fora das áreas de navegação e, se a página marca o conteúdo principal, dentro dele.
+    fn visible(&self) -> bool {
+        self.skip_depth == 0 && (self.focus.is_none() || self.focus_depth > 0)
+    }
+
+    /// Área de navegação descartada (C-23). Sem `<main>`/`<article>`: `nav`, `aside` e `footer`.
+    /// Dentro do conteúdo principal, só `nav` (menus e abas, como os da Wikipédia): `aside` e
+    /// `footer` de um artigo costumam ser conteúdo (quadros laterais, notas).
+    fn is_chrome(&self, name: &str) -> bool {
+        match self.focus {
+            Some(_) => name == "nav",
+            None => matches!(name, "nav" | "aside" | "footer"),
         }
     }
-    let decoded = decode_entities(&out);
+
+    fn open(&mut self, name: &str, tag: &str) {
+        if Some(name) == self.focus {
+            self.focus_depth += 1;
+        }
+        if self.is_chrome(name) {
+            self.skip_depth += 1;
+        }
+        // Elemento com `role="navigation"` (menus de documentação em `div`): fora, até fechar.
+        match self.role_skip.as_mut() {
+            Some((skip_name, nested)) => {
+                if skip_name == name {
+                    *nested += 1;
+                }
+            }
+            None => {
+                let navigation = !VOID_TAGS.contains(&name)
+                    && tag_attr(tag, "role").is_some_and(|r| r.trim().eq_ignore_ascii_case("navigation"));
+                if navigation {
+                    self.role_skip = Some((name.to_string(), 1));
+                    self.skip_depth += 1;
+                }
+            }
+        }
+        if matches!(name, "ul" | "ol") {
+            self.lists.push((name == "ol", 1));
+        }
+        let show = self.visible();
+        match name {
+            "li" => {
+                let marker = match self.lists.last_mut() {
+                    Some((true, n)) => {
+                        let m = format!("{n}. ");
+                        *n += 1;
+                        m
+                    }
+                    _ => "- ".to_string(),
+                };
+                if show {
+                    self.line_start();
+                    self.out.extend(std::iter::repeat_n(INDENT, self.lists.len().saturating_sub(1)));
+                    self.out.push_str(&marker);
+                    self.at_marker = true;
+                }
+            }
+            "ul" | "ol" => {
+                if show {
+                    // A lista de fora abre com uma linha em branco; a de dentro, na linha seguinte.
+                    if self.lists.len() == 1 {
+                        self.out.push('\n');
+                    }
+                    self.line_start();
+                }
+            }
+            "pre" => {
+                self.pre_depth += 1;
+                if show && self.pre_depth == 1 {
+                    self.out.push('\n');
+                    self.out.push(PRE_OPEN);
+                    self.out.push('\n');
+                }
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                if show && self.pre_depth == 0 {
+                    let level = usize::from(name.as_bytes()[1] - b'0');
+                    self.out.push_str("\n\n");
+                    self.out.push_str(&"#".repeat(level));
+                    self.out.push(' ');
+                    self.heading = true;
+                }
+            }
+            _ => {
+                if show && BLOCK_TAGS.contains(&name) {
+                    self.block_break();
+                }
+            }
+        }
+    }
+
+    /// Começa uma linha nova, se a saída ainda não está no começo de uma.
+    fn line_start(&mut self) {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+        self.at_marker = false;
+    }
+
+    /// Quebra de bloco, exceto logo depois do marcador de um item (`<li><p>texto</p></li>`).
+    fn block_break(&mut self) {
+        if !self.at_marker {
+            self.out.push('\n');
+        }
+    }
+
+    fn close(&mut self, name: &str) {
+        let show = self.visible();
+        match name {
+            "pre" => {
+                if show && self.pre_depth == 1 {
+                    self.out.push('\n');
+                    self.out.push(PRE_CLOSE);
+                    self.out.push('\n');
+                }
+                self.pre_depth = self.pre_depth.saturating_sub(1);
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                if self.heading {
+                    self.out.push_str("\n\n");
+                }
+                self.heading = false;
+            }
+            "ul" | "ol" => {
+                self.lists.pop();
+                if show {
+                    self.line_start();
+                    if self.lists.is_empty() {
+                        self.out.push('\n');
+                    }
+                }
+            }
+            // O próximo item (ou o fim da lista) já começa uma linha.
+            "li" => {}
+            _ => {
+                if show && BLOCK_TAGS.contains(&name) {
+                    self.block_break();
+                }
+            }
+        }
+        if Some(name) == self.focus {
+            self.focus_depth = self.focus_depth.saturating_sub(1);
+        }
+        if self.is_chrome(name) {
+            self.skip_depth = self.skip_depth.saturating_sub(1);
+        }
+        if let Some((skip_name, nested)) = self.role_skip.as_mut() {
+            if skip_name == name {
+                *nested -= 1;
+                if *nested == 0 {
+                    self.role_skip = None;
+                    self.skip_depth = self.skip_depth.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        if !self.visible() {
+            return;
+        }
+        if !text.trim().is_empty() {
+            self.at_marker = false;
+        }
+        if self.pre_depth > 0 {
+            self.out.push_str(text);
+        } else {
+            // Fora do `pre`, a quebra de linha do fonte é espaço, como no navegador.
+            self.out.extend(text.chars().map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c }));
+        }
+    }
+}
+
+/// Junta as linhas: colapsa espaços, uma linha em branco no máximo entre blocos, recuo das listas
+/// e os blocos `pre` entre crases, sem colapsar.
+fn finish_lines(decoded: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
+    let mut code: Option<Vec<String>> = None;
+    let fence = |lines: &mut Vec<String>, block: Vec<String>| {
+        let first = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
+        let last = block.iter().rposition(|l| !l.trim().is_empty()).map_or(first, |p| p + 1);
+        if lines.last().is_some_and(|l| !l.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("```".to_string());
+        lines.extend(block.into_iter().take(last).skip(first));
+        lines.push("```".to_string());
+    };
     for line in decoded.lines() {
-        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if collapsed.is_empty() && lines.last().map_or(true, String::is_empty) {
+        let marker = line.trim();
+        if let Some(mut block) = code.take() {
+            if marker.starts_with(PRE_CLOSE) && marker.chars().count() == 1 {
+                fence(&mut lines, block);
+            } else {
+                block.push(line.trim_end().to_string());
+                code = Some(block);
+            }
+            continue;
+        }
+        if marker.starts_with(PRE_OPEN) && marker.chars().count() == 1 {
+            code = Some(Vec::new());
+            continue;
+        }
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ").replace(INDENT, "  ");
+        if collapsed.is_empty() && lines.last().is_none_or(String::is_empty) {
             continue;
         }
         lines.push(collapsed);
     }
-    lines.join("\n").trim().to_string()
+    if let Some(block) = code {
+        fence(&mut lines, block);
+    }
+    lines.join("\n").replace([PRE_OPEN, PRE_CLOSE, INDENT], "").trim().to_string()
+}
+
+/// Converte HTML em texto legível, em markdown simples (spec 134/T02):
+/// - remove script/style/comentários/tags, decodifica entidades e colapsa espaços;
+/// - preserva os títulos (`#` a `######`), as listas (`-` e `1.`, com recuo por nível) e o `pre`
+///   (bloco entre crases, sem colapsar espaços);
+/// - foca no conteúdo principal (C-23): com `<main>`, extrai só ele; sem `<main>` e com
+///   `<article>`, só os artigos; sem nenhum dos dois, descarta `nav`, `aside` e `footer`.
+pub fn html_to_text(html: &str) -> String {
+    let cleaned: std::borrow::Cow<'_, str> = if html.contains([PRE_OPEN, PRE_CLOSE, INDENT]) {
+        std::borrow::Cow::Owned(html.replace([PRE_OPEN, PRE_CLOSE, INDENT], ""))
+    } else {
+        std::borrow::Cow::Borrowed(html)
+    };
+    let html = cleaned.as_ref();
+    let lower = html.to_ascii_lowercase();
+    let mut has_main = false;
+    let mut has_article = false;
+    walk_html(html, &lower, |piece| {
+        if let HtmlPiece::Open(name, _) = piece {
+            has_main |= name == "main";
+            has_article |= name == "article";
+        }
+    });
+    let focus = if has_main {
+        Some("main")
+    } else if has_article {
+        Some("article")
+    } else {
+        None
+    };
+    let mut render = Render {
+        focus,
+        focus_depth: 0,
+        skip_depth: 0,
+        pre_depth: 0,
+        heading: false,
+        lists: Vec::new(),
+        at_marker: false,
+        role_skip: None,
+        out: String::with_capacity(html.len() / 2),
+    };
+    walk_html(html, &lower, |piece| match piece {
+        HtmlPiece::Open(name, tag) => render.open(name, tag),
+        HtmlPiece::Close(name) => render.close(name),
+        HtmlPiece::Text(text) => render.text(text),
+    });
+    finish_lines(&decode_entities(&render.out))
+}
+
+/// Metadados de uma página para a base de conhecimento (spec 134/T02).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HtmlMeta {
+    /// Texto do `<title>`, decodificado e numa linha.
+    pub title: Option<String>,
+    /// `<meta name="description" content="...">`, numa linha.
+    pub description: Option<String>,
+    /// `href` de cada `<a>`, decodificado, na ordem da página e sem repetição, até
+    /// [`crate::kb::extract::MAX_LINK_TARGETS`]. Âncoras (`#x`) e esquemas que nunca são alvo
+    /// (`mailto:`, `javascript:`, `tel:`, `data:`) ficam de fora e não gastam o teto.
+    pub links: Vec<String>,
+}
+
+/// Valor do atributo `name` numa tag (`<a href="x">`), com as entidades decodificadas.
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(p) = lower[from..].find(name).map(|p| p + from) {
+        from = p + name.len();
+        let before_ok = p > 0 && (bytes[p - 1].is_ascii_whitespace() || bytes[p - 1] == b'/');
+        let mut k = from;
+        while bytes.get(k).is_some_and(u8::is_ascii_whitespace) {
+            k += 1;
+        }
+        if !before_ok || bytes.get(k) != Some(&b'=') {
+            continue;
+        }
+        k += 1;
+        while bytes.get(k).is_some_and(u8::is_ascii_whitespace) {
+            k += 1;
+        }
+        let value = match bytes.get(k) {
+            Some(&q) if q == b'"' || q == b'\'' => {
+                let end = lower[k + 1..].find(char::from(q)).map_or(tag.len(), |e| k + 1 + e);
+                &tag[k + 1..end]
+            }
+            Some(_) => {
+                let end = lower[k..].find(|c: char| c.is_ascii_whitespace() || c == '>').map_or(tag.len(), |e| k + e);
+                &tag[k..end]
+            }
+            None => return None,
+        };
+        return Some(decode_entities(value));
+    }
+    None
+}
+
+/// Título, descrição e links de uma página.
+pub fn html_meta(html: &str) -> HtmlMeta {
+    let lower = html.to_ascii_lowercase();
+    let mut meta = HtmlMeta::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_title = false;
+    let mut title = String::new();
+    walk_html(html, &lower, |piece| match piece {
+        HtmlPiece::Open("title", _) => in_title = meta.title.is_none(),
+        HtmlPiece::Close("title") => {
+            if in_title {
+                let text = decode_entities(&title).split_whitespace().collect::<Vec<_>>().join(" ");
+                meta.title = (!text.is_empty()).then_some(text);
+            }
+            in_title = false;
+        }
+        HtmlPiece::Text(text) if in_title => title.push_str(text),
+        HtmlPiece::Open("meta", tag) => {
+            let is_description = tag_attr(tag, "name").is_some_and(|n| n.trim().eq_ignore_ascii_case("description"));
+            if is_description && meta.description.is_none() {
+                meta.description = tag_attr(tag, "content")
+                    .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|c| !c.is_empty());
+            }
+        }
+        HtmlPiece::Open("a", tag) => {
+            if meta.links.len() >= crate::kb::extract::MAX_LINK_TARGETS {
+                return;
+            }
+            if let Some(href) = tag_attr(tag, "href").map(|h| h.trim().to_string()) {
+                if !href.is_empty() && !never_a_target(&href) && seen.insert(href.clone()) {
+                    meta.links.push(href);
+                }
+            }
+        }
+        _ => {}
+    });
+    meta
+}
+
+/// `href` que nunca vira alvo de link entre documentos: âncora da própria página ou esquema que
+/// não é endereço de página.
+fn never_a_target(href: &str) -> bool {
+    let lower = href.get(..href.len().min(16)).unwrap_or(href).to_ascii_lowercase();
+    href.starts_with('#') || ["mailto:", "javascript:", "tel:", "data:"].iter().any(|p| lower.starts_with(p))
 }
 
 fn decode_entities(text: &str) -> String {
@@ -407,6 +847,7 @@ fn decode_entities(text: &str) -> String {
                 "quot" => Some('"'),
                 "apos" => Some('\''),
                 "nbsp" => Some(' '),
+                _ if !ent.starts_with('#') => NAMED_ENTITIES.iter().find(|(name, _)| *name == ent).map(|(_, c)| *c),
                 _ => ent
                     .strip_prefix('#')
                     .and_then(|n| match n.strip_prefix(['x', 'X']) {
@@ -736,7 +1177,8 @@ pub(crate) mod tests {
         .await;
         let c = WebClient::for_test(&[]);
         let t = c.fetch_url(&format!("{base}/h")).await.expect("html");
-        assert_eq!(t, "T\nOlá mundo\n\num & dois <b>\n\nab");
+        // Spec 134/T02: o título da página vira `#` (antes, linha solta).
+        assert_eq!(t, "T\n\n# Olá mundo\n\num & dois <b>\n\nab");
         assert!(!t.contains("alert") && !t.contains("color"));
         assert_eq!(c.fetch_url(&format!("{base}/j")).await.expect("json"), "{\"a\":1}");
         assert_eq!(c.fetch_url(&format!("{base}/t")).await.expect("txt"), "texto");
@@ -752,6 +1194,81 @@ pub(crate) mod tests {
         assert_eq!(html_to_text("<SCRIPT>x</SCRIPT>ok<p>&#65;&#x42;&nbsp;&zzz;"), "ok\nAB &zzz;");
         assert_eq!(html_to_text("<div>sem fecho"), "sem fecho");
         assert_eq!(html_to_text("<p>x</p><p></p><p></p><p>y</p>"), "x\n\ny");
+    }
+
+    #[test]
+    fn html_to_text_keeps_headings_lists_and_pre() {
+        let html = "<h2>Instalação</h2><p>Passos:</p><ol><li>Baixe</li><li>Rode\n   o <b>script</b>\n<ul><li>Linux</li><li>Mac</li></ul></li></ol>\
+            <h6>Nota</h6><pre>\nfn main() {\n    println!(\"&lt;oi&gt;\");\n}\n</pre><p>fim</p>";
+        assert_eq!(
+            html_to_text(html),
+            "## Instalação\n\nPassos:\n\n1. Baixe\n2. Rode o script\n  - Linux\n  - Mac\n\n###### Nota\n\n```\nfn main() {\n    println!(\"<oi>\");\n}\n```\n\nfim"
+        );
+        // Marcadores internos na entrada não vazam nem viram estrutura.
+        assert_eq!(html_to_text("a\u{E000}b\u{E002}c"), "abc");
+        // `pre` sem fecho fecha no fim.
+        assert_eq!(html_to_text("<pre>x  y"), "```\nx  y\n```");
+    }
+
+    #[test]
+    fn html_to_text_focuses_on_main_content() {
+        let chrome = "<header>Topo</header><nav><ul><li>Início</li></ul></nav><aside>Anúncio</aside>";
+        // Com `<main>`: só ele (nem os artigos de fora).
+        let html = format!("{chrome}<article>Fora</article><main><h1>Doc</h1><p>Corpo</p></main><footer>Rodapé</footer>");
+        assert_eq!(html_to_text(&html), "# Doc\n\nCorpo");
+        // Sem `<main>` e com `<article>`: os artigos.
+        let html = format!("{chrome}<article><p>Um</p></article><div>solto</div><article><p>Dois</p></article>");
+        assert_eq!(html_to_text(&html), "Um\n\nDois");
+        // Sem nenhum dos dois: descarta nav, aside e footer (o header fica).
+        let html = format!("{chrome}<div><p>Texto</p></div><footer><p>Rodapé</p></footer>");
+        assert_eq!(html_to_text(&html), "Topo\n\nTexto");
+        // `<main>` citado dentro de script não conta.
+        assert_eq!(html_to_text("<script>var t='<main>';</script><nav>x</nav><p>ok</p>"), "ok");
+    }
+
+    #[test]
+    fn html_meta_reads_title_description_and_links() {
+        let html = "<head><title>Guia &amp; API</title><meta content='Resumo curto.' name=description>\
+            <meta name=\"descriptionx\" content=\"não\"></head><body><a href=\"/a\">a</a><A HREF='b.html'>b</A>\
+            <a href=\"/a\">de novo</a><a name=\"x\">sem href</a></body>";
+        let meta = html_meta(html);
+        assert_eq!(meta.title.as_deref(), Some("Guia & API"));
+        assert_eq!(meta.description.as_deref(), Some("Resumo curto."));
+        assert_eq!(meta.links, vec!["/a".to_string(), "b.html".to_string()]);
+        assert_eq!(html_meta("<p>nada</p>"), HtmlMeta::default());
+    }
+
+    #[test]
+    fn html_meta_links_skip_anchors_and_stop_at_the_cap() {
+        let cap = crate::kb::extract::MAX_LINK_TARGETS;
+        let mut html = String::from("<a href=\"#topo\">t</a><a href=\"mailto:a@b.c\">m</a><a href=\"JavaScript:x()\">j</a>");
+        for i in 0..cap * 4 {
+            html.push_str(&format!("<a href=\"/p{}\">x</a>", i % (cap * 2)));
+        }
+        let meta = html_meta(&html);
+        assert_eq!(meta.links.len(), cap);
+        assert_eq!(meta.links[0], "/p0");
+        assert_eq!(meta.links[cap - 1], format!("/p{}", cap - 1));
+    }
+
+    #[tokio::test]
+    async fn fetch_page_keeps_body_final_url_and_truncation() {
+        let big = "y".repeat(MAX_BODY + 10);
+        let base = serve(vec![
+            ("/velho", 301, "text/plain", "/novo".into(), vec![]),
+            ok("/novo", "Text/HTML; charset=utf-8", "<p>oi</p>"),
+            ("/grande", 200, "text/plain", String::new(), big.into_bytes()),
+        ])
+        .await;
+        let c = WebClient::for_test(&[]);
+        let page = c.fetch_page(&format!("{base}/velho")).await.expect("página");
+        assert_eq!(page.url, format!("{base}/novo"));
+        assert_eq!(page.content_type, "text/html; charset=utf-8");
+        assert_eq!(page.body, b"<p>oi</p>");
+        assert!(!page.truncated);
+        let page = c.fetch_page(&format!("{base}/grande")).await.expect("grande");
+        assert!(page.truncated && page.body.len() == MAX_BODY);
+        assert!(matches!(WebClient::new().fetch_page("http://127.0.0.1/").await, Err(WebError::Blocked(_))));
     }
 
     #[test]
