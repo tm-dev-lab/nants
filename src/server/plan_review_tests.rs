@@ -1542,40 +1542,156 @@ async fn only_the_split_task_too_large_is_inferred() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Spec 134 T05: com um padrão marcado na base, o plano que não o cita ganha os dois avisos
-/// codificados (C-17 e, na tarefa cujo escopo cruza o `applies_to`, C-21), sem bloqueio e uma vez
-/// por conjunto; citado na tarefa, os avisos somem e nada se repete.
+/// Spec 136 T02: sem classificação manual, a revisão do plano não emite mais os avisos da base da
+/// 134 (`kb.plan_no_standard` e `kb.task_standard_uncited`), nem com um manifesto antigo que ainda
+/// marca um documento como padrão com `applies_to` cruzando o escopo da tarefa.
 #[tokio::test]
-async fn kb_standards_give_coded_plan_warnings_once() {
+async fn kb_plan_review_gives_no_standard_warnings() {
     let root = tmp("kb-warnings");
     fs::create_dir_all(root.join(".git/info")).expect("git");
     let none = SecretSet::default();
-    let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
-    let patch = crate::kb::Patch { role: Some(crate::kb::Role::Standard), description: None, applies_to: Some(vec!["src/**".into()]) };
-    crate::kb::update(&root, &doc.id, &patch).expect("padrão");
+    crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+    let path = root.join(crate::kb::MANIFEST_REL);
+    let mut manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).expect("manifesto")).expect("json");
+    manifest["docs"][0]["role"] = serde_json::json!("standard");
+    manifest["docs"][0]["applies_to"] = serde_json::json!(["src/**"]);
+    fs::write(&path, serde_json::to_string_pretty(&manifest).expect("json")).expect("gravar");
     write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
-    let w = kb_plan_warnings(&root, SPEC);
-    assert!(w.no_standard_cited && w.uncited.len() == 1 && w.uncited[0].0 == "T01", "{w:?}");
-    let scripted = Scripted::new(vec![text("{\"issues\": []}"), text("{\"issues\": []}")]);
+    let scripted = Scripted::new(vec![text("{\"issues\": []}")]);
     let st = state(&root, true, scripted.clone());
     assert_eq!(run(&st, &root).await, 1);
-    let codes = |root: &Path| -> Vec<String> {
-        system_lines(root)
-            .into_iter()
-            .filter_map(|v| v["notice"]["code"].as_str().map(str::to_string))
-            .filter(|c| c.starts_with("kb."))
-            .collect()
+    let kb_codes: Vec<String> = system_lines(&root)
+        .into_iter()
+        .filter_map(|v| v["notice"]["code"].as_str().map(str::to_string))
+        .filter(|c| c.starts_with("kb."))
+        .collect();
+    assert!(kb_codes.is_empty(), "{kb_codes:?}");
+    assert_eq!(record(&root).status, STATUS_OK);
+    let source = include_str!("plan_review.rs");
+    for gone in [concat!("kb.plan_", "no_standard"), concat!("kb.task_", "standard_uncited")] {
+        assert!(!source.contains(gone), "{gone} saiu do servidor");
+    }
+}
+
+// ---- Spec 136 T05 (C-03): menções do usuário conferidas no consenso do plano ----
+
+/// Plano em aprovação com dois documentos na base e a conversa do caso de uso principal: um plano
+/// anterior, já aprovado, mencionou `kb:<beta>`; o pedido novo menciona `kb:<alfa>`, o Arquiteto
+/// pergunta antes do rascunho (citando `kb:<beta>`), o usuário responde e o rascunho nasce; um
+/// turno interno cita `kb:<beta>`. A sessão é gravada pela regra do servidor, como no fim do turno.
+fn mention_root(tag: &str) -> (PathBuf, String, String) {
+    use crate::agents::architect::{ChatTurn, TurnRole};
+    let root = plan_root(tag);
+    let add = |name: &str, body: &str| {
+        crate::kb::add_file(&root, name, body.as_bytes(), &SecretSet::default(), "2026-10-29T00:00:00Z").expect("documento").id
     };
-    assert_eq!(codes(&root), [KB_NO_STANDARD_CODE, KB_TASK_UNCITED_CODE]);
-    let line = system_lines(&root).into_iter().find(|v| v["notice"]["code"] == KB_TASK_UNCITED_CODE).expect("aviso");
-    assert_eq!(line["notice"]["params"]["task"], "T01");
-    assert_eq!(line["notice"]["params"]["citation"], format!("kb:{}", doc.id));
-    assert!(line["text"].as_str().is_some_and(|t| t.contains("T01") && t.contains("não o cita")), "{line}");
-    assert_eq!(record(&root).status, STATUS_OK, "sem bloqueio");
-    // A tarefa passa a citar o padrão: nova versão revisada, sem avisos novos.
-    let cited = EXAMPLE_TASK_MD.replace("- [ ] Critério verificável.", &format!("- [ ] Critério verificável (kb:{}#filas).", doc.id));
-    write_plan(&root, "AWAITING_APPROVAL", &cited);
-    assert!(kb_plan_warnings(&root, SPEC).is_empty());
+    let alfa = add("Alfa.md", "# Alfa
+Texto.
+
+## Uso
+Como usar.
+");
+    let beta = add("Beta.md", "# Beta
+Outro texto.
+");
+    let turn = |role, text: String, ts, internal| ChatTurn { role, text, ts, turn_id: None, internal, attachments: Vec::new(), notice: None };
+    assert!(crate::server::chat::append_turns(&root, &[turn(TurnRole::User, format!("plano anterior com kb:{beta}"), 5, false)]));
+    assert!(crate::kb::mention::record_plan_closed(&root, 7), "o plano anterior foi aprovado");
+    let turns = [
+        turn(TurnRole::User, format!("Crie a aplicação com os padrões do Spring de kb:{alfa}."), 10, false),
+        turn(TurnRole::Architect, format!("Antes do rascunho: qual banco? Vi kb:{beta}."), 11, false),
+        turn(TurnRole::User, "Postgres.".to_string(), 12, false),
+        turn(TurnRole::User, format!("pedido interno kb:{beta}"), 13, true),
+    ];
+    assert!(crate::server::chat::append_turns(&root, &turns));
+    let since = crate::kb::mention::session_start(&root, &crate::server::chat::read_session_turns(&root));
+    assert_eq!(since, 10, "a sessão começa no pedido inicial, depois da aprovação anterior");
+    assert_eq!(crate::kb::mention::ensure_sessions(&root, &[SPEC.to_string()], since), vec![SPEC.to_string()]);
+    (root, alfa, beta)
+}
+
+/// O caso de uso principal: a menção do pedido inicial, feita antes da pergunta do Arquiteto e do
+/// rascunho, entra na conferência; a do plano anterior, já aprovado, não.
+#[test]
+fn initial_request_mention_counts_and_the_previous_approved_plan_does_not() {
+    let (root, alfa, beta) = mention_root("mention-initial");
+    let turns = crate::server::chat::read_session_turns(&root);
+    let plan = build_plan(&root, SPEC, &SecretSet::default()).expect("plano");
+    let unused = crate::kb::mention::unused_in_plan(&root, SPEC, &turns, &plan, &SecretSet::default());
+    assert_eq!(unused, vec![(alfa, "Alfa".to_string())]);
+    assert!(unused.iter().all(|(id, _)| *id != beta));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Mencionado e não citado vira ponto do servidor; recusado com motivo, volta em disputa com a
+/// posição do Arquiteto (sem julgamento de modelo: o Revisor falso não aponta nada).
+#[tokio::test]
+async fn mentioned_and_uncited_doc_is_a_consensus_point_and_a_refusal_keeps_the_reason() {
+    let (root, alfa, beta) = mention_root("mention-reject");
+    let reviewer = Scripted::new(vec![review(&[]), review(&[])]);
+    let architect = Architect::new(vec![vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "O guia é de outra versão.")])]]);
+    let st = consensus_state(&root, reviewer, architect);
     assert_eq!(run(&st, &root).await, 1);
-    assert_eq!(codes(&root).len(), 2, "nada se repete");
+    let rec = record(&root);
+    let first = &rec.rounds[0].issues;
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!((first[0].kind.as_str(), first[0].task.as_deref()), (MENTIONED_UNUSED, None));
+    assert!(first[0].text.contains(&format!("kb:{alfa} (\"Alfa\")")), "{}", first[0].text);
+    assert!(first[0].text.starts_with("O usuário mencionou na conversa do plano"), "{}", first[0].text);
+    assert!(!first[0].text.contains(&beta), "o Arquiteto, o interno e o plano anterior não contam: {}", first[0].text);
+    let rounds: Vec<String> = internal_turns(&root).into_iter().filter(|t| t.starts_with(PLAN_CONSENSUS_INTRO)).collect();
+    assert!(rounds[0].contains("P1") && rounds[0].contains(&format!("kb:{alfa}")), "{}", rounds[0]);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_DISPUTED));
+    let view = consensus(&root);
+    assert_eq!(view.disputed.len(), 1, "{view:?}");
+    assert_eq!(view.disputed[0].kind, MENTIONED_UNUSED);
+    assert_eq!(view.disputed[0].reason_kind.as_deref(), Some("not_worth_cost"));
+    assert_eq!(view.disputed[0].reason.as_deref(), Some("O guia é de outra versão."));
+    let shown = super::view(&root, SPEC, &SecretSet::default()).expect("vista");
+    assert!(shown.issues.iter().any(|i| i.kind == MENTIONED_UNUSED), "a tela recebe o ponto: {:?}", shown.issues);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Aceito: o Arquiteto passa a citar o documento, e a revisão seguinte não traz mais o ponto.
+#[tokio::test]
+async fn accepted_mention_point_disappears_once_the_plan_cites_the_doc() {
+    let (root, alfa, _) = mention_root("mention-accept");
+    let reviewer = Scripted::new(vec![review(&[]), review(&[])]);
+    let cited = format!("{}\n\n## Contexto\nSegue o guia kb:{alfa}.\n", EXAMPLE_SPEC_MD.trim_end());
+    let args = json!({"path": format!(".sdd/specs/{SPEC}/spec.md"), "content": cited});
+    let write_spec = crate::agents::architect::testing::calls(&[("s1", "write_sdd_artifacts", &args.to_string())]);
+    let architect = Architect::new(vec![vec![write_spec, decided(&[("P1", DECISION_ACCEPT, "agree", "Passei a citar o guia.")])]]);
+    let st = consensus_state(&root, reviewer, architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.rounds[0].issues.len(), 1);
+    assert!(rec.issues.is_empty(), "{:?}", rec.issues);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    let view = consensus(&root);
+    assert_eq!((view.total, view.adjusted, view.kept), (1, 1, 0), "{view:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// O ponto das menções é do servidor: no idioma do projeto, um só com a lista (com teto), e nunca
+/// cede a vaga aos do modelo nem ao do ciclo.
+#[test]
+fn mention_issue_is_one_server_point_in_the_project_language() {
+    use crate::i18n::Lang;
+    let unused: Vec<(String, String)> = (0..6).map(|i| (format!("doc{i}-0123abcd"), format!("Doc {i}"))).collect();
+    let pt = with_mention_issue(Vec::new(), &unused[..1], Lang::PtBr);
+    assert_eq!(pt.len(), 1);
+    assert!(pt[0].text.contains("kb:doc0-0123abcd (\"Doc 0\")"), "{}", pt[0].text);
+    let en = with_mention_issue(Vec::new(), &unused, Lang::En);
+    assert!(en[0].text.starts_with("The user mentioned knowledge base documents"), "{}", en[0].text);
+    assert!(en[0].text.contains("kb:doc3-0123abcd") && !en[0].text.contains("kb:doc4-0123abcd") && en[0].text.contains("+2"), "{}", en[0].text);
+    let full: Vec<PlanIssue> = (0..MAX_ISSUES).map(|i| PlanIssue::new(None, "scope", &format!("p{i}"))).collect();
+    let out = with_cycle_issue(with_mention_issue(full, &unused, Lang::PtBr), &["T01".to_string(), "T02".to_string()], Lang::PtBr);
+    assert_eq!(out.len(), MAX_ISSUES);
+    assert!(out.iter().any(|i| i.kind == MENTIONED_UNUSED), "{out:?}");
+    assert_eq!(out.last().map(|i| i.kind.as_str()), Some(CYCLE_KIND));
+    assert!(with_mention_issue(Vec::new(), &[], Lang::PtBr).is_empty());
+    // O modelo não emite o tipo: só o servidor.
+    assert!(!ISSUE_KINDS.contains(&MENTIONED_UNUSED));
+    let parsed = parse_issues(&json!({"issues": [{"task": null, "kind": MENTIONED_UNUSED, "text": "x"}]}).to_string(), &SecretSet::default());
+    assert!(parsed.is_none_or(|p| p.is_empty()));
 }

@@ -73,6 +73,10 @@ const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-draft-thumb", "miniatura de imagem do rascunho"],
   ["nd-thumb-btn", "miniatura de imagem que amplia"],
   ["nd-kb-row-btn", "linha da lista do Conhecimento (spec 134): abre a prévia do documento"],
+  ["nd-kb-src-item", "linha do quadro Fontes da base no Plano (spec 136 T04): abre o Conhecimento na seção citada"],
+  ["nd-plan-task-toggle", "linha da tarefa no Plano (spec 136 T04): abre e fecha os critérios, com a forma da linha da lista"],
+  ["nd-kb-outline-item", "item do sumário do documento no Conhecimento (spec 136 T07): pula para a seção, com a seção em leitura marcada"],
+  ["nd-kb-rel-item", "linha das ligações do documento no Conhecimento (spec 136 T07): abre o documento ligado ou pula para a seção usada no plano"],
 ]);
 
 /** Abertura de cada `<button …>` no fonte (com expressões `{…}` que podem conter `>`). */

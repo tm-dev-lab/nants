@@ -729,6 +729,50 @@
   overflow-wrap: anywhere;
 }
 
+/* A base do Tailwind tira os marcadores; aqui eles voltam (spec 136 T11). */
+ul.nd-md-list {
+  list-style: disc;
+}
+
+ul.nd-md-list ul.nd-md-list {
+  list-style: circle;
+}
+
+ol.nd-md-list {
+  list-style: decimal;
+}
+
+.nd-md-list li::marker {
+  color: var(--muted);
+}
+
+/* Item de tarefa: a caixa desabilitada no lugar do marcador. */
+.nd-md-list li[data-task] {
+  list-style: none;
+}
+
+.nd-md-task {
+  margin: 0 var(--sp-2) 0 calc(-1 * var(--sp-5) + var(--sp-1));
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+
+.nd-md-quote {
+  margin: 0;
+  padding: 0 0 0 var(--sp-3);
+  border-left: 2px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  color: var(--muted);
+}
+
+.nd-md-link {
+  color: var(--pill-violet-ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .nd-md-pre {
   margin: 0;
   padding: var(--sp-2);
@@ -1266,6 +1310,78 @@
 
 .nd-composer-input::placeholder {
   color: var(--muted);
+}
+
+/*
+ * Menções com `@` (spec 136 T06): o campo fica sobre uma camada com o mesmo texto, a mesma fonte e
+ * a mesma quebra. Com alguma menção, o texto do campo fica transparente (o cursor e a seleção
+ * continuam dele) e a camada desenha o texto e as etiquetas. A etiqueta não muda a largura do texto:
+ * o fundo se estende pelo contorno, e o ícone fica sobre o `@`, que ocupa o lugar dele.
+ */
+.nd-composer-field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+/* A mesma calha da barra de rolagem nos dois: com barra clássica, as linhas quebram igual. */
+.nd-composer-field > textarea.nd-composer-input {
+  position: relative;
+  z-index: 1;
+  scrollbar-gutter: stable;
+}
+
+.nd-composer-input[data-mentions="true"] {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--ink);
+}
+
+.nd-mention-backdrop {
+  position: absolute;
+  inset: 0;
+  max-height: none;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  color: transparent;
+  pointer-events: none;
+}
+
+.nd-mention-backdrop[data-visible="true"] {
+  color: var(--ink);
+}
+
+.nd-root[data-mobile="true"] .nd-mention-backdrop {
+  font-size: var(--fs-touch);
+}
+
+.nd-mention {
+  border-radius: var(--r-xs);
+  background: var(--pill-violet-bg);
+  color: var(--pill-violet-ink);
+  outline: 2px solid var(--pill-violet-bg);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.nd-mention-at {
+  position: relative;
+  color: transparent;
+}
+
+.nd-mention-at > svg {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--icon-violet);
+}
+
+.nd-mention-section {
+  opacity: 0.75;
 }
 
 .nd-composer-btn {
@@ -2070,4 +2186,285 @@
   margin: 0;
   font-size: var(--fs-label);
   color: var(--muted);
+}
+
+/*
+ * --- Fontes da base no Plano (spec 136 T04) ---
+ * Um bloco discreto sobre o fundo neutro de controle, sem borda: os documentos com o tipo, e em cada
+ * um as seções citadas com os lugares de uso e a marca de regra ou consulta (C-04). A linha inteira
+ * abre o Conhecimento na seção.
+ */
+.nd-kb-sources {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--control);
+}
+
+.nd-kb-sources-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb-sources-icon {
+  flex-shrink: 0;
+  color: var(--icon-violet);
+}
+
+.nd-kb-sources-count {
+  margin-left: auto;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.nd-kb-sources-docs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-kb-src-doc-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-control);
+}
+
+.nd-kb-src-doc-icon {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.nd-kb-src-doc-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-kb-src-doc[data-removed="true"] .nd-kb-src-doc-title {
+  color: var(--muted);
+}
+
+.nd-kb-src-items {
+  list-style: none;
+  margin: var(--sp-1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Linha da seção: título, onde é usada, a marca e a seta, que só aparece no foco. */
+.nd-kb-src-item {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto minmax(0, 1fr) 14px;
+  align-items: center;
+  column-gap: var(--sp-2);
+  min-height: 30px;
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) var(--sp-6);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink2);
+  font: inherit;
+  font-size: var(--fs-control);
+  text-align: left;
+  cursor: pointer;
+}
+
+li.nd-kb-src-item {
+  cursor: default;
+}
+
+.nd-root button.nd-kb-src-item:hover {
+  background: var(--state-hover);
+}
+
+.nd-root .nd-kb-src-item:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+}
+
+.nd-kb-src-section {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-src-where {
+  min-width: 0;
+  justify-self: end;
+  padding-left: var(--sp-4);
+  font-size: var(--fs-label);
+  color: var(--muted);
+  text-align: right;
+}
+
+.nd-kb-src-doc-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--muted);
+}
+
+.nd-kb-src-go {
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.nd-root .nd-kb-src-item:hover .nd-kb-src-go,
+.nd-root .nd-kb-src-item:focus-visible .nd-kb-src-go {
+  opacity: 1;
+}
+
+.nd-kb-src-item[data-removed="true"] .nd-kb-src-section {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.nd-kb-sources-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-4);
+  margin: 0;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--divider);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-sources-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-kb-sources-none {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-control);
+  color: var(--muted);
+}
+
+/* Celular e janela estreita: a seção e a marca na primeira linha, os usos embaixo. */
+.nd-root[data-mobile="true"] .nd-kb-src-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 var(--sp-2);
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-6);
+}
+
+.nd-root[data-mobile="true"] .nd-kb-src-where {
+  flex-basis: 100%;
+  padding-left: 0;
+  text-align: left;
+}
+
+.nd-root[data-mobile="true"] .nd-kb-src-doc-head {
+  flex-wrap: wrap;
+}
+
+.nd-root[data-mobile="true"] .nd-kb-src-doc-title {
+  white-space: normal;
+}
+
+.nd-root[data-mobile="true"] .nd-kb-src-go {
+  display: none;
+}
+
+.nd-root[data-mobile="true"] .nd-kb-sources-legend {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* Tarefa com critérios: a linha abre e fecha a lista, com as citações como link. */
+.nd-plan-task-item {
+  border-bottom: 1px solid var(--divider);
+}
+
+.nd-plan-task-item > .nd-plan-task {
+  border-bottom: 0;
+}
+
+.nd-plan-task-toggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-root .nd-plan-task-toggle:hover .nd-plan-task-title {
+  color: var(--accent-ink);
+}
+
+.nd-root .nd-plan-task-toggle:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+}
+
+.nd-plan-task-chevron {
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--muted);
+  transition: transform 0.12s ease;
+}
+
+.nd-plan-task-toggle[aria-expanded="true"] .nd-plan-task-chevron {
+  transform: rotate(90deg);
+}
+
+.nd-plan-task-cites {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+  align-self: center;
+  font-size: var(--fs-label);
+  color: var(--pill-violet-ink);
+}
+
+.nd-plan-task-criteria,
+.nd-plan-criteria {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0 0 0 var(--sp-5);
+  font-size: var(--fs-control);
+  line-height: 1.6;
+  color: var(--ink2);
+}
+
+.nd-plan-task-criteria {
+  margin: 0 0 var(--sp-3) 40px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-plan-task-chevron,
+  .nd-kb-src-go {
+    transition: none;
+  }
 }

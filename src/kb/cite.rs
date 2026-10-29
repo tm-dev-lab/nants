@@ -6,8 +6,9 @@
 //!   com o motivo, para o modelo corrigir.
 //! - **Congelamento:** na aprovação da spec, [`freeze`] grava em `.sdd/kb/frozen/<spec>.json`
 //!   (fora do Git, dentro de `.sdd/kb/`) o SHA-256 do texto de cada seção citada, o catálogo e os
-//!   padrões daquele momento. Durante a execução, o catálogo e o índice de padrões vêm dali (não
-//!   mudam a cada turno) e [`changed`] diz quais fontes citadas mudaram desde a aprovação.
+//!   padrões daquele momento. Durante a execução, o catálogo vem dali (não muda a cada turno) e
+//!   [`changed`] diz quais fontes citadas mudaram desde a aprovação. Os `standards` (os padrões
+//!   marcados) dos arquivos da 134 são ignorados na leitura desde a spec 136 T02.
 //!
 //! A base é sempre dado: o que obriga é a spec aprovada (decisão C-14 da spec).
 
@@ -15,7 +16,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::catalog::{self, StandardRef};
+use super::catalog;
 use super::index;
 use super::{is_doc_id, load_manifest, sha256_hex, write_atomic, KbError, Manifest, Status, KB_REL};
 use crate::server::events::SecretSet;
@@ -197,16 +198,19 @@ pub struct Frozen {
     pub frozen_at: String,
     #[serde(default)]
     pub sources: Vec<FrozenSource>,
-    /// Catálogo do prefixo do Arquiteto na aprovação ([`catalog::render`]).
+    /// Catálogo do prefixo do Arquiteto na aprovação ([`catalog::render`]). Num arquivo da 134,
+    /// ainda com a ordem por marcação e o selo `[padrão]`: a recuperação da spec já aprovada usa
+    /// esse texto como está (spec 136 T02), para não mudar o prefixo dela no meio da execução.
     #[serde(default)]
     pub catalog: String,
-    /// Padrões prontos na aprovação, para o índice por escopo do briefing.
+    /// Bloco da Visão geral na aprovação ([`catalog::overview`]; spec 136 T02). Vazio nos arquivos
+    /// da 134, cujo catálogo já traz a Visão geral dentro dele.
     #[serde(default)]
-    pub standards: Vec<StandardRef>,
+    pub overview: String,
 }
 
 /// Id de spec seguro para o nome do arquivo.
-fn safe_spec_id(spec_id: &str) -> bool {
+pub(super) fn safe_spec_id(spec_id: &str) -> bool {
     !spec_id.is_empty()
         && spec_id.chars().count() <= MAX_SPEC_ID_CHARS
         && !spec_id.starts_with('.')
@@ -250,7 +254,7 @@ pub fn freeze(root: &Path, spec_id: &str, texts: &[&str], secrets: &SecretSet, n
         frozen_at: now.to_string(),
         sources,
         catalog: catalog::render(root, secrets),
-        standards: catalog::standards(&manifest),
+        overview: catalog::overview(root, secrets),
     };
     let mut text = serde_json::to_string_pretty(&frozen).map_err(|_| KbError::Fs(SafeFsError::Io))?;
     text.push('\n');

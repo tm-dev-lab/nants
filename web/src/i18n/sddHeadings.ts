@@ -41,6 +41,7 @@ const FIXED_KEYS: readonly MessageKey[] = [
   "sddHeading.humanGuidance",
   "sddHeading.pending",
   "sddHeading.pendingResolved",
+  "sddHeading.checkedWarnings",
 ];
 
 /** Títulos com um valor no meio ("Tentativa 2", "Pergunta (developer)"). */

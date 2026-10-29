@@ -1,7 +1,8 @@
 //! Indicadores dos documentos da base (spec 134 T06, C-24), calculados pelo servidor sem modelo,
 //! a partir do manifesto e do índice já montado:
 //! - `duplicate`: o mesmo conteúdo que outro documento por outro caminho (um link e um arquivo,
-//!   por exemplo): o mesmo SHA-256 do original ou os mesmos termos no texto extraído;
+//!   por exemplo, ou um documento escrito no Nants com o texto de outro, spec 136 T10): o mesmo
+//!   SHA-256 do original ou os mesmos termos no texto extraído;
 //! - `no_headings`: a nota não tem títulos, então só se cita o documento inteiro (o PDF é citado
 //!   por página e nunca entra aqui);
 //! - `broken_link`: um link interno (para um arquivo `.md`, `.txt` ou `.pdf`) que não aponta para
@@ -42,10 +43,13 @@ impl Indicator {
 pub fn compute(docs: &[Entry], index: &Index) -> HashMap<String, Vec<Indicator>> {
     let facts: HashMap<&str, (Option<&str>, bool)> = index.doc_facts().map(|(id, hash, headings)| (id, (hash, headings))).collect();
     let ready: Vec<&Entry> = docs.iter().filter(|d| d.status == Status::Ready).collect();
+    let empty = super::sha256_hex(b"");
+    let counts = |sha: &str| !sha.is_empty() && sha != empty;
     let mut by_sha: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut by_text: HashMap<&str, Vec<&str>> = HashMap::new();
     for doc in &ready {
-        if !doc.sha256.is_empty() {
+        // Documento vazio (um documento escrito ainda sem texto) não é duplicata de outro vazio.
+        if counts(&doc.sha256) {
             by_sha.entry(doc.sha256.as_str()).or_default().push(doc.id.as_str());
         }
         if let Some((Some(hash), _)) = facts.get(doc.id.as_str()) {
@@ -72,7 +76,7 @@ pub fn compute(docs: &[Entry], index: &Index) -> HashMap<String, Vec<Indicator>>
         let me = doc.id.as_str();
         let mut list = Vec::new();
         let fact = facts.get(me).copied();
-        let twin = (!doc.sha256.is_empty())
+        let twin = counts(&doc.sha256)
             .then(|| other_than(by_sha.get(doc.sha256.as_str()), me))
             .flatten()
             .or_else(|| fact.and_then(|(hash, _)| hash).and_then(|h| other_than(by_text.get(h), me)));

@@ -71,6 +71,7 @@ pub const SERVER_WRITTEN: &[&str] = &[
     runner::FINAL_OBSERVATIONS,
     runner::PENDING,
     runner::PENDING_RESOLVED,
+    runner::CHECKED_WARNINGS,
     runner::HISTORY,
     runner::ADVICE_SECTION,
     runner::GUIDANCE_SECTION,

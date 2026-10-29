@@ -61,19 +61,18 @@ fn markdown_is_ready_with_frontmatter_and_raw_body() {
     let entry = add_md(&root, "arquitetura.md", text);
     assert_eq!(entry.kind, Kind::Markdown);
     assert_eq!(entry.status, Status::Ready);
-    assert_eq!(entry.role, Role::Reference);
     assert_eq!(entry.extractor.as_deref(), Some("raw"));
     assert_eq!(entry.size, text.len() as u64);
     assert_eq!(entry.sha256.len(), 64);
-    assert!(entry.links_out.is_empty() && entry.applies_to.is_empty());
+    assert!(entry.links_out.is_empty());
     assert_eq!(entry.description, "Use camadas.", "primeira frase (C-19)");
     assert_eq!(entry.title, "arquitetura");
 
     let note = fs::read_to_string(root.join(NOTES_REL).join(format!("{}.md", entry.id))).expect("nota");
-    for key in ["title", "kind", "source", "source_url", "added_at", "fetched_at", "sha256", "pages", "extractor", "status", "role"] {
+    for key in ["title", "kind", "source", "source_url", "added_at", "fetched_at", "sha256", "pages", "extractor", "status"] {
         assert!(note.contains(&format!("\n{key}: ")), "{key} no frontmatter:\n{note}");
     }
-    assert!(note.contains("status: \"ready\"") && note.contains("role: \"reference\""));
+    assert!(note.contains("status: \"ready\"") && !note.contains("\nrole: "), "sem marcação (spec 136 T02)");
     assert_eq!(note_body(&note), "# Arquitetura\n\nUse camadas.\n");
     assert_eq!(fs::read(root.join(SOURCES_REL).join(format!("{}.md", entry.id))).expect("original"), text.as_bytes());
 
@@ -84,8 +83,11 @@ fn markdown_is_ready_with_frontmatter_and_raw_body() {
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join(MANIFEST_REL)).expect("manifesto")).expect("json");
     let doc = &manifest["docs"][0];
-    for key in ["id", "title", "kind", "source", "size", "sha256", "added_at", "status", "role", "description", "applies_to", "links_out"] {
+    for key in ["id", "title", "kind", "source", "size", "sha256", "added_at", "status", "description", "links_out"] {
         assert!(!doc[key].is_null(), "{key} no manifesto");
+    }
+    for gone in ["role", "applies_to"] {
+        assert!(doc.get(gone).is_none(), "{gone} saiu do manifesto (spec 136 T02)");
     }
 }
 
@@ -179,25 +181,15 @@ fn duplicate_by_sha256_is_refused() {
 }
 
 #[test]
-fn update_role_description_and_applies_to() {
+fn update_changes_only_the_description() {
     let root = root("update");
     let entry = add_md(&root, "api.md", "# API\n");
-    let globs = vec!["src/api/**".to_string(), " ".to_string(), "src/api/**".to_string()];
-    let refused = update(&root, &entry.id, &Patch { applies_to: Some(globs.clone()), ..Patch::default() });
-    assert_eq!(refused, Err(KbError::AppliesToStandardOnly));
-
-    let patch = Patch { role: Some(Role::Standard), description: Some("  Padrão de APIs REST  ".into()), applies_to: Some(globs) };
+    let patch = Patch { description: Some("  Padrão de APIs REST  ".into()), ..Patch::default() };
     let updated = update(&root, &entry.id, &patch).expect("update");
-    assert_eq!(updated.role, Role::Standard);
     assert_eq!(updated.description, "Padrão de APIs REST");
-    assert_eq!(updated.applies_to, vec!["src/api/**".to_string()]);
     let note = fs::read_to_string(root.join(NOTES_REL).join(format!("{}.md", entry.id))).expect("nota");
-    assert!(note.contains("role: \"standard\""), "{note}");
     assert_eq!(note_body(&note), "# API\n", "corpo preservado");
     assert_eq!(list(&root).expect("lista")[0], updated);
-
-    let back = update(&root, &entry.id, &Patch { role: Some(Role::Reference), ..Patch::default() }).expect("referência");
-    assert!(back.applies_to.is_empty(), "referência não guarda globs");
 
     let long = "a".repeat(MAX_DESCRIPTION_CHARS + 1);
     assert_eq!(update(&root, &entry.id, &Patch { description: Some(long), ..Patch::default() }), Err(KbError::DescriptionTooLong));
@@ -205,14 +197,56 @@ fn update_role_description_and_applies_to() {
         update(&root, &entry.id, &Patch { description: Some("a\nb".into()), ..Patch::default() }),
         Err(KbError::BadDescription)
     );
-    for bad in ["/etc/**", "../x", "a/../b", "a\\b"] {
-        let patch = Patch { role: Some(Role::Standard), applies_to: Some(vec![bad.into()]), ..Patch::default() };
-        assert_eq!(update(&root, &entry.id, &patch), Err(KbError::BadAppliesTo), "{bad}");
-    }
-    let many: Vec<String> = (0..=MAX_APPLIES_TO).map(|i| format!("src/{i}/**")).collect();
-    let patch = Patch { role: Some(Role::Standard), applies_to: Some(many), ..Patch::default() };
-    assert_eq!(update(&root, &entry.id, &patch), Err(KbError::BadAppliesTo));
     assert_eq!(update(&root, "nao-existe-1", &Patch::default()), Err(KbError::NotFound));
+}
+
+/// Spec 136 T02 (C-06): o `PATCH` da 134 com `role` e `applies_to` é aceito, com qualquer valor, e
+/// os dois são ignorados; outro campo desconhecido continua recusado.
+#[test]
+fn legacy_patch_fields_are_accepted_and_ignored() {
+    let root = root("legacy-patch");
+    let entry = add_md(&root, "api.md", "# API\n");
+    let before = list(&root).expect("lista");
+    for body in [
+        serde_json::json!({"role": "standard", "applies_to": ["src/**"]}),
+        serde_json::json!({"role": "reference", "applies_to": []}),
+        serde_json::json!({"role": "qualquer", "applies_to": "/etc/**"}),
+    ] {
+        let patch: Patch = serde_json::from_value(body.clone()).unwrap_or_else(|e| panic!("{body}: {e}"));
+        update(&root, &entry.id, &patch).expect("aceito");
+        assert_eq!(list(&root).expect("lista"), before, "nada muda: {body}");
+    }
+    let patch: Patch = serde_json::from_value(serde_json::json!({"role": null, "applies_to": null, "description": "Rotas"})).expect("aceito");
+    assert_eq!(update(&root, &entry.id, &patch).expect("descrição").description, "Rotas");
+    let manifest = fs::read_to_string(root.join(MANIFEST_REL)).expect("manifesto");
+    assert!(!manifest.contains("\"role\"") && !manifest.contains("applies_to"), "{manifest}");
+    assert!(serde_json::from_value::<Patch>(serde_json::json!({"outro": 1})).is_err(), "campo desconhecido");
+}
+
+/// Spec 136 T02 (C-06): o manifesto e a nota da 134, com `role` e `applies_to`, continuam
+/// legíveis; a próxima gravação descarta os dois campos e o corpo da nota fica.
+#[test]
+fn manifest_and_note_from_134_stay_readable() {
+    let root = root("legacy-manifest");
+    let entry = add_md(&root, "api.md", "# API\nRotas.\n");
+    let path = root.join(MANIFEST_REL);
+    let mut manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).expect("manifesto")).expect("json");
+    manifest["docs"][0]["role"] = serde_json::json!("standard");
+    manifest["docs"][0]["applies_to"] = serde_json::json!(["src/api/**"]);
+    fs::write(&path, serde_json::to_string_pretty(&manifest).expect("json")).expect("gravar");
+    let note_path = root.join(NOTES_REL).join(format!("{}.md", entry.id));
+    let note = fs::read_to_string(&note_path).expect("nota").replace("status: \"ready\"\n", "status: \"ready\"\nrole: \"standard\"\n");
+    assert!(note.contains("\nrole: \"standard\"\n"));
+    fs::write(&note_path, note).expect("gravar nota");
+
+    let docs = list(&root).expect("lê o manifesto da 134");
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].id, entry.id);
+    let (_, body) = read_note(&root, &entry.id, &none()).expect("lê a nota da 134");
+    assert_eq!(body, "# API\nRotas.\n");
+    update(&root, &entry.id, &Patch { description: Some("API".into()), ..Patch::default() }).expect("grava");
+    let saved = fs::read_to_string(&path).expect("manifesto");
+    assert!(!saved.contains("\"role\"") && !saved.contains("applies_to"), "{saved}");
 }
 
 #[test]

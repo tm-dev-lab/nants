@@ -112,9 +112,17 @@ describe("parseReportMarkdown: texto inline", () => {
     expect(block?.kind === "paragraph" ? block.inlines.map((i) => i.kind) : []).toEqual(["text"]);
   });
 
-  it("link vira só texto (não clicável); URL http(s) aparece ao lado do rótulo", () => {
-    const [block] = parseReportMarkdown("[site](https://exemplo.com)");
-    expect(block?.kind === "paragraph" ? block.inlines : []).toEqual([{ kind: "text", text: "site (https://exemplo.com)" }]);
+  it("link http(s) vira link com o rótulo (spec 136 T11); relativo e sem esquema viram só o rótulo", () => {
+    const inlines = (md: string): Inline[] => {
+      const [block] = parseReportMarkdown(md);
+      return block?.kind === "paragraph" ? block.inlines : [];
+    };
+    expect(inlines("[site](https://exemplo.com)")).toEqual([{ kind: "link", text: "site", href: "https://exemplo.com" }]);
+    expect(inlines("[a](http://exemplo.com/x?y=1)")).toEqual([{ kind: "link", text: "a", href: "http://exemplo.com/x?y=1" }]);
+    expect(inlines("[banco](banco.md#versoes)")).toEqual([{ kind: "text", text: "banco" }]);
+    expect(inlines("[f](file:///etc/passwd)")).toEqual([{ kind: "text", text: "f" }]);
+    expect(inlines("[d](data:text/html,oi)")).toEqual([{ kind: "text", text: "d" }]);
+    expect(inlines("[h](https://)")).toEqual([{ kind: "text", text: "h" }]);
   });
 
   it("link com esquema perigoso vira só o rótulo, sem URL", () => {

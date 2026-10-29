@@ -390,6 +390,8 @@ export interface TaskView {
   /** Motivo do bloqueio (redigido e limitado pelo servidor); ausente quando não há. */
   next_action?: string;
   error?: string;
+  /** Critérios de aceitação da tarefa (spec 136 T04), com as citações `kb:` como estão no arquivo. */
+  criteria?: string[];
   /** Opções de recuperação vigentes (só em tarefa BLOCKED); ver spec 073. */
   recovery_options?: RecoveryOption[];
   /** Número da análise das opções; devolvido sem alteração ao escolher. */
@@ -409,6 +411,8 @@ export interface SpecView {
   error?: string;
   /** Ambiente docker proposto no plano (spec em rascunho); ausente = host. */
   environment?: EnvironmentView;
+  /** Critérios globais do spec.md (spec 136 T04), com as citações `kb:`. */
+  criteria?: string[];
   /** Itens da seção "Premissas" do spec.md, quando o servidor os expõe. */
   premises?: string[];
   /** Orientações por papel (Desenvolvedor/Revisor) escritas pelo Arquiteto no spec.md. */
@@ -451,7 +455,7 @@ export interface PlanIssue {
   /** Id estável do ponto na spec (`P1`, spec 128); ausente nos registros antigos. */
   id?: string;
   task: string | null;
-  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "too_large" | string;
+  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "too_large" | "mentioned_unused" | string;
   text: string;
   /** Repete um ponto recusado pelo Arquiteto sem argumento novo (spec 128). */
   disputed?: boolean;

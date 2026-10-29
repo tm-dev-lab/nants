@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
@@ -1391,7 +1391,7 @@ async fn launch(
         let (ref_root, sid) = (root.clone(), spec_id.clone());
         let _ = tokio::task::spawn_blocking(move || crate::sdd::references::copy_to_spec(&ref_root, &sid, &names)).await;
     }
-    // (4b6) Spec 134 T05: o SHA-256 de cada fonte da base citada no plano, o catálogo e os padrões
+    // (4b6) Spec 134 T05: o SHA-256 de cada fonte da base citada no plano e o catálogo
     // congelados em `.sdd/kb/frozen/<spec>.json` (fora do Git). Melhor esforço: a citação já foi
     // validada na gravação, e a falha aqui só tira o aviso de fonte alterada.
     if approving {
@@ -1479,6 +1479,12 @@ async fn launch(
         return Err(shutting_down());
     }
     restore.disarm();
+    // Spec 136 T05: a aprovação concluída fecha a sessão do plano das menções à base; o próximo
+    // plano conta as menções a partir da mensagem seguinte do usuário. Melhor esforço.
+    if approving {
+        let (closed_root, now) = (root.clone(), SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        let _closed = tokio::task::spawn_blocking(move || crate::kb::mention::record_plan_closed(&closed_root, now)).await;
+    }
     // Spec 128 T04: a linha da renumeração na Conversa, só com a aprovação concluída.
     if let Some(r) = renumbering {
         let mut params = Map::new();
@@ -4199,7 +4205,7 @@ mod tests {
     }
 
     /// Spec 134 T05: a aprovação congela o SHA-256 de cada fonte da base citada no plano (com o
-    /// catálogo e os padrões) em `.sdd/kb/frozen/<spec>.json`, fora do Git.
+    /// catálogo) em `.sdd/kb/frozen/<spec>.json`, fora do Git.
     #[tokio::test]
     async fn approve_freezes_the_cited_kb_sources() {
         let root = setup("approve-kb-freeze", true);
@@ -4224,6 +4230,11 @@ mod tests {
         assert!(frozen.catalog.contains(&format!("- kb:{} |", doc.id)));
         let exclude = fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
         assert!(exclude.lines().any(|l| l == crate::kb::KB_EXCLUDE_LINE), "fora do Git: {exclude}");
+        // Spec 136 T05: a aprovação concluída fecha a sessão do plano das menções.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let closed = crate::kb::mention::plan_closed_ts(&root).expect("fim do plano gravado");
+        assert!(closed + 120 >= now && closed <= now, "{closed} vs {now}");
+        assert!(root.join(".sdd/kb/mentions/.closed.json").is_file());
     }
 
     /// Backend do relatório que só responde quando o teste libera (F-02).
@@ -7130,6 +7141,29 @@ mod tests {
         (state, backend)
     }
 
+    /// Pedidos da recuperação (análise, reforço, opções e diagnóstico) ao `report_backend`.
+    ///
+    /// Por que filtrar: depois do evento `integrated`, a mesma tarefa do run segue para
+    /// `report::after_integration`, que gera o relatório final (`report_system`) e em seguida
+    /// atualiza o ARCHITECTURE.md (`architecture_update_system`) pelo MESMO `report_backend` destes
+    /// testes. `run_until(.., "integrated")` volta assim que o evento chega, e esses pedidos
+    /// posteriores podem ou não já estar gravados quando o teste lê `backend.requests()`: era a
+    /// intermitência das contagens. Eles ficam de fora; os da recuperação seguem contados.
+    fn recovery_requests(backend: &crate::agents::architect::testing::Scripted) -> Vec<crate::agents::llm_client::ChatRequest> {
+        use crate::agents::prompts::{architecture_update_system_for, report_system_for};
+        use crate::i18n::Lang;
+        let after: Vec<String> = [Lang::PtBr, Lang::En]
+            .into_iter()
+            .flat_map(|lang| [report_system_for(lang), architecture_update_system_for(lang)])
+            .map(|p| p.chars().take(120).collect())
+            .collect();
+        backend
+            .requests()
+            .into_iter()
+            .filter(|r| !r.messages.first().is_some_and(|m| after.iter().any(|head| m.content.starts_with(head.as_str()))))
+            .collect()
+    }
+
     async fn run_until(state: &AppState, status: &str) -> Vec<ApiEvent> {
         let mut rx = state.events().subscribe();
         let (code, body) = call(state, approve_req(PROJECT, SPEC, "")).await;
@@ -7170,7 +7204,7 @@ mod tests {
         assert!(events.iter().any(|e| e.event_type() == "agent_message"
             && e.payload["agent"] == "architect"
             && e.payload["task_id"] == "T01"));
-        let reqs = backend.requests();
+        let reqs = recovery_requests(&backend);
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0]
             .tools
@@ -7213,7 +7247,7 @@ mod tests {
             payloads(&events, "recovery_decided"),
             vec![json!({"spec_id": SPEC, "task_id": "T01", "cycle": 1, "decision": "REVISE_TASK"})]
         );
-        let reqs = backend.requests();
+        let reqs = recovery_requests(&backend);
         assert!(
             reqs[1].messages.iter().any(|m| m.content.contains("SO_NA_WORKTREE")),
             "o modelo deve ler o arquivo da worktree"
@@ -7347,7 +7381,7 @@ mod tests {
             .find(|p| p["agent"] == "architect" && p["code"] == crate::server::recovery::CODE_ANALYSIS)
             .expect("análise com código");
         assert_eq!(analysis["params"], json!({"cycle": 1, "decision": "SPLIT", "autonomous": 0}), "{analysis}");
-        let facts = backend.requests()[0].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+        let facts = recovery_requests(&backend)[0].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
         assert!(facts.contains("## Sinais para a decisão") && facts.contains("Critérios de aceitação: 1"), "{facts}");
     }
 
@@ -7422,7 +7456,7 @@ mod tests {
             vec![text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON)],
         );
         let events = run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 3, "o 3º ciclo só pede opções (spec 074); RETRY não vale");
+        assert_eq!(recovery_requests(&backend).len(), 3, "o 3º ciclo só pede opções (spec 074); RETRY não vale");
         let cycles: Vec<u64> = payloads(&events, "recovery_decided")
             .iter()
             .map(|p| p["cycle"].as_u64().unwrap_or(0))
@@ -7449,7 +7483,7 @@ mod tests {
             vec![text(RETRY_JSON), text(RETRY_JSON), text(LIMIT_OPTIONS_JSON)],
         );
         let events = run_until(&state, "blocked").await;
-        let reqs = backend.requests();
+        let reqs = recovery_requests(&backend);
         assert_eq!(reqs.len(), 3);
         let last = reqs[2].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
         assert!(last.contains("Orçamento de recuperação esgotado") && last.contains("NÃO repita"), "{last}");
@@ -7500,7 +7534,7 @@ mod tests {
             vec![text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON), text(LIMIT_OPTIONS_JSON)],
         );
         let events = run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 5);
+        assert_eq!(recovery_requests(&backend).len(), 5);
         assert!(!settings_text(&root).contains("force-exit"), "{}", settings_text(&root));
         let decided = payloads(&events, "recovery_decided");
         assert_eq!(decided[4]["decision"], "ESCALATE");
@@ -7521,7 +7555,7 @@ mod tests {
         fs::write(t01_path(&root), md).expect("T01");
         let (state, backend) = recovery_state(&root, Script::RecoverStuck, vec![text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON)]);
         let _ = run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 3, "o orçamento zerado chama o modelo de novo (2 ciclos + opções do limite)");
+        assert_eq!(recovery_requests(&backend).len(), 3, "o orçamento zerado chama o modelo de novo (2 ciclos + opções do limite)");
     }
 
     // ---- Spec 073/T02: opções de recuperação e endpoint recovery-choice ----
@@ -7820,7 +7854,7 @@ mod tests {
         enable_yolo(&root);
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(OPTIONS_JSON)]);
         let events = run_until(&state, "integrated").await;
-        assert_eq!(backend.requests().len(), 1, "sem reforço: a opção config resolve");
+        assert_eq!(recovery_requests(&backend).len(), 1, "sem reforço: a opção config resolve");
         assert!(settings_text(&root).contains("node --test --test-force-exit"), "{}", settings_text(&root));
         assert!(payloads(&events, "recovery_decided").iter().all(|p| p["decision"] == "REVISE_CONFIG"));
         assert!(events.iter().all(|e| e.event_type() != "permission_requested"));
@@ -7867,7 +7901,7 @@ mod tests {
             vec![text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON), text(RETRY_JSON)],
         );
         let events = run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 5, "2 ciclos + 2 rodadas autônomas + 1 chamada só para opções");
+        assert_eq!(recovery_requests(&backend).len(), 5, "2 ciclos + 2 rodadas autônomas + 1 chamada só para opções");
         let cycles: Vec<u64> = payloads(&events, "recovery_decided")
             .iter()
             .map(|p| p["cycle"].as_u64().unwrap_or(0))
@@ -7878,7 +7912,7 @@ mod tests {
         let rounds = task.body.lines().filter(|l| l.starts_with(recovery::AUTONOMOUS_ROUND_PREFIX)).count();
         assert_eq!(rounds, 2, "{}", task.body);
         assert!(task.body.contains(recovery::CAUSE_LIMIT), "{}", task.body);
-        assert_eq!(backend.requests().len(), 5, "a 5ª análise só pede opções ao modelo");
+        assert_eq!(recovery_requests(&backend).len(), 5, "a 5ª análise só pede opções ao modelo");
         assert!(events
             .iter()
             .any(|e| e.event_type() == "agent_message" && e.payload["text"].as_str().is_some_and(|t| t.contains("[rodada autônoma]"))));
@@ -7893,13 +7927,17 @@ mod tests {
         let esc = r#"{"decision":"ESCALATE","root_cause":"trocar Plug.Cowboy ou aceitar o risco"}"#;
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(esc), text(RETRY_JSON)]);
         run_until(&state, "integrated").await;
-        let reqs = backend.requests();
-        assert_eq!(reqs.len(), 2);
+        // Só os pedidos da recuperação: o relatório final e o ARCHITECTURE.md, pedidos ao mesmo
+        // backend depois do `integrated`, chegavam às vezes antes da leitura (ver `recovery_requests`).
+        let reqs = recovery_requests(&backend);
         let dump = |r: &crate::agents::llm_client::ChatRequest| {
             r.messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n")
         };
-        assert!(dump(&reqs[0]).contains("Aprovação automática: autonomia"), "{}", dump(&reqs[0]));
-        assert!(dump(&reqs[1]).contains("ESCALATE NÃO É PERMITIDO"));
+        let dumps: Vec<String> = reqs.iter().map(dump).collect();
+        assert_eq!(dumps.len(), 2, "exatamente dois pedidos de recuperação: {dumps:?}");
+        let autonomous = dumps.iter().position(|d| d.contains("Aprovação automática: autonomia"));
+        let reinforced = dumps.iter().position(|d| d.contains("ESCALATE NÃO É PERMITIDO"));
+        assert_eq!((autonomous, reinforced), (Some(0), Some(1)), "{dumps:?}");
     }
 
     /// YOLO (C-02): ESCALATE persistente vira RETRY com a estratégia sugerida + premissa registrada,
@@ -7912,7 +7950,7 @@ mod tests {
         let esc = r#"{"decision":"ESCALATE","root_cause":"decisão de produto","strategy":"usar a biblioteca atual","proposal":"SPLIT: dividir"}"#;
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(esc), text(esc)]);
         let events = run_until(&state, "integrated").await;
-        assert_eq!(backend.requests().len(), 2);
+        assert_eq!(recovery_requests(&backend).len(), 2);
         let task = read_t01(&root);
         assert!(!task.body.contains("Decisão: escalar ao humano"), "{}", task.body);
         assert!(task.body.contains("premissa registrada"), "{}", task.body);
@@ -7949,12 +7987,12 @@ mod tests {
         enable_yolo(&root);
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text("x"), text("y"), text(RETRY_JSON)]);
         run_until(&state, "integrated").await;
-        assert_eq!(backend.requests().len(), 3);
+        assert_eq!(recovery_requests(&backend).len(), 3);
         let root = setup("rec-yolo-unavail2", true);
         enable_yolo(&root);
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text("x"), text("y"), text("z")]);
         run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 3);
+        assert_eq!(recovery_requests(&backend).len(), 3);
         assert!(read_t01(&root).body.contains(recovery::CAUSE_UNAVAILABLE));
     }
 
@@ -7967,7 +8005,7 @@ mod tests {
         enable_yolo(&root);
         let (state, backend) = recovery_state(&root, Script::EnvComposeFixes, vec![]);
         let events = run_until(&state, "integrated").await;
-        assert!(backend.requests().is_empty(), "sem modelo");
+        assert!(recovery_requests(&backend).is_empty(), "sem modelo");
         let task = read_t01(&root);
         assert!(task.body.contains("request_environment_change"), "{}", task.body);
         assert!(task.body.contains(recovery::ENV_FIX_PREFIX), "{}", task.body);
@@ -7979,7 +8017,7 @@ mod tests {
         run_until(&state, "blocked").await;
         let task = read_t01(&root);
         assert_eq!(task.body.lines().filter(|l| l.starts_with(recovery::ENV_FIX_PREFIX)).count(), 1, "{}", task.body);
-        assert_eq!(backend.requests().len(), 1, "só o diagnóstico depois da segunda falha");
+        assert_eq!(recovery_requests(&backend).len(), 1, "só o diagnóstico depois da segunda falha");
         assert!(task.body.contains("## Diagnóstico de ambiente #1"), "{}", task.body);
     }
 
@@ -8000,7 +8038,7 @@ mod tests {
         let esc = r#"{"decision":"ESCALATE","root_cause":"decisão de produto"}"#;
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(esc), text(RETRY_JSON)]);
         run_until(&state, "blocked").await;
-        let reqs = backend.requests();
+        let reqs = recovery_requests(&backend);
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].messages.iter().all(|m| !m.content.contains("## Aprovação automática")));
     }
@@ -8012,11 +8050,11 @@ mod tests {
         let root = setup("rec-retry-once", true);
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text("não é JSON"), text(RETRY_JSON)]);
         run_until(&state, "integrated").await;
-        assert_eq!(backend.requests().len(), 2);
+        assert_eq!(recovery_requests(&backend).len(), 2);
         let root = setup("rec-retry-twice", true);
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text("lixo"), text("lixo")]);
         run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 2);
+        assert_eq!(recovery_requests(&backend).len(), 2);
         assert!(read_t01(&root).body.contains(recovery::CAUSE_UNAVAILABLE));
     }
 
@@ -8030,7 +8068,7 @@ mod tests {
         fs::write(root.with_file_name("evidence.txt"), "[falha dos testes: código 127]\nsh: tsc: not found").expect("evidência");
         let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(ENV_CONFIG_JSON)]);
         let _ = run_until(&state, "integrated").await;
-        let reqs = backend.requests();
+        let reqs = recovery_requests(&backend);
         assert_eq!(reqs.len(), 1, "o modelo é consultado");
         let facts = reqs[0].messages.iter().map(|m| m.content.clone()).collect::<String>();
         assert!(facts.contains("Falha de ambiente") && facts.contains("tsc: not found") && facts.contains("código: 127"), "{facts}");
@@ -8055,7 +8093,7 @@ mod tests {
         let diff = pending[0].diff.clone().unwrap_or_default();
         assert!(diff.contains("Antes:") && diff.contains("npm ci && true"), "{diff}");
         assert!(!settings_text(&root).contains("npm ci"));
-        assert_eq!(backend.requests().len(), 1);
+        assert_eq!(recovery_requests(&backend).len(), 1);
     }
 
     /// Proposta que tira o comando original é recusada pelo servidor e vira escalada explicada.
@@ -8086,7 +8124,7 @@ mod tests {
             let esc = r#"{"decision":"ESCALATE","root_cause":"o host não tem a ferramenta","proposal":"decidir o ambiente"}"#;
             let (state, backend) = recovery_state(&root, Script::RecoverFixes, vec![text(esc)]);
             let _ = run_until(&state, "blocked").await;
-            assert_eq!(backend.requests().len(), 1, "{tag}: passa pelo modelo");
+            assert_eq!(recovery_requests(&backend).len(), 1, "{tag}: passa pelo modelo");
             let task = read_t01(&root);
             assert_eq!(task.frontmatter.status, TaskStatus::Blocked, "{tag}");
             for needle in ["- Contexto:", "comando: true", code, "trecho do erro:", "o que foi tentado:", "por que não resolveu: o host não tem a ferramenta", "opções:"] {
@@ -8256,7 +8294,7 @@ mod tests {
         enable_yolo(&root);
         let (state, backend) = recovery_state(&root, Script::RecoverAdjustsEnv, vec![text(ENV_FILES_JSON)]);
         let events = run_until(&state, "integrated").await;
-        assert_eq!(backend.requests().len(), 1, "a opção com files não é reforçada");
+        assert_eq!(recovery_requests(&backend).len(), 1, "a opção com files não é reforçada");
         let settings = read_settings_checked(&root).expect("settings");
         assert_eq!(settings.environment, crate::sdd::Environment::Docker);
         let hash = crate::sdd::environment::env_hash(&root).expect("hash");
@@ -8470,7 +8508,7 @@ mod tests {
         git(&root, &["branch", "-M", "main"]);
         let (state, backend) = recovery_state(&root, Script::EnvBlock, vec![text(DIAG_JSON), text(DIAG_JSON)]);
         let events = run_until(&state, "blocked").await;
-        assert_eq!(backend.requests().len(), 1);
+        assert_eq!(recovery_requests(&backend).len(), 1);
         assert!(payloads(&events, "recovery_started").is_empty());
         let task = read_t01(&root);
         assert!(task.body.contains("## Diagnóstico de ambiente #1"), "{}", task.body);
@@ -8489,7 +8527,7 @@ mod tests {
         let (code, body) = call(&state, resume_req(PROJECT, SPEC, "")).await;
         assert_eq!(code, StatusCode::ACCEPTED, "{body}");
         collect_until(&mut rx, "blocked").await;
-        assert_eq!(backend.requests().len(), 1, "sem segundo diagnóstico");
+        assert_eq!(recovery_requests(&backend).len(), 1, "sem segundo diagnóstico");
         assert!(!read_t01(&root).body.contains("Diagnóstico de ambiente #2"));
     }
 

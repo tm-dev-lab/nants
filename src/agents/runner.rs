@@ -801,6 +801,10 @@ pub struct ReviewInput {
     pub checks: String,
     /// Seção "Critérios" da resposta final do Desenvolvedor (critério → evidência); vazio sem ela.
     pub dev_criteria: String,
+    /// Spec 136 T01: os avisos explícitos do Desenvolvedor ([`extract_dev_pending`], `- texto` por
+    /// linha, já redigidos), que o Revisor confere um a um ([`warning_items`]); vazio sem avisos e na
+    /// verificação final.
+    pub dev_warnings: String,
     /// Outras tarefas da spec ("Txx: título", uma por linha); fora do escopo desta revisão.
     pub other_tasks: String,
     /// Findings da revisão anterior (texto), quando houver; vazio na primeira revisão.
@@ -1426,6 +1430,10 @@ pub const FINAL_OBSERVATIONS: &str = "Observações para a verificação final";
 pub const PENDING: &str = "Pendências conhecidas";
 /// Spec 133 T07: pendências que a verificação final resolveu, com a evidência dela.
 pub const PENDING_RESOLVED: &str = "Pendências resolvidas na verificação final";
+/// Spec 136 T01: seção do corpo da tarefa com os avisos do Desenvolvedor que o Revisor conferiu
+/// (`confirmed`), um por linha (`- texto`, no idioma do projeto), registrados na aprovação. O
+/// relatório os mostra como conferidos.
+pub const CHECKED_WARNINGS: &str = "Avisos conferidos pelo Revisor";
 /// Teto da seção de avisos do Desenvolvedor guardada na evidência.
 const DEV_PENDING_MAX_BYTES: usize = 2048;
 /// Teto das observações das tarefas nos FATOS da verificação final.
@@ -1623,6 +1631,119 @@ pub fn extract_dev_pending(summary: &str) -> String {
         }
     }
     tail_bytes_head(out.trim_end(), DEV_PENDING_MAX_BYTES)
+}
+
+/// Spec 136 T01: os avisos do Desenvolvedor, um por item da seção ([`extract_dev_pending`]), na
+/// ordem: o aviso `n` é o item `n` (contando de 1).
+pub fn warning_items(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Spec 136 T01: o que a aprovação registra dos avisos do Desenvolvedor, no idioma do projeto.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarningOutcome {
+    /// Os conferidos (`confirmed`), com a evidência: vão para [`CHECKED_WARNINGS`].
+    pub checked: Vec<String>,
+    /// Os que o Revisor não pôde conferir (`not_checkable`, com o motivo) e os que ficaram sem
+    /// desfecho mesmo depois do novo pedido: vão para [`PENDING`], como antes.
+    pub pending: Vec<String>,
+}
+
+/// Spec 136 T01: regra única de destino dos avisos do Desenvolvedor (`warnings`, ver
+/// [`warning_items`]), pareados com o desfecho do Revisor (`result.warnings`) pelo número do aviso,
+/// no molde de [`apply_declared`]:
+/// - `confirmed` com evidência: conferido (devolvido em `checked`);
+/// - `not_checkable` com motivo: pendência que não bloqueia (devolvida em `pending`);
+/// - `refuted`: o aviso vira apontamento HIGH, que reprova. Com `finding` igual ao id de um
+///   apontamento desta resposta, é ele que passa a HIGH (e confiança alta); sem isso, um apontamento
+///   novo com o aviso. Como HIGH, nenhuma convergência o rebaixa ([`demote_late_new`] e as demais só
+///   rebaixam MEDIUM e LOW);
+/// - sem desfecho completo (o novo pedido único já foi feito na sessão do Revisor): pendência, como
+///   antes da 136.
+///
+/// Regra agnóstica: só o número e o desfecho contam, nunca o texto do aviso.
+pub fn apply_warnings(lang: Lang, mut result: ReviewResult, warnings: &[String]) -> (ReviewResult, WarningOutcome) {
+    let mut outcome = WarningOutcome::default();
+    let mut generated = Vec::new();
+    let mut refuted = false;
+    for (i, text) in warnings.iter().enumerate() {
+        let number = i + 1;
+        let replies = || result.warnings.iter().filter(move |r| r.number == number);
+        let reply = replies().find(|r| r.complete()).or_else(|| replies().next()).cloned();
+        let evidence = reply.as_ref().map(|r| r.evidence.trim().to_string()).filter(|e| !e.is_empty());
+        match reply.as_ref().map(|r| r.status) {
+            Some(WarningStatus::Confirmed) if evidence.is_some() => {
+                let evidence = evidence.unwrap_or_default();
+                outcome.checked.push(i18n::tr(lang, "runner.warning.checked", &[("text", text), ("evidence", &evidence)]));
+            }
+            Some(WarningStatus::NotCheckable) if evidence.is_some() => {
+                let reason = evidence.unwrap_or_default();
+                outcome.pending.push(i18n::tr(lang, "runner.pending.dev_warning_unchecked", &[("text", text), ("reason", &reason)]));
+            }
+            Some(WarningStatus::Refuted) => {
+                refuted = true;
+                let linked = reply.as_ref().map(|r| r.finding.trim()).filter(|id| !id.is_empty());
+                match linked.and_then(|id| result.findings.iter_mut().find(|f| f.id.trim().eq_ignore_ascii_case(id))) {
+                    Some(f) => {
+                        f.severity = "HIGH".into();
+                        f.confidence = Confidence::High;
+                    }
+                    None => {
+                        let evidence = evidence.unwrap_or_else(|| i18n::text(lang, "runner.review.no_evidence"));
+                        generated.push(i18n::tr(
+                            lang,
+                            "runner.review.warning_refuted",
+                            &[("number", &number.to_string()), ("text", text), ("evidence", &evidence)],
+                        ));
+                    }
+                }
+            }
+            _ => outcome.pending.push(i18n::tr(lang, "runner.pending.dev_warning", &[("text", text)])),
+        }
+    }
+    if !refuted {
+        return (result, outcome);
+    }
+    let number = |id: &str| id.trim().strip_prefix("F-").and_then(|n| n.parse::<u32>().ok());
+    let mut next = result.findings.iter().filter_map(|f| number(&f.id)).max().unwrap_or(0);
+    for description in generated {
+        next += 1;
+        result.findings.push(Finding {
+            id: format!("F-{next:02}"),
+            severity: "HIGH".into(),
+            location: i18n::text(lang, "runner.review.warning_location"),
+            description,
+            recommendation: i18n::text(lang, "runner.review.warning_recommendation"),
+            state: Some(FindingState::New),
+            ..Finding::default()
+        });
+    }
+    result.verdict = Verdict::ChangesRequested;
+    (result, outcome)
+}
+
+/// Spec 136 T01: acrescenta os avisos conferidos (texto já no idioma do projeto) à seção
+/// [`CHECKED_WARNINGS`] da tarefa, sem repetir linha. Devolve o corpo novo.
+pub fn append_checked(body: &str, items: &[String]) -> String {
+    let existing = section_text(body, CHECKED_WARNINGS).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+    let before = lines.len();
+    for item in items.iter().filter(|i| !i.trim().is_empty()) {
+        let line = format!("- {}", one_line_text(item));
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    if lines.len() == before {
+        return body.to_string();
+    }
+    replace_section(body, CHECKED_WARNINGS, Some(lines.join("\n")))
 }
 
 /// Spec 133 T07: acrescenta `items` (texto já no idioma do projeto) à seção [`PENDING`] da tarefa,
@@ -2322,6 +2443,39 @@ pub struct ReviewResult {
     /// Spec 133 T07: só na verificação final, a resposta a cada pendência das tarefas (campo
     /// `pending`); vazia sem resposta.
     pub pending: Vec<PendingReply>,
+    /// Spec 136 T01: o desfecho de cada aviso do Desenvolvedor (campo `warnings`), pelo número do
+    /// aviso; vazio sem resposta.
+    pub warnings: Vec<WarningReply>,
+}
+
+/// Spec 136 T01: o desfecho que o Revisor deu a um aviso do Desenvolvedor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningStatus {
+    /// O que o aviso supõe ou afirma confere com o código (vale com evidência).
+    Confirmed,
+    /// O código contradiz o aviso: vira apontamento HIGH ([`apply_warnings`]).
+    Refuted,
+    /// Não dá para conferir com as ferramentas da revisão (vale com o motivo): vira pendência.
+    NotCheckable,
+}
+
+/// Spec 136 T01: resposta do Revisor a um aviso do Desenvolvedor, pareada pelo número do aviso.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarningReply {
+    pub number: usize,
+    pub status: WarningStatus,
+    /// A evidência (`confirmed`, `refuted`) ou o motivo (`not_checkable`).
+    pub evidence: String,
+    /// Id do apontamento desta resposta que trata o aviso refutado; vazio sem ele.
+    pub finding: String,
+}
+
+impl WarningReply {
+    /// A resposta é um desfecho completo: `confirmed` com evidência, `not_checkable` com motivo ou
+    /// `refuted`. A incompleta conta como desfecho faltando.
+    pub fn complete(&self) -> bool {
+        self.status == WarningStatus::Refuted || !self.evidence.trim().is_empty()
+    }
 }
 
 /// Spec 133 T07: o que o Revisor respondeu sobre um critério declarado pelo Desenvolvedor.
@@ -4653,6 +4807,8 @@ impl TaskRunner {
             test_output,
             checks,
             dev_criteria,
+            // Spec 136 T01: os avisos vão ao Revisor, que dá um desfecho a cada um.
+            dev_warnings: self.scrub(&dev_pending),
             other_tasks,
             worktree,
             project_root: self.repo_root.clone(),
@@ -4683,6 +4839,9 @@ impl TaskRunner {
         // Spec 133 T07: cada critério que o Desenvolvedor declarou não atendido ou parcial tem destino
         // pela resposta do Revisor, pareada pelo número; o de ambiente vira pendência na aprovação.
         let (reviewed, declared_pending) = apply_declared(self.lang.get(), reviewed, &declared_criteria(&input.dev_criteria));
+        // Spec 136 T01: cada aviso do Desenvolvedor tem destino pelo desfecho do Revisor: o refutado
+        // reprova como HIGH; o conferido e o que não dá para conferir ficam para a aprovação.
+        let (reviewed, warned) = apply_warnings(self.lang.get(), reviewed, &warning_items(&input.dev_warnings));
         self.sync_advice(task);
         // Spec 087 T05: tamanho do diff de código desta tentativa (informativo; falha do git não registra).
         if let Ok(lines) = code_diff_lines(&root, &settings.base_branch, &branch) {
@@ -4789,17 +4948,15 @@ impl TaskRunner {
                 // Spec 133 T07: aprovada mesmo assim, as pendências ficam registradas na tarefa: o
                 // critério declarado com motivo de ambiente, os avisos explícitos do Desenvolvedor e
                 // os "não verificados" (spec 133 T06).
-                let lang = self.lang.get();
+                // Spec 136 T01: dos avisos, ficam pendentes só o que o Revisor não pôde conferir e o que
+                // ficou sem desfecho; o conferido vai para a seção dos conferidos.
                 let mut pending = declared_pending;
-                pending.extend(
-                    dev_pending
-                        .lines()
-                        .filter_map(|l| l.trim().strip_prefix("- "))
-                        .map(|t| i18n::tr(lang, "runner.pending.dev_warning", &[("text", t.trim())])),
-                );
+                pending.extend(warned.pending);
                 pending.extend(unverified_pending);
                 let pending: Vec<String> = pending.iter().map(|p| self.scrub(p)).collect();
                 task.body = append_pending(&task.body, &pending);
+                let checked: Vec<String> = warned.checked.iter().map(|c| self.scrub(c)).collect();
+                task.body = append_checked(&task.body, &checked);
                 self.transition(task, TaskStatus::Approved, "integrar")?;
                 Ok(Step::Next)
             }
@@ -5352,21 +5509,16 @@ impl TaskRunner {
     }
 
     /// Bloco da base de conhecimento do briefing (spec 134 T05): as seções `kb:` citadas na tarefa
-    /// e na spec, dentro de [`KB_SOURCES_MAX_BYTES`], o índice do que não coube e a linha dos padrões
-    /// cujo `applies_to` cruza o escopo da tarefa (os congelados na aprovação, quando há). Vazio sem
-    /// documento pronto na base. `used` sai do teto do contexto da spec.
+    /// e na spec, dentro de [`KB_SOURCES_MAX_BYTES`], separadas entre as transcritas como regra e as
+    /// de contexto (spec 136 T02), e o índice do que não coube. Vazio sem documento pronto na base.
+    /// `used` sai do teto do contexto da spec.
     fn kb_block(&self, spec_id: &str, task: Option<&Task>, reviewer: bool) -> crate::kb::catalog::BriefBlock {
-        use crate::kb::catalog::{briefing_block, standards, BriefInput};
+        use crate::kb::catalog::{briefing_block, BriefInput};
         let none = crate::server::events::SecretSet::new(Vec::<String>::new());
         let secrets = self.secrets.as_deref().unwrap_or(&none);
         let spec_text = fs::read_to_string(self.spec_dir(spec_id).join("spec.md")).unwrap_or_default();
-        let standards = match crate::kb::cite::load_frozen(&self.repo_root, spec_id) {
-            Some(frozen) => frozen.standards,
-            None => standards(&crate::kb::load_manifest(&self.repo_root).unwrap_or_default()),
-        };
         let task_text = task.map(|t| t.body.as_str()).unwrap_or_default();
-        let scope = task.map(|t| t.frontmatter.allowed_scope.clone()).unwrap_or_default();
-        let input = BriefInput { task_text, spec_text: &spec_text, scope: &scope, standards: &standards, reviewer, max: KB_SOURCES_MAX_BYTES };
+        let input = BriefInput { task_text, spec_text: &spec_text, reviewer, max: KB_SOURCES_MAX_BYTES };
         let mut block = briefing_block(&self.repo_root, &input, secrets);
         block.text = self.scrub(&block.text);
         block
@@ -5620,6 +5772,7 @@ impl TaskRunner {
             test_output: self.scrub(truncate_bytes(&test_output, 8 * 1024)),
             checks: self.scrub(&checks_text),
             dev_criteria: String::new(),
+            dev_warnings: String::new(),
             other_tasks: tasks
                 .iter()
                 .map(|t| format!("{}: {}", t.frontmatter.id, t.frontmatter.title))
@@ -7364,6 +7517,7 @@ mod tests {
             screenshots_viewed: Vec::new(),
             declared: Vec::new(),
             pending: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -7376,6 +7530,7 @@ mod tests {
             screenshots_viewed: Vec::new(),
             declared: Vec::new(),
             pending: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -7761,33 +7916,42 @@ mod tests {
         }
     }
 
-    /// Spec 134 T05: o bloco da base no briefing traz as fontes citadas na tarefa e na spec e a linha
-    /// dos padrões do escopo; sem documento pronto na base, nada.
+    /// Spec 134 T05 e 136 T02: o bloco da base no briefing traz as fontes citadas na tarefa e na
+    /// spec, separadas entre regra (critério, Premissas) e contexto (seção descritiva), sem índice
+    /// de padrões por escopo; sem documento pronto na base, nada.
     #[test]
-    fn kb_block_brings_cited_sources_and_scope_standards_only_with_a_base() {
-        use crate::kb::catalog::{BriefBlock, DEV_RULE, REVIEWER_RULE};
+    fn kb_block_brings_cited_sources_split_by_rule_and_context_only_with_a_base() {
+        use crate::kb::catalog::{BriefBlock, CONTEXT_SOURCES_TITLE, DEV_RULE, REVIEWER_RULE, RULE_SOURCES_TITLE};
         let fx = Fixture::new("kb-block", "true");
         let runner = fx.noop_runner(&FakeReviewer::new(|_, _| approved(vec![])));
         let mut t = task("T01", TaskStatus::Todo, &[]);
         assert_eq!(runner.kb_block(SPEC, Some(&t), false), BriefBlock::default(), "sem base");
         let none = crate::server::events::SecretSet::new(Vec::<String>::new());
-        let doc = crate::kb::add_file(&fx.repo, "regras.md", b"# Filas\nUse filas.\n\n# Logs\nLogs em JSON.\n", &none, "2026-10-28T12:00:00Z")
-            .unwrap();
-        let patch = crate::kb::Patch { role: Some(crate::kb::Role::Standard), description: None, applies_to: Some(vec!["src/**".into()]) };
-        crate::kb::update(&fx.repo, &doc.id, &patch).unwrap();
+        let doc = crate::kb::add_file(
+            &fx.repo,
+            "regras.md",
+            b"# Filas\nUse filas.\n\n# Logs\nLogs em JSON.\n\n# Exemplo\nPacote controller.\n",
+            &none,
+            "2026-10-28T12:00:00Z",
+        )
+        .unwrap();
         assert_eq!(runner.kb_block(SPEC, Some(&t), false).used, 0, "sem citação, nada do teto");
         let spec_path = fx.repo.join(".sdd/specs/s1/spec.md");
-        let spec = fs::read_to_string(&spec_path).unwrap().replace("teste\n", &format!("teste\n\n## Premissas\n- Logs (kb:{}#logs)\n", doc.id));
+        let spec = fs::read_to_string(&spec_path).unwrap().replace(
+            "teste\n",
+            &format!("teste\n\n## Premissas\n- Logs (kb:{0}#logs)\n\n## Abordagem técnica\n- Como no livro (kb:{0}#exemplo)\n", doc.id),
+        );
         fs::write(&spec_path, spec).unwrap();
-        t.body.push_str(&format!("- Filas (kb:{}#filas)\n", doc.id));
+        t.body.push_str(&format!("\n## Critérios de Aceitação\n- Filas (kb:{}#filas)\n", doc.id));
         let dev = runner.kb_block(SPEC, Some(&t), false);
         assert!(dev.text.contains("Use filas.") && dev.text.contains("Logs em JSON.") && dev.text.contains(DEV_RULE), "{}", dev.text);
-        assert!(dev.text.contains(&format!("- kb:{} | ", doc.id)), "padrão do escopo: {}", dev.text);
+        let (rules, context) = (dev.text.find(RULE_SOURCES_TITLE).expect("regra"), dev.text.find(CONTEXT_SOURCES_TITLE).expect("contexto"));
+        let at = |needle: &str| dev.text.find(needle).unwrap_or(usize::MAX);
+        assert!(rules < at("Use filas.") && at("Logs em JSON.") < context && context < at("Pacote controller."), "{}", dev.text);
+        assert!(!dev.text.contains("applies_to") && !dev.text.contains("[padrão]"), "{}", dev.text);
         assert!(dev.used > 0 && dev.used <= KB_SOURCES_MAX_BYTES && KB_SOURCES_MAX_BYTES < SPEC_CONTEXT_MAX_BYTES);
         assert!(runner.kb_block(SPEC, Some(&t), true).text.contains(REVIEWER_RULE));
-        t.frontmatter.allowed_scope = vec!["docs/**".into()];
-        assert!(!runner.kb_block(SPEC, Some(&t), false).text.contains(&format!("- kb:{} | ", doc.id)), "fora do escopo");
-        // Verificação final: as fontes da spec, sem tarefa nem índice de padrões.
+        // Verificação final: as fontes da spec, sem tarefa.
         let last = runner.kb_block(SPEC, None, true);
         assert!(last.text.contains("Logs em JSON.") && !last.text.contains("Use filas."), "{}", last.text);
     }
@@ -7821,6 +7985,27 @@ mod tests {
             _ => None,
         });
         assert!(text.is_some_and(|t| t.contains(&cited) && t.contains("mudou desde a aprovação")));
+    }
+
+    /// Spec 136 T10: a seção citada de um documento escrito no Nants, editada pela rota de edição
+    /// depois da aprovação, dá o mesmo aviso (o índice segue o manifesto, sem esquecer nada à mão).
+    #[test]
+    fn kb_written_source_edited_after_approval_gives_the_notice() {
+        let fx = Fixture::new("kb-written-changed", "true");
+        let rec = Recorder::default();
+        let runner = fx.runner(&FakeDev::default(), &FakeReviewer::new(|_, _| approved(vec![])), ScriptedTests::default(), &rec);
+        let none = crate::server::events::SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_written(&fx.repo, "Regras", "# Filas\n\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("escrever");
+        let cited = format!("kb:{}#filas", doc.id);
+        crate::kb::cite::freeze(&fx.repo, SPEC, &[cited.as_str()], &none, "2026-10-28T12:00:00Z").expect("congelar");
+        runner.kb_source_notices(SPEC, "T01");
+        assert!(notices(&rec).is_empty(), "nada mudou");
+        crate::kb::edit_content(&fx.repo, &doc.id, "# Filas\n\nUse eventos.\n", &doc.sha256, &none).expect("editar");
+        runner.kb_source_notices(SPEC, "T01");
+        let seen = notices(&rec);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, KB_SOURCE_CHANGED_CODE);
+        assert_eq!(seen[0].1.get("citation"), Some(&serde_json::Value::from(cited)));
     }
 
     /// Spec 131 T01: o contexto da spec não repete o que o briefing já entrega inteiro (a orientação
@@ -12757,6 +12942,186 @@ mod tests {
         assert_eq!(out.verdict, Verdict::ChangesRequested);
         assert!(demoted.is_empty(), "{demoted:?}");
         assert!(out.findings.iter().any(|f| f.severity == "HIGH" && f.description.contains("o Revisor confirmou: entrar")), "{:?}", out.findings);
+    }
+
+    fn warning(number: usize, status: WarningStatus, evidence: &str, finding: &str) -> WarningReply {
+        WarningReply { number, status, evidence: evidence.into(), finding: finding.into() }
+    }
+
+    /// O aviso da T04 do test-12 (spec 136 P5).
+    const ERRORS_WARNING: &str = "não li o `ApiExceptionHandler` para confirmar o formato `errors` como lista";
+
+    /// Spec 136 T01: cenário do test-12. O Desenvolvedor avisa que não conferiu o formato `errors`; o
+    /// Revisor confere, refuta (o handler devolve um mapa) e aprova sem apontamento: o aviso vira
+    /// finding HIGH e a tarefa volta.
+    #[test]
+    fn refuted_warning_without_finding_becomes_a_high_finding() {
+        let r = ReviewResult {
+            criteria: vec![met("erros na tela", true)],
+            warnings: vec![warning(1, WarningStatus::Refuted, "ApiExceptionHandler.java:41 devolve `errors` como mapa; app.js:88 lê uma lista", "")],
+            ..approved(vec![Finding { severity: "MEDIUM".into(), ..finding("F-02") }])
+        };
+        let (out, outcome) = apply_warnings(Lang::PtBr, r, &[ERRORS_WARNING.to_string()]);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert_eq!(outcome, WarningOutcome::default(), "o refutado não vira pendência nem conferido");
+        let f = &out.findings[1];
+        assert_eq!((f.id.as_str(), f.severity.as_str(), f.location.as_str()), ("F-03", "HIGH", "aviso do Desenvolvedor"));
+        assert_eq!(
+            f.description,
+            format!("O Desenvolvedor deixou o aviso 1 e o Revisor o refutou: {ERRORS_WARNING}. Evidência: ApiExceptionHandler.java:41 devolve `errors` como mapa; app.js:88 lê uma lista")
+        );
+        assert_eq!(f.state, Some(FindingState::New));
+        // O finding do próprio Revisor (MEDIUM, não ligado ao aviso) fica como estava.
+        assert_eq!(out.findings[0].severity, "MEDIUM");
+        // Em inglês, no idioma do projeto; o id que não existe na resposta conta como sem apontamento.
+        let r = ReviewResult { warnings: vec![warning(1, WarningStatus::Refuted, "", "F-09")], ..approved(vec![]) };
+        let (out, _) = apply_warnings(Lang::En, r, &["the column is empty".to_string()]);
+        assert_eq!(out.findings[0].description, "The Developer left warning 1 and the Reviewer refuted it: the column is empty. Evidence: (none)");
+        assert_eq!(out.findings[0].location, "Developer warning");
+    }
+
+    /// Spec 136 T01: o refutado com o id de um apontamento desta resposta reprova por ele, como HIGH
+    /// e com confiança alta, sem apontamento repetido.
+    #[test]
+    fn refuted_warning_with_its_finding_raises_that_finding() {
+        let linked = Finding { severity: "MEDIUM".into(), confidence: Confidence::Low, ..finding("F-01") };
+        let r = ReviewResult { warnings: vec![warning(1, WarningStatus::Refuted, "x", " f-01 ")], ..approved(vec![linked]) };
+        let (out, _) = apply_warnings(Lang::PtBr, r, &[ERRORS_WARNING.to_string()]);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!((out.findings[0].severity.as_str(), out.findings[0].confidence), ("HIGH", Confidence::High));
+    }
+
+    /// Spec 136 T01: `confirmed` com evidência é conferido; `not_checkable` com motivo e o aviso sem
+    /// desfecho (ou com desfecho incompleto) viram pendência, que não bloqueia. Só o número conta.
+    #[test]
+    fn confirmed_and_not_checkable_warnings_do_not_block() {
+        let items: Vec<String> = ["a coluna fica vazia", "sem prova no celular", "o link Entrar fica para depois", "cache sem teto"]
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        let r = ReviewResult {
+            criteria: vec![met("lista", true)],
+            warnings: vec![
+                warning(1, WarningStatus::Confirmed, "src/col.rs:12", ""),
+                warning(2, WarningStatus::NotCheckable, "o ambiente não tem celular", ""),
+                warning(4, WarningStatus::Confirmed, " ", ""),
+                warning(7, WarningStatus::Refuted, "fora da lista", ""),
+            ],
+            ..approved(vec![])
+        };
+        let (out, outcome) = apply_warnings(Lang::PtBr, r, &items);
+        assert_eq!((out.verdict, out.findings.len()), (Verdict::Approved, 0));
+        assert_eq!(outcome.checked, vec!["Aviso do Desenvolvedor: a coluna fica vazia. Conferido pelo Revisor: src/col.rs:12".to_string()]);
+        assert_eq!(
+            outcome.pending,
+            vec![
+                "Aviso do Desenvolvedor que o Revisor não pôde conferir: sem prova no celular. Motivo: o ambiente não tem celular".to_string(),
+                "Aviso do Desenvolvedor: o link Entrar fica para depois".to_string(),
+                "Aviso do Desenvolvedor: cache sem teto".to_string(),
+            ]
+        );
+        let only = ReviewResult { warnings: vec![warning(1, WarningStatus::NotCheckable, "no phone", "")], ..approved(vec![]) };
+        let (_, en) = apply_warnings(Lang::En, only, &items[..1]);
+        assert_eq!(en.pending, vec!["Developer warning the Reviewer could not check: a coluna fica vazia. Reason: no phone".to_string()]);
+        // Sem avisos, nada muda.
+        let (out, outcome) = apply_warnings(Lang::PtBr, approved(vec![]), &[]);
+        assert_eq!((out.verdict, outcome), (Verdict::Approved, WarningOutcome::default()));
+        assert_eq!(warning_items("- a\n\n-  \n- b\nsolto"), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Spec 136 T01: na revisão da convergência, com a matriz toda atendida, o MEDIUM novo ligado a um
+    /// aviso refutado não é rebaixado pelo `demote_late_new`; o MEDIUM novo sem aviso continua sendo.
+    #[test]
+    fn refuted_warning_finding_survives_the_convergence() {
+        let new_medium = |id: &str| Finding { severity: "MEDIUM".into(), state: Some(FindingState::New), ..finding(id) };
+        let r = ReviewResult {
+            criteria: vec![met("lista", true)],
+            warnings: vec![warning(1, WarningStatus::Refuted, "ApiExceptionHandler.java:41", "F-04")],
+            ..rejected(vec![new_medium("F-04"), new_medium("F-05")])
+        };
+        let (r, _) = apply_warnings(Lang::PtBr, r, &[ERRORS_WARNING.to_string()]);
+        let (out, demoted) = demote_late_new(Lang::PtBr, enforce_criteria(Lang::PtBr, r), &[], CONVERGENCE_FROM_REVIEW);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert_eq!(out.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["F-04"]);
+        assert_eq!(demoted.len(), 1, "{demoted:?}");
+        // Refutado sem apontamento numa resposta só de MEDIUM novos: o HIGH gerado também fica.
+        let r = ReviewResult {
+            criteria: vec![met("lista", true)],
+            warnings: vec![warning(1, WarningStatus::Refuted, "x", "")],
+            ..rejected(vec![new_medium("F-01")])
+        };
+        let (r, _) = apply_warnings(Lang::PtBr, r, &[ERRORS_WARNING.to_string()]);
+        let (out, _) = demote_late_new(Lang::PtBr, r, &[], CONVERGENCE_FROM_REVIEW + 2);
+        assert_eq!(out.verdict, Verdict::ChangesRequested);
+        assert!(out.findings.iter().any(|f| f.severity == "HIGH" && f.description.contains("o Revisor o refutou")), "{:?}", out.findings);
+    }
+
+    /// Spec 136 T01: os conferidos ficam na seção própria da tarefa, sem repetir linha.
+    #[test]
+    fn checked_warnings_are_appended_once() {
+        let body = append_checked("## Objetivo\nx\n", &["a\nquebrada".into(), String::new()]);
+        let body = append_checked(&body, &["a quebrada".into(), "b".into()]);
+        assert_eq!(section_text(&body, CHECKED_WARNINGS).unwrap_or_default().trim(), "- a quebrada\n- b");
+        assert_eq!(append_checked(&body, &[]), body);
+    }
+
+    /// Spec 136 T01, de ponta a ponta: o aviso vai ao Revisor; refutado, a tarefa volta ao
+    /// Desenvolvedor com o finding; na aprovação seguinte, o conferido fica na seção dos conferidos e
+    /// o que não dá para conferir vira pendência.
+    #[tokio::test]
+    async fn dev_warnings_are_checked_by_the_reviewer() {
+        let fx = Fixture::new("avisos", "true");
+        with_globals(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let dev = FakeDev {
+            summary: Some(Arc::new(|n, _brief: &DevBrief| {
+                // A sessão do Desenvolvedor conta de 1.
+                if n == 1 {
+                    format!("dev {n}\n\n## Pendências\n- {ERRORS_WARNING}\n")
+                } else {
+                    format!("dev {n}\n\n## Pendências\n- o handler devolve `errors` como lista\n- sem prova no celular\n")
+                }
+            })),
+            ..FakeDev::default()
+        };
+        let rec = Recorder::default();
+        let rev = FakeReviewer::new(|n, i| {
+            if i.task_id == "FINAL" {
+                return matrix(true);
+            }
+            if n == 0 {
+                assert_eq!(warning_items(&i.dev_warnings), vec![ERRORS_WARNING.to_string()]);
+                return ReviewResult {
+                    criteria: vec![met("arquivo criado", true)],
+                    warnings: vec![warning(1, WarningStatus::Refuted, "ApiExceptionHandler.java:41 devolve um mapa", "")],
+                    ..approved(vec![])
+                };
+            }
+            assert_eq!(warning_items(&i.dev_warnings).len(), 2, "{}", i.dev_warnings);
+            ReviewResult {
+                criteria: vec![met("arquivo criado", true)],
+                warnings: vec![
+                    warning(1, WarningStatus::Confirmed, "ApiExceptionHandler.java:41", ""),
+                    warning(2, WarningStatus::NotCheckable, "sem celular no ambiente", ""),
+                ],
+                ..approved(vec![])
+            }
+        });
+        let out = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).run_spec(SPEC).await.unwrap();
+        assert_eq!(out, SpecOutcome::Completed);
+        let texts = reviewer_texts(&rec);
+        assert!(texts[0].contains(&format!("o Revisor o refutou: {ERRORS_WARNING}")), "{}", texts[0]);
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.status, t.frontmatter.attempts), (TaskStatus::Done, 1));
+        assert_eq!(
+            section_text(&t.body, CHECKED_WARNINGS).unwrap_or_default().trim(),
+            "- Aviso do Desenvolvedor: o handler devolve `errors` como lista. Conferido pelo Revisor: ApiExceptionHandler.java:41"
+        );
+        assert_eq!(
+            section_text(&t.body, PENDING).unwrap_or_default().trim(),
+            "- P-01: Aviso do Desenvolvedor que o Revisor não pôde conferir: sem prova no celular. Motivo: sem celular no ambiente"
+        );
     }
 
     /// Spec 133 T07: os avisos explícitos do Desenvolvedor saem da seção dele, em qualquer idioma.

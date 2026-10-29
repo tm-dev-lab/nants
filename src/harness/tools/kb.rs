@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::{arg, opt_arg, opt_positive, ToolError, MAX_TOOL_RESULT_BYTES};
 use crate::kb::index::{self, Hit, SectionInfo, SectionText};
-use crate::kb::{self, Entry, KbError, Kind, Manifest, Origin, Role, Status};
+use crate::kb::{self, Entry, KbError, Kind, Manifest, Origin, Status};
 use crate::server::events::SecretSet;
 use crate::server::projects::scrub_text;
 
@@ -39,7 +39,6 @@ const MAX_ECHO_CHARS: usize = 80;
 /// Linha de `kb_search` sem resultado.
 const NO_RESULTS: &str =
     "Nenhum resultado. Varie os termos: sinônimos, palavras mais gerais, o nome do padrão ou sem aspas.";
-const NO_STANDARD_RESULTS: &str = "Nenhum resultado nos documentos marcados como padrão. Varie os termos ou busque sem only_standards.";
 
 /// `true` se a base do projeto em `root` tem pelo menos um documento pronto. Base inexistente,
 /// vazia, só com pendentes ou com manifesto ilegível → `false`.
@@ -74,24 +73,17 @@ impl KbAccess {
         &self.secrets
     }
 
-    /// `kb_search {query, max_results?, only_standards?}`.
+    /// `kb_search {query, max_results?}`. O `only_standards` da 134, se vier (de um histórico
+    /// antigo), é ignorado com qualquer valor: não há mais marcação de padrão (spec 136 T02, C-06).
     pub fn search(&self, args: &Value) -> Result<String, ToolError> {
         let query = arg(args, "query")?.trim();
         if query.is_empty() {
             return Err(ToolError::InvalidArgs("`query` vazio".into()));
         }
         let max = opt_positive(args, "max_results")?.map_or(DEFAULT_RESULTS, |n| n.min(MAX_RESULTS));
-        let only_standards = match args.get("only_standards") {
-            None | Some(Value::Null) => false,
-            Some(Value::Bool(b)) => *b,
-            Some(_) => return Err(ToolError::InvalidArgs("`only_standards` deve ser booleano".into())),
-        };
-        // O filtro de papel roda dentro do índice, antes do teto: nenhum padrão some atrás das
-        // referências.
-        let role = only_standards.then_some(Role::Standard);
-        let hits = index::search_role(&self.root, query, max, role, &self.secrets).map_err(kb_failure)?;
+        let hits = index::search(&self.root, query, max, &self.secrets).map_err(kb_failure)?;
         let manifest = kb::load_manifest(&self.root).unwrap_or_default();
-        Ok(render_search(&hits, &manifest, &self.secrets, only_standards))
+        Ok(render_search(&hits, &manifest, &self.secrets))
     }
 
     /// `kb_read {id, section}`: a seção inteira (com as subseções) ou, com `section: "list"`, o
@@ -156,14 +148,6 @@ fn field(secrets: &SecretSet, text: &str) -> String {
     scrub_text(secrets, text).replace(['\n', '\r'], " ").replace('|', "/")
 }
 
-/// Título do documento com a marcação de padrão.
-fn doc_title(title: &str, role: Role) -> String {
-    match role {
-        Role::Standard => format!("{title} [padrão]"),
-        Role::Reference => title.to_string(),
-    }
-}
-
 /// Origem do documento: o arquivo (com a página, nos PDFs) ou o link com a data em que foi lido.
 fn origin(entry: Option<&Entry>, page: Option<u32>, secrets: &SecretSet) -> String {
     let page = page.map(|p| format!(", p. {p}")).unwrap_or_default();
@@ -172,6 +156,7 @@ fn origin(entry: Option<&Entry>, page: Option<u32>, secrets: &SecretSet) -> Stri
     };
     match entry.source {
         Origin::File => format!("arquivo {}{page}", field(secrets, entry.file_name.as_deref().unwrap_or(&entry.title))),
+        Origin::Written => format!("escrito na base: {}{page}", field(secrets, &entry.title)),
         Origin::Url => {
             let url = field(secrets, entry.source_url.as_deref().unwrap_or(""));
             match entry.fetched_at.as_deref().and_then(|d| d.get(..10)) {
@@ -186,17 +171,17 @@ fn find<'a>(manifest: &'a Manifest, id: &str) -> Option<&'a Entry> {
     manifest.docs.iter().find(|d| d.id == id)
 }
 
-fn render_search(hits: &[Hit], manifest: &Manifest, secrets: &SecretSet, only_standards: bool) -> String {
+fn render_search(hits: &[Hit], manifest: &Manifest, secrets: &SecretSet) -> String {
     let mut out = format!("{KB_LABEL}\n\n");
     if hits.is_empty() {
-        out.push_str(if only_standards { NO_STANDARD_RESULTS } else { NO_RESULTS });
+        out.push_str(NO_RESULTS);
         return out;
     }
     for hit in hits {
         out.push_str(&format!(
             "{} | {} | {} | {} | {}\n",
             hit.citation(),
-            field(secrets, &doc_title(&hit.doc_title, hit.role)),
+            field(secrets, &hit.doc_title),
             field(secrets, &hit.trail),
             origin(find(manifest, &hit.doc_id), hit.page, secrets),
             field(secrets, &hit.snippet),
@@ -211,7 +196,7 @@ fn header(entry: &Entry, citation: &str, trail: Option<&str>, page: Option<u32>,
     let trail = trail.map(|t| format!(" | {}", field(secrets, t))).unwrap_or_default();
     format!(
         "{KB_LABEL}\n\n{citation} | {}{trail} | {}\n",
-        field(secrets, &doc_title(&entry.title, entry.role)),
+        field(secrets, &entry.title),
         origin(Some(entry), page, secrets)
     )
 }

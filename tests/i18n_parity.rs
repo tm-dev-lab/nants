@@ -533,7 +533,8 @@ fn helpers_read_the_web_and_match_server_literals() {
 fn server_headings() -> Vec<(String, &'static str)> {
     use nants::agents::{finding_reply, finding_track, runner};
     use nants::sdd::{role_guidance, spec_sections};
-    let fixed: [(&str, &'static str); 19] = [
+    let fixed: [(&str, &'static str); 20] = [
+        (runner::CHECKED_WARNINGS, "sddHeading.checkedWarnings"),
         (runner::OBJECTIVE, "sddHeading.objective"),
         (runner::ACCEPTANCE, "sddHeading.criteria"),
         (runner::FINDINGS, "sddHeading.findings"),

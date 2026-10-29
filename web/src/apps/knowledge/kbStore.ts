@@ -18,6 +18,15 @@ const inflight = new Set<string>();
 /** Pedido de releitura que chegou com um GET em voo: ao terminar, sai mais um GET. */
 const pending = new Set<string>();
 const listeners = new Set<() => void>();
+/**
+ * Geração da base por projeto (spec 136 T04): sobe a cada `kb_updated` e a cada remoção. O quadro
+ * "Fontes da base" relê as fontes e a prévia da citação descarta o trecho guardado quando ela muda.
+ */
+const generations = new Map<string, number>();
+
+function bump(projectId: string): void {
+  generations.set(projectId, (generations.get(projectId) ?? 0) + 1);
+}
 
 function notify(): void {
   for (const listener of [...listeners]) listener();
@@ -66,6 +75,8 @@ export function upsertKbDoc(projectId: string, doc: KbDoc): void {
 }
 
 export function removeKbDoc(projectId: string, id: string): void {
+  bump(projectId);
+  notify();
   const state = states.get(projectId);
   if (state?.status !== "ok") return;
   set(projectId, { status: "ok", list: { ...state.list, docs: state.list.docs.filter((d) => d.id !== id) } });
@@ -82,7 +93,19 @@ export function setKbOverviewFlag(projectId: string, hasOverview: boolean): void
  * lista é relida; só os projetos já carregados.
  */
 export function applyKbEvent(projectId: string): void {
+  bump(projectId);
+  notify();
   if (states.has(projectId)) void reloadKb(projectId);
+}
+
+/** Geração atual da base do projeto (sem assinar). */
+export function kbGeneration(projectId: string): number {
+  return generations.get(projectId) ?? 0;
+}
+
+/** Geração da base do projeto, assinada: muda a cada `kb_updated`. */
+export function useKbGeneration(projectId: string): number {
+  return useSyncExternalStore(subscribe, () => kbGeneration(projectId));
 }
 
 function subscribe(listener: () => void): () => void {
@@ -113,6 +136,7 @@ export function kbStateOf(projectId: string): KbState | null {
 /** Testes: esquece tudo. */
 export function resetKbStore(): void {
   states.clear();
+  generations.clear();
   inflight.clear();
   pending.clear();
   notify();

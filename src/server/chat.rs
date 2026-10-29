@@ -534,6 +534,10 @@ async fn run_turn_body(
     // Estado do projeto deste turno (fonte da verdade para o Arquiteto). Só vai ao modelo.
     let active_run = state.runs().active(id).is_some();
     let snapshot = project_snapshot(root.clone(), Arc::clone(&secrets), active_run).await;
+    // Spec 136 T05: as menções do usuário à base vão num bloco junto do estado (mensagem `user` na
+    // cauda, nunca `system`), fora do histórico gravado; o prefixo do pedido não muda.
+    let mentions = turn_mentions(root.clone(), &incoming, Arc::clone(&secrets)).await;
+    let snapshot = if mentions.block.is_empty() { snapshot } else { format!("{snapshot}\n\n{}", mentions.block) };
     let approver = Arc::new(ProjectApprover::new(
         id,
         root.clone(),
@@ -602,6 +606,13 @@ async fn run_turn_body(
     })
     .await
     .unwrap_or_default();
+    // Spec 136 T05: menção a documento ou seção que não existe vira aviso na Conversa, logo depois
+    // da mensagem do usuário; o turno segue sem ela.
+    for invalid in mentions.invalid.iter().take(crate::kb::mention::MAX_INVALID_NOTICES) {
+        let mut params = Map::new();
+        params.insert("mention".into(), json!(invalid.text()));
+        system_notice(state, id, root.clone(), MENTION_INVALID_CODE, params).await;
+    }
     // Spec 092 T01: ao fim do turno, os avisos do plano (só nas specs que o turno alterou) voltam
     // ao Arquiteto uma vez, para o plano chegar limpo ao usuário.
     let signatures: std::collections::BTreeMap<String, String> =
@@ -647,6 +658,44 @@ async fn run_turn_body(
     };
     let kind = TurnKind { consensus: incoming.consensus_round.is_some(), user_mark: incoming.user_mark };
     Ok(finish_turn(state, id, &secrets, root, reply, turn_id, plans_before, kind).await)
+}
+
+/// Código do aviso de menção à base que não existe (spec 136 T05), com `params.mention`.
+pub const MENTION_INVALID_CODE: &str = "kb.mention_invalid";
+
+/// Menções do turno (spec 136 T05): as da mensagem do usuário (nenhuma num turno interno) com o
+/// conteúdo, e as anteriores da sessão do plano corrente como lembrete. A sessão vem da mesma fonte
+/// da conferência do plano: o histórico inteiro da janela de [`read_session_turns`] (não só os
+/// turnos que vão ao modelo) e [`crate::kb::mention::effective_start`] sobre as specs em plano: o
+/// início nunca fica antes do fim do plano anterior, nem com o registro antigo de uma spec
+/// abandonada. Ver [`crate::kb::mention`].
+async fn turn_mentions(root: PathBuf, incoming: &Incoming, secrets: Arc<SecretSet>) -> crate::kb::mention::TurnMentions {
+    let current = if incoming.internal { Vec::new() } else { crate::kb::cite::find(&incoming.message) };
+    tokio::task::spawn_blocking(move || {
+        let turns = read_session_turns(&root);
+        let since = crate::kb::mention::effective_start(&root, &super::plan_changes::plan_spec_ids(&root), &turns);
+        let earlier = crate::kb::mention::user_mentions(&turns, since);
+        crate::kb::mention::turn_block(&root, &current, &earlier, &secrets)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Registra o início da sessão do plano das specs em plano que ainda não têm (spec 136 T05), pela
+/// regra de [`crate::kb::mention::session_start`]: o primeiro turno do usuário depois do fim do
+/// plano anterior.
+fn record_plan_sessions(root: &Path) {
+    let specs = super::plan_changes::plan_spec_ids(root);
+    if specs.is_empty() {
+        return;
+    }
+    let since = crate::kb::mention::session_start(root, &read_turns(root));
+    crate::kb::mention::ensure_sessions(root, &specs, since);
+}
+
+/// Todos os turnos da janela final do histórico (1 MiB), para a sessão do plano das menções.
+pub(super) fn read_session_turns(root: &Path) -> Vec<ChatTurn> {
+    read_turns(root)
 }
 
 /// Tipo do turno, para o fim dele.
@@ -854,9 +903,14 @@ async fn finish_turn(
     ];
     // Falha de persistência não derruba o turno: o histórico é melhor esforço.
     let review_root = root.clone();
-    let _saved = tokio::task::spawn_blocking(move || append_turns(&root, &turns))
-        .await
-        .unwrap_or(false);
+    let _saved = tokio::task::spawn_blocking(move || {
+        let saved = append_turns(&root, &turns);
+        // Spec 136 T05: antes da revisão do plano, que confere as menções da sessão.
+        record_plan_sessions(&root);
+        saved
+    })
+    .await
+    .unwrap_or(false);
 
     if !hidden {
         state.events().publish(ApiEvent::new(
@@ -2877,6 +2931,207 @@ mod tests {
         assert!(!persisted.contains("ESTADO ATUAL"), "{persisted}");
         assert!(!persisted.contains("Projeto:"), "{persisted}");
         assert!(!persisted.contains("Data/hora"), "{persisted}");
+    }
+
+    // ---- Spec 136 T05: menções do usuário à base ----
+
+    /// Documento pronto na base do projeto; devolve o id.
+    fn kb_doc(root: &Path, name: &str, body: &str) -> String {
+        crate::kb::add_file(root, name, body.as_bytes(), &SecretSet::default(), "2026-10-29T00:00:00Z").expect("documento").id
+    }
+
+    /// O bloco das menções vai junto do estado (mensagem `user` na cauda), fora do histórico; com
+    /// e sem menção, o pedido é igual byte a byte até a posição do estado.
+    #[tokio::test]
+    async fn mention_block_rides_with_the_state_and_keeps_the_prefix_byte_for_byte() {
+        let root = tmp_root("chat-mention-cache");
+        let state = state_for(&root, config_for(&root, true));
+        let alfa = kb_doc(&root, "Alfa.md", "# Alfa\nTexto.\n\n## Uso\nComo usar o alfa.\n");
+        let (with, dynb) = backend(vec![text("Li o guia.")]);
+        let message = format!("Siga kb:{alfa} no plano.");
+        let (status, body) = turn(&state, PROJECT_ID, &message, dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let persisted = fs::read_to_string(root.join(CHAT_FILE_REL)).expect("histórico");
+        assert!(!persisted.contains(crate::kb::mention::MENTIONS_LABEL), "o bloco não é gravado: {persisted}");
+        assert!(!persisted.contains("sumário das seções"), "{persisted}");
+
+        // A mesma conversa do zero, sem a menção.
+        fs::remove_file(root.join(CHAT_FILE_REL)).expect("zera o histórico");
+        let (without, dynb) = backend(vec![text("Ok.")]);
+        let (status, body) = turn(&state, PROJECT_ID, "Siga o guia no plano.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (a, b) = (&with.requests()[0], &without.requests()[0]);
+        let (na, nb) = (a.messages.len(), b.messages.len());
+        assert_eq!(na, nb);
+        assert_eq!(a.messages[..na - 2], b.messages[..nb - 2], "prefixo igual até o estado");
+        assert_eq!((&a.tools, &a.model, a.effort), (&b.tools, &b.model, b.effort));
+        assert!(a.messages[..na - 2].iter().all(|m| !m.content.contains(crate::kb::mention::MENTIONS_LABEL)));
+        let state_msg = &a.messages[na - 2];
+        assert_eq!(state_msg.role, ChatRole::User, "nunca system");
+        assert!(state_msg.content.starts_with(crate::agents::architect::STATE_BLOCK_LABEL), "{}", state_msg.content);
+        let block = state_msg.content.split_once(&format!("\n\n{}", crate::kb::mention::MENTIONS_LABEL)).map(|(_, b)| b).expect("bloco depois do estado");
+        assert!(block.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\" | sumário das seções (dado):")), "{block}");
+        assert!(block.contains(crate::kb::mention::MENTIONS_RULE));
+        assert_eq!(a.messages[na - 1].content, message, "a mensagem do turno vai como foi escrita");
+        assert!(!b.messages[nb - 2].content.contains(crate::kb::mention::MENTIONS_LABEL), "sem menção, sem bloco");
+    }
+
+    /// Menção a documento ou seção que não existe: aviso codificado na Conversa, turno normal.
+    /// Base vazia: nem bloco nem aviso.
+    #[tokio::test]
+    async fn invalid_mention_is_a_coded_notice_and_the_turn_goes_on() {
+        let root = tmp_root("chat-mention-invalid");
+        let state = state_for(&root, config_for(&root, true));
+        // Base vazia: nada.
+        let (empty, dynb) = backend(vec![text("Ok.")]);
+        let (status, _) = turn(&state, PROJECT_ID, "Use kb:fantasma-0123abcd.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &empty.requests()[0].messages;
+        assert!(!msgs[msgs.len() - 2].content.contains(crate::kb::mention::MENTIONS_LABEL));
+        assert!(chat_lines(&root).iter().all(|l| l["role"] != "system"), "base vazia, sem aviso");
+
+        let alfa = kb_doc(&root, "Alfa.md", "# Alfa\nTexto.\n\n## Uso\nComo usar.\n");
+        let mut rx = state.events().subscribe();
+        let (with, dynb) = backend(vec![text("Segui.")]);
+        let message = format!("Use kb:fantasma-0123abcd, kb:{alfa}#nao-existe e kb:{alfa}.");
+        let (status, body) = turn(&state, PROJECT_ID, &message, dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["reply"], "Segui.");
+        let notices: Vec<Value> = chat_lines(&root).into_iter().filter(|l| l["role"] == "system").collect();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert_eq!(notices[0]["notice"]["code"], MENTION_INVALID_CODE);
+        assert_eq!(notices[0]["notice"]["params"]["mention"], "kb:fantasma-0123abcd");
+        assert_eq!(notices[1]["notice"]["params"]["mention"], format!("kb:{alfa}#nao-existe"));
+        assert!(notices[0]["text"].as_str().unwrap_or_default().starts_with("Aviso: a menção kb:fantasma-0123abcd"), "{}", notices[0]);
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|e| e.payload["code"] == MENTION_INVALID_CODE), "publicado na Conversa");
+        // A menção válida segue no bloco; as inválidas ficam fora.
+        let msgs = &with.requests()[0].messages;
+        let state_msg = &msgs[msgs.len() - 2].content;
+        assert!(state_msg.contains(&format!("- kb:{alfa} |")), "{state_msg}");
+        assert!(!state_msg.contains("fantasma") && !state_msg.contains("nao-existe"), "{state_msg}");
+        // Os avisos não vão ao modelo no turno seguinte.
+        assert!(read_history(&root).iter().all(|t| t.role != TurnRole::System));
+    }
+
+    /// Origem: só o usuário conta. O turno interno e a resposta do Arquiteto não geram bloco nem
+    /// aviso. O caso de uso principal: o pedido inicial menciona, o Arquiteto pergunta antes do
+    /// rascunho, o usuário responde e o rascunho nasce; a sessão começa no pedido inicial (depois
+    /// do plano anterior, já aprovado), e a menção dele volta como lembrete nos turnos seguintes.
+    #[tokio::test]
+    async fn only_user_turns_feed_mentions_and_the_session_starts_at_the_initial_request() {
+        let root = tmp_root("chat-mention-origin");
+        let state = state_for(&root, config_for(&root, true));
+        let alfa = kb_doc(&root, "Alfa.md", "# Alfa\nTexto.\n");
+        let beta = kb_doc(&root, "Beta.md", "# Beta\nOutro.\n");
+        // Um plano anterior, já aprovado, mencionou beta.
+        let old = ChatTurn { role: TurnRole::User, text: format!("plano anterior kb:{beta}"), ts: 100, turn_id: None, internal: false, attachments: Vec::new(), notice: None };
+        assert!(append_turns(&root, &[old]));
+        assert!(crate::kb::mention::record_plan_closed(&root, 200));
+        // Turno interno com menção: nada.
+        let (internal, dynb) = backend(vec![text("Ok.")]);
+        let (status, _) = internal_turn(&state, &format!("interno kb:{beta} kb:fantasma-0123abcd"), dynb).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &internal.requests()[0].messages;
+        assert!(!msgs[msgs.len() - 2].content.contains(crate::kb::mention::MENTIONS_LABEL));
+        assert!(chat_lines(&root).iter().all(|l| l["role"] != "system"), "interno não gera aviso");
+
+        // O pedido inicial menciona alfa; o Arquiteto pergunta antes do rascunho.
+        let (first, dynb) = backend(vec![text("Antes do rascunho: qual banco?")]);
+        let (status, body) = turn(&state, PROJECT_ID, &format!("Crie a aplicação com os padrões do Spring de kb:{alfa}."), dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let msgs = &first.requests()[0].messages;
+        assert!(msgs[msgs.len() - 2].content.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\" | sumário")));
+        assert!(!root.join(".sdd/specs/001-exemplo").exists(), "ainda sem rascunho");
+        let request_ts = chat_lines(&root)
+            .iter()
+            .rev()
+            .find(|l| l["role"] == "user" && l.get("internal").is_none())
+            .and_then(|l| l["ts"].as_u64())
+            .expect("ts do pedido");
+        // A resposta cria o rascunho; o Arquiteto cita outro documento na resposta.
+        let (_, dynb) = backend(vec![write_spec_call(), text(&format!("Rascunho pronto; vi kb:{beta}."))]);
+        let (status, body) = turn(&state, PROJECT_ID, "Postgres.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(crate::kb::mention::session_since(&root, "001-exemplo"), Some(request_ts), "a sessão começa no pedido inicial");
+
+        // Turno seguinte sem menção: a do usuário volta como lembrete; a do Arquiteto e a do interno não.
+        let (next, dynb) = backend(vec![text("Ok.")]);
+        let (status, _) = turn(&state, PROJECT_ID, "Pode seguir.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &next.requests()[0].messages;
+        let state_msg = &msgs[msgs.len() - 2].content;
+        assert!(state_msg.contains("Mencionados antes nesta sessão do plano"), "{state_msg}");
+        assert!(state_msg.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\"")), "{state_msg}");
+        assert!(!state_msg.contains(&format!("kb:{beta}")), "{state_msg}");
+    }
+
+    /// Ajuste da revisão: numa sessão longa, o pedido inicial sai da janela de turnos que vai ao
+    /// modelo, mas a menção dele continua no lembrete (mesma fonte da conferência do plano).
+    #[tokio::test]
+    async fn long_session_keeps_the_initial_mention_beyond_the_model_window() {
+        let root = tmp_root("chat-mention-long");
+        let state = state_for(&root, config_for(&root, true));
+        let alfa = kb_doc(&root, "Alfa.md", "# Alfa\nTexto.\n");
+        let first = format!("Crie a aplicação com kb:{alfa}.");
+        let mut turns = vec![ChatTurn { role: TurnRole::User, text: first.clone(), ts: 1000, turn_id: None, internal: false, attachments: Vec::new(), notice: None }];
+        for i in 0..(MAX_HISTORY_TURNS + 10) as u64 {
+            let role = if i % 2 == 0 { TurnRole::Architect } else { TurnRole::User };
+            turns.push(ChatTurn { role, text: format!("conversa {i}"), ts: 1001 + i, turn_id: None, internal: i % 5 == 0 && role == TurnRole::User, attachments: Vec::new(), notice: None });
+        }
+        assert!(append_turns(&root, &turns));
+        let (next, dynb) = backend(vec![text("Ok.")]);
+        let (status, _) = turn(&state, PROJECT_ID, "Pode seguir.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &next.requests()[0].messages;
+        assert!(msgs.iter().all(|m| m.content != first), "o pedido inicial saiu da janela do modelo");
+        let state_msg = &msgs[msgs.len() - 2].content;
+        assert!(state_msg.contains("Mencionados antes nesta sessão do plano"), "{state_msg}");
+        assert!(state_msg.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\"")), "{state_msg}");
+    }
+
+    /// F-02 da revisão: uma spec abandonada em `DRAFT` com o registro da sessão de um plano já
+    /// aprovado não traz de volta as menções daquele plano, nem no bloco do pedido novo (antes do
+    /// rascunho) nem na conferência.
+    #[tokio::test]
+    async fn stale_draft_record_never_reopens_mentions_of_an_approved_plan() {
+        let root = tmp_root("chat-mention-stale");
+        let state = state_for(&root, config_for(&root, true));
+        let alfa = kb_doc(&root, "Alfa.md", "# Alfa\nTexto.\n");
+        let beta = kb_doc(&root, "Beta.md", "# Beta\nOutro.\n");
+        let user = |text: String, ts| ChatTurn { role: TurnRole::User, text, ts, turn_id: None, internal: false, attachments: Vec::new(), notice: None };
+        // Plano A: o usuário mencionou beta; uma spec ficou abandonada em DRAFT, com registro antigo.
+        assert!(append_turns(&root, &[user(format!("plano A com kb:{beta}"), 100), user("mais do plano A".into(), 150)]));
+        let dir = root.join(".sdd/specs/001-exemplo");
+        fs::create_dir_all(&dir).expect("spec");
+        fs::write(dir.join("spec.md"), EXAMPLE_SPEC_MD.replace("AWAITING_APPROVAL", "DRAFT")).expect("spec");
+        assert_eq!(crate::kb::mention::ensure_sessions(&root, &["001-exemplo".to_string()], 100), vec!["001-exemplo".to_string()]);
+        // A aprovação de A fecha o plano.
+        assert!(crate::kb::mention::record_plan_closed(&root, 200));
+
+        // Pedido novo, sem rascunho: a menção nova vai com o conteúdo, a de A não volta.
+        let (first, dynb) = backend(vec![text("Qual banco?")]);
+        let (status, _) = turn(&state, PROJECT_ID, &format!("Novo pedido com kb:{alfa}."), dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &first.requests()[0].messages;
+        let state_msg = &msgs[msgs.len() - 2].content;
+        assert!(state_msg.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\" | sumário")), "{state_msg}");
+        assert!(!state_msg.contains(&format!("kb:{beta}")), "{state_msg}");
+
+        // Turno seguinte: a do pedido novo volta como lembrete; a de A, não.
+        let (next, dynb) = backend(vec![text("Ok.")]);
+        let (status, _) = turn(&state, PROJECT_ID, "Postgres.", dynb, CHAT_TIMEOUT).await;
+        assert_eq!(status, StatusCode::OK);
+        let msgs = &next.requests()[0].messages;
+        let state_msg = &msgs[msgs.len() - 2].content;
+        assert!(state_msg.contains("Mencionados antes nesta sessão do plano"), "{state_msg}");
+        assert!(state_msg.contains(&format!("- kb:{alfa} | título (dado): \"Alfa\"")), "{state_msg}");
+        assert!(!state_msg.contains(&format!("kb:{beta}")), "{state_msg}");
+
+        // A conferência, mesmo da spec com o registro antigo, só vê o plano novo.
+        let unused = crate::kb::mention::unused_in_plan(&root, "001-exemplo", &read_session_turns(&root), "sem citação", &SecretSet::default());
+        assert_eq!(unused, vec![(alfa.clone(), "Alfa".to_string())]);
     }
 
     #[tokio::test]

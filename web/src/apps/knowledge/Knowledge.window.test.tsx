@@ -1,8 +1,8 @@
 /*
  * Janela Conhecimento montada pelo shell (spec 134 T06): lista e subtítulo vivo, estados,
- * indicadores, estado vazio, envio de arquivos, link, edição da marcação, da descrição e do
- * `applies_to`, remoção com confirmação, Visão geral, o SSE `kb_updated`, a citação `kb:` do
- * Plano e os erros por código.
+ * indicadores, estado vazio, envio de arquivos, link, edição da descrição, remoção com confirmação,
+ * Visão geral (com a ajuda de que é ali que se declaram os padrões da empresa), o SSE `kb_updated`,
+ * a citação `kb:` do Plano e os erros por código. Sem classificação manual (spec 136 T02).
  */
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,9 +32,7 @@ function doc(partial: Partial<KbDoc> & Pick<KbDoc, "id" | "title" | "kind">): Kb
     status: "ready",
     status_reason: null,
     pages: null,
-    role: "reference",
     description: "",
-    applies_to: [],
     links_out: [],
     indicators: [],
     ...partial,
@@ -43,7 +41,7 @@ function doc(partial: Partial<KbDoc> & Pick<KbDoc, "id" | "title" | "kind">): Kb
 
 function docs(): KbDoc[] {
   return [
-    doc({ id: API, title: "Padrões de API", kind: "markdown", file_name: "padroes-api.md", size: 2048, role: "standard", description: "Rotas e erros", applies_to: ["src/api/**"] }),
+    doc({ id: API, title: "Padrões de API", kind: "markdown", file_name: "padroes-api.md", size: 2048, description: "Rotas e erros" }),
     doc({
       id: LINK,
       title: "Arquitetura hexagonal",
@@ -139,13 +137,14 @@ afterEach(() => {
 });
 
 describe("Conhecimento: lista, estados e subtítulo", () => {
-  it("lista com tipo, marcação, estado, motivo e indicadores traduzidos; subtítulo vivo com plural", async () => {
+  it("lista com tipo, estado, motivo e indicadores traduzidos, sem marcação; subtítulo vivo com plural", async () => {
     await mount();
     expect(subtitle()).toBe("5 documentos · 1 indexando · 1 com problema");
-    expect(row(API).textContent).toContain("Padrão");
+    expect(row(API).querySelector(".nd-kb-title")?.textContent).toBe("Padrões de API");
+    expect(knowledge().querySelector("[data-kb-role]")).toBeNull();
     expect(row(API).textContent).toContain("padroes-api.md · 2 KB");
     expect(row(API).querySelector('[data-kb-status="ready"]')?.textContent).toBe("Pronto");
-    expect(row(LINK).textContent).toContain("Referência");
+    expect(row(LINK).textContent).not.toContain("Referência");
     expect(row(LINK).textContent).toContain('O link interno para "banco.md" não aponta para nenhum documento da base');
     expect(row(GATEWAY).querySelector('[data-kb-status="extracting"]')?.textContent).toBe("Indexando");
     expect(row(SCAN).textContent).toContain("Sem texto aproveitável");
@@ -240,7 +239,7 @@ describe("Conhecimento: envio e link", () => {
 });
 
 describe("Conhecimento: prévia e edição", () => {
-  it("abre a nota, edita a descrição e o applies_to, troca a marcação e remove com confirmação", async () => {
+  it("abre a nota, edita a descrição e remove com confirmação, sem marcação nem Vale para", async () => {
     const { server } = await mount();
     const bodies: unknown[] = [];
     const patch = server.calls.length;
@@ -261,21 +260,13 @@ describe("Conhecimento: prévia e edição", () => {
       fireEvent.click(within(preview()).getByRole("button", { name: "Salvar" }));
     });
     await settle();
-    fireEvent.click(within(preview()).getByRole("button", { name: "Editar Vale para" }));
-    fireEvent.change(within(preview()).getByLabelText("Vale para"), { target: { value: "src/api/**\n\n src/routes/** \n" } });
-    await act(async () => {
-      fireEvent.click(within(preview()).getByRole("button", { name: "Salvar" }));
-    });
-    await settle();
-    await act(async () => {
-      fireEvent.click(within(preview()).getByRole("button", { name: "Referência" }));
-    });
-    await settle();
     for (const c of server.calls.slice(patch)) if (c.method === "PATCH") bodies.push(c.body);
-    expect(bodies).toEqual([{ description: "Rotas, erros e paginação" }, { applies_to: ["src/api/**", "src/routes/**"] }, { role: "reference", applies_to: [] }]);
-    // Referência não tem applies_to.
+    expect(bodies).toEqual([{ description: "Rotas, erros e paginação" }]);
+    // Spec 136 T02: sem o seletor Padrão ou Referência, sem o "Vale para" e sem as dicas deles.
+    for (const gone of ["Padrão do projeto", "Referência", "Marcação", "Vale para", "Todo o projeto"]) expect(preview().textContent).not.toContain(gone);
+    expect(within(preview()).queryByRole("group", { name: "Marcação" })).toBeNull();
     expect(within(preview()).queryByRole("button", { name: "Editar Vale para" })).toBeNull();
-    expect(row(API).textContent).toContain("Referência");
+    expect(preview().querySelectorAll("[data-kb-field]").length).toBe(1);
 
     fireEvent.click(within(preview()).getByRole("button", { name: "Remover Padrões de API" }));
     expect(server.count("DELETE", /\/kb\/docs\//)).toBe(0);
@@ -316,6 +307,10 @@ describe("Conhecimento: prévia e edição", () => {
     await settle();
     const field = within(knowledge()).getByLabelText("Visão geral") as HTMLTextAreaElement;
     expect(field.value).toBe("Resumo do projeto.");
+    // A ajuda diz que é ali que se declaram os padrões da empresa, lidos como a intenção da pessoa.
+    const hint = knowledge().querySelector(`#${CSS.escape(field.getAttribute("aria-describedby") ?? "")}`);
+    expect(hint?.textContent).toContain("quais documentos são padrão da empresa");
+    expect(hint?.textContent).toContain("como a sua intenção");
     fireEvent.change(field, { target: { value: "API de pagamentos." } });
     await act(async () => {
       fireEvent.click(within(knowledge()).getByRole("button", { name: "Salvar" }));
@@ -351,5 +346,143 @@ describe("Plano: citação kb: abre o Conhecimento", () => {
     expect(cited?.textContent).toContain("Seção citada no plano");
     expect(cited?.textContent).toContain("Prefixo /v2.");
     expect(cited?.textContent).not.toContain("problem+json");
+  });
+});
+
+describe("Navegação (spec 136 T07)", () => {
+  async function openApi() {
+    const view = await mount();
+    await act(async () => {
+      fireEvent.click(within(row(API)).getByRole("button"));
+    });
+    await settle();
+    const preview = knowledge().querySelector<HTMLElement>(`[data-kb-preview="${API}"]`);
+    if (preview === null) throw new Error("prévia ausente");
+    return { ...view, preview };
+  }
+
+  /** O sumário, aberto se estiver recolhido (janela média ou estreita). */
+  function outline(): HTMLElement {
+    const nav = within(knowledge()).getByRole("navigation", { name: "Sumário" });
+    const toggle = nav.querySelector<HTMLButtonElement>(".nd-kb-outline-toggle");
+    if (toggle !== null && toggle.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
+    return nav;
+  }
+
+  it("/ fora de um campo leva à busca rápida; dentro de um campo, é só a letra", async () => {
+    await mount();
+    const search = within(knowledge()).getByRole("combobox", { name: "Buscar na base de conhecimento" });
+    const link = within(knowledge()).getByLabelText("Link de uma página");
+    link.focus();
+    fireEvent.keyDown(link, { key: "/" });
+    expect(document.activeElement).toBe(link);
+    const rowButton = within(row(API)).getByRole("button");
+    rowButton.focus();
+    fireEvent.keyDown(rowButton, { key: "/" });
+    expect(document.activeElement).toBe(search);
+  });
+
+  it("o sumário lista as seções sem o título do documento e o pulo destaca a seção", async () => {
+    const { preview } = await openApi();
+    const nav = outline();
+    const items = within(nav).getAllByRole("button").filter((b) => b.classList.contains("nd-kb-outline-item"));
+    expect(items.map((b) => b.textContent)).toEqual(["Versionamento", "Erros"]);
+    await act(async () => {
+      fireEvent.click(within(nav).getByRole("button", { name: "Erros" }));
+    });
+    const focus = preview.querySelector<HTMLElement>('[data-kb-focus="erros"]');
+    expect(focus?.textContent).toContain("problem+json.");
+    expect(focus?.textContent).not.toContain("Prefixo /v2.");
+    expect(focus?.getAttribute("data-flash")).toBe("true");
+    expect(focus?.textContent).not.toContain("Seção citada no plano");
+    expect(within(outline()).getByRole("button", { name: "Erros" }).getAttribute("aria-current")).toBe("location");
+  });
+
+  it("a seção em leitura acompanha a rolagem da nota", async () => {
+    const { preview } = await openApi();
+    const tops: Record<string, number> = { "padroes-de-api": -400, versionamento: 10, erros: 300 };
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const sec = (this as HTMLElement).dataset?.kbSec;
+      const top = sec === undefined ? 0 : (tops[sec] ?? 0);
+      return { top, bottom: top + 10, left: 0, right: 0, width: 0, height: 10, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+    });
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    await act(async () => {
+      fireEvent.scroll(preview);
+    });
+    expect(within(outline()).getByRole("button", { name: "Versionamento" }).getAttribute("aria-current")).toBe("location");
+    tops.erros = 20;
+    await act(async () => {
+      fireEvent.scroll(preview);
+    });
+    expect(within(outline()).getByRole("button", { name: "Erros" }).getAttribute("aria-current")).toBe("location");
+  });
+});
+
+describe("Conhecimento: documentos escritos no Nants (spec 136 T11)", () => {
+  function preview(id: string): HTMLElement {
+    const el = knowledge().querySelector<HTMLElement>(`[data-kb-preview="${id}"]`);
+    if (el === null) throw new Error("prévia ausente");
+    return el;
+  }
+
+  async function open(id: string): Promise<void> {
+    await act(async () => {
+      fireEvent.click(within(row(id)).getByRole("button"));
+    });
+    await settle();
+  }
+
+  it("Editar abre o editor com o original (não a nota), e Concluir volta à prévia", async () => {
+    const { server } = await mount();
+    server.reply("GET", /\/kb\/docs\/[^/]+\/content$/, () => ({ status: 200, body: { content: "---\nfonte: equipe\n---\n# Padrões de API\n", sha256: "sha-api" } }));
+    await open(API);
+    const edit = within(preview(API)).getByRole("button", { name: 'Editar "Padrões de API"' });
+    expect(edit.textContent).toBe("Editar");
+    // O "Editar" da descrição diz o que edita.
+    expect(within(preview(API)).getByRole("button", { name: "Editar Descrição" }).textContent).toBe("Editar descrição");
+    await act(async () => {
+      fireEvent.click(edit);
+    });
+    await settle();
+    const area = (await within(knowledge()).findByRole("textbox", { name: "Texto do documento, em markdown" }, { timeout: 10_000 })) as HTMLTextAreaElement;
+    await settle();
+    expect(area.value).toBe("---\nfonte: equipe\n---\n# Padrões de API\n");
+    expect(server.count("GET", /\/kb\/docs\/padroes-api-3f9a1c2e\/content$/)).toBe(1);
+    // Em edição, a janela foca na escrita: sem a lista, a busca e as abas.
+    expect(knowledge().querySelector("[data-kb-side]")).toBeNull();
+    expect(within(knowledge()).queryByRole("button", { name: "Documentos" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(within(knowledge()).getByRole("button", { name: "Concluir" }));
+    });
+    await settle();
+    expect(preview(API)).toBeTruthy();
+  });
+
+  it("Novo documento abre o editor vazio, com o campo do título", async () => {
+    await mount();
+    await act(async () => {
+      fireEvent.click(within(knowledge()).getByRole("button", { name: "Novo documento" }));
+    });
+    await settle();
+    const title = (await within(knowledge()).findByRole("textbox", { name: "Título do documento" }, { timeout: 10_000 })) as HTMLInputElement;
+    expect(title.value).toBe("");
+    expect(title.placeholder).toBe("Sem título");
+    expect(knowledge().querySelector("[data-state]")?.textContent).toBe("Falta o título");
+  });
+
+  it("texto acima de 2 MiB fica só leitura, com o motivo; PDF e link não têm Editar", async () => {
+    const big = { id: "registro-1a2b3c4d", title: "Registro legado", kind: "text" as const, file_name: "registro.txt", size: 3 * 1024 * 1024 };
+    await mount({ list: [...docs(), doc(big)] });
+    await open(big.id);
+    expect(within(preview(big.id)).queryByRole("button", { name: /^Editar "/ })).toBeNull();
+    expect(preview(big.id).querySelector("[data-kb-readonly]")?.textContent).toBe("Só leitura");
+    expect(preview(big.id).textContent).toContain("Arquivos acima de 2 MiB não são editados no Nants.");
+    await open(SCAN);
+    expect(within(preview(SCAN)).queryByRole("button", { name: /^Editar "/ })).toBeNull();
+    expect(preview(SCAN).querySelector("[data-kb-readonly]")).toBeNull();
   });
 });

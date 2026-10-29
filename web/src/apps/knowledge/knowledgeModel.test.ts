@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { KbDoc } from "../../api/kb";
 import { setLanguage } from "../../i18n";
-import { indicatorText, isDocId, kbSubtitle, splitAtSection, splitCitations } from "./knowledgeModel";
+import { indicatorText, isDocId, kbSubtitle, noteChunks, sectionSpan, splitCitations } from "./knowledgeModel";
 
 afterEach(() => setLanguage("pt-BR", { persist: false }));
 
@@ -19,9 +19,7 @@ function doc(id: string, status: KbDoc["status"] = "ready"): KbDoc {
     fetched_at: null,
     status,
     pages: null,
-    role: "reference",
     description: "",
-    applies_to: [],
     links_out: [],
   };
 }
@@ -84,22 +82,33 @@ describe("seção citada na prévia (F-03)", () => {
     { anchor: "fim", title: "Fim", level: 2, line: 14 },
   ];
 
-  it("#exemplo-2 destaca o segundo Exemplo, pela linha do servidor, e o título na cerca não confunde", () => {
-    const parts = splitAtSection(content, sections, "exemplo-2");
-    expect(parts?.[1]).toBe("## Exemplo\n\nSegundo.\n");
-    expect(parts?.[0]).toContain("Primeiro.");
-    expect(parts?.[0]).toContain("```md\n## Exemplo\n```");
-    expect(parts?.[2]).toBe("## Fim\n\nFim.");
+  const text = (chunks: ReturnType<typeof noteChunks>, span: [number, number] | null) => (span === null ? null : chunks.slice(span[0], span[1]).map((c) => c.text).join("\n"));
+
+  it("a nota vira um bloco por seção, pela linha do servidor; o título na cerca não corta", () => {
+    const chunks = noteChunks(content, sections);
+    expect(chunks.map((c) => c.anchor)).toEqual(["guia", "exemplo", "exemplo-2", "fim"]);
+    expect(chunks[1]?.text).toContain("```md\n## Exemplo\n```");
+    expect(chunks.map((c) => c.text).join("\n")).toBe(content);
   });
 
-  it("#exemplo vai até a próxima seção do mesmo nível, com a cerca dentro", () => {
-    const parts = splitAtSection(content, sections, "exemplo");
-    expect(parts?.[1]).toBe("## Exemplo\n\nPrimeiro.\n\n```md\n## Exemplo\n```\n");
+  it("o começo antes do primeiro título vira um bloco sem âncora; linha fora da nota é ignorada", () => {
+    const chunks = noteChunks("Intro.\n\n## A\nTexto.", [
+      { anchor: "a", title: "A", level: 2, line: 2 },
+      { anchor: "fora", title: "Fora", level: 2, line: 99 },
+      { anchor: "sem-linha", title: "Sem linha", level: 2 },
+    ]);
+    expect(chunks.map((c) => [c.anchor, c.text])).toEqual([
+      [null, "Intro.\n"],
+      ["a", "## A\nTexto."],
+    ]);
   });
 
-  it("sem a linha, âncora desconhecida ou a seção de nível 1 do topo: sem destaque", () => {
-    expect(splitAtSection(content, [{ anchor: "exemplo", title: "Exemplo", level: 2 }], "exemplo")).toBeNull();
-    expect(splitAtSection(content, sections, "nada")).toBeNull();
-    expect(splitAtSection(content, sections, null)).toBeNull();
+  it("#exemplo-2 destaca o segundo Exemplo; #guia leva as subseções; âncora desconhecida, nada", () => {
+    const chunks = noteChunks(content, sections);
+    expect(text(chunks, sectionSpan(chunks, "exemplo-2"))).toBe("## Exemplo\n\nSegundo.\n");
+    expect(text(chunks, sectionSpan(chunks, "exemplo"))).toBe("## Exemplo\n\nPrimeiro.\n\n```md\n## Exemplo\n```\n");
+    expect(sectionSpan(chunks, "guia")).toEqual([0, 4]);
+    expect(sectionSpan(chunks, "nada")).toBeNull();
+    expect(sectionSpan(chunks, null)).toBeNull();
   });
 });

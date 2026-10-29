@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use super::{
-    extract, fold_accent, note_body, read_note_file, sha256_hex, slugify, Entry, KbError, Kind, Manifest, Role, Status,
+    extract, fold_accent, note_body, read_note_file, sha256_hex, slugify, Entry, KbError, Kind, Manifest, Status,
     MANIFEST_REL, MAX_MANIFEST_BYTES,
 };
 use crate::server::events::SecretSet;
@@ -131,7 +131,6 @@ struct SectionData {
 struct DocData {
     id: String,
     title: String,
-    role: Role,
     kind: Kind,
     sections: Vec<SectionData>,
     /// SHA-256 dos termos do texto (sem formatação, caixa nem acento): o mesmo conteúdo vindo por
@@ -167,7 +166,6 @@ pub struct Index {
 pub struct Hit {
     pub doc_id: String,
     pub doc_title: String,
-    pub role: Role,
     /// Âncora da seção, estável no documento: a citação é `kb:<doc_id>#<section>`.
     pub section: String,
     pub title: String,
@@ -210,7 +208,6 @@ pub struct SectionInfo {
 pub struct SectionText {
     pub doc_id: String,
     pub doc_title: String,
-    pub role: Role,
     pub anchor: String,
     pub title: String,
     pub trail: String,
@@ -419,7 +416,7 @@ impl Index {
             }
             index.doc_meta.push((tags, description));
             let text_hash = sha256_hex(terms_of(&body).join(" ").as_bytes());
-            index.docs.push(DocData { id: entry.id, title: entry.title, role: entry.role, kind: entry.kind, sections, text_hash });
+            index.docs.push(DocData { id: entry.id, title: entry.title, kind: entry.kind, sections, text_hash });
         }
         index.avg_len = if index.chunks.is_empty() { 1.0 } else { (total_len / index.chunks.len() as f64).max(1.0) as f32 };
         for list in &mut index.postings {
@@ -467,13 +464,6 @@ impl Index {
     /// Busca: termos em OR ranqueado, frases entre aspas obrigatórias; até `max` seções (no
     /// máximo [`MAX_RESULTS`]), da mais relevante para a menos.
     pub fn search(&self, query: &str, max: usize, secrets: &SecretSet) -> Vec<Hit> {
-        self.search_role(query, max, None, secrets)
-    }
-
-    /// Como [`Self::search`], só nos documentos com a marcação `role` quando dada (spec 134 T04:
-    /// `only_standards`). O filtro vem antes do teto e da conferência das frases: um padrão abaixo
-    /// de muitas seções de referência não some.
-    pub fn search_role(&self, query: &str, max: usize, role: Option<Role>, secrets: &SecretSet) -> Vec<Hit> {
         let (terms, phrases) = parse_query(query);
         if terms.is_empty() || self.chunks.is_empty() {
             return Vec::new();
@@ -512,7 +502,6 @@ impl Index {
         let mut ranked: Vec<(u32, f32)> = touched
             .into_iter()
             .filter(|c| needed == 0 || present[*c as usize] >= needed)
-            .filter(|c| role.is_none_or(|r| self.docs[self.chunks[*c as usize].doc as usize].role == r))
             .map(|c| (c, scores[c as usize]))
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -531,7 +520,6 @@ impl Index {
             hits.push(Hit {
                 doc_id: doc.id.clone(),
                 doc_title: scrub_text(secrets, &doc.title),
-                role: doc.role,
                 section: public_anchor(&doc.sections, chunk.section as usize, secrets),
                 title: scrub_text(secrets, &section.title),
                 trail: scrub_text(secrets, &section.trail),
@@ -575,23 +563,37 @@ impl Index {
     /// acento; o primeiro que casar). `None` se o documento ou a seção não existem.
     pub fn section(&self, doc_id: &str, wanted: &str, secrets: &SecretSet) -> Option<SectionText> {
         let doc = self.doc(doc_id)?;
-        let wanted = wanted.trim().trim_start_matches('#').trim();
-        let key = folded(wanted);
-        let i = (0..doc.sections.len())
-            .find(|&i| public_anchor(&doc.sections, i, secrets) == wanted)
-            .or_else(|| (!key.is_empty()).then(|| doc.sections.iter().position(|s| folded(&s.title) == key)).flatten())?;
+        let i = Self::position(doc, wanted, secrets)?;
         let s = &doc.sections[i];
         let text: Vec<&str> = doc.sections[i..s.end.max(i + 1)].iter().map(|x| x.own.as_str()).collect();
         Some(SectionText {
             doc_id: doc.id.clone(),
             doc_title: scrub_text(secrets, &doc.title),
-            role: doc.role,
             anchor: public_anchor(&doc.sections, i, secrets),
             title: scrub_text(secrets, &s.title),
             trail: scrub_text(secrets, &s.trail),
             page: s.page,
             text: scrub_text(secrets, &text.join("\n\n")),
         })
+    }
+
+    /// Posição da seção `wanted` em `doc`, pela régua de [`Index::section`]: a âncora pública ou,
+    /// sem ela, o título sem caixa nem acento (o primeiro que casar).
+    fn position(doc: &DocData, wanted: &str, secrets: &SecretSet) -> Option<usize> {
+        let wanted = wanted.trim().trim_start_matches('#').trim();
+        let key = folded(wanted);
+        (0..doc.sections.len())
+            .find(|&i| public_anchor(&doc.sections, i, secrets) == wanted)
+            .or_else(|| (!key.is_empty()).then(|| doc.sections.iter().position(|s| folded(&s.title) == key)).flatten())
+    }
+
+    /// A seção `wanted` resolvida pela mesma régua de [`Index::section`], sem montar o texto: a
+    /// âncora pública e o título, redigidos. `None` se o documento ou a seção não existem (spec 136
+    /// T03, as fontes do plano).
+    pub fn resolve_section(&self, doc_id: &str, wanted: &str, secrets: &SecretSet) -> Option<(String, String)> {
+        let doc = self.doc(doc_id)?;
+        let i = Self::position(doc, wanted, secrets)?;
+        Some((public_anchor(&doc.sections, i, secrets), scrub_text(secrets, &doc.sections[i].title)))
     }
 
     /// Texto inteiro de um documento do índice (todas as seções, redigido). `None` se ele não
@@ -616,6 +618,49 @@ impl Index {
     pub fn kind(&self, doc_id: &str) -> Option<Kind> {
         self.doc(doc_id).map(|d| d.kind)
     }
+
+    /// `true` se o documento está no índice.
+    pub fn has_doc(&self, doc_id: &str) -> bool {
+        self.doc(doc_id).is_some()
+    }
+
+    /// Primeira linha do texto do documento que satisfaz `wanted`, como está (sem redação: quem
+    /// mostra redige). `None` se o documento não está no índice ou nenhuma linha serve. Lê o texto
+    /// uma vez, sem ir ao disco (spec 136 T03, o "Citado por").
+    pub fn find_line(&self, doc_id: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
+        let doc = self.doc(doc_id)?;
+        doc.sections.iter().flat_map(|s| s.own.lines()).find(|l| wanted(l)).map(str::to_string)
+    }
+}
+
+/// Destaques de `text` (spec 136 T03, C-10): os termos de `terms` (já tokenizados, como os de
+/// [`parse_query`]) achados pela mesma tokenização do índice, com a dobra de acentos ("acao"
+/// destaca "ação"), como pares `[início, fim)` em posições de CARACTERE (Unicode) de `text`. O
+/// `text` é o que vai à tela, já redigido: as posições valem para ele. A interface não
+/// reimplementa o tokenizador.
+pub fn highlights(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // Os termos vêm em ordem crescente de byte: a contagem de caracteres anda junto, uma passada.
+    let mut chars = text.char_indices().map(|(b, _)| b).peekable();
+    let mut seen_chars = 0usize;
+    let mut char_at = |byte: usize| -> usize {
+        while chars.peek().is_some_and(|b| *b < byte) {
+            chars.next();
+            seen_chars += 1;
+        }
+        seen_chars
+    };
+    for (range, term) in tokens(text) {
+        if terms.contains(&term) {
+            let start = char_at(range.start);
+            let end = char_at(range.end);
+            out.push((start, end));
+        }
+    }
+    out
 }
 
 /// Prefixo da âncora neutra: o ponto nunca sai do `slugify` (só `[a-z0-9-]`), então a âncora
@@ -790,11 +835,6 @@ pub(crate) fn builds(root: &Path) -> u64 {
 /// Busca na base do projeto (ver [`Index::search`]).
 pub fn search(root: &Path, query: &str, max: usize, secrets: &SecretSet) -> Result<Vec<Hit>, KbError> {
     Ok(index_for(root)?.search(query, max, secrets))
-}
-
-/// Busca na base do projeto só nos documentos com a marcação `role` (ver [`Index::search_role`]).
-pub fn search_role(root: &Path, query: &str, max: usize, role: Option<Role>, secrets: &SecretSet) -> Result<Vec<Hit>, KbError> {
-    Ok(index_for(root)?.search_role(query, max, role, secrets))
 }
 
 /// Seção inteira de um documento (ver [`Index::section`]). Documento fora do índice ou seção

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::*;
-use crate::kb::{self, Kind, Origin, Role};
+use crate::kb::{self, Kind, Origin};
 use crate::server::events::SecretSet;
 
 const NOW: &str = "2026-10-29T12:00:00Z";
@@ -25,9 +25,7 @@ fn entry(id: &str, kind: Kind, source: Origin) -> Entry {
         status_reason: None,
         pages: None,
         extractor: None,
-        role: Role::Reference,
         description: String::new(),
-        applies_to: Vec::new(),
         links_out: Vec::new(),
         link_targets: Vec::new(),
     }

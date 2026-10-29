@@ -66,10 +66,13 @@ describe("ReportMarkdown: segurança (texto do agente não é confiável)", () =
     expect(container.textContent).toBe("i");
   });
 
-  it("links http(s) não são clicáveis (nenhum <a> no relatório)", () => {
-    const { container } = renderMarkdown("Abra [o app](http://localhost:3000) agora.");
-    expect(container.querySelector("a")).toBeNull();
-    expect(container.textContent).toContain("o app (http://localhost:3000)");
+  it("link http(s) abre em outra aba, sem opener (spec 136 T11); outro esquema fica só o rótulo", () => {
+    const { container } = renderMarkdown("Abra [o app](http://localhost:3000) agora, não [isto](javascript:alert(1)).");
+    const links = [...container.querySelectorAll("a")];
+    expect(links.map((a) => [a.textContent, a.getAttribute("href"), a.getAttribute("target"), a.getAttribute("rel")])).toEqual([
+      ["o app", "http://localhost:3000", "_blank", "noopener noreferrer"],
+    ]);
+    expect(container.textContent).toBe("Abra o app agora, não isto.");
   });
 
   it("HTML dentro de bloco de código fica literal", () => {

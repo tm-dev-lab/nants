@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::kb::{add_file, update, Patch, Role};
+use crate::kb::add_file;
 
 const NOW: &str = "2026-10-28T12:00:00Z";
 
@@ -75,17 +75,15 @@ fn only_real_ids_are_citations() {
 }
 
 #[test]
-fn freeze_records_hashes_catalog_and_standards_and_detects_changes() {
+fn freeze_records_hashes_and_catalog_and_detects_changes() {
     let root = root("freeze");
     let id = md(&root, "regras.md", RULES);
-    update(&root, &id, &Patch { role: Some(Role::Standard), description: None, applies_to: Some(vec!["src/**".into()]) }).expect("padrão");
     let spec = format!("## Premissas\n- Filas (kb:{id}#filas)\n");
     let task = format!("## Critérios\n1. Logs (kb:{id}#logs)\n");
     let frozen = freeze(&root, "134-x", &[&spec, &task], &none(), NOW).expect("freeze").expect("gravado");
     assert_eq!(frozen.sources.len(), 2);
     assert!(frozen.sources.iter().all(|s| s.sha256.len() == 64), "{frozen:?}");
     assert!(frozen.catalog.contains(&format!("kb:{id}")), "{}", frozen.catalog);
-    assert_eq!(frozen.standards.len(), 1);
     assert!(root.join(frozen_rel("134-x")).is_file());
     assert!(frozen_rel("134-x").starts_with(".sdd/kb/"), "fora do Git, dentro da base");
     assert_eq!(load_frozen(&root, "134-x"), Some(frozen.clone()));
@@ -100,6 +98,28 @@ fn freeze_records_hashes_catalog_and_standards_and_detects_changes() {
     // O índice vale pelo manifesto: força a remontagem.
     crate::kb::index::forget(&root);
     assert_eq!(changed(&root, &frozen, &none()), [format!("kb:{id}#logs")]);
+}
+
+/// Spec 136 T02 (C-06): o arquivo congelado da 134, com `standards` e o catálogo com o selo
+/// `[padrão]`, continua legível; o catálogo vem como está (a recuperação o usa assim).
+#[test]
+fn frozen_from_134_with_standards_stays_readable() {
+    let root = root("frozen-134");
+    let id = md(&root, "regras.md", RULES);
+    let old = serde_json::json!({
+        "version": 1,
+        "spec": "134-x",
+        "frozen_at": NOW,
+        "sources": [{"citation": format!("kb:{id}#filas"), "sha256": ""}],
+        "catalog": format!("Documentos prontos (1; os padrões primeiro).\n- kb:{id} | Regras [padrão] | markdown"),
+        "standards": [{"id": id, "title": "Regras", "description": "", "applies_to": ["src/**"]}],
+    });
+    fs::create_dir_all(root.join(FROZEN_REL)).expect("mkdir");
+    fs::write(root.join(frozen_rel("134-x")), serde_json::to_string_pretty(&old).expect("json")).expect("gravar");
+    let frozen = load_frozen(&root, "134-x").expect("legível");
+    assert_eq!(frozen.sources.len(), 1);
+    assert!(frozen.catalog.contains("[padrão]"), "o catálogo congelado fica como está");
+    assert!(frozen.overview.is_empty(), "a Visão geral da 134 está dentro do catálogo");
 }
 
 #[test]
@@ -122,4 +142,26 @@ fn check_counted_counts_listed_and_remaining() {
     let one = check_counted(&root, "kb:falta-ab12cd34#x", &none()).expect_err("recusa");
     assert_eq!(one.count, 1, "{}", one.message);
     assert_eq!(check_counted(&root, "texto sem citação", &none()), Ok(()));
+}
+
+/// Paridade com a leitura da web (spec 136 T04, C-14): os mesmos casos de `cite_cases.json` passam
+/// pelo `splitCitations` de `web/src/apps/knowledge/knowledgeModel.ts`.
+#[test]
+fn find_follows_the_shared_cases() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!("cite_cases.json")).expect("json dos casos");
+    let list = cases["cases"].as_array().expect("lista de casos");
+    assert!(list.len() >= 10);
+    for case in list {
+        let text = case["text"].as_str().expect("texto");
+        let expected: Vec<Citation> = case["cites"]
+            .as_array()
+            .expect("citações")
+            .iter()
+            .map(|c| Citation {
+                doc: c["doc"].as_str().expect("doc").to_string(),
+                section: c["section"].as_str().map(str::to_string),
+            })
+            .collect();
+        assert_eq!(find(text), expected, "{text}");
+    }
 }

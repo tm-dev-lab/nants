@@ -457,15 +457,20 @@ impl LlmArchitect {
     /// Mensagem da base de conhecimento (spec 134 T05): as regras de processo e o catálogo. Com
     /// `frozen_spec`, o catálogo congelado na aprovação dessa spec, quando existe; senão, o atual.
     /// `None` sem documento pronto.
+    ///
+    /// Exceção registrada da spec 136 T02: a recuperação de uma spec aprovada antes da 136 usa o
+    /// catálogo congelado como está, com a ordem por marcação e o selo `[padrão]` da 134. Trocar o
+    /// texto no meio da execução mudaria o prefixo e a regra com que o plano foi aprovado; as regras
+    /// de processo ao lado são as atuais.
     fn kb_message(&self, root: &Path, frozen_spec: Option<&str>) -> Option<ChatMessage> {
         let none = SecretSet::new(Vec::<String>::new());
         let secrets = self.memory.as_deref().unwrap_or(&none);
-        let catalog = frozen_spec
+        let (overview, catalog) = frozen_spec
             .and_then(|spec| crate::kb::cite::load_frozen(root, spec))
-            .map(|f| f.catalog)
-            .filter(|c| !c.trim().is_empty())
-            .unwrap_or_else(|| crate::kb::catalog::render(root, secrets));
-        let text = crate::kb::catalog::architect_message(&catalog);
+            .filter(|f| !f.catalog.trim().is_empty())
+            .map(|f| (f.overview, f.catalog))
+            .unwrap_or_else(|| (crate::kb::catalog::overview(root, secrets), crate::kb::catalog::render(root, secrets)));
+        let text = crate::kb::catalog::architect_message(&overview, &catalog);
         (!text.is_empty()).then(|| ChatMessage::text(ChatRole::System, text))
     }
 
@@ -2130,7 +2135,7 @@ mod tests {
         };
         let before = [prefix(root.clone()).await, prefix(root.clone()).await];
         assert_eq!(before[0], before[1]);
-        let patch = crate::kb::Patch { role: None, description: Some("Filas e retentativas".into()), applies_to: None };
+        let patch = crate::kb::Patch { description: Some("Filas e retentativas".into()), ..crate::kb::Patch::default() };
         crate::kb::update(&root, &doc.id, &patch).expect("descrição");
         let after = [prefix(root.clone()).await, prefix(root.clone()).await, prefix(root.clone()).await];
         assert_ne!(after[0], before[0], "a edição muda o catálogo");
@@ -2162,11 +2167,40 @@ mod tests {
         let before = recover(root.clone()).await;
         let kb = before.messages.iter().find(|m| m.content.starts_with(crate::kb::catalog::ARCHITECT_RULES)).expect("catálogo");
         assert!(kb.content.contains(&format!("- kb:{} |", doc.id)));
-        let patch = crate::kb::Patch { role: None, description: Some("Descrição nova".into()), applies_to: None };
+        let patch = crate::kb::Patch { description: Some("Descrição nova".into()), ..crate::kb::Patch::default() };
         crate::kb::update(&root, &doc.id, &patch).expect("descrição");
         let after = recover(root.clone()).await;
         assert_eq!(after.messages, before.messages, "congelado durante a execução");
         assert!(!after.messages.iter().any(|m| m.content.contains("Descrição nova")));
+    }
+
+    /// Spec 136 T02 (exceção registrada): a recuperação de uma spec aprovada na 134 usa o catálogo
+    /// congelado como está, com o selo `[padrão]` de então; o arquivo com `standards` é legível.
+    #[tokio::test]
+    async fn recovery_keeps_a_frozen_catalog_from_134_as_is() {
+        let root = tmp_root("kb-catalog-frozen-134");
+        let none = SecretSet::new(Vec::<String>::new());
+        let doc = crate::kb::add_file(&root, "padroes.md", b"# Filas\nUse filas.\n", &none, "2026-10-28T12:00:00Z").expect("md");
+        let old_catalog = format!("Documentos prontos (1; os padrões primeiro).\n- kb:{} | padroes [padrão] | markdown", doc.id);
+        let old = serde_json::json!({
+            "version": 1,
+            "spec": "134-x",
+            "frozen_at": "2026-10-28T12:00:00Z",
+            "sources": [],
+            "catalog": old_catalog,
+            "standards": [{"id": doc.id, "title": "padroes", "description": "", "applies_to": ["src/**"]}],
+        });
+        std::fs::create_dir_all(root.join(crate::kb::cite::FROZEN_REL)).expect("mkdir");
+        std::fs::write(root.join(crate::kb::cite::frozen_rel("134-x")), old.to_string()).expect("congelado");
+        let backend = Scripted::new(vec![text("{}")]);
+        architect(backend.clone())
+            .with_activity(Arc::new(NullSink), Some("134-x".into()), Some("T01".into()))
+            .recover(&root, "fatos")
+            .await
+            .expect("recuperação");
+        let req = backend.requests()[0].clone();
+        let kb = req.messages.iter().find(|m| m.content.starts_with(crate::kb::catalog::ARCHITECT_RULES)).expect("catálogo");
+        assert!(kb.content.ends_with(&old_catalog), "{}", kb.content);
     }
 
     /// Revisão 1, F-01: na recuperação e na arbitragem, a raiz de leitura é a worktree (sem a base);

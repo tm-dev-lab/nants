@@ -93,8 +93,27 @@ Each project can keep a knowledge base of documents and links in `.sdd/kb/`: the
   redirects are checked one by one, and the page is read up to 2 MiB. Extracted text that carries a
   private key or a configured secret is refused and the original is removed.
 - **Files:** nothing is written through a symbolic link; the manifest is replaced atomically.
-  The base content is always data for the agents, never instructions: it reaches the prompts
-  marked as untrusted data, and only the approved spec (which cites it) binds the agents.
+- **Content and titles are data:** the text, the titles, the section headings and the
+  descriptions of the documents are always data for the agents, never instructions. They reach
+  the prompts marked as untrusted data, kept on one line where they are labels, cut to a length
+  limit and redacted. Only what the approved spec transcribes, with the citation, binds the
+  agents.
+- **The Overview is your text:** the Overview is written only by you, in the interface, and
+  reaches the Architect as your intent (it is where you declare which documents are company
+  standards), outside the untrusted data warning that covers the documents. It is still redacted
+  and capped. Anyone who can write the Overview can steer the plan, as they could through the
+  Conversation; the plan still needs your approval.
+- **Mentions are your intent:** a `@` mention counts only when it comes from your own messages in
+  the Conversation; the Architect's replies and internal turns never count. The mentioned
+  sections and outlines go with the turn as untrusted data, never as a system message, with a
+  size limit, redaction and the data markers neutralized inside the text; they are not stored in
+  the conversation history. A mention of a document that does not exist only shows a warning.
+- **Written documents:** documents written in Nants go through the same path as uploads (no
+  symbolic links, atomic writes, redaction, refusal of content with a secret), up to 2 MiB. An
+  edit carries the version it started from, and a newer version on disk is a conflict, never a
+  silent overwrite. The editor opens the original text only for markdown and text documents; PDFs
+  and links are refused, and so is a document whose text the redaction would change, so a
+  redacted copy can never be saved over the original.
 - **Limits of the redaction:** redaction replaces the secrets you configured (API keys and the
   other values Nants knows) and refuses PEM private key blocks. It does not detect other
   sensitive data: personal data, credentials you never configured, tokens in an unknown format,
@@ -103,7 +122,10 @@ Each project can keep a knowledge base of documents and links in `.sdd/kb/`: the
   Redaction is a safety net, not a classifier.
 - **Interface:** the Knowledge window shows the note already redacted. Indicators (duplicate,
   no headings, broken internal link) are computed by the server from the manifest and the index,
-  without a model.
+  without a model. The search highlights are computed by the server after redaction and sent as
+  positions; the interface builds them with text nodes, never by injecting HTML. Links outside the
+  base, in the document view and in **Links to**, are clickable only for `http` and `https`; any
+  other scheme (`javascript:`, `file:`) shows as plain text.
 
 ## Workspace home folder
 

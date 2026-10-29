@@ -4,9 +4,11 @@
  * nunca HTML. Suportado: títulos (# a ###, mais fundos viram ###), parágrafos, listas ordenadas e
  * não ordenadas aninhadas (numeração escrita preservada), blocos de código ``` (também dentro de
  * item de lista, na ordem do Markdown), tabelas GFM (cabeçalho, separador `|---|` com alinhamento
- * opcional, corpo; spec 126 T04), código inline, negrito e ênfase. Fora do conjunto, o texto
- * segue literal: HTML bruto, imagens (viram o texto alternativo), links (viram só o rótulo; URL
- * http(s) aparece entre parênteses, sem ser clicável).
+ * opcional, corpo; spec 126 T04), código inline, negrito e ênfase. Desde a spec 136 T11, também
+ * a citação (`>`, aninhada até [`MAX_QUOTE_DEPTH`]), a lista de tarefas (`- [ ]` e `- [x]`, uma caixa
+ * desabilitada) e o link `[rótulo](endereço)`: só `http:` e `https:` viram link (aberto em outra
+ * aba, como os "Links para" da T07); qualquer outro alvo vira só o rótulo. Fora do conjunto, o
+ * texto segue literal: HTML bruto e imagens (viram o texto alternativo).
  *
  * Tempo linear por construção (não por instância de regex):
  * - o texto é normalizado antes (quebras Unicode viram "\n"; controles saem);
@@ -19,6 +21,9 @@
  * dicionário, e o título da seção de execução é reconhecido nos dois idiomas.
  */
 import { t } from "./i18n";
+
+/** Profundidade máxima de citações aninhadas; além disso, o resto vira parágrafo da última. */
+export const MAX_QUOTE_DEPTH = 3;
 
 /** Profundidade máxima de listas aninhadas; além disso, o texto do item é achatado no pai. */
 export const MAX_LIST_DEPTH = 6;
@@ -38,6 +43,8 @@ export type Inline =
   | { kind: "strong"; text: string }
   | { kind: "em"; text: string }
   | { kind: "code"; text: string }
+  /** Link para uma página `http:` ou `https:` (o `href` já conferido); o resto vira texto. */
+  | { kind: "link"; text: string; href: string }
   /** Quebra de linha visual (só com `keepLineBreaks`, mensagens de agentes). */
   | { kind: "break"; text: string };
 
@@ -67,6 +74,8 @@ type ItemPart =
 export interface ListItem {
   /** Número escrito no Markdown (listas ordenadas); 0 nas não ordenadas. */
   number: number;
+  /** Item de tarefa (`[ ]` ou `[x]` no começo): marcado ou não; `undefined` no item comum. */
+  checked?: boolean;
   parts: ItemPart[];
 }
 
@@ -90,7 +99,13 @@ export interface TableBlock {
   rows: Inline[][][];
 }
 
-export type Block = ParagraphBlock | HeadingBlock | CodeBlock | ListBlock | TableBlock;
+/** Citação (`>`): os blocos de dentro, com a mesma análise. */
+interface QuoteBlock {
+  kind: "quote";
+  blocks: Block[];
+}
+
+export type Block = ParagraphBlock | HeadingBlock | CodeBlock | ListBlock | TableBlock | QuoteBlock;
 
 /** Número máximo de colunas de uma tabela; acima disso as linhas seguem como texto. */
 export const MAX_TABLE_COLUMNS = 32;
@@ -113,7 +128,15 @@ const INLINE_SOURCE = [
   "\\[([^\\[\\]\\n]+)\\]\\(([^()\\[\\]\\s]*(?:\\([^()\\[\\]\\s]*\\)[^()\\[\\]\\s]*)*)\\)",
 ].join("|");
 
-const HTTP_URL = /^https?:\/\//i;
+/** Endereço `http:` ou `https:` válido (a mesma regra dos "Links para" da T07). */
+function webUrl(target: string): boolean {
+  try {
+    const url = new URL(target);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 /** Texto inline do Markdown restrito. Nunca interpreta HTML. */
 function parseInline(source: string): Inline[] {
@@ -137,8 +160,7 @@ function parseInline(source: string): Inline[] {
       out.push({ kind: "text", text: imageAlt.trim() === "" ? t("report.imageAlt") : imageAlt });
     } else if (linkLabel !== undefined) {
       const url = linkUrl ?? imageUrl ?? "";
-      const showUrl = HTTP_URL.test(url) && url !== linkLabel;
-      out.push({ kind: "text", text: showUrl ? `${linkLabel} (${url})` : linkLabel });
+      out.push(webUrl(url) ? { kind: "link", text: linkLabel, href: url } : { kind: "text", text: linkLabel });
     }
   }
   if (last < source.length) out.push({ kind: "text", text: source.slice(last) });
@@ -261,7 +283,16 @@ type RawPart =
 
 interface RawItem {
   number: number;
+  checked?: boolean;
   parts: RawPart[];
+}
+
+/** Caixa de tarefa no começo do texto do item: `[ ]` ou `[x]` seguido de espaço (ou do fim). */
+function taskOf(text: string): { checked: boolean; text: string } | null {
+  if (text[0] !== "[" || text[2] !== "]" || (text.length > 3 && !isSpace(text[3]))) return null;
+  const mark = text[1];
+  if (mark !== " " && mark !== "x" && mark !== "X") return null;
+  return { checked: mark !== " ", text: text.slice(3).trim() };
 }
 
 function appendText(item: RawItem, text: string): void {
@@ -330,8 +361,9 @@ function parseList(lines: readonly string[], start: number, depth: number): { li
       if (indent < baseIndent) break;
       if (indent === baseIndent) {
         if (item.ordered !== ordered) break;
-        const entry: RawItem = { number: item.number, parts: [] };
-        appendText(entry, item.text);
+        const task = taskOf(item.text);
+        const entry: RawItem = task === null ? { number: item.number, parts: [] } : { number: item.number, checked: task.checked, parts: [] };
+        appendText(entry, task === null ? item.text : task.text);
         raw.push(entry);
         i += 1;
         continue;
@@ -370,6 +402,7 @@ function parseList(lines: readonly string[], start: number, depth: number): { li
 
   const items: ListItem[] = raw.map((entry) => ({
     number: entry.number,
+    ...(entry.checked === undefined ? {} : { checked: entry.checked }),
     parts: entry.parts.map((part): ItemPart => {
       if (part.kind === "text") return { kind: "inlines", inlines: parseInline(part.text) };
       return part;
@@ -480,13 +513,23 @@ function parseTable(
   return { table: { kind: "table", align: head.align, header: fitRow(head.header, columns), rows }, next: i };
 }
 
+/** Linha de citação: até 3 espaços e `>`; devolve o resto, sem o `>` e um espaço. */
+function quoteOf(line: string): string | null {
+  const { width, pos } = indentInfo(line);
+  if (width > 3 || line[pos] !== ">") return null;
+  return line.slice(isSpace(line[pos + 1]) ? pos + 2 : pos + 1);
+}
+
 function startsBlock(line: string): boolean {
-  return fenceOpenOf(line, 3) !== null || headingOf(line) !== null || itemOf(line) !== null;
+  return fenceOpenOf(line, 3) !== null || headingOf(line) !== null || itemOf(line) !== null || quoteOf(line) !== null;
 }
 
 /** Converte o Markdown restrito em blocos. Entrada vazia devolve `[]`. */
 export function parseReportMarkdown(markdown: string, options: { keepLineBreaks?: boolean } = {}): Block[] {
-  const lines = sanitizeReportText(markdown).split("\n");
+  return parseBlocks(sanitizeReportText(markdown).split("\n"), options, 1);
+}
+
+function parseBlocks(lines: readonly string[], options: { keepLineBreaks?: boolean }, depth: number): Block[] {
   const blocks: Block[] = [];
   let i = 0;
   while (i < lines.length) {
@@ -510,6 +553,22 @@ export function parseReportMarkdown(markdown: string, options: { keepLineBreaks?
     }
 
     const line = prose(raw);
+    if (quoteOf(line) !== null) {
+      // As linhas seguidas com `>`; dentro delas, a mesma análise (até a profundidade máxima).
+      const inner: string[] = [];
+      while (i < lines.length) {
+        const rest = quoteOf(prose(lines[i] ?? ""));
+        if (rest === null) break;
+        inner.push(rest);
+        i += 1;
+      }
+      const blocksInside: Block[] =
+        depth < MAX_QUOTE_DEPTH
+          ? parseBlocks(inner, options, depth + 1)
+          : [{ kind: "paragraph", inlines: parseInline(inner.map((part) => part.trim()).filter((part) => part !== "").join(" ")) }];
+      blocks.push({ kind: "quote", blocks: blocksInside });
+      continue;
+    }
     const heading = headingOf(line);
     if (heading !== null) {
       blocks.push({ kind: "heading", level: heading.level, inlines: parseInline(heading.text) });

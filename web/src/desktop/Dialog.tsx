@@ -7,16 +7,8 @@ import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type React
 import { createPortal } from "react-dom";
 import { useT } from "../i18n/react";
 import { Icon } from "./Icon";
+import { FOCUSABLE, trapTab } from "./focusTrap";
 import { useDesktopLayer } from "./layer";
-
-const FOCUSABLE = [
-  "button:not([disabled])",
-  "[href]",
-  "input:not([disabled]):not([type='hidden'])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  "[tabindex]:not([tabindex='-1'])",
-].join(", ");
 
 interface DialogProps {
   titleId: string;
@@ -56,20 +48,7 @@ export function Dialog({ titleId, title, describedById, onClose, width = 440, in
       closeRef.current();
       return;
     }
-    if (event.key !== "Tab") return;
-    const panel = panelRef.current;
-    if (panel === null) return;
-    const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (first === undefined || last === undefined) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    trapTab(event, panelRef.current);
   };
 
   const node = (

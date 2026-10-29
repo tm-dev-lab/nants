@@ -875,7 +875,12 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/projects/:id/chat/attachments/:name", GetEffect::Read),
     ("/api/projects/:id/kb", GetEffect::Read),
     ("/api/projects/:id/kb/docs/:doc", GetEffect::Read),
+    // Spec 136 T11: o texto-fonte de um editável, para o editor; só lê.
+    ("/api/projects/:id/kb/docs/:doc/content", GetEffect::Read),
     ("/api/projects/:id/kb/overview", GetEffect::Read),
+    // Spec 136 T03: só leem (a busca pode montar o índice em memória, como o `GET /kb`).
+    ("/api/projects/:id/kb/search", GetEffect::Read),
+    ("/api/projects/:id/specs/:spec_id/kb-sources", GetEffect::Read),
     ("/api/ui-state", GetEffect::Read),
     ("/api/projects/:id/ui-state", GetEffect::Read),
     ("/api/attention", GetEffect::Read),
@@ -989,4 +994,32 @@ fn get_routes_with_effect_are_audited() {
     assert_eq!(secret, ["chatgpt::FINISH_PATH", "devices::PAIR_LINK_PATH"]);
     assert_eq!(crate::server::chatgpt::FINISH_PATH, "/auth/finish");
     assert_eq!(PAIR_LINK_PATH, "/pair");
+}
+
+/// Rotas de escrita da base de conhecimento (spec 134 T01 e, os documentos escritos no Nants, spec
+/// 136 T10): todas pedem dispositivo autorizado fora do loopback real, como qualquer rota da API.
+const KB_WRITE_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/api/projects/x/kb/files?name=a.md"),
+    ("POST", "/api/projects/x/kb/links"),
+    ("POST", "/api/projects/x/kb/written"),
+    ("PUT", "/api/projects/x/kb/docs/doc-0123abcd/content"),
+    ("PATCH", "/api/projects/x/kb/docs/doc-0123abcd"),
+    ("DELETE", "/api/projects/x/kb/docs/doc-0123abcd"),
+    ("PUT", "/api/projects/x/kb/overview"),
+];
+
+#[tokio::test]
+async fn kb_write_routes_require_a_device() {
+    let dir = TempDir::new("kb-write");
+    let clock = Clock::new();
+    let state = lan_state(&dir, &clock);
+    for (method, uri) in KB_WRITE_ROUTES {
+        let method = Method::from_bytes(method.as_bytes()).expect("método");
+        let resp = send(&state, req(method, uri, NAT_PEER, None, Some(json!({})))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(json_body(resp).await["code"], CODE_DEVICE_REQUIRED, "{uri}");
+    }
+    // As duas rotas novas estão no roteador (a tabela não é só papel).
+    let body = router_body();
+    assert!(body.contains("\"/api/projects/:id/kb/written\"") && body.contains("\"/api/projects/:id/kb/docs/:doc/content\""));
 }

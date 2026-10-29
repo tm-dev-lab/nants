@@ -87,6 +87,12 @@ fn plan_specs(root: &Path) -> Vec<(String, Spec)> {
         .collect()
 }
 
+/// Ids das specs em plano (`DRAFT`/`AWAITING_APPROVAL`), na ordem das pastas (spec 136 T05: a
+/// sessão do plano das menções).
+pub(super) fn plan_spec_ids(root: &Path) -> Vec<String> {
+    plan_specs(root).into_iter().map(|(id, _)| id).collect()
+}
+
 /// Retrato redigido de uma spec: cada texto é redigido antes de qualquer corte.
 fn snapshot_of(root: &Path, spec_id: &str, spec: &Spec, secrets: &SecretSet) -> PlanSnapshot {
     let tasks: Vec<_> = task_names(root, spec_id)

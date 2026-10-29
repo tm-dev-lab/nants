@@ -97,7 +97,18 @@ export type IconName =
   | "home"
   | "switcher"
   | "knowledge"
-  | "upload";
+  | "upload"
+  | "outline"
+  | "bold"
+  | "italic"
+  | "heading"
+  | "list"
+  | "list-ordered"
+  | "quote"
+  | "code"
+  | "file-plus"
+  | "lock"
+  | "columns";
 
 const PATHS: Readonly<Record<IconName, ReactNode>> = {
   close: <path d="M18 6 6 18M6 6l12 12" />,
@@ -307,6 +318,32 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
     </>
   ),
   upload: <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />,
+  outline: <path d="M3 5h14M8 12h13M8 19h10M3 12h1M3 19h1" />,
+  bold: <path d="M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8" />,
+  italic: <path d="M19 4h-9M14 20H5M15 4 9 20" />,
+  heading: <path d="M6 12h12M6 20V4M18 20V4" />,
+  list: <path d="M3 6h.01M3 12h.01M3 18h.01M8 6h13M8 12h13M8 18h13" />,
+  "list-ordered": <path d="M10 6h11M10 12h11M10 18h11M4 6h1v4M4 10h2M6 18H4c0-1 2-2 2-3s-1-1.5-2-1" />,
+  quote: <path d="M17 6H3M21 12H8M21 18H8M3 12v6" />,
+  code: <path d="m16 18 6-6-6-6M8 6l-6 6 6 6" />,
+  "file-plus": (
+    <>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 12v6" />
+    </>
+  ),
+  lock: (
+    <>
+      <rect width="18" height="11" x="3" y="11" rx="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </>
+  ),
+  columns: (
+    <>
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M12 3v18" />
+    </>
+  ),
   message: <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />,
   file: (
     <>

@@ -126,7 +126,7 @@ export function isDocId(id: string): boolean {
 
 const isWordChar = (c: string): boolean => /[\p{L}\p{N}_]/u.test(c);
 
-/** Separa o texto do plano em trechos e citações. */
+/** Separa o texto do plano em trechos e citações (paridade com o servidor em `src/kb/cite_cases.json`). */
 export function splitCitations(text: string): CitedPart[] {
   // A mesma leitura do servidor (`kb::cite::find`): só `kb:` seguido de um id real é citação.
   const parts: CitedPart[] = [];
@@ -143,11 +143,12 @@ export function splitCitations(text: string): CitedPart[] {
     if (!isDocId(doc)) continue;
     let length = 3 + doc.length;
     let section: string | null = null;
-    if (doc.length === run.length && rest.charAt(run.length) === "#") {
+    // Como no servidor, a âncora vem logo depois do trecho inteiro (com os hífens que o id perdeu).
+    if (rest.charAt(run.length) === "#") {
       const anchor = (/^[A-Za-z0-9._-]*/.exec(rest.slice(run.length + 1))?.[0] ?? "").replace(/[.-]+$/, "");
       if (anchor !== "") {
         section = anchor;
-        length += 1 + anchor.length;
+        length = 3 + run.length + 1 + anchor.length;
       }
     }
     if (at > last) parts.push({ kind: "text", text: text.slice(last, at) });
@@ -159,20 +160,48 @@ export function splitCitations(text: string): CitedPart[] {
   return parts;
 }
 
+/** Um pedaço da nota: o texto de uma seção até o próximo título (ou o começo, sem âncora). */
+interface NoteChunk {
+  anchor: string | null;
+  level: number;
+  text: string;
+}
+
 /**
- * Corta a nota em antes, a seção citada e depois, pela linha que o servidor devolve para cada
- * seção (`sections[].line`, no `content`): a seção vai até a próxima de nível igual ou maior.
- * Assim `#exemplo-2` destaca o segundo "Exemplo", e um título dentro de cerca de código, que o
- * servidor não conta como seção, não confunde. Sem a linha (ou a seção do topo), `null`.
+ * Corta a nota nos títulos que o servidor conta como seção (`sections[].line`, spec 136 T07): um
+ * pedaço por seção, mais o começo antes do primeiro título. Cada pedaço vira um bloco com a
+ * âncora, para o sumário pular até ele e saber onde a leitura está. Um título dentro de cerca de
+ * código não é seção e não corta nada.
  */
-export function splitAtSection(content: string, sections: readonly KbSection[], anchor: string | null): [string, string, string] | null {
-  if (anchor === null) return null;
-  const i = sections.findIndex((s) => s.anchor === anchor);
-  const target = sections[i];
-  if (target === undefined || target.level < 1 || typeof target.line !== "number") return null;
+export function noteChunks(content: string, sections: readonly KbSection[]): NoteChunk[] {
   const lines = content.split("\n");
-  if (target.line < 0 || target.line >= lines.length) return null;
-  const next = sections.slice(i + 1).find((s) => s.level >= 1 && s.level <= target.level && typeof s.line === "number");
-  const end = next?.line !== undefined && next.line > target.line ? Math.min(next.line, lines.length) : lines.length;
-  return [lines.slice(0, target.line).join("\n"), lines.slice(target.line, end).join("\n"), lines.slice(end).join("\n")];
+  const cuts = sections
+    .filter((s) => s.level >= 1 && typeof s.line === "number" && s.line >= 0 && s.line < lines.length)
+    .sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+  const chunks: NoteChunk[] = [];
+  let from = 0;
+  let current: { anchor: string | null; level: number } = { anchor: null, level: 0 };
+  for (const cut of cuts) {
+    const line = cut.line ?? 0;
+    if (line < from || (line === from && current.anchor !== null)) continue;
+    if (line > from) chunks.push({ ...current, text: lines.slice(from, line).join("\n") });
+    from = line;
+    current = { anchor: cut.anchor, level: cut.level };
+  }
+  chunks.push({ ...current, text: lines.slice(from).join("\n") });
+  return chunks.filter((c) => c.anchor !== null || c.text.trim() !== "");
+}
+
+/**
+ * Pedaços da seção `anchor` com as subseções: do título dela até o próximo de nível igual ou
+ * maior (`[início, fim)` em `chunks`), ou `null` se a seção não está na nota.
+ */
+export function sectionSpan(chunks: readonly NoteChunk[], anchor: string | null): [number, number] | null {
+  if (anchor === null) return null;
+  const at = chunks.findIndex((c) => c.anchor === anchor);
+  const target = chunks[at];
+  if (target === undefined) return null;
+  let end = at + 1;
+  while (end < chunks.length && (chunks[end]?.level ?? 0) > target.level) end += 1;
+  return [at, end];
 }

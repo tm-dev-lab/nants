@@ -14,7 +14,7 @@ use crate::harness::allowlist::Policy;
 use crate::harness::tools::{
     is_allowed, specs, specs_kb, ApprovalDecision, ApprovalRequest, Approver, Role as ToolRole, ToolHost, ToolName,
 };
-use crate::kb::{add_file, add_link, begin_extraction, extract, finish_extraction, update, Patch};
+use crate::kb::{add_file, add_link, begin_extraction, extract, finish_extraction};
 
 const NOW: &str = "2026-10-28T12:00:00Z";
 // Montado em pedaços: a árvore pública recusa literal com cara de segredo.
@@ -111,38 +111,28 @@ fn search_limits_results_to_ten() {
     assert_eq!(count(json!({"query": "filas", "max_results": 50})), MAX_RESULTS);
 }
 
+/// Spec 136 T02 (C-06): sem marcação de padrão, o `only_standards` de um histórico antigo é
+/// ignorado com qualquer valor; a busca é a mesma, sem selo no título.
 #[test]
-fn only_standards_filters_by_role() {
+fn only_standards_is_ignored() {
     let root = root("standards");
     let reference = md(&root, "artigo.md", "# Artigo\nfilas com retry exponencial em todo serviço\n");
-    let standard = md(&root, "padrao.md", "# Padrão\nfilas usam retry\n");
-    let out = access(&root).search(&json!({"query": "filas retry", "only_standards": true})).expect("busca");
-    assert!(out.ends_with(NO_STANDARD_RESULTS), "nenhum padrão ainda: {out}");
-    update(&root, &standard.id, &Patch { role: Some(Role::Standard), ..Patch::default() }).expect("marcar");
+    let other = md(&root, "padrao.md", "# Padrão\nfilas usam retry\n");
+    // Manifesto da 134 com o segundo documento marcado como padrão.
+    let path = root.join(crate::kb::MANIFEST_REL);
+    let mut manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).expect("manifesto")).expect("json");
+    manifest["docs"][1]["role"] = json!("standard");
+    fs::write(&path, serde_json::to_string_pretty(&manifest).expect("json")).expect("gravar");
+    crate::kb::index::forget(&root);
     let all = access(&root).search(&json!({"query": "filas retry"})).expect("busca");
-    assert!(all.contains(&reference.id) && all.contains(&standard.id), "{all}");
-    let only = access(&root).search(&json!({"query": "filas retry", "only_standards": true})).expect("busca");
-    assert!(only.contains(&standard.id) && !only.contains(&reference.id), "{only}");
-    assert!(only.contains("| padrao [padrão] |"), "a marcação aparece no título: {only}");
-    assert!(matches!(access(&root).search(&json!({"query": "filas", "only_standards": "sim"})), Err(ToolError::InvalidArgs(_))));
-}
-
-/// Revisão 1, F-02: o filtro de papel roda antes do teto do índice ([`index::MAX_RESULTS`]): um
-/// padrão abaixo de mais de 50 seções de referência ainda aparece com `only_standards`.
-#[test]
-fn only_standards_finds_a_standard_below_many_references() {
-    let root = root("standards-deep");
-    for i in 0..(index::MAX_RESULTS + 6) {
-        md(&root, &format!("ref{i}.md"), &format!("# Filas {i}\nfilas filas filas retry filas {i}\n"));
+    assert!(all.contains(&reference.id) && all.contains(&other.id), "{all}");
+    assert!(!all.contains("[padrão]"), "{all}");
+    for flag in [json!(true), json!(false), json!("sim"), json!(null)] {
+        let out = access(&root).search(&json!({"query": "filas retry", "only_standards": flag})).expect("aceito");
+        assert_eq!(out, all, "only_standards = {flag}");
     }
-    let filler = "texto longo sem relação com o assunto da busca ".repeat(40);
-    let standard = md(&root, "padrao.md", &format!("# Norma\n{filler} filas\n"));
-    update(&root, &standard.id, &Patch { role: Some(Role::Standard), ..Patch::default() }).expect("marcar");
-    let all = index::search(&root, "filas", index::MAX_RESULTS, &none()).expect("busca");
-    assert!(all.iter().all(|h| h.doc_id != standard.id), "o padrão fica abaixo do teto sem o filtro");
-    let only = access(&root).search(&json!({"query": "filas", "only_standards": true})).expect("busca");
-    assert!(only.contains(&format!("kb:{}#", standard.id)), "{only}");
-    assert_eq!(only.lines().filter(|l| l.starts_with("kb:")).count(), 1, "{only}");
+    let spec = specs_kb().into_iter().find(|s| s.name == "kb_search").expect("kb_search");
+    assert!(!spec.parameters.to_string().contains("only_standards") && !spec.description.contains("only_standards"));
 }
 
 #[test]

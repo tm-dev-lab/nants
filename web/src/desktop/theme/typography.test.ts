@@ -113,12 +113,12 @@ const MONO_SELECTORS: ReadonlyMap<string, string> = new Map([
   [".nd-md-code", "código em linha no markdown"],
   [".nd-app-log", "console da execução do app"],
   [".nd-plan-task-id", "id de tarefa no Plano"],
+  [".nd-kb-src-doc-id", "id do documento que saiu da base, no quadro Fontes da base do Plano (identificador, spec 136 T04)"],
 ]);
 
 /** Arquivos `.tsx` que podem usar `nd-mono`, com o que é mono em cada um (categorias da C-08). */
 const MONO_FILES: ReadonlyMap<string, string> = new Map([
   ["apps/activity/ActivityApp.tsx", "id de tarefa e comando do registro de ferramentas"],
-  ["apps/knowledge/KnowledgeApp.tsx", "padrões de caminho do applies_to dos Padrões da base (spec 134): caminhos de arquivo"],
   ["apps/app/ConsolePanel.tsx", "comando digitado no Console, a saída dele e o histórico de comandos (spec 130)"],
   ["apps/app/RunViews.tsx", "comando, porta, saída do programa, registro e caminhos dos arquivos criados (spec 130)"],
   ["apps/execution/ExecutionApp.tsx", "comando de execução, caminho do projeto, detalhes da falha e console"],

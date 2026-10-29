@@ -39,9 +39,7 @@ fn entry(id: &str, title: &str, kind: Kind) -> Entry {
         status_reason: None,
         pages: None,
         extractor: None,
-        role: Role::Reference,
         description: String::new(),
-        applies_to: Vec::new(),
         links_out: Vec::new(),
         link_targets: Vec::new(),
     }

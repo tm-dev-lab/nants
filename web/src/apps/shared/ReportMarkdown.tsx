@@ -1,9 +1,10 @@
 /*
  * Markdown restrito (ver `reportMarkdown.ts`):
- * todo texto entra como texto React, sem HTML bruto, imagens nem links clicáveis. Estilos pelos
- * tokens (`.nd-md`).
+ * todo texto entra como texto React, sem HTML bruto nem imagens. Só o link `http:` ou `https:` é
+ * clicável, em outra aba e sem `opener` (spec 136 T11). Estilos pelos tokens (`.nd-md`).
  */
 import { useMemo } from "react";
+import { useT } from "../../i18n/react";
 import { parseReportMarkdown, type Block, type Inline, type ListBlock, type TableAlign, type TableBlock } from "../../reportMarkdown";
 
 export function ReportMarkdown({ blocks }: { blocks: readonly Block[] }) {
@@ -42,6 +43,14 @@ function BlockView({ block }: { block: Block }) {
       return <List list={block} />;
     case "table":
       return <Table table={block} />;
+    case "quote":
+      return (
+        <blockquote className="nd-md-quote">
+          {block.blocks.map((inner, index) => (
+            <BlockView key={index} block={inner} />
+          ))}
+        </blockquote>
+      );
   }
 }
 
@@ -110,8 +119,19 @@ function Heading({ level, inlines }: { level: 1 | 2 | 3; inlines: readonly Inlin
 }
 
 function List({ list }: { list: ListBlock }) {
+  const { t } = useT();
   const items = list.items.map((item, index) => (
-    <li key={index} value={list.ordered ? item.number : undefined}>
+    <li key={index} value={list.ordered ? item.number : undefined} data-task={item.checked === undefined ? undefined : item.checked ? "done" : "open"}>
+      {item.checked !== undefined ? (
+        <input
+          type="checkbox"
+          className="nd-md-task"
+          checked={item.checked}
+          disabled
+          readOnly
+          aria-label={item.checked ? t("report.taskDone") : t("report.taskOpen")}
+        />
+      ) : null}
       {item.parts.map((part, partIndex) => {
         if (part.kind === "inlines") return <Inlines key={partIndex} inlines={part.inlines} />;
         if (part.kind === "code") {
@@ -145,6 +165,12 @@ function Inlines({ inlines }: { inlines: readonly Inline[] }) {
             );
           case "break":
             return <br key={index} />;
+          case "link":
+            return (
+              <a key={index} className="nd-md-link" href={inline.href} target="_blank" rel="noopener noreferrer">
+                {inline.text}
+              </a>
+            );
           case "text":
             return <span key={index}>{inline.text}</span>;
         }

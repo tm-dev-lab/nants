@@ -50,6 +50,7 @@ import { AutoScrollBox, type ScrollPosition } from "./AutoScrollBox";
 import { answerAfter, Bubble, sameSource } from "./Bubble";
 import { AttachmentPreview, imageFiles, useChatAttachments } from "./ChatAttachments";
 import { setChatSending, takeChatRequest, useChatRequestCount } from "./chatChannel";
+import { useMentionComposer } from "./useMentionComposer";
 import { dayKey, dayLabel, hasTime } from "./chatTime";
 import { PausedRunCard } from "./PausedRunCard";
 import { RoleConnectionFooter } from "./RoleConnectionFooter";
@@ -162,13 +163,9 @@ export function Conversation({
   const inputId = useId();
   const hintId = useId();
   const [draft, setDraftState] = useState(() => loadDraft(projectId));
-  const setDraft = useCallback(
-    (text: string) => {
-      setDraftState(text);
-      saveDraft(projectId, text);
-    },
-    [projectId],
-  );
+  // O rascunho guardado é o texto codificado, com as menções em `kb:` (`useMentionComposer`).
+  const setDraft = useCallback((text: string) => setDraftState(text), []);
+  const persistDraft = useCallback((encoded: string) => saveDraft(projectId, encoded), [projectId]);
   const [sending, setSending] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -181,6 +178,7 @@ export function Conversation({
   const remoteTurn = useAppStore((s) => s.architectTurns[projectId]);
   const chatLevel = gateLevel(shell.readiness, "chat");
   const chatBlocked = chatLevel !== null && !chatLevel.ok;
+  const mention = useMentionComposer({ projectId, draft, setDraft, areaRef, disabled: chatBlocked, persist: persistDraft });
 
   useEffect(() => {
     const area = areaRef.current;
@@ -380,7 +378,7 @@ export function Conversation({
   }, [queued, sending, chatBlocked, projectId]);
 
   async function send(): Promise<void> {
-    const text = draft.trim();
+    const text = mention.encode().trim();
     const withImages = images.items.length > 0;
     if ((text === "" && !withImages) || sending || preparing || chatBlocked) return;
     let names: string[] = [];
@@ -395,6 +393,7 @@ export function Conversation({
       names = done.flatMap((item) => (item.name === undefined ? [] : [item.name]));
     }
     setDraft("");
+    mention.clear();
     images.clear();
     await submit(text === "" ? translateNow("attachments.imageOnly") : text, null, false, names);
   }
@@ -407,6 +406,7 @@ export function Conversation({
   }
 
   function onKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>): void {
+    if (mention.onKeyDown(event)) return;
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
     void send();
@@ -597,6 +597,7 @@ export function Conversation({
             void send();
           }}
         >
+          {mention.mobile ? mention.picker : null}
           <AttachmentPreview items={images.items} onRemove={images.remove} />
           {images.notice !== null ? (
             <p role="alert" className="nd-dialog-warning">
@@ -632,23 +633,38 @@ export function Conversation({
                 images.add(files);
               }}
             />
-            <textarea
-              id={inputId}
-              rows={1}
-              value={draft}
-              ref={areaRef}
-              disabled={chatBlocked}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={onKeyDown}
-              onPaste={onPaste}
-              aria-describedby={hintId}
-              aria-label={t("conversation.inputLabel")}
-              placeholder={chatBlocked ? t("conversation.placeholderBlocked") : t("conversation.placeholder")}
-              className="nd-composer-input"
-            />
+            <div className="nd-composer-field">
+              {mention.backdrop}
+              <textarea
+                id={inputId}
+                rows={1}
+                value={draft}
+                ref={areaRef}
+                disabled={chatBlocked}
+                onChange={(event) => mention.onChange(event.target.value, event.target.selectionStart)}
+                onKeyDown={onKeyDown}
+                onSelect={(event) => mention.onSelect(event.currentTarget)}
+                onScroll={(event) => mention.onScroll(event.currentTarget)}
+                onFocus={(event) => mention.onFocus(event.currentTarget)}
+                onBlur={mention.onBlur}
+                onPaste={onPaste}
+                aria-describedby={hintId}
+                aria-label={t("conversation.inputLabel")}
+                placeholder={chatBlocked ? t("conversation.placeholderBlocked") : t("conversation.placeholder")}
+                className="nd-composer-input"
+                {...mention.areaProps}
+              />
+              {mention.mobile ? null : mention.picker}
+            </div>
             <span id={hintId} className="nd-sr-only">
               {t("conversation.inputHint")}
+              {mention.hint !== "" ? ` ${mention.hint}` : ""}
             </span>
+            {mention.status !== "" ? (
+              <span role="status" className="nd-sr-only">
+                {mention.status}
+              </span>
+            ) : null}
             <button type="submit" aria-label={t("conversation.send")} disabled={!canSend} className="nd-btn nd-composer-send" data-variant={canSend ? "primary" : undefined}>
               <Icon name="send" size={16} />
             </button>

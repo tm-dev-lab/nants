@@ -33,6 +33,7 @@ pub mod image_gen;
 pub mod judge;
 pub mod kb;
 pub mod kb_queue;
+pub mod kb_read;
 pub mod lan;
 pub mod lang;
 pub mod live_activity;
@@ -185,10 +186,21 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/projects/:id/kb/links", post(kb::post_link))
         .route(
+            "/api/projects/:id/kb/written",
+            post(kb::post_written).layer(DefaultBodyLimit::max(crate::kb::MAX_WRITTEN_BODY_BYTES)),
+        )
+        .route(
+            "/api/projects/:id/kb/docs/:doc/content",
+            get(kb::get_content).put(kb::put_content).layer(DefaultBodyLimit::max(crate::kb::MAX_WRITTEN_BODY_BYTES)),
+        )
+        .route(
             "/api/projects/:id/kb/docs/:doc",
             get(kb::get_doc).patch(kb::patch_doc).delete(kb::delete_doc),
         )
         .route("/api/projects/:id/kb/overview", get(kb::get_overview).put(kb::put_overview))
+        // Spec 136 T03: a busca da interface e as fontes da base citadas no plano.
+        .route("/api/projects/:id/kb/search", get(kb::search))
+        .route("/api/projects/:id/specs/:spec_id/kb-sources", get(kb::get_plan_sources))
         // Estado da interface (spec 093): teto de 64 KiB por documento, também no corpo do PUT.
         .route(
             "/api/ui-state",

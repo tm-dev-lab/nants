@@ -1,0 +1,20 @@
+{
+  "about": "Casos compartilhados da leitura das citações kb: (spec 136 T04, C-14): lidos por src/kb/cite_tests.rs (kb::cite::find) e por web/src/apps/knowledge/knowledgeModel.parity.test.ts (splitCitations). Cada caso lista as citações na ordem, sem repetir.",
+  "cases": [
+    { "text": "sem citação", "cites": [] },
+    { "text": "Veja kb:api-3f9a1c2e#versionamento.", "cites": [{ "doc": "api-3f9a1c2e", "section": "versionamento" }] },
+    { "text": "kb:guia-0d6b72ae, e só.", "cites": [{ "doc": "guia-0d6b72ae", "section": null }] },
+    { "text": "kb:session kb:user:1 kb:<id>#<seção> kb:padroes-3F9A1C2E", "cites": [] },
+    { "text": "abckb:api-3f9a1c2e e _kb:api-3f9a1c2e e ákb:api-3f9a1c2e", "cites": [] },
+    { "text": "(kb:api-3f9a1c2e#erros) e [kb:api-3f9a1c2e]", "cites": [{ "doc": "api-3f9a1c2e", "section": "erros" }, { "doc": "api-3f9a1c2e", "section": null }] },
+    { "text": "ver kb:api-3f9a1c2e#s.3", "cites": [{ "doc": "api-3f9a1c2e", "section": "s.3" }] },
+    { "text": "fim kb:api-3f9a1c2e#secao-final-.", "cites": [{ "doc": "api-3f9a1c2e", "section": "secao-final" }] },
+    { "text": "âncora vazia kb:api-3f9a1c2e# e depois", "cites": [{ "doc": "api-3f9a1c2e", "section": null }] },
+    { "text": "hífen no fim do id kb:api-3f9a1c2e-#x", "cites": [{ "doc": "api-3f9a1c2e", "section": "x" }] },
+    { "text": "repetida kb:api-3f9a1c2e#a e kb:api-3f9a1c2e#a de novo", "cites": [{ "doc": "api-3f9a1c2e", "section": "a" }] },
+    { "text": "ids de 16 e 32: kb:a-0123456789abcdef e kb:b-0123456789abcdef0123456789abcdef#Sec_1", "cites": [{ "doc": "a-0123456789abcdef", "section": null }, { "doc": "b-0123456789abcdef0123456789abcdef", "section": "Sec_1" }] },
+    { "text": "sufixo de 9 kb:api-3f9a1c2e1 não conta", "cites": [] },
+    { "text": "acento na âncora kb:api-3f9a1c2e#paginação", "cites": [{ "doc": "api-3f9a1c2e", "section": "pagina" }] },
+    { "text": "kb:kb:api-3f9a1c2e", "cites": [{ "doc": "api-3f9a1c2e", "section": null }] }
+  ]
+}

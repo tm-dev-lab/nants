@@ -79,6 +79,23 @@ pub const ISSUE_KINDS: [&str; 6] = ["contradiction", "untestable", "scope", "unc
 /// Tarefa grande demais para uma revisão (spec 124 T06): o modelo aponta as áreas misturadas e o
 /// servidor completa, de forma determinística, as de muitos critérios ([`MANY_CRITERIA`]).
 pub const TOO_LARGE: &str = "too_large";
+/// Documento da base mencionado pelo usuário na sessão do plano que o plano não cita (spec 136
+/// T05, C-03): ponto só do servidor, determinístico, fora do vocabulário do modelo
+/// ([`ISSUE_KINDS`]). O Arquiteto aceita (passa a citar) ou recusa com o motivo, como os demais.
+pub const MENTIONED_UNUSED: &str = "mentioned_unused";
+/// Documentos listados no ponto [`MENTIONED_UNUSED`]; o resto vira "+N".
+const MAX_UNUSED_LISTED: usize = 4;
+
+/// Apontamento que o servidor completa e que nunca cede a vaga a outro (`too_large` e
+/// [`MENTIONED_UNUSED`]).
+fn server_kind(kind: &str) -> bool {
+    kind == TOO_LARGE || kind == MENTIONED_UNUSED
+}
+
+/// Tipo de apontamento conhecido na leitura: os do modelo e os só do servidor.
+fn known_kind(kind: &str) -> bool {
+    ISSUE_KINDS.contains(&kind) || kind == MENTIONED_UNUSED
+}
 
 pub const STATUS_OK: &str = "ok";
 pub const STATUS_UNAVAILABLE: &str = "unavailable";
@@ -566,11 +583,9 @@ async fn review_loop(state: &AppState, project_id: &str, root: &Path, spec_id: &
         memory.tasks = Some(reviewed.sizes.iter().map(|s| s.id.clone()).collect());
         memory.changes.clear();
         let items = match reviewed.items {
-            Ok(items) => {
-                // Spec 134 T05: os avisos da base sobre esta versão do plano, sem bloqueio.
-                kb_plan_notices(state, project_id, root, spec_id).await;
-                items
-            }
+            // Spec 136 T02: os dois avisos da base da 134 (plano sem padrão citado e padrão do
+            // escopo não citado) saíram junto com a marcação de padrão.
+            Ok(items) => items,
             Err(detail) => {
                 let record = PlanReviewRecord {
                     failure: reviewed.failure,
@@ -1065,12 +1080,17 @@ async fn review_once(
 ) -> Result<Reviewed, Stop> {
     let secrets = state.secret_set().await;
     let (plan_root, sid, plan_secrets) = (root.to_path_buf(), spec_id.to_string(), Arc::clone(&secrets));
-    let (signature, plan, sizes, dep_cycle) = tokio::task::spawn_blocking(move || {
+    let (signature, plan, sizes, dep_cycle, unused) = tokio::task::spawn_blocking(move || {
+        let plan = build_plan(&plan_root, &sid, &plan_secrets)?;
+        // Spec 136 T05 (C-03): mencionados na sessão do plano e não citados no plano.
+        let turns = super::chat::read_session_turns(&plan_root);
+        let unused = crate::kb::mention::unused_in_plan(&plan_root, &sid, &turns, &plan, &plan_secrets);
         Some((
             plan_signature(&plan_root, &sid)?,
-            build_plan(&plan_root, &sid, &plan_secrets)?,
+            plan,
             task_sizes(&plan_root, &sid),
             plan_cycle(&plan_root, &sid),
+            unused,
         ))
     })
     .await
@@ -1130,84 +1150,12 @@ async fn review_once(
     let lang = state.project_lang(project_id).get();
     let items = match answer {
         Ok(raw) => match parse_review(&raw, &secrets) {
-            Some(found) => Ok(with_cycle_items(with_size_items(found, &sizes, lang), &dep_cycle, lang)),
+            Some(found) => Ok(with_cycle_items(with_mention_items(with_size_items(found, &sizes, lang), &unused, lang), &dep_cycle, lang)),
             None => Err(DETAIL_INVALID_JSON.to_string()),
         },
         Err(why) => Err(why),
     };
     Ok(Reviewed { signature, sizes, items, failure: failure_params })
-}
-
-/// Aviso da base (spec 134 T05, C-17): há padrão marcado e o plano não cita nenhum.
-pub const KB_NO_STANDARD_CODE: &str = "kb.plan_no_standard";
-/// Aviso da base (spec 134 T05, C-21): o escopo da tarefa cruza o `applies_to` de um padrão que
-/// ela não cita.
-pub const KB_TASK_UNCITED_CODE: &str = "kb.task_standard_uncited";
-/// Teto dos avisos por tarefa numa versão do plano.
-const MAX_KB_TASK_NOTICES: usize = 12;
-
-/// Último conjunto de avisos da base publicado por spec (raiz e spec): a mesma versão dos avisos
-/// não se repete a cada rodada do consenso.
-static KB_WARNED: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Avisos da base sobre o plano da spec (spec 134 T05): os padrões prontos do manifesto contra a
-/// spec e as tarefas lidas do disco. Sem padrão pronto, nenhum.
-pub fn kb_plan_warnings(root: &Path, spec_id: &str) -> crate::kb::catalog::PlanWarnings {
-    use crate::kb::catalog::{plan_warnings, standards, PlanTask, PlanWarnings};
-    let standards = standards(&crate::kb::load_manifest(root).unwrap_or_default());
-    if standards.is_empty() {
-        return PlanWarnings::default();
-    }
-    let spec_rel = format!("{SPECS_REL}/{spec_id}");
-    let spec = safe_fs::read_regular(root, &format!("{spec_rel}/spec.md"), MAX_READ_BYTES).unwrap_or_default();
-    let mut tasks: Vec<(String, Vec<String>, String)> = Vec::new();
-    for name in task_names(root, spec_id) {
-        let Ok(content) = safe_fs::read_regular(root, &format!("{spec_rel}/tasks/{name}"), MAX_READ_BYTES) else {
-            continue;
-        };
-        let Ok(task) = crate::sdd::Task::parse(&content) else {
-            continue;
-        };
-        tasks.push((task.frontmatter.id.clone(), task.frontmatter.allowed_scope.clone(), content));
-    }
-    let plan: Vec<PlanTask> = tasks.iter().map(|(id, scope, text)| PlanTask { id, scope, text }).collect();
-    plan_warnings(&standards, &spec, &plan)
-}
-
-/// Publica na Conversa os avisos da base sobre a versão atual do plano (C-17 e C-21), uma vez por
-/// conjunto de avisos: o mesmo conjunto numa rodada seguinte não se repete.
-async fn kb_plan_notices(state: &AppState, project_id: &str, root: &Path, spec_id: &str) {
-    let (scan_root, sid) = (root.to_path_buf(), spec_id.to_string());
-    let warnings = tokio::task::spawn_blocking(move || kb_plan_warnings(&scan_root, &sid)).await.unwrap_or_default();
-    let mut fingerprint = format!("{}", warnings.no_standard_cited);
-    for (task, standard) in &warnings.uncited {
-        fingerprint.push_str(&format!("\n{task}\0{}", standard.id));
-    }
-    {
-        let mut warned = KB_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = format!("{}\0{spec_id}", root.display());
-        if warned.get(&key) == Some(&fingerprint) {
-            return;
-        }
-        warned.insert(key, fingerprint);
-    }
-    if warnings.is_empty() {
-        return;
-    }
-    let secrets = state.secret_set().await;
-    if warnings.no_standard_cited {
-        let mut params = serde_json::Map::new();
-        params.insert("spec".into(), json!(spec_id));
-        super::chat::system_notice(state, project_id, root.to_path_buf(), KB_NO_STANDARD_CODE, params).await;
-    }
-    for (task, standard) in warnings.uncited.iter().take(MAX_KB_TASK_NOTICES) {
-        let mut params = serde_json::Map::new();
-        params.insert("spec".into(), json!(spec_id));
-        params.insert("task".into(), json!(task));
-        params.insert("doc".into(), json!(truncate_bytes(&clean_text(&secrets, &standard.title), MAX_FINAL_TITLE_BYTES)));
-        params.insert("citation".into(), json!(format!("kb:{}", standard.id)));
-        super::chat::system_notice(state, project_id, root.to_path_buf(), KB_TASK_UNCITED_CODE, params).await;
-    }
 }
 
 /// Tarefas do plano que formam ciclo pelo `depends_on` (spec 128 T04); vazio sem ciclo. Com ciclo
@@ -1241,11 +1189,42 @@ fn with_cycle_items(mut items: Vec<ReviewItem>, cycle: &[String], lang: crate::i
     };
     let text = crate::i18n::tr(lang, "plan_review.dependency_cycle", &[("tasks", &cycle.join(", "))]);
     if items.len() >= MAX_ISSUES {
-        // Cede a vaga o último apontamento do modelo (os `too_large` do servidor ficam).
-        let at = items.iter().rposition(|i| i.issue.kind != TOO_LARGE).unwrap_or(items.len() - 1);
+        // Cede a vaga o último apontamento do modelo (os `too_large` e o `mentioned_unused` do servidor ficam).
+        let at = items.iter().rposition(|i| !server_kind(&i.issue.kind)).unwrap_or(items.len() - 1);
         items.remove(at);
     }
     items.push(ReviewItem { issue: PlanIssue::new(Some(first.clone()), CYCLE_KIND, &text), reference: None, new_argument: false });
+    items
+}
+
+/// Completa os apontamentos com um [`MENTIONED_UNUSED`] do servidor quando há documento mencionado
+/// pelo usuário na sessão do plano e não citado (spec 136 T05, C-03). `unused` são os pares (id,
+/// título) de [`crate::kb::mention::unused_in_plan`]. Um ponto só, com a lista: os textos de vários
+/// pontos do mesmo tipo e sem tarefa seriam parecidos demais para a reserva do [`Cycle::classify`].
+/// Nunca é cortado: o último apontamento do modelo cede a vaga (e o do ciclo, que vem depois, também não o corta). Texto no idioma do
+/// projeto.
+pub fn with_mention_issue(found: Vec<PlanIssue>, unused: &[(String, String)], lang: crate::i18n::Lang) -> Vec<PlanIssue> {
+    with_mention_items(found.into_iter().map(|issue| ReviewItem { issue, reference: None, new_argument: false }).collect(), unused, lang)
+        .into_iter()
+        .map(|i| i.issue)
+        .collect()
+}
+
+fn with_mention_items(mut items: Vec<ReviewItem>, unused: &[(String, String)], lang: crate::i18n::Lang) -> Vec<ReviewItem> {
+    if unused.is_empty() {
+        return items;
+    }
+    let mut docs: Vec<String> = unused.iter().take(MAX_UNUSED_LISTED).map(|(id, title)| format!("kb:{id} (\"{title}\")")).collect();
+    if unused.len() > MAX_UNUSED_LISTED {
+        docs.push(format!("+{}", unused.len() - MAX_UNUSED_LISTED));
+    }
+    let text = crate::i18n::tr(lang, "plan_review.mentioned_unused", &[("docs", &docs.join(", "))]);
+    if items.len() >= MAX_ISSUES {
+        // Cede a vaga o último apontamento do modelo (os do servidor ficam).
+        let at = items.iter().rposition(|i| !server_kind(&i.issue.kind)).unwrap_or(items.len() - 1);
+        items.remove(at);
+    }
+    items.push(ReviewItem { issue: PlanIssue::new(None, MENTIONED_UNUSED, &text), reference: None, new_argument: false });
     items
 }
 
@@ -1612,7 +1591,7 @@ pub fn view(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<PlanRevie
     let issues: Vec<PlanIssue> = record
         .issues
         .iter()
-        .filter(|i| ISSUE_KINDS.contains(&i.kind.as_str()))
+        .filter(|i| known_kind(&i.kind))
         .take(MAX_ISSUES)
         .map(|i| clean_issue(secrets, i))
         .collect();

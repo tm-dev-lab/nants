@@ -1,0 +1,473 @@
+/*
+ * Editor de documentos da base (spec 136 T11). Sem borda nem sombra nos painéis: o cabeçalho e a
+ * barra se separam do texto por uma linha fina, a prévia por um tom de fundo. O campo de escrita
+ * e a camada de realce dividem a MESMA métrica (fonte, tamanho, entrelinha, quebra, recuo): só a
+ * cor muda na camada, para o cursor do campo cair certo sobre as letras.
+ */
+.nd-kbe {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+/* --- Cabeçalho --- */
+.nd-kbe-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.nd-kbe-name {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kbe-name > svg {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.nd-kbe-name-text {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-kbe-file {
+  color: var(--muted);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+
+.nd-kbe-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--muted);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+
+.nd-kbe-state[data-state="saved"] > svg {
+  color: var(--pill-green-ink);
+}
+
+.nd-kbe-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-xs);
+  background: var(--muted);
+}
+
+.nd-kbe-state:is([data-state="pending"], [data-state="needsTitle"]) .nd-kbe-dot {
+  background: var(--icon-amber);
+}
+
+.nd-kbe-failure {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--divider);
+  background: var(--pill-amber-bg);
+  color: var(--ink2);
+  font-size: var(--fs-label);
+  flex-shrink: 0;
+}
+
+.nd-kbe-failure > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--pill-amber-ink);
+}
+
+.nd-kbe-state:is([data-state="local"], [data-state="failed"], [data-state="conflict"]) {
+  color: var(--pill-amber-ink);
+}
+
+.nd-kbe-state:is([data-state="local"], [data-state="failed"], [data-state="conflict"]) .nd-kbe-dot {
+  background: var(--pill-amber-ink);
+}
+
+.nd-kbe-modes .nd-segment-item {
+  gap: var(--sp-1);
+}
+
+/* --- Barra de formatação --- */
+.nd-kbe-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-4);
+  border-bottom: 1px solid var(--divider);
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nd-kbe-bar-group {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.nd-kbe-bar-group + .nd-kbe-bar-group {
+  margin-left: var(--sp-1);
+  padding-left: var(--sp-2);
+  border-left: 1px solid var(--divider);
+}
+
+.nd-kbe-words {
+  margin-left: auto;
+  padding-left: var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+
+/* --- Avisos --- */
+.nd-kbe-conflict {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin: var(--sp-3) var(--sp-4) 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--pill-amber-bg);
+  color: var(--ink2);
+  flex-shrink: 0;
+}
+
+.nd-kbe-conflict > svg {
+  color: var(--pill-amber-ink);
+  flex-shrink: 0;
+}
+
+.nd-kbe-conflict-text {
+  flex: 1 1 280px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-kbe-conflict-text > strong {
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-kbe-conflict-text > span {
+  font-size: var(--fs-label);
+}
+
+.nd-kbe-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-1) var(--sp-4);
+  border-bottom: 1px solid var(--divider);
+  color: var(--muted);
+  font-size: var(--fs-label);
+  flex-shrink: 0;
+}
+
+/* --- Painéis --- */
+.nd-kbe-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.nd-kbe-write,
+.nd-kbe-view {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* A faixa do foco fica reservada (transparente) para o texto não pular ao focar. */
+.nd-kbe-write {
+  border-left: 2px solid transparent;
+}
+
+.nd-kbe[data-mode="split"] .nd-kbe-view {
+  background: var(--card);
+  border-left: 1px solid var(--divider);
+}
+
+.nd-kbe-page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-12);
+}
+
+.nd-kbe-title {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--fs-display);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--ls-tight);
+  outline: none;
+}
+
+.nd-kbe-title::placeholder {
+  color: var(--muted);
+}
+
+.nd-kbe-view-title {
+  margin-bottom: var(--sp-3);
+}
+
+.nd-kbe-rendered {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+/* --- Campo e camada de realce: a mesma métrica --- */
+.nd-kbe-field {
+  position: relative;
+  min-height: 60vh;
+}
+
+.nd-kbe-backdrop,
+.nd-kbe-input {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-regular);
+  line-height: 1.75;
+  letter-spacing: var(--ls-tight);
+  font-kerning: none;
+  font-variant-ligatures: none;
+  tab-size: 4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  text-align: left;
+}
+
+.nd-kbe-backdrop {
+  position: relative;
+  color: var(--ink2);
+  pointer-events: none;
+  user-select: none;
+}
+
+.nd-kbe-line {
+  min-height: 1.75em;
+}
+
+.nd-kbe-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  color: var(--ink);
+  caret-color: var(--ink);
+  resize: none;
+  outline: none;
+}
+
+/* Com a camada, o campo fica por cima, transparente, e a camada dá a altura. */
+.nd-kbe-write[data-highlight="true"] .nd-kbe-input {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  overflow: hidden;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.nd-kbe-write[data-highlight="false"] .nd-kbe-input {
+  min-height: 60vh;
+}
+
+/*
+ * Foco: o campo ocupa o painel inteiro, então o anel duplo vira uma faixa na borda do painel
+ * (o cursor piscando já marca o lugar); o título tem o mesmo tratamento.
+ */
+.nd-root .nd-kbe .nd-kbe-input:focus-visible,
+.nd-root .nd-kbe .nd-kbe-title:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.nd-kbe-write:focus-within {
+  border-left-color: var(--focus-outer);
+}
+
+.nd-kbe-input::placeholder {
+  color: var(--muted);
+  -webkit-text-fill-color: var(--muted);
+}
+
+.nd-kbe-input::selection {
+  background: var(--accent-soft);
+}
+
+.nd-kbe-hl-mark {
+  color: var(--muted);
+}
+
+.nd-kbe-hl-heading,
+.nd-kbe-hl-strong {
+  color: var(--ink);
+}
+
+.nd-kbe-line[data-heading="true"] .nd-kbe-hl-mark {
+  color: var(--icon-violet);
+}
+
+.nd-kbe-hl-emph {
+  color: var(--ink);
+}
+
+.nd-kbe-hl-link {
+  color: var(--icon-violet);
+}
+
+.nd-kbe-hl-url {
+  color: var(--muted);
+}
+
+.nd-kbe-hl-quote {
+  color: var(--muted);
+}
+
+.nd-kbe-hl-code {
+  border-radius: var(--r-xs);
+  background: var(--control);
+  outline: 2px solid var(--control);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  color: var(--ink);
+}
+
+.nd-kbe-marker {
+  display: inline-block;
+  width: 0;
+  height: 1em;
+  vertical-align: baseline;
+}
+
+/* --- Celular: abas, barra acima do teclado e campos com 16 px --- */
+.nd-kbe[data-stacked="true"] .nd-kbe-head {
+  padding: var(--sp-2) var(--sp-3);
+  gap: var(--sp-2);
+}
+
+/* Uma linha só: "Concluir", as abas e o estado; o título já está no próprio texto. */
+.nd-kbe[data-stacked="true"] .nd-kbe-head {
+  flex-wrap: nowrap;
+}
+
+.nd-kbe[data-stacked="true"] :is(.nd-kbe-name, .nd-kb-spacer) {
+  display: none;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-modes {
+  order: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-state {
+  order: 2;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-modes .nd-segment-item {
+  flex: 1 1 0;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-write:focus-within {
+  border-left-color: transparent;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-page {
+  padding: var(--sp-4) var(--sp-4) var(--sp-8);
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-bar {
+  border-bottom: 0;
+  border-top: 1px solid var(--divider);
+  padding: var(--sp-1) var(--sp-2) max(var(--sp-1), env(safe-area-inset-bottom));
+  justify-content: space-between;
+  background: var(--surface);
+}
+
+/* As dez ações cabem na largura do iPhone: cada uma com a sua fatia, sem rolar. */
+.nd-kbe[data-stacked="true"] .nd-kbe-bar-group {
+  display: contents;
+}
+
+.nd-kbe[data-stacked="true"] .nd-kbe-bar .nd-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0;
+}
+
+.nd-kbe[data-stacked="true"] > .nd-kb-picker[data-variant="panel"] {
+  margin: 0 var(--sp-2) var(--sp-2);
+}
+
+.nd-root[data-mobile="true"] :is(.nd-kbe-backdrop, .nd-kbe-input) {
+  font-size: var(--fs-touch);
+}
+
+.nd-root[data-mobile="true"] .nd-kbe-title {
+  font-size: var(--fs-display);
+}
+
+/* --- Só leitura (texto acima do teto de edição) --- */
+.nd-kb-readonly {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--control);
+  color: var(--muted);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+
+.nd-kb-readonly-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+
+.nd-kb-readonly-note > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}

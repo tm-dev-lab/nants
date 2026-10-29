@@ -48,6 +48,9 @@ import { appStore, useAppStore } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { MarkdownText } from "../shared/ReportMarkdown";
 import { CitedText } from "../knowledge/CitedText";
+import { usePlanKbSources } from "../knowledge/kbCiteStore";
+import { KbSources } from "./KbSources";
+import { sourcesByTask } from "./kbSourcesModel";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
 import { ProviderEvidenceDetails } from "../shared/ProviderEvidenceDetails";
 import { renumberMap, tasksInExecutionOrder } from "../shared/executionOrder";
@@ -167,9 +170,10 @@ function skillStatusLabel(status: string): string {
 }
 
 /** Partes do detalhe do plano (premissas, orientações...), pela chave do rótulo. */
-type MorePart = "premises" | "guidance" | "environment" | "skills" | "checks" | "changes";
+type MorePart = "criteria" | "premises" | "guidance" | "environment" | "skills" | "checks" | "changes";
 
 const MORE_PART_KEYS: Readonly<Record<MorePart, MessageKey>> = {
+  criteria: "plan.part.criteria",
   premises: "plan.part.premises",
   guidance: "plan.part.guidance",
   environment: "plan.part.environment",
@@ -600,9 +604,22 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
   const renumberId = useId();
   const bigTasks = new Set(tooLargeIssues(checks.issues).map((issue) => issue.task));
   const premises = spec.premises ?? [];
+  const criteria = spec.criteria ?? [];
+  const planRevision = JSON.stringify([spec.status, spec.tasks.map((task) => [task.id, task.criteria]), criteria, premises, guidance]);
+  const kbSources = usePlanKbSources(projectId, spec.id, planRevision);
+  const taskSources = sourcesByTask(kbSources ?? []);
+  const [openTasks, setOpenTasks] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleTask = (id: string): void =>
+    setOpenTasks((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const skills = spec.skills ?? [];
   const changes = spec.plan_changes ?? [];
   const moreParts: MorePart[] = [
+    ...(criteria.length > 0 ? (["criteria"] as const) : []),
     ...(premises.length > 0 ? (["premises"] as const) : []),
     ...(guidance.length > 0 ? (["guidance"] as const) : []),
     ...(spec.environment !== undefined ? (["environment"] as const) : []),
@@ -769,26 +786,71 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
       </header>
 
       <ol className="nd-plan-tasks" aria-label={t("plan.tasksLabel")}>
-        {tasksInExecutionOrder(spec).map((task) => (
-          <li key={task.id} className="nd-plan-task">
-            {/* Só o id identifica a tarefa (094/T08, A-09): sem numeração redundante. */}
-            <span className="nd-mono nd-plan-task-id">{task.id}</span>
-            <span className="nd-plan-task-title nd-break">{task.title}</span>
-            {bigTasks.has(task.id) ? (
-              <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone="amber" data-task-too-large="">
-                {t("plan.tooLarge.badge")}
-              </span>
-            ) : null}
-            {task.depends_on.length > 0 ? (
-              <span className="nd-meta-line nd-plan-task-meta" data-task-meta="">
-                <span className="nd-meta-part nd-break">{t("plan.dependsOn", { ids: task.depends_on.join(", ") })}</span>
-              </span>
-            ) : null}
-          </li>
-        ))}
+        {tasksInExecutionOrder(spec).map((task) => {
+          const taskCriteria = task.criteria ?? [];
+          const open = openTasks.has(task.id);
+          const cites = taskSources.get(task.id) ?? 0;
+          const row = (
+            <>
+              {/* Só o id identifica a tarefa (094/T08, A-09): sem numeração redundante. */}
+              <span className="nd-mono nd-plan-task-id">{task.id}</span>
+              <span className="nd-plan-task-title nd-break">{task.title}</span>
+              {bigTasks.has(task.id) ? (
+                <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone="amber" data-task-too-large="">
+                  {t("plan.tooLarge.badge")}
+                </span>
+              ) : null}
+              {cites > 0 ? (
+                <span className="nd-plan-task-cites" title={tp("plan.task.sources", cites)} data-task-cites={cites}>
+                  <Icon name="knowledge" size={14} />
+                  {cites}
+                </span>
+              ) : null}
+              {task.depends_on.length > 0 ? (
+                <span className="nd-meta-line nd-plan-task-meta" data-task-meta="">
+                  <span className="nd-meta-part nd-break">{t("plan.dependsOn", { ids: task.depends_on.join(", ") })}</span>
+                </span>
+              ) : null}
+            </>
+          );
+          if (taskCriteria.length === 0) {
+            return (
+              <li key={task.id} className="nd-plan-task">
+                {row}
+              </li>
+            );
+          }
+          const listId = `${titleId}-crit-${task.id}`;
+          return (
+            <li key={task.id} className="nd-plan-task-item" data-open={open ? "true" : undefined}>
+              <button
+                type="button"
+                className="nd-plan-task nd-plan-task-toggle"
+                aria-expanded={open}
+                aria-controls={listId}
+                aria-label={`${task.id} ${task.title}`}
+                onClick={() => toggleTask(task.id)}
+              >
+                {row}
+                <Icon name="chevron-right" size={14} className="nd-details-chevron nd-plan-task-chevron" />
+              </button>
+              {open ? (
+                <ol id={listId} className="nd-plan-task-criteria" aria-label={t("plan.task.showCriteria", { task: task.id })}>
+                  {taskCriteria.map((c, i) => (
+                    <li key={`${i}-${c}`} className="nd-break">
+                      <CitedText projectId={projectId} text={c} />
+                    </li>
+                  ))}
+                </ol>
+              ) : null}
+            </li>
+          );
+        })}
       </ol>
 
       {drafting ? null : <PlanChecksSummary checks={checks} />}
+
+      {drafting ? null : <KbSources projectId={projectId} sources={kbSources} />}
 
       {moreParts.length > 0 ? (
         <details className="nd-plan-more" data-plan-more="">
@@ -797,6 +859,21 @@ export function PlanCard({ projectId, spec, onApproved, onRequestFix, fixDisable
             {planMoreLabel(moreParts.map((part) => t(MORE_PART_KEYS[part])))}
           </summary>
           <div className="nd-plan-more-body">
+            {criteria.length > 0 ? (
+              <section aria-labelledby={`${titleId}-criteria`} className="nd-plan-more-section" data-plan-criteria="">
+                <h3 id={`${titleId}-criteria`} className="nd-plan-heading">
+                  {t("sddHeading.globalCriteria")}
+                </h3>
+                <ol className="nd-plan-criteria">
+                  {criteria.map((c, i) => (
+                    <li key={`${i}-${c}`} className="nd-break">
+                      <CitedText projectId={projectId} text={c} />
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            ) : null}
+
             {premises.length > 0 ? (
               <section aria-labelledby={`${titleId}-premises`} className="nd-plan-more-section">
                 <h3 id={`${titleId}-premises`} className="nd-plan-heading">

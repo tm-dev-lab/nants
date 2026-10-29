@@ -122,7 +122,10 @@ impl PlanReviewer {
         let kb_message = match &self.kb {
             Some(secrets) if host.has_kb() => {
                 review_tools.extend(tools::specs_kb());
-                Some(crate::kb::catalog::plan_review_message(&crate::kb::catalog::render(root, secrets)))
+                Some(crate::kb::catalog::plan_review_message(
+                    &crate::kb::catalog::overview(root, secrets),
+                    &crate::kb::catalog::render(root, secrets),
+                ))
                     .filter(|m| !m.is_empty())
             }
             _ => None,
@@ -226,7 +229,7 @@ mod tests {
         assert_eq!(req.messages.len(), plain.messages.len() + 1);
         let kb = &req.messages[1].content;
         assert!(kb.starts_with(crate::kb::catalog::PLAN_REVIEW_RULES), "{kb}");
-        assert!(kb.contains("fiel à fonte") && kb.contains("não contradiz") && kb.contains(&format!("- kb:{} |", doc.id)), "{kb}");
+        assert!(kb.contains("fiel à fonte") && kb.contains("transcrita como regra") && kb.contains(&format!("- kb:{} |", doc.id)), "{kb}");
         assert!(req.messages[2].content.starts_with(PLAN_FACTS_LABEL));
         let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.ends_with(&["kb_search", "kb_read"]), "{names:?}");

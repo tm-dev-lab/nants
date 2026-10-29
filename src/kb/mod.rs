@@ -3,7 +3,8 @@
 //! Estrutura, toda fora do Git do projeto (linha [`KB_EXCLUDE_LINE`] no `.git/info/exclude`):
 //! - `sources/<id>.<ext>`: o original enviado, intocado;
 //! - `notes/<id>.md`: o texto em markdown com frontmatter (`title`, `kind`, `source`,
-//!   `source_url`, `added_at`, `fetched_at`, `sha256`, `pages`, `extractor`, `status`, `role`).
+//!   `source_url`, `added_at`, `fetched_at`, `sha256`, `pages`, `extractor`, `status`). As notas
+//!   da 134 trazem também `role`, que a leitura ignora (só o corpo depois do frontmatter conta).
 //!   Markdown e texto nascem prontos, com o texto normalizado; PDF e link nascem `pending` e a
 //!   fila de extração ([`crate::server::kb_queue`], T02) passa por `extracting` até `ready`,
 //!   `no_text` ou `error` (com o motivo codificado em `status_reason`);
@@ -19,6 +20,12 @@
 //!   chave privada PEM ou com um segredo configurado são recusados na entrada;
 //! - o id é estável e seguro para caminho ([`valid_id`]): `slug-<hex do sha256>`;
 //! - o texto gravado na nota já sai redigido pelo `SecretSet`, e a leitura redige de novo.
+//!
+//! Spec 136 T10, documentos escritos no Nants ([`add_written`] e [`edit_content`]): o documento
+//! escrito é um markdown com `source: "written"`, gravado pelo mesmo caminho (original em
+//! `sources/<id>.md`, nota, manifesto, a mesma recusa de segredo e a mesma redação). A edição vale
+//! para ele e para os enviados em markdown ou texto, cujo original é o próprio texto; PDF e link
+//! são extração de um original e continuam só leitura.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -38,6 +45,7 @@ pub mod cite;
 pub mod extract;
 pub mod index;
 pub mod indicators;
+pub mod mention;
 #[cfg(test)]
 pub(crate) mod test_pdf;
 
@@ -68,10 +76,6 @@ pub const MAX_OVERVIEW_BYTES: usize = 32 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 200;
 /// Tamanho máximo do título derivado do nome do arquivo ou do link.
 pub const MAX_TITLE_CHARS: usize = 200;
-/// Quantidade máxima de globs em `applies_to` (C-21).
-pub const MAX_APPLIES_TO: usize = 32;
-/// Tamanho máximo de um glob de `applies_to`.
-pub const MAX_GLOB_CHARS: usize = 200;
 /// Tamanho máximo de um link.
 pub const MAX_URL_BYTES: usize = 2048;
 /// Tamanho máximo do nome do arquivo enviado.
@@ -80,6 +84,12 @@ pub const MAX_FILE_NAME_CHARS: usize = 255;
 pub const MAX_ID_CHARS: usize = 64;
 /// Tamanho máximo do slug no início do id.
 const SLUG_MAX_CHARS: usize = 40;
+/// Teto do texto de um documento escrito ou editado no Nants (2 MiB): folgado para um documento
+/// escrito à mão, e o corpo vai inteiro num JSON (o limite da rota é [`MAX_WRITTEN_BODY_BYTES`]).
+pub const MAX_WRITTEN_BYTES: usize = 2 * 1024 * 1024;
+/// Limite de corpo das rotas de escrita (`POST /kb/written` e `PUT /kb/docs/:doc/content`): o
+/// dobro do texto, para o escape do JSON, mais folga para o título e a versão.
+pub const MAX_WRITTEN_BODY_BYTES: usize = 2 * MAX_WRITTEN_BYTES + 64 * 1024;
 /// Versão do formato do manifesto.
 pub const MANIFEST_VERSION: u32 = 1;
 
@@ -91,24 +101,6 @@ const SOURCE_EXTS: [&str; 4] = ["md", "txt", "pdf", "html"];
 
 /// Serializa as mutações da base (manifesto, notas e originais) entre pedidos simultâneos.
 static KB_GUARD: Mutex<()> = Mutex::new(());
-
-/// Marcação do documento (C-17): padrão do projeto ou referência.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Standard,
-    #[default]
-    Reference,
-}
-
-impl Role {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Reference => "reference",
-        }
-    }
-}
 
 /// Tipo do documento.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,12 +174,13 @@ impl Status {
     }
 }
 
-/// Origem do documento: arquivo enviado ou link.
+/// Origem do documento: arquivo enviado, link ou escrito no Nants (spec 136 T10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     File,
     Url,
+    Written,
 }
 
 impl Origin {
@@ -195,11 +188,16 @@ impl Origin {
         match self {
             Self::File => "file",
             Self::Url => "url",
+            Self::Written => "written",
         }
     }
 }
 
 /// Um documento do manifesto.
+///
+/// Spec 136 T02 (P2): sem classificação manual. Os campos `role` e `applies_to` dos manifestos da
+/// 134 não existem mais aqui: a leitura os ignora (a struct não recusa campo desconhecido) e a
+/// próxima gravação do manifesto os descarta.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
@@ -232,14 +230,9 @@ pub struct Entry {
     /// Extrator que gerou a nota (`raw` para markdown e texto).
     #[serde(default)]
     pub extractor: Option<String>,
-    #[serde(default)]
-    pub role: Role,
     /// Descrição de uma linha, escrita pela pessoa (C-19); a T02 preenche um rascunho extraído.
     #[serde(default)]
     pub description: String,
-    /// Globs dos caminhos a que um padrão se aplica (C-21). Sempre vazio em `reference`.
-    #[serde(default)]
-    pub applies_to: Vec<String>,
     /// Ids dos documentos da base citados por este (C-22), recalculados a cada mudança da base.
     #[serde(default)]
     pub links_out: Vec<String>,
@@ -292,12 +285,23 @@ pub enum KbError {
     BadDescription,
     /// Descrição acima de [`MAX_DESCRIPTION_CHARS`].
     DescriptionTooLong,
-    /// Glob inválido ou acima dos tetos.
-    BadAppliesTo,
-    /// `applies_to` num documento de referência.
-    AppliesToStandardOnly,
     /// Visão geral acima de [`MAX_OVERVIEW_BYTES`].
     OverviewTooLarge,
+    /// Título do documento escrito vazio (spec 136 T10).
+    TitleEmpty,
+    /// Título acima de [`MAX_TITLE_CHARS`].
+    TitleTooLong,
+    /// Já existe documento com o mesmo título: o id dele.
+    TitleTaken(String),
+    /// Texto escrito acima de [`MAX_WRITTEN_BYTES`].
+    WrittenTooLarge,
+    /// A versão (`base_sha256`) enviada não é mais a atual: outra edição gravou antes.
+    EditConflict,
+    /// PDF e link: o texto é extração de um original e não se edita.
+    NotEditable,
+    /// O original de um editável mudaria com a redação (segredo configurado, credencial num
+    /// endereço): não sai redigido, para o editor não gravar o texto redigido por cima do original.
+    SourceRedacted,
 }
 
 impl From<SafeFsError> for KbError {
@@ -362,7 +366,7 @@ fn slugify(text: &str) -> String {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -474,33 +478,6 @@ pub fn clean_description(raw: &str) -> Result<String, KbError> {
         return Err(KbError::DescriptionTooLong);
     }
     Ok(text.to_string())
-}
-
-/// Globs validados (C-21): relativos à raiz, sem `..`, sem controle, até os tetos; vazios saem e
-/// repetidos também.
-pub fn clean_applies_to(raw: &[String]) -> Result<Vec<String>, KbError> {
-    let mut out: Vec<String> = Vec::new();
-    for glob in raw {
-        let glob = glob.trim();
-        if glob.is_empty() {
-            continue;
-        }
-        let bad = glob.chars().count() > MAX_GLOB_CHARS
-            || glob.chars().any(char::is_control)
-            || glob.starts_with('/')
-            || glob.contains('\\')
-            || glob.split('/').any(|part| part == "..");
-        if bad {
-            return Err(KbError::BadAppliesTo);
-        }
-        if !out.iter().any(|g| g == glob) {
-            out.push(glob.to_string());
-        }
-    }
-    if out.len() > MAX_APPLIES_TO {
-        return Err(KbError::BadAppliesTo);
-    }
-    Ok(out)
 }
 
 /// Link validado e normalizado (sem o fragmento): http ou https, com host, sem usuário nem senha.
@@ -618,7 +595,6 @@ fn note_text(entry: &Entry, body: &str) -> String {
         ("pages", pages),
         ("extractor", fm_str(entry.extractor.as_deref())),
         ("status", fm_str(Some(entry.status.as_str()))),
-        ("role", fm_str(Some(entry.role.as_str()))),
     ] {
         out.push_str(key);
         out.push_str(": ");
@@ -767,9 +743,7 @@ pub fn add_file(root: &Path, name: &str, data: &[u8], secrets: &SecretSet, now: 
         status_reason: None,
         pages: None,
         extractor: extracted.as_ref().map(|e| e.extractor.to_string()),
-        role: Role::Reference,
         description: extracted_description(secrets, extracted.as_ref().and_then(|e| e.description.as_deref())),
-        applies_to: Vec::new(),
         links_out: Vec::new(),
         link_targets: extracted.as_ref().map(|e| e.link_targets.clone()).unwrap_or_default(),
     };
@@ -829,9 +803,7 @@ pub fn add_link(root: &Path, raw_url: &str, secrets: &SecretSet, now: &str) -> R
         status_reason: None,
         pages: None,
         extractor: None,
-        role: Role::Reference,
         description: String::new(),
-        applies_to: Vec::new(),
         links_out: Vec::new(),
         link_targets: Vec::new(),
     };
@@ -846,6 +818,178 @@ pub fn add_link(root: &Path, raw_url: &str, secrets: &SecretSet, now: &str) -> R
         return Err(e);
     }
     Ok(entry)
+}
+
+// --- documentos escritos no Nants (spec 136 T10) ---
+
+/// Chave de comparação de títulos: sem acento, sem caixa e com os espaços colapsados
+/// ("Padrões  da API" e "padroes da api" são o mesmo título).
+fn title_key(title: &str) -> String {
+    one_line(title, usize::MAX).chars().map(fold_accent).flat_map(char::to_lowercase).collect()
+}
+
+/// Título do documento escrito: uma linha, sem caracteres de controle, até [`MAX_TITLE_CHARS`];
+/// vazio é recusado, e o título com segredo também (ele vai ao manifesto, à nota e ao catálogo).
+fn clean_title(raw: &str, secrets: &SecretSet) -> Result<String, KbError> {
+    let title = one_line(raw, usize::MAX);
+    if title.is_empty() {
+        return Err(KbError::TitleEmpty);
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(KbError::TitleTooLong);
+    }
+    if has_private_key(title.as_bytes()) || has_configured_secret(secrets, title.as_bytes()) {
+        return Err(KbError::SecretContent);
+    }
+    Ok(title)
+}
+
+/// Texto escrito ou editado: até [`MAX_WRITTEN_BYTES`], sem byte nulo, sem chave privada nem
+/// segredo configurado (a mesma recusa do envio de arquivo).
+fn check_written(content: &str, secrets: &SecretSet) -> Result<(), KbError> {
+    if content.len() > MAX_WRITTEN_BYTES {
+        return Err(KbError::WrittenTooLarge);
+    }
+    if content.contains('\0') {
+        return Err(KbError::NotText);
+    }
+    if has_private_key(content.as_bytes()) || has_configured_secret(secrets, content.as_bytes()) {
+        return Err(KbError::SecretContent);
+    }
+    Ok(())
+}
+
+/// Cria um documento escrito no Nants: markdown, `source: "written"`, pronto na hora.
+///
+/// - **Id:** estável a partir do título ([`make_id`] com o slug e o hash da chave do título): o
+///   mesmo título dá o mesmo id, também depois de remover e escrever de novo.
+/// - **Título:** o da pessoa (o `title` de um frontmatter no texto não o troca); repetido (a mesma
+///   chave de [`title_key`] de outro documento da base) é recusado com o id do outro.
+/// - **Nome:** `<slug do título>.md`, para que um link `[texto](<slug>.md)` de outro documento
+///   chegue a ele pela regra de sempre ([`link_points_to`]).
+/// - **Duplicata:** o mesmo conteúdo de outro documento não é recusado; vira o indicador
+///   `duplicate` ([`indicators`]).
+pub fn add_written(root: &Path, raw_title: &str, content: &str, secrets: &SecretSet, now: &str) -> Result<Entry, KbError> {
+    let title = clean_title(raw_title, secrets)?;
+    check_written(content, secrets)?;
+    let extracted = extract::text(content, true);
+    let sha256 = sha256_hex(content.as_bytes());
+    let key = title_key(&title);
+    let slug = slugify(&title);
+
+    let _guard = lock();
+    ensure_layout(root)?;
+    let mut manifest = load_manifest(root)?;
+    if let Some(taken) = manifest.docs.iter().find(|d| title_key(&d.title) == key) {
+        return Err(KbError::TitleTaken(taken.id.clone()));
+    }
+    let id = make_id(&slug, &sha256_hex(key.as_bytes()), &manifest).ok_or(KbError::Fs(SafeFsError::Io))?;
+    let entry = Entry {
+        id: id.clone(),
+        title,
+        kind: Kind::Markdown,
+        source: Origin::Written,
+        file_name: Some(format!("{slug}.md")),
+        source_url: None,
+        size: content.len() as u64,
+        sha256,
+        added_at: now.to_string(),
+        fetched_at: None,
+        status: Status::Ready,
+        status_reason: None,
+        pages: None,
+        extractor: Some(extracted.extractor.to_string()),
+        description: extracted_description(secrets, extracted.description.as_deref()),
+        links_out: Vec::new(),
+        link_targets: extracted.link_targets.clone(),
+    };
+    remove_files(root, &id);
+    let mut saved = entry.clone();
+    let stored = write_new_file(root, &source_rel(&id, "md"), content.as_bytes())
+        .and_then(|()| write_atomic(root, &note_rel(&id), note_text(&entry, &scrub_text(secrets, &extracted.body)).as_bytes()))
+        .and_then(|()| {
+            manifest.docs.push(entry.clone());
+            relink(&mut manifest);
+            if let Some(found) = manifest.docs.iter().find(|d| d.id == id) {
+                saved = found.clone();
+            }
+            save_manifest(root, &manifest)
+        });
+    if let Err(e) = stored {
+        remove_files(root, &id);
+        return Err(e);
+    }
+    Ok(saved)
+}
+
+/// `true` se o texto do documento é editável no Nants: o escrito e o enviado em markdown ou
+/// texto (o original é o próprio texto). PDF e link são extração de um original.
+pub fn is_editable(entry: &Entry) -> bool {
+    matches!(entry.kind, Kind::Markdown | Kind::Text) && matches!(entry.source, Origin::File | Origin::Written)
+}
+
+/// Troca o texto de `id` (spec 136 T10): regrava o original e a nota e recalcula o `sha256`, o
+/// tamanho, os alvos de link e os `links_out` de toda a base. O índice e os indicadores seguem o
+/// manifesto, que muda junto (a impressão do `sha256` do manifesto invalida o índice).
+///
+/// - **Versão:** `base_sha256` é o `sha256` que a pessoa abriu; outro → [`KbError::EditConflict`]
+///   e nada é gravado.
+/// - **Título:** fica o do manifesto e do frontmatter da nota (não é derivado do texto de novo).
+/// - **Descrição:** a escrita pela pessoa fica; vazia, ou igual ao rascunho extraído do texto
+///   antigo, passa a ser a extraída do texto novo.
+/// - **Ordem:** original, nota e por fim o manifesto; o índice nunca vê o manifesto novo com a
+///   nota antiga. Falhou no meio, o original e a nota antigos voltam (melhor esforço).
+pub fn edit_content(root: &Path, id: &str, content: &str, base_sha256: &str, secrets: &SecretSet) -> Result<Entry, KbError> {
+    if !valid_id(id) {
+        return Err(KbError::NotFound);
+    }
+    check_written(content, secrets)?;
+
+    let _guard = lock();
+    let mut manifest = load_manifest(root)?;
+    let entry = manifest.docs.iter_mut().find(|d| d.id == id).ok_or(KbError::NotFound)?;
+    if !is_editable(entry) {
+        return Err(KbError::NotEditable);
+    }
+    if entry.sha256 != base_sha256 {
+        return Err(KbError::EditConflict);
+    }
+    let ext = entry.kind.source_ext().ok_or(KbError::NotEditable)?;
+    let markdown = entry.kind == Kind::Markdown;
+    let old_note = read_note_file(root, id)?;
+    // A descrição que é o rascunho extraído do texto antigo acompanha o texto; a escrita pela
+    // pessoa (diferente do rascunho) fica.
+    let old_draft = old_note
+        .as_deref()
+        .map(|note| extracted_description(secrets, extract::text(note_body(note), markdown).description.as_deref()));
+    let extracted = extract::text(content, markdown);
+    entry.sha256 = sha256_hex(content.as_bytes());
+    entry.size = content.len() as u64;
+    entry.status = Status::Ready;
+    entry.status_reason = None;
+    entry.extractor = Some(extracted.extractor.to_string());
+    entry.link_targets = extracted.link_targets.clone();
+    if entry.description.is_empty() || old_draft.as_deref() == Some(entry.description.as_str()) {
+        entry.description = extracted_description(secrets, extracted.description.as_deref());
+    }
+    relink(&mut manifest);
+    let updated = manifest.docs.iter().find(|d| d.id == id).cloned().ok_or(KbError::NotFound)?;
+
+    let source = source_rel(id, ext);
+    let old_source = safe_fs::read_bounded(root, &source, MAX_UPLOAD_BYTES as u64).ok().and_then(|r| r.data);
+    let stored = write_atomic(root, &source, content.as_bytes())
+        .and_then(|()| write_atomic(root, &note_rel(id), note_text(&updated, &scrub_text(secrets, &extracted.body)).as_bytes()))
+        .and_then(|()| save_manifest(root, &manifest));
+    if let Err(e) = stored {
+        if let Some(bytes) = old_source {
+            let _ = write_atomic(root, &source, &bytes);
+        }
+        if let Some(note) = old_note {
+            let _ = write_atomic(root, &note_rel(id), note.as_bytes());
+        }
+        return Err(e);
+    }
+    Ok(updated)
 }
 
 // --- extração (T02) ---
@@ -972,6 +1116,14 @@ pub fn list(root: &Path) -> Result<Vec<Entry>, KbError> {
     Ok(load_manifest(root)?.docs)
 }
 
+/// Entrada de `id` no manifesto, sem ler a nota (spec 136 T03, a leitura de uma seção).
+pub fn read_entry(root: &Path, id: &str) -> Result<Entry, KbError> {
+    if !valid_id(id) {
+        return Err(KbError::NotFound);
+    }
+    load_manifest(root)?.docs.into_iter().find(|d| d.id == id).ok_or(KbError::NotFound)
+}
+
 /// Entrada e corpo da nota de `id`, redigido pelo `SecretSet`. Nota ainda ausente → corpo vazio.
 pub fn read_note(root: &Path, id: &str, secrets: &SecretSet) -> Result<(Entry, String), KbError> {
     if !valid_id(id) {
@@ -982,49 +1134,66 @@ pub fn read_note(root: &Path, id: &str, secrets: &SecretSet) -> Result<(Entry, S
     Ok((entry, crate::server::projects::scrub_text(secrets, note_body(&note))))
 }
 
-/// Alteração de um documento pela pessoa.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Patch {
-    pub role: Option<Role>,
-    pub description: Option<String>,
-    pub applies_to: Option<Vec<String>>,
+/// Texto-fonte de um documento editável (spec 136 T11), para o editor: a entrada e o original,
+/// sem redação. O `sha256` da entrada é a versão que o `PUT` espera em `base_sha256`.
+///
+/// - PDF e link → [`KbError::NotEditable`];
+/// - original acima de [`MAX_WRITTEN_BYTES`] → [`KbError::WrittenTooLarge`] (a gravação recusaria);
+/// - original que a redação mudaria → [`KbError::SourceRedacted`]: o envio e a escrita já recusam
+///   segredo configurado, então isso só acontece com um segredo configurado depois do envio ou com
+///   uma credencial num endereço; devolver o texto redigido levaria o marcador ao original.
+pub fn read_source(root: &Path, id: &str, secrets: &SecretSet) -> Result<(Entry, String), KbError> {
+    if !valid_id(id) {
+        return Err(KbError::NotFound);
+    }
+    let entry = load_manifest(root)?.docs.into_iter().find(|d| d.id == id).ok_or(KbError::NotFound)?;
+    if !is_editable(&entry) {
+        return Err(KbError::NotEditable);
+    }
+    let ext = entry.kind.source_ext().ok_or(KbError::NotEditable)?;
+    let text = match safe_fs::read_regular(root, &source_rel(id, ext), MAX_WRITTEN_BYTES as u64) {
+        Ok(text) => text,
+        Err(SafeFsError::TooLarge) => return Err(KbError::WrittenTooLarge),
+        Err(e) => return Err(KbError::Fs(e)),
+    };
+    if crate::server::projects::scrub_text(secrets, &text) != text {
+        return Err(KbError::SourceRedacted);
+    }
+    Ok((entry, text))
 }
 
-/// Altera `role`, `description` e `applies_to`. `applies_to` só vale em `standard`: pedido com
-/// globs num documento de referência é recusado, e passar para `reference` limpa os globs.
+/// Alteração de um documento pela pessoa: a descrição.
+///
+/// Spec 136 T02 (C-06): o `PATCH` da 134 mandava também `role` e `applies_to`. Os dois continuam
+/// aceitos, com qualquer valor, e são ignorados: um cliente antigo não recebe erro, e nenhum campo
+/// desconhecido além deles passa.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Patch {
+    pub description: Option<String>,
+    /// `role` da 134, ignorado.
+    #[serde(default, rename = "role")]
+    pub legacy_role: Option<serde::de::IgnoredAny>,
+    /// `applies_to` da 134, ignorado.
+    #[serde(default, rename = "applies_to")]
+    pub legacy_applies_to: Option<serde::de::IgnoredAny>,
+}
+
+/// Altera a `description`. Os campos antigos do [`Patch`] não mudam nada.
 pub fn update(root: &Path, id: &str, patch: &Patch) -> Result<Entry, KbError> {
     if !valid_id(id) {
         return Err(KbError::NotFound);
     }
     let description = patch.description.as_deref().map(clean_description).transpose()?;
-    let applies_to = patch.applies_to.as_deref().map(clean_applies_to).transpose()?;
 
     let _guard = lock();
     let mut manifest = load_manifest(root)?;
     let entry = manifest.docs.iter_mut().find(|d| d.id == id).ok_or(KbError::NotFound)?;
-    let role = patch.role.unwrap_or(entry.role);
-    if role == Role::Reference && applies_to.as_ref().is_some_and(|g| !g.is_empty()) {
-        return Err(KbError::AppliesToStandardOnly);
-    }
-    let role_changed = role != entry.role;
-    entry.role = role;
     if let Some(description) = description {
         entry.description = description;
     }
-    if let Some(applies_to) = applies_to {
-        entry.applies_to = applies_to;
-    }
-    if role == Role::Reference {
-        entry.applies_to.clear();
-    }
     let updated = entry.clone();
     save_manifest(root, &manifest)?;
-    if role_changed {
-        // A nota traz o `role` no frontmatter: regrava com o corpo de antes.
-        let note = read_note_file(root, id)?.unwrap_or_default();
-        write_atomic(root, &note_rel(id), note_text(&updated, note_body(&note)).as_bytes())?;
-    }
     Ok(updated)
 }
 
@@ -1072,3 +1241,5 @@ pub fn write_overview(root: &Path, text: &str) -> Result<(), KbError> {
 mod tests;
 #[cfg(test)]
 mod eval_tests;
+#[cfg(test)]
+mod written_tests;

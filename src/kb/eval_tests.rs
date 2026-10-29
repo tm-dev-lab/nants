@@ -15,7 +15,9 @@
 //! - `kb_eval_recall`: hit@1, hit@5 e MRR da busca (a mesma de `kb_search`), por base e na base
 //!   com todos os documentos juntos; a escolha do documento (doc@1) com três descrições (vazia,
 //!   a extraída na entrada e a escrita à mão, C-19); e a escolha do documento só pelo catálogo
-//!   (título contra título e descrição), que é o que o modelo vê no prefixo.
+//!   pela linha real do catálogo, com e sem o sumário do nível útil e com a descrição escrita
+//!   (spec 136 T08), que é o que o modelo vê no prefixo; e os bytes do catálogo em bases
+//!   simuladas de 10, 25 e 50 documentos.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -190,28 +192,109 @@ fn short(id: &str) -> &str {
     id.rsplit_once('-').map_or(id, |(a, _)| a)
 }
 
-/// Escolha do documento só pelo catálogo (título, com ou sem a descrição): o que o modelo vê no
-/// prefixo antes de buscar. Mede doc@1 de um BM25 sobre as linhas do catálogo.
-fn catalog_choice(docs: &[(Entry, String)], questions: &[&Question], with_description: bool) -> (usize, usize) {
+/// Linha do catálogo usada na escolha do documento (spec 136 T08, C-08).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Line {
+    /// Só o título (a linha de base da 134/T07, mantida como histórico).
+    Title,
+    /// A linha real do catálogo (`catalog_line` sem o sumário), com a descrição extraída.
+    Real,
+    /// A linha real com o sumário do nível útil.
+    Summary,
+    /// A linha real com a descrição escrita à mão.
+    Written,
+    /// A linha real com o sumário e a descrição escrita.
+    SummaryWritten,
+}
+
+const LINES: [Line; 5] = [Line::Title, Line::Real, Line::Summary, Line::Written, Line::SummaryWritten];
+
+/// Escolha do documento só pelo catálogo: o que o modelo vê no prefixo antes de buscar. Mede
+/// doc@1 de um BM25 sobre as linhas do catálogo (uma linha por documento) e devolve os acertos.
+fn catalog_choice(root: &Path, docs: &[(Entry, String)], questions: &[&Question], line: Line, written: &HashMap<String, String>) -> usize {
     let none = SecretSet::default();
+    let docs = match line {
+        Line::Written | Line::SummaryWritten => with_descriptions(docs, Desc::Written, written),
+        _ => docs.to_vec(),
+    };
     let lines: Vec<(Entry, String)> = docs
         .iter()
         .map(|(e, _)| {
+            let body = match line {
+                Line::Title => format!("{}\n", e.title),
+                Line::Real | Line::Written => format!("{}\n", super::catalog::catalog_line(root, e, &none, false)),
+                Line::Summary | Line::SummaryWritten => format!("{}\n", super::catalog::catalog_line(root, e, &none, true)),
+            };
             let mut e = e.clone();
-            let body = if with_description { format!("{}\n\n{}\n", e.title, e.description) } else { format!("{}\n", e.title) };
             e.description.clear();
             (e, body)
         })
         .collect();
     let index = Index::build(lines);
-    let mut ok = 0;
-    for q in questions {
-        let hits = index.search(&q.q, 1, &none);
-        if hits.first().is_some_and(|h| h.doc_id.starts_with(&q.doc)) {
-            ok += 1;
-        }
+    questions
+        .iter()
+        .filter(|q| index.search(&q.q, 1, &none).first().is_some_and(|h| h.doc_id.starts_with(&q.doc)))
+        .count()
+}
+
+/// Base simulada com `n` documentos, repetindo os de `pool` (a base com tudo) com outro id, para
+/// medir os bytes do catálogo. Devolve a pasta (em `TMPDIR`, que o `scripts/test.sh` apaga).
+fn simulated_base(pool_root: &Path, n: usize) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("nants-kbeval-sim-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".sdd/kb/notes")).expect("pasta");
+    let text = std::fs::read_to_string(pool_root.join(super::MANIFEST_REL)).expect("manifesto");
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let pool: Vec<serde_json::Value> =
+        manifest["docs"].as_array().expect("docs").iter().filter(|d| d["status"] == "ready").cloned().collect();
+    let mut docs = Vec::new();
+    for i in 0..n {
+        let mut d = pool[i % pool.len()].clone();
+        let old = d["id"].as_str().expect("id").to_string();
+        let id = format!("{}-{:08x}", short(&old), i);
+        std::fs::copy(pool_root.join(format!(".sdd/kb/notes/{old}.md")), root.join(format!(".sdd/kb/notes/{id}.md"))).expect("nota");
+        d["id"] = serde_json::json!(id);
+        docs.push(d);
     }
-    (ok, questions.len())
+    let out = serde_json::json!({ "version": manifest["version"], "docs": docs });
+    std::fs::write(root.join(super::MANIFEST_REL), serde_json::to_string_pretty(&out).expect("json")).expect("manifesto");
+    root
+}
+
+/// Modo do catálogo: inteiro com o sumário, inteiro sem ele ou curto.
+fn catalog_mode(text: &str) -> &'static str {
+    if text.contains("Catálogo longo") {
+        "curto"
+    } else if text.contains("(seções: ") {
+        "inteiro com sumário"
+    } else {
+        "inteiro sem sumário"
+    }
+}
+
+/// Bytes e modo do catálogo em bases simuladas de 10, 25 e 50 documentos com os degraus `steps`,
+/// e o maior número de documentos com o catálogo inteiro (com ou sem o sumário).
+fn catalog_sizes(pool_root: &Path, steps: &[bool]) -> (usize, Vec<(usize, usize, &'static str)>) {
+    let none = SecretSet::default();
+    let mut samples = Vec::new();
+    for n in [10usize, 25, 50] {
+        let root = simulated_base(pool_root, n);
+        let text = super::catalog::render_steps(&root, &none, steps);
+        assert_eq!(super::catalog::render_steps(&root, &none, steps), text, "mesma base, mesmo catálogo");
+        samples.push((n, text.len(), catalog_mode(&text)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    let mut last = 0;
+    for n in 1..=60usize {
+        let root = simulated_base(pool_root, n);
+        let text = super::catalog::render_steps(&root, &none, steps);
+        let _ = std::fs::remove_dir_all(&root);
+        if catalog_mode(&text) == "curto" {
+            break;
+        }
+        last = n;
+    }
+    (last, samples)
 }
 
 #[test]
@@ -295,23 +378,61 @@ fn kb_eval_recall() {
         stats.approx_bytes / 1024
     );
 
-    // Escolha do documento só pelo catálogo (C-19).
-    println!("\ncatálogo (doc@1 só pela linha do catálogo): base | só título | título + extraída | título + escrita");
+    // Escolha do documento só pelo catálogo (C-19; spec 136 T08, C-08).
+    //
+    // LIMIAR, escrito antes de rodar (spec 136 T08): o sumário do nível útil entra no catálogo se
+    // a escolha do documento certo pela linha com o sumário (`Summary`) não piorar em nenhuma base
+    // contra a linha real (`Real`), contando os acertos absolutos, e melhorar na soma das bases
+    // (pelo menos um acerto a mais), e se a base simulada de 25 documentos não cair no modo curto
+    // por causa dele. Senão, o catálogo fica como está e os números ficam registrados aqui.
+    //
+    // Resultado de 2026-10-29 (acertos/n; (a) linha real, (b) com o sumário, (c) com a escrita):
+    // cruzado 0/5, 0/5, 3/5; cruzado-traduzido 2/5, 2/5, 1/5; html 9/15, 11/15, 10/15;
+    // md 4/14, 5/14, 6/14; pdf 0/15, 0/15, 0/15 (soma 15/54 contra 18/54); todas 13/44, 15/44,
+    // 13/44. Bytes: só com o sumário, a base de 25 documentos cairia no modo curto (inteiro até
+    // 16); em degraus (`CATALOG_STEPS`), 10 documentos com o sumário, 25 inteiros sem ele e 50
+    // no modo curto, como antes: adotado em degraus.
+    println!("\ncatálogo (doc@1 só pela linha do catálogo, acertos/n): base | só título | (a) linha real | (b) real + sumário | (c) real + escrita | (b)+(c)");
+    let mut not_worse = true;
+    let (mut real_sum, mut summary_sum) = (0usize, 0usize);
+    let mut table = |name: &str, root: &Path, docs: &[(Entry, String)], qs: &[&Question], written: &HashMap<String, String>, counts: bool| {
+        let n = qs.len();
+        let got: Vec<usize> = LINES.iter().map(|l| catalog_choice(root, docs, qs, *l, written)).collect();
+        let cells: Vec<String> = got.iter().map(|ok| format!("{ok}/{n} ({})", Score::pct(*ok, n))).collect();
+        println!("{name:<5} | {}", cells.join(" | "));
+        let (real, summary) = (got[1], got[2]);
+        not_worse &= summary >= real;
+        if counts {
+            real_sum += real;
+            summary_sum += summary;
+        }
+    };
     for (name, base) in &fx.bases {
-        let docs = load(&dir.join(base.dir.as_deref().unwrap_or(name)));
+        let root = dir.join(base.dir.as_deref().unwrap_or(name));
+        let docs = load(&root);
         let qs: Vec<&Question> = base.questions.iter().collect();
         let written = if base.dir.is_some() { &all_written } else { &base.descriptions };
-        let (t_ok, n) = catalog_choice(&docs, &qs, false);
-        let (e_ok, _) = catalog_choice(&docs, &qs, true);
-        let (w_ok, _) = catalog_choice(&with_descriptions(&docs, Desc::Written, written), &qs, true);
-        println!("{name:<5} | {} | {} | {}", Score::pct(t_ok, n), Score::pct(e_ok, n), Score::pct(w_ok, n));
+        table(name, &root, &docs, &qs, written, true);
     }
-    {
-        let (t_ok, n) = catalog_choice(&all_docs, &qs_all, false);
-        let (e_ok, _) = catalog_choice(&all_docs, &qs_all, true);
-        let (w_ok, _) = catalog_choice(&with_descriptions(&all_docs, Desc::Written, &all_written), &qs_all, true);
-        println!("{:<5} | {} | {} | {}", "todas", Score::pct(t_ok, n), Score::pct(e_ok, n), Score::pct(w_ok, n));
+    // A linha "todas" junta as perguntas de pdf, html e md na base com tudo: conta para o "não
+    // piorar", fora da soma (as perguntas já estão nas linhas das bases).
+    table("todas", &dir.join("all"), &all_docs, &qs_all, &all_written, false);
+    // Bytes: com quantos documentos o catálogo cai no modo curto, antes (sem o sumário), só com
+    // o sumário e em degraus (o catálogo de verdade).
+    let all_root = dir.join("all");
+    let (fit_before, before) = catalog_sizes(&all_root, &[false]);
+    let (fit_summary, only) = catalog_sizes(&all_root, &[true]);
+    let (fit_steps, steps) = catalog_sizes(&all_root, &super::catalog::CATALOG_STEPS);
+    println!("\ncatálogo (bytes, teto {} B): n | sem sumário | só com sumário | em degraus", super::catalog::MAX_CATALOG_BYTES);
+    for (((n, b, bm), (_, o, om)), (_, d, dm)) in before.iter().zip(only.iter()).zip(steps.iter()) {
+        println!("{n:>3} | {b:>5} {bm} | {o:>5} {om} | {d:>5} {dm}");
     }
+    println!("inteiro até: {fit_before} documentos sem o sumário; {fit_summary} só com o sumário; {fit_steps} em degraus");
+    let medium_ok = fit_steps >= fit_before;
+    let adopt = not_worse && summary_sum > real_sum && medium_ok;
+    println!(
+        "limiar: não piora em nenhuma base = {not_worse}; soma (a) {real_sum} contra (b) {summary_sum}; o sumário não leva base nenhuma ao modo curto = {medium_ok}; adotar em degraus = {adopt}"
+    );
     assert!(total >= 10, "poucas perguntas: {total}");
     assert!(rows.iter().all(|(_, _, s)| s.n > 0));
 }

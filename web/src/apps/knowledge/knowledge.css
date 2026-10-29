@@ -234,13 +234,6 @@
   min-width: 0;
 }
 
-.nd-kb-row-head {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
 .nd-kb-title {
   color: var(--ink);
   font-weight: var(--fw-medium);
@@ -256,12 +249,6 @@
   color: var(--muted);
   margin: 0;
   overflow-wrap: anywhere;
-}
-
-.nd-kb-role-ref {
-  font-size: var(--fs-caption);
-  color: var(--muted);
-  white-space: nowrap;
 }
 
 .nd-kb-reason {
@@ -383,23 +370,6 @@
 
 .nd-kb-field-value.nd-muted {
   color: var(--muted);
-}
-
-.nd-kb-globs {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-1);
-}
-
-.nd-kb-glob {
-  padding: 0 var(--sp-2);
-  border-radius: var(--r-sm);
-  background: var(--control);
-  color: var(--ink);
-  line-height: 1.8;
 }
 
 .nd-kb-confirm {
@@ -541,6 +511,7 @@
   cursor: pointer;
   vertical-align: baseline;
   text-align: left;
+  text-decoration: none;
   /* Link dentro do texto corrido: no celular, sem a altura mínima de 44 px dos botões. */
   min-height: 0;
 }
@@ -593,4 +564,1370 @@
 
 .nd-kb[data-size="narrow"] .nd-kb-add:not([data-empty]) .nd-kb-drop-text {
   order: 2;
+}
+
+/*
+ * --- Prévia da citação (spec 136 T04) ---
+ * Cartão do desktop na camada de sobreposição (superfície sólida elevada, sem borda) e folha
+ * inferior do celular. O trecho tem altura reservada desde o carregamento: nada pula nem pisca.
+ */
+.nd-kb-cite[data-removed="true"] {
+  background: var(--control);
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.nd-kb-card {
+  position: absolute;
+  z-index: 955;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  box-shadow: var(--bevel), var(--elev-3);
+  color: var(--ink2);
+  font-size: var(--fs-control);
+  line-height: 1.5;
+  animation: nd-kb-fade-in 140ms ease-out;
+}
+
+.nd-kb-card[data-above="true"] {
+  transform: translateY(-100%);
+}
+
+@keyframes nd-kb-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.nd-kb-card-doc {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-card-doc > svg {
+  flex-shrink: 0;
+  color: var(--icon-violet);
+}
+
+.nd-kb-card-doc-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-card-page {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.nd-kb-card-heading {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.nd-kb-card-trail {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-kb-card-title {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* O trecho: altura reservada no carregamento e fim esmaecido quando passa do teto. */
+.nd-kb-card-text {
+  min-height: 72px;
+  max-height: 176px;
+  overflow: hidden;
+  color: var(--ink2);
+  mask-image: linear-gradient(to bottom, black 72%, transparent);
+}
+
+.nd-kb-card-text[data-state="error"] {
+  mask-image: none;
+}
+
+.nd-kb-card-text :where(p, ul, ol, pre, table) {
+  margin: 0 0 var(--sp-2);
+}
+
+.nd-kb-card-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-1);
+}
+
+.nd-kb-card-skeleton > span {
+  display: block;
+  height: 10px;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  animation: nd-kb-pulse 1.2s ease-in-out infinite;
+}
+
+.nd-kb-card-skeleton > span:nth-child(2) {
+  width: 88%;
+}
+
+.nd-kb-card-skeleton > span:nth-child(3) {
+  width: 56%;
+}
+
+@keyframes nd-kb-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.nd-kb-card-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  color: var(--pill-rose-ink);
+}
+
+.nd-kb-card-note > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.nd-kb-card-cut {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-card-foot {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.nd-kb-card-foot:empty {
+  display: none;
+}
+
+.nd-kb-card-open {
+  gap: var(--sp-2);
+}
+
+/* Folha inferior do celular. */
+.nd-kb-sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 980;
+  display: flex;
+  align-items: flex-end;
+  background: var(--scrim);
+  animation: nd-kb-fade-in 160ms ease-out;
+}
+
+.nd-kb-sheet {
+  position: relative;
+  width: 100%;
+  max-height: 72%;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-5) var(--sp-6);
+  border-radius: var(--r-xl) var(--r-xl) 0 0;
+  background: var(--surface);
+  box-shadow: var(--elev-3);
+  color: var(--ink2);
+  font-size: var(--fs-body);
+  line-height: 1.55;
+  outline: none;
+  animation: nd-kb-sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes nd-kb-sheet-in {
+  from {
+    transform: translateY(24px);
+    opacity: 0.6;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* A folha recebe o foco só para o Esc e o Tab; o anel fica nos controles dela. */
+.nd-root .nd-kb-sheet:focus-visible {
+  outline: none;
+  box-shadow: var(--elev-3);
+}
+
+.nd-kb-sheet-grab {
+  align-self: center;
+  width: 36px;
+  height: 4px;
+  margin-bottom: var(--sp-2);
+  border-radius: var(--r-xs);
+  background: var(--line2);
+}
+
+.nd-kb-sheet-close {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-3);
+}
+
+.nd-kb-sheet .nd-kb-card-doc {
+  padding-right: var(--sp-10);
+  font-size: var(--fs-control);
+}
+
+.nd-kb-sheet .nd-kb-card-title {
+  font-size: var(--fs-heading);
+}
+
+.nd-kb-sheet .nd-kb-card-text {
+  min-height: 96px;
+  max-height: none;
+  mask-image: none;
+}
+
+.nd-kb-sheet .nd-kb-card-foot {
+  padding-top: var(--sp-2);
+}
+
+.nd-kb-sheet .nd-kb-card-open {
+  width: 100%;
+  height: 44px;
+  justify-content: center;
+  font-size: var(--fs-body);
+}
+
+/* Seção citada: ao chegar pela citação, um destaque que se apaga em 1,8 s (G8). */
+.nd-kb-cited[data-flash="true"] {
+  animation: nd-kb-flash 1800ms ease-out;
+}
+
+@keyframes nd-kb-flash {
+  0%,
+  35% {
+    background: var(--accent-soft);
+    outline: 2px solid var(--pill-violet-edge);
+  }
+  100% {
+    background: var(--pill-violet-bg);
+    outline: 2px solid transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-kb-card,
+  .nd-kb-sheet,
+  .nd-kb-sheet-backdrop,
+  .nd-kb-card-skeleton > span,
+  .nd-kb-cited[data-flash="true"] {
+    animation: none;
+  }
+}
+
+/*
+ * Seletor da base (spec 136 T06, C-11): o mesmo do `@` da Conversa e da busca rápida (T07).
+ * Sobreposição sólida (`.nd-overlay`), sem borda, como o lançador: linhas de 36 px (44 no celular)
+ * com o ícone do tipo, o título e a origem à direita; a opção destacada ganha o `--accent-soft`.
+ */
+.nd-kb-picker {
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  max-height: min(360px, 60vh);
+  border-radius: var(--r-lg);
+  box-shadow: var(--bevel), var(--elev-3);
+  color: var(--ink);
+  overflow: hidden;
+  animation: nd-kb-picker-in 120ms ease-out;
+}
+
+.nd-kb-picker[data-variant="popover"] {
+  position: absolute;
+}
+
+/* Celular: faixa logo acima do campo (e do teclado), com a largura da caixa. */
+.nd-kb-picker[data-variant="panel"] {
+  position: relative;
+  flex-shrink: 0;
+  max-height: min(296px, calc(var(--app-height, 100dvh) * 0.42));
+}
+
+@keyframes nd-kb-picker-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.nd-kb-picker-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 32px;
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-picker-head > svg {
+  flex-shrink: 0;
+  color: var(--icon-violet);
+}
+
+.nd-kb-picker-head-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--fw-medium);
+  color: var(--ink2);
+}
+
+.nd-kb-picker-count {
+  margin-left: auto;
+  font-size: var(--fs-caption);
+  white-space: nowrap;
+}
+
+.nd-kb-picker-back {
+  width: 24px;
+  height: 24px;
+  margin-left: calc(var(--sp-1) * -1);
+  flex-shrink: 0;
+}
+
+.nd-kb-picker-list {
+  min-height: 0;
+  margin: 0;
+  padding: 0 var(--sp-2) var(--sp-2);
+  overflow: auto;
+  list-style: none;
+}
+
+.nd-kb-picker-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-control);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.nd-root .nd-kb-picker-item[data-active="true"] {
+  background-color: var(--accent-soft);
+}
+
+.nd-kb-picker-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: var(--r-sm);
+  background: var(--pill-violet-bg);
+  color: var(--icon-violet);
+}
+
+.nd-kb-picker-text {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  flex: 1;
+  min-width: 0;
+}
+
+.nd-kb-picker-title {
+  min-width: 0;
+  max-width: calc(100% - 60px);
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* O título tem a vez: a origem encolhe primeiro. */
+.nd-kb-picker-origin {
+  margin-left: auto;
+  min-width: 48px;
+  max-width: 45%;
+  flex-shrink: 100;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-picker-hit {
+  background: transparent;
+  color: inherit;
+  font-weight: var(--fw-semibold);
+}
+
+.nd-kb-picker-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+}
+
+.nd-kb-picker-more:hover {
+  background: var(--control);
+  color: var(--ink);
+}
+
+/* Sumário em níveis: o recuo acompanha o nível, com o `#` discreto antes do título. */
+.nd-kb-picker-item[data-kind="section"] {
+  padding-left: var(--sp-3);
+}
+
+.nd-kb-picker-item[data-depth="0"] {
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-picker-item[data-depth="1"] {
+  padding-left: var(--sp-8);
+}
+
+.nd-kb-picker-item[data-depth="2"] {
+  padding-left: var(--sp-12);
+}
+
+.nd-kb-picker-item[data-depth="3"] {
+  padding-left: calc(var(--sp-12) + var(--sp-4));
+}
+
+.nd-kb-picker-hash {
+  margin-right: var(--sp-1);
+  color: var(--muted);
+}
+
+.nd-kb-picker-item[data-kind="whole"] .nd-kb-picker-title {
+  color: var(--ink2);
+}
+
+.nd-kb-picker-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-4) var(--sp-3);
+}
+
+.nd-kb-picker-skeleton > span {
+  display: block;
+  height: 10px;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  animation: nd-kb-pulse 1.2s ease-in-out infinite;
+}
+
+.nd-kb-picker-skeleton > span:nth-child(2) {
+  width: 72%;
+}
+
+.nd-kb-picker-skeleton > span:nth-child(3) {
+  width: 48%;
+}
+
+.nd-kb-picker-note {
+  margin: 0;
+  padding: 0 var(--sp-4) var(--sp-3);
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-kb-picker-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--divider);
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+/* Celular: título e origem em duas linhas, toque de 48 px e a seta das seções com 44 px. */
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-item {
+  min-height: 48px;
+  font-size: var(--fs-body);
+}
+
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-text {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+}
+
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-title {
+  max-width: 100%;
+}
+
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-origin {
+  margin-left: 0;
+  max-width: 100%;
+}
+
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-more,
+.nd-kb-picker[data-variant="panel"] .nd-kb-picker-back {
+  width: 44px;
+  height: 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-kb-picker,
+  .nd-kb-picker-skeleton > span {
+    animation: none;
+  }
+}
+
+/*
+ * --- Navegação na janela Conhecimento (spec 136 T07, G8) ---
+ * Busca rápida no topo, sumário ao lado da nota e as ligações do documento no fim, no padrão das
+ * janelas enxutas: sem borda, superfícies por tom, a seleção com `--accent-soft`.
+ */
+
+/* Busca rápida: a faixa sob a barra de título; o campo centrado, com os resultados sob ele. */
+.nd-kb-searchbar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--divider);
+  position: relative;
+  z-index: 2;
+}
+
+.nd-kb-search {
+  position: relative;
+  width: 100%;
+  max-width: 680px;
+  min-width: 0;
+}
+
+.nd-kb-search-field {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 34px;
+  padding: 0 var(--sp-1) 0 var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--muted);
+  transition: background-color 120ms ease-out, box-shadow 120ms ease-out;
+}
+
+.nd-kb-search-field:focus-within {
+  background: var(--card);
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 0;
+  color: var(--ink2);
+}
+
+.nd-kb-search-icon {
+  flex-shrink: 0;
+}
+
+.nd-kb-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fs-body) var(--font-sans);
+  outline: none;
+}
+
+/* O anel fica no campo inteiro (`:focus-within`), não no `input` de dentro. */
+.nd-root .nd-kb-search-input:focus,
+.nd-root .nd-kb-search-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.nd-kb-search-input::placeholder {
+  color: var(--muted);
+}
+
+/* Passo das seções: o documento escolhido vira um prefixo do campo. */
+.nd-kb-search-scope {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  max-width: 45%;
+  min-width: 0;
+  flex-shrink: 0;
+  padding: 0 var(--sp-1) 0 var(--sp-2);
+  height: 24px;
+  border-radius: var(--r-sm);
+  background: var(--pill-violet-bg);
+  color: var(--pill-violet-ink);
+  font-size: var(--fs-label);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-search-scope-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-kb-search-key {
+  margin-right: var(--sp-2);
+}
+
+.nd-kb-search-clear {
+  width: 26px;
+  height: 26px;
+}
+
+/* Estreito com os resultados abertos: o campo e o "Cancelar" na mesma linha. */
+.nd-kb-search[data-variant="panel"][data-open="true"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: var(--sp-2);
+  align-items: center;
+}
+
+.nd-kb-search[data-variant="panel"][data-open="true"] > .nd-kb-search-panel {
+  grid-column: 1 / -1;
+  align-self: stretch;
+  min-height: 0;
+}
+
+/* Desktop: os resultados flutuam sob o campo, na sobreposição sólida, com a largura dele. */
+.nd-kb-search-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  color: var(--ink);
+}
+
+.nd-kb-search-panel[data-variant="popover"] {
+  position: absolute;
+  top: calc(100% + var(--sp-2));
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: min(520px, 70vh);
+  border-radius: var(--r-lg);
+  box-shadow: var(--bevel), var(--elev-3);
+  overflow: hidden;
+  animation: nd-kb-picker-in 120ms ease-out;
+}
+
+.nd-kb-search-panel[data-variant="popover"] > .nd-kb-picker {
+  flex-shrink: 0;
+}
+
+.nd-kb-search-panel[data-variant="popover"] > .nd-kb-search-group {
+  flex-shrink: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Estreito: o painel ocupa o corpo da janela, abaixo do campo. */
+.nd-kb-body[data-searching="true"] > .nd-kb-searchbar {
+  flex: 1 1 auto;
+  min-height: 0;
+  align-items: stretch;
+  border-bottom: 0;
+}
+
+.nd-kb-body[data-searching="true"] .nd-kb-search {
+  min-height: 0;
+  max-width: none;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.nd-kb-search-panel[data-variant="panel"] {
+  flex: 1 1 auto;
+  overflow: auto;
+  margin: var(--sp-2) calc(-1 * var(--sp-2)) 0;
+  padding-bottom: var(--sp-4);
+}
+
+/* O seletor da T06 como grupo do painel: sem sobreposição própria, sem teto de altura. */
+.nd-kb-picker[data-variant="embedded"] {
+  position: static;
+  max-height: none;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  animation: none;
+  overflow: visible;
+}
+
+.nd-kb-picker[data-variant="embedded"] + .nd-kb-search-group {
+  border-top: 1px solid var(--divider);
+  padding-top: var(--sp-1);
+}
+
+.nd-kb-search-group > .nd-kb-picker-head > svg {
+  color: var(--icon-cyan);
+}
+
+.nd-kb-search-group > .nd-kb-picker-head > .nd-kb-spin {
+  margin-left: auto;
+}
+
+/* Resultado no texto: onde (documento, caminho e seção) e o trecho com os termos marcados. */
+.nd-kb-hit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+
+.nd-root .nd-kb-hit-row[data-active="true"] {
+  background-color: var(--accent-soft);
+}
+
+.nd-kb-hit-row > .nd-kb-picker-icon {
+  margin-top: 1px;
+  background: var(--pill-cyan-bg);
+  color: var(--icon-cyan);
+}
+
+.nd-kb-hit-list {
+  transition: opacity 120ms ease-out;
+}
+
+.nd-kb-hit-list[data-stale="true"] {
+  opacity: 0.6;
+}
+
+.nd-kb-hit-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  flex: 1;
+}
+
+.nd-kb-hit-where {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-1);
+  min-width: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.nd-kb-hit-doc {
+  color: var(--ink2);
+  font-weight: var(--fw-medium);
+  flex-shrink: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-kb-hit-trail,
+.nd-kb-hit-section {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-kb-hit-trail::before,
+.nd-kb-hit-section::before {
+  content: "›";
+  margin-right: var(--sp-1);
+  color: var(--ink3);
+}
+
+.nd-kb-hit-section {
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  flex-shrink: 0;
+  max-width: 60%;
+}
+
+.nd-kb-hit-page {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: var(--fs-caption);
+}
+
+.nd-kb-hit-snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-control);
+  line-height: 1.5;
+  color: var(--ink2);
+  overflow-wrap: anywhere;
+}
+
+/* O termo achado: fundo âmbar suave, como o marca-texto, e o texto na cor de leitura. */
+.nd-kb-hit {
+  padding: 0;
+  border-radius: var(--r-xs);
+  background: var(--pill-amber-bg);
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-hit-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4) var(--sp-3);
+}
+
+.nd-kb-hit-skeleton-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-kb-hit-skeleton-row > span {
+  display: block;
+  height: 10px;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  animation: nd-kb-pulse 1.2s ease-in-out infinite;
+}
+
+.nd-kb-hit-skeleton-row > span:first-child {
+  width: 36%;
+}
+
+.nd-kb-search-min {
+  padding-top: var(--sp-2);
+}
+
+.nd-kb-search-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-6) var(--sp-5);
+  text-align: center;
+  color: var(--muted);
+}
+
+.nd-kb-search-empty-title {
+  margin: var(--sp-1) 0 0;
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-search-empty-text {
+  margin: 0;
+  max-width: 420px;
+  font-size: var(--fs-label);
+}
+
+.nd-kb-search-panel[data-variant="panel"] .nd-kb-hit-row {
+  padding: var(--sp-3) var(--sp-2);
+}
+
+.nd-kb-search-panel[data-variant="panel"] .nd-kb-hit-where {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+
+.nd-kb-search-panel[data-variant="panel"] .nd-kb-hit-snippet {
+  -webkit-line-clamp: 3;
+  font-size: var(--fs-body);
+}
+
+/* --- Leitura: a nota e o sumário fixo ao lado --- */
+.nd-kb-reader {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.nd-kb-outline-side {
+  flex: 0 0 216px;
+  min-height: 0;
+  padding: var(--sp-4) var(--sp-3) var(--sp-4) 0;
+}
+
+.nd-kb-outline[data-variant="side"] {
+  position: relative;
+  padding-left: var(--sp-3);
+}
+
+/* Um fio discreto à esquerda do sumário; a seção em leitura ganha o trecho em destaque dele. */
+.nd-kb-outline[data-variant="side"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 28px;
+  bottom: 0;
+  width: 1px;
+  background: var(--divider);
+}
+
+.nd-kb-outline-head {
+  margin-bottom: var(--sp-2);
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+}
+
+.nd-kb-outline-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-kb-outline-item {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding: var(--sp-1) var(--sp-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink3);
+  font: var(--fs-label) var(--font-sans);
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: color 120ms ease-out, background-color 120ms ease-out;
+}
+
+.nd-kb-outline-item:hover {
+  background: var(--state-hover);
+  color: var(--ink);
+}
+
+.nd-kb-outline-item[data-depth="0"] {
+  color: var(--ink2);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-outline-item[data-depth="1"] {
+  padding-left: var(--sp-5);
+}
+
+.nd-kb-outline-item[data-depth="2"],
+.nd-kb-outline-item[data-depth="3"] {
+  padding-left: var(--sp-8);
+}
+
+.nd-root .nd-kb-outline-item[aria-current="location"] {
+  background: transparent;
+  color: var(--accent);
+}
+
+.nd-kb-outline[data-variant="side"] .nd-kb-outline-item[aria-current="location"]::before {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--sp-3));
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: var(--r-xs);
+  background: var(--accent);
+}
+
+.nd-root .nd-kb-outline-item:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+}
+
+.nd-kb-outline-text {
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Recolhido (janela estreita e celular): uma linha com a seção em leitura; abre a lista. */
+.nd-kb-outline[data-variant="collapsed"] {
+  margin-top: var(--sp-4);
+  border-radius: var(--r-md);
+  background: var(--control);
+}
+
+.nd-kb-outline-toggle {
+  min-height: 40px;
+  padding: 0 var(--sp-3);
+  gap: var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-control);
+}
+
+.nd-kb-outline-icon {
+  flex-shrink: 0;
+  color: var(--icon-violet);
+}
+
+.nd-kb-outline-toggle-title {
+  color: var(--ink);
+  flex-shrink: 0;
+}
+
+.nd-kb-outline-toggle-meta {
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-weight: var(--fw-regular);
+}
+
+.nd-kb-outline-chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform 160ms ease-out;
+}
+
+.nd-kb-outline[data-open="true"] .nd-kb-outline-chevron {
+  transform: rotate(180deg);
+}
+
+.nd-kb-outline-drawer {
+  padding: 0 var(--sp-2) var(--sp-2);
+  animation: nd-kb-picker-in 140ms ease-out;
+}
+
+.nd-kb-outline[data-variant="collapsed"] .nd-kb-outline-item {
+  min-height: 40px;
+  font-size: var(--fs-control);
+}
+
+/* --- Nota em blocos por seção (o sumário pula para eles) --- */
+.nd-kb-note-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-kb-chunk {
+  scroll-margin-top: var(--sp-3);
+}
+
+.nd-kb-cited,
+.nd-kb-focus {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* Pulo pelo sumário, pelas ligações ou pela busca: o destaque aparece e se apaga. */
+.nd-kb-focus {
+  margin: 0 calc(-1 * var(--sp-3));
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  scroll-margin-top: var(--sp-3);
+}
+
+.nd-kb-focus[data-flash="true"] {
+  animation: nd-kb-focus-flash 1800ms ease-out;
+}
+
+@keyframes nd-kb-focus-flash {
+  0%,
+  30% {
+    background: var(--accent-soft);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+/* --- Ligações do documento: no fim da nota, cada lista numa superfície de tom --- */
+.nd-kb-rels {
+  margin-top: var(--sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-kb-rel {
+  padding: var(--sp-3) var(--sp-2) var(--sp-2);
+  border-radius: var(--r-lg);
+  background: var(--control);
+}
+
+.nd-kb-rel-head {
+  margin: 0 0 var(--sp-1);
+  padding: 0 var(--sp-2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--ink);
+  font-size: var(--fs-control);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-kb-rel-head-icon {
+  color: var(--icon-violet);
+}
+
+.nd-kb-rel[data-kb-rel="cited"] .nd-kb-rel-head-icon,
+.nd-kb-rel[data-kb-rel="links"] .nd-kb-rel-head-icon {
+  color: var(--icon-cyan);
+}
+
+.nd-kb-rel-count {
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-medium);
+  color: var(--muted);
+}
+
+.nd-kb-rel-list,
+.nd-kb-rel-uses {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.nd-kb-rel-plan + .nd-kb-rel-plan {
+  margin-top: var(--sp-1);
+  padding-top: var(--sp-1);
+  border-top: 1px solid var(--divider);
+}
+
+.nd-kb-rel-plan-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.nd-kb-rel-plan-title {
+  color: var(--ink2);
+  font-size: var(--fs-label);
+  font-weight: var(--fw-medium);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-rel-plan-id {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-kb-rel-item {
+  width: 100%;
+  display: flex;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.nd-kb-rel-item[data-static="true"] {
+  cursor: default;
+}
+
+.nd-kb-rel-item:not([data-static]):hover {
+  background: var(--state-hover);
+}
+
+.nd-root .nd-kb-rel-item:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+}
+
+.nd-kb-rel-use {
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.nd-kb-rel-use-section {
+  color: var(--ink);
+  font-size: var(--fs-control);
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-kb-rel-hash {
+  margin-right: var(--sp-1);
+  color: var(--muted);
+}
+
+.nd-kb-rel-use-where {
+  margin-left: auto;
+  min-width: 0;
+  flex: 0 1 auto;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-rel-doc {
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+}
+
+.nd-kb-rel-doc-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-kb-rel-doc-icon {
+  flex-shrink: 0;
+  color: var(--icon-cyan);
+}
+
+.nd-kb-rel-doc-icon[data-outside] {
+  color: var(--muted);
+}
+
+.nd-kb-rel-doc-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+  font-size: var(--fs-control);
+  font-weight: var(--fw-medium);
+}
+
+.nd-kb-rel-url,
+.nd-kb-rel-file {
+  font-weight: var(--fw-regular);
+  color: var(--ink2);
+}
+
+.nd-kb-rel-go {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.nd-kb-rel-item:hover .nd-kb-rel-go,
+.nd-kb-rel-item:focus-visible .nd-kb-rel-go,
+.nd-root[data-mobile="true"] .nd-kb-rel-go {
+  opacity: 1;
+}
+
+/* A linha que cita: o texto em volta, com o link em destaque, recuada sob o título. */
+.nd-kb-rel-context {
+  margin-left: calc(14px + var(--sp-2));
+  padding-left: var(--sp-2);
+  border-left: 2px solid var(--divider);
+  font-size: var(--fs-label);
+  line-height: 1.5;
+  color: var(--ink3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.nd-kb-rel-context-link {
+  color: var(--accent);
+  font-weight: var(--fw-medium);
+}
+
+/* Janela larga: "Citado por" e "Links para" lado a lado, sob o "Usado nos planos". */
+.nd-kb[data-size="wide"] .nd-kb-rels[data-pair="true"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+}
+
+.nd-kb[data-size="wide"] .nd-kb-rels[data-pair="true"] > [data-kb-rel="plans"] {
+  grid-column: 1 / -1;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-rel-use {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-rel-use-where {
+  margin-left: 0;
+  order: 3;
+  flex-basis: 100%;
+  text-align: left;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-rel-use .nd-kb-src-kind {
+  margin-left: auto;
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-rels {
+  margin-top: var(--sp-5);
+}
+
+.nd-kb[data-size="narrow"] .nd-kb-searchbar {
+  padding: var(--sp-2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-kb-search-panel,
+  .nd-kb-outline-drawer,
+  .nd-kb-hit-skeleton-row > span,
+  .nd-kb-focus[data-flash="true"] {
+    animation: none;
+  }
 }

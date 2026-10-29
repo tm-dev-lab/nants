@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use crate::agents::runner::{final_base_prefix, manual_criteria, pending_lines, section_text, ACCEPTANCE, FINAL_BASE_PREFIX, PENDING};
+use crate::agents::runner::{final_base_prefix, manual_criteria, pending_lines, section_text, ACCEPTANCE, CHECKED_WARNINGS, FINAL_BASE_PREFIX, PENDING};
 use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
@@ -451,29 +451,48 @@ const MAX_PENDING_BYTES: usize = 6 * 1024;
 
 /// Spec 133 T07: seção "Pendências conhecidas" do relatório, no idioma do projeto, com as pendências
 /// das tarefas ([`PENDING`]) que a verificação final não resolveu, `- Txx P-yy: texto`, redigidas.
-/// `None` sem nenhuma: a seção não aparece.
+/// Spec 136 T01: em seguida, a seção dos avisos do Desenvolvedor que o Revisor conferiu
+/// ([`CHECKED_WARNINGS`]), `- Txx: texto`, redigidos. `None` sem nenhuma das duas: nada aparece.
 pub(super) fn pending_section(root: &Path, spec_id: &str, secrets: &SecretSet, lang: Lang) -> Option<String> {
     let tasks = read_tasks(root, &format!("{SPECS_REL}/{spec_id}"));
-    let mut lines = String::new();
-    let mut omitted = 0usize;
+    let mut pending = Vec::new();
+    let mut checked = Vec::new();
     for t in &tasks {
         let id = scrub_text(secrets, &t.frontmatter.id);
         for (pid, text) in pending_lines(&section_text(&t.body, PENDING).unwrap_or_default()) {
-            let line = format!("- {id} {}: {}\n", scrub_text(secrets, &pid), scrub_text(secrets, &text));
-            if lines.len() + line.len() > MAX_PENDING_BYTES {
-                omitted += 1;
-            } else {
-                lines.push_str(&line);
-            }
+            pending.push(format!("- {id} {}: {}\n", scrub_text(secrets, &pid), scrub_text(secrets, &text)));
+        }
+        let section = section_text(&t.body, CHECKED_WARNINGS).unwrap_or_default();
+        for text in section.lines().filter_map(|l| l.trim().strip_prefix("- ")).map(str::trim).filter(|l| !l.is_empty()) {
+            checked.push(format!("- {id}: {}\n", scrub_text(secrets, text)));
         }
     }
-    if lines.is_empty() && omitted == 0 {
+    let sections: Vec<String> = [("report.pending.title", pending), ("report.checked.title", checked)]
+        .into_iter()
+        .filter_map(|(title, items)| capped_section(lang, title, &items))
+        .collect();
+    (!sections.is_empty()).then(|| sections.join("\n"))
+}
+
+/// Uma seção do relatório com o título do dicionário e os itens até [`MAX_PENDING_BYTES`] (o que
+/// não cabe vira `- (+n)`); `None` sem itens.
+fn capped_section(lang: Lang, title: &str, items: &[String]) -> Option<String> {
+    if items.is_empty() {
         return None;
+    }
+    let mut lines = String::new();
+    let mut omitted = 0usize;
+    for line in items {
+        if lines.len() + line.len() > MAX_PENDING_BYTES {
+            omitted += 1;
+        } else {
+            lines.push_str(line);
+        }
     }
     if omitted > 0 {
         lines.push_str(&format!("- (+{omitted})\n"));
     }
-    Some(format!("{}\n\n{lines}", crate::i18n::text(lang, "report.pending.title")))
+    Some(format!("{}\n\n{lines}", crate::i18n::text(lang, title)))
 }
 
 pub(super) fn traceability(root: &Path, spec_id: &str, secrets: &SecretSet, lang: Lang) -> Option<String> {
@@ -985,6 +1004,30 @@ mod pending_tests {
         let en = pending_section(&dir, SPEC, &secrets, Lang::En).expect("section");
         assert!(en.starts_with("## Known issues\n\n"), "{en}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Spec 136 T01: o aviso conferido pelo Revisor aparece como conferido, depois das pendências,
+    /// e o que ele não pôde conferir segue nas pendências.
+    #[test]
+    fn report_shows_checked_warnings_after_the_pending() {
+        let secrets = SecretSet::new(vec![SECRET.to_string()]);
+        let t04 = format!(
+            "## Objetivo\nx\n\n## Pendências conhecidas\n- P-01: Aviso do Desenvolvedor que o Revisor não pôde conferir: sem prova no celular. Motivo: sem celular\n\n\
+             ## Avisos conferidos pelo Revisor\n- Aviso do Desenvolvedor: o handler devolve `errors` como lista. Conferido pelo Revisor: Api.java:41 {SECRET}\n"
+        );
+        let dir = root("conferidos", &[("T04", &t04)]);
+        let pt = pending_section(&dir, SPEC, &secrets, Lang::PtBr).expect("seção");
+        let (pending, checked) = pt.split_once("## Avisos conferidos pelo Revisor\n\n").expect("conferidos");
+        assert!(pending.starts_with("## Pendências conhecidas\n\n- T04 P-01: Aviso do Desenvolvedor que o Revisor não pôde conferir"), "{pt}");
+        assert!(checked.starts_with("- T04: Aviso do Desenvolvedor: o handler devolve `errors` como lista. Conferido pelo Revisor: Api.java:41"), "{pt}");
+        assert!(!pt.contains(SECRET), "{pt}");
+        let en = pending_section(&dir, SPEC, &secrets, Lang::En).expect("section");
+        assert!(en.contains("\n## Warnings checked by the Reviewer\n\n- T04: "), "{en}");
+        // Só conferidos: a seção de pendências não aparece.
+        let only = root("so-conferidos", &[("T01", "## Objetivo\nx\n\n## Avisos conferidos pelo Revisor\n- a\n")]);
+        assert_eq!(pending_section(&only, SPEC, &secrets, Lang::PtBr).as_deref(), Some("## Avisos conferidos pelo Revisor\n\n- T01: a\n"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&only);
     }
 
     #[test]

@@ -3,16 +3,16 @@
  * - abas "Documentos" e "Visão geral" e o "Atualizar" no slot da barra de título;
  * - vazia: a área de soltar com "Adicionar arquivos", o campo de link e o aviso de que a base
  *   fica fora do Git e é dado, não instrução;
- * - com documentos: a lista (ícone do tipo, título, origem, tamanho, estado, marcação e
- *   indicadores) e a prévia da nota em markdown, lado a lado; estreita (celular), uma de cada vez,
- *   com "Voltar";
- * - na prévia: a marcação Padrão/Referência, a descrição e o `applies_to` (só nos Padrões)
- *   editáveis, a remoção com confirmação e a seção citada pelo plano em destaque;
+ * - com documentos: a lista (ícone do tipo, título, origem, tamanho, estado e indicadores) e a
+ *   prévia da nota em markdown, lado a lado; estreita (celular), uma de cada vez, com "Voltar";
+ * - na prévia: a descrição editável, a remoção com confirmação e a seção citada pelo plano em
+ *   destaque. Sem classificação manual (spec 136 T02): quem decide o que obriga é o Arquiteto, na
+ *   spec que a pessoa aprova; a Visão geral é onde ela declara os padrões da empresa;
  * - a lista é compartilhada com o subtítulo vivo (`kbStore`) e se atualiza por `kb_updated`.
  */
 import "./knowledge.css";
 import "../shared/apps.css";
-import { memo, useEffect, useId, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type FormEvent, type ReactNode } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type FormEvent, type ReactNode } from "react";
 import type { ApiFailure } from "../../api/client";
 import {
   deleteKbDoc,
@@ -25,7 +25,6 @@ import {
   type KbDoc,
   type KbNote,
   type KbPatch,
-  type KbRole,
 } from "../../api/kb";
 import { EmptyState } from "../../desktop/EmptyState";
 import { Icon } from "../../desktop/Icon";
@@ -45,14 +44,22 @@ import {
   KB_MAX_DESCRIPTION_CHARS,
   KB_MAX_UPLOAD_MIB,
   kindIcon,
+  noteChunks,
   reasonText,
-  splitAtSection,
+  sectionSpan,
   STATUS_TONE,
   statusText,
 } from "./knowledgeModel";
+import { KbOutline } from "./KbOutline";
+import { KbQuickSearch } from "./KbQuickSearch";
+import { KbRelations } from "./KbRelations";
 import { consumeOpenKbDoc, useOpenKbDocRequest } from "./openRequest";
+import { editability, KB_MAX_WRITTEN_MIB } from "./editor/editability";
 
 type Tab = "docs" | "overview";
+
+/** O editor (spec 136 T11) só é baixado quando abre: um chunk próprio, fora da entrada. */
+const KbEditor = lazy(() => import("./editor/KbEditor").then((m) => ({ default: m.KbEditor })));
 
 interface Upload {
   key: number;
@@ -223,19 +230,6 @@ function StatusPill({ doc }: { doc: KbDoc }) {
   );
 }
 
-function RolePill({ role }: { role: KbRole }) {
-  const { t } = useT();
-  return role === "standard" ? (
-    <span className="nd-pill nd-pill-sm nd-pill-nowrap" data-tone="violet" data-kb-role="standard">
-      {t("kb.role.standard")}
-    </span>
-  ) : (
-    <span className="nd-kb-role-ref" data-kb-role="reference">
-      {t("kb.role.reference")}
-    </span>
-  );
-}
-
 function DocRow({ doc, docs, selected, onOpen }: { doc: KbDoc; docs: readonly KbDoc[]; selected: boolean; onOpen: () => void }) {
   const reason = doc.status === "error" ? reasonText(doc) : null;
   const flags = indicatorTexts(doc, docs);
@@ -244,10 +238,7 @@ function DocRow({ doc, docs, selected, onOpen }: { doc: KbDoc; docs: readonly Kb
       <button type="button" className="nd-kb-row-btn" onClick={onOpen}>
         <Icon name={kindIcon(doc)} size={16} className="nd-kb-kind" />
         <span className="nd-kb-row-main">
-          <span className="nd-kb-row-head">
-            <span className="nd-kb-title">{doc.title}</span>
-            <RolePill role={doc.role} />
-          </span>
+          <span className="nd-kb-title">{doc.title}</span>
           <span className="nd-kb-meta">{detailParts(doc).join(" · ")}</span>
           {reason !== null ? <span className="nd-kb-reason">{reason}</span> : null}
           {flags.length > 0 ? (
@@ -269,28 +260,73 @@ function DocRow({ doc, docs, selected, onOpen }: { doc: KbDoc; docs: readonly Kb
 
 // --- Prévia ---
 
-function NoteBody({ note, section }: { note: KbNote; section: string | null }) {
+/** Duração do destaque da seção citada (a animação em `knowledge.css` tem a mesma). */
+const CITED_FLASH_MS = 1800;
+
+/**
+ * Seção em foco na prévia: a citada pelo plano (destaque fixo, com o rótulo), ou a escolhida no
+ * sumário, nas ligações ou na busca (o destaque se apaga). `seq` repete o pulo para a mesma seção.
+ */
+interface KbFocus {
+  anchor: string;
+  origin: "plan" | "jump";
+  seq: number;
+}
+
+function NoteBody({ note, focus }: { note: KbNote; focus: KbFocus | null }) {
   const { t } = useT();
-  const cited = useRef<HTMLDivElement | null>(null);
-  const sections = note.sections;
-  const parts = useMemo(() => splitAtSection(note.content, sections ?? [], section), [note.content, sections, section]);
+  const target = useRef<HTMLDivElement | null>(null);
+  const chunks = useMemo(() => noteChunks(note.content, note.sections ?? []), [note.content, note.sections]);
+  const span = useMemo(() => sectionSpan(chunks, focus?.anchor ?? null), [chunks, focus?.anchor]);
+  // Ao chegar pela citação, pelo sumário ou pela busca, a seção rola até o topo e se destaca.
+  const [flash, setFlash] = useState(false);
   useEffect(() => {
-    cited.current?.scrollIntoView?.({ block: "start" });
-  }, [parts]);
-  if (parts === null) return <MarkdownText text={note.content} />;
+    if (span === null) return undefined;
+    target.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+    setFlash(true);
+    const timer = setTimeout(() => setFlash(false), CITED_FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [span, focus?.seq]);
+  const chunk = (c: (typeof chunks)[number], i: number) => (
+    <div key={i} className="nd-kb-chunk" data-kb-sec={c.anchor ?? undefined}>
+      <MarkdownText text={c.text} />
+    </div>
+  );
+  if (span === null || focus === null) return <>{chunks.map(chunk)}</>;
+  const [from, to] = span;
   return (
     <>
-      {parts[0].trim() !== "" ? <MarkdownText text={parts[0]} /> : null}
-      <div ref={cited} className="nd-kb-cited" data-kb-cited={section ?? undefined}>
-        <span className="nd-kb-cited-label">
-          <Icon name="plan" size={14} />
-          {t("kb.preview.cited")}
-        </span>
-        <MarkdownText text={parts[1]} />
+      {chunks.slice(0, from).map(chunk)}
+      <div
+        ref={target}
+        className={focus.origin === "plan" ? "nd-kb-cited" : "nd-kb-focus"}
+        data-kb-cited={focus.origin === "plan" ? focus.anchor : undefined}
+        data-kb-focus={focus.anchor}
+        data-flash={flash ? "true" : undefined}
+      >
+        {focus.origin === "plan" ? (
+          <span className="nd-kb-cited-label">
+            <Icon name="plan" size={14} />
+            {t("kb.preview.cited")}
+          </span>
+        ) : null}
+        {chunks.slice(from, to).map((c, i) => chunk(c, from + i))}
       </div>
-      {parts[2].trim() !== "" ? <MarkdownText text={parts[2]} /> : null}
+      {chunks.slice(to).map((c, i) => chunk(c, to + i))}
     </>
   );
+}
+
+/** Seção em leitura: a última cujo bloco já chegou ao topo da área rolável. */
+function readingSection(scroller: HTMLElement): string | null {
+  const top = scroller.getBoundingClientRect().top + 32;
+  let current: string | null = null;
+  for (const el of scroller.querySelectorAll<HTMLElement>("[data-kb-sec]")) {
+    if (el.getBoundingClientRect().top <= top) current = el.dataset.kbSec ?? current;
+    else break;
+  }
+  if (current === null) current = scroller.querySelector<HTMLElement>("[data-kb-sec]")?.dataset.kbSec ?? null;
+  return current;
 }
 
 function EditableLine({
@@ -298,14 +334,12 @@ function EditableLine({
   hint,
   value,
   emptyText,
-  multiline,
   onSave,
 }: {
   label: string;
   hint: string;
   value: string;
   emptyText: string;
-  multiline: boolean;
   onSave: (value: string) => Promise<ApiFailure | null>;
 }) {
   const { t } = useT();
@@ -342,20 +376,10 @@ function EditableLine({
             }}
           >
             <Icon name="pencil" size={14} />
-            {t("kb.edit")}
+            {t("kb.description.edit")}
           </button>
         </div>
-        {multiline && value !== "" ? (
-          <ul className="nd-kb-globs">
-            {value.split("\n").map((g) => (
-              <li key={g} className="nd-mono nd-kb-glob">
-                {g}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className={value === "" ? "nd-muted nd-kb-field-value" : "nd-kb-field-value"}>{value === "" ? emptyText : value}</p>
-        )}
+        <p className={value === "" ? "nd-muted nd-kb-field-value" : "nd-kb-field-value"}>{value === "" ? emptyText : value}</p>
       </div>
     );
   }
@@ -364,11 +388,7 @@ function EditableLine({
       <label htmlFor={fieldId} className="nd-section-label">
         {label}
       </label>
-      {multiline ? (
-        <textarea id={fieldId} className="nd-input nd-textarea nd-mono nd-kb-globs-input" rows={4} value={draft} aria-describedby={hintId} onChange={(e) => setDraft(e.target.value)} />
-      ) : (
-        <input id={fieldId} className="nd-input" value={draft} maxLength={KB_MAX_DESCRIPTION_CHARS} aria-describedby={hintId} onChange={(e) => setDraft(e.target.value)} />
-      )}
+      <input id={fieldId} className="nd-input" value={draft} maxLength={KB_MAX_DESCRIPTION_CHARS} aria-describedby={hintId} onChange={(e) => setDraft(e.target.value)} />
       <span id={hintId} className="nd-field-hint">
         {hint}
       </span>
@@ -389,13 +409,34 @@ function EditableLine({
   );
 }
 
-function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: string; doc: KbDoc; docs: readonly KbDoc[]; section: string | null; onRemoved: () => void }) {
+interface PreviewProps {
+  projectId: string;
+  doc: KbDoc;
+  docs: readonly KbDoc[];
+  focus: KbFocus | null;
+  /** `side`: sumário fixo ao lado (janela larga); `collapsed`: recolhido no topo da nota. */
+  outline: "side" | "collapsed";
+  onFocus: (anchor: string) => void;
+  onOpenDoc: (doc: string) => void;
+  onRemoved: () => void;
+  onEdit: () => void;
+}
+
+function Preview({ projectId, doc, docs, focus, outline, onFocus, onOpenDoc, onRemoved, onEdit }: PreviewProps) {
   const { t } = useT();
+  const scroller = useRef<HTMLElement | null>(null);
+  const [current, setCurrent] = useState<string | null>(null);
+  const frame = useRef(0);
+  const onScroll = useCallback(() => {
+    cancelAnimationFrame(frame.current);
+    frame.current = requestAnimationFrame(() => {
+      if (scroller.current !== null) setCurrent(readingSection(scroller.current));
+    });
+  }, []);
   const [note, setNote] = useState<{ status: "loading" } | { status: "error"; failure: ApiFailure } | { status: "ok"; note: KbNote }>({ status: "loading" });
   const [confirming, setConfirming] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [problem, setProblem] = useState<ApiFailure | null>(null);
-  const roleHintId = useId();
   const ready = doc.status === "ready";
 
   useEffect(() => {
@@ -418,11 +459,6 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
     return null;
   }
 
-  async function setRole(role: KbRole): Promise<void> {
-    if (role === doc.role) return;
-    setProblem(await patch(role === "reference" ? { role, applies_to: [] } : { role }));
-  }
-
   async function remove(): Promise<void> {
     setRemoving(true);
     const result = await deleteKbDoc(projectId, doc.id);
@@ -438,6 +474,7 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
 
   const reason = reasonText(doc);
   const flags = indicatorTexts(doc, docs);
+  const edit = editability(doc);
   let body: ReactNode;
   if (!ready) {
     body = <p className="nd-muted nd-kb-note">{doc.status === "pending" || doc.status === "extracting" ? t("kb.preview.pending") : (reason ?? statusText(doc.status))}</p>;
@@ -454,11 +491,21 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
       </p>
     );
   } else {
-    body = <NoteBody note={note.note} section={section} />;
+    body = <NoteBody note={note.note} focus={focus} />;
   }
+  // O título de topo igual ao do documento não entra no sumário (já está no cabeçalho).
+  const sections = (note.status === "ok" && ready ? (note.note.sections ?? []) : []).filter((s, i) => !(i === 0 && s.level === 1 && s.title === doc.title));
+  const hasOutline = sections.length >= 2;
+  const jump = (anchor: string): void => {
+    setCurrent(anchor);
+    onFocus(anchor);
+  };
+  useEffect(() => {
+    if (note.status === "ok" && scroller.current !== null) setCurrent(readingSection(scroller.current));
+  }, [note]);
 
-  return (
-    <article className="nd-kb-preview nd-kb-scroll" data-kb-preview={doc.id} aria-labelledby={`kb-${doc.id}-title`}>
+  const article = (
+    <article ref={scroller} className="nd-kb-preview nd-kb-scroll" data-kb-preview={doc.id} aria-labelledby={`kb-${doc.id}-title`} onScroll={onScroll}>
       <header className="nd-kb-preview-head">
         <div className="nd-kb-preview-title">
           <Icon name={kindIcon(doc)} size={18} className="nd-kb-kind" />
@@ -467,6 +514,18 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
           </h2>
           <StatusPill doc={doc} />
           <span className="nd-kb-spacer" />
+          {edit === "editable" && ready ? (
+            <button type="button" className="nd-btn nd-btn-sm" data-kb-edit="" aria-label={t("kb.editor.editLabel", { title: doc.title })} onClick={onEdit}>
+              <Icon name="pencil" size={14} />
+              {t("kb.editor.edit")}
+            </button>
+          ) : null}
+          {edit === "too_large" ? (
+            <span className="nd-kb-readonly" data-kb-readonly="">
+              <Icon name="lock" size={14} />
+              {t("kb.editor.readOnly")}
+            </span>
+          ) : null}
           {doc.source_url !== null ? (
             <a className="nd-btn nd-iconbtn nd-btn-sm" data-variant="ghost" href={doc.source_url} target="_blank" rel="noreferrer noopener" aria-label={t("kb.preview.openSource")} title={t("kb.preview.openSource")}>
               <Icon name="external" size={14} />
@@ -506,6 +565,12 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
           </p>
         ) : null}
         {doc.status === "error" && reason !== null ? <p className="nd-kb-reason">{reason}</p> : null}
+        {edit === "too_large" ? (
+          <p className="nd-kb-readonly-note">
+            <Icon name="lock" size={14} />
+            <span>{t("kb.editor.tooLarge", { max: KB_MAX_WRITTEN_MIB })}</span>
+          </p>
+        ) : null}
         {flags.length > 0 ? (
           <ul className="nd-kb-flags nd-kb-flags-block">
             {flags.map((f) => (
@@ -516,52 +581,30 @@ function Preview({ projectId, doc, docs, section, onRemoved }: { projectId: stri
             ))}
           </ul>
         ) : null}
-        <div className="nd-kb-field">
-          <span className="nd-section-label">{t("kb.role.label")}</span>
-          <div role="group" aria-label={t("kb.role.label")} aria-describedby={roleHintId} className="nd-segment nd-chrome">
-            <button type="button" className="nd-segment-item" aria-pressed={doc.role === "standard"} onClick={() => void setRole("standard")}>
-              <span>{t("kb.role.standardLong")}</span>
-            </button>
-            <button type="button" className="nd-segment-item" aria-pressed={doc.role === "reference"} onClick={() => void setRole("reference")}>
-              <span>{t("kb.role.reference")}</span>
-            </button>
-          </div>
-          <span id={roleHintId} className="nd-field-hint">
-            {doc.role === "standard" ? t("kb.role.hint.standard") : t("kb.role.hint.reference")}
-          </span>
-        </div>
         <EditableLine
           key={`d-${doc.id}`}
           label={t("kb.description.label")}
           hint={t("kb.description.hint", { max: KB_MAX_DESCRIPTION_CHARS })}
           value={doc.description}
           emptyText={t("kb.description.empty")}
-          multiline={false}
           onSave={(value) => patch({ description: value.trim() })}
         />
-        {doc.role === "standard" ? (
-          <EditableLine
-            key={`a-${doc.id}`}
-            label={t("kb.appliesTo.label")}
-            hint={t("kb.appliesTo.hint")}
-            value={doc.applies_to.join("\n")}
-            emptyText={t("kb.appliesTo.all")}
-            multiline
-            onSave={(value) =>
-              patch({
-                applies_to: value
-                  .split("\n")
-                  .map((g) => g.trim())
-                  .filter((g) => g !== ""),
-              })
-            }
-          />
-        ) : null}
       </header>
+      {hasOutline && outline === "collapsed" ? <KbOutline sections={sections} current={current} onJump={jump} variant="collapsed" /> : null}
       <section className="nd-kb-note-body" aria-label={t("kb.preview.note")}>
         {body}
       </section>
+      {note.status === "ok" && ready ? <KbRelations note={note.note} docs={docs} sections={sections} onOpenDoc={onOpenDoc} onJump={jump} /> : null}
     </article>
+  );
+  if (!hasOutline || outline === "collapsed") return article;
+  return (
+    <div className="nd-kb-reader" data-kb-reader="">
+      {article}
+      <aside className="nd-kb-outline-side nd-kb-scroll">
+        <KbOutline sections={sections} current={current} onJump={jump} variant="side" />
+      </aside>
+    </div>
   );
 }
 
@@ -683,31 +726,42 @@ const KnowledgeView = memo(function KnowledgeView({ projectId, size }: { project
   const kb = useKb(projectId);
   const [tab, setTab] = useState<Tab>("docs");
   const [selected, setSelected] = useState<string | null>(null);
-  const [section, setSection] = useState<string | null>(null);
+  const [focus, setFocus] = useState<KbFocus | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  const [searching, setSearching] = useState(false);
+  /** Edição aberta: o documento, ou `null` para um novo. */
+  const [editing, setEditing] = useState<{ doc: KbDoc | null } | null>(null);
+  const searchInput = useRef<HTMLInputElement | null>(null);
+  const focusSeq = useRef(0);
   const request = useOpenKbDocRequest(projectId);
   const stacked = kbArrangement(size) === "stacked";
+
+  const focusOn = useCallback((anchor: string | null, origin: KbFocus["origin"]): void => {
+    focusSeq.current += 1;
+    setFocus(anchor === null ? null : { anchor, origin, seq: focusSeq.current });
+  }, []);
 
   // Citação do Plano: abre o documento e a seção.
   useEffect(() => {
     if (request === null) return;
     setTab("docs");
     setSelected(request.doc);
-    setSection(request.section);
+    focusOn(request.section, "plan");
     setShowPreview(true);
     consumeOpenKbDoc(request.id);
-  }, [request]);
+  }, [request, focusOn]);
 
   const docs = kb?.status === "ok" ? kb.list.docs : [];
   const doc = docs.find((d) => d.id === selected) ?? null;
   // Sem nada escolhido, a prévia mostra o primeiro (lado a lado).
   const shown = doc ?? (stacked ? null : (docs[0] ?? null));
 
-  const open = (id: string): void => {
+  const open = (id: string, section: string | null = null): void => {
     setSelected(id);
-    setSection(null);
+    focusOn(section, "jump");
     setShowPreview(true);
   };
+  const onSearchOpen = useCallback((value: boolean) => setSearching(value), []);
 
   const tools = (
     <WindowTools inlineOutsideWindow>
@@ -723,6 +777,12 @@ const KnowledgeView = memo(function KnowledgeView({ projectId, size }: { project
         <button type="button" className="nd-btn nd-iconbtn nd-btn-sm" data-variant="ghost" aria-label={t("kb.refresh")} title={t("kb.refresh")} onClick={() => void reloadKb(projectId)}>
           <Icon name="refresh" size={14} />
         </button>
+        {tab === "docs" && editing === null ? (
+          <button type="button" className="nd-btn nd-btn-sm" data-kb-new="" onClick={() => setEditing({ doc: null })}>
+            <Icon name="file-plus" size={14} />
+            {t("kb.editor.new")}
+          </button>
+        ) : null}
       </div>
     </WindowTools>
   );
@@ -741,6 +801,30 @@ const KnowledgeView = memo(function KnowledgeView({ projectId, size }: { project
       <p role="alert" className="nd-field-error nd-kb-note">
         {t("kb.list.error", { message: apiFailureText(kb.failure) })}
       </p>
+    );
+  } else if (editing !== null) {
+    body = (
+      <div className="nd-kb-body" data-arrangement="stacked" data-editing="true">
+        <Suspense
+          fallback={
+            <p role="status" className="nd-muted nd-kb-note">
+              {t("kb.editor.loading")}
+            </p>
+          }
+        >
+          <KbEditor
+          key={editing.doc?.id ?? "new"}
+          projectId={projectId}
+          docs={docs}
+          doc={editing.doc}
+          stacked={stacked}
+          onDone={(id) => {
+            setEditing(null);
+            if (id !== null) open(id);
+          }}
+          />
+        </Suspense>
+      </div>
     );
   } else if (docs.length === 0) {
     body = (
@@ -777,16 +861,32 @@ const KnowledgeView = memo(function KnowledgeView({ projectId, size }: { project
           projectId={projectId}
           doc={shown}
           docs={docs}
-          section={shown.id === selected ? section : null}
+          focus={shown.id === selected ? focus : null}
+          outline={size === "wide" ? "side" : "collapsed"}
+          onFocus={(anchor) => {
+            setSelected(shown.id);
+            focusOn(anchor, "jump");
+          }}
+          onOpenDoc={(id) => open(id)}
           onRemoved={() => {
             setSelected(null);
             setShowPreview(false);
           }}
+          onEdit={() => setEditing({ doc: shown })}
         />
       );
+    const search = (
+      <div className="nd-kb-searchbar" data-kb-searchbar="">
+        <KbQuickSearch projectId={projectId} docs={docs} variant={stacked ? "panel" : "popover"} onOpen={open} onOpenChange={onSearchOpen} inputRef={searchInput} />
+      </div>
+    );
     if (stacked) {
       body =
-        showPreview && shown !== null ? (
+        searching ? (
+          <div className="nd-kb-body" data-arrangement="stacked" data-searching="true">
+            {search}
+          </div>
+        ) : showPreview && shown !== null ? (
           <div className="nd-kb-body" data-arrangement="stacked">
             <div className="nd-kb-back" data-kb-back="">
               <button type="button" className="nd-btn nd-btn-sm" onClick={() => setShowPreview(false)}>
@@ -801,22 +901,38 @@ const KnowledgeView = memo(function KnowledgeView({ projectId, size }: { project
           </div>
         ) : (
           <div className="nd-kb-body" data-arrangement="stacked">
+            {search}
             {list}
           </div>
         );
     } else {
       body = (
-        <div className="nd-kb-body" data-arrangement="split">
-          {list}
-          {preview}
-        </div>
+        <>
+          {search}
+          <div className="nd-kb-body" data-arrangement="split">
+            {list}
+            {preview}
+          </div>
+        </>
       );
     }
   }
 
   return (
-    <div className="nd-kb" data-kb="" data-size={size}>
-      {tools}
+    <div
+      className="nd-kb"
+      data-kb=""
+      data-size={size}
+      onKeyDown={(event) => {
+        // `/` leva à busca rápida quando o foco não está num campo.
+        if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+        const el = event.target as HTMLElement;
+        if (el.closest("input, textarea, [contenteditable='true']") !== null) return;
+        event.preventDefault();
+        searchInput.current?.focus();
+      }}
+    >
+      {editing === null ? tools : null}
       {body}
     </div>
   );

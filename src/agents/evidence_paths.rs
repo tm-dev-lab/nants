@@ -23,7 +23,7 @@ use crate::agents::usage::ContextChange;
 use crate::harness::git::Git;
 use crate::i18n::{self, Lang};
 
-use super::runner::ReviewResult;
+use super::runner::{ReviewResult, WarningStatus};
 
 /// Teto de entradas da varredura do disco (arquivos e diretórios, em largura): a varredura só
 /// roda quando a árvore do git e o caminho exato no disco não acharam o citado.
@@ -322,12 +322,14 @@ pub enum Item {
     Criterion(usize),
     /// Índice em `findings`.
     Finding(usize),
+    /// Índice em `warnings`: o aviso do Desenvolvedor dado como `confirmed` (spec 136 T09).
+    Warning(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     pub item: Item,
-    /// O texto do critério ou o id do apontamento.
+    /// O texto do critério, o id do apontamento ou o número do aviso.
     pub label: String,
     pub problems: Vec<Problem>,
 }
@@ -410,7 +412,8 @@ fn check_field(tree: &Tree, text: &str, strict: bool, audit: &mut Audit) -> Vec<
     problems
 }
 
-/// Confere o parecer: a evidência dos critérios `met` e o `location` dos apontamentos.
+/// Confere o parecer: a evidência dos critérios `met`, o `location` dos apontamentos e a evidência
+/// dos avisos do Desenvolvedor dados como `confirmed` (spec 136 T09, com a régua dos critérios).
 pub fn audit(result: &ReviewResult, tree: &Tree) -> Audit {
     let mut audit = Audit::default();
     for (i, c) in result.criteria.iter().enumerate() {
@@ -428,7 +431,28 @@ pub fn audit(result: &ReviewResult, tree: &Tree) -> Audit {
             audit.issues.push(Issue { item: Item::Finding(i), label: f.id.clone(), problems });
         }
     }
+    audit_warnings_into(result, tree, &mut audit);
     audit
+}
+
+/// Só a parte dos avisos `confirmed` de [`audit`]: a conferência dos desfechos que chegam no novo
+/// pedido dos avisos (spec 136 T09), sem recontar critérios e apontamentos já conferidos.
+pub fn audit_warnings(result: &ReviewResult, tree: &Tree) -> Audit {
+    let mut audit = Audit::default();
+    audit_warnings_into(result, tree, &mut audit);
+    audit
+}
+
+fn audit_warnings_into(result: &ReviewResult, tree: &Tree, audit: &mut Audit) {
+    for (i, w) in result.warnings.iter().enumerate() {
+        if w.status != WarningStatus::Confirmed {
+            continue;
+        }
+        let problems = check_field(tree, &w.evidence, true, audit);
+        if !problems.is_empty() {
+            audit.issues.push(Issue { item: Item::Warning(i), label: w.number.to_string(), problems });
+        }
+    }
 }
 
 /// Lista curta das citações com problema (`a.rs:10, b.rs:400`), para a matriz.
@@ -438,8 +462,21 @@ pub fn cited_list(issue: &Issue) -> String {
 
 /// Marca como "não verificado" os critérios do parecer com a evidência ainda inválida: `met` vira
 /// `false` com `unverified`, e a evidência ganha o motivo no idioma do projeto. Só a resposta do
-/// Revisor faz um critério "não cumprido".
+/// Revisor faz um critério "não cumprido". O aviso `confirmed` com a evidência inválida passa a
+/// `not_checkable`, com o mesmo motivo, e vai para as pendências como os outros não conferidos
+/// (spec 136 T09).
 pub fn mark_unverified(lang: Lang, result: &mut ReviewResult, audit: &Audit) {
+    for issue in &audit.issues {
+        let Item::Warning(i) = issue.item else { continue };
+        if let Some(w) = result.warnings.get_mut(i) {
+            w.status = WarningStatus::NotCheckable;
+            w.evidence = i18n::tr(
+                lang,
+                "runner.review.unverified_evidence",
+                &[("paths", &cited_list(issue)), ("evidence", w.evidence.trim())],
+            );
+        }
+    }
     for (i, c) in result.criteria.iter_mut().enumerate() {
         if let Some(issue) = audit.criterion(i) {
             c.met = false;
@@ -619,6 +656,7 @@ pub fn reask_prompt(audit: &Audit, criteria: &[String], lang: crate::i18n::Lang)
                 tr(lang, "agent.evidence.criterion", &[("label", criteria.get(i).map_or(issue.label.as_str(), String::as_str))])
             }
             Item::Finding(_) => tr(lang, "agent.evidence.finding", &[("label", &issue.label)]),
+            Item::Warning(_) => tr(lang, "agent.evidence.warning", &[("label", &issue.label)]),
         };
         let problems = issue
             .problems
@@ -683,6 +721,7 @@ mod tests {
             screenshots_viewed: Vec::new(),
             declared: Vec::new(),
             pending: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -927,5 +966,49 @@ mod tests {
         assert!(en.contains("- Criterion \"login works\": `a.rs:1` does not exist"), "{en}");
         assert!(en.contains("- Finding F-01: `b.rs:9` goes past the end of the file (3 lines)"), "{en}");
         assert!(en.starts_with("The Nants check did not find"), "{en}");
+    }
+
+    /// Spec 136 T09: a evidência de um aviso `confirmed` passa pela mesma conferência de caminhos
+    /// dos critérios. A que cita o que não existe vai ao pedido único e, se continuar inválida,
+    /// vira `not_checkable` com o motivo, e o aviso cai nas pendências (não fica "conferido").
+    /// Os outros desfechos não são conferidos aqui.
+    #[test]
+    fn confirmed_warning_evidence_is_checked_by_paths() {
+        use crate::agents::runner::{apply_warnings, WarningReply};
+        let root = repo("warnings");
+        let tree = Tree::load(&root, "main").expect("árvore");
+        let reply = |number: usize, status: WarningStatus, evidence: &str| WarningReply {
+            number,
+            status,
+            evidence: evidence.into(),
+            finding: String::new(),
+        };
+        let mut r = result(&[], &[]);
+        r.warnings = vec![
+            reply(1, WarningStatus::Confirmed, "src/app.js:2"),
+            reply(2, WarningStatus::Confirmed, "src/ApiExceptionHandler.java:41"),
+            reply(3, WarningStatus::NotCheckable, "src/sumiu.rs:1 não está no projeto"),
+            reply(4, WarningStatus::Confirmed, "src/app.js:40"),
+        ];
+        let audit = audit(&r, &tree);
+        let items: Vec<(Item, &str)> = audit.issues.iter().map(|i| (i.item.clone(), i.label.as_str())).collect();
+        assert_eq!(items, vec![(Item::Warning(1), "2"), (Item::Warning(3), "4")]);
+        let en = reask_prompt(&audit, &[], crate::i18n::Lang::En);
+        assert!(en.contains("- Developer warning 2 (confirmed): `src/ApiExceptionHandler.java:41` does not exist"), "{en}");
+        let pt = reask_prompt(&audit, &[], crate::i18n::Lang::PtBr);
+        assert!(pt.contains("- Aviso 4 do Desenvolvedor (confirmed): `src/app.js:40` passa do fim do arquivo (3 linhas)"), "{pt}");
+        mark_unverified(crate::i18n::Lang::En, &mut r, &audit);
+        assert_eq!(r.warnings[0].status, WarningStatus::Confirmed);
+        assert_eq!(r.warnings[1].status, WarningStatus::NotCheckable);
+        assert!(r.warnings[1].evidence.starts_with("not verified:"), "{}", r.warnings[1].evidence);
+        assert_eq!((r.warnings[2].status, r.warnings[3].status), (WarningStatus::NotCheckable, WarningStatus::NotCheckable));
+        let texts: Vec<String> = (1..=4).map(|n| format!("aviso {n}")).collect();
+        let (out, outcome) = apply_warnings(crate::i18n::Lang::En, r, &texts);
+        assert_eq!(out.verdict, Verdict::Approved);
+        assert_eq!(outcome.checked.len(), 1, "{outcome:?}");
+        assert!(outcome.checked[0].contains("aviso 1"), "{outcome:?}");
+        assert_eq!(outcome.pending.len(), 3, "{outcome:?}");
+        assert!(outcome.pending.iter().any(|p| p.contains("aviso 2") && p.contains("ApiExceptionHandler.java:41")), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

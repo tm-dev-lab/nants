@@ -33,6 +33,7 @@ import { YoloBadge } from "../shared/YoloBadge";
 import { ChatImageThumbs } from "./ChatAttachments";
 import { ChatCard, ChatCardHead } from "./ChatCard";
 import { userMeta } from "./chatTime";
+import { CitedText } from "../knowledge/CitedText";
 import { ChoicesForm } from "./ChoicesForm";
 
 /*
@@ -137,7 +138,9 @@ function BubbleView({
         <p className="nd-msg-user-meta" data-user-meta="">
           {userMeta(message.at)}
         </p>
-        <p className="nd-bubble-user">{message.text}</p>
+        <p className="nd-bubble-user">
+          <CitedText projectId={projectId} text={message.text} />
+        </p>
         {message.attachments !== undefined && message.attachments.length > 0 ? <ChatImageThumbs projectId={projectId} names={message.attachments} /> : null}
         {message.unsent !== undefined ? (
           <p role="alert" className="nd-unsent">

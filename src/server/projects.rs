@@ -154,6 +154,10 @@ pub struct SpecView {
     /// Ambiente docker proposto pela spec (modo, serviços, imagem base e arquivos).
     #[serde(skip_serializing_if = "Option::is_none")]
     environment: Option<EnvView>,
+    /// Critérios globais do spec.md (spec 136 T04), redigidos e com teto, com as citações `kb:`
+    /// como estão no arquivo (omitido quando vazio).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    criteria: Vec<String>,
     /// Itens da seção `## Premissas` do spec.md (omitido quando vazio).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     premises: Vec<String>,
@@ -216,6 +220,9 @@ pub struct TaskView {
     /// Número da análise que ofereceu `recovery_options`; a UI o envia de volta na escolha.
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_options_analysis: Option<usize>,
+    /// Critérios de aceitação da tarefa (spec 136 T04), redigidos e com teto (omitido quando vazio).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    criteria: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<&'static str>,
 }
@@ -1449,6 +1456,7 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
                     execution_order,
                     error: None,
                     environment: env_view(root, &spec, secrets),
+                    criteria: criteria_view(secrets, &spec.body, crate::agents::runner::GLOBAL_CRITERIA),
                     premises: premises_view(secrets, &spec.body),
                     role_guidance: role_guidance_view(secrets, &spec.body),
                     skills: skills_view(&profiles, secrets, &spec.frontmatter.id),
@@ -1489,6 +1497,7 @@ fn load_specs(root: &Path, secrets: &SecretSet, review_now: Option<SystemTime>) 
                     execution_order,
                     error: Some(INVALID_FILE),
                     environment: None,
+                    criteria: Vec::new(),
                     premises: Vec::new(),
                     role_guidance: Vec::new(),
                     skills: Vec::new(),
@@ -1710,6 +1719,52 @@ fn premises_view(secrets: &SecretSet, body: &str) -> Vec<String> {
     out
 }
 
+const MAX_CRITERIA: usize = 24;
+const MAX_CRITERION_CHARS: usize = 600;
+
+/// Critérios da seção `## <title>` (spec 136 T04): cada item de primeiro nível, com as linhas da
+/// sublista e as de continuação juntadas a ele, redigido de segredos ANTES do corte (máx. 24 itens
+/// de 600 caracteres, com "…" quando corta). As citações `kb:` ficam como estão no arquivo.
+fn criteria_view(secrets: &SecretSet, body: &str, title: &str) -> Vec<String> {
+    let Some(section) = crate::agents::runner::section_text(body, title) else {
+        return Vec::new();
+    };
+    let mut items: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in section.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(item) = crate::sdd::coverage::criterion_items(line).into_iter().next() {
+            if items.len() >= MAX_CRITERIA {
+                break;
+            }
+            items.push(item);
+            open = true;
+            continue;
+        }
+        // Sublista ou continuação: junta ao item aberto, sem o marcador.
+        if let (true, Some(last)) = (open, items.last_mut()) {
+            let t = line.trim();
+            let t = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).unwrap_or(t).trim();
+            last.push(' ');
+            last.push_str(t);
+        }
+    }
+    items
+        .iter()
+        .map(|item| {
+            let clean = scrub_text(secrets, item);
+            if clean.chars().count() <= MAX_CRITERION_CHARS {
+                return clean;
+            }
+            let mut cut: String = clean.chars().take(MAX_CRITERION_CHARS).collect();
+            cut.push('…');
+            cut
+        })
+        .collect()
+}
+
 /// Ambiente docker da spec em rascunho (os arquivos são redigidos de segredos).
 fn env_view(root: &Path, spec: &Spec, secrets: &SecretSet) -> Option<EnvView> {
     if spec.frontmatter.environment.as_deref() != Some("docker")
@@ -1769,6 +1824,7 @@ pub(super) fn load_tasks(root: &Path, spec_rel: &str, secrets: &SecretSet) -> Ve
                     next_action: next_action_view(secrets, meta.next_action.as_deref()),
                     recovery_options: options,
                     recovery_options_analysis: analysis,
+                    criteria: criteria_view(secrets, &task.body, crate::agents::runner::ACCEPTANCE),
                     error: None,
                 }
             }
@@ -1783,6 +1839,7 @@ pub(super) fn load_tasks(root: &Path, spec_rel: &str, secrets: &SecretSet) -> Ve
                 next_action: None,
                 recovery_options: Vec::new(),
                 recovery_options_analysis: None,
+                criteria: Vec::new(),
                 error: Some(INVALID_FILE),
             },
         })
@@ -3328,6 +3385,28 @@ mod settings_tests {
         let crossing = format!("## Premissas\n- {}sk-segredo-longo-123\n", "a".repeat(290));
         let cut = &premises_view(&keyed, &crossing)[0];
         assert!(!cut.contains("sk-") && !cut.contains("segredo"), "{cut}");
+    }
+
+    #[test]
+    fn criteria_view_reads_items_with_sublists_masks_and_caps() {
+        let secrets = SecretSet::default();
+        let body = "## Objetivo\nx\n## Critérios de Aceitação\n1. Cria a rota, como em kb:padroes-api-3f9a1c2e#erros.\n2. **Lista:**\n   - um\n   - dois\n## Outro\n- fora\n";
+        assert_eq!(
+            criteria_view(&secrets, body, "Critérios de Aceitação"),
+            vec!["Cria a rota, como em kb:padroes-api-3f9a1c2e#erros.", "**Lista:** um dois"]
+        );
+        assert!(criteria_view(&secrets, "## Premissas\n- a\n", "Critérios de Aceitação").is_empty());
+        let many: String = (0..40).map(|i| format!("- c{i}\n")).collect();
+        assert_eq!(criteria_view(&secrets, &format!("## Critérios de Aceitação Globais\n{many}"), "Critérios de Aceitação Globais").len(), 24);
+        let long = format!("## Critérios de Aceitação\n- {}\n", "a".repeat(900));
+        let cut = &criteria_view(&secrets, &long, "Critérios de Aceitação")[0];
+        assert_eq!(cut.chars().count(), 601);
+        assert!(cut.ends_with('…'));
+        let key = ["sk", "-segredo-longo-123"].concat();
+        let keyed = SecretSet::new([key.clone()]);
+        let crossing = format!("## Critérios de Aceitação\n- {}{key}\n", "a".repeat(590));
+        let masked = &criteria_view(&keyed, &crossing, "Critérios de Aceitação")[0];
+        assert!(!masked.contains("segredo"), "{masked}");
     }
 
     use std::os::unix::fs::symlink;

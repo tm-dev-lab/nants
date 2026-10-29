@@ -48,7 +48,8 @@ const ACTIVITY_CODES = [
   "tool.request_environment_change", "tool.kb_search", "tool.kb_read", "tool.kb_index",
   "pace.waiting", "pace.throttled", "pace.queued", "plan.checking", "provider.retry", "provider.web_search_retry",
 ];
-const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "final.unverified", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable", "task.recurring_arbitration", "task.recurring_recovery", "task.recurring_unavailable", "task.dev_resumed_steps", "task.dev_resumed_repeated", "task.dev_resumed_stalled", "kb.source_changed", "kb.plan_no_standard", "kb.task_standard_uncited"];
+/** `kb.plan_no_standard` e `kb.task_standard_uncited`: legado (spec 136 T02); o servidor não os emite mais, e as chaves ficam para o histórico das conversas antigas. */
+const SYSTEM_CODES = ["final.skipped", "final.unavailable", "final.still_unmet", "final.fix_refused", "final.fix_created", "final.unverified", "task.worktree_dirty", "task.ownership_failed", "task.cleanup_failed", "task.arbitration_keep", "task.arbitration_adjust", "task.arbitration_manual", "task.arbitration_unavailable", "task.recurring_arbitration", "task.recurring_recovery", "task.recurring_unavailable", "task.dev_resumed_steps", "task.dev_resumed_repeated", "task.dev_resumed_stalled", "kb.source_changed", "kb.mention_invalid", "kb.plan_no_standard", "kb.task_standard_uncited"];
 
 describe("códigos novos do servidor (spec 102 T06)", () => {
   it("cada code tem texto nos dois idiomas, e o en não tem português", () => {
@@ -264,5 +265,16 @@ describe("análise de recuperação: opções fixas do servidor em en", () => {
     }
     const shown = localizeRecoveryAnalysis(`Análise de recuperação #1 (ESCALATE)\n${environmental ?? ""}`, "en");
     expect(shown).toContain(en["recoveryText.options.environmental"]);
+  });
+});
+
+describe("avisos legados da base (spec 136 T02)", () => {
+  it("a conversa antiga com kb.plan_no_standard e kb.task_standard_uncited ainda se lê nos dois idiomas", () => {
+    const noStandard = { text: "Aviso antigo", code: "kb.plan_no_standard", params: { spec: "134-x" } };
+    expect(systemMessageText(noStandard, "en")).toBe(en["system.kb.plan_no_standard"].replace("{spec}", "134-x"));
+    expect(systemMessageText(noStandard, "pt-BR")).toBe(ptBR["system.kb.plan_no_standard"].replace("{spec}", "134-x"));
+    const uncited = { text: "Aviso antigo", code: "kb.task_standard_uncited", params: { task: "T01", spec: "134-x", doc: "API", citation: "kb:api-0123abcd" } };
+    expect(systemMessageText(uncited, "en")).toContain("T01");
+    expect(systemMessageText(uncited, "en")).not.toBe(uncited.text);
   });
 });
