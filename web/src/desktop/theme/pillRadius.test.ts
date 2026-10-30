@@ -31,7 +31,9 @@ const ALLOWED: ReadonlyMap<string, Category> = new Map<string, Category>([
   [".nd-agent-dot", "ponto"],
   [".nd-exec-dot", "ponto"],
   [".nd-tree-dot", "ponto"],
-  [".nd-dock-indicator", "ponto"],
+  // Menu do N (spec 137): o ponto rosa de novidade no botão N e o ponto da janela aberta na grade.
+  [".nd-nbtn-dot", "ponto"],
+  [".nd-nmenu-indicator", "ponto"],
   // Avatar do agente e o anel dele: o ponto redondo que identifica o papel (sem texto).
   [".nd-avatar", "ponto"],
   [".nd-avatar-ring", "ponto"],

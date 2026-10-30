@@ -15,7 +15,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { notReady, settle } from "../../desktop/shell-test-utils";
+import { activateApp, notReady, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers, installPointerCapturePolyfill, manualScheduler, pointerEvent } from "../../desktop/test-utils";
 import { WindowLayoutContext } from "../../desktop/useWindowVisibility";
 import { windowTitleBarId } from "../../desktop/focus";
@@ -33,7 +33,7 @@ import {
   appEmpty,
   appWindow,
   calls,
-  clickDock,
+  clickApp,
   confirmDialog,
   emit,
   frame,
@@ -279,7 +279,7 @@ describe("App: minimizada ao montar", () => {
     const win = document.querySelector<HTMLElement>('[data-window="app"]');
     expect(win?.hidden).toBe(true);
     expect(view.fetchMock.mock.calls.some(([input]) => /\/app(\/|$)/.test(String(input)))).toBe(false);
-    await clickDock("App");
+    await clickApp("App");
     expect(calls(view, STATUS_URL)).toBe(1);
     expect(frame().getAttribute("src")).toBe(APP_URL);
   });
@@ -442,7 +442,7 @@ describe("App: iframe branco no celular (094/T05)", () => {
     // Relógio controlado antes de a janela abrir (o primeiro intervalo já nasce falso).
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "App" }));
+      activateApp("App");
     });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10);
@@ -590,7 +590,7 @@ describe("App: ciclo da janela (DOM estável)", () => {
     await settle();
     expect(win.hidden).toBe(true);
     expect(iframe.isConnected).toBe(true);
-    await clickDock("App");
+    await clickApp("App");
     expect(win.hidden).toBe(false);
     expect(frame()).toBe(iframe);
     expect(iframe.getAttribute("src")).toBe(APP_URL);

@@ -76,7 +76,7 @@ describe("Lançador (Ctrl+K)", () => {
     expect(screen.getByRole("region", { name: "Conversa" })).toBeTruthy();
   });
 
-  it("janelas com o atalho do dock (Alt+N), projetos e ações; setas e Enter executam", async () => {
+  it("janelas com o atalho da posição no menu do N (Alt+N), projetos e ações; setas e Enter executam", async () => {
     await renderShell({
       url: "/?space=p1",
       projects: [P1, P2],

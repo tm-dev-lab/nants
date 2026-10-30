@@ -112,7 +112,10 @@ describe("V-02: o CSS gerado mantém as formas padrão das propriedades prefixad
     const body = ruleOut(desktopOut, ".nd-chrome");
     expect(body).toContain("background:var(--chrome)");
     expect(body).toContain("box-shadow:var(--bevel)");
-    expect(desktopOut).not.toContain("backdrop-filter");
+    // Exceção única (spec 137): o véu do menu do N desfoca de leve a área de trabalho; a forma
+    // padrão continua no CSS final (V-02), e nenhuma outra regra usa desfoque.
+    expect(desktopOut.replace(/\.nd-nmenu-scrim\{[^}]*\}/g, "")).not.toContain("backdrop-filter");
+    expect(ruleOut(desktopOut, ".nd-nmenu-scrim")).toMatch(/(?:^|;)backdrop-filter:blur\(/);
     const more = ruleOut(desktopOut, ".nd-root .nd-chrome", "@media (prefers-contrast:more)");
     expect(more).toContain("background:var(--surface2)");
     expect(more).toMatch(/outline:1px solid var\(--edge-strong\)/);

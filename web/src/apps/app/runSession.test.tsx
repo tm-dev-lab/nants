@@ -23,7 +23,7 @@ import {
   STATUS_URL,
   appWindow,
   calls,
-  clickDock,
+  clickApp,
   emit,
   execWindow,
   frame,
@@ -72,7 +72,7 @@ describe("um único GET do estado por vez", () => {
 
   it("a Execução visível lê o estado mesmo com o App minimizado (qualquer janela visível pede)", async () => {
     const view = await mountRun({ app: { status: running() }, open: [] });
-    await clickDock("Execução");
+    await clickApp("Execução");
     expect(calls(view, STATUS_URL)).toBe(1);
   });
 });
@@ -105,14 +105,14 @@ describe("registro só com a Execução visível", () => {
       await vi.advanceTimersByTimeAsync(LOGS_POLL_MS * 3);
     });
     expect(calls(view, LOGS_URL)).toBe(0);
-    await clickDock("Execução");
+    await clickApp("Execução");
     expect(calls(view, LOGS_URL)).toBe(1);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LOGS_POLL_MS + 10);
     });
     expect(calls(view, LOGS_URL)).toBe(2);
     // Minimizada, para; o App visível não lê o registro.
-    await clickDock("Execução");
+    await clickApp("Execução");
     const n = calls(view, LOGS_URL);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LOGS_POLL_MS * 3);

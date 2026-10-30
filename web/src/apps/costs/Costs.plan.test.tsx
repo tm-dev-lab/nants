@@ -2,11 +2,11 @@
  * Custos com o plano ChatGPT (spec 116 T03): a seção "Plano ChatGPT" com os tokens e as chamadas,
  * sem US$, e o link "Gerenciar uso". Só pelo plano, nada de total em dólar.
  */
-import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UsageView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
 import { makeProject, makeProjectState } from "../../test-utils";
 import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
@@ -24,7 +24,7 @@ async function openCosts(project: UsageView) {
   const view = await renderShell({ url: "/?space=p1", projects: [makeProject("p1", "Loja")], states: { p1: makeProjectState({ id: "p1", name: "Loja" }) } });
   view.server.reply("GET", /\/api\/projects\/p1\/usage/, () => ({ status: 200, body: project }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Custos" }));
+    activateApp("Custos");
   });
   await settle();
   return screen.getByRole("region", { name: "Custos" });
@@ -75,7 +75,7 @@ async function openCostsEn() {
     body: { specs: [], total: { ...zero, chatgpt_plan: PLAN }, by_agent: [], by_spec: [], by_model: [], budget: null },
   }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Costs" }));
+    activateApp("Costs");
   });
   await settle();
   return screen.getByRole("region", { name: "Costs" });

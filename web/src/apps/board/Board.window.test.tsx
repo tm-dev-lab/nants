@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState, SpecView, TaskView, UsageView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, openNMenu, renderShell, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
@@ -110,7 +110,7 @@ describe("Quadro: colunas, cartões e resumo", () => {
     expect(findForbiddenGlyphs(win)).toEqual([]);
   });
 
-  it("tarefa bloqueada: coluna Bloqueada com o motivo e selo no dock; selo de recuperação no cartão", async () => {
+  it("tarefa bloqueada: coluna Bloqueada com o motivo e selo no menu do N; selo de recuperação no cartão", async () => {
     const tasks = [makeTask("T01", "Base", "BLOCKED", { next_action: "o teste falha" }), makeTask("T02", "Carrinho", "IN_PROGRESS")];
     appStore.setState({});
     await mount(spec(tasks));
@@ -122,8 +122,9 @@ describe("Quadro: colunas, cartões e resumo", () => {
     expect(blocked.textContent).toContain("Motivo");
     expect(blocked.textContent).toContain("o teste falha");
     expect(win.querySelector('[data-recovery="analyzing"]')?.textContent).toBe("Arquiteto analisando (ciclo 2)");
-    const dock = screen.getByRole("navigation", { name: "Dock" });
-    expect(dock.querySelector('[data-badge]')?.textContent ?? "").toContain("1");
+    // O selo do Quadro aparece no menu do N.
+    const menu = openNMenu();
+    expect(menu.querySelector('[data-kind="board"] [data-badge]')?.textContent ?? "").toContain("1");
     expect(findForbiddenGlyphs(win)).toEqual([]);
   });
 
@@ -242,9 +243,9 @@ describe("Quadro: colunas, cartões e resumo", () => {
     });
     await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: waiting } });
     await settle();
-    // Com pedido pendente, o layout abre a Conversa e o Plano: o Quadro vem pelo Dock.
+    // Com pedido pendente, o layout abre a Conversa e o Plano: o Quadro vem pelo menu do N.
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: /Quadro/ }));
+      activateApp(/Quadro/);
     });
     await settle();
     expect(board().querySelector('[data-paused="decision"]')?.textContent).toBe("Aguardando vocêaguardando sua decisão");

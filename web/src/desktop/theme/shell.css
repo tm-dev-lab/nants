@@ -26,57 +26,78 @@
 }
 
 .nd-topbar-center {
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
   display: flex;
   justify-content: center;
 }
 
-/* Marca (095/T02, `reference/Main.dc.html`): o símbolo real do Nants, o nome (14/600) e o slogan. */
-.nd-brand {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: 0 var(--sp-2) 0 0;
-  min-width: 0;
+/*
+ * Barra sem quebra nem sobreposição (137/T03, G2): quem cede espaço é a faixa de status
+ * (`.nd-topbar-center`, com a pílula): o título e os detalhes saem primeiro e a fase encolhe com
+ * reticências, com o texto inteiro na dica da pílula. O seletor de projeto, o Layout, Automático,
+ * Internet, o selo de setup, a busca e o sino ficam com a largura deles.
+ *
+ * De 1366 px para cima, os rótulos do seletor (com teto e reticências no nome), do Layout, de
+ * Automático, de Internet e da busca ficam visíveis; a partir de 1660 a busca é a larga, com o atalho.
+ * O selo de setup vira só o ícone abaixo de 1520. Abaixo de 1366, se ainda falta espaço, os rótulos
+ * saem pelo que menos faz falta: Automático e Internet, depois a busca e por fim o Layout (o nome
+ * segue no `aria-label` e na dica `title`). As faixas valem só no desktop (o celular tem a barra
+ * compacta própria, `mobile.css`). `TopBar.width.test.ts` confere, de 1024 a 1920 px e nos dois
+ * idiomas, com uma estimativa de texto acima da largura real da Inter, que os controles e a largura
+ * mínima legível da pílula (o ponto e uns 8 caracteres da fase) cabem.
+ */
+.nd-topbar-content:not([data-compact="true"]) > :not(.nd-topbar-center) {
   flex-shrink: 0;
 }
 
-/* Duas linhas no total: o nome em cima e o slogan inteiro embaixo, centradas na barra (44 px). */
-.nd-brand-text {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-self: center;
-  gap: 0;
-  min-width: 0;
+@media (max-width: 1659.98px) {
+  .nd-topbar-content:not([data-compact="true"]) .nd-search-btn {
+    flex: 0 0 160px;
+    width: 160px;
+  }
+
+  .nd-topbar-content:not([data-compact="true"]) .nd-search-btn > kbd {
+    display: none;
+  }
+
+  .nd-topbar-content:not([data-compact="true"]) [data-space-switcher] > .nd-bar-text {
+    max-width: 130px;
+  }
 }
 
-.nd-brand-name {
-  font-weight: var(--fw-semibold);
-  font-size: var(--fs-body);
-  line-height: 16px;
-  color: var(--ink);
-  white-space: nowrap;
+@media (max-width: 1519.98px) {
+  .nd-topbar-content:not([data-compact="true"]) [data-setup-badge] > .nd-bar-label {
+    display: none;
+  }
 }
 
-.nd-brand-slogan {
-  font-size: var(--fs-caption);
-  line-height: 13px;
-  color: var(--muted);
-  /* Uma linha só: nunca quebra; onde não cabe, some (regra abaixo). */
-  white-space: nowrap;
+@media (max-width: 1365.98px) {
+  .nd-topbar-content:not([data-compact="true"]) .nd-toggle > .nd-bar-label {
+    display: none;
+  }
 }
 
-/* Estreita: o slogan some primeiro (nenhum controle da barra some antes dele). */
-@media (max-width: 1365px) {
-  .nd-brand-slogan {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
+@media (max-width: 1219.98px) {
+  .nd-topbar-content:not([data-compact="true"]) .nd-search-btn {
+    flex: 0 0 32px;
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .nd-topbar-content:not([data-compact="true"]) .nd-search-btn > .nd-search-text {
+    display: none;
+  }
+}
+
+@media (max-width: 1099.98px) {
+  .nd-topbar-content:not([data-compact="true"]) [data-layout-menu] > .nd-bar-text {
+    display: none;
+  }
+
+  .nd-topbar-content:not([data-compact="true"]) [data-space-switcher] > .nd-bar-text {
+    max-width: 100px;
   }
 }
 
@@ -200,6 +221,18 @@
 }
 
 /*
+ * Rótulo da fase (137/T03): encolhe com reticências quando não cabe inteiro
+ * (o título e os detalhes só ocupam a sobra e saem antes). O texto inteiro fica na
+ * dica da pílula e no rótulo do grupo.
+ */
+.nd-run-pill > .nd-run-phase:not(.nd-run-op) {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
  * Encaixe do título (095/T07, A-01): uma linha só (`height` de uma linha e `overflow: hidden`) que
  * quebra. O `::before` de largura zero ocupa a primeira linha; o título tem base e mínimo de 12
  * caracteres, então, quando não cabem 12, ele desce para a segunda linha, que fica escondida.
@@ -208,7 +241,12 @@
 .nd-run-title-slot {
   display: flex;
   flex-wrap: wrap;
-  flex: 0 1 auto;
+  /*
+   * 137/T03: base 0 e crescimento até o tamanho do texto. O título e os detalhes só ocupam a sobra
+   * depois da fase e do botão: sem espaço, eles saem antes e a fase continua inteira.
+   */
+  flex: 1 1 0;
+  max-width: max-content;
   min-width: 0;
   height: 20px;
   line-height: 20px;
@@ -248,7 +286,9 @@
 .nd-run-details-slot {
   display: flex;
   flex-wrap: wrap;
-  flex: 0 1 auto;
+  /* A mesma regra do título (137/T03): só a sobra depois da fase e do botão. */
+  flex: 1 1 0;
+  max-width: max-content;
   min-width: 0;
   height: 20px;
   line-height: 20px;
@@ -377,7 +417,7 @@
 .nd-toast {
   position: absolute;
   left: 50%;
-  bottom: 104px;
+  bottom: var(--float-bottom);
   transform: translateX(-50%);
   display: flex;
   align-items: center;

@@ -873,7 +873,7 @@ const RED_PNG: [u8; 75] = [
 /// ferramenta vazio. A chave, o modelo, o preço e o teto de gasto vêm de [`live_tests`]; o uso e o
 /// custo de cada pedido saem no relatório.
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_GEMINI_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real do Gemini com a chave do usuário"]
 async fn gemini_live_text_and_tool() {
@@ -1062,7 +1062,7 @@ async fn gemini_live_text_and_tool() {
 /// isso o prefixo é o mesmo entre execuções, e a falta de leitura sai como aviso no relatório, não
 /// como falha; `NANTS_LIVE_GEMINI_REQUIRE_CACHE=1` a torna falha (útil numa segunda execução).
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_GEMINI_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real do Gemini com a chave do usuário"]
 async fn gemini_live_cache() {
@@ -1106,7 +1106,7 @@ async fn gemini_live_cache() {
 /// pergunta pede uma só consulta (a Interactions não tem `max_uses`; o limite de buscas do
 /// [`live_tests`] confere o que veio).
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_GEMINI_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real do Gemini com a chave do usuário e faz uma busca"]
 async fn gemini_live_web_search() {

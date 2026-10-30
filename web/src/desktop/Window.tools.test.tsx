@@ -92,6 +92,35 @@ describe("barra de título de 44 px (C-06)", () => {
   });
 });
 
+describe("controles sempre à direita (137/T04)", () => {
+  const controls = (): string[] =>
+    [...bar().querySelectorAll(":scope > button")].map((b) => `${b.getAttribute("aria-label") ?? ""}${b.hasAttribute("data-window-controls-start") ? " [start]" : ""}`);
+
+  it("o primeiro controle leva a margem automática, com ou sem ferramentas no slot", () => {
+    expect(cssRuleBody(css("desktop.css"), ".nd-titlebar > [data-window-controls-start]")).toContain("margin-left: auto;");
+    // Sem ferramentas (o App em modo Console, Rodando, Terminou): o slot some e nada mais empurra.
+    render(<Live />);
+    expect(bar().querySelector("[data-window-tools]")?.childElementCount).toBe(0);
+    expect(controls()).toEqual(["Menu da janela [start]", "Minimizar", "Maximizar", "Fechar"]);
+    cleanup();
+    render(<Live tools={<Tools />} />);
+    expect(controls()).toEqual(["Menu da janela [start]", "Minimizar", "Maximizar", "Fechar"]);
+    expect(bar().querySelector("[data-window-tools]")?.nextElementSibling?.hasAttribute("data-window-controls-start")).toBe(true);
+  });
+
+  it("no celular, o Fechar (único controle) também fica na ponta", () => {
+    render(<Live host={{ mobile: true }} />);
+    expect(controls()).toEqual(["Fechar [start]"]);
+  });
+
+  it("nenhuma regra de janela tira a margem dos controles", () => {
+    for (const file of ["desktop.css", "mobile.css"]) {
+      const loose = cssRules(css(file)).filter((r) => r.selectors.some((sel) => /\.nd-wbtn|data-window-controls-start/.test(sel)) && /margin(-left)?:/.test(r.body));
+      expect(loose.map((r) => r.selectors.join(", "))).toEqual(file === "desktop.css" ? [".nd-titlebar > [data-window-controls-start]"] : []);
+    }
+  });
+});
+
 describe("slot de ferramentas [data-window-tools] (C-07)", () => {
   it("fica entre o subtítulo e os controles; vazio, some", () => {
     render(<Live tools={<Tools />} />);

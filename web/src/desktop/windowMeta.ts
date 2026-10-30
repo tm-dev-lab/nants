@@ -1,6 +1,6 @@
 /*
  * Metadados de cada tipo de janela (spec 093, decisão 3): título, ícone, tom do ícone e o estado
- * vazio padrão (uma frase e uma ação). Também a ordem do dock.
+ * vazio padrão (uma frase e uma ação). Também a ordem dos apps (menu do N e Alt+1…9).
  * Spec 101: título e frases vêm do dicionário, lidos no idioma ativo a cada acesso (quem desenha
  * assina o idioma com `useT()`/`useLanguage()`).
  */
@@ -67,11 +67,11 @@ export const WINDOW_META: Readonly<Record<WindowKind, WindowMeta>> = {
 };
 
 /**
- * Ordem do dock (095/T03, C-04): Alt+1…9 cobre as nove primeiras (até Custos); Conhecimento
+ * Ordem dos apps (095/T03, C-04; o menu do N na 137): Alt+1…9 cobre as nove primeiras (até Custos); Conhecimento
  * (spec 134 T06), Projeto, Configurações e Primeiros passos ficam pelo lançador (sem Alt+0). Primeiros passos entra no
  * fim, quando aberto.
  */
-export const DOCK_ORDER: readonly WindowKind[] = [
+export const APP_ORDER: readonly WindowKind[] = [
   "conversation",
   "plan",
   "board",

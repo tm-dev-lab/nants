@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState } from "../../test-utils";
@@ -30,7 +30,7 @@ function states(extra: Partial<ProjectState> = {}): Record<string, ProjectState>
 async function openProject(options: RenderShellOptions = {}) {
   const view = await renderShell({ url: "/?space=p1", projects: [P1, P2], states: states(), ...options });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Projeto" }));
+    activateApp("Projeto");
   });
   await settle();
   return view;
@@ -253,7 +253,7 @@ describe("Projeto: Remover do Nants", () => {
     const { server } = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: states().p1 as ProjectState } });
     server.reply("DELETE", /^\/api\/projects\/p1$/, () => ({ status: 200, body: { ok: true, removed: "p1" } }));
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Projeto" }));
+      activateApp("Projeto");
     });
     await settle();
     fireEvent.click(within(project()).getByRole("button", { name: "Remover do Nants" }));

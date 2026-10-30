@@ -8,7 +8,7 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
 import { appStore } from "../../store";
@@ -61,7 +61,7 @@ async function openSettings(extra: RenderShellOptions = {}) {
   view.server.reply("GET", /^\/api\/system\/prereqs$/, () => ({ status: 200, body: [] }));
   view.server.reply("GET", /^\/api\/config\/pricing\/estimate/, () => ({ status: 200, body: PRICES }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: /^(Configurações|Settings)$/ }));
+    activateApp(/^(Configurações|Settings)$/);
   });
   await settle();
   return view;

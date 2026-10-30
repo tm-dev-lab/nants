@@ -54,8 +54,20 @@ describe("A-01: sobreposições opacas (titânio), sem vidro nem desfoque", () =
     for (const stop of [base.top, base.mid, base.bottom]) expect(parseColor(stop).a).toBe(1);
   });
 
+  /*
+   * Exceção única (spec 137, decisão do usuário): o véu do menu do N desfoca de leve a área de
+   * trabalho atrás dele. O véu não é sobreposição nem painel: o menu continua sólido (`--overlay`).
+   * Com movimento reduzido, o desfoque sai.
+   */
+  const BLUR_EXCEPTIONS: ReadonlySet<string> = new Set([".nd-nmenu-scrim"]);
+
   it("nenhum CSS da interface usa backdrop-filter nem as classes de vidro", () => {
-    const css = [desktopCss, shellCss, mobileCss, appsCss, boardCss, activityCss, costsCss, filesCss, appCss].map((c) => c.replace(/\/\*[\s\S]*?\*\//g, "")).join("\n");
+    const sheets = [desktopCss, shellCss, mobileCss, appsCss, boardCss, activityCss, costsCss, filesCss, appCss];
+    const blurred = sheets.flatMap((c) => cssRules(c)).filter((r) => /backdrop-filter:\s*(?!none)/.test(r.body));
+    expect(blurred.flatMap((r) => r.selectors).filter((sel) => !BLUR_EXCEPTIONS.has(sel))).toEqual([]);
+    const css = sheets
+      .map((c) => cssRules(c).filter((r) => !r.selectors.every((sel) => BLUR_EXCEPTIONS.has(sel))).map((r) => `${r.selectors.join(", ")} { ${r.body} }`).join("\n"))
+      .join("\n");
     expect(css).not.toMatch(/backdrop-filter|\.nd-glass|\.nd-metal|overlay-glass|modal-glass/);
     for (const { file, text } of sources()) expect({ file, glass: /\bnd-(?:glass|metal|overlay-glass|modal-glass)\b/.test(text) }).toEqual({ file, glass: false });
   });
@@ -63,12 +75,12 @@ describe("A-01: sobreposições opacas (titânio), sem vidro nem desfoque", () =
   /*
    * Decisão do Arquiteto na revisão 1 da T01: as sobreposições NÃO são titânio. Elas são a
    * superfície sólida `--overlay` (como a busca e o aviso do mockup); o titânio fica só nas barras,
-   * nos títulos, no dock, nas abas do celular e nos segmentados.
+   * nos títulos, nas abas do celular e nos segmentados.
    */
   it("toda superfície que flutua (menu, popover, sino, lançador, avisos, dicas) é .nd-overlay sólida, sem titânio", () => {
     const overlay = /\bnd-overlay(?![\w-])/;
     // 095/T02 (C-07): no celular as ferramentas da janela são uma linha de titânio sob a barra de título.
-    const bars = /\bnd-(?:topbar|titlebar|dock|mobile-tabs|segment|window-tools)(?![\w-])/;
+    const bars = /\bnd-(?:topbar|titlebar|mobile-tabs|segment|window-tools)(?![\w-])/;
     const seen = new Set<string>();
     const wrong: string[] = [];
     for (const { file, text } of sources()) {
@@ -78,11 +90,11 @@ describe("A-01: sobreposições opacas (titânio), sem vidro nem desfoque", () =
           for (const cls of m[0].match(/nd-[\w-]+/g) ?? []) seen.add(cls);
           if (chrome) wrong.push(`sobreposição com titânio: ${file}: ${m[0]}`);
         }
-        if (chrome && !bars.test(m[0])) wrong.push(`titânio fora de barra/título/dock/abas/segmentado: ${file}: ${m[0]}`);
+        if (chrome && !bars.test(m[0])) wrong.push(`titânio fora de barra/título/abas/segmentado: ${file}: ${m[0]}`);
       }
     }
     expect(wrong).toEqual([]);
-    for (const cls of ["nd-menu", "nd-popover", "nd-sheet", "nd-attention", "nd-launcher", "nd-toast", "nd-toast-more", "nd-permission-toast", "nd-bar-alert", "nd-bar-note", "nd-hint", "nd-tip", "nd-board-popover"]) {
+    for (const cls of ["nd-menu", "nd-popover", "nd-sheet", "nd-attention", "nd-launcher", "nd-toast", "nd-toast-more", "nd-permission-toast", "nd-bar-alert", "nd-bar-note", "nd-hint", "nd-board-popover"]) {
       expect(seen).toContain(cls);
     }
   });
@@ -256,7 +268,7 @@ describe("A-12 e 095/T07 A-09: Alternador em linhas neutras; só a vista atual s
     expect(item).toContain("border-bottom: 1px solid var(--divider);");
     expect(item).toContain("background: transparent;");
     expect(cssRuleBody(mobileCss, ".nd-switcher-list")).toContain("gap: 0;");
-    // Ícone neutro como no dock: nem tom por aplicativo no componente.
+    // Ícone neutro como na grade do menu do N: nem tom por aplicativo no componente.
     expect(cssRuleBody(mobileCss, ".nd-switcher-icon")).toContain("color: var(--ink2);");
     // Fora do contraste alto (onde o atual ganha o contorno neutro --edge-strong, 095/T09).
     const current = cssRules(desktopCss).filter(

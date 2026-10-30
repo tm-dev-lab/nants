@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/desktop-en.webp" width="900" alt="Nants running a finished project: the final report, the generated app and the conversation with the agents">
+  <img src="docs/images/desktop-en.webp" width="900" alt="The Nants desktop with the Nants menu open from the N at the top left: search, the grid of apps, the open windows and the shortcuts, over the Conversation with the Architect and the Plan">
 </p>
 
 ## What is Nants
@@ -51,6 +51,14 @@ and you decide at every step.
 
 - **Agents with roles.** Architect, Developer and Reviewer work from a specification with
   acceptance criteria, and every task runs in an isolated Git worktree.
+- **A desktop in your browser.** Every app (Conversation, Plan, Board, Activity, Files, App, Run,
+  Report, Costs, Knowledge, Project and Settings) opens in a window you can move, snap, resize and
+  minimize, and the windows use the whole screen down to the bottom edge. The **N** at the top left
+  opens the Nants menu: search, the grid of apps with their badges, the open and minimized windows
+  (a click focuses or restores one) and the shortcuts. A pink dot on the N means an app has
+  something new. **Alt+0** opens and closes the menu, **Alt+1** to **Alt+9** open the apps in the
+  menu's order, **Ctrl+K** opens the launcher and **Esc** closes the menu. On the phone, Nants keeps
+  its own bottom bar.
 - **The whole spec for every role.** The Architect writes in each task the titles of the spec
   sections it implements. Each Developer and Reviewer briefing carries the spec's index (every
   heading and its size) and whole sections, never cut in the middle: first the ones the task cites,
@@ -123,6 +131,13 @@ and you decide at every step.
   close to its time limit, you get a warning to split or focus it. A failed round is run once more
   with no change, and if it passes the task goes on with a flaky test alert. When the round fails
   with the same failure lines the Developer already saw on the same code, there is no extra round.
+- **Offline round.** A property of the environment, such as "the tests do not reach the internet",
+  is proven by the environment and not by guards in the code. The Architect marks such a criterion
+  with `(offline)` at its start (the marker is the same in both languages). After the regular test
+  round passes, the suite runs once more on an internal Docker network with no internet access:
+  the project's own services, such as a database, stay reachable, and the dependency cache is the
+  same. The result goes into the run record marked as offline and is the evidence of the marked
+  criteria; the Reviewer asks for that round, never for code that checks the network.
 - **A stopped Developer picks up where it left off.** When the Developer stops before finishing
   (the step limit, the same call repeated with no progress, or no progress at all), Nants resumes
   the work once, in a new session with what was done and what is left, before tests and review.
@@ -182,6 +197,14 @@ and you decide at every step.
   app that cannot run in the sandbox (a native desktop window, a native mobile app) is declared in
   the plan, and the window explains it and shows how to run it on your computer. See
   [SECURITY.md](SECURITY.md#project-console) for the Console's protections.
+- **A service you can call from the Console.** When the app is a service without a page (an API,
+  or a worker with a port), the approved environment installs a tool to make HTTP requests with the
+  image's own package manager, or uses an image that already has one. When a task changes the
+  project's README, the first word of every command in its "How to run" and "How to test" sections
+  is checked inside the environment, and a command the image does not have is a finding in that
+  task's review. In the Console, a command that ends with
+  code 127 says the command does not exist in the project image (a missing tool or a typo) and
+  suggests asking the Architect to add the tool.
 - **Visual quality.** Projects with an interface follow a short visual baseline (use of the desktop
   width, styled form controls, clear type and spacing, finished empty and error states, contrast,
   nothing cut off on mobile): the Architect adds it to the plan as a global criterion, the
@@ -323,8 +346,12 @@ sign-in from this computer. If Nants asks you to sign in again, use **Reconnect*
 Each role (Architect, Developer and Reviewer) has its own connection and model, set in
 **Settings > Agents**, and they can be on different providers.
 
-- **In the Conversation.** The footer shows the role you are talking to, its model and its
-  connection (the name and the type). Click it to open **Connections in use**: the three roles,
+- **In the Conversation.** The footer shows the role you are talking to, the Architect, with its
+  model and its connection (the name, and the type only when it differs from the name). While a
+  run is going, a short line next to it shows the role working right now, with the task and the
+  connection (for example "now: Developer · T01 · Gemini · gemini-3.1-flash-lite"); it goes away
+  when the run ends. Each line fits on one line on the phone. Click the footer to open
+  **Connections in use**: the three roles,
   each with its connection, model and state (available, or paused with the reason), a **Switch**
   button and, when the provider has one, a link to the account limits or billing page. A switch is
   saved in Agents and changes only that role. It applies when the run starts again (on
@@ -357,7 +384,7 @@ Each role (Architect, Developer and Reviewer) has its own connection and model, 
 
 Each project can have its own knowledge base: your company's architecture standards, API
 guidelines, manuals, or any reference the agents should look up. Open the **Knowledge** window
-(after Costs in the dock).
+from the Nants menu (the N at the top left) or with Ctrl+K.
 
 - **What goes in.** Markdown, plain text and PDF files with text (up to 32 MiB each, dropped on
   the window or picked with **Add files**), and links to web pages. A link is read once, when you
@@ -487,8 +514,8 @@ scripts/test.sh cargo test
 (cd web && npm ci && ../scripts/test.sh npx vitest run)
 ```
 
-The optional live tests against Anthropic and Gemini, with your own key and a spend ceiling, are
-described in [docs/live-tests.md](docs/live-tests.md).
+The test suite never calls a real provider: the agents and the providers are simulated, so no key
+is needed and nothing is spent.
 
 After changing `web/`, rebuild the interface with `(cd web && npm run build)` and then the
 executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized.

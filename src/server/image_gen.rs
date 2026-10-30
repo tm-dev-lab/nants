@@ -4,12 +4,12 @@
 //! - Disponibilidade: o registro de capacidade do `AppState` para o par (conexão, modelo), consultado
 //!   a cada sessão do Desenvolvedor.
 //! - Recusa: marca o par como indisponível e publica uma única vez por execução (este gerador vive
-//!   uma execução) a mensagem de sistema [`IMAGE_UNAVAILABLE_NOTICE`].
+//!   uma execução) a mensagem de sistema `system.image.unavailable`, no idioma do projeto.
 //! - Falha final (spec 091): linha no stderr (também na recusa) e mensagem de sistema com o motivo
 //!   fixo e o caminho, até [`MAX_FAILURE_NOTICES`] por execução.
 //! - Freio de custo (spec 094 T01): o gerador vive uma execução e serve um par (conexão, modelo),
 //!   então guarda o [`ChargedBrake`] da execução. Ao suspender, linha no stderr e mensagem de
-//!   sistema única ([`image_suspended_notice`]), SEMPRE publicada, fora do teto da 091.
+//!   sistema única ([`image_suspended_text`]), SEMPRE publicada, fora do teto da 091.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,7 +25,8 @@ use crate::agents::llm_client::{
 use crate::agents::runner::{EventSink, RunnerEvent};
 use crate::agents::LlmError;
 use crate::config::{Config, WireApi};
-use crate::harness::tools::{image_suspended_notice, ChargedBrake, ImageGenerator, IMAGE_UNAVAILABLE_NOTICE};
+use crate::harness::tools::{ChargedBrake, ImageGenerator};
+use crate::i18n::{Lang, SharedLang};
 
 /// Códigos (spec 102) das mensagens de sistema de imagem; a interface as mostra pelo `code`.
 pub const CODE_IMAGE_UNAVAILABLE: &str = "image.unavailable";
@@ -39,12 +40,15 @@ const IMAGE_ROLE: &str = "developer";
 /// Teto de mensagens de sistema de falha de imagem por execução; depois, só o log.
 pub const MAX_FAILURE_NOTICES: usize = 3;
 
-/// Mensagem de sistema da falha final da geração de `path` (spec 091): só o motivo fixo.
-pub fn image_failure_notice(path: &str, failure: &ProviderFailure) -> String {
-    format!(
-        "Geração de imagem falhou ({}): {path}. O Developer seguirá com SVG/CSS se necessário.",
-        failure.describe()
-    )
+/// Mensagem de sistema da falha final da geração de `path` (spec 091): só o motivo fixo, no idioma
+/// do projeto (spec 137 T12).
+pub fn image_failure_notice(lang: Lang, path: &str, failure: &ProviderFailure) -> String {
+    crate::i18n::tr(lang, "system.image.failed", &[("failure", &failure.describe_in(lang)), ("path", path)])
+}
+
+/// Mensagem de sistema da geração suspensa pelo freio de custo, no idioma do projeto (spec 137 T12).
+pub fn image_suspended_text(lang: Lang, charged: usize) -> String {
+    crate::i18n::tr_plural(lang, "system.image.suspended", u64::try_from(charged).unwrap_or(u64::MAX), &[])
 }
 
 /// Gerador sobre a conexão e o modelo do Desenvolvedor.
@@ -60,6 +64,8 @@ pub struct LlmImageGenerator {
     failures: AtomicUsize,
     /// Freio de custo da execução para o par (spec 094 T01).
     brake: ChargedBrake,
+    /// Idioma do projeto das mensagens de sistema gravadas no diálogo (spec 137 T12).
+    lang: SharedLang,
 }
 
 impl LlmImageGenerator {
@@ -89,7 +95,14 @@ impl LlmImageGenerator {
             warned: AtomicBool::new(false),
             failures: AtomicUsize::new(0),
             brake: ChargedBrake::default(),
+            lang: SharedLang::default(),
         }
+    }
+
+    /// Idioma do projeto das mensagens de sistema (spec 137 T12).
+    pub fn with_lang(mut self, lang: SharedLang) -> Self {
+        self.lang = lang;
+        self
     }
 
     /// Destino das mensagens de sistema da primeira recusa e das falhas (barramento +
@@ -125,7 +138,8 @@ impl ImageGenerator for LlmImageGenerator {
         if self.warned.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.system_message(IMAGE_UNAVAILABLE_NOTICE.into(), CODE_IMAGE_UNAVAILABLE, Map::new());
+        let text = crate::i18n::tr(self.lang.get(), "system.image.unavailable", &[]);
+        self.system_message(text, CODE_IMAGE_UNAVAILABLE, Map::new());
     }
 
     fn report_failure(&self, path: &str, failure: &ProviderFailure) {
@@ -134,7 +148,7 @@ impl ImageGenerator for LlmImageGenerator {
             // Params neutros de idioma (spec 102): `provider`, `kind`, `provider_code` e `path`.
             let mut params = super::error::provider_failure_params(failure);
             params.insert("path".to_string(), Value::from(path));
-            self.system_message(image_failure_notice(path, failure), CODE_IMAGE_FAILED, params);
+            self.system_message(image_failure_notice(self.lang.get(), path, failure), CODE_IMAGE_FAILED, params);
         }
     }
 
@@ -149,7 +163,7 @@ impl ImageGenerator for LlmImageGenerator {
         log_image_suspended(IMAGE_ROLE, &self.connection_id, &self.model, total);
         // Sempre publicada (uma vez por execução: a suspensão só acontece uma vez), fora do teto.
         let params = Map::from_iter([("count".to_string(), Value::from(total))]);
-        self.system_message(image_suspended_notice(total), CODE_IMAGE_SUSPENDED, params);
+        self.system_message(image_suspended_text(self.lang.get(), total), CODE_IMAGE_SUSPENDED, params);
         true
     }
 
@@ -160,7 +174,7 @@ impl ImageGenerator for LlmImageGenerator {
 
 impl LlmImageGenerator {
     /// Publica uma mensagem de sistema da execução, quando há destino, com `code`/`params` (spec
-    /// 102) e o texto de reserva em pt-BR.
+    /// 102) e o texto de reserva no idioma do projeto.
     fn system_message(&self, text: String, code: &str, params: Map<String, Value>) {
         if let Some(sink) = &self.notice {
             sink.emit(RunnerEvent::SystemNotice { text, code: code.to_string(), params, task_id: None });
@@ -171,6 +185,10 @@ impl LlmImageGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::tools::image_suspended_notice;
+
+    /// Texto pt-BR do aviso de imagem indisponível (`system.image.unavailable`).
+    const IMAGE_UNAVAILABLE_NOTICE: &str = "Este modelo não gera imagens neste provedor; usando ilustrações em SVG/CSS.";
     use crate::config::Connection;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -256,9 +274,9 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "Geração de imagem falhou (provider_http_400 (código: invalid_value)): web/img/a.webp. O Developer seguirá com SVG/CSS se necessário.",
-                "Geração de imagem falhou (provider_timeout): web/img/b.webp. O Developer seguirá com SVG/CSS se necessário.",
-                "Geração de imagem falhou (provider_http_500): web/img/c.webp. O Developer seguirá com SVG/CSS se necessário.",
+                "Geração de imagem falhou (provider_http_400 (código: invalid_value)): web/img/a.webp. O Desenvolvedor seguirá com SVG/CSS se necessário.",
+                "Geração de imagem falhou (provider_timeout): web/img/b.webp. O Desenvolvedor seguirá com SVG/CSS se necessário.",
+                "Geração de imagem falhou (provider_http_500): web/img/c.webp. O Desenvolvedor seguirá com SVG/CSS se necessário.",
             ],
             "a 4ª falha fica só no log"
         );

@@ -1,8 +1,8 @@
 /*
  * Modelo puro do gerenciador de janelas do desktop (spec 093, decisão 4).
  *
- * Coordenadas relativas à área de trabalho (`Workspace`): o viewport sem a barra superior e o
- * dock, com origem (0, 0) no canto superior esquerdo. Nada sai dela: abrir, mover, redimensionar,
+ * Coordenadas relativas à área de trabalho (`Workspace`): o viewport sem a barra superior (o dock
+ * saiu na 137/T02), com origem (0, 0) no canto superior esquerdo. Nada sai dela: abrir, mover, redimensionar,
  * encaixar, maximizar e normalizar sempre devolvem retângulos dentro da área.
  *
  * Uma janela por tipo. A geometria `x/y/w/h` é a do modo normal; maximizada, a janela ocupa a
@@ -37,7 +37,7 @@ export function isWindowKind(value: unknown): value is WindowKind {
   return typeof value === "string" && (WINDOW_KINDS as readonly string[]).includes(value);
 }
 
-/** `normal`: geometria própria; `maximized`: área inteira; `minimized`: só no dock. */
+/** `normal`: geometria própria; `maximized`: área inteira; `minimized`: só no menu do N. */
 export type WindowMode = "normal" | "maximized" | "minimized";
 
 export interface Rect {
@@ -57,14 +57,23 @@ export interface WindowState extends Rect {
   restoreMode?: "normal" | "maximized";
 }
 
-/** Viewport sem a barra superior e o dock. */
+/** Viewport sem a barra superior. */
 export interface Workspace {
   w: number;
   h: number;
 }
 
+/**
+ * Versão do arranjo gravado (spec 137/T02). A 2 é a área sem dock (até a borda de baixo); sem
+ * versão, o arranjo foi gravado com o dock e passa uma vez pela migração (`migrateLayout`, em
+ * `presets.ts`).
+ */
+export const LAYOUT_VERSION = 2;
+
 /** Arranjo das janelas de um espaço. Tipos ausentes nunca foram abertos. */
 export interface Layout {
+  /** `LAYOUT_VERSION` no que foi lido já na versão atual ou vai para o servidor; ausente = antigo. */
+  v?: typeof LAYOUT_VERSION;
   windows: Partial<Record<WindowKind, WindowState>>;
 }
 
@@ -477,7 +486,8 @@ export function parseLayout(value: unknown): Layout | null {
     if (win === null) return null;
     windows[kind] = win;
   }
-  return { windows };
+  // A versão só vale se for a atual; qualquer outra (ou nenhuma) é um arranjo de antes do fim do dock.
+  return (value as { v?: unknown }).v === LAYOUT_VERSION ? { v: LAYOUT_VERSION, windows } : { windows };
 }
 
 function parseWindowState(value: unknown): WindowState | null {
@@ -492,12 +502,12 @@ function parseWindowState(value: unknown): WindowState | null {
   return win;
 }
 
-/** Arranjo serializável (sem campos `undefined`), igual ao que vai para o servidor. */
+/** Arranjo serializável (sem campos `undefined`), igual ao que vai para o servidor, sempre com a versão. */
 export function serializeLayout(layout: Layout): Layout {
   const windows: Layout["windows"] = {};
   for (const [kind, win] of entries(layout)) {
     const { restoreMode, ...rest } = win;
     windows[kind] = restoreMode === undefined ? rest : { ...rest, restoreMode };
   }
-  return { windows };
+  return { v: LAYOUT_VERSION, windows };
 }

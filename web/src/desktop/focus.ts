@@ -1,22 +1,24 @@
 /*
  * Regras de foco do gerenciador (spec 093, decisão 4; WCAG 2.4.11):
- * - minimizar ou fechar → foco no ícone da janela no dock (sem ele, o primeiro botão do dock);
+ * - minimizar ou fechar → foco no botão N da barra de cima (spec 137/T02: o dock saiu; as janelas
+ *   minimizadas ficam no menu do N, e é dele que a janela volta);
  * - restaurar → o último elemento focado dentro da janela (senão a barra de título);
  * - minimizada = `hidden` + `inert` (nunca `aria-hidden` por sobreposição);
- * - F6/Shift+F6 percorrem as janelas visíveis na ordem do dock.
+ * - F6/Shift+F6 percorrem as janelas visíveis na ordem dos apps (`APP_ORDER`).
  */
 import { isShown, WINDOW_KINDS, type Layout, type WindowKind, type WindowState } from "./windows";
 
 /** Ids estáveis de DOM usados pelas regras de foco. */
-export const dockButtonId = (kind: WindowKind): string => `dock-${kind}`;
+/** Botão N (abre o menu do N): destino do foco ao minimizar ou fechar e da animação de minimizar. */
+export const N_BUTTON_ID = "nd-nbutton";
 export const windowTitleBarId = (kind: WindowKind): string => `window-${kind}-titlebar`;
 export const windowTitleId = (kind: WindowKind): string => `window-${kind}-title`;
 
 export type FocusTarget =
-  | { type: "dock"; kind: WindowKind }
+  | { type: "nButton" }
   | { type: "element"; element: HTMLElement }
   /**
-   * `ring`: a navegação foi por teclado (F6, Esc) e o anel aparece. Sem ele (abrir pelo dock, pelo
+   * `ring`: a navegação foi por teclado (F6, Esc) e o anel aparece. Sem ele (abrir pelo menu do N, pelo
    * lançador, restaurar), o foco é programático e a barra NÃO mostra anel (spec 095, decisão 2).
    */
   | { type: "titleBar"; kind: WindowKind; ring?: boolean };
@@ -40,8 +42,8 @@ function markQuiet(element: HTMLElement): void {
 }
 
 /** Para onde vai o foco depois de minimizar ou fechar. */
-export function focusAfterHide(kind: WindowKind): FocusTarget {
-  return { type: "dock", kind };
+export function focusAfterHide(): FocusTarget {
+  return { type: "nButton" };
 }
 
 /** Último elemento focado em cada janela (só referências; nada vai para o estado salvo). */
@@ -76,9 +78,8 @@ export function applyFocus(target: FocusTarget, doc: Document = document): boole
   const element =
     target.type === "element"
       ? target.element
-      : target.type === "dock"
-        ? // Sem o botão da janela no dock, o primeiro botão do dock (o foco nunca se perde).
-          (doc.getElementById(dockButtonId(target.kind)) ?? doc.querySelector<HTMLElement>(".nd-dock .nd-dock-btn"))
+      : target.type === "nButton"
+        ? doc.getElementById(N_BUTTON_ID)
         : doc.getElementById(windowTitleBarId(target.kind));
   if (element === null) return false;
   if (target.type === "titleBar" && target.ring !== true) {
@@ -97,7 +98,7 @@ export function windowHiddenAttrs(win: WindowState | undefined): { hidden: boole
   return { hidden, inert: hidden };
 }
 
-/** Próxima/anterior janela visível na ordem do dock (F6/Shift+F6), com volta. */
+/** Próxima/anterior janela visível na ordem dos apps (F6/Shift+F6), com volta. */
 export function cycleWindow(
   layout: Layout,
   current: WindowKind | null,

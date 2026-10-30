@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NetworkConfig } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { makeProject, makeProjectState, type RouteReply } from "../../test-utils";
 import { reachEnvironment } from "../app/runSession";
 import { devicesEnvironment } from "./DevicesStep";
@@ -97,7 +97,7 @@ async function openMachine(api: Api) {
     return { status: 204 };
   });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Configurações" }));
+    activateApp("Configurações");
   });
   await settle();
   return view;

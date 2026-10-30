@@ -1,11 +1,9 @@
 /*
- * Barra superior, dock e lançador conforme o mockup (095/T02; `reference/Main.dc.html` e
+ * Barra superior, menus e lançador conforme o mockup (095/T02; `reference/Main.dc.html` e
  * `reference/Janelas.dc.html`):
- * - barra: o SÍMBOLO REAL do Nants (o asset da marca, não um quadrado colorido), nome e slogan; o
- *   botão de busca largo ("Buscar ou pedir" + o atalho em `<kbd>` sem serifa); no celular (390 px,
+ * - barra: o botão de busca largo ("Buscar ou pedir" + o atalho em `<kbd>` sem serifa); no celular (390 px,
  *   C-16), a busca é só o ícone;
- * - dock: botões de 44 px com ícone de 20 px, `--dock-h` coerente com `metrics.ts` e o ícone de
- *   Execução na biblioteca;
+ * - menus com `--elev-3` e o ícone de Execução na biblioteca (o dock saiu na 137/T02);
  * - lançador: campo de 56 px sem borda, texto de 17 px, raio 16 e resultados em linhas de 44 px.
  * O jsdom não aplica CSS: as medidas são lidas do CSS-fonte.
  */
@@ -14,7 +12,6 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ICON_NAMES } from "../Icon";
-import { DOCK_BUTTON, DOCK_HEIGHT } from "../metrics";
 import { shortcutById } from "../shortcuts";
 import { cssRuleBody, cssRules } from "../test-utils";
 import { FONT_SIZES, RADII } from "../theme/tokens";
@@ -49,25 +46,12 @@ function renderBar(compact = false) {
 }
 
 describe("barra superior (Main.dc.html)", () => {
-  it("a marca usa o símbolo real do Nants (as três peças da marca), com nome e slogan", () => {
+  it("spec 137: a marca saiu do conteúdo da barra (o símbolo vira o botão N do Desktop; nome e slogan vão para o menu)", () => {
     renderBar();
-    const brand = document.querySelector<HTMLElement>("[data-brand]");
-    const symbol = brand?.querySelector("svg[data-brand-symbol]");
-    expect(symbol).not.toBeNull();
-    expect(symbol?.querySelectorAll("path")).toHaveLength(3);
-    // O mesmo desenho do asset da marca (`public/brand/nants-symbol-color-dark.svg`).
-    const asset = read("../public/brand/nants-symbol-color-dark.svg");
-    const assetPaths = [...asset.matchAll(/<path fill="([^"]+)" d="([^"]+)"/g)].map((m) => [m[1], m[2]]);
-    const drawn = [...(symbol?.querySelectorAll("path") ?? [])].map((p) => [p.getAttribute("fill"), p.getAttribute("d")]);
-    expect(assetPaths).toHaveLength(3);
-    expect(drawn).toEqual(assetPaths);
-    expect(symbol?.getAttribute("height")).toBe("22");
-    expect(brand?.querySelector(".nd-brand-name")?.textContent).toBe("Nants");
-    expect(brand?.querySelector("[data-brand-slogan]")?.textContent).not.toBe("");
-    // Nome 14/600, sem o 700.
-    const name = cssRuleBody(shellCss, ".nd-brand-name");
-    expect(name).toContain("font-size: var(--fs-body);");
-    expect(name).toContain("font-weight: var(--fw-semibold);");
+    const bar = document.querySelector<HTMLElement>("[data-topbar]");
+    expect(bar).not.toBeNull();
+    expect(bar?.querySelector("[data-brand], [data-brand-symbol], [data-brand-slogan]")).toBeNull();
+    expect(bar?.textContent).not.toContain("Nants");
   });
 
   it("busca larga: 'Buscar ou pedir' e o atalho em <kbd> sem serifa", () => {
@@ -78,6 +62,9 @@ describe("barra superior (Main.dc.html)", () => {
     expect(search.querySelector("kbd")?.textContent).toBe(shortcutById("launcher")?.keys);
     expect(search.getAttribute("aria-keyshortcuts")).toBe("Control+K");
     expect(search.getAttribute("data-variant")).toBeNull();
+    // 137/T03: onde a barra aperta, só o ícone aparece; o nome fica no rótulo e na dica.
+    expect(search.getAttribute("aria-label")).toBe("Buscar ou pedir");
+    expect(search.getAttribute("title")).toBe("Buscar ou pedir");
     const body = cssRuleBody(desktopCss, ".nd-search-btn");
     expect(body).toContain("width: 220px;");
     expect(body).toContain("color: var(--muted);");
@@ -103,21 +90,10 @@ describe("barra superior (Main.dc.html)", () => {
   });
 });
 
-describe("dock (Main.dc.html)", () => {
-  it("botões de 44 px com ícone de 20 px; --dock-h é o botão mais o padding (metrics.ts)", () => {
-    expect(DOCK_BUTTON).toBe(44);
-    expect(DOCK_HEIGHT).toBe(60);
-    const btn = cssRuleBody(desktopCss, ".nd-dock-btn");
-    expect(btn).toContain(`width: ${DOCK_BUTTON}px;`);
-    expect(btn).toContain(`height: ${DOCK_BUTTON}px;`);
-    expect(cssRuleBody(desktopCss, ".nd-root")).toContain(`--dock-h: ${DOCK_HEIGHT}px;`);
-    expect(cssRuleBody(desktopCss, ".nd-dock")).toContain("padding: 0 var(--sp-2);");
-    expect(read("desktop/Dock.tsx")).toMatch(/<Icon name=\{meta\.icon\} size=\{20\} \/>/);
-    // O ponto da janela aberta.
-    expect(cssRuleBody(desktopCss, ".nd-dock-indicator")).toContain("width: 4px;");
-    // Menus e dock mantêm --elev-3 e --elev-1 (C-16).
-    expect(cssRuleBody(desktopCss, ".nd-dock")).toContain("box-shadow: var(--bevel), var(--elev-1);");
+describe("menus e ícones (Main.dc.html)", () => {
+  it("os menus mantêm --elev-3 (C-16); sem dock (137/T02)", () => {
     expect(cssRuleBody(desktopCss, ".nd-menu")).toContain("box-shadow: var(--bevel), var(--elev-3);");
+    expect(desktopCss).not.toMatch(/\.nd-dock\b/);
   });
 
   it("o ícone de Execução está na biblioteca", () => {

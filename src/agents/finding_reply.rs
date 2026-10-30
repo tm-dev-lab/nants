@@ -325,6 +325,42 @@ pub fn high_count(findings: &[Finding]) -> usize {
     findings.iter().filter(|f| f.severity.trim().eq_ignore_ascii_case("HIGH")).count()
 }
 
+/// Spec 137 T11: apontamentos que o Arquiteto manteve (`keep`) e que voltaram sem progresso, entre
+/// os abertos de uma revisão já apurada pelo [`crate::agents::finding_track::track`]. O sinal é só
+/// o que a recorrência já registra, sem patamar novo:
+/// - o apontamento continua aberto (estado `open`: o mesmo id reutilizado ou o `continues` aceito
+///   para um apontamento do registro) e traz a decisão `keep`;
+/// - a revisão é a primeira, ou uma seguinte, do código que o Desenvolvedor escreveu já com a
+///   decisão no briefing ([`informed_review`]).
+///
+/// Esses apontamentos não voltam ao Desenvolvedor: vão ao Arquiteto como decisão final.
+pub fn kept_without_progress(open: &[Finding]) -> Vec<Finding> {
+    open.iter()
+        .filter(|f| f.state == Some(FindingState::Open))
+        .filter(|f| {
+            f.arbitration
+                .as_ref()
+                .is_some_and(|a| a.decision == ArbitrationDecision::Keep && f.last_review >= informed_review(f, a))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Primeira revisão do código escrito com a decisão `a` no briefing do Desenvolvedor. A decisão
+/// antecipada da recorrência (spec 126 T02, marcada em `early_review` logo depois da revisão
+/// anterior à decisão) vem depois de uma reprovação e antes da tentativa seguinte: essa tentativa já
+/// a recebe, e a revisão dela é a `a.review`. A arbitragem de uma contestação vem depois da
+/// tentativa e antes da revisão `a.review`, que ainda julga o código da contestação: a primeira com a
+/// decisão é a seguinte.
+fn informed_review(f: &Finding, a: &Arbitration) -> u32 {
+    let early = f.early_review != 0 && f.early_review + 1 == a.review;
+    if early {
+        a.review
+    } else {
+        a.review + 1
+    }
+}
+
 /// Marca `ids` com o gatilho antecipado da revisão `review`, no registro e nos abertos.
 pub fn mark_early(registry: &mut [Finding], open: &mut [Finding], ids: &[String], review: u32) {
     for f in registry.iter_mut().chain(open.iter_mut()) {
@@ -697,6 +733,25 @@ mod tests {
         assert_eq!(open.iter().filter(|f| f.early_review == 4).count(), 2);
         let text = recurring_facts("T05", "Render", "obj", "1. a", &[(registry[2].clone(), parse_line("- F-03: test_added: tests/a.rs::x"))]);
         assert!(text.contains("respondido como corrigido ou com teste em 2 delas") && text.contains("Última resposta do Desenvolvedor: test_added: tests/a.rs::x"), "{text}");
+    }
+
+    /// Spec 137 T11: o mantido que continua aberto na revisão do código escrito com a decisão (a
+    /// decisão antecipada vale já na revisão seguinte; a da contestação, na outra); o novo (voltou
+    /// depois de resolvido), o dispensado e o ainda não informado ficam de fora.
+    #[test]
+    fn kept_without_progress_after_the_informed_review() {
+        let keep = |review| Some(Arbitration { decision: ArbitrationDecision::Keep, reason: "x".into(), review });
+        let early = |id: &str, last| Finding { arbitration: keep(4), early_review: 3, last_review: last, ..finding(id) };
+        let contest = |id: &str, last| Finding { arbitration: keep(2), last_review: last, ..finding(id) };
+        let returned = Finding { state: Some(FindingState::New), ..early("F-03", 4) };
+        let manual = Finding {
+            arbitration: Some(Arbitration { decision: ArbitrationDecision::Manual, reason: "x".into(), review: 4 }),
+            ..early("F-04", 4)
+        };
+        let open = vec![early("F-01", 4), contest("F-02", 2), returned, manual, contest("F-05", 3), early("F-06", 5)];
+        let ids: Vec<String> = kept_without_progress(&open).into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec!["F-01", "F-05", "F-06"]);
+        assert!(kept_without_progress(&[Finding { arbitration: keep(4), last_review: 4, ..finding("F-07") }]).is_empty(), "contestação: ainda não informado");
     }
 
     #[test]

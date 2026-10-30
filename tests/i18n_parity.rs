@@ -335,6 +335,11 @@ fn every_server_code_has_a_web_key_in_both_languages() {
         if pt.contains_key(&key) && en.contains_key(&key) {
             continue;
         }
+        // Código com `{count}` (spec 137 T12): as formas `.one` e `.other`, nos dois idiomas.
+        let plural = [format!("{key}.one"), format!("{key}.other")];
+        if plural.iter().all(|k| pt.contains_key(k) && en.contains_key(k)) {
+            continue;
+        }
         match CODE_EXCEPTIONS.iter().position(|(f, code, _)| *f == c.family && *code == c.code) {
             Some(k) => {
                 used.insert(k);

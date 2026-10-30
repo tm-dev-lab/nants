@@ -58,6 +58,7 @@ use tokio::sync::watch;
 
 use super::approvals::{replace_atomic, ApprovalRegistry, ProjectApprover, RunScopeGuard, PERSIST_LOCK};
 use super::error::{params, ApiError};
+use crate::i18n::Lang;
 use super::dialog::{deliver, DialogTarget};
 use crate::agents::activity::ActivitySink;
 use super::events::{validate_project_id, ApiEvent, BusActivitySink, BusSink, EventBus, EventType, SecretSet};
@@ -111,8 +112,6 @@ const SHUTTING_DOWN_MSG: &str = "shutting_down";
 const SHUTDOWN_REASON: &str = "shutdown";
 /// Motivo do `idle` quando o usuário para a execução (spec 086 T04).
 const STOPPED_REASON: &str = "stopped";
-/// Mensagem do sistema no diálogo depois da parada pelo usuário.
-const STOPPED_TEXT: &str = "Execução parada pelo usuário. Use Continuar para retomar.";
 /// 409 da parada sem execução ativa daquela spec.
 const NOT_RUNNING_MSG: &str = "no_run_for_spec";
 const GIT_TIMEOUT_MSG: &str = "git_timeout";
@@ -156,7 +155,6 @@ const ARCH_COMMIT_MSG: &str = "architecture_commit_failed";
 const ARCH_FILE: &str = crate::agents::arch_memory::ARCH_FILE;
 const SKILLS_INVALID_MSG: &str = "skills_invalid";
 const SKILLS_COMMIT_MSG: &str = "skills_commit_failed";
-const RELAUNCH_FAILED: &str = "o relançamento em modo docker foi recusado; use Retomar";
 pub(crate) const REASON_ENV_NOT_DOCKER: &str = "environment_not_docker";
 const REASON_DOCKER_UNAVAILABLE: &str = "docker_unavailable";
 const PLAN_NOT_DOCKER_MSG: &str = "plan_not_docker";
@@ -171,9 +169,6 @@ const REASON_BUDGET: &str = "budget_exceeded";
 const REASON_REPORT_IN_PROGRESS: &str = "report_in_progress";
 /// `reason` do evento `blocked` (o motivo do runner não é ecoado).
 const BLOCKED_REASON: &str = "task_blocked";
-/// Texto fixo da mensagem do sistema quando o runner falha sem causa conhecida (pânico, relançamento).
-const RUN_FAILED_TEXT: &str =
-    "a execução foi interrompida por erro interno; confira o estado do projeto";
 /// Teto (bytes) da causa exibida na mensagem do sistema de falha (spec 081 T02).
 const RUN_FAILED_CAUSE_MAX_BYTES: usize = 300;
 /// Agente usado nas mensagens emitidas pelo próprio sistema.
@@ -485,7 +480,7 @@ impl RunnerFactory for ConfiguredRunnerFactory {
                     BusSink::new(job.events.clone(), job.project_id.clone(), Arc::clone(&job.secrets))
                         .with_dialog(DialogTarget::new(job.root.clone(), job.spec_id.clone())),
                 );
-                developer.with_image_generator(Arc::new(generator.with_notice(notice)))
+                developer.with_image_generator(Arc::new(generator.with_notice(notice).with_lang(job.lang.clone())))
             }
             None => developer,
         };
@@ -1416,7 +1411,7 @@ async fn launch(
         let migrate_root = root.clone();
         let (migrated, changed) = blocking(move || migrate_docker_settings(&migrate_root)).await?;
         if changed {
-            notes.push(DOCKER_MIGRATION_NOTE.to_string());
+            notes.push(CODE_DOCKER_MIGRATION.to_string());
         }
         migrated.unwrap_or(settings)
     };
@@ -1913,15 +1908,17 @@ fn spawn_run(bg: Background) -> bool {
         let mut guard = Some(guard);
         let runner: Arc<dyn SpecRunner> = Arc::from(runner);
         let dialog = DialogTarget::new(root.clone(), spec_id.clone());
+        // Spec 137 T12: o texto de reserva gravado no diálogo sai no idioma do projeto.
+        let lang = state.project_lang(&project_id).get();
         for note in &notes {
-            let event = if note == DOCKER_MIGRATION_NOTE {
-                system_message_coded(&project_id, note, CODE_DOCKER_MIGRATION, Map::new())
+            let event = if note == CODE_DOCKER_MIGRATION {
+                system_message_coded(&project_id, &coded_text(lang, CODE_DOCKER_MIGRATION, &[]), CODE_DOCKER_MIGRATION, Map::new())
             } else {
                 system_message(&project_id, note)
             };
             deliver(&events, Some(&dialog), event);
         }
-        let mut end = run_once(&runner, &spec_id, &mut shutdown, &cancel, grace).await;
+        let mut end = run_once(&state.project_lang(&project_id), &runner, &spec_id, &mut shutdown, &cancel, grace).await;
         // Bloqueio por qualidade: o Arquiteto analisa dentro do mesmo run (mesma reserva). RETRY
         // reabre a tarefa e o run continua; ESCALATE deixa BLOCKED. Ambiental nunca passa por aqui.
         let mut relaunch = false;
@@ -1961,7 +1958,7 @@ fn spawn_run(bg: Background) -> bool {
             let env_reason = (*kind == BlockKind::Environmental).then_some(reason.as_str());
             match recovery::recover(&scope, &runner, task_id, env_reason, &mut halt).await {
                 recovery::Next::Retry => {
-                    end = run_once(&runner, &spec_id, &mut shutdown, &cancel, grace).await;
+                    end = run_once(&state.project_lang(&project_id), &runner, &spec_id, &mut shutdown, &cancel, grace).await;
                 }
                 // Ambiente migrado para docker (spec 074): este run (host) termina limpo e o launch
                 // relança a spec, detectando o modo docker.
@@ -1993,9 +1990,10 @@ fn spawn_run(bg: Background) -> bool {
                 // O novo run assumiu a spec e a reserva; este termina sem eventos finais.
                 Ok(()) => return,
                 Err(refusal) => {
-                    let (text, params) = relaunch_failure(&secrets, refusal.as_ref());
+                    let lang = state.project_lang(&project_id).get();
+                    let (text, params) = relaunch_failure(lang, &secrets, refusal.as_ref());
                     deliver(&events, Some(&dialog), system_message_coded(&project_id, &text, CODE_RELAUNCH_FAILED, params));
-                    for ev in terminal_events(&project_id, &secrets, &spec_id, RunEnd::Failed(None)) {
+                    for ev in terminal_events(lang, &project_id, &secrets, &spec_id, RunEnd::Failed(None)) {
                         deliver(&events, Some(&dialog), ev);
                     }
                     return;
@@ -2057,7 +2055,8 @@ fn spawn_run(bg: Background) -> bool {
         };
         record_provider_end(&mut end, &roles, &root, &project_id, &spec_id, &secrets).await;
         // Mensagens do sistema vão ao diálogo da spec; o status segue na mesma ordem.
-        for ev in terminal_events(&project_id, &secrets, &spec_id, end) {
+        let lang = state.project_lang(&project_id).get();
+        for ev in terminal_events(lang, &project_id, &secrets, &spec_id, end) {
             deliver(&events, Some(&dialog), ev);
         }
         // Relatório final da spec: só depois de `integrated`; falhas viram evento próprio.
@@ -2071,6 +2070,7 @@ fn spawn_run(bg: Background) -> bool {
 
 /// Uma execução do runner em task própria, com shutdown cooperativo (prazo `grace`, depois abandono).
 async fn run_once(
+    lang: &crate::i18n::SharedLang,
     runner: &Arc<dyn SpecRunner>,
     spec_id: &str,
     shutdown: &mut watch::Receiver<bool>,
@@ -2086,26 +2086,28 @@ async fn run_once(
         _ = wait_shutdown(shutdown) => {
             cancel.store(true, Ordering::SeqCst);
             match tokio::time::timeout(grace, &mut worker).await {
-                Ok(joined) => run_end(joined),
+                Ok(joined) => run_end(lang.get(), joined),
                 Err(_) => {
                     worker.abort();
                     RunEnd::Forced
                 }
             }
         }
-        joined = &mut worker => run_end(joined),
+        joined = &mut worker => run_end(lang.get(), joined),
     }
 }
 
-/// Converte o resultado do worker em desfecho.
+/// Converte o resultado do worker em desfecho. A causa da falha sai no idioma `lang` do projeto
+/// (spec 137 T12): vai ao texto gravado e ao `params.cause`.
 fn run_end(
+    lang: Lang,
     joined: Result<Result<SpecOutcome, RunnerError>, tokio::task::JoinError>,
 ) -> RunEnd {
     match joined {
         Ok(Ok(outcome)) => RunEnd::Outcome(outcome),
         Ok(Err(RunnerError::Cancelled)) => RunEnd::Cancelled,
         Ok(Err(RunnerError::Provider { failure, evidence, .. })) => RunEnd::Provider(failure, evidence),
-        Ok(Err(err)) => RunEnd::Failed(Some(err.to_string())),
+        Ok(Err(err)) => RunEnd::Failed(Some(err.describe_in(lang))),
         Err(_) => RunEnd::Panicked,
     }
 }
@@ -2166,21 +2168,27 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
-/// Mensagem do sistema de falha: com causa, "a execução foi interrompida: <causa>; confira o estado do
-/// projeto" (causa com scrub, numa linha e limitada a [`RUN_FAILED_CAUSE_MAX_BYTES`] sem quebrar
-/// caracteres); sem causa, o [`RUN_FAILED_TEXT`].
+/// Mensagem do sistema de falha no idioma do projeto: com causa, `system.run.failed_cause` ("A
+/// execução foi interrompida: <causa>; confira o estado do projeto.", causa com scrub, numa linha e
+/// limitada a [`RUN_FAILED_CAUSE_MAX_BYTES`] sem quebrar caracteres); sem causa, `system.run.failed`.
 #[cfg(test)]
-fn run_failed_text(secrets: &SecretSet, cause: Option<&str>) -> String {
-    run_failed_parts(secrets, cause).0
+fn run_failed_text(lang: Lang, secrets: &SecretSet, cause: Option<&str>) -> String {
+    run_failed_parts(lang, secrets, cause).0
+}
+
+/// Texto de reserva no idioma do projeto (`system.<code>` do dicionário, o mesmo texto que a web
+/// monta pelo `code`; spec 137 T12), com os parâmetros de texto.
+fn coded_text(lang: Lang, code: &str, params: &[(&str, &str)]) -> String {
+    crate::i18n::tr(lang, &format!("system.{code}"), params)
 }
 
 /// Texto de reserva, `code` e `params` (spec 102) da falha do run.
-fn run_failed_parts(secrets: &SecretSet, cause: Option<&str>) -> (String, &'static str, Map<String, Value>) {
+fn run_failed_parts(lang: Lang, secrets: &SecretSet, cause: Option<&str>) -> (String, &'static str, Map<String, Value>) {
     let cause = cause
         .map(|c| scrub_text(secrets, c).split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|c| !c.is_empty());
     let Some(mut cause) = cause else {
-        return (RUN_FAILED_TEXT.to_string(), CODE_RUN_FAILED, Map::new());
+        return (coded_text(lang, CODE_RUN_FAILED, &[]), CODE_RUN_FAILED, Map::new());
     };
     if cause.len() > RUN_FAILED_CAUSE_MAX_BYTES {
         let mut end = RUN_FAILED_CAUSE_MAX_BYTES;
@@ -2190,13 +2198,14 @@ fn run_failed_parts(secrets: &SecretSet, cause: Option<&str>) -> (String, &'stat
         cause.truncate(end);
         cause.push('…');
     }
-    let text = format!("a execução foi interrompida: {cause}; confira o estado do projeto");
+    let text = coded_text(lang, CODE_RUN_FAILED_CAUSE, &[("cause", &cause)]);
     (text, CODE_RUN_FAILED_CAUSE, Map::from_iter([("cause".to_string(), Value::from(cause))]))
 }
 
-/// Eventos finais de uma execução. Textos fixos (a falha com causa leva a causa com scrub e a registra
-/// no log do servidor); o id da tarefa passa por redação.
+/// Eventos finais de uma execução. Textos fixos no idioma `lang` do projeto (a falha com causa leva a
+/// causa com scrub e a registra no log do servidor); o id da tarefa passa por redação.
 fn terminal_events(
+    lang: Lang,
     project_id: &str,
     secrets: &SecretSet,
     spec_id: &str,
@@ -2231,14 +2240,14 @@ fn terminal_events(
             }
             vec![
                 {
-                    let (text, code, params) = run_failed_parts(secrets, cause.as_deref());
+                    let (text, code, params) = run_failed_parts(lang, secrets, cause.as_deref());
                     system_message_coded(project_id, &text, code, params)
                 },
                 status_event(project_id, json!({"status": "idle", "reason": "error"})),
             ]
         }
         RunEnd::Panicked => vec![
-            system_message_coded(project_id, RUN_FAILED_TEXT, CODE_RUN_FAILED, Map::new()),
+            system_message_coded(project_id, &coded_text(lang, CODE_RUN_FAILED, &[]), CODE_RUN_FAILED, Map::new()),
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
         // Código fixo do provedor (ex.: `provider_http_400`), com o motivo fechado da resposta
@@ -2272,7 +2281,7 @@ fn terminal_events(
                 // Params neutros de idioma (spec 102): a interface monta o motivo pelo dicionário.
                 let params = super::error::provider_failure_params(&failure);
                 let code = if params.contains_key("kind") { CODE_PROVIDER_FAILED_DETAIL } else { CODE_PROVIDER_FAILED };
-                system_message_coded(project_id, &failure.describe(), code, evidence_params(secrets, evidence.as_deref(), params))
+                system_message_coded(project_id, &failure.describe_in(lang), code, evidence_params(secrets, evidence.as_deref(), params))
             },
             status_event(project_id, json!({"status": "idle", "reason": "error"})),
         ],
@@ -2281,7 +2290,7 @@ fn terminal_events(
             json!({"status": "idle", "reason": "shutdown"}),
         )],
         RunEnd::Stopped => vec![
-            system_message_coded(project_id, STOPPED_TEXT, CODE_STOPPED, Map::new()),
+            system_message_coded(project_id, &coded_text(lang, CODE_STOPPED, &[]), CODE_STOPPED, Map::new()),
             status_event(project_id, json!({"status": "idle", "reason": STOPPED_REASON})),
         ],
         RunEnd::Forced => vec![status_event(
@@ -2360,7 +2369,7 @@ pub const CODE_DOCKER_MIGRATION: &str = "run.docker_migration";
 /// `params` dela e o `detail` técnico, para a interface traduzir pelo `serverError.<code>`;
 /// `message` (o texto de reserva da recusa) fica só para quem não conhece o código. Tudo redigido
 /// e cortado em [`super::events::MAX_PARAM_BYTES`].
-fn relaunch_failure(secrets: &SecretSet, refusal: Option<&ApiError>) -> (String, Map<String, Value>) {
+fn relaunch_failure(lang: Lang, secrets: &SecretSet, refusal: Option<&ApiError>) -> (String, Map<String, Value>) {
     let cut = |s: &str| {
         let clean = scrub_text(secrets, s);
         let mut end = clean.len().min(super::events::MAX_PARAM_BYTES);
@@ -2369,12 +2378,19 @@ fn relaunch_failure(secrets: &SecretSet, refusal: Option<&ApiError>) -> (String,
         }
         clean[..end].to_string()
     };
+    // Spec 137 T12: o motivo (a recusa pelo código dela) e o texto saem no idioma do projeto.
     let Some(err) = refusal else {
-        let message = cut(RELAUNCH_FAILED);
-        return (scrub_text(secrets, RELAUNCH_FAILED), Map::from_iter([("message".to_string(), Value::from(message))]));
+        let message = crate::i18n::tr(lang, "runs.relaunch_unavailable", &[]);
+        let text = coded_text(lang, CODE_RELAUNCH_FAILED, &[("message", &message)]);
+        return (scrub_text(secrets, &text), Map::from_iter([("message".to_string(), Value::from(cut(&message)))]));
+    };
+    let message = match (err.code(), err.params()) {
+        (Some(code), Some(params)) => super::error::fallback_text_in(lang, code, params),
+        (Some(code), None) => super::error::fallback_text_in(lang, code, &Map::new()),
+        (None, _) => err.message().to_string(),
     };
     let mut params = Map::new();
-    params.insert("message".into(), Value::from(cut(err.message())));
+    params.insert("message".into(), Value::from(cut(&message)));
     if let Some(code) = err.code() {
         params.insert("error_code".into(), Value::from(code));
     }
@@ -2389,10 +2405,11 @@ fn relaunch_failure(secrets: &SecretSet, refusal: Option<&ApiError>) -> (String,
         };
         params.insert(name.clone(), value);
     }
-    let mut text = format!("{RELAUNCH_FAILED}: {}", err.message());
+    let mut text = coded_text(lang, CODE_RELAUNCH_FAILED, &[("message", &message)]);
     if let Some(detail) = err.detail() {
         params.insert("detail".into(), Value::from(cut(detail)));
-        text.push_str(&format!(" ({detail})"));
+        text.push('\n');
+        text.push_str(&coded_text(lang, "run.relaunch_failed_detail", &[("detail", detail)]));
     }
     (scrub_text(secrets, &text), params)
 }
@@ -2776,8 +2793,6 @@ fn adopt_spec_glob_list(
     Ok(settings)
 }
 
-/// Linha do diálogo quando a migração desembrulha os comandos de teste.
-const DOCKER_MIGRATION_NOTE: &str = "Ajustei o test_command/checks do projeto para rodarem dentro do workspace (sem 'docker compose'): em modo docker o Nants já executa esses comandos no serviço workspace.";
 
 /// Migração idempotente (spec 039): lê sob o `PERSIST_LOCK`, desembrulha `test_command`/`checks` no
 /// formato embrulhado exato e grava de forma atômica. `(settings, alterou)`; `None` se o projeto
@@ -3506,6 +3521,10 @@ mod tests {
 
     use super::*;
     use crate::agents::runner::{EventSink, RunnerEvent};
+
+    /// Textos de reserva em pt-BR das mensagens fixas do run (`system.run.*`, spec 137 T12).
+    const STOPPED_TEXT: &str = "Execução parada pelo usuário. Use Continuar para retomar.";
+    const RUN_FAILED_TEXT: &str = "A execução foi interrompida por erro interno; confira o estado do projeto.";
     use crate::i18n::Lang;
 
     /// Spec 115 T03: o motivo do ajuste escolhido pela pessoa sai no idioma do projeto.
@@ -4775,6 +4794,136 @@ mod tests {
         assert!(line["seq"].as_u64().is_some(), "{line}");
     }
 
+    /// Mensagens do sistema gravadas no `dialog.jsonl` da spec.
+    fn system_lines(root: &Path) -> Vec<Value> {
+        crate::server::dialog::flush_project(root, Duration::from_secs(5));
+        let text = fs::read_to_string(root.join(".sdd/specs").join(SPEC).join("dialog.jsonl")).unwrap_or_default();
+        text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|l| l["agent"] == SYSTEM_AGENT).collect()
+    }
+
+    /// Spec 137 T12 (trava, 135 P4): num projeto en, o fluxo grava no `dialog.jsonl` as mensagens do
+    /// sistema da parada e da falha em inglês, com o `code` para a web; nenhuma sai em pt.
+    #[tokio::test]
+    async fn english_project_records_stop_and_failure_in_english() {
+        use crate::i18n::portuguese_in;
+        let root = setup("en-stop", true);
+        let stop_state = state_with(&root, config_for(&root), Script::Slow).with_shutdown_grace(Duration::from_secs(10));
+        stop_state.project_lang(PROJECT).set(Lang::En);
+        let mut rx = stop_state.events().subscribe();
+        let (status, _) = call(&stop_state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        collect_until(&mut rx, "executing").await;
+        let (status, _) = call(&stop_state, stop_req(PROJECT, SPEC)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        collect_until(&mut rx, "idle").await;
+        assert!(wait_idle(&stop_state).await);
+        let lines = system_lines(&root);
+        let stopped = lines.iter().find(|l| l["code"] == CODE_STOPPED).expect("parada gravada");
+        assert_eq!(stopped["text"], "Run stopped by the user. Use Continue to resume.");
+        stop_state.trigger_shutdown();
+
+        let root = setup("en-panic", true);
+        let state = state(&root, Script::Panic);
+        state.project_lang(PROJECT).set(Lang::En);
+        let mut rx = state.events().subscribe();
+        let (status, _) = call(&state, approve_req(PROJECT, SPEC, "{}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        collect_until(&mut rx, "idle").await;
+        assert!(wait_idle(&state).await);
+        let lines = system_lines(&root);
+        let failed = lines.iter().find(|l| l["code"] == CODE_RUN_FAILED).expect("falha gravada");
+        assert_eq!(failed["text"], "The run was interrupted by an internal error; check the project state.");
+        for line in lines.iter().chain([stopped]) {
+            let text = line["text"].as_str().unwrap_or_default();
+            assert_eq!(portuguese_in(text), None, "pt gravado num projeto en: {text}");
+        }
+    }
+
+    /// Spec 137 T12 (trava, 135 P4 e P6): todo texto fixo que o servidor grava no idioma do projeto sai
+    /// sem pt num projeto en: as mensagens finais do run, o relançamento recusado, o ajuste do docker,
+    /// os avisos de imagem, o perfil de especialista (linha de papel, seções e motivo das lições) e o
+    /// prompt do Arquiteto que pede o perfil.
+    #[test]
+    fn english_project_records_no_portuguese_text() {
+        use crate::agents::llm_client::{BadKind, BadReason};
+        use crate::i18n::portuguese_in;
+        use crate::sdd::skills;
+        let secrets = SecretSet::new(vec![SECRET.to_string()]);
+        let en = Lang::En;
+        let mut texts: Vec<String> = Vec::new();
+        let bad = ProviderFailure::BadResponse(BadReason::with_code(BadKind::Incomplete, Some("content_filter")));
+        for end in [
+            RunEnd::Stopped,
+            RunEnd::Failed(None),
+            RunEnd::Failed(Some("boom".into())),
+            RunEnd::Panicked,
+            RunEnd::Provider(bad, None),
+            RunEnd::Provider(ProviderFailure::Http(429, None), None),
+        ] {
+            for ev in terminal_events(en, PROJECT, &secrets, SPEC, end) {
+                if ev.payload["agent"] == SYSTEM_AGENT {
+                    assert!(ev.payload["code"].is_string(), "{}", ev.payload);
+                    texts.push(ev.payload["text"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert!(texts.len() >= 6, "{texts:?}");
+        // Causa do `RunnerError` no idioma do projeto, no texto e no `params.cause`.
+        let failures = [
+            RunnerError::Config("x".into()),
+            RunnerError::Invalid("y".into()),
+            RunnerError::Docker("z".into()),
+            RunnerError::Tests("t".into()),
+            RunnerError::Port { role: "developer", message: "m".into() },
+            RunnerError::ExternalEdit { path: "spec.md".into() },
+            RunnerError::DependenciesPending { task: "T02".into(), pending: vec!["T01".into()] },
+            RunnerError::Io { path: "a.txt".into(), source: std::io::Error::other("e") },
+            RunnerError::InvalidId { name: "spec", value: "v".into() },
+        ];
+        for err in failures {
+            let end = run_end(en, Ok(Err(err)));
+            let RunEnd::Failed(Some(cause)) = &end else { panic!("falha esperada") };
+            assert!(!cause.is_empty());
+            let ev = terminal_events(en, PROJECT, &secrets, SPEC, end);
+            assert_eq!(ev[0].payload["code"], CODE_RUN_FAILED_CAUSE);
+            texts.push(ev[0].payload["params"]["cause"].as_str().unwrap_or_default().to_string());
+            texts.push(ev[0].payload["text"].as_str().unwrap_or_default().to_string());
+        }
+        let config = terminal_events(en, PROJECT, &secrets, SPEC, run_end(en, Ok(Err(RunnerError::Config("x".into())))));
+        assert_eq!(config[0].payload["text"], "The run was interrupted: invalid configuration: x; check the project state.");
+        texts.push(crate::server::image_gen::image_suspended_text(en, 1));
+        assert!(texts.last().is_some_and(|t| t.contains("(1 attempt)")), "{texts:?}");
+        let docker = ApiError::coded(StatusCode::CONFLICT, "docker_unavailable", params([("item", json!("docker_cli"))]));
+        let env = conflict_reason("environment_invalid", REASON_ENV_INVALID).with_detail("compose.yaml");
+        for refusal in [Some(&docker), Some(&env), None] {
+            let (text, params) = relaunch_failure(en, &secrets, refusal);
+            texts.push(text);
+            texts.push(params["message"].as_str().unwrap_or_default().to_string());
+        }
+        texts.push(coded_text(en, CODE_DOCKER_MIGRATION, &[]));
+        texts.push(crate::i18n::tr(en, "system.image.unavailable", &[]));
+        texts.push(crate::server::image_gen::image_failure_notice(en, "web/img/a.webp", &bad));
+        texts.push(crate::server::image_gen::image_suspended_text(en, 2));
+        // Perfil de especialista.
+        texts.push(skills::role_line(en, "developer", "Rust"));
+        texts.push(skills::role_line(en, "reviewer", "Rust"));
+        let profile = "---\nrole: developer\nstack: [rust]\nupdated_at: 2026-10-30\nsource_spec: 001-x\n---\n\
+                       You are an expert developer in Rust for this project.\n## Pitfalls\n- `cargo test` runs the suite.\n";
+        let updated = skills::with_lessons(en, profile, &["- run clippy (T01)".to_string()], "001-x", "2026-10-30").expect("lições");
+        texts.push(updated);
+        let prompt = crate::agents::prompts::architect_system_for(en);
+        let start = prompt.find(".sdd/skills/developer.md").expect("trecho do perfil");
+        let end = start + prompt[start..].find("critério de aprovação").expect("fim do trecho");
+        let roles = &prompt[prompt[..end].rfind("PRIMEIRA linha").expect("linha de papel")..end];
+        for marker in ["You are an expert developer in <stack> for this project.", "## User notes", "## Project lessons"] {
+            assert!(roles.contains(marker), "{marker}: {roles}");
+        }
+        for (k, text) in texts.iter().enumerate() {
+            assert!(!text.trim().is_empty(), "texto {k} vazio");
+            assert_eq!(portuguese_in(text), None, "pt gravado num projeto en ({k}): {text}");
+        }
+    }
+
     #[tokio::test]
     async fn runner_error_is_reported_with_its_cause() {
         // Spec 081 T02: a causa do `RunnerError` aparece (com scrub); o pânico mantém o texto fixo.
@@ -4782,7 +4931,7 @@ mod tests {
     }
 
     /// Início da mensagem de falha do `Script::Fail` (o segredo da causa sai redigido em seguida).
-    const FAILED_WITH_CAUSE: &str = "a execução foi interrompida: configuração inválida: falha com ";
+    const FAILED_WITH_CAUSE: &str = "A execução foi interrompida: configuração inválida: falha com ";
 
     #[tokio::test]
     async fn runner_panic_releases_run_and_reports_idle() {
@@ -6445,23 +6594,31 @@ mod tests {
         let secrets = SecretSet::new([secret.clone()]);
         let docker = ApiError::coded(StatusCode::CONFLICT, "docker_unavailable", params([("item", json!("docker_cli"))]))
             .with_reason(REASON_DOCKER_UNAVAILABLE);
-        let (text, p) = relaunch_failure(&secrets, Some(&docker));
+        let (text, p) = relaunch_failure(Lang::PtBr, &secrets, Some(&docker));
         assert_eq!(p["error_code"], "docker_unavailable");
         assert_eq!(p["item"], "docker_cli");
         assert!(p["message"].as_str().is_some_and(|m| m.starts_with("O Docker é pré-requisito")), "{p:?}");
         assert!(p.get("detail").is_none());
-        assert!(text.starts_with(RELAUNCH_FAILED), "{text}");
+        assert!(text.starts_with("O relançamento em modo docker foi recusado; use Retomar. Motivo: O Docker é pré-requisito"), "{text}");
         let env = conflict_reason("environment_invalid", REASON_ENV_INVALID)
             .with_detail(format!("compose.yaml não pode expor o docker.sock {secret}"));
-        let (text, p) = relaunch_failure(&secrets, Some(&env));
+        let (text, p) = relaunch_failure(Lang::PtBr, &secrets, Some(&env));
         assert_eq!(p["error_code"], "environment_invalid");
         let detail = p["detail"].as_str().unwrap_or_default();
         assert!(detail.starts_with("compose.yaml não pode expor o docker.sock"), "{detail}");
         assert!(!detail.contains(&secret) && !text.contains(&secret), "segredo redigido");
         assert!(text.contains("docker.sock"), "{text}");
-        let (text, p) = relaunch_failure(&secrets, None);
-        assert_eq!(text, RELAUNCH_FAILED);
+        assert!(text.contains("\nDetalhe técnico: compose.yaml"), "{text}");
+        let (text, p) = relaunch_failure(Lang::PtBr, &secrets, None);
+        assert!(text.starts_with("O relançamento em modo docker foi recusado; use Retomar. Motivo: o projeto"), "{text}");
         assert_eq!(p.len(), 1);
+        // Spec 137 T12: num projeto en, o texto gravado e o motivo da recusa saem em inglês.
+        let (text, p) = relaunch_failure(Lang::En, &secrets, Some(&docker));
+        assert!(text.starts_with("The relaunch in docker mode was refused; use Resume. Reason: "), "{text}");
+        assert_eq!(p["error_code"], "docker_unavailable");
+        assert!(!p["message"].as_str().unwrap_or_default().contains("Docker é"), "{p:?}");
+        let (text, _) = relaunch_failure(Lang::En, &secrets, Some(&env));
+        assert!(text.contains("\nTechnical detail: "), "{text}");
     }
 
     #[test]
@@ -6877,9 +7034,9 @@ mod tests {
             failure: ProviderFailure::Http(400, None),
             evidence: None,
         };
-        let end = run_end(Ok(Err(err)));
+        let end = run_end(Lang::PtBr, Ok(Err(err)));
         assert!(matches!(end, RunEnd::Provider(ProviderFailure::Http(400, None), None)));
-        let other = run_end(Ok(Err(RunnerError::Config("x".into()))));
+        let other = run_end(Lang::PtBr, Ok(Err(RunnerError::Config("x".into()))));
         assert!(matches!(other, RunEnd::Failed(Some(ref c)) if c == "configuração inválida: x"));
     }
 
@@ -6888,33 +7045,33 @@ mod tests {
     fn system_messages_carry_code_and_params() {
         let secrets = SecretSet::new(vec![SECRET.to_string()]);
         let code_of = |ev: &ApiEvent| (ev.payload["code"].clone(), ev.payload["params"].clone());
-        let stopped = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Stopped);
+        let stopped = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Stopped);
         assert_eq!(stopped[0].payload["text"], STOPPED_TEXT);
         assert_eq!(code_of(&stopped[0]), (json!(CODE_STOPPED), json!({})));
-        let failed = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Failed(None));
+        let failed = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Failed(None));
         assert_eq!(code_of(&failed[0]), (json!(CODE_RUN_FAILED), json!({})));
         let cause = format!("boom {SECRET}");
-        let failed = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Failed(Some(cause)));
+        let failed = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Failed(Some(cause)));
         let (code, params) = code_of(&failed[0]);
         assert_eq!(code, json!(CODE_RUN_FAILED_CAUSE));
         let cause = params["cause"].as_str().unwrap_or_default();
         assert!(cause.starts_with("boom") && !cause.contains(SECRET), "{params}");
         assert!(failed[0].payload["text"].as_str().unwrap_or_default().contains(cause));
-        let panicked = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Panicked);
+        let panicked = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Panicked);
         assert_eq!(code_of(&panicked[0]).0, json!(CODE_RUN_FAILED));
-        let provider = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Http(400, None), None));
+        let provider = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Http(400, None), None));
         assert_eq!(code_of(&provider[0]), (json!(CODE_PROVIDER_FAILED), json!({"provider": "provider_http_400"})));
         let reason = crate::agents::llm_client::BadReason::with_code(
             crate::agents::llm_client::BadKind::Incomplete,
             Some("content_filter"),
         );
-        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
+        let bad = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
         assert_eq!(
             code_of(&bad[0]),
             (json!(CODE_PROVIDER_FAILED_DETAIL), json!({"provider": "provider_bad_response", "kind": "incomplete", "provider_code": "content_filter"}))
         );
         // Status sem mensagem do sistema não ganha `code`.
-        let integrated = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Outcome(SpecOutcome::Completed));
+        let integrated = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Outcome(SpecOutcome::Completed));
         assert!(integrated[0].payload.get("code").is_none());
     }
 
@@ -6929,7 +7086,7 @@ mod tests {
             (PlanError::NotEligible, CODE_PLAN_NOT_ELIGIBLE, "provider_plan_not_eligible"),
             (PlanError::NeedsLogin, CODE_PLAN_NEEDS_LOGIN, "provider_plan_needs_login"),
         ] {
-            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Plan(plan), None));
+            let events = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Plan(plan), None));
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].payload["code"], json!(code));
             assert_eq!(events[0].payload["params"], json!({}));
@@ -6937,7 +7094,7 @@ mod tests {
             assert_eq!(events[1].payload["status"], "idle");
         }
         let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Plan(PlanError::UsageLimit), evidence: None };
-        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit), None)));
+        assert!(matches!(run_end(Lang::PtBr, Ok(Err(err))), RunEnd::Provider(ProviderFailure::Plan(PlanError::UsageLimit), None)));
     }
 
     /// Spec 133 T01: a falha do provedor com evidência leva os `params` completos (papel, conexão,
@@ -6969,7 +7126,7 @@ mod tests {
         let roles = vec![("reviewer", ConnectionRef { id: "gem".into(), name: "Gemini do Ana".into(), kind: "google_gemini".into() })];
         let mut end = RunEnd::Provider(ProviderFailure::Http(400, None), Some(Box::new(evidence.clone())));
         record_provider_end(&mut end, &roles, &root, PROJECT, SPEC, &secrets).await;
-        let events = terminal_events(PROJECT, &secrets, SPEC, end);
+        let events = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, end);
         let dialog = DialogTarget::new(root.clone(), SPEC.to_string());
         let bus = EventBus::new();
         for ev in events.iter().cloned() {
@@ -7007,7 +7164,7 @@ mod tests {
 
         let mut limit = RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit), Some(Box::new(evidence)));
         record_provider_end(&mut limit, &roles, &root, PROJECT, SPEC, &secrets).await;
-        let events = terminal_events(PROJECT, &secrets, SPEC, limit);
+        let events = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, limit);
         assert_eq!(events[0].payload["code"], json!(CODE_SPEND_LIMIT));
         assert_eq!(events[0].payload["params"]["role"], "reviewer");
         assert_eq!(events[0].payload["params"]["connection_name"], "Gemini do Ana");
@@ -7025,7 +7182,7 @@ mod tests {
             (ProviderLimit::DailyQuota, CODE_DAILY_QUOTA, "provider_daily_quota"),
             (ProviderLimit::Billing, CODE_BILLING, "provider_billing"),
         ] {
-            let events = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Limit(limit), None));
+            let events = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::Limit(limit), None));
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].payload["code"], json!(code));
             assert_eq!(events[0].payload["params"], json!({}));
@@ -7033,19 +7190,20 @@ mod tests {
             assert_eq!(events[1].payload["status"], "idle");
         }
         let err = RunnerError::Provider { role: "developer", failure: ProviderFailure::Limit(ProviderLimit::SpendLimit), evidence: None };
-        assert!(matches!(run_end(Ok(Err(err))), RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit), None)));
+        assert!(matches!(run_end(Lang::PtBr, Ok(Err(err))), RunEnd::Provider(ProviderFailure::Limit(ProviderLimit::SpendLimit), None)));
     }
 
     #[test]
     fn terminal_events_are_fixed_and_redacted() {
         let secrets = SecretSet::new(vec![SECRET.to_string()]);
-        let failed = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Failed(None));
+        let failed = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Failed(None));
         assert_eq!(failed.len(), 2);
         assert_eq!(failed[0].payload["text"], RUN_FAILED_TEXT);
-        let panicked = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Panicked);
+        let panicked = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Panicked);
         assert_eq!(panicked[0].payload["text"], RUN_FAILED_TEXT);
         assert_eq!(panicked[1].payload["reason"], "error");
         let provider = terminal_events(
+            Lang::PtBr,
             PROJECT,
             &secrets,
             SPEC,
@@ -7058,10 +7216,11 @@ mod tests {
             crate::agents::llm_client::BadKind::Incomplete,
             Some("content_filter"),
         );
-        let bad = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
+        let bad = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Provider(ProviderFailure::BadResponse(reason), None));
         assert_eq!(bad[0].payload["text"], "provider_bad_response (incompleta: content_filter)");
         assert_eq!(bad[1].payload["reason"], "error");
         let blocked = terminal_events(
+            Lang::PtBr,
             PROJECT,
             &secrets,
             SPEC,
@@ -7080,21 +7239,21 @@ mod tests {
         // Spec 081 T02: a causa aparece, com scrub, numa linha e limitada sem quebrar caracteres.
         let secrets = SecretSet::new(vec![SECRET.to_string()]);
         let cause = format!("falha do papel developer: limite de 40 passos\ncom {SECRET}");
-        let ev = terminal_events(PROJECT, &secrets, SPEC, RunEnd::Failed(Some(cause)));
+        let ev = terminal_events(Lang::PtBr,PROJECT, &secrets, SPEC, RunEnd::Failed(Some(cause)));
         let text = ev[0].payload["text"].as_str().expect("texto").to_string();
-        assert!(text.starts_with("a execução foi interrompida: falha do papel developer: limite de 40 passos com "), "{text}");
-        assert!(text.ends_with("; confira o estado do projeto"), "{text}");
+        assert!(text.starts_with("A execução foi interrompida: falha do papel developer: limite de 40 passos com "), "{text}");
+        assert!(text.ends_with("; confira o estado do projeto."), "{text}");
         assert!(!text.contains(SECRET), "segredo vazou: {text}");
         assert_eq!(ev[1].payload["reason"], "error");
         let long = "ç".repeat(400);
-        let capped = run_failed_text(&secrets, Some(&long));
+        let capped = run_failed_text(Lang::PtBr, &secrets, Some(&long));
         let shown = capped
-            .trim_start_matches("a execução foi interrompida: ")
-            .trim_end_matches("; confira o estado do projeto");
+            .trim_start_matches("A execução foi interrompida: ")
+            .trim_end_matches("; confira o estado do projeto.");
         assert!(shown.len() <= RUN_FAILED_CAUSE_MAX_BYTES + '…'.len_utf8(), "{}", shown.len());
         assert!(shown.ends_with('…') && shown.starts_with("çç"), "{shown}");
-        assert_eq!(run_failed_text(&secrets, Some("  \n ")), RUN_FAILED_TEXT);
-        assert_eq!(run_failed_text(&secrets, None), RUN_FAILED_TEXT);
+        assert_eq!(run_failed_text(Lang::PtBr, &secrets, Some("  \n ")), RUN_FAILED_TEXT);
+        assert_eq!(run_failed_text(Lang::PtBr, &secrets, None), RUN_FAILED_TEXT);
     }
 
     #[test]
@@ -7103,6 +7262,7 @@ mod tests {
         let secrets = SecretSet::default();
         for (kind, want) in [(BlockKind::Quality, "quality"), (BlockKind::Environmental, "environmental")] {
             let ev = terminal_events(
+                Lang::PtBr,
                 PROJECT,
                 &secrets,
                 SPEC,

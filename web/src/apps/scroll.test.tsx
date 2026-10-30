@@ -10,8 +10,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { act, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { dockButtonId } from "../desktop/focus";
-import { renderShell, settle } from "../desktop/shell-test-utils";
+import { openNMenu, renderShell, settle } from "../desktop/shell-test-utils";
 import { cssRules } from "../desktop/test-utils";
 import { WINDOW_KINDS } from "../desktop/windows";
 import { makeProject, makeProjectState } from "../test-utils";
@@ -201,12 +200,13 @@ describe("contrato de rolagem (shell montado)", () => {
     });
     for (const kind of WINDOW_KINDS) {
       if (kind === "setup") continue;
-      const button = document.getElementById(dockButtonId(kind));
-      if (button !== null && document.querySelector(`[data-window="${kind}"]`) === null) {
-        await act(async () => {
-          fireEvent.click(button);
-        });
-      }
+      if (document.querySelector(`[data-window="${kind}"]`) !== null) continue;
+      // Pelo menu do N; o app fora da grade fecha o menu sem abrir nada.
+      const tile = openNMenu().querySelector<HTMLElement>(`.nd-nmenu-tile[data-kind="${kind}"]`);
+      await act(async () => {
+        if (tile !== null) fireEvent.click(tile);
+        else fireEvent.keyDown(window, { key: "Escape" });
+      });
     }
     await settle();
     const checked: string[] = [];

@@ -9,7 +9,7 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { notReady, renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, notReady, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState } from "../../test-utils";
@@ -51,7 +51,7 @@ async function shell(extra: RenderShellOptions = {}) {
 async function openSettings(extra: RenderShellOptions = {}) {
   const view = await shell(extra);
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: /^(Configurações|Settings)$/ }));
+    activateApp(/^(Configurações|Settings)$/);
   });
   await settle();
   return view;

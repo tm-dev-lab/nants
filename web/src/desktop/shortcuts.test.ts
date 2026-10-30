@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { setBody } from "./test-utils";
 import {
-  dockSlotAria,
+  appSlotAria,
   matchShortcut,
   shortcutById,
   shortcutContext,
@@ -25,17 +25,19 @@ const typing: ShortcutContext = { typing: true, onDesktop: false, onTitleBar: fa
 
 describe("tabela única de atalhos", () => {
   it("tem todos os atalhos da spec, sem Alt+Espaço nem Ctrl+`", () => {
-    const ids: ShortcutId[] = ["launcher", "nextWindow", "previousWindow", "dockSlot", "shortcutSheet", "undoLayout", "windowMenu"];
+    const ids: ShortcutId[] = ["launcher", "nextWindow", "previousWindow", "nMenu", "appSlot", "shortcutSheet", "undoLayout", "windowMenu"];
     for (const id of ids) expect(shortcutById(id)?.id).toBe(id);
     const all = SHORTCUTS.map((s) => `${s.aria} ${s.keys}`).join(" ");
-    expect(all).not.toMatch(/Alt\+Space|Control\+`|Ctrl\+`/);
+    expect(all).not.toMatch(/Alt\+Space|Alt\+Espaço|Control\+`|Ctrl\+`/);
+    // Menu do N (spec 137): Alt+0, no lugar do Alt+Espaço do mockup.
+    expect(shortcutById("nMenu")).toMatchObject({ aria: "Alt+0", keys: "Alt+0" });
     expect(SHORTCUTS.filter((s) => s.allowWhileTyping).map((s) => s.id)).toEqual(["launcher"]);
   });
 
-  it("aria-keyshortcuts do dock", () => {
-    expect(dockSlotAria(1)).toBe("Alt+1");
-    expect(dockSlotAria(9)).toBe("Alt+9");
-    expect(dockSlotAria(10)).toBeUndefined();
+  it("aria-keyshortcuts dos apps na grade do menu do N", () => {
+    expect(appSlotAria(1)).toBe("Alt+1");
+    expect(appSlotAria(9)).toBe("Alt+9");
+    expect(appSlotAria(10)).toBeUndefined();
   });
 });
 
@@ -51,9 +53,19 @@ describe("matchShortcut", () => {
   });
 
   it("Alt+1…9 pelo código físico (layouts que trocam o key com Alt)", () => {
-    expect(matchShortcut(key("1", { altKey: true, code: "Digit1" }), desktop)).toEqual({ id: "dockSlot", slot: 1 });
-    expect(matchShortcut(key("¡", { altKey: true, code: "Digit9" }), desktop)).toEqual({ id: "dockSlot", slot: 9 });
-    expect(matchShortcut(key("0", { altKey: true, code: "Digit0" }), desktop)).toBeNull();
+    expect(matchShortcut(key("1", { altKey: true, code: "Digit1" }), desktop)).toEqual({ id: "appSlot", slot: 1 });
+    expect(matchShortcut(key("¡", { altKey: true, code: "Digit9" }), desktop)).toEqual({ id: "appSlot", slot: 9 });
+    expect(matchShortcut(key("0", { altKey: true, code: "Digit0" }), desktop)).toEqual({ id: "nMenu" });
+  });
+
+  it("Alt+0 abre o menu do N pelo código físico Digit0; Alt+Espaço não é atalho", () => {
+    expect(matchShortcut(key("º", { altKey: true, code: "Digit0" }), desktop)).toEqual({ id: "nMenu" });
+    expect(matchShortcut(key("0", { altKey: true }), desktop)).toEqual({ id: "nMenu" });
+    expect(matchShortcut(key("0", { altKey: true, code: "Numpad0" }), desktop)).toBeNull();
+    expect(matchShortcut(key("0", { code: "Digit0" }), desktop)).toBeNull();
+    expect(matchShortcut(key("0", { altKey: true, ctrlKey: true, code: "Digit0" }), desktop)).toBeNull();
+    expect(matchShortcut(key(" ", { altKey: true, code: "Space" }), desktop)).toBeNull();
+    expect(matchShortcut(key("0", { altKey: true, code: "Digit0" }), typing)).toBeNull();
   });
 
   it("Shift+/ abre a folha de atalhos", () => {

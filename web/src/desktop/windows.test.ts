@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { TOPBAR_HEIGHT, workspaceForViewport } from "./metrics";
 import {
   CASCADE_ORIGIN,
   CASCADE_STEP,
@@ -9,6 +10,7 @@ import {
   displayedLayout,
   effectiveRect,
   isCoveredByMaximized,
+  LAYOUT_VERSION,
   MIN_WINDOW_H,
   MIN_WINDOW_W,
   parseLayout,
@@ -260,13 +262,38 @@ describe("desfazer", () => {
 describe("parseLayout / serializeLayout", () => {
   it("valida o que vem de fora e rejeita estado inválido", () => {
     const layout: Layout = { windows: { conversation: win({ restoreMode: "maximized", mode: "minimized" }) } };
-    expect(parseLayout(JSON.parse(JSON.stringify(serializeLayout(layout))))).toEqual(layout);
+    // O que vai ao servidor leva a versão (137/T02), e ela volta na leitura.
+    const sent = JSON.parse(JSON.stringify(serializeLayout(layout))) as unknown;
+    expect(sent).toMatchObject({ v: LAYOUT_VERSION });
+    expect(parseLayout(sent)).toEqual({ v: LAYOUT_VERSION, ...layout });
     expect(parseLayout(null)).toBeNull();
     expect(parseLayout({ windows: [] })).toBeNull();
     expect(parseLayout({ windows: { conversation: { ...win(), mode: "flutuante" } } })).toBeNull();
     expect(parseLayout({ windows: { conversation: { ...win(), x: "1" } } })).toBeNull();
     // Tipo desconhecido é ignorado.
     expect(parseLayout({ windows: { antiga: win() } })).toEqual({ windows: {} });
+  });
+
+  it("versão: sem ela (ou com outra), o arranjo é do tempo do dock e vem sem `v`", () => {
+    expect(LAYOUT_VERSION).toBe(2);
+    expect(parseLayout({ windows: { plan: win() } })).toEqual({ windows: { plan: win() } });
+    expect(parseLayout({ v: 1, windows: { plan: win() } })).toEqual({ windows: { plan: win() } });
+    expect(parseLayout({ v: "2", windows: { plan: win() } })).toEqual({ windows: { plan: win() } });
+    expect(parseLayout({ v: 2, windows: { plan: win() } })).toEqual({ v: 2, windows: { plan: win() } });
+  });
+
+  it("maximizar ocupa a área nova inteira (sem o dock): até a borda de baixo", () => {
+    const ws = workspaceForViewport(1440, 860);
+    let s = createDesktopState({ windows: { plan: win() } }, ws);
+    s = run(s, { type: "toggleMaximize", kind: "plan" });
+    const plan = s.layout.windows.plan;
+    if (plan === undefined) throw new Error("plano ausente");
+    expect(effectiveRect(plan, s.workspace)).toEqual({ x: 0, y: 0, w: 1440, h: 860 - TOPBAR_HEIGHT });
+    // Encaixe à esquerda e redimensionar também vão até a borda nova.
+    s = run(s, { type: "toggleMaximize", kind: "plan" }, { type: "snap", kind: "plan", target: "left" });
+    expect(s.layout.windows.plan).toMatchObject({ y: 0, h: 860 - TOPBAR_HEIGHT });
+    s = run(s, { type: "setRect", kind: "plan", rect: { x: 0, y: 400, w: 500, h: 300 } }, { type: "resize", kind: "plan", w: 500, h: 9_999 });
+    expect(s.layout.windows.plan).toMatchObject({ y: 400, h: 860 - TOPBAR_HEIGHT - 400 });
   });
 
   it("z é compactado quando cresce demais, sem mudar a ordem", () => {

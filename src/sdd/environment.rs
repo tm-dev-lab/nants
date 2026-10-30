@@ -859,6 +859,17 @@ mod tests {
         assert_eq!(validate_compose(REALISTIC), Ok(()));
     }
 
+    /// Spec 137 T09: a rede `internal: true` (a da rodada offline) é permitida, e `network_mode`
+    /// segue fora da lista (por isso a rodada offline entra pelo override do Nants).
+    #[test]
+    fn compose_allows_internal_networks_but_not_network_mode() {
+        let internal = "services:\n  workspace:\n    image: x\n    networks: [sem-internet]\nnetworks:\n  sem-internet:\n    internal: true\n";
+        assert_eq!(validate_compose(internal), Ok(()));
+        assert!(!SERVICE_KEYS.contains(&"network_mode"));
+        let none = "services:\n  workspace:\n    image: x\n    network_mode: none\n";
+        assert!(validate_compose(none).expect_err("network_mode").contains("network_mode"));
+    }
+
     #[test]
     fn compose_allowlist_rejects_each_vector_with_key_and_service() {
         let svc = |extra: &str| format!("services:\n  workspace:\n    image: x\n{extra}");

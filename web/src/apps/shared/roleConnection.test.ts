@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { Agents, ConnectionView } from "../../api/types";
 import { setLanguage } from "../../i18n";
 import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
-import { connectionKindLabel, providerPage, readyConnections, roleOf, suggestedModel, withRoleConnection } from "./roleConnection";
+import { activeWorker, connectionKindLabel, providerPage, readyConnections, roleOf, shortConnectionName, showsConnectionKind, suggestedModel, withRoleConnection } from "./roleConnection";
 
 afterEach(() => setLanguage("pt-BR", { persist: false }));
 
@@ -60,5 +60,44 @@ describe("conexão por papel", () => {
     expect(connectionKindLabel(undefined)).toBe("Chave de API");
     setLanguage("en", { persist: false });
     expect(connectionKindLabel("chatgpt_plan")).toBe("ChatGPT plan");
+  });
+});
+
+describe("rodapé da Conversa (spec 137 T05)", () => {
+  it("nome curto: sem email e sem o identificador entre parênteses no fim", () => {
+    expect(shortConnectionName("ChatGPT (ana@x.com)")).toBe("ChatGPT");
+    expect(shortConnectionName("Conta Azure ana@empresa.com.br")).toBe("Conta Azure");
+    expect(shortConnectionName("Claude (trabalho)")).toBe("Claude");
+    expect(shortConnectionName("Gemini")).toBe("Gemini");
+    expect(shortConnectionName("(pessoal)")).toBe("(pessoal)");
+    expect(shortConnectionName("ana@x.com")).toBe("ana@x.com");
+  });
+
+  it("o tipo só aparece quando um nome não contém o outro", () => {
+    expect(showsConnectionKind("ChatGPT (ana@x.com)", "Plano ChatGPT")).toBe(false);
+    expect(showsConnectionKind("chatgpt", "ChatGPT plan")).toBe(false);
+    expect(showsConnectionKind("Anthropic pessoal", "Anthropic")).toBe(false);
+    expect(showsConnectionKind("Gemini", "Google Gemini")).toBe(false);
+    expect(showsConnectionKind("OpenAI", "Chave de API")).toBe(true);
+    expect(showsConnectionKind("Claude trabalho", "Anthropic")).toBe(true);
+  });
+
+  const entry = (agent: string, lastAt: number, over: { taskId?: string; endedAt?: number } = {}) => ({ agent, lastAt, ...over });
+
+  it("papel ativo: a atividade aberta mais recente do Desenvolvedor ou do Revisor", () => {
+    const list = [entry("developer", 10, { taskId: "T01" }), entry("reviewer", 30, { taskId: "T01" }), entry("architect", 50), entry("developer", 40, { taskId: "T02", endedAt: 41 })];
+    expect(activeWorker(list, [], null)).toEqual({ role: "reviewer", taskId: "T01" });
+    expect(activeWorker([entry("developer", 5)], [], null)).toEqual({ role: "developer", taskId: null });
+  });
+
+  it("sem atividade aberta, a reserva é a tarefa IN_PROGRESS ou IN_REVIEW da spec da execução", () => {
+    const specs = [
+      { id: "s1", tasks: [{ id: "T01", status: "DONE" }, { id: "T02", status: "IN_REVIEW" }] },
+      { id: "s2", tasks: [{ id: "T09", status: "IN_PROGRESS" }] },
+    ];
+    expect(activeWorker([entry("developer", 1, { endedAt: 2 })], specs, "s1")).toEqual({ role: "reviewer", taskId: "T02" });
+    expect(activeWorker(undefined, specs, "s2")).toEqual({ role: "developer", taskId: "T09" });
+    expect(activeWorker(undefined, specs, null)).toEqual({ role: "reviewer", taskId: "T02" });
+    expect(activeWorker([entry("architect", 9)], [{ id: "s1", tasks: [{ id: "T01", status: "DONE" }] }], "s1")).toBeNull();
   });
 });

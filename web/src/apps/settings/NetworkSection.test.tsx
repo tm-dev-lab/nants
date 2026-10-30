@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NetworkConfig, NetworkView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { appStore } from "../../store";
 import type { RouteReply } from "../../test-utils";
 import { makeProject, makeProjectState } from "../../test-utils";
@@ -66,7 +66,7 @@ async function openMachine(network: NetworkView | undefined, opts: { net?: NetRe
     appStore.setState((s) => (s.config === null || network === undefined ? s : { config: { ...s.config, network } }));
   });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Configurações" }));
+    activateApp("Configurações");
   });
   await settle();
   return view;

@@ -19,6 +19,7 @@ pub mod screenshots;
 pub mod skills;
 pub mod spec_sections;
 pub mod test_levels;
+pub mod usage_commands;
 mod parser;
 mod schema;
 

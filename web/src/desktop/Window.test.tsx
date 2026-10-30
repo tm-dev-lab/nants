@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { useReducer, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ANIMATION_MS } from "./animation";
-import { windowTitleBarId, windowTitleId } from "./focus";
+import { N_BUTTON_ID, windowTitleBarId, windowTitleId } from "./focus";
 import { findForbiddenGlyphs } from "./glyphs";
 import { fakeResizeObservers, installPointerCapturePolyfill, manualScheduler, pointerEvent } from "./test-utils";
 import { RESIZE_CORNER_PX, RESIZE_EDGE_PX, Window, type WindowProps } from "./Window";
@@ -335,12 +335,12 @@ describe("Window: animações FLIP", () => {
     expect(animate).not.toHaveBeenCalled();
   });
 
-  it("minimizar anima até o ícone do dock, e a janela só some depois (nunca presa)", async () => {
+  it("minimizar anima até o botão N, e a janela só some depois (nunca presa)", async () => {
     vi.useFakeTimers();
     try {
-      const dock = document.createElement("button");
-      dock.id = "dock-plan";
-      document.body.append(dock);
+      const nButton = document.createElement("button");
+      nButton.id = N_BUTTON_ID;
+      document.body.append(nButton);
       render(<Live initial={BASE} />);
       fireEvent.click(screen.getByRole("button", { name: "Minimizar" }));
       const region = document.querySelector<HTMLElement>("[data-window='plan']");
@@ -354,7 +354,7 @@ describe("Window: animações FLIP", () => {
         vi.advanceTimersByTime(ANIMATION_MS.minimize + 200);
       });
       expect(region?.hidden).toBe(true);
-      dock.remove();
+      nButton.remove();
     } finally {
       vi.useRealTimers();
     }

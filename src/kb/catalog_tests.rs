@@ -132,6 +132,9 @@ fn rules_bind_only_what_is_transcribed() {
     assert!(PLAN_REVIEW_RULES.contains("Uma citação só de consulta") && PLAN_REVIEW_RULES.contains("não gera ponto"));
     assert!(REVIEWER_RULE.contains("finding bloqueante por uma fonte da base só quando a spec ou esta tarefa transcreve a regra em critério, nas Premissas ou nas Orientações por papel"));
     assert!(REVIEWER_RULE.contains("citações em seções descritivas") && REVIEWER_RULE.contains("nunca é finding bloqueante"));
+    // Spec 137 T07 (P5): a regra transcrita leva o escopo, e o Revisor a aplica só nele.
+    assert!(ARCHITECT_RULES.contains("quando a regra não vale para tudo, com o escopo escrito (ex.: \"no código de produção\", \"nos testes\", \"nos arquivos de configuração\")"));
+    assert!(REVIEWER_RULE.contains("só no escopo que ele escreve (ex.: \"no código de produção\"): fora dele, não é finding"));
     for text in [ARCHITECT_RULES, PLAN_REVIEW_RULES, REVIEWER_RULE, DEV_RULE] {
         assert!(!text.contains("[padrão]") && !text.contains("only_standards") && !text.contains("applies_to"), "{text}");
     }

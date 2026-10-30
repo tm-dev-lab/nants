@@ -4,7 +4,10 @@
 //! o parecer estruturado é conferido contra a árvore revisada, sem linguagem nem framework:
 //! - **fonte:** só `criteria[].evidence` (critérios `met`) e `findings[].location`, nunca a prosa;
 //! - **o que não é caminho:** URL (`://`), glob (`*`, `?`, `{`), tipo MIME (`image/png`), `a/b` sem
-//!   extensão nem linha e rota absoluta que não existe sob a raiz (`/api/users.json`);
+//!   extensão nem linha e rota absoluta que não existe sob a raiz (`/api/users.json`); pela forma
+//!   (spec 137 T06), endereço IP, digest e pacote (`@scope/pkg@1.2.3`, `pkg==1.2.3`,
+//!   `group:artifact:version`) e, quando o primeiro segmento não existe na árvore, a imagem com
+//!   host (`mcr.microsoft.com/openjdk/jdk:21`) ou sem host (`bitnami/postgresql:16`);
 //! - **existência:** os arquivos e diretórios de `git ls-tree -r -t <rev>` (o HEAD da branch na
 //!   revisão da tarefa, a base na verificação final) e o disco da worktree, inclusive o que o git
 //!   ignora (capturas, `test-results`, arquivos gerados), comparados pelo sufixo (a citação é o fim do caminho real);
@@ -107,7 +110,7 @@ fn normalize(token: &str) -> Option<(String, Option<u32>)> {
     let t = token.trim();
     let t = t.rsplit_once("](").map_or(t, |(_, target)| target);
     let t = t.trim_start_matches(EDGES_START).trim_end_matches(EDGES_END);
-    if t.contains("://") {
+    if t.contains("://") || is_package_ref(t) {
         return None;
     }
     let t = t.split("::").next().unwrap_or_default();
@@ -115,6 +118,10 @@ fn normalize(token: &str) -> Option<(String, Option<u32>)> {
     let (path, line) = match t.find(':') {
         Some(i) => {
             let digits: String = t[i + 1..].chars().take_while(char::is_ascii_digit).collect();
+            // `host:5000/...`: a porta seguida de `/` é endereço, não arquivo com linha (spec 137 T06).
+            if !digits.is_empty() && t[i + 1 + digits.len()..].starts_with('/') {
+                return None;
+            }
             (&t[..i], digits.parse::<u32>().ok())
         }
         None => (t, None),
@@ -155,10 +162,11 @@ pub fn citations(text: &str) -> Vec<Citation> {
     out
 }
 
-/// Uma citação de um token, sem partes; `None` para o que não é caminho (URL, glob, MIME, `a/b`).
+/// Uma citação de um token, sem partes; `None` para o que não é caminho (URL, glob, MIME, `a/b`,
+/// endereço IP, digest e pacote).
 fn citation(token: &str) -> Option<Citation> {
     let (path, line) = normalize(token)?;
-    if path.contains(['*', '?', '{', '}']) || is_mime(&path, line.is_some()) {
+    if path.contains(['*', '?', '{', '}']) || is_mime(&path, line.is_some()) || is_ipv4(first_segment(&path)) {
         return None;
     }
     let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
@@ -181,6 +189,67 @@ fn is_mime(path: &str, has_line: bool) -> bool {
         Some((top, sub)) => MIME_TOP.contains(&top.to_ascii_lowercase().as_str()) && !sub.is_empty() && !sub.contains('/'),
         None => false,
     }
+}
+
+/// Spec 137 T06: referência de pacote ou de imagem pela forma, sem tabela por linguagem nem por
+/// registro: digest (`nome@sha256:…`), versão com `@` (`@scope/pkg@1.2.3`, `pkg@^1.2`), requisito
+/// (`pkg==1.2.3`, `pkg>=2`) e coordenada `group:artifact:version` (três partes, sem `/`, a segunda
+/// sem ser número, para não confundir com `a.js:10:5`).
+fn is_package_ref(t: &str) -> bool {
+    if ["==", "~=", ">=", "<="].iter().any(|op| t.contains(op)) {
+        return true;
+    }
+    if let Some((algo, hash)) = t.rsplit_once('@').and_then(|(_, after)| after.split_once(':')) {
+        let digest = !algo.is_empty()
+            && algo.chars().all(|c| c.is_ascii_alphanumeric())
+            && hash.len() >= 7
+            && hash.chars().all(|c| c.is_ascii_hexdigit());
+        if digest {
+            return true;
+        }
+    }
+    let versioned = t.split('/').any(|seg| match seg.find('@') {
+        Some(i) if i > 0 => is_version(&seg[i + 1..]),
+        _ => false,
+    });
+    if versioned {
+        return true;
+    }
+    let parts: Vec<&str> = t.split(':').collect();
+    !t.contains('/') && parts.len() >= 3 && parts.iter().all(|p| !p.is_empty()) && !parts[1].chars().all(|c| c.is_ascii_digit())
+}
+
+/// `1.2.3`, `^1.2`, `~4`, `2.0.0-beta.1`: número de versão, não nome de arquivo (`logo@2x.png`).
+fn is_version(v: &str) -> bool {
+    let v = v.trim_start_matches(['^', '~']);
+    let (core, extra) = match v.find(['-', '+']) {
+        Some(i) => (&v[..i], Some(&v[i + 1..])),
+        None => (v, None),
+    };
+    !core.is_empty()
+        && core.split('.').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        && extra.is_none_or(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+}
+
+/// O primeiro segmento de um caminho (`a` em `a/b/c`), sem a barra inicial.
+fn first_segment(path: &str) -> &str {
+    path.trim_start_matches('/').split('/').next().unwrap_or_default()
+}
+
+/// Endereço IPv4 literal (`127.0.0.1`).
+fn is_ipv4(seg: &str) -> bool {
+    let octets: Vec<&str> = seg.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|o| (1..=3).contains(&o.len()) && o.chars().all(|c| c.is_ascii_digit()) && o.parse::<u16>().is_ok_and(|n| n <= 255))
+}
+
+/// Segmento com cara de host: rótulos de domínio separados por ponto, o último só com letras
+/// (`mcr.microsoft.com`, `ghcr.io`). `.nants` e `docs.v2` não têm essa forma.
+fn is_host_like(seg: &str) -> bool {
+    let labels: Vec<&str> = seg.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && labels.last().is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
 /// Resultado de procurar uma citação na árvore.
@@ -270,6 +339,27 @@ impl Tree {
         Some(newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n')))
     }
 
+    /// Spec 137 T06: o citado que não existe tem a forma de uma referência de imagem, e não de
+    /// arquivo, quando o primeiro segmento é seguido de `/` e não existe na árvore, e:
+    /// - **host:** o segmento tem cara de host (`mcr.microsoft.com/openjdk/jdk:21`, `ghcr.io/o/a`);
+    /// - **imagem sem host:** `a/b:N` com o último segmento sem extensão (`bitnami/postgresql:16`).
+    ///
+    /// Um citado de um segmento só (`README.md:1`, `web.config:3`) nunca tem essa forma.
+    fn reference_shape(&self, rel: &str, has_line: bool) -> bool {
+        let Some((first, rest)) = rel.split_once('/') else { return false };
+        if first.is_empty() || rest.is_empty() {
+            return false;
+        }
+        let last = rest.rsplit('/').next().unwrap_or_default();
+        (is_host_like(first) || (has_line && !last.contains('.'))) && !self.segment_exists(first)
+    }
+
+    /// Algum arquivo ou diretório da árvore (git ou disco) tem `seg` como um dos componentes.
+    fn segment_exists(&self, seg: &str) -> bool {
+        let has = |e: &String| e.split('/').any(|p| p == seg);
+        self.entries.iter().any(has) || self.root.join(seg).exists() || self.disk_entries().iter().any(has)
+    }
+
     fn locate(&self, c: &Citation) -> Located {
         let (rel, absolute) = self.relative(&c.path);
         if !Self::inside(&rel) {
@@ -288,7 +378,7 @@ impl Tree {
             found = self.disk_entries().iter().filter(|e| matches(e)).map(|e| (e.clone(), false)).collect();
         }
         if found.is_empty() {
-            return if absolute { Located::NotAPath } else { Located::Missing };
+            return if absolute || self.reference_shape(&rel, c.line.is_some()) { Located::NotAPath } else { Located::Missing };
         }
         if c.line.is_none() {
             return Located::Found(None);
@@ -884,6 +974,97 @@ mod tests {
         assert_eq!(tree.locate(&c("/api/nope.json:1")), Located::NotAPath);
         let audit = audit(&result(&["/work/src/nope.js:1"], &[]), &tree);
         assert_eq!(audit.criterion(0).map(|i| i.problems.clone()), Some(vec![Problem::Missing("/work/src/nope.js:1".into())]));
+    }
+
+    /// Spec 137 T06: imagem, host, IP e pacote não são caminho, pela forma do token; o que é arquivo
+    /// continua conferido.
+    #[test]
+    fn image_host_ip_and_package_references_are_not_paths() {
+        // (b) IP e (d) digest e pacote: fora já na leitura das citações.
+        for text in [
+            "127.0.0.1:8080/api",
+            "127.0.0.1/api",
+            "10.0.0.1:5432",
+            "registry.example.com:5000/team/app:1",
+            "node@sha256:4f1c2a9be0d1e2f3a4b5c6d7e8f9",
+            "mcr.microsoft.com/openjdk/jdk@sha256:abcdef0123456789",
+            "org.springframework.boot:spring-boot-starter-web:3.2.0",
+            "com.example:demo:1.0",
+            "@scope/pkg@1.2.3",
+            "@angular/core@^17.0.1",
+            "pkg==1.2.3",
+            "django>=4.2",
+        ] {
+            assert!(citations(text).is_empty(), "{text}: {:?}", citations(text));
+        }
+        // Linha e coluna, e nome de arquivo com `@`, continuam citação.
+        let cited: Vec<String> = citations("src/app.js:10:5 app.js:3:1 img/logo@2x.png").into_iter().map(|c| c.cited).collect();
+        assert_eq!(cited, ["src/app.js:10", "app.js:3", "img/logo@2x.png"]);
+
+        let root = repo("images");
+        std::fs::create_dir_all(root.join(".nants")).expect("dir");
+        std::fs::create_dir_all(root.join("docs.v2")).expect("dir");
+        std::fs::write(root.join(".nants/Dockerfile"), "FROM mcr.microsoft.com/openjdk/jdk:21\nWORKDIR /app\n").expect("w");
+        std::fs::write(root.join("docs.v2/x.md"), "x\n").expect("w");
+        std::fs::write(root.join("web.config"), "a\nb\nc\n").expect("w");
+        std::fs::write(root.join("README.md"), "r\n").expect("w");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "img"]);
+        let tree = Tree::load(&root, "main").expect("árvore");
+        let c = |t: &str| citations(t).remove(0);
+        // (a) host e (c) imagem sem host, com o primeiro segmento fora da árvore.
+        for t in [
+            "mcr.microsoft.com/openjdk/jdk:21",
+            "ghcr.io/org/app:1.4",
+            "docker.io/library/node:20",
+            "github.com/org/repo.git",
+            "bitnami/postgresql:16",
+            "library/node:20",
+            "bin/run:3",
+        ] {
+            assert_eq!(tree.locate(&c(t)), Located::NotAPath, "{t}");
+        }
+        // Nada afrouxa: arquivo real com ponto no primeiro segmento e o de um segmento só.
+        assert_eq!(tree.locate(&c(".nants/Dockerfile:1")), Located::Found(Some(2)));
+        assert_eq!(tree.locate(&c("docs.v2/x.md:1")), Located::Found(Some(1)));
+        assert_eq!(tree.locate(&c("web.config:3")), Located::Found(Some(3)));
+        assert_eq!(tree.locate(&c("README.md:99")), Located::Found(Some(1)));
+        for t in ["README.md:1", "app.js:3", "web.config:3"] {
+            assert!(!tree.reference_shape(&c(t).path, true), "{t}");
+        }
+        // Primeiro segmento que existe: continua conferido e acusado se falta.
+        for t in ["docs.v2/nope.md:1", "src/run:3", ".nants/sumiu:1", "src/nope.js:2"] {
+            assert_eq!(tree.locate(&c(t)), Located::Missing, "{t}");
+        }
+        let checks = [
+            ("README.md:99", vec![Problem::PastEnd { cited: "README.md:99".into(), lines: 1 }]),
+            ("nao-existe.md:1", vec![Problem::Missing("nao-existe.md:1".into())]),
+            ("web.config:9", vec![Problem::PastEnd { cited: "web.config:9".into(), lines: 3 }]),
+            ("docs.v2/x.md:5", vec![Problem::PastEnd { cited: "docs.v2/x.md:5".into(), lines: 1 }]),
+            ("/work/.nants/Dockerfile:9", vec![Problem::PastEnd { cited: "/work/.nants/Dockerfile:9".into(), lines: 2 }]),
+        ];
+        for (evidence, problems) in checks {
+            let audit = audit(&result(&[evidence], &[]), &tree);
+            assert_eq!(audit.criterion(0).map(|i| i.problems.clone()), Some(problems), "{evidence}");
+        }
+        // README.md:99 quando o README não existe continua acusado.
+        std::fs::remove_file(root.join("README.md")).expect("rm");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "sem readme"]);
+        let tree = Tree::load(&root, "main").expect("árvore");
+        let gone = audit(&result(&["README.md:99"], &[]), &tree);
+        assert_eq!(gone.criterion(0).map(|i| i.problems.clone()), Some(vec![Problem::Missing("README.md:99".into())]));
+
+        // O caso do test-13 inteiro: a evidência do G3 passa a valer.
+        let g3 = "A imagem base está em `.nants/Dockerfile:1`; conferido com \
+                  `grep \"mcr.microsoft.com/openjdk/jdk:21\" .nants/Dockerfile`.";
+        let mut r = result(&[g3], &[]);
+        let audit = audit(&r, &tree);
+        assert!(audit.is_clean(), "{audit:?}");
+        assert_eq!(audit.cited, 1, "{audit:?}");
+        mark_unverified(Lang::En, &mut r, &audit);
+        assert!(r.criteria[0].met && !r.criteria[0].unverified);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -11,7 +11,7 @@ import type { SettingsWindowTab } from "../../desktop/api";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { setLanguage } from "../../i18n";
 import { ptBR } from "../../i18n/ptBR";
-import { notReady, renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, notReady, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { useShell } from "../../desktop/shellContext";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { appStore } from "../../store";
@@ -47,7 +47,7 @@ async function openSettings(extra: RenderShellOptions = {}) {
   view.server.reply("POST", /^\/api\/config\/pricing\/estimate/, () => ({ status: 200, body: {} }));
   view.server.reply("GET", /^\/api\/config\/pricing\/estimate/, () => ({ status: 200, body: {} }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Configurações" }));
+    activateApp("Configurações");
   });
   await settle();
   return view;
@@ -187,10 +187,10 @@ describe("Configurações: abas", () => {
     expect(tab("Agentes").textContent).toBe("Agentes");
   });
 
-  it("boas-vindas (sem espaço): abre pelo dock e troca de aba só na janela", async () => {
+  it("boas-vindas (sem espaço): abre pelo menu do N e troca de aba só na janela", async () => {
     const { server } = await renderShell({ connections: [CONN] });
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Configurações" }));
+      activateApp("Configurações");
     });
     await settle();
     await chooseTab("Aparência");

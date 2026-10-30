@@ -1,11 +1,10 @@
 /*
- * Abas do modo celular (spec 093, decisão 17), no lugar do dock: as janelas da categoria da fase
+ * Abas do modo celular (spec 093, decisão 17), na barra de baixo do celular: as janelas da categoria da fase
  * e o Alternador (no meio, em destaque). Alvos com ≥ 44 px; somem com o teclado virtual aberto
  * (`.nd-keyboard-hide`). A aba atual tem `aria-current="page"`.
  */
 import { memo } from "react";
-import type { DockBadge } from "./Dock";
-import { BADGE_MAX } from "./Dock";
+import { BADGE_MAX, type AppBadge } from "./appState";
 import { Icon, type IconName } from "./Icon";
 import { useT } from "../i18n/react";
 import { MOBILE_VIEW_LABELS, viewWindow, type MobileView } from "./mobile";
@@ -24,7 +23,7 @@ function mobileViewMeta(view: MobileView): { label: string; icon: IconName } {
 interface MobileTabsProps {
   tabs: readonly MobileView[];
   view: MobileView;
-  badges?: Partial<Record<WindowKind, DockBadge>>;
+  badges?: Partial<Record<WindowKind, AppBadge>>;
   onSelect: (view: MobileView) => void;
 }
 

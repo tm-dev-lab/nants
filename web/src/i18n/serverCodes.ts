@@ -10,7 +10,7 @@
  */
 import type { ApiFailure } from "../api/client";
 import { parseCodeParams, type CodeParams } from "../api/codes";
-import { DICTIONARIES, getLanguage, translate, type Lang, type MessageKey } from "./index";
+import { DICTIONARIES, formatNumberIn, getLanguage, pluralForm, translate, type Lang, type MessageKey } from "./index";
 import { providerStopText } from "./providerEvidence";
 import { localizeHeadingTitle } from "./sddHeadings";
 
@@ -110,11 +110,12 @@ type CodePrefix = "serverError" | "system" | "activity.stage" | "activity.code" 
 
 /** Texto de `prefix.code` em `lang`, ou `null` sem chave ou com parâmetro do texto faltando. */
 export function translateCode(prefix: CodePrefix, code: string, params: CodeParams | undefined, lang: Lang = getLanguage()): string | null {
-  const key = `${prefix}.${code}`;
   const dict = DICTIONARIES[lang];
-  if (!Object.hasOwn(dict, key)) return null;
+  const key = pluralCodeKey(`${prefix}.${code}`, params, lang);
+  if (key === null || !Object.hasOwn(dict, key)) return null;
   const template = dict[key as MessageKey];
-  const base = withProviderReason(params ?? {}, lang);
+  const counted = plainCount(params);
+  const base = withProviderReason(counted === null ? (params ?? {}) : { ...params, count: formatNumberIn(lang, counted) }, lang);
   const values =
     prefix === "serverError" && code === "docker_unavailable"
       ? withDockerItem(base, lang)
@@ -128,6 +129,23 @@ export function translateCode(prefix: CodePrefix, code: string, params: CodePara
     if (!Object.hasOwn(values, name)) return null;
   }
   return translate(lang, key as MessageKey, values);
+}
+
+/** `params.count` numérico do código com plural, ou `null`. */
+function plainCount(params: CodeParams | undefined): number | null {
+  const count = params?.count;
+  return typeof count === "number" && Number.isFinite(count) ? count : null;
+}
+
+/**
+ * Chave do código: a própria, ou a forma do plural (`<chave>.one`/`.other`, spec 137 T12) quando o
+ * dicionário só tem as duas formas e os `params` trazem o `count`; sem `count`, `null`.
+ */
+function pluralCodeKey(key: string, params: CodeParams | undefined, lang: Lang): string | null {
+  const dict = DICTIONARIES[lang];
+  if (Object.hasOwn(dict, key) || !Object.hasOwn(dict, `${key}.other`)) return key;
+  const count = plainCount(params);
+  return count === null ? null : `${key}.${pluralForm(lang, count)}`;
 }
 
 /** Texto do erro da API para exibir agora, no idioma ativo (ou em `lang`). */

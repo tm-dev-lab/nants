@@ -70,6 +70,20 @@ function useDuration(): (ms: number | null) => string {
   };
 }
 
+/** Código de saída do shell para "comando não encontrado". */
+const NOT_FOUND_CODE = 127;
+
+/**
+ * Spec 137 T08: o comando que o shell não achou. Vem da saída (`sh: 1: curl: not found`,
+ * `bash: curl: command not found`), que aponta o certo mesmo numa cadeia (`cd x && curl ...`); sem
+ * ela, a primeira palavra do comando.
+ */
+function missingCommand(entry: TranscriptEntry): string {
+  const fromOutput = /(?:^|\n)[^\n]*?:\s*([^\s:]+):\s*(?:command )?not found/.exec(entry.text);
+  if (fromOutput?.[1] !== undefined) return fromOutput[1];
+  return entry.command.trim().split(/\s+/)[0] ?? entry.command;
+}
+
 /** Linha de fim de um comando: código e duração, parado, tempo estourado ou não rodou. */
 function ResultLine({ entry }: { entry: TranscriptEntry }) {
   const { t } = useT();
@@ -95,6 +109,11 @@ function ResultLine({ entry }: { entry: TranscriptEntry }) {
         {text}
       </div>
       {entry.truncated || result.output_truncated ? <div className="nd-console-result">{t("console.result.truncated")}</div> : null}
+      {result.status === "exited" && result.exit_code === NOT_FOUND_CODE ? (
+        <div className="nd-console-notice" data-console-notice="command_not_found">
+          {t("console.result.notFound", { command: missingCommand(entry) })}
+        </div>
+      ) : null}
       {notice !== null ? (
         <div className="nd-console-notice" data-console-notice={result.notice?.code}>
           {notice}

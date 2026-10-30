@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { cssRuleBody } from "../test-utils";
+import { cssRuleBody, cssRules } from "../test-utils";
 import {
   allWallpaperExtremes,
   CHROME_CONTENT_BAND,
@@ -34,7 +34,6 @@ import {
   type CodeTokens,
   type ThemeName,
 } from "./tokens";
-import { DOCK_HEIGHT } from "../metrics";
 
 const TEXT = 4.5;
 const NON_TEXT = 3;
@@ -94,7 +93,7 @@ describe("titânio com reflexo: extremos na faixa de conteúdo (C-01)", () => {
     expect(luminance(titaniumAt("dark", 0.66, 0, box))).toBeGreaterThan(luminance(titaniumExtremes("dark").lightest));
   });
 
-  it("o titânio só tem as superfícies de barra (barras, títulos e dock); as sobreposições são sólidas", () => {
+  it("o titânio só tem as superfícies de barra (barra de cima e títulos); as sobreposições são sólidas", () => {
     expect(Object.keys(CHROME_SURFACES)).toEqual(["bar"]);
     for (const theme of THEME_NAMES) {
       const t = THEMES[theme];
@@ -124,23 +123,20 @@ describe("titânio com reflexo: extremos na faixa de conteúdo (C-01)", () => {
     expect(parseColor(ti.streak.tail).a).toBeGreaterThanOrEqual(0.02);
   });
 
-  it("o botão do dock em foco tem o fundo --state-press, e hover e pressionado não empilham outra camada", () => {
+  it("o app em foco na grade do menu do N tem o fundo --state-press no ícone", () => {
     const css = readFileSync(resolve(process.cwd(), "src/desktop/theme/desktop.css"), "utf8");
-    expect(cssRuleBody(css, '.nd-dock-btn[data-state="focused"]')).toContain("background-color: var(--state-press);");
-    const reset = cssRuleBody(css, '.nd-root .nd-dock-btn[data-state="focused"]:hover');
-    expect(reset).toContain("background-image: none;");
-    expect(css.indexOf('.nd-root .nd-dock-btn[data-state="focused"]:hover')).toBeGreaterThan(css.indexOf(".nd-root .nd-dock-btn:active {"));
+    const focused = cssRules(css).filter((r) => r.at === null && r.selectors.includes('.nd-nmenu-tile[data-state="focused"] .nd-nmenu-icon'));
+    expect(focused.some((r) => r.body.includes("background-color: var(--state-press);"))).toBe(true);
   });
 
   it("geometria: os controles das barras são centralizados e cabem na faixa de conteúdo", () => {
     const css = readFileSync(resolve(process.cwd(), "src/desktop/theme/desktop.css"), "utf8");
-    for (const selector of [".nd-topbar", ".nd-titlebar", ".nd-dock", ".nd-dock-btn"]) {
+    for (const selector of [".nd-topbar", ".nd-titlebar"]) {
       expect({ selector, body: cssRuleBody(css, selector) }).toEqual({ selector, body: expect.stringContaining("align-items: center;") });
     }
-    // Ícones de 16 a 20 px e texto de 11 a 14 px em barras de 40 a 44 px; ícone de 20 px no dock de 60 px (botão de 44, 095/T02).
+    // Ícones de 16 a 20 px e texto de 11 a 14 px em barras de 40 a 44 px.
     const cases: [number, number][] = [];
     for (const bar of [40, 44]) for (const size of [11, 12, 13, 14, 16, 18, 20]) cases.push([bar, size]);
-    cases.push([DOCK_HEIGHT, 20]);
     for (const [bar, size] of cases) {
       const top = (bar - size) / 2 / bar;
       const bottom = (bar + size) / 2 / bar;
@@ -174,7 +170,7 @@ interface Pair {
 function pairsFor(theme: ThemeName): Pair[] {
   const t = THEMES[theme];
   const windowBg = windowBackgrounds(theme);
-  // Titânio: barra superior, barras de título, dock, abas do celular e segmentados.
+  // Titânio: barra superior, barras de título, menu do N, abas do celular e segmentados.
   const chromeBg = chromeBackgrounds(theme);
   const pairs: Pair[] = [];
   const text = (label: string, fg: string, backgrounds: Rgba[]): void => {
@@ -203,15 +199,15 @@ function pairsFor(theme: ThemeName): Pair[] {
   text("texto da ação principal", t.accentInk, [parseColor(t.accent)]);
   // Ação principal desabilitada (pendência da T09): texto --muted sobre --surface2, ≥ 3:1.
   nonText("texto da ação principal desabilitada", t.muted, [parseColor(t.surface2)]);
-  // Ícones: nas janelas, os tons; no titânio (dock e barras), os tons do cromo, também nos estados do dock.
+  // Ícones: nas janelas, os tons; no titânio (menu do N e barras), os tons do cromo, também nos estados da grade do menu.
   for (const tone of TONES) {
     const icon = t.chromeIcon[tone];
     nonText(`ícone ${tone} na janela`, t.icon[tone], windowBg);
     nonText(`ícone ${tone} no titânio`, icon, chromeBg);
-    nonText(`ícone ${tone} do dock em hover`, icon, chromeBg.map((bg) => stack(bg, t.stateHover)));
-    nonText(`ícone ${tone} do dock pressionado`, icon, chromeBg.map((bg) => stack(bg, t.statePress)));
+    nonText(`ícone ${tone} da grade do menu do N em hover`, icon, chromeBg.map((bg) => stack(bg, t.stateHover)));
+    nonText(`ícone ${tone} da grade do menu do N pressionado`, icon, chromeBg.map((bg) => stack(bg, t.statePress)));
     // Janela em foco: o fundo `--state-press` do botão (hover e pressionado não empilham, teste abaixo).
-    nonText(`ícone ${tone} do dock em foco`, icon, chromeBg.map((bg) => stack(bg, t.statePress)));
+    nonText(`ícone ${tone} da grade do menu do N em foco`, icon, chromeBg.map((bg) => stack(bg, t.statePress)));
     // Os tons do cromo também valem nos filhos do titânio que pintam a superfície da janela.
     nonText(`ícone ${tone} do cromo na janela`, icon, windowBg);
   }
@@ -222,7 +218,7 @@ function pairsFor(theme: ThemeName): Pair[] {
   nonText("borda de controle no titânio", t.chromeMuted, chromeBg);
   // Contraste alto: o titânio vira `--surface2` sólido e o contorno é o `--edge-strong`.
   nonText("borda forte (alto contraste)", t.edgeStrong, [...windowBg, parseColor(t.surface2)]);
-  // Indicador de seleção (item escolhido, janela em foco no dock): na janela e, com o violeta do cromo, no titânio.
+  // Indicador de seleção (item escolhido, janela em foco no menu do N): na janela e, com o violeta do cromo, no titânio.
   nonText("indicador de seleção na janela", t.selectedEdge, windowBg);
   nonText("indicador de seleção no titânio", t.chromeInk, [...chromeBg, ...chromeBg.map((bg) => stack(bg, t.statePress))]);
   nonText("indicador de seleção do cromo na janela", t.chromeIcon.violet, windowBg);
@@ -258,13 +254,13 @@ function pairsFor(theme: ThemeName): Pair[] {
   // Controle segmentado (titânio): segmento comum e escolhido.
   text("segmento no titânio", t.chromeInk, chromeBg);
   text("segmento escolhido no titânio", t.chromeInk, chromeBg.map((bg) => stack(bg, t.accentSoft)));
-  // Selo do dock.
-  text("selo do dock", t.badgeInk, [parseColor(t.badgeBg)]);
+  // Selo dos apps no menu do N.
+  text("selo dos apps no menu do N", t.badgeInk, [parseColor(t.badgeBg)]);
   // Fechar em hover.
   nonText("ícone de fechar em hover", t.chromePillInk.rose, chromeBg.map((bg) => stack(bg, t.dangerSoft)));
   text("texto de perigo no titânio", t.chromePillInk.rose, chromeBg);
 
-  // --- 095/T02: botões neutros, pílulas de fundo neutro, `<kbd>` sem serifa, busca e dock neutro ---
+  // --- 095/T02: botões neutros, pílulas de fundo neutro, `<kbd>` sem serifa, busca e grade neutra do menu do N ---
   // Nas janelas e sobreposições: fundo `--control` (secundária, pílulas, `<kbd>`), com hover e pressionado.
   const controlBg = windowBg.map((bg) => stack(bg, t.control));
   text("botão secundário na janela", t.ink, controlBg);
@@ -305,16 +301,16 @@ function pairsFor(theme: ThemeName): Pair[] {
   const stopBg = chromeControlBg.map((bg) => stack(bg, t.dangerSoft));
   text("Parar (perigo) na pílula no titânio", t.chromePillInk.rose, stopBg);
   text("Parar (perigo) em hover na pílula no titânio", t.chromePillInk.rose, stopBg.map((bg) => stack(bg, t.stateHover)));
-  // Dock neutro: aberta `--ink` (no cromo, `--chrome-ink`), fechada `--muted`; também em hover, pressionado e em foco.
+  // Grade neutra do menu do N: aberta `--ink` (no cromo, `--chrome-ink`), fechada `--muted`; também em hover, pressionado e em foco.
   for (const [name, fg] of [
     ["aberta", t.chromeInk],
     ["fechada", t.chromeMuted],
   ] as const) {
-    nonText(`ícone do dock (janela ${name})`, fg, chromeBg);
-    nonText(`ícone do dock (janela ${name}) em hover`, fg, chromeBg.map((bg) => stack(bg, t.stateHover)));
-    nonText(`ícone do dock (janela ${name}) pressionado ou em foco`, fg, chromeBg.map((bg) => stack(bg, t.statePress)));
+    nonText(`ícone da grade do menu do N (janela ${name})`, fg, chromeBg);
+    nonText(`ícone da grade do menu do N (janela ${name}) em hover`, fg, chromeBg.map((bg) => stack(bg, t.stateHover)));
+    nonText(`ícone da grade do menu do N (janela ${name}) pressionado ou em foco`, fg, chromeBg.map((bg) => stack(bg, t.statePress)));
   }
-  nonText("ponto da janela aberta no dock", t.chromeInk, chromeBg.map((bg) => stack(bg, t.statePress)));
+  nonText("ponto da janela aberta na grade do menu do N", t.chromeInk, chromeBg.map((bg) => stack(bg, t.statePress)));
 
   // Sobreposições (menus, popovers, sino, lançador, avisos e dicas): superfície sólida `--overlay`,
   // já em `windowBackgrounds`; aqui, explícitos, os pares de menu com os tokens normais.
@@ -373,10 +369,10 @@ describe.each(THEME_NAMES)("contraste dos pares de tokens: tema %s", (theme) => 
   });
 });
 
-describe("tema claro: dock e pílula de execução com as variantes escuras da marca", () => {
+describe("tema claro: menu do N e pílula de execução com as variantes escuras da marca", () => {
   const light = THEMES.light;
 
-  it("os ícones do dock no claro usam as variantes escuras (ciano, violeta, âmbar)", () => {
+  it("os ícones da grade do menu do N no claro usam as variantes escuras (ciano, violeta, âmbar)", () => {
     const dark = THEMES.dark;
     expect(light.icon.cyan).not.toBe(dark.icon.cyan);
     expect(light.icon.cyan).toBe(light.pill.cyan.ink);

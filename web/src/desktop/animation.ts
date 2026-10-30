@@ -38,8 +38,8 @@ const sameRect = (a: Rect, b: Rect): boolean => a.x === b.x && a.y === b.y && a.
 /**
  * Animação de `from` para `to`. `reduced` (prefers-reduced-motion) desliga todas: `null`.
  * - geometry (maximizar/restaurar/encaixar): a caixa já está em `to`; parte do inverso de `from`.
- * - minimize: a caixa continua em `from` (a janela); vai até o ícone do dock (`to`) e some.
- * - restore: a caixa está em `to` (a janela); vem do ícone do dock (`from`) e aparece.
+ * - minimize: a caixa continua em `from` (a janela); vai até o botão N (`to`) e some.
+ * - restore: a caixa está em `to` (a janela); vem do botão N (`from`) e aparece.
  */
 export function animationFor(from: Rect, to: Rect, reduced: boolean, kind: AnimationKind = "geometry"): FlipAnimation | null {
   if (reduced) return null;

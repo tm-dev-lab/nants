@@ -4,9 +4,12 @@
  */
 import { localized } from "../i18n";
 import type { ProjectPhase } from "../store";
+import { LEGACY_DOCK_RESERVE } from "./metrics";
 import {
+  LAYOUT_VERSION,
   normalizeLayout,
   parseLayout,
+  WINDOW_KINDS,
   type Layout,
   type WindowKind,
   type Workspace,
@@ -112,6 +115,60 @@ export function emptyCategoryLayouts(): CategoryLayouts {
     execution: { current: null, mine: null },
     done: { current: null, mine: null },
   };
+}
+
+/**
+ * Migração única de um arranjo gravado com o dock (sem versão; spec 137/T02). A geometria é gravada
+ * em px absolutos: sem migrar, toda janela que ia até o dock ficaria com o vão dele embaixo.
+ * - A janela cuja borda de baixo estava a até `PRESET_GAP` da borda antiga (`ws.h -
+ *   LEGACY_DOCK_RESERVE`) ganha a altura do dock; as outras ficam como estão.
+ * - Nunca passa da borda nova (`ws.h`) nem encolhe: se o navegador mudou de tamanho entre a
+ *   gravação e agora e a heurística erra, no máximo sobra um vão, nunca uma janela fora da tela.
+ * - Devolve o arranjo com a versão (quem chama o grava assim); um arranjo já na versão atual
+ *   volta como veio. Sem área medida (`ws.h` zero), não migra.
+ */
+export function migrateLayout(layout: Layout, ws: Workspace): Layout {
+  if (layout.v === LAYOUT_VERSION || ws.h <= 0) return layout;
+  const oldBottom = ws.h - LEGACY_DOCK_RESERVE;
+  const windows: Layout["windows"] = {};
+  for (const kind of WINDOW_KINDS) {
+    const win = layout.windows[kind];
+    if (win === undefined) continue;
+    if (Math.abs(oldBottom - (win.y + win.h)) > PRESET_GAP) {
+      windows[kind] = win;
+      continue;
+    }
+    const h = Math.max(win.h, Math.min(win.h + LEGACY_DOCK_RESERVE, ws.h - win.y));
+    windows[kind] = h === win.h ? win : { ...win, h };
+  }
+  return { v: LAYOUT_VERSION, windows };
+}
+
+type LayoutSlot = keyof CategoryLayout;
+
+/** Arranjo que a migração mudou (para gravar de volta, já com a versão). */
+interface MigratedLayout {
+  category: LayoutCategory;
+  slot: LayoutSlot;
+  layout: Layout;
+}
+
+/**
+ * Migra os arranjos gravados de todas as categorias (o atual e o meu) para a área sem dock.
+ * Idempotente: o que já está na versão atual passa direto e fica fora de `migrated`.
+ */
+export function migrateCategoryLayouts(layouts: CategoryLayouts, ws: Workspace): { layouts: CategoryLayouts; migrated: MigratedLayout[] } {
+  const out = emptyCategoryLayouts();
+  const migrated: MigratedLayout[] = [];
+  for (const category of LAYOUT_CATEGORIES) {
+    for (const slot of ["current", "mine"] as const) {
+      const stored = layouts[category][slot];
+      const layout = stored === null ? null : migrateLayout(stored, ws);
+      out[category][slot] = layout;
+      if (layout !== null && layout !== stored) migrated.push({ category, slot, layout });
+    }
+  }
+  return migrated.length === 0 ? { layouts, migrated } : { layouts: out, migrated };
 }
 
 /** Valida o que veio do servidor/cache; o que for inválido volta a `null` (o padrão). */

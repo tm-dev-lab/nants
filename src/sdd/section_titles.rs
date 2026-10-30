@@ -17,7 +17,7 @@
 use crate::agents::{finding_reply, finding_track, runner};
 use crate::i18n::{self, Lang};
 
-use super::{images, role_guidance, spec_sections};
+use super::{images, role_guidance, skills, spec_sections};
 
 /// Arquivo em que o título estrutural aparece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +35,33 @@ pub enum Doc {
 pub struct Structural {
     /// Nível do cabeçalho (2 = `##`).
     pub level: usize,
+    /// Título fixo; nos que seguem o idioma do projeto ([`Structural::key`]), a forma em pt-BR.
     pub title: &'static str,
     pub doc: Doc,
+    /// Chave do dicionário dos títulos que saem no idioma do projeto e são lidos nas formas de todos
+    /// os idiomas (spec 137 T12: as seções dos perfis). `None`: o título é igual em todo idioma.
+    pub key: Option<&'static str>,
+}
+
+impl Structural {
+    /// Título no idioma do projeto (o fixo, quando não segue o idioma).
+    pub fn title_in(&self, lang: Lang) -> String {
+        self.key.map_or_else(|| self.title.to_string(), |key| i18n::text(lang, key))
+    }
+
+    /// O texto é este título, em qualquer idioma.
+    fn matches(&self, title: &str) -> bool {
+        self.title == title || self.key.is_some_and(|key| i18n::forms(key).contains(&title))
+    }
 }
 
 const fn s(level: usize, title: &'static str, doc: Doc) -> Structural {
-    Structural { level, title, doc }
+    Structural { level, title, doc, key: None }
+}
+
+/// Título estrutural que segue o idioma do projeto (`title` é a forma em pt-BR, a dos perfis antigos).
+const fn localized(level: usize, title: &'static str, doc: Doc, key: &'static str) -> Structural {
+    Structural { level, title, doc, key: Some(key) }
 }
 
 /// Títulos estruturais que o Arquiteto escreve, com quem os lê.
@@ -58,9 +79,10 @@ pub const STRUCTURAL: &[Structural] = &[
     // `runner`, `sdd::scope_warnings`, `sdd::plan_diff`, `harness::tools` (validação) e o relatório.
     s(2, runner::OBJECTIVE, Doc::Task),
     s(2, runner::ACCEPTANCE, Doc::Task),
-    // `sdd::skills` (`USER_NOTES_SECTION` e `LESSONS_SECTION`, preservadas literalmente).
-    s(2, "Notas do usuário", Doc::Profile),
-    s(2, "Lições do projeto", Doc::Profile),
+    // `sdd::skills` (`USER_NOTES_KEY` e `LESSONS_KEY`, preservadas pelo conteúdo): spec 137 T12, no
+    // idioma do projeto e lidas nos dois idiomas.
+    localized(2, "Notas do usuário", Doc::Profile, skills::USER_NOTES_KEY),
+    localized(2, "Lições do projeto", Doc::Profile, skills::LESSONS_KEY),
 ];
 
 /// Títulos estruturais que só o servidor grava (e relê): nenhum agente os escreve nem os traduz.
@@ -112,29 +134,38 @@ pub fn free_title(lang: Lang, key: &str) -> String {
 /// O título é estrutural (escrito por agente ou pelo servidor)? Compara o texto exato, sem `#`.
 pub fn is_structural(title: &str) -> bool {
     let t = title.trim().trim_start_matches('#').trim();
-    STRUCTURAL.iter().any(|x| x.title == t)
+    STRUCTURAL.iter().any(|x| x.matches(t))
         || SERVER_WRITTEN.contains(&t)
         || SERVER_WRITTEN_PREFIXES.iter().any(|p| t.strip_prefix(p).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
-/// Linhas de cabeçalho (`## Título`) dos estruturais de um arquivo, na ordem da lista.
-pub fn structural_headings(doc: Doc) -> Vec<String> {
+/// Linhas de cabeçalho (`## Título`) dos estruturais de um arquivo, na ordem da lista, com os que
+/// seguem o idioma do projeto no idioma `lang`.
+pub fn structural_headings(doc: Doc, lang: Lang) -> Vec<String> {
     STRUCTURAL
         .iter()
         .filter(|x| x.doc == doc)
-        .map(|x| format!("{} {}", "#".repeat(x.level), x.title))
+        .map(|x| format!("{} {}", "#".repeat(x.level), x.title_in(lang)))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sdd::{coverage, scope_warnings, skills, Task};
+    use crate::sdd::{coverage, scope_warnings, Task};
 
     #[test]
     fn profile_titles_are_the_ones_skills_reads() {
-        let profile = structural_headings(Doc::Profile);
-        assert_eq!(profile, vec![skills::USER_NOTES_SECTION.to_string(), skills::LESSONS_SECTION.to_string()]);
+        for lang in Lang::ALL {
+            let profile = structural_headings(Doc::Profile, lang);
+            assert_eq!(profile, vec![skills::heading(lang, skills::USER_NOTES_KEY), skills::heading(lang, skills::LESSONS_KEY)]);
+        }
+        assert_eq!(structural_headings(Doc::Profile, Lang::PtBr), ["## Notas do usuário", "## Lições do projeto"]);
+        assert_eq!(structural_headings(Doc::Profile, Lang::En), ["## User notes", "## Project lessons"]);
+        // Os perfis antigos (pt) continuam estruturais, e os novos nos dois idiomas também.
+        for title in ["## Notas do usuário", "Lições do projeto", "## User notes", "Project lessons"] {
+            assert!(is_structural(title), "{title}");
+        }
     }
 
     #[test]

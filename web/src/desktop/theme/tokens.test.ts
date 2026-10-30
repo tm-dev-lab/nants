@@ -287,8 +287,10 @@ describe("desktop.css: material, fallback e preferências do sistema", () => {
         expect({ gone, value: vars[gone] }).toEqual({ gone, value: undefined });
       }
     }
-    // Sem vidro: nenhum desfoque nem fallback de vidro no desktop.
-    expect(CSS.replace(/\/\*[\s\S]*?\*\//g, "")).not.toMatch(/backdrop-filter|@supports not|prefers-reduced-transparency/);
+    // Sem vidro: nenhum desfoque nem fallback de vidro no desktop (o véu do menu do N, spec 137, é a
+    // exceção única: desfoca de leve a área de trabalho atrás dele, não é superfície).
+    const css = CSS.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\.nd-nmenu-scrim\s*\{[^}]*\}/g, "");
+    expect(css).not.toMatch(/backdrop-filter|@supports not|prefers-reduced-transparency/);
   });
 
   it("contraste alto: o titânio vira sólido, com contorno --edge-strong (outline, nunca border)", () => {
@@ -320,7 +322,7 @@ describe("desktop.css: material, fallback e preferências do sistema", () => {
   it("nenhuma sombra de componente apaga o anel interno do foco", () => {
     // Elementos focáveis e as classes/atributos que eles podem ter ao mesmo tempo.
     const focusables: { label: string; classes: string[]; attrs?: string[] }[] = [
-      { label: "ícone do dock em foco", classes: ["nd-dock-btn"], attrs: ['data-state="focused"'] },
+      { label: "app em foco na grade do menu do N", classes: ["nd-nmenu-tile"], attrs: ['data-state="focused"'] },
       { label: "opção marcada do Personalizar", classes: ["nd-choice"], attrs: ['aria-pressed="true"'] },
       { label: "barra de título", classes: ["nd-titlebar", "nd-chrome"] },
       { label: "folha de atalhos (titânio focável)", classes: ["nd-sheet", "nd-popover", "nd-chrome"] },
@@ -342,9 +344,9 @@ describe("desktop.css: material, fallback e preferências do sistema", () => {
     }
   });
 
-  it("contraste alto: o contorno --edge-strong vence no dock, na barra de título, na barra superior e na janela", () => {
+  it("contraste alto: o contorno --edge-strong vence na barra de título, na barra superior e na janela", () => {
     const forClasses = (classes: string[]): CssRule | undefined => winner(classes, false, "outline", [], "prefers-contrast: more");
-    for (const classes of [["nd-titlebar", "nd-chrome"], ["nd-dock", "nd-chrome"], ["nd-topbar", "nd-chrome"], ["nd-window"]]) {
+    for (const classes of [["nd-titlebar", "nd-chrome"], ["nd-topbar", "nd-chrome"], ["nd-window"]]) {
       expect({ classes, outline: forClasses(classes)?.body.includes("outline: 1px solid var(--edge-strong)") }).toEqual({ classes, outline: true });
     }
   });

@@ -1,10 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Desktop, useDesktopReducer, type DesktopProps } from "./Desktop";
-import { dockButtonId, windowTitleBarId } from "./focus";
+import { N_BUTTON_ID, windowTitleBarId } from "./focus";
 import { gestureSignal } from "./gestures";
 import { findForbiddenGlyphs } from "./glyphs";
 import { HINT_IDS, HINTS, MAX_HINTS, markHintSeen, parseHints, shouldShowHint } from "./hints";
+import { activateApp } from "./shell-test-utils";
 import { SHORTCUTS } from "./shortcuts";
 import { fakeUiStateServer, installPointerCapturePolyfill, manualScheduler, pointerEvent } from "./test-utils";
 import { THEMES } from "./theme/tokens";
@@ -70,33 +71,34 @@ describe("Desktop: área de trabalho e área vazia", () => {
     const live = document.querySelector("[data-desktop-status]");
     expect(live?.getAttribute("aria-live")).toBe("polite");
     expect(live?.classList.contains("nd-sr-only")).toBe(true);
-    expect(live?.textContent?.trim()).toBe("Nenhuma janela aberta. Use o dock ou Ctrl+K.");
+    expect(live?.textContent?.trim()).toBe("Nenhuma janela aberta. Use o menu do Nants ou Ctrl+K.");
     expect(document.querySelectorAll("[role='status']")).toHaveLength(1);
   });
 
-  it("fechar a última janela leva o foco ao botão dela no dock e anuncia a área vazia", () => {
+  it("fechar a última janela leva o foco ao botão N e anuncia a área vazia", () => {
     const { status } = setup({ layout: { windows: { conversation: win() } } });
     expect(status()).toBe("");
     fireEvent.click(within(screen.getByRole("region", { name: "Conversa" })).getByRole("button", { name: "Fechar" }));
     expect(screen.queryByRole("region", { name: "Conversa" })).toBeNull();
-    expect(document.activeElement?.id).toBe(dockButtonId("conversation"));
-    expect(status()).toBe("Conversa fechada. Nenhuma janela aberta. Use o dock ou Ctrl+K.");
+    expect(document.activeElement?.id).toBe(N_BUTTON_ID);
+    expect(status()).toBe("Conversa fechada. Nenhuma janela aberta. Use o menu do Nants ou Ctrl+K.");
     expect(screen.getByRole("main", { name: "Área de trabalho" }).querySelector("section")).toBeNull();
   });
 
-  it("fechar a última janela sem botão no dock leva o foco ao primeiro botão do dock", () => {
-    setup({ layout: { windows: { conversation: win() } }, props: { dockKinds: ["plan", "board"] } });
+  it("fechar uma janela fora da grade do menu também leva o foco ao botão N (nunca se perde)", () => {
+    setup({ layout: { windows: { conversation: win() } }, props: { appKinds: ["plan", "board"] } });
     fireEvent.click(within(screen.getByRole("region", { name: "Conversa" })).getByRole("button", { name: "Fechar" }));
-    expect(document.activeElement?.id).toBe(dockButtonId("plan"));
+    expect(document.activeElement?.id).toBe(N_BUTTON_ID);
+    expect(document.querySelector(".nd-dock")).toBeNull();
   });
 
-  it("abrir uma janela pelo dock tira o aviso; minimizar todas deixa só o papel de parede", () => {
+  it("abrir uma janela pelo menu do N tira o aviso; minimizar todas deixa só o papel de parede", () => {
     const { status } = setup();
-    fireEvent.click(screen.getByRole("button", { name: "Conversa" }));
+    activateApp("Conversa");
     expect(screen.getByRole("region", { name: "Conversa" })).toBeTruthy();
     expect(status()).toBe("Conversa aberta");
     fireEvent.click(within(screen.getByRole("region", { name: "Conversa" })).getByRole("button", { name: "Minimizar" }));
-    expect(status()).toBe("Conversa minimizada. Nenhuma janela aberta. Use o dock ou Ctrl+K.");
+    expect(status()).toBe("Conversa minimizada. Nenhuma janela aberta. Use o menu do Nants ou Ctrl+K.");
     expect(screen.getByRole("main", { name: "Área de trabalho" }).querySelector("section:not([data-window])")).toBeNull();
   });
 
@@ -122,12 +124,12 @@ describe("Desktop: área de trabalho e área vazia", () => {
     expect(screen.getByRole("region", { name: "Conversa" })).toBeTruthy();
   });
 
-  it("o titânio está na barra superior, nas barras de título e no dock; os menus são sólidos", () => {
+  it("o titânio está na barra superior e nas barras de título; sem dock; os menus são sólidos", () => {
     setup({ layout: { windows: { plan: win() } } });
     expect(document.querySelector("header")?.classList.contains("nd-chrome")).toBe(true);
-    expect(screen.getByRole("navigation", { name: "Dock" }).classList.contains("nd-chrome")).toBe(true);
-    // Os botões do dock ficam sobre o titânio do dock (sem material próprio).
-    expect(document.getElementById(dockButtonId("plan"))?.classList.contains("nd-chrome")).toBe(false);
+    expect(screen.queryByRole("navigation", { name: "Dock" })).toBeNull();
+    // O botão N fica sobre o titânio da barra (sem material próprio).
+    expect(document.getElementById(N_BUTTON_ID)?.classList.contains("nd-chrome")).toBe(false);
     expect(document.getElementById(windowTitleBarId("plan"))?.classList.contains("nd-chrome")).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Menu da janela" }));
     const menu = screen.getByRole("menu");
@@ -142,7 +144,7 @@ describe("Desktop: área de trabalho e área vazia", () => {
 });
 
 describe("Desktop: anúncios, foco e atalhos", () => {
-  it("role=status fixo anuncia; minimizar leva o foco ao ícone do dock e restaurar volta ao último elemento", () => {
+  it("role=status fixo anuncia; minimizar leva o foco ao botão N e restaurar volta ao último elemento", () => {
     const { status } = setup({
       layout: { windows: { conversation: win() } },
       props: { windows: { conversation: { content: <input aria-label="Mensagem" /> } } },
@@ -151,21 +153,21 @@ describe("Desktop: anúncios, foco e atalhos", () => {
     const input = screen.getByRole("textbox", { name: "Mensagem" });
     act(() => input.focus());
     fireEvent.click(within(screen.getByRole("region", { name: "Conversa" })).getByRole("button", { name: "Minimizar" }));
-    expect(status()).toBe("Conversa minimizada. Nenhuma janela aberta. Use o dock ou Ctrl+K.");
-    expect(document.activeElement?.id).toBe(dockButtonId("conversation"));
-    fireEvent.click(screen.getByRole("button", { name: "Conversa" }));
+    expect(status()).toBe("Conversa minimizada. Nenhuma janela aberta. Use o menu do Nants ou Ctrl+K.");
+    expect(document.activeElement?.id).toBe(N_BUTTON_ID);
+    activateApp("Conversa");
     expect(status()).toBe("Conversa restaurada");
     expect(document.activeElement).toBe(input);
   });
 
-  it("fechar anuncia e leva o foco ao dock; maximizar anuncia", () => {
+  it("fechar anuncia e leva o foco ao botão N; maximizar anuncia", () => {
     const { status } = setup({ layout: { windows: { plan: win() } } });
     const region = screen.getByRole("region", { name: "Plano" });
     fireEvent.click(within(region).getByRole("button", { name: "Maximizar" }));
     expect(status()).toBe("Plano maximizada");
     fireEvent.click(within(region).getByRole("button", { name: "Fechar" }));
-    expect(status()).toBe("Plano fechada. Nenhuma janela aberta. Use o dock ou Ctrl+K.");
-    expect(document.activeElement?.id).toBe(dockButtonId("plan"));
+    expect(status()).toBe("Plano fechada. Nenhuma janela aberta. Use o menu do Nants ou Ctrl+K.");
+    expect(document.activeElement?.id).toBe(N_BUTTON_ID);
     expect(screen.queryByRole("region", { name: "Plano" })).toBeNull();
   });
 
@@ -178,24 +180,24 @@ describe("Desktop: anúncios, foco e atalhos", () => {
     expect(status()).toBe("Última mudança de layout desfeita");
   });
 
-  it("F6/Shift+F6 percorrem as janelas visíveis; Alt+N abre a janela da posição do dock", () => {
+  it("F6/Shift+F6 percorrem as janelas visíveis; Alt+N abre a janela da posição no menu do N", () => {
     setup({ layout: { windows: { conversation: win({ z: 1 }), board: win({ z: 2 }) } } });
     fireEvent.keyDown(document.body, { key: "F6" });
-    // Da janela em foco (Quadro), a próxima na ordem do dock é a Conversa (com volta).
+    // Da janela em foco (Quadro), a próxima na ordem dos apps é a Conversa (com volta).
     expect(document.activeElement?.id).toBe(windowTitleBarId("conversation"));
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F6" });
     expect(document.activeElement?.id).toBe(windowTitleBarId("board"));
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F6", shiftKey: true });
     expect(document.activeElement?.id).toBe(windowTitleBarId("conversation"));
-    // Alt+2 = Plano (segunda posição do dock).
+    // Alt+2 = Plano (segunda posição no menu do N).
     fireEvent.keyDown(document.body, { key: "2", code: "Digit2", altKey: true });
     expect(screen.getByRole("region", { name: "Plano" })).toBeTruthy();
     expect(document.activeElement?.id).toBe(windowTitleBarId("plan"));
   });
 
-  it("095/T07: abrir pelo dock foca a barra SEM anel (foco programático); F6 e teclas mostram o anel neutro", () => {
+  it("095/T07: abrir pelo menu do N foca a barra SEM anel (foco programático); F6 e teclas mostram o anel neutro", () => {
     setup({ layout: { windows: { conversation: win({ z: 1 }) } } });
-    fireEvent.click(document.getElementById(dockButtonId("plan")) as HTMLElement);
+    activateApp("Plano");
     const plan = document.getElementById(windowTitleBarId("plan"));
     expect(document.activeElement).toBe(plan);
     expect(plan?.getAttribute("data-quiet-focus")).toBe("true");
@@ -317,19 +319,23 @@ describe("Desktop: dicas contextuais (hints)", () => {
     expect(HINT_IDS).toHaveLength(MAX_HINTS);
     expect(MAX_HINTS).toBeLessThanOrEqual(2);
     let state = parseHints(undefined);
-    expect(shouldShowHint(state, "dock")).toBe(true);
-    state = markHintSeen(state, "dock");
-    expect(shouldShowHint(state, "dock")).toBe(false);
-    expect(parseHints({ seen: ["dock", "x", 3] })).toEqual({ seen: ["dock"] });
+    expect(shouldShowHint(state, "menu")).toBe(true);
+    state = markHintSeen(state, "menu");
+    expect(shouldShowHint(state, "menu")).toBe(false);
+    expect(parseHints({ seen: ["menu", "x", 3] })).toEqual({ seen: ["menu"] });
+    // A dica antiga do dock saiu: quem já a viu vê a do menu uma vez.
+    expect(HINT_IDS).toEqual(["snap", "menu"]);
+    expect(parseHints({ seen: ["dock"] })).toEqual({ seen: [] });
   });
 
-  it("primeira vez que minimiza: 'Suas janelas ficam no dock', salva em hints e não volta", async () => {
+  it("primeira vez que minimiza: 'As janelas minimizadas ficam no menu do Nants', salva em hints e não volta", async () => {
     const { server } = setup({ layout: { windows: { plan: win(), conversation: win({ z: 2 }) } } });
     await settle();
     fireEvent.click(within(screen.getByRole("region", { name: "Plano" })).getByRole("button", { name: "Minimizar" }));
-    expect(screen.getByRole("note").textContent).toContain(HINTS.dock);
+    expect(screen.getByRole("note").textContent).toContain(HINTS.menu);
+    expect(HINTS.menu).toBe("As janelas minimizadas ficam no menu do Nants");
     await settle();
-    expect(server.puts().map((c) => c.body)).toContainEqual({ base_rev: 1, section: "hints", value: { seen: ["dock"] } });
+    expect(server.puts().map((c) => c.body)).toContainEqual({ base_rev: 1, section: "hints", value: { seen: ["menu"] } });
     fireEvent.click(screen.getByRole("button", { name: "Dispensar dica" }));
     expect(screen.queryByRole("note")).toBeNull();
     fireEvent.click(within(screen.getByRole("region", { name: "Conversa" })).getByRole("button", { name: "Minimizar" }));
@@ -337,7 +343,7 @@ describe("Desktop: dicas contextuais (hints)", () => {
   });
 
   it("já vista em outra sessão: não aparece", async () => {
-    setup({ layout: { windows: { plan: win() } }, data: { hints: { seen: ["dock"] } } });
+    setup({ layout: { windows: { plan: win() } }, data: { hints: { seen: ["menu"] } } });
     await settle();
     fireEvent.click(screen.getByRole("button", { name: "Minimizar" }));
     expect(screen.queryByRole("note")).toBeNull();
@@ -381,5 +387,44 @@ describe("Desktop: ícones, nunca caracteres", () => {
     fireEvent.click(within(screen.getByRole("region", { name: "Plano" })).getByRole("button", { name: "Menu da janela" }));
     fireEvent.click(screen.getByRole("button", { name: "Personalizar" }));
     expect(findForbiddenGlyphs(document.body)).toEqual([]);
+  });
+});
+
+describe("Desktop: sem dock (137/T02), o N no lugar dele", () => {
+  it("minimizar anima até o botão N e restaurar volta dele (transform)", () => {
+    const animate = vi.fn();
+    const proto = HTMLElement.prototype as HTMLElement & { animate?: unknown };
+    const original = Object.getOwnPropertyDescriptor(proto, "animate");
+    Object.defineProperty(proto, "animate", { configurable: true, writable: true, value: animate });
+    const rects: Record<string, DOMRect> = {
+      [N_BUTTON_ID]: new DOMRect(8, 4, 36, 36),
+      plan: new DOMRect(100, 124, 480, 360),
+    };
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return rects[this.id] ?? rects[this.getAttribute("data-window") ?? ""] ?? new DOMRect(0, 0, 0, 0);
+    });
+    try {
+      setup({ layout: { windows: { plan: win() } } });
+      fireEvent.click(within(screen.getByRole("region", { name: "Plano" })).getByRole("button", { name: "Minimizar" }));
+      const [out] = animate.mock.calls[0] as [Keyframe[]];
+      // Da janela (100, 124, 480×360) até o N (8, 4, 36×36), no canto de cima à esquerda.
+      expect(out[1]).toEqual({ transform: "translate(-92px, -120px) scale(0.075, 0.1)", opacity: 0 });
+      activateApp("Plano");
+      const [back] = animate.mock.calls[1] as [Keyframe[]];
+      expect(back[0]).toEqual({ transform: "translate(-92px, -120px) scale(0.075, 0.1)", opacity: 0 });
+    } finally {
+      rectSpy.mockRestore();
+      if (original === undefined) delete (proto as { animate?: unknown }).animate;
+      else Object.defineProperty(proto, "animate", original);
+    }
+  });
+
+  it("Alt+1 restaura a janela minimizada da primeira posição, sem passar pelo menu", () => {
+    setup({ layout: { windows: { conversation: win({ mode: "minimized", restoreMode: "normal" }) } } });
+    expect(document.querySelector<HTMLElement>("[data-window='conversation']")?.hidden).toBe(true);
+    fireEvent.keyDown(document.body, { key: "1", code: "Digit1", altKey: true });
+    expect(document.querySelector<HTMLElement>("[data-window='conversation']")?.hidden).toBe(false);
+    expect(document.activeElement?.id).toBe(windowTitleBarId("conversation"));
+    expect(document.getElementById("nd-nmenu")).toBeNull();
   });
 });

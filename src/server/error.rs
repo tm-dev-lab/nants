@@ -56,9 +56,15 @@ fn param_text(value: &Value) -> String {
 
 /// Texto de reserva em pt-BR de `serverError.<code>`, com os `params` preenchidos.
 pub fn fallback_text(code: &str, params: &Map<String, Value>) -> String {
+    fallback_text_in(Lang::PtBr, code, params)
+}
+
+/// Texto de `serverError.<code>` no idioma `lang`, com os `params` preenchidos: o motivo de uma recusa
+/// citado num texto gravado no idioma do projeto (spec 137 T12).
+pub fn fallback_text_in(lang: Lang, code: &str, params: &Map<String, Value>) -> String {
     let values: Vec<(String, String)> = params.iter().map(|(k, v)| (k.clone(), param_text(v))).collect();
     let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    i18n::tr(Lang::PtBr, &format!("serverError.{code}"), &pairs)
+    i18n::tr(lang, &format!("serverError.{code}"), &pairs)
 }
 
 impl ApiError {

@@ -1,6 +1,6 @@
 /*
  * Conteúdo da barra superior (spec 093, decisão 8), desenhado no espaço reservado do Desktop
- * (Atalhos e Personalizar ficam no fim, pelo próprio Desktop): marca, seletor de espaços, menu
+ * (o botão N no começo e Atalhos e Personalizar no fim ficam com o próprio Desktop): seletor de espaços, menu
  * Layout, pílula de execução, YOLO e Internet, selo "Setup incompleto", Buscar e o sino
  * "Precisa de você" com a contagem do `/api/attention`.
  *
@@ -9,6 +9,10 @@
  *
  * 095/T02 (`reference/Main.dc.html`, decisão 9): controles neutros do conjunto único de botões;
  * a busca é larga ("Buscar ou pedir" + o atalho em `<kbd>` sem serifa).
+ *
+ * 137/T03 (G2): a barra nunca quebra linha. Só a faixa de status (a pílula) encolhe; os outros
+ * controles ficam com a largura deles e, onde a largura aperta, alguns trocam o rótulo pelo ícone
+ * (faixas fixas em `shell.css`), com o nome no `aria-label` e na dica.
  */
 import { memo } from "react";
 import type { ProjectEntry } from "../../api/types";
@@ -18,7 +22,6 @@ import { useT } from "../../i18n/react";
 import { Icon } from "../Icon";
 import { shortcutById } from "../shortcuts";
 import type { SpaceData } from "../useSpaceData";
-import { BrandMark } from "./BrandMark";
 import { LayoutMenu, type LayoutCommand } from "./LayoutMenu";
 import { InternetToggle, YoloToggle } from "./ProjectToggles";
 import { RunPill } from "./RunPill";
@@ -63,9 +66,17 @@ export const TopBar = memo(function TopBar(props: TopBarProps) {
   const launcher = shortcutById("launcher");
   const state = space?.state ?? null;
   const setupBadge = props.setupIncomplete ? (
-    <button type="button" className="nd-btn nd-bar-btn nd-setup-badge" data-setup-badge="" onClick={props.onOpenSetup}>
+    <button
+      type="button"
+      className="nd-btn nd-bar-btn nd-setup-badge"
+      data-setup-badge=""
+      // Onde a barra aperta (137/T03), só o ícone aparece: o nome segue no rótulo e na dica.
+      aria-label={tr("topbar.setupIncomplete")}
+      title={tr("topbar.setupIncomplete")}
+      onClick={props.onOpenSetup}
+    >
       <Icon name="alert" size={14} className="nd-icon-warn" />
-      <span>{tr("topbar.setupIncomplete")}</span>
+      <span className="nd-bar-label">{tr("topbar.setupIncomplete")}</span>
     </button>
   ) : null;
   const bell = (
@@ -92,7 +103,9 @@ export const TopBar = memo(function TopBar(props: TopBarProps) {
       className={compact ? "nd-btn nd-iconbtn nd-bar-btn nd-search-btn" : "nd-btn nd-bar-btn nd-search-btn"}
       data-search=""
       data-compact={compact ? "true" : undefined}
-      aria-label={compact ? searchLabel : undefined}
+      // Rótulo e dica sempre: no celular e onde a barra aperta (137/T03), só o ícone aparece.
+      aria-label={searchLabel}
+      title={searchLabel}
       aria-keyshortcuts={launcher?.aria}
       onClick={props.onOpenLauncher}
     >
@@ -137,7 +150,6 @@ export const TopBar = memo(function TopBar(props: TopBarProps) {
   }
   return (
     <div className="nd-topbar-content" data-topbar="">
-      <BrandMark />
       <SpaceSwitcher
         spaceId={props.spaceId}
         spaceName={space?.name ?? ""}

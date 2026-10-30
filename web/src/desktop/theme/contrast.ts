@@ -140,9 +140,8 @@ export function allWallpaperExtremes(theme: ThemeName): { id: WallpaperId; which
 
 /**
  * Faixa vertical onde fica o conteúdo das BARRAS de titânio (fração da altura). Os controles das
- * barras (barra superior, títulos, dock) são centralizados verticalmente: ícone de 16 a 20 px e
- * texto de 11 a 14 px em barra de 40 a 44 px ocupam no máximo de 27% a 73% da altura (o ícone de
- * 20 px do dock, de 33% a 67% dos 60 px; 095/T02). Fora dela (a borda de luz no topo, a sombra embaixo) não
+ * barras (barra superior e títulos) são centralizados verticalmente: ícone de 16 a 20 px e
+ * texto de 11 a 14 px em barra de 40 a 44 px ocupam no máximo de 27% a 73% da altura. Fora dela (a borda de luz no topo, a sombra embaixo) não
  * há texto nem ícone, então o contraste (WCAG: contra o fundo efetivamente atrás do conteúdo) é
  * medido só aqui (095/T01, decisão do Arquiteto).
  */
@@ -160,7 +159,7 @@ interface ChromeBox {
 
 /**
  * Superfícies de titânio e onde o conteúdo fica nelas. O titânio fica só nas barras (barra
- * superior, barras de título, abas do celular), no dock e nos segmentados, todos com controles
+ * superior, barras de título, abas do celular) e nos segmentados, todos com controles
  * centralizados: faixa de 25% a 75% (`CHROME_SAMPLE_Y`). As caixas são proporções reais (px): a
  * linha da faixa diagonal de 100° depende delas. As sobreposições não são titânio (decisão do
  * Arquiteto na revisão 1 da T01): são a superfície sólida `--overlay`, medida em `windowBackgrounds`.
@@ -169,7 +168,7 @@ type ChromeSurface = "bar";
 
 export const CHROME_SURFACES: Readonly<Record<ChromeSurface, { boxes: readonly ChromeBox[]; sampleY: (box: ChromeBox) => number[] }>> = {
   bar: {
-    // Barra superior, barra de título e dock.
+    // Barra superior e barra de título.
     boxes: [
       { w: 1440, h: 44 },
       { w: 560, h: 44 },

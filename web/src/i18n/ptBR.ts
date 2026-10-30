@@ -111,19 +111,30 @@ export const ptBR = {
   "announce.snap.center": "centro",
   "announce.snap.top": "tela inteira",
   "announce.undo": "Última mudança de layout desfeita",
-  "announce.noWindows": "Nenhuma janela aberta. Use o dock ou {keys}.",
+  "announce.noWindows": "Nenhuma janela aberta. Use o menu do Nants ou {keys}.",
   "announce.launcherFallback": "o lançador",
   "announce.moveCanceled": "{title}: movimento cancelado",
   "announce.keyboardMove": "Mover {title} pelo teclado: setas em passos de 16 px, Enter confirma, Esc cancela",
   "announce.keyboardResize": "Redimensionar {title} pelo teclado: setas em passos de 16 px, Enter confirma, Esc cancela",
   "announce.positionConfirmed": "{title}: posição confirmada",
 
-  // Dock.
-  "dock.label": "Dock",
-  "dock.state.closed": "fechada",
-  "dock.state.open": "aberta",
-  "dock.state.minimized": "minimizada",
-  "dock.state.focused": "em foco",
+  // Estado das janelas (menu do N, abas e Alternador do celular).
+  "windowState.closed": "fechada",
+  "windowState.open": "aberta",
+  "windowState.minimized": "minimizada",
+  "windowState.focused": "em foco",
+
+  // Menu do N (spec 137).
+  "nmenu.button": "Menu do Nants",
+  "nmenu.buttonPending.one": "Menu do Nants, {count} novidade nos aplicativos",
+  "nmenu.buttonPending.other": "Menu do Nants, {count} novidades nos aplicativos",
+  "nmenu.search": "Abrir app ou janela",
+  "nmenu.apps": "Aplicativos",
+  "nmenu.openWindows": "Janelas abertas",
+  "nmenu.noMatch": "Nenhum aplicativo com esse nome",
+  "nmenu.footerSlots": "Alt+1 a Alt+9 abrem direto",
+  "nmenu.footerClose": "Esc fecha",
+  "nmenu.version": "Versão {version}",
 
   // Área de trabalho, dicas e diálogos.
   "desktop.workarea": "Área de trabalho",
@@ -131,7 +142,7 @@ export const ptBR = {
   "desktop.personalize": "Personalizar",
   "desktop.dismissHint": "Dispensar dica",
   "hint.snap": "Arraste até a borda para encaixar",
-  "hint.dock": "Suas janelas ficam no dock",
+  "hint.menu": "As janelas minimizadas ficam no menu do Nants",
   "common.close": "Fechar",
   "common.cancel": "Cancelar",
   "common.dismiss": "Dispensar",
@@ -144,10 +155,11 @@ export const ptBR = {
   "shortcut.launcher": "Abrir o lançador",
   "shortcut.nextWindow": "Próxima janela",
   "shortcut.previousWindow": "Janela anterior",
-  "shortcut.dockSlot": "Janela na posição do dock",
+  "shortcut.appSlot": "App daquela posição no menu do Nants",
   "shortcut.shortcutSheet": "Folha de atalhos",
   "shortcut.undoLayout": "Desfazer a última mudança de layout",
   "shortcut.windowMenu": "Menu da janela (com foco na barra de título)",
+  "shortcut.nMenu": "Abrir e fechar o menu do Nants",
 
   // Lançador e busca.
   "launcher.label": "Lançador",
@@ -159,6 +171,7 @@ export const ptBR = {
   "launcher.group.projects": "Projetos",
   "launcher.group.actions": "Ações",
   "launcher.openSettings": "Abrir as Configurações",
+  "launcher.openNMenu": "Abrir o menu do Nants",
   "launcher.approvePlan": "Aprovar o plano",
   "launcher.stopRun": "Parar a execução",
   "launcher.continueRun": "Continuar a execução",
@@ -608,7 +621,9 @@ export const ptBR = {
   "system.run.auto_approved": "aprovada automaticamente: {detail}",
   "system.image.unavailable": "Este modelo não gera imagens neste provedor; usando ilustrações em SVG/CSS.",
   "system.image.failed": "Geração de imagem falhou ({failure}): {path}. O Desenvolvedor seguirá com SVG/CSS se necessário.",
-  "system.image.suspended":
+  "system.image.suspended.one":
+    "O provedor respondeu sem uma imagem que o Nants consiga ler ({count} tentativa); a geração pode ter sido cobrada pelo provedor. As imagens restantes seguem pelo fallback do plano.",
+  "system.image.suspended.other":
     "O provedor respondeu sem uma imagem que o Nants consiga ler ({count} tentativas); a geração pode ter sido cobrada pelo provedor. As imagens restantes seguem pelo fallback do plano.",
   // Avisos do runner presos a uma tarefa, pelo `code` (spec 102 T02).
   "system.task.worktree_dirty":
@@ -621,6 +636,7 @@ export const ptBR = {
   "system.task.recurring_arbitration": "Os apontamentos {findings} da {task} continuam abertos depois de várias revisões. O Arquiteto decide cada um antes de uma nova tentativa.",
   "system.task.recurring_recovery": "Os apontamentos {findings} da {task} continuam abertos depois de várias revisões. O Arquiteto analisa a tarefa antes de uma nova tentativa.",
   "system.task.recurring_unavailable": "A decisão do Arquiteto sobre os apontamentos recorrentes da {task} ({findings}) ficou indisponível; eles continuam cobrados na próxima tentativa.",
+  "system.task.kept_recurring": "Os apontamentos {findings} da {task} foram mantidos pelo Arquiteto e voltaram sem progresso. Eles não voltam ao Desenvolvedor: o Arquiteto toma a decisão final (aceitar como está, rebaixar para pendência que não bloqueia ou mudar o plano).",
   "system.task.dev_resumed_steps": "O Desenvolvedor atingiu o limite de passos na {task} (tentativa {attempt}). O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa.",
   "system.task.dev_resumed_repeated": "O Desenvolvedor parou na {task} (tentativa {attempt}) por repetir a mesma chamada sem progresso. O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa.",
   "system.task.dev_resumed_stalled": "O Desenvolvedor parou por falta de progresso na {task} (tentativa {attempt}). O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa.",
@@ -1694,6 +1710,7 @@ export const ptBR = {
   "console.result.timedOut": "passou do tempo · {duration}",
   "console.result.failed": "não rodou",
   "console.result.truncated": "a saída passou do limite e foi cortada",
+  "console.result.notFound": "O comando {command} não existe na imagem do projeto (falta a ferramenta ou o nome foi digitado errado). Se o projeto precisa dele, peça ao Arquiteto para incluir a ferramenta no ambiente.",
   "console.duration.seconds": "{seconds} s",
   "console.duration.minutes": "{minutes} min {seconds} s",
   "console.history": "Histórico",
@@ -1982,6 +1999,9 @@ export const ptBR = {
   "roleConn.continueWithout": "Continuar sem trocar",
   "roleConn.footerLabel": "Conexões em uso. {role} usa {model} pela conexão {connection}.",
   "roleConn.otherPaused": "{role} pausado",
+  "roleConn.now": "agora:",
+  "roleConn.nowLabel": "Trabalhando agora: {role}, com {model} pela conexão {connection}.",
+  "roleConn.nowTaskLabel": "Trabalhando agora: {role} na tarefa {task}, com {model} pela conexão {connection}.",
   "roleConn.panelTitle": "Conexões em uso",
   "roleConn.panelHint": "Cada papel usa a sua conexão e o seu modelo. A troca vale quando a execução partir de novo (no Continuar ou num novo início); para o Arquiteto, no próximo turno da conversa, e a parte da execução que ele cumpre só muda quando a execução partir de novo.",
   "roleConn.savedRunning": "Troca salva. Ela vale quando a execução recomeçar; a que está rodando segue com a conexão de antes.",

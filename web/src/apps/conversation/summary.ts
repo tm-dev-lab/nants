@@ -1,5 +1,5 @@
 /*
- * Subtítulo vivo e selo do dock da Conversa (função pura, valores primitivos):
+ * Subtítulo vivo e selo da Conversa (menu do N e celular) (função pura, valores primitivos):
  * - subtítulo: o que falta para conversar, pedidos pendentes, a etapa do plano ("Planejando",
  *   "Revisando o plano", "Aguardando sua aprovação", pela fase derivada de `planStage`),
  *   "Arquiteto pensando" ou a fase;

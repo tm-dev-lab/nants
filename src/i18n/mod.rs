@@ -342,6 +342,29 @@ impl Msg {
     }
 }
 
+/// Letras do português que o inglês não usa (as mesmas da web, `ptLeftovers.ts`).
+#[cfg(test)]
+const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
+
+/// Palavras do português sem acento que denunciam texto em pt num texto em inglês.
+#[cfg(test)]
+const PT_WORDS: [&str; 19] = [
+    "testes", "checagem", "checagens", "não", "esgotado", "arquivos", "coberto", "limite", "nao", "falhou", "reaproveitado", "arvore",
+    "verificação", "bloqueante", "executado", "pergunta", "resposta", "levantamento", "iniciar",
+];
+
+/// Detector de português num texto que devia estar em inglês (o da sentinela abaixo, spec 113 T04),
+/// reaproveitado pela trava do texto gravado no idioma do projeto (spec 137 T12): devolve a letra ou a
+/// palavra achada.
+#[cfg(test)]
+pub(crate) fn portuguese_in(text: &str) -> Option<String> {
+    if let Some(c) = text.chars().find(|c| PT_LETTERS.contains(*c)) {
+        return Some(c.to_string());
+    }
+    let lower = text.to_lowercase();
+    lower.split(|c: char| !c.is_alphanumeric()).find(|w| PT_WORDS.contains(w)).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,22 +427,13 @@ mod tests {
             "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.", "plan_review.",
             "architecture.", "sdd.", "agent.", "kb.",
         ];
-        const PT_LETTERS: &str = "ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ";
-        const PT_WORDS: [&str; 19] = [
-            "testes", "checagem", "checagens", "não", "esgotado", "arquivos", "coberto", "limite", "nao", "falhou", "reaproveitado", "arvore",
-            "verificação", "bloqueante", "executado", "pergunta", "resposta", "levantamento", "iniciar",
-        ];
         for (key, _) in en::MESSAGES {
             assert!(PREFIXES.iter().any(|p| key.starts_with(p)), "chave fora das famílias da sentinela: {key}");
         }
         let system: Vec<&(&str, &str)> = en::MESSAGES.iter().filter(|(k, _)| PREFIXES.iter().any(|p| k.starts_with(p))).collect();
         assert!(system.len() >= 20, "chaves do sistema: {}", system.len());
         for (key, value) in system {
-            assert!(!value.chars().any(|c| PT_LETTERS.contains(c)), "letra do pt em en {key}: {value}");
-            let lower = value.to_lowercase();
-            for word in PT_WORDS {
-                assert!(!lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == word), "palavra do pt em en {key}: {value}");
-            }
+            assert_eq!(portuguese_in(value), None, "pt em en {key}: {value}");
             let pt = lookup(Lang::PtBr, key).unwrap_or_default();
             let neutral = SAME_IN_BOTH.iter().any(|(k, _)| k == key);
             assert!(neutral || pt != *value, "pt-BR igual ao en em {key}: {value}");

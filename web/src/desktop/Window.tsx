@@ -6,8 +6,8 @@
  *   duplo clique maximiza/restaura; Shift+F10/tecla Menu abrem o menu da janela;
  * - alças de redimensionar na borda direita, na inferior e no canto (≥ 10 px de área útil);
  * - conteúdo (`[data-window-content]`) com `useContainerSize` (`data-size`) e estado vazio padrão;
- * - animações FLIP (`animationFor`) ao maximizar, restaurar, encaixar, minimizar até o ícone do
- *   dock e restaurar a partir dele. O estado nunca espera a animação; nenhuma depois de um gesto;
+ * - animações FLIP (`animationFor`) ao maximizar, restaurar, encaixar, minimizar até o botão N
+ *   (137/T02) e restaurar a partir dele. O estado nunca espera a animação; nenhuma depois de um gesto;
  * - minimizada = `hidden` + `inert` (durante a animação de saída, só `inert`);
  * - no modo celular (`host.mobile`, T10), tela cheia sem gestos, sem alças e sem menu: a barra de
  *   título só tem Fechar (que volta ao Alternador);
@@ -16,6 +16,9 @@
  *   navegador ficam DENTRO da barra. O app põe as ferramentas por `tools` ou por `<WindowTools>`
  *   (portal no slot). O arrasto não começa no slot e os atalhos da barra não valem lá dentro; no
  *   celular o slot é uma linha logo abaixo da barra, rolável na horizontal.
+ * - os controles ficam sempre à direita (137/T04): o primeiro (`[data-window-controls-start]`) tem
+ *   `margin-left: auto`, então o lugar deles não depende de o subtítulo ou o slot crescerem (com o
+ *   slot vazio, como no App em modo Console, eles iam para junto do título).
  */
 import {
   createContext,
@@ -36,7 +39,7 @@ import { createPortal } from "react-dom";
 import { useT } from "../i18n/react";
 import { ANIMATION_MS, animationFor, playAnimation, waitForAnimations } from "./animation";
 import { EmptyState, type EmptyAction } from "./EmptyState";
-import { dockButtonId, windowHiddenAttrs, windowTitleBarId, windowTitleId } from "./focus";
+import { N_BUTTON_ID, windowHiddenAttrs, windowTitleBarId, windowTitleId } from "./focus";
 import { Icon } from "./Icon";
 import { TITLEBAR_HEIGHT } from "./metrics";
 import { matchShortcut, shortcutById, shortcutContext } from "./shortcuts";
@@ -153,10 +156,11 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
     const element = rootRef.current;
     if (before === null || element === null) return;
     const reduced = host.reducedMotion();
-    const dock = rectOf(document.getElementById(dockButtonId(kind)));
+    // Sem dock (137/T02): a janela minimizada vai para o botão N e volta dele.
+    const nButton = rectOf(document.getElementById(N_BUTTON_ID));
     if (win.mode === "minimized" && before.mode !== "minimized") {
       const from = rectOf(element);
-      const animation = from !== null && dock !== null ? animationFor(from, dock, reduced, "minimize") : null;
+      const animation = from !== null && nButton !== null ? animationFor(from, nButton, reduced, "minimize") : null;
       playAnimation(element, animation);
       let done = false;
       const finish = (): void => {
@@ -171,7 +175,7 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
     }
     if (before.mode === "minimized" && win.mode !== "minimized") {
       const to = rectOf(element);
-      playAnimation(element, dock !== null && to !== null ? animationFor(dock, to, reduced, "restore") : null);
+      playAnimation(element, nButton !== null && to !== null ? animationFor(nButton, to, reduced, "restore") : null);
       return undefined;
     }
     // Mudou a área de trabalho (resize do navegador): a janela só acompanha, sem animar.
@@ -417,6 +421,7 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
             type="button"
             className="nd-wbtn"
             data-variant="close"
+            data-window-controls-start=""
             aria-label={t("windowControls.close")}
             onClick={() => host.act({ type: "close", kind })}
           >
@@ -428,6 +433,7 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
               ref={menuButtonRef}
               type="button"
               className="nd-wbtn"
+              data-window-controls-start=""
               aria-label={t("window.menu")}
               aria-haspopup="menu"
               aria-expanded={menu !== null}

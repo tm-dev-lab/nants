@@ -91,7 +91,7 @@ export function YoloToggle({ projectId, state, onChanged }: ToggleProps) {
       >
         <span className="nd-switch" data-on={on ? "true" : undefined} aria-hidden="true" />
         <Icon name="zap" size={14} />
-        <span>{t("autoApprove.short")}</span>
+        <span className="nd-bar-label">{t("autoApprove.short")}</span>
       </button>
       {error !== null && !open ? <BarAlert source="yolo" message={error} onDismiss={() => setError(null)} /> : null}
       {open ? (
@@ -159,6 +159,7 @@ export function InternetToggle({ projectId, state }: Omit<ToggleProps, "onChange
         role="switch"
         aria-checked={checked}
         aria-label={t("internet.label")}
+        title={t("internet.label")}
         aria-busy={optimistic !== null}
         className="nd-btn nd-bar-btn nd-toggle"
         data-variant="ghost"
@@ -175,7 +176,7 @@ export function InternetToggle({ projectId, state }: Omit<ToggleProps, "onChange
       >
         <span className="nd-switch" data-on={checked ? "true" : undefined} aria-hidden="true" />
         <Icon name="globe" size={14} />
-        <span>{t("internet.short")}</span>
+        <span className="nd-bar-label">{t("internet.short")}</span>
       </button>
       {error !== null && !open ? <BarAlert source="internet" message={error} onDismiss={() => setError(null)} /> : null}
       {open ? (

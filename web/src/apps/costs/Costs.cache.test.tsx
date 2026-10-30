@@ -2,11 +2,11 @@
  * Custos com a escrita de cache (spec 132 T02/T10): nos detalhes, a linha com os tokens lidos do
  * cache e os gravados nele, só quando o provedor informa a escrita. Nos dois idiomas.
  */
-import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UsageView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
 import { makeProject, makeProjectState } from "../../test-utils";
@@ -23,7 +23,7 @@ async function openCosts(project: UsageView, dock = "Custos") {
   const view = await renderShell({ url: "/?space=p1", projects: [makeProject("p1", "Loja")], states: { p1: makeProjectState({ id: "p1", name: "Loja" }) } });
   view.server.reply("GET", /\/api\/projects\/p1\/usage/, () => ({ status: 200, body: project }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: dock }));
+    activateApp(dock);
   });
   await settle();
   return screen.getByRole("region", { name: dock });

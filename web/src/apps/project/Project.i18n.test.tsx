@@ -5,7 +5,7 @@
  */
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
@@ -32,7 +32,7 @@ async function open(lang: Lang, options: RenderShellOptions = {}) {
     ...options,
   });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: PROJECT[lang] }));
+    activateApp(PROJECT[lang]);
   });
   await settle();
   return view;

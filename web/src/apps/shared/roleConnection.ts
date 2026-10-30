@@ -103,3 +103,75 @@ export function suggestedModel(agents: Agents, connectionId: string): string {
   }
   return "";
 }
+
+/*
+ * Rodapé da Conversa (spec 137 T05): o nome curto da conexão, quando o tipo aparece e qual papel
+ * está trabalhando agora.
+ */
+
+/** Email da conta, com ou sem parênteses em volta. */
+const EMAIL_RE = /\s*\(?[^\s()]+@[^\s()]+\)?/g;
+/** Identificador entre parênteses no fim do nome. */
+const TRAILING_PAREN_RE = /\s*\([^()]*\)\s*$/;
+
+/**
+ * Nome curto da conexão: sem o email e sem o identificador entre parênteses no fim (eles ficam no
+ * painel "Conexões em uso"). Se não sobrar nada, o nome inteiro.
+ */
+export function shortConnectionName(name: string): string {
+  const short = name.replace(EMAIL_RE, "").replace(TRAILING_PAREN_RE, "").trim();
+  return short === "" ? name : short;
+}
+
+/**
+ * O tipo da conexão aparece ao lado do nome? Só quando um não contém o outro, sem diferenciar
+ * maiúsculas (comparando com o nome curto): "ChatGPT" e "Plano ChatGPT" não se repetem.
+ */
+export function showsConnectionKind(name: string, kindLabel: string): boolean {
+  const a = shortConnectionName(name).toLowerCase();
+  const b = kindLabel.toLowerCase();
+  return !(a.includes(b) || b.includes(a));
+}
+
+/** O que a escolha do papel ativo lê de cada atividade (a entrada do store). */
+interface ActivityLike {
+  agent: string;
+  taskId?: string;
+  lastAt: number;
+  endedAt?: number;
+}
+
+/** O que a reserva lê das specs do projeto. */
+interface SpecLike {
+  id: string;
+  tasks: readonly { id: string; status: string | null }[];
+}
+
+/** Papel que trabalha agora numa execução, com a tarefa quando se sabe. */
+interface ActiveWorker {
+  role: "developer" | "reviewer";
+  taskId: string | null;
+}
+
+/**
+ * Quem trabalha agora: a atividade aberta mais recente do Desenvolvedor ou do Revisor (maior
+ * `lastAt` sem `endedAt`). Sem atividade aberta, a reserva é a tarefa `IN_PROGRESS`
+ * (Desenvolvedor) ou `IN_REVIEW` (Revisor), na spec da execução quando ela é conhecida. O
+ * Arquiteto nunca entra: ele já está na primeira linha.
+ */
+export function activeWorker(activities: readonly ActivityLike[] | undefined, specs: readonly SpecLike[] | undefined, runSpecId: string | null): ActiveWorker | null {
+  let best: ActivityLike | null = null;
+  for (const a of activities ?? []) {
+    if (a.endedAt !== undefined || (a.agent !== "developer" && a.agent !== "reviewer")) continue;
+    if (best === null || a.lastAt > best.lastAt) best = a;
+  }
+  if (best !== null) return { role: best.agent === "reviewer" ? "reviewer" : "developer", taskId: best.taskId ?? null };
+  const pool = (specs ?? []).filter((s) => runSpecId === null || s.id === runSpecId);
+  for (const spec of pool) {
+    for (const task of spec.tasks) {
+      if (task.status === "IN_PROGRESS") return { role: "developer", taskId: task.id };
+      if (task.status === "IN_REVIEW") return { role: "reviewer", taskId: task.id };
+    }
+  }
+  return null;
+}

@@ -4,9 +4,9 @@
  *
  * Material "titânio com reflexo" (spec 095, T01): `.nd-chrome` pinta `--chrome` (base opaca com
  * faixa de luz, ponto de brilho e faixa diagonal, só gradientes) com o bisel `--bevel` (borda de
- * luz no topo `--hi` e linha da base `--lo`). Vai na barra superior, nas barras de título, no
- * dock e nos controles segmentados; menus, popovers e avisos são `.nd-overlay`. Sem vidro nem `backdrop-filter`:
- * tudo é opaco. Janelas, barras e dock não têm `border`: a sombra e o contraste da superfície
+ * luz no topo `--hi` e linha da base `--lo`). Vai na barra superior, nas barras de título e nos
+ * controles segmentados; menus, popovers e avisos são `.nd-overlay`. Sem vidro nem `backdrop-filter`:
+ * tudo é opaco. Janelas e barras não têm `border`: a sombra e o contraste da superfície
  * separam; no contraste alto entra um `outline` com `--edge-strong`.
  *
  * Escala de acabamento (spec 094, T06): raios `--r-*`, espaços `--sp-*`, fontes `--fs-*`/`--fw-*`
@@ -15,19 +15,19 @@
  */
 
 .nd-root {
-  /* Medidas fixas (as mesmas de `metrics.ts`): a área de trabalho desconta a barra e o dock. */
+  /* Medidas fixas (as mesmas de `metrics.ts`): a área de trabalho desconta só a barra (sem dock, 137/T02). */
   --topbar-h: 44px;
   --titlebar-h: 44px;
-  --dock-h: 60px;
-  --dock-gap: 12px;
+  /* Distância dos avisos flutuantes (dica, aviso do shell, permissão) até a borda de baixo da área. */
+  --float-bottom: var(--sp-5);
   position: relative;
   width: 100%;
-  /* Altura real da viewport: o dock nunca fica abaixo da borda visível. */
+  /* Altura real da viewport: a área de trabalho nunca fica abaixo da borda visível. */
   height: 100%;
   height: 100dvh;
   height: var(--app-height, 100dvh);
   overflow: hidden;
-  /* `clip` não deixa o foco ou um `scrollIntoView` rolar a raiz (o dock sairia do lugar). */
+  /* `clip` não deixa o foco ou um `scrollIntoView` rolar a raiz (a barra de cima sairia do lugar). */
   overflow: clip;
   font-family: var(--font-sans);
   /* Escala da 095/T02 (C-09): corpo de 14 px, entrelinha 1.55 e o espaçamento levemente negativo do mockup. */
@@ -114,7 +114,7 @@
 
 /*
  * --- Material: titânio com reflexo (095/T01) ---
- * Só na barra superior, nas barras de título, no dock (e nas abas do celular) e nos segmentados.
+ * Só na barra superior, nas barras de título (e nas abas do celular) e nos segmentados.
  * Opaco: nada da janela de trás aparece através dele.
  * Sobre o titânio o conteúdo usa as cores do cromo (C-01): texto `--chrome-ink`, secundário e borda
  * de controle `--chrome-muted`, ícones `--chrome-icon-*` e seleção no tom violeta do cromo. O reflexo
@@ -171,6 +171,11 @@
   z-index: 900;
 }
 
+/* Só o conteúdo encolhe (137/T03): o N, Atalhos e Personalizar ficam com a largura deles. */
+.nd-topbar > :not(.nd-topbar-slot) {
+  flex-shrink: 0;
+}
+
 .nd-topbar-slot {
   display: flex;
   align-items: center;
@@ -185,9 +190,9 @@
   left: 0;
   right: 0;
   top: var(--topbar-h);
-  /* O dock inteiro e as duas folgas ficam fora da área de trabalho. */
-  bottom: calc(var(--dock-h) + 2 * var(--dock-gap));
-  /* Contexto de empilhamento próprio: o `z` das janelas nunca passa da barra, do dock e dos popovers. */
+  /* Sem dock (137/T02): vai até a borda de baixo; a margem das janelas é a mesma das laterais. */
+  bottom: 0;
+  /* Contexto de empilhamento próprio: o `z` das janelas nunca passa da barra, do menu do N e dos popovers. */
   z-index: 1;
   isolation: isolate;
 }
@@ -234,7 +239,7 @@
   cursor: default;
 }
 
-/* O tom por aplicativo fica SÓ aqui, no ícone pequeno da barra de título (o dock é neutro). */
+/* O tom por aplicativo fica SÓ aqui, no ícone pequeno da barra de título (a grade do menu do N é neutra). */
 .nd-titlebar-icon {
   flex-shrink: 0;
   display: inline-flex;
@@ -275,6 +280,17 @@
 
 .nd-wbtn:hover {
   color: var(--ink);
+}
+
+/*
+ * Os controles ficam sempre na ponta direita da barra (137/T04). Antes, quem os empurrava era o
+ * subtítulo ou o slot de ferramentas crescendo; no App o subtítulo não cresce (o slot é que cresce)
+ * e, sem ferramentas (modo Console, Rodando, Terminou), o slot some: os controles iam para junto do
+ * título. A margem automática no primeiro controle vale para qualquer janela e qualquer conteúdo;
+ * quando o subtítulo ou o slot já crescem, ela fica em zero.
+ */
+.nd-titlebar > [data-window-controls-start] {
+  margin-left: auto;
 }
 
 /*
@@ -510,7 +526,7 @@
  * `<kbd>` sem serifa à direita. No celular (C-16) e onde a barra aperta, só o ícone.
  */
 .nd-search-btn {
-  flex: 0 1 220px;
+  flex: 0 0 220px;
   width: 220px;
   padding: 0 var(--sp-2) 0 var(--sp-3);
   color: var(--muted);
@@ -718,7 +734,7 @@
 .nd-hint {
   position: absolute;
   left: 50%;
-  bottom: 104px;
+  bottom: var(--float-bottom);
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -728,7 +744,8 @@
   font-size: var(--fs-body);
   color: var(--ink);
   box-shadow: var(--bevel), var(--elev-3);
-  z-index: 990;
+  /* Abaixo da camada do menu do N (975): com o menu aberto, a dica fica sob o véu. */
+  z-index: 970;
 }
 
 /* O botão de dispensar encosta no padding da dica: `--r-lg` − `--sp-1` = `--r-md` (concêntrico). */
@@ -740,92 +757,430 @@
   color: var(--icon-amber);
 }
 
-/* --- Dock --- */
-.nd-dock {
-  position: absolute;
-  left: 50%;
-  bottom: var(--dock-gap);
-  transform: translateX(-50%);
-  height: var(--dock-h);
-  max-width: calc(100% - 24px);
-  border-radius: var(--r-2xl);
-  padding: 0 var(--sp-2);
+/*
+ * --- Menu do N (spec 137, `reference/menu-n.dc.html`) ---
+ * O botão N fica no lugar da marca, dentro da barra de 44 px (36 px de altura): relevo discreto
+ * (brilho em cima e sombra curta embaixo) e, com o menu aberto, afundado (sombra interna e fundo
+ * mais escuro), sem contorno colorido. O ponto rosa marca novidade nos apps com o menu fechado.
+ * O menu desce de cima (cerca de 0,26 s, com o conteúdo em cascata) e sobe ao fechar; o véu
+ * escurece e desfoca de leve a área de trabalho, sem cobrir a barra. A altura fica limitada à
+ * área de trabalho, com rolagem só na grade. Com movimento reduzido: sem animação nem desfoque.
+ */
+.nd-nbtn {
+  position: relative;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
   display: flex;
   align-items: center;
-  box-shadow: var(--bevel), var(--elev-1);
-  z-index: 960;
-  box-sizing: border-box;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--nbtn-bg);
+  box-shadow: var(--elev-nbtn);
+  cursor: pointer;
+  transition: box-shadow 0.15s ease, filter 0.15s ease;
 }
 
-.nd-dock-list {
+.nd-nbtn:hover {
+  filter: brightness(1.1);
+}
+
+.nd-nbtn[aria-expanded="true"] {
+  background: var(--nbtn-bg-open);
+  box-shadow: var(--elev-nbtn-open);
+}
+
+/* Afundado: o símbolo desce 1 px com o botão. */
+.nd-nbtn[aria-expanded="true"] > svg {
+  transform: translateY(1px);
+}
+
+.nd-nbtn-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 10px;
+  height: 10px;
+  border-radius: var(--r-pill);
+  background: var(--ndot);
+  box-shadow: var(--ring-ndot);
+}
+
+/* Camada do menu: abaixo da barra, acima das janelas e da dica (`.nd-hint`). */
+.nd-nmenu-layer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: var(--topbar-h);
+  bottom: 0;
+  z-index: 975;
+}
+
+.nd-nmenu-scrim {
+  position: absolute;
+  inset: 0;
+  background: var(--nmenu-scrim);
+  backdrop-filter: blur(3px) saturate(0.85);
+  animation: nd-nmenu-fade 0.22s ease-out both;
+}
+
+.nd-nmenu-layer[data-state="closing"] .nd-nmenu-scrim {
+  animation: nd-nmenu-fade-out 0.18s ease-in both;
+}
+
+.nd-nmenu {
+  position: absolute;
+  left: var(--sp-2);
+  top: var(--sp-1);
+  width: min(432px, calc(100% - 16px));
+  max-height: calc(100% - var(--sp-1) - var(--sp-2));
+  box-sizing: border-box;
+  padding: var(--sp-3);
+  border-radius: var(--r-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  box-shadow: var(--elev-nmenu);
+  transform-origin: top left;
+  animation: nd-nmenu-drop 0.26s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+
+.nd-nmenu-layer[data-state="closing"] .nd-nmenu {
+  animation: nd-nmenu-lift 0.18s ease-in both;
+}
+
+.nd-nmenu > * {
+  flex: 0 0 auto;
+  animation: nd-nmenu-item 0.22s ease-out both;
+}
+
+.nd-nmenu > :nth-child(1) {
+  animation-delay: 0.05s;
+}
+
+.nd-nmenu > :nth-child(2) {
+  animation-delay: 0.08s;
+}
+
+.nd-nmenu > :nth-child(3) {
+  animation-delay: 0.11s;
+}
+
+.nd-nmenu > :nth-child(4) {
+  animation-delay: 0.14s;
+}
+
+.nd-nmenu > :nth-child(5) {
+  animation-delay: 0.17s;
+}
+
+.nd-nmenu-layer[data-state="closing"] .nd-nmenu > * {
+  animation: none;
+}
+
+@keyframes nd-nmenu-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-12px) scaleY(0.94);
+    clip-path: inset(0 0 100% 0 round var(--r-xl));
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+    clip-path: inset(0 0 0 0 round var(--r-xl));
+  }
+}
+
+@keyframes nd-nmenu-lift {
+  from {
+    opacity: 1;
+    transform: none;
+    clip-path: inset(0 0 0 0 round var(--r-xl));
+  }
+
+  to {
+    opacity: 0;
+    transform: translateY(-12px) scaleY(0.94);
+    clip-path: inset(0 0 100% 0 round var(--r-xl));
+  }
+}
+
+@keyframes nd-nmenu-item {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes nd-nmenu-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes nd-nmenu-fade-out {
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+.nd-nmenu-head {
   display: flex;
   align-items: center;
-  gap: var(--sp-1);
+  gap: var(--sp-2);
+  padding: 0 var(--sp-1);
+}
+
+.nd-nmenu-brand {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.nd-nmenu-name {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  color: var(--ink);
+}
+
+.nd-nmenu-slogan {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-nmenu-version {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.nd-nmenu-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 40px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--muted);
+}
+
+.nd-nmenu-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fw-regular) var(--fs-control) var(--font-sans);
+}
+
+/* Sem anel no campo, como no lançador (A-02): o cursor e o destaque mostram onde está o foco. */
+.nd-root .nd-nmenu-search input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* Só a grade rola: o topo, a busca, as janelas abertas e o rodapé ficam sempre à vista. */
+.nd-nmenu > .nd-nmenu-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.nd-nmenu-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: 84px;
+  gap: var(--sp-2);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.nd-dock-item {
+.nd-nmenu-tile {
   position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-1);
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--control);
+  color: var(--ink);
+  font: var(--fw-medium) var(--fs-label) var(--font-sans);
+  cursor: pointer;
 }
 
-/*
- * Ícones do dock NEUTROS (095/T02, decisão 9; `reference/Main.dc.html`): `--ink` com a janela
- * aberta, `--muted` fechada, sem tom por aplicativo (o tom fica só no ícone da barra de título).
- * Botão de 44 px (`--dock-h` − 2 × `--sp-2`), ícone de 20 px e o ponto da janela aberta.
- */
-.nd-dock-btn {
-  position: relative;
-  width: 44px;
-  height: 44px;
-  border-radius: var(--r-lg);
-  border: 0;
-  background: transparent;
-  color: var(--muted);
+.nd-nmenu-tile-label {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Os estados dos apps: fechado em `--muted`, aberto em `--ink` com o ponto, em foco com o pressionado. */
+.nd-nmenu-icon {
+  width: 34px;
+  height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
-  transition: transform 0.15s ease;
+  border-radius: var(--r-md);
+  color: var(--muted);
 }
 
-.nd-dock-btn:hover {
-  transform: translateY(-4px);
-}
-
-/* Janela em foco: a "tecla" acesa do mockup (`active`), a camada de pressionado sobre o titânio. */
-.nd-dock-btn[data-state="focused"] {
-  background-color: var(--state-press);
-}
-
-.nd-dock-btn[data-state="open"],
-.nd-dock-btn[data-state="minimized"],
-.nd-dock-btn[data-state="focused"] {
+.nd-nmenu-tile[data-state="open"] .nd-nmenu-icon,
+.nd-nmenu-tile[data-state="minimized"] .nd-nmenu-icon,
+.nd-nmenu-tile[data-state="focused"] .nd-nmenu-icon {
   color: var(--ink);
 }
 
-.nd-dock-indicator {
+.nd-nmenu-tile[data-state="focused"] .nd-nmenu-icon {
+  background-color: var(--state-press);
+}
+
+/* Destaque das setas na busca: o anel fino de seleção, neutro. */
+.nd-nmenu-tile[data-highlight="true"] {
+  box-shadow: var(--ring-selected);
+}
+
+.nd-nmenu-tile .nd-badge {
+  top: var(--sp-2);
+  right: var(--sp-2);
+}
+
+.nd-nmenu-indicator {
   position: absolute;
-  bottom: 3px;
+  bottom: 7px;
   left: 50%;
   transform: translateX(-50%);
   width: 4px;
   height: 4px;
   border-radius: var(--r-pill);
-  background: var(--ink);
+  background: var(--ink2);
   box-sizing: border-box;
 }
 
-.nd-dock-indicator[data-indicator="minimized"] {
+.nd-nmenu-indicator[data-indicator="minimized"] {
   background: transparent;
   border: 1px solid var(--muted);
 }
 
-.nd-dock-indicator[data-indicator="focused"] {
+.nd-nmenu-indicator[data-indicator="focused"] {
   width: 12px;
 }
 
+.nd-nmenu-empty {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-1);
+  color: var(--muted);
+  font-size: var(--fs-control);
+  text-align: center;
+}
+
+.nd-nmenu-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-nmenu-label {
+  margin: 0;
+  padding: 0 var(--sp-1);
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nd-nmenu-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-nmenu-chip {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--ink);
+  font: var(--fw-regular) var(--fs-label) var(--font-sans);
+  cursor: pointer;
+}
+
+.nd-nmenu-chip .nd-nmenu-indicator {
+  position: static;
+  transform: none;
+  width: 6px;
+  height: 6px;
+}
+
+.nd-nmenu-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-1) 0;
+  border-top: 1px solid var(--divider);
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-nbtn,
+  .nd-nbtn[aria-expanded="true"] > svg {
+    transition: none;
+  }
+
+  .nd-nmenu-scrim,
+  .nd-nmenu,
+  .nd-nmenu > *,
+  .nd-nmenu-layer[data-state="closing"] .nd-nmenu-scrim,
+  .nd-nmenu-layer[data-state="closing"] .nd-nmenu {
+    animation: none;
+  }
+
+  .nd-nmenu-scrim {
+    backdrop-filter: none;
+  }
+}
+
+/* --- Selo dos apps (menu do N, abas e Alternador do celular) --- */
 .nd-badge {
   position: absolute;
   top: -4px;
@@ -844,47 +1199,9 @@
   box-sizing: border-box;
 }
 
-.nd-tip {
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: 50%;
-  transform: translateX(-50%);
-  white-space: nowrap;
-  padding: var(--sp-1) var(--sp-2);
-  border-radius: var(--r-md);
-  font-size: var(--fs-label);
-  color: var(--ink);
-  box-shadow: var(--bevel), var(--elev-3);
-  pointer-events: none;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.12s ease;
-}
-
-.nd-tip-sub {
-  color: var(--muted);
-}
-
-.nd-dock-item:hover .nd-tip,
-.nd-dock-btn:focus-visible + .nd-tip {
-  opacity: 1;
-  visibility: visible;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .nd-dock-btn,
-  .nd-tip {
-    transition: none;
-  }
-
-  .nd-dock-btn:hover {
-    transform: none;
-  }
-}
-
 /*
  * --- Contraste alto (no fim e com especificidade 0,2,0) ---
- * O titânio vira sólido (`--surface2`) e janelas, barras, dock e pílula ganham um `outline` com
+ * O titânio vira sólido (`--surface2`) e janelas, barras e pílula ganham um `outline` com
  * `--edge-strong` (nunca `border`: a moldura continua sem borda). O anel de foco (0,3,0) vence.
  */
 @media (prefers-contrast: more) {
@@ -952,7 +1269,9 @@
 .nd-root .nd-option:hover:not(:disabled),
 .nd-root .nd-board-check:hover:not(:disabled),
 .nd-root .nd-board-card:hover:not(:disabled),
-.nd-root .nd-remove-volumes:hover:not(:disabled) {
+.nd-root .nd-remove-volumes:hover:not(:disabled),
+.nd-root .nd-nmenu-tile:hover:not(:disabled),
+.nd-root .nd-nmenu-chip:hover:not(:disabled) {
   background-image: linear-gradient(var(--state-hover), var(--state-hover));
 }
 
@@ -978,7 +1297,9 @@
 .nd-root .nd-option:active:not(:disabled),
 .nd-root .nd-board-check:active:not(:disabled),
 .nd-root .nd-board-card:active:not(:disabled),
-.nd-root .nd-remove-volumes:active:not(:disabled) {
+.nd-root .nd-remove-volumes:active:not(:disabled),
+.nd-root .nd-nmenu-tile:active:not(:disabled),
+.nd-root .nd-nmenu-chip:active:not(:disabled) {
   background-image: linear-gradient(var(--state-press), var(--state-press));
 }
 
@@ -1073,31 +1394,14 @@
   background-image: none;
 }
 
-/* Os ícones do dock ficam sobre o titânio: a camada de estado é o único fundo do botão. */
-.nd-root .nd-dock-btn:hover {
-  background-image: linear-gradient(var(--state-hover), var(--state-hover));
-}
-
-.nd-root .nd-dock-btn:active {
-  background-image: linear-gradient(var(--state-press), var(--state-press));
-}
-
-/*
- * O botão da janela em foco já tem o fundo `--state-press`: hover e pressionado não empilham outra
- * camada (o hover dele é a subida do ícone), para o ícone seguir ≥ 3:1 sobre o titânio.
- */
-.nd-root .nd-dock-btn[data-state="focused"]:hover,
-.nd-root .nd-dock-btn[data-state="focused"]:active {
-  background-image: none;
-}
-
 /*
  * --- Foco duplo nos componentes com sombra própria (especificidade 0,3,0) ---
  * `.nd-root :focus-visible` (0,2,0) perderia o anel interno para regras como
- * `.nd-dock-btn[data-state="focused"]` e `.nd-choice[aria-pressed="true"]` (0,2,0, depois no
+ * `.nd-choice[aria-pressed="true"]` (0,2,0, depois no
  * arquivo) ou para o material. Aqui o anel duplo volta em todos eles.
  */
-.nd-root .nd-dock-btn:focus-visible,
+.nd-root .nd-nbtn:focus-visible,
+.nd-root .nd-nmenu-tile:focus-visible,
 .nd-root .nd-choice:focus-visible,
 .nd-root .nd-chrome:focus-visible,
 .nd-root .nd-btn:focus-visible,
@@ -1112,7 +1416,7 @@
  * Barra de título (spec 095, decisão 2; pedido do usuário): nenhum contorno colorido na moldura
  * nem na barra. Com navegação real por teclado, um anel NEUTRO e discreto, só o `--focus-outer`
  * (neutro, ≥ 3:1 no titânio), DENTRO da barra (ela fica colada no topo de uma janela com
- * `overflow: hidden`); o bisel do titânio continua. Foco programático (abrir pelo dock ou pelo
+ * `overflow: hidden`); o bisel do titânio continua. Foco programático (abrir pelo menu do N ou pelo
  * lançador, restaurar): `data-quiet-focus` (focus.ts) e nenhum anel.
  */
 .nd-root .nd-titlebar:focus-visible {

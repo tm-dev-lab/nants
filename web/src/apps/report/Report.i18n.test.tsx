@@ -4,10 +4,10 @@
  * escrito pelo Arquiteto aparece como foi escrito, e o destaque da seção de execução vale nos dois
  * idiomas ("How to run" e "Como executar"); pt-BR igual a hoje; a troca vale na hora.
  */
-import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState, SpecStatus } from "../../api/types";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
@@ -69,9 +69,9 @@ async function mount(lang: Lang, s: ProjectState, report: () => { status: number
 const reportWindow = (lang: Lang = "en"): HTMLElement => screen.getByRole("region", { name: NAME[lang] });
 const ready = (markdown: string) => () => ({ status: 200, body: { markdown, generated_at: "2026-10-14T13:05:00Z", source: "architect" } });
 
-async function openByDock(lang: Lang): Promise<void> {
+async function openByMenu(lang: Lang): Promise<void> {
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: NAME[lang] }));
+    activateApp(NAME[lang]);
   });
   await settle();
 }
@@ -102,7 +102,7 @@ describe("Relatório em en", () => {
 
   it("sem relatório: fatos e carregando; escrevendo: subtítulo; vazio antes da conclusão", async () => {
     await mount("en", state("COMPLETED", true), () => ({ status: 404 }));
-    await openByDock("en");
+    await openByMenu("en");
     const win = reportWindow();
     await waitFor(() => expect(win.textContent).toContain("Done: 2 tasks integrated"));
     expect(within(win).queryByRole("region", { name: "Project completed" })).toBeNull();
@@ -112,7 +112,7 @@ describe("Relatório em en", () => {
 
     setLanguage("en", { persist: false });
     await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: state("IN_PROGRESS") } });
-    await openByDock("en");
+    await openByMenu("en");
     const empty = reportWindow();
     expect(empty.textContent).toContain("The report is ready once the run finishes.");
     expect(within(empty).getByRole("button", { name: "Open the Board" })).toBeTruthy();

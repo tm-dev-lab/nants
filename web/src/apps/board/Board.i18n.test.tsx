@@ -7,7 +7,7 @@ import { parseReviewMessage } from "../../reviewMessage";
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState, SpecView, TaskView, UsageView } from "../../api/types";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
@@ -95,9 +95,7 @@ function columnLabels(win: HTMLElement): (string | null)[] {
 
 function openBoard(): Promise<void> {
   return act(async () => {
-    const dock = screen.getByRole("navigation", { name: "Dock" });
-    const button = within(dock).queryByRole("button", { name: "Board" }) ?? within(dock).getByRole("button", { name: "Quadro" });
-    fireEvent.click(button);
+    activateApp(/^(Board|Quadro)$/);
   });
 }
 

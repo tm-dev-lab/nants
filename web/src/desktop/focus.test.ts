@@ -4,9 +4,9 @@ import {
   applyFocus,
   createFocusMemory,
   cycleWindow,
-  dockButtonId,
   focusAfterHide,
   focusAfterRestore,
+  N_BUTTON_ID,
   QUIET_FOCUS_ATTR,
   windowHiddenAttrs,
   windowTitleBarId,
@@ -20,18 +20,12 @@ afterEach(() => {
 });
 
 describe("regras de foco", () => {
-  it("minimizar ou fechar → ícone da janela no dock", () => {
-    setBody(`<button id="${dockButtonId("plan")}">Plano</button>`);
-    const target = focusAfterHide("plan");
-    expect(target).toEqual({ type: "dock", kind: "plan" });
+  it("minimizar ou fechar → o botão N da barra de cima (137/T02: sem dock)", () => {
+    setBody(`<header><button id="${N_BUTTON_ID}">Menu do Nants</button></header>`);
+    const target = focusAfterHide();
+    expect(target).toEqual({ type: "nButton" });
     expect(applyFocus(target)).toBe(true);
-    expect(document.activeElement?.id).toBe("dock-plan");
-  });
-
-  it("fechar sem o botão da janela no dock → primeiro botão do dock", () => {
-    setBody(`<nav class="nd-dock"><button class="nd-dock-btn" id="${dockButtonId("board")}">Quadro</button><button class="nd-dock-btn" id="${dockButtonId("plan")}">Plano</button></nav>`);
-    expect(applyFocus(focusAfterHide("conversation"))).toBe(true);
-    expect(document.activeElement?.id).toBe("dock-board");
+    expect(document.activeElement?.id).toBe(N_BUTTON_ID);
   });
 
   it("restaurar → último elemento focado na janela; se sumiu, a barra de título", () => {
@@ -53,7 +47,8 @@ describe("regras de foco", () => {
   });
 
   it("alvo ausente no documento não lança", () => {
-    expect(applyFocus({ type: "dock", kind: "files" })).toBe(false);
+    expect(applyFocus({ type: "nButton" })).toBe(false);
+    expect(applyFocus({ type: "titleBar", kind: "files" })).toBe(false);
   });
 
   it("minimizada ou fechada = hidden + inert; visível não", () => {
@@ -83,10 +78,10 @@ describe("foco programático sem anel na barra de título (095/T07, decisão 2)"
     expect(document.getElementById(windowTitleBarId("files"))?.hasAttribute(QUIET_FOCUS_ATTR)).toBe(false);
   });
 
-  it("o dock e os elementos lembrados nunca recebem a marca", () => {
-    setBody(`<button id="${dockButtonId("plan")}">Plano</button>`);
-    applyFocus({ type: "dock", kind: "plan" });
-    expect(document.getElementById(dockButtonId("plan"))?.hasAttribute(QUIET_FOCUS_ATTR)).toBe(false);
+  it("o botão N e os elementos lembrados nunca recebem a marca", () => {
+    setBody(`<button id="${N_BUTTON_ID}">Menu do Nants</button>`);
+    applyFocus({ type: "nButton" });
+    expect(document.getElementById(N_BUTTON_ID)?.hasAttribute(QUIET_FOCUS_ATTR)).toBe(false);
   });
 });
 
@@ -100,7 +95,7 @@ describe("cycleWindow (F6 / Shift+F6)", () => {
     },
   };
 
-  it("percorre só as visíveis na ordem do dock, com volta", () => {
+  it("percorre só as visíveis na ordem dos apps, com volta", () => {
     expect(cycleWindow(layout, "conversation", 1)).toBe("board");
     expect(cycleWindow(layout, "board", 1)).toBe("files");
     expect(cycleWindow(layout, "files", 1)).toBe("conversation");

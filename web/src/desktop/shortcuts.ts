@@ -1,7 +1,8 @@
 /*
  * Tabela única de atalhos do desktop (spec 093, decisão 4). Alimenta `aria-keyshortcuts`, a
  * folha de atalhos e o lançador; `matchShortcut` decide qual atalho uma tecla aciona.
- * Sem Alt+Espaço nem Ctrl+` (não funcionam no Windows nem no ABNT2).
+ * Sem Alt+Espaço nem Ctrl+` (não funcionam no Windows nem no ABNT2). O menu do N (spec 137) é o
+ * Alt+0, casado pelo `code` físico, como o Alt+1…9.
  */
 import { t, type MessageKey } from "../i18n";
 import { isTypingTarget } from "../typing";
@@ -10,10 +11,11 @@ export type ShortcutId =
   | "launcher"
   | "nextWindow"
   | "previousWindow"
-  | "dockSlot"
+  | "appSlot"
   | "shortcutSheet"
   | "undoLayout"
-  | "windowMenu";
+  | "windowMenu"
+  | "nMenu";
 
 interface Shortcut {
   id: ShortcutId;
@@ -44,7 +46,8 @@ export const SHORTCUTS: readonly Shortcut[] = [
   shortcut("launcher", "Control+K", "Ctrl+K", "shortcut.launcher", true),
   shortcut("nextWindow", "F6", "F6", "shortcut.nextWindow", false),
   shortcut("previousWindow", "Shift+F6", "Shift+F6", "shortcut.previousWindow", false),
-  shortcut("dockSlot", "Alt+1", "Alt+1…9", "shortcut.dockSlot", false),
+  shortcut("nMenu", "Alt+0", "Alt+0", "shortcut.nMenu", false),
+  shortcut("appSlot", "Alt+1", "Alt+1…9", "shortcut.appSlot", false),
   shortcut("shortcutSheet", "Shift+/", "Shift+/", "shortcut.shortcutSheet", false),
   shortcut("undoLayout", "Control+Z", "Ctrl+Z", "shortcut.undoLayout", false),
   shortcut("windowMenu", "Shift+F10 ContextMenu", "Shift+F10", "shortcut.windowMenu", false),
@@ -57,8 +60,8 @@ export function shortcutById(id: ShortcutId): Shortcut | undefined {
   return SHORTCUT_BY_ID.get(id);
 }
 
-/** `aria-keyshortcuts` do ícone do dock na posição `slot` (1..9); fora disso, `undefined`. */
-export function dockSlotAria(slot: number): string | undefined {
+/** `aria-keyshortcuts` do app na posição `slot` (1..9) do menu do N; fora disso, `undefined`. */
+export function appSlotAria(slot: number): string | undefined {
   return Number.isInteger(slot) && slot >= 1 && slot <= 9 ? `Alt+${slot}` : undefined;
 }
 
@@ -83,7 +86,7 @@ export interface ShortcutContext {
 
 interface ShortcutMatch {
   id: ShortcutId;
-  /** Posição do dock (1..9) em `dockSlot`. */
+  /** Posição do app (1..9) em `appSlot`. */
   slot?: number;
 }
 
@@ -105,6 +108,11 @@ function digitOf(event: KeyLike): number | null {
   return /^[1-9]$/.test(event.key) ? Number(event.key) : null;
 }
 
+/** Alt+0 do menu do N: pelo `code` físico (`Digit0`); sem `code`, pelo `key`. */
+function isZero(event: KeyLike): boolean {
+  return event.code !== undefined ? event.code === "Digit0" : event.key === "0";
+}
+
 /** Qual atalho a tecla aciona no contexto, ou `null`. */
 export function matchShortcut(event: KeyLike, ctx: ShortcutContext): ShortcutMatch | null {
   const ctrl = event.ctrlKey || event.metaKey;
@@ -117,8 +125,9 @@ export function matchShortcut(event: KeyLike, ctx: ShortcutContext): ShortcutMat
     return { id: event.shiftKey ? "previousWindow" : "nextWindow" };
   }
   if (event.altKey && !ctrl && !event.shiftKey) {
+    if (isZero(event)) return { id: "nMenu" };
     const slot = digitOf(event);
-    if (slot !== null) return { id: "dockSlot", slot };
+    if (slot !== null) return { id: "appSlot", slot };
   }
   if (event.shiftKey && !ctrl && !event.altKey && (key === "?" || key === "/" || event.code === "Slash")) {
     return { id: "shortcutSheet" };

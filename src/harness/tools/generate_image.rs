@@ -39,8 +39,6 @@ use crate::sdd::images::{self, ManifestEntry, MAX_IMAGE_BYTES, MAX_NEW_PER_SPEC}
 /// Resposta ao modelo quando a geração não existe neste provedor/modelo.
 pub const IMAGE_UNAVAILABLE_MSG: &str =
     "geração de imagens indisponível neste provedor/modelo; use ilustração SVG/CSS equivalente";
-/// Mensagem de sistema publicada (uma vez por execução) na primeira recusa.
-pub const IMAGE_UNAVAILABLE_NOTICE: &str = "Este modelo não gera imagens neste provedor; usando ilustrações em SVG/CSS.";
 /// Resposta ao modelo acima do limite de gerações novas da spec.
 pub const IMAGE_LIMIT_MSG: &str = "limite de imagens desta spec atingido; reutilize as existentes ou use SVG/CSS";
 /// Resposta quando o manifesto da spec não aceita mais uma linha (antes de gerar).
@@ -58,13 +56,11 @@ pub const IMAGE_SUSPENDED_MSG: &str = "geração de imagens suspensa nesta execu
 /// Motivo fixo da recusa pela suspensão, para os FATOS (spec 092 T03).
 pub const REASON_SUSPENDED: &str = "geração suspensa na execução";
 
-/// Mensagem de sistema publicada uma vez por execução quando o freio suspende a geração (spec 094
-/// decisão 1); `charged` = falhas cobradas na execução.
+/// Mensagem de sistema da suspensão pelo freio de custo nos testes, em pt-BR: sai do dicionário
+/// (`system.image.suspended`, spec 137 T12), o mesmo texto que `server::image_gen` grava.
+#[cfg(test)]
 pub fn image_suspended_notice(charged: usize) -> String {
-    format!(
-        "O provedor respondeu sem uma imagem que o Nants consiga ler ({charged} tentativas); a geração pode ter sido \
-         cobrada pelo provedor. As imagens restantes seguem pelo fallback do plano."
-    )
+    crate::i18n::tr_plural(crate::i18n::Lang::PtBr, "system.image.suspended", u64::try_from(charged).unwrap_or(u64::MAX), &[])
 }
 
 /// Freio de custo de uma execução para um par (conexão, modelo) (spec 094 T01): conta as falhas

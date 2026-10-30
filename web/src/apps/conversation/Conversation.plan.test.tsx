@@ -9,6 +9,7 @@ import type { ConnectionView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { renderShell, settle } from "../../desktop/shell-test-utils";
 import { setLanguage } from "../../i18n";
+import { parseApiEvent } from "../../api/events";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 import { PLAN_USAGE_URL } from "../settings/chatgptPlan";
@@ -70,7 +71,8 @@ describe("rodapé com a conexão do papel (spec 133, no lugar do indicador do pl
     expect(footer?.textContent).toContain("Arquiteto");
     expect(footer?.textContent).toContain("model");
     expect(footer?.textContent).toContain("ChatGPT (ana@x.com)");
-    expect(footer?.textContent).toContain("Plano ChatGPT");
+    // Spec 137 T05: o tipo "Plano ChatGPT" contém o nome "ChatGPT" e não se repete.
+    expect(footer?.textContent).not.toContain("Plano ChatGPT");
     expect(footer?.closest(".nd-composer-dock")).not.toBeNull();
     expect(document.querySelector("[data-plan-indicator]")).toBeNull();
     const panel = await openPanel();
@@ -98,6 +100,83 @@ describe("rodapé com a conexão do papel (spec 133, no lugar do indicador do pl
     const panel = await openPanel();
     expect(within(panel).getByRole("heading", { name: "Connections in use" })).toBeTruthy();
     expect(within(panel).getAllByRole("link", { name: "Manage usage" }).length).toBeGreaterThan(0);
+  });
+});
+
+describe("rodapé com o papel ativo (spec 137 T05)", () => {
+  function activity(payload: Record<string, unknown>): void {
+    const ev = parseApiEvent({ event_type: "agent_activity", project_id: "p1", payload });
+    if (ev === null) throw new Error("evento inválido");
+    act(() => appStore.applyEvent(ev));
+  }
+
+  async function openRunning(specs = [STOPPED]) {
+    const view = await renderShell({
+      url: "/?space=p1",
+      projects: [makeProject("p1", "Loja")],
+      states: { p1: makeProjectState({ id: "p1", name: "Loja", specs, running: true }) },
+      connections: [PLAN],
+    });
+    await settle();
+    return view;
+  }
+
+  function nowLine(): HTMLElement | null {
+    return document.querySelector<HTMLElement>("[data-role-conn-footer] [data-role-conn-now]");
+  }
+
+  it("durante a execução: papel, tarefa, modelo e conexão curta, atualizado pelo agent_activity", async () => {
+    await openRunning();
+    activity({ agent: "reviewer", task_id: "T07", activity_id: "r1", kind: "start" });
+    await settle();
+    const line = nowLine();
+    expect(line?.getAttribute("data-role-conn-now")).toBe("reviewer");
+    const visible = Array.from(line?.querySelectorAll("[aria-hidden='true']") ?? [])
+      .map((el) => el.textContent ?? "")
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    expect(visible).toBe("agora: Revisor · T07 · model · ChatGPT");
+    expect(line?.querySelector(".nd-dot")?.getAttribute("data-pulse")).toBe("true");
+    expect(line?.querySelector(".nd-sr-only")?.textContent).toBe("Trabalhando agora: Revisor na tarefa T07, com model pela conexão ChatGPT.");
+    // A primeira linha continua com o Arquiteto e o nome completo no desktop.
+    expect(document.querySelector("[data-role-conn-footer] .nd-role-conn-trigger")?.textContent).toContain("ChatGPT (ana@x.com)");
+    activity({ agent: "reviewer", task_id: "T07", activity_id: "r1", kind: "end" });
+    activity({ agent: "developer", task_id: "T08", activity_id: "d1", kind: "start" });
+    await settle();
+    expect(nowLine()?.getAttribute("data-role-conn-now")).toBe("developer");
+    expect(nowLine()?.textContent).toContain("T08");
+    // O store é global: encerra a atividade para não vazar para os próximos testes.
+    activity({ agent: "developer", task_id: "T08", activity_id: "d1", kind: "end" });
+  });
+
+  it("sem atividade aberta, a reserva é a tarefa em andamento", async () => {
+    await openRunning();
+    expect(nowLine()?.getAttribute("data-role-conn-now")).toBe("developer");
+    expect(nowLine()?.textContent).toContain("T01");
+  });
+
+  it("no celular, a primeira linha também usa o nome curto", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("max-width"), media: query, addEventListener: () => undefined, removeEventListener: () => undefined }));
+    await openRunning();
+    const trigger = document.querySelector<HTMLElement>("[data-role-conn-footer] .nd-role-conn-trigger");
+    expect(trigger?.querySelector(".nd-role-conn-name")?.textContent).toBe("ChatGPT");
+    expect(trigger?.textContent).not.toContain("ana@x.com");
+    // O nome completo segue no rótulo acessível e no painel.
+    expect(trigger?.getAttribute("aria-label")).toContain("ChatGPT (ana@x.com)");
+  });
+
+  it("fora da execução, não aparece", async () => {
+    await open([PLAN]);
+    expect(nowLine()).toBeNull();
+  });
+
+  it("em en", async () => {
+    setLanguage("en", { persist: false });
+    await openRunning();
+    expect(nowLine()?.textContent).toContain("now:");
+    expect(nowLine()?.textContent).toContain("Developer");
+    expect(nowLine()?.querySelector(".nd-sr-only")?.textContent).toBe("Working now: Developer on task T01, using model through the ChatGPT connection.");
   });
 });
 

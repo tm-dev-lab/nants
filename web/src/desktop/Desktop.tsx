@@ -1,7 +1,9 @@
 /*
  * Desktop (spec 093, decisões 4, 9, 13 e 15): papel de parede, barra superior (o conteúdo vem
- * da T05), área de trabalho com as janelas do espaço ativo, dock, região `role="status"` fixa
- * para os anúncios do gerenciador, dicas contextuais, folha de atalhos e Personalizar.
+ * da T05), área de trabalho com as janelas do espaço ativo, região `role="status"` fixa
+ * para os anúncios do gerenciador, dicas contextuais, folha de atalhos e Personalizar. No começo
+ * da barra fica o botão N, que abre o menu do N (spec 137, `NMenu.tsx`) com a grade dos mesmos
+ * `kinds` em ordem (`APP_ORDER`). Sem dock (137/T02): a área de trabalho vai até a borda de baixo.
  *
  * Controlado: o estado do gerenciador (`DesktopState`) e o `dispatch` vêm de fora
  * (`useDesktopReducer`), para o shell trocar de espaço e de layout por fase. A aparência e as
@@ -12,7 +14,7 @@
  *
  * Modo celular (`mobile`, T10; decisão 17): o mesmo Desktop, com a barra compacta (conteúdo do
  * shell), uma janela por vez em tela cheia (arranjo derivado por `mobileLayout`, sem tocar no
- * arranjo do desktop), o Alternador em lista e as abas no lugar do dock. As janelas continuam no
+ * arranjo do desktop), o Alternador em lista e as abas embaixo. As janelas continuam no
  * mesmo lugar da árvore: trocar de modo não as remonta.
  */
 import "./theme/desktop.css";
@@ -32,8 +34,8 @@ import {
   type DragEvent as ReactDragEvent,
   type ReactNode,
 } from "react";
-import { prefersReducedMotion } from "./animation";
-import { Dock, type DockBadge } from "./Dock";
+import { prefersReducedMotion, waitForAnimations } from "./animation";
+import type { AppBadge } from "./appState";
 import { applyFocus, createFocusMemory, cycleWindow, focusAfterHide, focusAfterRestore, type FocusTarget } from "./focus";
 import { snapAnnouncement, snapPreviewRect, type GestureMode } from "./gestures";
 import { DesktopLayerContext } from "./layer";
@@ -42,6 +44,7 @@ import { Icon } from "./Icon";
 import { mobileLayout, viewWindow, type MobileView } from "./mobile";
 import { MobileSwitcher } from "./MobileSwitcher";
 import { mobileTabId, MobileTabs } from "./MobileTabs";
+import { NButton, NMenu, pendingCount, type NMenuCloseReason } from "./NMenu";
 import { Personalize } from "./Personalize";
 import { ShortcutSheet } from "./ShortcutSheet";
 import { matchShortcut, shortcutById, shortcutContext } from "./shortcuts";
@@ -56,7 +59,7 @@ import { AppearanceContext, type AppearanceApi } from "./theme/appearanceContext
 import { Window, type WindowEmpty, type WindowScroll } from "./Window";
 import { WindowHostContext, type WindowHost } from "./windowHost";
 import { useAppHeight, useKeyboardMode } from "./viewport";
-import { DOCK_ORDER, WINDOW_META } from "./windowMeta";
+import { APP_ORDER, WINDOW_META } from "./windowMeta";
 import {
   canUndo,
   createDesktopState,
@@ -76,10 +79,10 @@ import {
 
 /** O que o shell fornece para cada janela. */
 export interface WindowSpec {
-  /** Subtítulo de estado vivo (barra de título e dica do dock). */
+  /** Subtítulo de estado vivo (barra de título e dica no menu do N). */
   subtitle?: string;
-  /** Selo no dock (pendências, "N novas"). */
-  badge?: DockBadge;
+  /** Selo do app no menu do N e no celular (pendências, "N novas"). */
+  badge?: AppBadge;
   /** Estado vazio (padrão: o do tipo de janela, com a ação padrão). */
   empty?: WindowEmpty;
   /** Conteúdo; ausente mostra o estado vazio. */
@@ -107,8 +110,8 @@ export interface DesktopProps {
   /** ui-state global (`appearance` e `hints`). */
   globalState: UiStateHandle;
   windows?: Partial<Record<WindowKind, WindowSpec>>;
-  /** Ordem do dock (padrão: `DOCK_ORDER`, com Primeiros passos só quando aberta). */
-  dockKinds?: readonly WindowKind[];
+  /** Ordem dos apps (padrão: `APP_ORDER`, com Primeiros passos só quando aberta). */
+  appKinds?: readonly WindowKind[];
   /** Conteúdo da barra superior (marca, espaços, pílula... na T05). */
   topBar?: ReactNode;
   /** Ctrl+K. */
@@ -122,6 +125,10 @@ export interface DesktopProps {
   scheduler?: FrameScheduler;
   /** Modo celular (ausente = desktop). */
   mobile?: MobileControl;
+  /** Versão do Nants, no topo do menu do N. */
+  version?: string;
+  /** Pedido de abrir o menu do N (o lançador incrementa; spec 137). */
+  nMenuSignal?: number;
 }
 
 /** Área do celular antes da primeira medição (jsdom não mede): a janela menos barra e abas. */
@@ -140,8 +147,8 @@ const HINT_TIMEOUT_MS = 10_000;
 
 const SIZE_LABELS = localized({ compact: "announce.size.compact", medium: "announce.size.medium", wide: "announce.size.wide" });
 
-function defaultDockKinds(layout: Layout): WindowKind[] {
-  return DOCK_ORDER.filter((kind) => kind !== "setup" || layout.windows.setup?.open === true);
+function defaultAppKinds(layout: Layout): WindowKind[] {
+  return APP_ORDER.filter((kind) => kind !== "setup" || layout.windows.setup?.open === true);
 }
 
 /**
@@ -168,7 +175,7 @@ export function Desktop({
   dispatch,
   globalState,
   windows,
-  dockKinds,
+  appKinds,
   topBar,
   onOpenLauncher,
   emptyContent,
@@ -176,6 +183,8 @@ export function Desktop({
   createObserver,
   scheduler,
   mobile,
+  version,
+  nMenuSignal,
 }: DesktopProps) {
   const mobileOn = mobile !== undefined;
   // Spec 101: a moldura re-renderiza na troca de idioma (rótulos, estados vazios, anúncios).
@@ -192,7 +201,7 @@ export function Desktop({
   const gestureActive = useGestureActive();
 
   const layout = state.layout;
-  const kinds = useMemo(() => dockKinds ?? defaultDockKinds(layout), [dockKinds, layout]);
+  const kinds = useMemo(() => appKinds ?? defaultAppKinds(layout), [appKinds, layout]);
 
   // --- Celular: janela da vista em tela cheia; as visitadas continuam montadas (ocultas) ---
   const [mobileWorkspace, setMobileWorkspace] = useState<Workspace>(initialMobileWorkspace);
@@ -321,14 +330,14 @@ export function Desktop({
       switch (action.type) {
         case "minimize":
           if (win?.open !== true || win.mode === "minimized") return;
-          pendingFocus.current = focusAfterHide(kind);
+          pendingFocus.current = focusAfterHide();
           hideMessage.current = t("announce.minimized", { title });
           announce(hideMessage.current);
-          showHint("dock");
+          showHint("menu");
           return;
         case "close":
           if (win?.open !== true) return;
-          pendingFocus.current = focusAfterHide(kind);
+          pendingFocus.current = focusAfterHide();
           focusMemory.forget(kind);
           hideMessage.current = t("announce.closed", { title });
           announce(hideMessage.current);
@@ -367,9 +376,9 @@ export function Desktop({
     applyFocus(target);
   }, [shownLayout]);
 
-  /** Dock e Alt+N: abre, restaura, foca; a janela em foco é minimizada (só pelo dock). */
+  /** Menu do N e Alt+N: abre, restaura, foca; a janela em foco é minimizada (só pela grade do menu). */
   const activate = useCallback(
-    (kind: WindowKind, fromDock: boolean) => {
+    (kind: WindowKind, fromGrid: boolean) => {
       const current = stateRef.current.layout;
       const win = current.windows[kind];
       if (win === undefined || !win.open) {
@@ -380,7 +389,7 @@ export function Desktop({
         act({ type: "restore", kind });
         return;
       }
-      if (fromDock && topWindow(current) === kind) {
+      if (fromGrid && topWindow(current) === kind) {
         act({ type: "minimize", kind });
         return;
       }
@@ -395,7 +404,6 @@ export function Desktop({
     },
     [act, focusMemory],
   );
-  const onDockActivate = useCallback((kind: WindowKind) => activate(kind, true), [activate]);
 
   // --- Prévia de encaixe ---
   const [snapPreview, setSnapPreview] = useState<{ kind: WindowKind; target: SnapTarget } | null>(null);
@@ -453,7 +461,7 @@ export function Desktop({
         return { x: r?.left ?? 0, y: r?.top ?? 0 };
       },
       menuLayer,
-      // Celular: troca de vista sem animação (uma janela por vez, sem dock para onde ir).
+      // Celular: troca de vista sem animação (uma janela por vez, sem o N para onde ir).
       reducedMotion: () => mobileOn || prefersReducedMotion(),
       ...(createObserver !== undefined ? { createObserver } : {}),
       ...(scheduler !== undefined ? { scheduler } : {}),
@@ -482,6 +490,52 @@ export function Desktop({
     setPersonalizeOpen(false);
     personalizeButton.current?.focus({ preventScroll: true });
   }, []);
+  // --- Menu do N (spec 137): sempre começa fechado; "closing" é a animação de subida ---
+  const [nMenu, setNMenu] = useState<"closed" | "open" | "closing">("closed");
+  const nButtonRef = useRef<HTMLButtonElement | null>(null);
+  const nPanelRef = useRef<HTMLDivElement | null>(null);
+  const openNMenu = useCallback(() => {
+    setSheetOpen(false);
+    setPersonalizeOpen(false);
+    setNMenu("open");
+  }, []);
+  const closeNMenu = useCallback((reason: NMenuCloseReason | "choose") => {
+    const panel = nPanelRef.current;
+    // Sem animação (movimento reduzido ou sem `getAnimations`), sai na hora.
+    const animated = panel !== null && typeof panel.getAnimations === "function" && !prefersReducedMotion();
+    setNMenu(animated ? "closing" : "closed");
+    // Pelo teclado ou pelo véu, o foco volta ao N; ao escolher, vai para a janela.
+    if (reason === "key" || reason === "scrim") nButtonRef.current?.focus({ preventScroll: true });
+  }, []);
+  useEffect(() => {
+    if (nMenu !== "closing") return undefined;
+    const panel = nPanelRef.current;
+    let live = true;
+    const done = (): void => {
+      if (live) setNMenu((current) => (current === "closing" ? "closed" : current));
+    };
+    if (panel === null) done();
+    else void waitForAnimations(panel).then(done);
+    return () => {
+      live = false;
+    };
+  }, [nMenu]);
+  const toggleNMenu = useCallback(() => {
+    if (nMenu === "open") closeNMenu("key");
+    else openNMenu();
+  }, [nMenu, closeNMenu, openNMenu]);
+  // No celular não há menu do N (a barra de baixo é própria): trocar de modo o fecha.
+  useEffect(() => {
+    if (mobileOn) setNMenu("closed");
+  }, [mobileOn]);
+  // O lançador pede o menu (item "Abrir o menu do Nants").
+  const nSignalSeen = useRef(nMenuSignal);
+  useEffect(() => {
+    if (nMenuSignal === nSignalSeen.current) return;
+    nSignalSeen.current = nMenuSignal;
+    if (mobileRef.current === undefined) openNMenu();
+  }, [nMenuSignal, openNMenu]);
+
   const changeAppearance = useCallback(
     (next: Appearance) => {
       globalState.set(UI_SECTIONS.appearance, next);
@@ -521,7 +575,7 @@ export function Desktop({
       }
       const match = matchShortcut(event, shortcutContext(active));
       if (match === null) return;
-      // Celular: só o lançador (teclado externo); janelas, dock e desfazer não se aplicam.
+      // Celular: só o lançador (teclado externo); janelas, menu do N e desfazer não se aplicam.
       if (mobileRef.current !== undefined && match.id !== "launcher") return;
       const current = stateRef.current;
       switch (match.id) {
@@ -542,13 +596,17 @@ export function Desktop({
           else pendingFocus.current = { type: "titleBar", kind: next, ring: true };
           return;
         }
-        case "dockSlot": {
+        case "appSlot": {
           const kind = kindsRef.current[(match.slot ?? 0) - 1];
           if (kind === undefined) return;
           event.preventDefault();
           activate(kind, false);
           return;
         }
+        case "nMenu":
+          event.preventDefault();
+          openNMenu();
+          return;
         case "shortcutSheet":
           event.preventDefault();
           openSheet();
@@ -564,7 +622,7 @@ export function Desktop({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [act, activate, onOpenLauncher, openSheet]);
+  }, [act, activate, onOpenLauncher, openSheet, openNMenu]);
 
   // --- Janelas ---
   const openKind = useCallback((kind: WindowKind) => act({ type: "open", kind }), [act]);
@@ -591,7 +649,7 @@ export function Desktop({
     return out;
   }, [windows]);
   const badges = useMemo(() => {
-    const out: Partial<Record<WindowKind, DockBadge>> = {};
+    const out: Partial<Record<WindowKind, AppBadge>> = {};
     for (const kind of WINDOW_KINDS) {
       const badge = windows?.[kind]?.badge;
       if (badge !== undefined) out[kind] = badge;
@@ -626,6 +684,23 @@ export function Desktop({
     control.onView(view);
   }, []);
   const sheetShortcut = shortcutById("shortcutSheet");
+  const pending = useMemo(() => pendingCount(kinds, badges), [kinds, badges]);
+  /** Item da grade: abre, foca, restaura ou minimiza a que está em foco. */
+  const onMenuActivate = useCallback(
+    (kind: WindowKind) => {
+      closeNMenu("choose");
+      activate(kind, true);
+    },
+    [closeNMenu, activate],
+  );
+  /** Janela aberta ou Alt+1…9 com o menu aberto: abre, foca ou restaura. */
+  const onMenuShow = useCallback(
+    (kind: WindowKind) => {
+      closeNMenu("choose");
+      activate(kind, false);
+    },
+    [closeNMenu, activate],
+  );
 
   const tree = (
     <WindowLayoutContext.Provider value={shownLayout}>
@@ -644,6 +719,7 @@ export function Desktop({
         >
           <div className="nd-wallpaper" aria-hidden="true" data-desktop-wallpaper="" style={wallpaperStyle(appearance.wallpaper, theme)} />
           <header className={mobileOn ? "nd-topbar nd-chrome nd-keyboard-hide" : "nd-topbar nd-chrome"}>
+            {mobileOn ? null : <NButton buttonRef={nButtonRef} open={nMenu === "open"} pending={pending} onToggle={toggleNMenu} />}
             <div className="nd-topbar-slot">{topBar}</div>
             {mobileOn ? null : (
               <>
@@ -714,9 +790,22 @@ export function Desktop({
           </main>
           {mobile !== undefined ? (
             <MobileTabs tabs={mobile.tabs} view={mobile.view} badges={badges} onSelect={selectTab} />
-          ) : (
-            <Dock kinds={kinds} layout={layout} subtitles={subtitles} badges={badges} onActivate={onDockActivate} />
-          )}
+          ) : null}
+          {nMenu !== "closed" && !mobileOn ? (
+            <NMenu
+              kinds={kinds}
+              layout={layout}
+              subtitles={subtitles}
+              badges={badges}
+              {...(version !== undefined ? { version } : {})}
+              closing={nMenu === "closing"}
+              panelRef={nPanelRef}
+              buttonRef={nButtonRef}
+              onActivate={onMenuActivate}
+              onShow={onMenuShow}
+              onClose={closeNMenu}
+            />
+          ) : null}
           {activeHint !== null && !mobileOn ? (
             <div className="nd-hint nd-overlay" role="note" data-hint={activeHint}>
               <Icon name="lightbulb" size={16} className="nd-hint-icon" />

@@ -41,6 +41,9 @@ export function LayoutMenu({ category, hasMine, onCommand }: LayoutMenuProps) {
         aria-haspopup="menu"
         aria-expanded={open}
         data-layout-menu=""
+        // Onde a barra aperta (137/T03), só o ícone aparece: o nome segue no rótulo e na dica.
+        aria-label={t("layout.button", { phase: phaseName })}
+        title={t("layout.button", { phase: phaseName })}
         onClick={() => setOpen((v) => !v)}
       >
         <Icon name="layout" size={16} />

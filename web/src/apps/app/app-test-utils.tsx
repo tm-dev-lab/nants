@@ -6,7 +6,7 @@
 import { act, fireEvent, screen, within } from "@testing-library/react";
 import type { ProjectState, SpecStatus } from "../../api/types";
 import { parseApiEvent } from "../../api/events";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 
@@ -73,7 +73,7 @@ interface AppServer {
   releaseStart: (() => void) | null;
 }
 
-/** Layout do "Concluído" só com a Conversa: App e Execução são abertos pelo dock. */
+/** Layout do "Concluído" só com a Conversa: App e Execução são abertos pelo menu do N. */
 const DONE_ONLY_CONVERSATION = {
   layouts: { done: { current: { windows: { conversation: { x: 0, y: 0, w: 500, h: 400, z: 1, mode: "normal", open: true } } }, mine: null } },
 };
@@ -86,15 +86,15 @@ interface MountOptions {
   ui?: Record<string, unknown>;
   /** Estado da interface global (ex.: a seção `network` da 097). */
   globalUi?: Record<string, unknown>;
-  /** Janelas abertas pelo dock depois das rotas falsas (padrão: só o App). */
+  /** Janelas abertas pelo menu do N depois das rotas falsas (padrão: só o App). */
   open?: readonly RunWindow[];
   extra?: Partial<RenderShellOptions>;
 }
 
-/** Abre (ou foca, restaura, minimiza) a janela pelo dock. */
-export async function clickDock(name: RunWindow): Promise<void> {
+/** Abre (ou foca, restaura, minimiza) a janela pelo menu do N. */
+export async function clickApp(name: RunWindow): Promise<void> {
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name }));
+    activateApp(name);
   });
   await settle();
 }
@@ -146,7 +146,7 @@ export async function mountRun({ app = {}, status = "COMPLETED", ui = DONE_ONLY_
     if (base === undefined) throw new Error("fetch ausente");
     return base(input, init);
   });
-  for (const name of open) await clickDock(name);
+  for (const name of open) await clickApp(name);
   return { ...view, app: server };
 }
 

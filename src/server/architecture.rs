@@ -171,19 +171,21 @@ pub(super) fn split_lessons(answer: &str) -> (String, Vec<(String, Vec<String>)>
 
 /// Bloco de fatos com as lições atuais de cada perfil (o modelo as mescla com as novas).
 fn current_lessons_block(root: &Path, secrets: &SecretSet) -> String {
-    use crate::sdd::skills::{read_profile, section, LESSONS_SECTION, ROLES};
+    use crate::sdd::skills::{read_profile, section_of, LESSONS_KEY, ROLES};
     let mut out = String::new();
     for role in ROLES {
         let Some(profile) = read_profile(root, role) else { continue };
-        let lessons = section(&profile.body, LESSONS_SECTION).unwrap_or_default();
+        // Spec 137 T12: a seção é lida com o título em qualquer idioma (perfis antigos em pt).
+        let lessons = section_of(&profile.body, LESSONS_KEY).unwrap_or_default();
         let lessons = if lessons.is_empty() { "(nenhuma)".to_string() } else { lessons };
         out.push_str(&format!("LIÇÕES ATUAIS DO PERFIL {role}:\n{}\n", scrub_text(secrets, &lessons)));
     }
     out
 }
 
-/// Aplica as lições aos perfis existentes: só a seção `## Lições do projeto` muda (até 5 itens,
-/// cada um com origem Txx); o resto do perfil, inclusive as notas do usuário, fica intacto.
+/// Aplica as lições aos perfis existentes: só a seção de lições muda (até 5 itens, cada um com
+/// origem Txx), com o título e o `reason` no idioma do projeto (spec 137 T12); o resto do perfil,
+/// inclusive as notas do usuário, fica intacto.
 /// Commita só os perfis alterados; falha de gravação/commit restaura os originais.
 pub(super) fn apply_lessons(
     lang: crate::i18n::Lang,
@@ -209,7 +211,7 @@ pub(super) fn apply_lessons(
         let rel = rel_path(role);
         let Ok(old) = safe_fs::read_regular(root, &rel, ((MAX_PROFILE_BYTES + MAX_LESSONS_SECTION_BYTES) * 2) as u64) else { continue };
         let lessons = clean_lessons(&items.iter().map(|l| scrub_text(secrets, l)).collect::<Vec<_>>());
-        let Some(new) = with_lessons(&old, &lessons, spec_id, &today) else { continue };
+        let Some(new) = with_lessons(lang, &old, &lessons, spec_id, &today) else { continue };
         if new == old {
             continue;
         }
@@ -521,6 +523,24 @@ mod tests {
         // sem lições válidas: nada muda.
         let none_valid = vec![("developer".to_string(), vec!["- sem origem".to_string()])];
         assert_eq!(apply_lessons(Lang::PtBr, &r, "065-z", &none_valid, &none()).expect("ok"), 0);
+    }
+
+    /// Spec 137 T12 (135 P6): num projeto en, o perfil antigo (seções em pt) ganha a seção de lições e o
+    /// motivo em inglês; as notas do usuário ficam intactas e as lições atuais são lidas pelo título pt.
+    #[test]
+    fn lessons_in_an_english_project_read_old_portuguese_profiles() {
+        let r = repo("lessons-en");
+        fs::create_dir_all(r.join(".sdd/skills")).expect("mkdir");
+        let old = PROFILE.replace("## Notas do usuário\n", "## Lições do projeto\n- antiga (T01)\n## Notas do usuário\n");
+        fs::write(r.join(".sdd/skills/developer.md"), &old).expect("w");
+        git(&r, &["add", "-f", ".sdd/skills"]);
+        git(&r, &["commit", "-q", "-m", "perfis"]);
+        assert!(current_lessons_block(&r, &none()).contains("- antiga (T01)"));
+        let blocks = vec![("developer".to_string(), vec!["- run clippy (T02)".to_string()])];
+        assert_eq!(apply_lessons(Lang::En, &r, "002-x", &blocks, &none()).expect("ok"), 1);
+        let text = fs::read_to_string(r.join(".sdd/skills/developer.md")).expect("r");
+        assert!(text.contains("## Project lessons\n- run clippy (T02)") && !text.contains("Lições do projeto"), "{text}");
+        assert!(text.contains("reason: lessons from spec 002-x") && text.contains("## Notas do usuário\n- usar cljfmt"), "{text}");
     }
 
     #[test]

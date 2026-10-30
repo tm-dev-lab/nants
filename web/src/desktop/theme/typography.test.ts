@@ -113,6 +113,7 @@ const MONO_SELECTORS: ReadonlyMap<string, string> = new Map([
   [".nd-md-code", "código em linha no markdown"],
   [".nd-app-log", "console da execução do app"],
   [".nd-plan-task-id", "id de tarefa no Plano"],
+  [".nd-nmenu-version", "versão do Nants no topo do menu do N (identificador de versão, como um hash; spec 137, pedido do usuário)"],
   [".nd-kb-src-doc-id", "id do documento que saiu da base, no quadro Fontes da base do Plano (identificador, spec 136 T04)"],
 ]);
 

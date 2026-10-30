@@ -55,6 +55,7 @@ export function SpaceSwitcher({ spaceId, spaceName, spacePhase, projects, attent
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={t("space.switch", { name: label })}
+        title={label}
         data-space-switcher=""
         onClick={() => setOpen((v) => !v)}
       >

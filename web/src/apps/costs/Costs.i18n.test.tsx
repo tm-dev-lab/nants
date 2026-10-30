@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UsageView } from "../../api/types";
 import { imagesCostHint, imagesCostLine, webSearchCostLine } from "../../copy";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
@@ -67,7 +67,7 @@ async function openCosts(lang: "pt-BR" | "en", project: UsageView = PROJECT) {
   view.server.reply("GET", /\/api\/projects\/p1\/usage/, (_b, url) => ({ status: 200, body: url.includes("spec=") ? SPEC : project }));
   view.server.reply("PUT", /\/api\/projects\/p1\/specs\/s1\/budget/, (body) => ({ status: 200, body }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: lang === "en" ? "Costs" : "Custos" }));
+    activateApp(lang === "en" ? "Costs" : "Custos");
   });
   await settle();
   return view;

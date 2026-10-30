@@ -13,7 +13,7 @@ import { PLAN_ACTIONS_WAITING_REASON, PLAN_DRAFTING_NOTICE } from "../copy";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../test-utils";
 import type { Attention } from "./api";
 import { applyAttention } from "./attention";
-import { renderShell, settle } from "./shell-test-utils";
+import { appBadge, renderShell, settle } from "./shell-test-utils";
 import { windowSubtitleId } from "./windowMeta";
 import type { WindowKind } from "./windows";
 
@@ -62,10 +62,6 @@ const conversation = (): HTMLElement => screen.getByRole("region", { name: "Conv
 const bell = (): string => document.querySelector("[data-bell]")?.getAttribute("aria-label") ?? "";
 const planReadyCard = (): Element | null => conversation().querySelector("[data-plan-ready]");
 
-function dockBadge(kind: string): string | null {
-  const el = document.querySelector<HTMLElement>(`.nd-dock-btn[data-kind="${kind}"]`);
-  return el?.querySelector("[data-badge]")?.textContent ?? null;
-}
 
 /** Item "Aprovar o plano" do lançador (`null` se ausente); fecha o lançador. */
 function launcherApprove(): { disabled: string | null } | null {
@@ -94,7 +90,7 @@ function action(root: HTMLElement, name: string): ActionView | null {
 
 /**
  * Tudo o que a etapa mostra, num objeto só: a falha nomeia a etapa e o diff aponta o elemento que
- * divergiu (pílula, subtítulo, Plano, Conversa, Dock, lançador ou sino). `withLauncher` abre e
+ * divergiu (pílula, subtítulo, Plano, Conversa, menu do N, lançador ou sino). `withLauncher` abre e
  * fecha o lançador (efeito colateral), por isso é opcional.
  */
 function observe(withLauncher: boolean): Record<string, unknown> {
@@ -111,7 +107,7 @@ function observe(withLauncher: boolean): Record<string, unknown> {
     approve: plan === null ? "Plano ausente" : action(plan, APPROVE),
     fix: plan === null ? "Plano ausente" : action(plan, FIX),
     planReadyCard: card === null ? null : (card.textContent ?? "").includes("Plano pronto"),
-    dockPlanBadge: dockBadge("plan"),
+    nmenuPlanBadge: appBadge("plan"),
     bell: bell(),
     ...(withLauncher ? { launcherApprove: launcherApprove() } : {}),
   };
@@ -143,7 +139,7 @@ describe("etapa do plano: planning → reviewing → awaiting sem F5 (sequência
       fix: null,
       reviewerNotice: false,
       planReadyCard: null,
-      dockPlanBadge: null,
+      nmenuPlanBadge: null,
       launcherApprove: null,
       bell: "Precisa de você, nada pendente",
     });
@@ -175,7 +171,7 @@ describe("etapa do plano: planning → reviewing → awaiting sem F5 (sequência
     expect(server.count("POST", /\/chat$/), "etapa 2 (reviewing): \"Pedir correção\" desabilitado não envia").toBe(0);
     expect(observe(true), "etapa 2 (reviewing), depois do clique").toMatchObject({
       planReadyCard: null,
-      dockPlanBadge: null,
+      nmenuPlanBadge: null,
       launcherApprove: { disabled: PLAN_ACTIONS_WAITING_REASON },
       bell: "Precisa de você, nada pendente",
     });
@@ -201,7 +197,7 @@ describe("etapa do plano: planning → reviewing → awaiting sem F5 (sequência
       approve: { disabled: false },
       fix: { disabled: false },
       planReadyCard: true,
-      dockPlanBadge: "1",
+      nmenuPlanBadge: "1",
       launcherApprove: { disabled: null },
       bell: "Precisa de você, 1 pendência",
     });

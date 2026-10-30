@@ -148,7 +148,7 @@ function pluralRules(lang: Lang): Intl.PluralRules {
  * Exceção (decisão do Arquiteto, 101/T01): em pt-BR o zero usa o plural ("0 avisos"), embora o
  * `Intl.PluralRules` trate 0 como singular em português.
  */
-function pluralForm(lang: Lang, count: number): "one" | "other" {
+export function pluralForm(lang: Lang, count: number): "one" | "other" {
   if (lang === "pt-BR" && count === 0) return "other";
   return pluralRules(lang).select(count) === "one" ? "one" : "other";
 }

@@ -4,14 +4,18 @@
  */
 import { localized } from "../i18n";
 
-export type HintId = "snap" | "dock";
+/**
+ * `menu` (spec 137/T02): ao minimizar pela primeira vez, lembra que as janelas minimizadas ficam
+ * no menu do N. Um id no `seen` que não está em `HINT_IDS` é ignorado.
+ */
+export type HintId = "snap" | "menu";
 
-export const HINT_IDS: readonly HintId[] = ["snap", "dock"];
+export const HINT_IDS: readonly HintId[] = ["snap", "menu"];
 
 /** Texto de cada dica (no máximo duas). */
 export const HINTS: Readonly<Record<HintId, string>> = localized({
   snap: "hint.snap",
-  dock: "hint.dock",
+  menu: "hint.menu",
 });
 
 export const MAX_HINTS = 2;

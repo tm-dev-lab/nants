@@ -59,9 +59,9 @@ pub const MAX_CHAT_MESSAGE_CHARS: usize = 8000;
 const HISTORY_READ_BYTES: u64 = MAX_READ_BYTES;
 
 const TIMEOUT_CODE: &str = "chat_timeout";
-const TIMEOUT_TURN_TEXT: &str = "O turno foi cortado por inatividade; envie a mensagem novamente.";
-const TIMEOUT_TURN_SAVED: &str =
-    "O turno foi cortado por demora, mas o plano foi salvo; veja o cartão do plano.";
+/// Turno cortado gravado no histórico, no idioma do projeto (spec 137 T12): sem e com plano salvo.
+const TIMEOUT_TURN_KEY: &str = "system.chat.timeout_turn";
+const TIMEOUT_TURN_SAVED_KEY: &str = "system.chat.timeout_turn_saved";
 const ARCHITECT_AGENT: &str = "architect";
 
 #[derive(Deserialize)]
@@ -114,8 +114,8 @@ pub(super) struct ConsensusTurnOutcome {
 const BUSY_POLL: Duration = Duration::from_millis(250);
 const CONSENSUS_BUSY_TRIES: u32 = 20;
 
-/// Texto de uma mensagem só com imagem (sem texto).
-const IMAGE_ONLY_TEXT: &str = "(imagem)";
+/// Texto de uma mensagem só com imagem (sem texto), no idioma do projeto (spec 137 T12).
+const IMAGE_ONLY_KEY: &str = "system.chat.image_only";
 
 /// Prazos do turno: inatividade (renovado a cada progresso) e teto absoluto.
 #[derive(Clone, Copy)]
@@ -412,7 +412,7 @@ async fn run_turn(
 ) -> Result<Response, ApiError> {
     let timeout: TurnLimits = timeout.into();
     validate_project_id(id)?;
-    let incoming = parse_message(body)?;
+    let incoming = parse_message(state.project_lang(id).get(), body)?;
     run_incoming(state, id, incoming, timeout, backend).await
 }
 
@@ -645,7 +645,7 @@ async fn run_turn_body(
                     crate::agents::architect::log_plan_check_failure("tempo esgotado");
                     first
                 }
-                None => return Ok(timeout_response(&secrets, root, turn_id, before).await),
+                None => return Ok(timeout_response(state.project_lang(id).get(), &secrets, root, turn_id, before).await),
             }
         }
         Some(Ok(reply)) => reply,
@@ -838,6 +838,7 @@ pub async fn post_chat_continue(
 /// Turno cortado: persiste um turno curto do Arquiteto informando o corte e devolve o 504,
 /// com `draft_saved` quando spec/rascunho foi gravado durante o turno.
 async fn timeout_response(
+    lang: crate::i18n::Lang,
     secrets: &Arc<SecretSet>,
     root: PathBuf,
     turn_id: String,
@@ -849,7 +850,7 @@ async fn timeout_response(
         .unwrap_or(false);
     let text = output_text(
         secrets,
-        if draft_saved { TIMEOUT_TURN_SAVED } else { TIMEOUT_TURN_TEXT },
+        &crate::i18n::tr(lang, if draft_saved { TIMEOUT_TURN_SAVED_KEY } else { TIMEOUT_TURN_KEY }, &[]),
     );
     let turn = ChatTurn {
         role: TurnRole::Architect,
@@ -963,7 +964,7 @@ fn output_text(secrets: &SecretSet, text: &str) -> String {
 }
 
 /// Decodifica o corpo e valida a mensagem. JSON malformado vira 400; campos inválidos, 422.
-fn parse_message(body: &[u8]) -> Result<Incoming, ApiError> {
+fn parse_message(lang: crate::i18n::Lang, body: &[u8]) -> Result<Incoming, ApiError> {
     let input: ChatInput = serde_json::from_slice(body).map_err(|e| {
         if e.classify() == serde_json::error::Category::Data {
             ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "json_invalid_fields", Map::new())
@@ -972,9 +973,9 @@ fn parse_message(body: &[u8]) -> Result<Incoming, ApiError> {
         }
     })?;
     let attachments = validate_attachments(input.attachments)?;
-    // Mensagem só com imagem: o texto vazio vira "(imagem)".
+    // Mensagem só com imagem: o texto vazio vira "(imagem)", no idioma do projeto.
     let message = if input.message.trim().is_empty() && !attachments.is_empty() {
-        IMAGE_ONLY_TEXT.to_string()
+        crate::i18n::tr(lang, IMAGE_ONLY_KEY, &[])
     } else {
         input.message
     };
@@ -2322,6 +2323,38 @@ mod tests {
         // O GET não duplica a mensagem do usuário.
         let visible = read_visible_history(&root);
         assert_eq!(visible.iter().filter(|t| matches!(t.role, TurnRole::User)).count(), 1);
+    }
+
+    /// Spec 137 T12 (trava): num projeto en, o turno cortado (com e sem plano salvo) e a mensagem só
+    /// com imagem são gravados no `.chat.jsonl` em inglês, sem nenhum pt.
+    #[tokio::test]
+    async fn english_project_records_cut_turn_and_image_only_text_in_english() {
+        use crate::i18n::{portuguese_in, Lang};
+        let root = tmp_root("chat-en-recorded");
+        let state = state_for(&root, config_for(&root, true));
+        state.project_lang(PROJECT_ID).set(Lang::En);
+        let inner = Scripted::new(vec![write_spec_call(), text("never")]);
+        let dynb: Option<Arc<dyn ChatBackend>> = Some(Arc::new(Stall(inner, std::sync::atomic::AtomicUsize::new(0))));
+        let (status, _) = turn(&state, PROJECT_ID, "go", dynb, limits(150, 10_000)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let lines = chat_lines(&root);
+        let cut = lines[1]["text"].as_str().unwrap_or_default().to_string();
+        assert_eq!(cut, "The turn was cut short for taking too long, but the plan was saved; see the plan card.");
+        let stalled = Scripted::new(vec![text("never")]);
+        let dynb: Option<Arc<dyn ChatBackend>> = Some(Arc::new(Stall(stalled, std::sync::atomic::AtomicUsize::new(1))));
+        let (status, _) = turn(&state, PROJECT_ID, "again", dynb, limits(150, 10_000)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let cut_plain = chat_lines(&root).last().and_then(|l| l["text"].as_str().map(str::to_string)).unwrap_or_default();
+        assert_eq!(cut_plain, "The turn was cut short for inactivity; send the message again.");
+        let name = put_attachment(&root, 1);
+        let (_, dynb) = backend(vec![text("ok")]);
+        let (status, body) = turn_with(&state, json!({"message": " ", "attachments": [name]}), dynb).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let lines = chat_lines(&root);
+        assert!(lines.iter().any(|l| l["role"] == "user" && l["text"] == "(image)"), "{lines:?}");
+        for text in [cut, cut_plain] {
+            assert_eq!(portuguese_in(&text), None, "{text}");
+        }
     }
 
     #[tokio::test]

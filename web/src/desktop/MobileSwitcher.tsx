@@ -5,8 +5,7 @@
  */
 import { memo } from "react";
 import { useT } from "../i18n/react";
-import type { DockBadge } from "./Dock";
-import { BADGE_MAX } from "./Dock";
+import { BADGE_MAX, type AppBadge } from "./appState";
 import { Icon } from "./Icon";
 import { WINDOW_META } from "./windowMeta";
 import type { WindowKind } from "./windows";
@@ -16,7 +15,7 @@ interface MobileSwitcherProps {
   /** Janelas já abertas (montadas) no celular ou no desktop. */
   open: ReadonlySet<WindowKind>;
   subtitles?: Partial<Record<WindowKind, string>>;
-  badges?: Partial<Record<WindowKind, DockBadge>>;
+  badges?: Partial<Record<WindowKind, AppBadge>>;
   /**
    * Janela da vista atual (a última mostrada em tela cheia antes do Alternador): só ela ganha o
    * sinal de selecionado (094/T08, A-12). As outras abertas ficam com a hairline neutra.
@@ -40,7 +39,7 @@ function MobileSwitcherView({ kinds, open, subtitles, badges, current = null, on
           const subtitle = subtitles?.[kind];
           const badge = badges?.[kind];
           const showBadge = badge !== undefined && badge.count > 0;
-          const details = [open.has(kind) ? t("dock.state.open") : undefined, subtitle, showBadge ? badge.label : undefined].filter(
+          const details = [open.has(kind) ? t("windowState.open") : undefined, subtitle, showBadge ? badge.label : undefined].filter(
             (part): part is string => part !== undefined && part !== "",
           );
           return (

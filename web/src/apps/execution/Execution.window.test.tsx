@@ -14,7 +14,7 @@ import { resolve } from "node:path";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { notReady, settle } from "../../desktop/shell-test-utils";
+import { notReady, openNMenu, settle } from "../../desktop/shell-test-utils";
 import { cssRules } from "../../desktop/test-utils";
 import { WindowLayoutContext } from "../../desktop/useWindowVisibility";
 import { windowSubtitleId } from "../../desktop/windowMeta";
@@ -30,7 +30,7 @@ import {
   appEmpty,
   appWindow,
   calls,
-  clickDock,
+  clickApp,
   confirmDialog,
   emit,
   execWindow,
@@ -55,12 +55,12 @@ const pill = (win: HTMLElement = execWindow()): HTMLElement => {
 };
 
 describe("Execução: registros de janela", () => {
-  it("dock, lançador, título, ícone e subtítulo; arranjo com ou sem a Execução é válido", async () => {
+  it("menu do N, lançador, título, ícone e subtítulo; arranjo com ou sem a Execução é válido", async () => {
     await mountRun({ open: ["Execução"] });
     const win = execWindow();
     expect(win.getAttribute("data-window")).toBe("execution");
     expect(document.getElementById(windowSubtitleId("execution"))?.textContent).toBe("s1 · docker compose");
-    expect(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Execução" })).toBeTruthy();
+    expect(within(openNMenu()).getByRole("button", { name: "Execução" })).toBeTruthy();
     expect(parseLayout({ windows: { execution: { x: 0, y: 0, w: 400, h: 300, z: 1, mode: "normal", open: true } } })?.windows.execution?.open).toBe(true);
     expect(parseLayout({ windows: { app: { x: 0, y: 0, w: 400, h: 300, z: 1, mode: "normal", open: true } } })?.windows.execution).toBeUndefined();
   });
@@ -335,8 +335,8 @@ describe("Execução: console", () => {
     const view = await mountRun({ app: { status: running(), logs: "<b>oi</b>" }, open: ["Execução"] });
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     // Religa o intervalo com o relógio falso (minimiza e restaura).
-    await clickDock("Execução");
-    await clickDock("Execução");
+    await clickApp("Execução");
+    await clickApp("Execução");
     const win = execWindow();
     const log = within(win).getByRole("log", { name: "Registro de execução" });
     expect(log.textContent).toBe("<b>oi</b>");
@@ -347,14 +347,14 @@ describe("Execução: console", () => {
       await vi.advanceTimersByTimeAsync(LOGS_POLL_MS * 2 + 50);
     });
     expect(calls(view, LOGS_URL)).toBe(before + 2);
-    await clickDock("Execução");
+    await clickApp("Execução");
     expect(win.hidden).toBe(true);
     const collapsed = calls(view, LOGS_URL);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LOGS_POLL_MS * 3);
     });
     expect(calls(view, LOGS_URL)).toBe(collapsed);
-    await clickDock("Execução");
+    await clickApp("Execução");
     expect(calls(view, LOGS_URL)).toBe(collapsed + 1);
     expect(within(win).getByRole("log").textContent).toBe("<b>oi</b>");
   });
@@ -367,8 +367,8 @@ describe("Execução: console", () => {
     view.app.logs = "web-1 | no ar";
     const writeText = vi.fn(async () => undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    await clickDock("Execução");
-    await clickDock("Execução");
+    await clickApp("Execução");
+    await clickApp("Execução");
     await act(async () => {
       fireEvent.click(within(win).getByRole("button", { name: "Copiar registro" }));
     });
@@ -407,7 +407,7 @@ describe("Execução: console", () => {
   it("encerrado: para a consulta", async () => {
     const view = await mountRun({ app: { status: running() }, open: [] });
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-    await clickDock("Execução");
+    await clickApp("Execução");
     emit("app_exited", { code: 0, reason: "exited" });
     await settle();
     const n = calls(view, LOGS_URL);
@@ -434,8 +434,8 @@ describe("Execução: console", () => {
     expect(within(appWindow()).queryByRole("log")).toBeNull();
     expect(within(appWindow()).queryByRole("tablist")).toBeNull();
     view.app.logs = "mais uma linha";
-    await clickDock("Execução");
-    await clickDock("Execução");
+    await clickApp("Execução");
+    await clickApp("Execução");
     expect(frame()).toBe(iframe);
     expect(iframe.getAttribute("src")).toBe(APP_URL);
   });

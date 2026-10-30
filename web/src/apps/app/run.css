@@ -12,6 +12,8 @@
   padding: var(--sp-4);
   font-size: var(--fs-body);
   color: var(--ink2);
+  /* Nenhum texto (caminho, comando, URL, linha de log) alarga a janela nem invade a coluna vizinha. */
+  overflow-wrap: anywhere;
 }
 
 /* Cabeçalho: selo do modo, informação curta e as ações à direita. */
@@ -132,42 +134,79 @@
   overflow-y: auto;
 }
 
-/* Duas colunas: o principal (saída, registro) e o lado (arquivos, provas). Estreita: empilha. */
+/*
+ * Duas colunas: o principal (saída, registro) e o lado (Como usar, provas, arquivos, histórico).
+ * 137/T04: cada coluna rola por dentro e nada pinta fora dela. Antes, a faixa das colunas tinha
+ * `min-height: 0` e as colunas, nenhuma rolagem: o conteúdo a mais (o "Como usar", as provas, o
+ * campo e o limite do Console) transbordava para baixo, por cima da dica do rodapé e, com a janela
+ * baixa, abaixo do fim do painel. Agora:
+ * - a faixa ocupa o espaço que sobra, mas nunca fica abaixo de `--runview-split-min` (se a janela é
+ *   mais baixa que isso, a página inteira rola, sem nada por cima de nada);
+ * - as duas colunas têm `overflow-y: auto`; a folga de `--sp-1` (padding com margem negativa) deixa
+ *   o anel de foco dos campos e botões das bordas dentro da área visível.
+ */
 .nd-runview-split {
-  flex: 1;
-  min-height: 0;
+  --runview-split-min: 20rem;
+  flex: 1 1 0;
+  min-height: var(--runview-split-min);
   display: flex;
   gap: var(--sp-4);
 }
 
-.nd-runview-main {
-  flex: 3 1 0;
+.nd-runview-main,
+.nd-runview-side {
   min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  margin: calc(var(--sp-1) * -1);
   display: flex;
   flex-direction: column;
+}
+
+.nd-runview-main {
+  flex: 3 1 0;
   gap: var(--sp-2);
 }
 
 .nd-runview-side {
   flex: 2 1 0;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
   gap: var(--sp-3);
+}
+
+/* Na coluna do lado nada encolhe: os cartões ficam inteiros e a coluna rola. */
+.nd-runview-side > * {
+  flex-shrink: 0;
 }
 
 .nd-runview-stack {
   gap: var(--sp-3);
 }
 
+/* Estreita: empilha, e a página inteira rola (as colunas não rolam por dentro nem encolhem). */
 [data-size="narrow"] .nd-runview-split {
   flex-direction: column;
+  flex: 1 0 auto;
+  min-height: 0;
 }
 
+[data-size="narrow"] .nd-runview-main,
+[data-size="narrow"] .nd-runview-side {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+/*
+ * A caixa de registro tem altura dada pela coluna, nunca pelo texto (137/T04): `contain: size` tira
+ * o registro inteiro do tamanho intrínseco dela. Sem isso, onde a altura vem do conteúdo (a coluna
+ * empilhada da janela estreita, a saída do Console com `min-height: auto`), a caixa crescia até o
+ * fim do registro e ele deixava de rolar por dentro.
+ */
 .nd-runview-main .nd-scroll-wrap {
   flex: 1;
   min-height: 10rem;
+  contain: size;
 }
 
 .nd-runview-command {
@@ -282,9 +321,15 @@
   gap: var(--sp-2);
 }
 
+/*
+ * A saída cresce no espaço da coluna, mas nunca abaixo do próprio conteúdo mínimo (a caixa de 12rem
+ * e a falha, quando houver). 137/T04: com `min-height: 0`, numa coluna baixa ela encolhia abaixo dos
+ * 12rem da caixa, e o registro transbordava por cima do campo, do limite e do fim do painel. Quem
+ * rola quando falta altura é a coluna (`.nd-runview-main`).
+ */
 .nd-console-out {
-  flex: 1;
-  min-height: 0;
+  flex: 1 1 0;
+  min-height: auto;
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
@@ -293,6 +338,7 @@
 .nd-console-out .nd-scroll-wrap {
   flex: 1;
   min-height: 12rem;
+  contain: size;
 }
 
 .nd-console-entry + .nd-console-entry {

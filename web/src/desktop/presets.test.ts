@@ -5,6 +5,8 @@ import {
   emptyCategoryLayouts,
   layoutForCategory,
   LAYOUT_CATEGORIES,
+  migrateCategoryLayouts,
+  migrateLayout,
   mineLayoutFor,
   onPhaseChange,
   parseCategoryLayouts,
@@ -14,7 +16,8 @@ import {
   saveCurrent,
   saveMine,
 } from "./presets";
-import { shownByZ, type Layout, type Workspace } from "./windows";
+import { LEGACY_DOCK_RESERVE, workspaceForViewport } from "./metrics";
+import { canUndo, createDesktopState, LAYOUT_VERSION, parseLayout, serializeLayout, shownByZ, windowsReducer, type Layout, type Workspace } from "./windows";
 
 const WS: Workspace = { w: 1440, h: 800 };
 const custom: Layout = { windows: { files: { x: 10, y: 10, w: 400, h: 300, z: 1, mode: "normal", open: true } } };
@@ -185,5 +188,110 @@ describe("onPhaseChange", () => {
     expect(change?.category).toBe("done");
     expect(change?.layouts).toEqual(state.layouts);
     expect(change?.layout).toEqual(presetLayout("done", WS));
+  });
+});
+
+describe("sem dock (137/T02): área nova e migração única dos layouts salvos", () => {
+  /** Viewport de 1440×860: com o dock, a área era de 732 px; sem ele, é de 816 px. */
+  const NEW = workspaceForViewport(1440, 860);
+  const OLD: Workspace = { w: NEW.w, h: NEW.h - LEGACY_DOCK_RESERVE };
+  /** Um arranjo salvo antes da 137: o que o servidor devolve (JSON, sem versão). */
+  const legacy = (layout: Layout): Layout => {
+    const parsed = parseLayout(JSON.parse(JSON.stringify({ windows: serializeLayout(layout).windows })));
+    if (parsed === null) throw new Error("arranjo inválido");
+    return parsed;
+  };
+
+  it("os presets usam a altura nova: as janelas de baixo vão até a borda, com a folga das laterais", () => {
+    expect(NEW).toEqual({ w: 1440, h: 816 });
+    for (const category of LAYOUT_CATEGORIES) {
+      const wins = Object.values(presetLayout(category, NEW).windows);
+      const bottom = Math.max(...wins.map((w) => w.y + w.h));
+      const right = Math.max(...wins.map((w) => w.x + w.w));
+      expect({ category, bottomGap: NEW.h - bottom, rightGap: NEW.w - right }).toEqual({ category, bottomGap: 12, rightGap: 12 });
+    }
+  });
+
+  it("sem versão: a janela que ia até a borda antiga ganha a altura do dock; as outras ficam; volta com a versão", () => {
+    for (const category of LAYOUT_CATEGORIES) {
+      const saved = legacy(presetLayout(category, OLD));
+      expect(saved.v).toBeUndefined();
+      const migrated = migrateLayout(saved, NEW);
+      expect(migrated.v).toBe(LAYOUT_VERSION);
+      for (const [kind, before] of Object.entries(saved.windows)) {
+        const after = migrated.windows[kind as keyof Layout["windows"]];
+        const touched = before.y + before.h === OLD.h - 12;
+        // Só a altura muda; a janela de baixo chega à borda nova com a mesma folga.
+        expect({ kind, x: after?.x, y: after?.y, w: after?.w }).toEqual({ kind, x: before.x, y: before.y, w: before.w });
+        expect({ kind, h: after?.h }).toEqual({ kind, h: touched ? before.h + LEGACY_DOCK_RESERVE : before.h });
+        if (touched) expect((after?.y ?? 0) + (after?.h ?? 0)).toBe(NEW.h - 12);
+      }
+    }
+  });
+
+  it("encostada na borda antiga (encaixe ou maximizada) também desce; já na versão, nada muda", () => {
+    const snapped = legacy({ windows: { plan: { x: 0, y: 0, w: 720, h: OLD.h, z: 1, mode: "maximized", open: true } } });
+    expect(migrateLayout(snapped, NEW).windows.plan).toMatchObject({ y: 0, h: NEW.h, mode: "maximized" });
+    const current: Layout = { v: LAYOUT_VERSION, windows: { plan: { x: 0, y: 0, w: 720, h: OLD.h, z: 1, mode: "normal", open: true } } };
+    expect(migrateLayout(current, NEW)).toBe(current);
+    // Sem área medida, não migra (e não marca a versão).
+    expect(migrateLayout(snapped, { w: 0, h: 0 })).toBe(snapped);
+  });
+
+  it("quando a heurística erra (o navegador mudou de tamanho), no máximo sobra um vão, nunca uma janela fora da tela", () => {
+    // Gravado numa área de 900 px (com o dock) e aberto agora numa de 600: a borda "antiga" calculada
+    // (600 − 84 = 516) cai no meio de uma janela qualquer.
+    const small: Workspace = { w: 1024, h: 600 };
+    const saved = legacy({
+      windows: {
+        conversation: { x: 12, y: 12, w: 400, h: 876, z: 1, mode: "normal", open: true },
+        plan: { x: 420, y: 100, w: 400, h: 426, z: 2, mode: "normal", open: true },
+        board: { x: 420, y: 520, w: 400, h: 70, z: 3, mode: "normal", open: true },
+      },
+    });
+    const migrated = migrateLayout(saved, small);
+    for (const [kind, win] of Object.entries(migrated.windows)) {
+      // Nunca encolhe e nunca passa da borda nova por causa da migração.
+      const before = saved.windows[kind as keyof Layout["windows"]];
+      expect({ kind, grew: win.h >= (before?.h ?? 0) }).toEqual({ kind, grew: true });
+      if (win.h !== before?.h) expect(win.y + win.h).toBeLessThanOrEqual(small.h);
+    }
+    // A Conversa já passava da área (fica como estava; a exibição a recorta); o Plano, perto da
+    // borda calculada, cresce só até a borda nova.
+    expect(migrated.windows.conversation?.h).toBe(876);
+    expect(migrated.windows.plan?.h).toBe(500);
+    // Gravado numa área menor e aberto numa maior: a borda calculada fica longe; sobra um vão.
+    const big = migrateLayout(legacy({ windows: { plan: { x: 12, y: 12, w: 400, h: 400, z: 1, mode: "normal", open: true } } }), NEW);
+    expect(big.windows.plan?.h).toBe(400);
+  });
+
+  it("current e mine: os dois migram de uma vez e só eles entram na lista para regravar (idempotente)", () => {
+    let layouts = emptyCategoryLayouts();
+    layouts = saveCurrent(layouts, "planning", legacy(presetLayout("planning", OLD)));
+    layouts = saveMine(layouts, "execution", legacy(presetLayout("execution", OLD)));
+    layouts = saveMine(layouts, "done", { v: LAYOUT_VERSION, windows: presetLayout("done", NEW).windows });
+    const { layouts: next, migrated } = migrateCategoryLayouts(layouts, NEW);
+    expect(migrated.map((m) => `${m.category}.${m.slot}`)).toEqual(["planning.current", "execution.mine"]);
+    expect(next.planning.current?.v).toBe(LAYOUT_VERSION);
+    expect(next.execution.mine?.v).toBe(LAYOUT_VERSION);
+    expect(next.done.mine).toBe(layouts.done.mine);
+    // O que entra é o arranjo migrado (a Conversa do planejamento chega à borda nova).
+    expect(layoutForCategory(next, "planning", NEW).windows.conversation).toMatchObject({ h: NEW.h - 24 });
+    expect(mineLayoutFor(next, "execution", NEW).windows.conversation).toMatchObject({ h: NEW.h - 24 });
+    // Rodar de novo não muda nada nem pede regravação.
+    const again = migrateCategoryLayouts(next, NEW);
+    expect(again.migrated).toEqual([]);
+    expect(again.layouts).toBe(next);
+  });
+
+  it("desfazer depois da migração volta ao arranjo migrado, não ao antigo com o vão do dock", () => {
+    const migrated = migrateLayout(legacy(presetLayout("planning", OLD)), NEW);
+    let s = createDesktopState({ windows: {} }, NEW);
+    s = windowsReducer(s, { type: "applyLayout", layout: migrated, undoable: false });
+    expect(canUndo(s)).toBe(false);
+    s = windowsReducer(s, { type: "toggleMaximize", kind: "conversation" });
+    s = windowsReducer(s, { type: "undo" });
+    expect(s.layout).toBe(migrated);
+    expect(s.layout.windows.conversation).toMatchObject({ y: 12, h: NEW.h - 24, mode: "normal" });
   });
 });

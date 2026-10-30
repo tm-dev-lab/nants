@@ -6,7 +6,8 @@
 //! - `ApiError::*(..)`, `Rejection::*(..)`, `json!({"error": ..})`, `json_response(..)` e as
 //!   funções e closures do arquivo que recebem texto e devolvem um desses erros: erro da API;
 //! - `AgentMessage { text: .. }` e `SystemNotice { text: .. }`: mensagens da conversa;
-//! - `say(..)`, `tests_message(..)`, `final_notice(..)` e `deliver(..)`: mensagens da conversa e
+//! - `say(..)`, `tests_message(..)`, `final_notice(..)`, `deliver(..)` e `system_message(..)`/
+//!   `system_message_coded(..)` (spec 137 T12: o texto de reserva gravado no diálogo): mensagens da conversa e
 //!   do diálogo;
 //! - `json!({"text": ..})`: mensagem montada direto em JSON;
 //! - `next_action = ..` / `next_action: ..`: o motivo gravado na tarefa e mostrado no quadro;
@@ -372,7 +373,7 @@ fn person_regions(toks: &[Token]) -> Vec<(usize, usize, Kind)> {
                     }
                 }
             }
-            "say" | "tests_message" | "final_notice" | "deliver" if !after_fn && at(i + 1).is_some_and(|t| t.is_punct('(')) => {
+            "say" | "tests_message" | "final_notice" | "deliver" | "system_message" | "system_message_coded" if !after_fn && at(i + 1).is_some_and(|t| t.is_punct('(')) => {
                 let kind = match name {
                     "say" | "tests_message" => Kind::Say,
                     "final_notice" => Kind::FinalNotice,
@@ -481,6 +482,7 @@ fn person_text_detector_catches_pt_and_en_and_lets_codes_pass() {
 fn sweep_finds_each_person_path() {
     let source = r#"
 const MSG: &str = "spec não encontrada";
+const STOPPED: &str = "Execução parada pelo usuário";
 fn f() {
     let a = ApiError::new(StatusCode::NOT_FOUND, MSG);
     let b = ApiError::unprocessable(format!("valor inválido: {x}"));
@@ -489,6 +491,7 @@ fn f() {
     self.say(format!("Revisor: aprovado {x}"));
     self.final_notice("AVISO: falhou".into(), "final.skipped", &[]);
     deliver(&bus, None, ev);
+    let s = system_message_coded(p, STOPPED, "run.stopped", Map::new());
     let j = json!({"agent": "system", "text": "Execution stopped by the user"});
     meta.next_action = Some("aguardando developer".into());
     let m = Meta { next_action: Some("integrar agora".into()), ..x };
@@ -517,6 +520,7 @@ mod t { fn g() { let a = ApiError::new(S, "de teste não conta"); } }
             (Kind::ConversationText, "Aviso: {e}"),
             (Kind::Say, "Revisor: aprovado {x}"),
             (Kind::FinalNotice, "AVISO: falhou"),
+            (Kind::Deliver, "Execução parada pelo usuário"),
             (Kind::JsonText, "Execution stopped by the user"),
             (Kind::NextAction, "aguardando developer"),
             (Kind::NextAction, "integrar agora"),

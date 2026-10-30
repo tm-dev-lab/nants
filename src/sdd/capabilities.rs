@@ -63,13 +63,23 @@ pub struct SuiteRun {
     pub timed_out: bool,
     /// Instante do fim (RFC 3339 UTC).
     pub at: String,
+    /// Spec 137 T09: rodada offline (sem internet, pela rede interna do override), a que prova os
+    /// critérios `(offline)`. Ausente nas rodadas normais e nos registros antigos.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline: bool,
 }
 
 impl SuiteRun {
     /// Rodada medida agora: duração `elapsed` contra o limite `limit`.
     pub fn measured(elapsed: Duration, limit: Option<Duration>, passed: bool, timed_out: bool, at: String) -> Self {
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        Self { ms: ms(elapsed), limit_ms: limit.map(ms), passed, timed_out, at }
+        Self { ms: ms(elapsed), limit_ms: limit.map(ms), passed, timed_out, at, offline: false }
+    }
+
+    /// A mesma rodada, marcada como offline.
+    pub fn offline(mut self) -> Self {
+        self.offline = true;
+        self
     }
 
     /// Duração em segundos, arredondada para cima.
@@ -361,7 +371,8 @@ pub fn prompt_section(caps: &Capabilities, audience: Audience) -> String {
                 } else {
                     "falhou"
                 };
-                format!("{} s ({how})", r.secs())
+                let offline = if r.offline { ", offline" } else { "" };
+                format!("{} s ({how}{offline})", r.secs())
             })
             .collect();
         let limit = caps.runs.last().and_then(SuiteRun::limit_secs).map_or_else(String::new, |l| format!("; limite de {l} s"));
@@ -563,6 +574,24 @@ mod tests {
         assert!(!rerun_fits(Duration::ZERO, None), "sem limite conhecido não dá para saber se cabe");
         let r = SuiteRun::measured(Duration::from_millis(200), Some(Duration::from_millis(250)), false, false, String::new());
         assert_eq!((r.secs(), r.limit_secs(), r.percent()), (1, Some(1), Some(80)));
+    }
+
+    /// Spec 137 T09: a rodada offline entra no registro de rodadas com a marca, e o registro antigo
+    /// (sem o campo) segue legível, como rodada normal.
+    #[test]
+    fn offline_runs_are_marked_in_the_record() {
+        let mut caps = Capabilities::default();
+        caps.push_run(run(30, Some(600), true));
+        caps.push_run(run(40, Some(600), true).offline());
+        let json = serde_json::to_string(&caps).expect("json");
+        assert_eq!(json.matches("\"offline\":true").count(), 1, "{json}");
+        assert!(!json.contains("\"offline\":false"), "a rodada normal não ganha o campo: {json}");
+        let back: Capabilities = serde_json::from_str(&json).expect("ler");
+        assert_eq!(back.runs.iter().map(|r| r.offline).collect::<Vec<_>>(), vec![false, true]);
+        let old: SuiteRun = serde_json::from_str("{\"ms\":1000,\"passed\":true,\"at\":\"t\"}").expect("antigo");
+        assert!(!old.offline);
+        let text = prompt_section(&caps, Audience::Reviewer);
+        assert!(text.contains("30 s (passou), 40 s (passou, offline)"), "{text}");
     }
 
     #[test]

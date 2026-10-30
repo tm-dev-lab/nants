@@ -8,7 +8,9 @@
  * - comandos do menu Layout (aplicar o meu, aplicar o padrão, salvar, restaurar o padrão);
  * - modo celular (T10): nada do layout é gravado (o celular só grava a seção `mobile`) e a área
  *   de trabalho do celular não é usada; ao voltar ao desktop, o arranjo salvo da categoria é
- *   reaplicado na área real, preservando o layout do desktop.
+ *   reaplicado na área real, preservando o layout do desktop;
+ * - arranjos gravados com o dock (sem versão, spec 137/T02) passam pela migração única na área real
+ *   (`migrateCategoryLayouts`) e, na primeira aplicação no desktop, são gravados de volta com a versão.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ProjectPhase } from "../store";
@@ -16,6 +18,7 @@ import {
   categoryOf,
   defaultLayoutFor,
   layoutForCategory,
+  migrateCategoryLayouts,
   mineLayoutFor,
   onPhaseChange,
   parseCategoryLayouts,
@@ -69,13 +72,18 @@ export function usePhaseLayout({ ui, state, dispatch, phase, ready, measure, mob
   const mobileRef = useRef(mobile);
   mobileRef.current = mobile;
   const measureDesktop = useCallback((): Workspace | null => (mobileRef.current ? null : (measure?.() ?? null)), [measure]);
+  /** Os arranjos gravados, migrados para a área sem dock (os da versão atual passam direto). */
+  const storedLayouts = useCallback((ws: Workspace): CategoryLayouts => migrateCategoryLayouts(layoutsRef.current, ws).layouts, []);
 
   useEffect(() => {
     if (ui === null || !ready || !uiReady) return;
     const current = stateRef.current;
     const workspace = measureDesktop() ?? current.workspace;
     if (prevPhase.current === null) {
-      const change = onPhaseChange(null, phase, { layouts: layoutsRef.current, layout: current.layout, workspace });
+      const { layouts: stored, migrated } = migrateCategoryLayouts(layoutsRef.current, workspace);
+      // Migração única: o que foi migrado volta ao servidor já com a versão (nunca pelo celular).
+      if (!mobileRef.current) for (const m of migrated) ui.set(UI_SECTIONS.layout(m.category, m.slot), serializeLayout(m.layout));
+      const change = onPhaseChange(null, phase, { layouts: stored, layout: current.layout, workspace });
       prevPhase.current = phase;
       if (change === null) return;
       categoryRef.current = change.category;
@@ -84,12 +92,12 @@ export function usePhaseLayout({ ui, state, dispatch, phase, ready, measure, mob
       return;
     }
     if (prevPhase.current === phase) return;
-    const change = onPhaseChange(prevPhase.current, phase, { layouts: layoutsRef.current, layout: current.layout, workspace });
+    const change = onPhaseChange(prevPhase.current, phase, { layouts: storedLayouts(workspace), layout: current.layout, workspace });
     prevPhase.current = phase;
     if (change === null) return;
     categoryRef.current = change.category;
     dispatch({ type: "applyLayout", layout: change.layout, undoable: false });
-  }, [ui, ready, uiReady, phase, dispatch, measureDesktop]);
+  }, [ui, ready, uiReady, phase, dispatch, measureDesktop, storedLayouts]);
 
   // Volta do celular ao desktop: reaplica o arranjo salvo da categoria (o do desktop, que o
   // celular nunca grava) na área real. O arranjo em memória pode ter sido montado para a tela
@@ -100,8 +108,8 @@ export function usePhaseLayout({ ui, state, dispatch, phase, ready, measure, mob
     wasMobile.current = mobile;
     if (mobile || !was || !initialized || ui === null) return;
     const workspace = measureDesktop() ?? stateRef.current.workspace;
-    dispatch({ type: "applyLayout", layout: layoutForCategory(layoutsRef.current, categoryRef.current, workspace), undoable: false });
-  }, [mobile, initialized, ui, dispatch, measureDesktop]);
+    dispatch({ type: "applyLayout", layout: layoutForCategory(storedLayouts(workspace), categoryRef.current, workspace), undoable: false });
+  }, [mobile, initialized, ui, dispatch, measureDesktop, storedLayouts]);
 
   // O arranjo atual é sempre salvo na categoria em vigor (nunca no celular). Só quando o arranjo
   // muda: a troca de modo sozinha não grava o arranjo em memória.
@@ -115,7 +123,7 @@ export function usePhaseLayout({ ui, state, dispatch, phase, ready, measure, mob
     (cmd: LayoutCommand): { message: string; undoable: boolean } => {
       const category = categoryRef.current;
       const ws = stateRef.current.workspace;
-      const all = layoutsRef.current;
+      const all = storedLayouts(ws);
       switch (cmd) {
         case "applyMine":
           dispatch({ type: "applyLayout", layout: mineLayoutFor(all, category, ws) });
@@ -134,15 +142,15 @@ export function usePhaseLayout({ ui, state, dispatch, phase, ready, measure, mob
         }
       }
     },
-    [dispatch, ui],
+    [dispatch, ui, storedLayouts],
   );
 
   const restorePhaseLayout = useCallback(() => {
     dispatch({
       type: "applyLayout",
-      layout: mineLayoutFor(layoutsRef.current, categoryRef.current, stateRef.current.workspace),
+      layout: mineLayoutFor(storedLayouts(stateRef.current.workspace), categoryRef.current, stateRef.current.workspace),
     });
-  }, [dispatch]);
+  }, [dispatch, storedLayouts]);
 
   return { layouts, category: categoryOf(phase), initialized, command, restorePhaseLayout };
 }

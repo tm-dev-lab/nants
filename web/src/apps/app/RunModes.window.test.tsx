@@ -26,7 +26,7 @@ import { resetStore } from "../../test-utils";
 import { AppRunner } from "./AppApp";
 import { clearGuideCache } from "./useAppGuide";
 import { ExecutionPanel } from "../execution/ExecutionApp";
-import { CONSOLE_EMPTY, S, STOP_URL, appWindow, calls, emit, execWindow, guide, mountRun, running } from "./app-test-utils";
+import { CONSOLE_EMPTY, S, STOP_URL, appWindow, calls, clickApp, emit, execWindow, guide, mountRun, running } from "./app-test-utils";
 
 afterEach(() => {
   cleanup();
@@ -320,6 +320,36 @@ describe("Console do projeto", () => {
     const out = within(appWindow()).getByRole("log", { name: "Saída do Console" });
     expect(out.querySelector("[data-console-result]")?.textContent).toBe("passou do tempo · 5 min 0 s");
     expect(out.querySelector("[data-console-notice]")?.textContent).toContain("O Console não tem entrada");
+  });
+
+  it("código 127: diz qual comando não existe na imagem e sugere pedir a ferramenta ao Arquiteto", async () => {
+    await mountRun();
+    await click(within(appWindow()).getByRole("button", { name: "Abrir o Console" }));
+    const run = async (execId: string, command: string, output: string, code: number): Promise<HTMLElement> => {
+      fireEvent.change(within(appWindow()).getByRole("textbox", { name: "Comando" }), { target: { value: command } });
+      await click(within(appWindow()).getByRole("button", { name: "Rodar" }));
+      await click(within(screen.getByRole("dialog", { name: "Rodar este comando?" })).getByRole("button", { name: "Rodar" }));
+      consoleEvent("app_exec_started", { exec_id: execId, spec_id: S, command, started_at: "2026-10-27T12:00:00Z", timeout_secs: 300, origin: {} });
+      if (output !== "") consoleEvent("app_exec_output", { exec_id: execId, seq: 1, text: output, truncated: false });
+      consoleEvent("app_exec_finished", { exec_id: execId, status: "exited", exit_code: code, duration_ms: 100, files: [], files_total: 0, notice: null });
+      await settle();
+      const entry = appWindow().querySelector<HTMLElement>(`[data-console-entry="${execId}"]`);
+      if (entry === null) throw new Error(`entrada ${execId} ausente`);
+      return entry;
+    };
+    // A ferramenta ausente numa cadeia: o nome vem da saída do shell.
+    const missing = await run("n1", "cd api && curl -s http://localhost:8080/health", "sh: 1: curl: not found\n", 127);
+    expect(missing.querySelector("[data-console-result]")?.textContent).toBe("código 127 · 0,1 s");
+    expect(missing.querySelector('[data-console-notice="command_not_found"]')?.textContent).toBe(
+      "O comando curl não existe na imagem do projeto (falta a ferramenta ou o nome foi digitado errado). Se o projeto precisa dele, peça ao Arquiteto para incluir a ferramenta no ambiente.",
+    );
+    // Erro de digitação sem saída: a primeira palavra do comando.
+    const typo = await run("n2", "nmp test", "", 127);
+    expect(typo.querySelector('[data-console-notice="command_not_found"]')?.textContent).toContain("O comando nmp não existe na imagem do projeto");
+    // Outro código não traz a mensagem.
+    const other = await run("n3", "false", "", 1);
+    expect(other.querySelector("[data-console-notice]")).toBeNull();
+    expect(findForbiddenGlyphs(appWindow())).toEqual([]);
   });
 
   it("sem run_command (próximo passo open_console), o Console abre sozinho nas duas janelas, sem o erro", async () => {
@@ -688,7 +718,7 @@ describe("em en", () => {
     // O "Como usar" vem do relatório, no idioma em que ele foi escrito.
     const english = guide({ how_to_use: { source: "report", markdown: "## How to run\nRun `ledger report --month 2026-09`.", truncated: false } });
     await mountRun({ app: { status: FINISHED, guide: { status: 200, body: english } }, open: [] });
-    await click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "App" }));
+    await clickApp("App");
     const v = view("finished");
     expect(within(v).getByRole("status").textContent).toBe("Finished · code 0");
     expect(within(v).getByRole("button", { name: "Run again" })).toBeTruthy();
@@ -703,7 +733,7 @@ describe("em en", () => {
   it("falha do ambiente em en", async () => {
     setLanguage("en", { persist: false });
     await mountRun({ app: { status: STOPPED_WITH_FAILURE }, open: [] });
-    await click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "App" }));
+    await clickApp("App");
     const v = view("failure");
     expect(within(v).getByRole("heading", { level: 2 }).textContent).toBe("The project's Docker environment did not start");
     expect(within(v).getByRole("button", { name: "Ask the Architect to fix it" })).toBeTruthy();

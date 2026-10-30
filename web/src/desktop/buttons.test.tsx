@@ -3,13 +3,13 @@
  * neutro"):
  * - conjunto único de variantes de `.nd-btn` (primária violeta, secundária neutra, fantasma/ícone
  *   e perigo rosa suave), usado por todas as janelas, pela barra e pelas sobreposições; os demais
- *   botões são controles especializados (abas, menus, dock…), numa lista fechada com o motivo;
+ *   botões são controles especializados (abas, menus, grade do menu do N…), numa lista fechada com o motivo;
  * - no máximo UMA primária visível por janela nos estados testados;
  * - YOLO, Internet e Layout neutros (a cor só no pino do interruptor quando ligado);
  * - pílulas de estado com fundo neutro (o tom só no ponto e no rótulo);
- * - ícones do dock neutros (o tom fica só no ícone da barra de título).
+ * - ícones da grade do menu do N neutros (o tom fica só no ícone da barra de título).
  */
-import { act, cleanup, fireEvent } from "@testing-library/react";
+import { cleanup } from "@testing-library/react";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,7 +17,7 @@ import type { ProjectState } from "../api/types";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../test-utils";
 import { applyAttention } from "./attention";
 import { presetWindows } from "./presets";
-import { renderShell, settle } from "./shell-test-utils";
+import { openAllApps, renderShell } from "./shell-test-utils";
 import { cssRuleBody, cssRules } from "./test-utils";
 
 afterEach(() => {
@@ -56,7 +56,9 @@ const VARIANTS = ["primary", "ghost", "danger"] as const;
 const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-wbtn", "controles da janela e de fechar: só o ícone, fundo no hover"],
   ["nd-menu-item", "item de menu (menus, sino, lançador)"],
-  ["nd-dock-btn", "ícone do dock (neutro, estado pelo ponto)"],
+  ["nd-nbtn", "botão N do menu do Nants (spec 137): o símbolo em relevo, afunda com o menu aberto"],
+  ["nd-nmenu-tile", "item da grade do menu do N (ícone e nome; estado pelo ponto)"],
+  ["nd-nmenu-chip", "janela aberta no menu do N (foca ou restaura; estado pelo ponto)"],
   ["nd-tab", "aba (Atividade e outras janelas)"],
   ["nd-settings-tab", "aba de Configurações"],
   ["nd-segment-item", "item do controle segmentado (Console e Arquivos; nas Configurações é um rótulo de rádio)"],
@@ -225,15 +227,15 @@ describe("conjunto único de botões", () => {
     for (const rule of toned) expect({ s: rule.selectors.join(", "), body: rule.body }).toEqual({ s: rule.selectors.join(", "), body: expect.not.stringMatching(/background|border/) });
   });
 
-  it("dock: ícones neutros (--ink aberta, --muted fechada), sem tom por aplicativo", () => {
+  it("grade do menu do N: ícones neutros (--ink aberta, --muted fechada), sem tom por aplicativo", () => {
     const desktop = read("desktop/theme/desktop.css");
-    expect(cssRuleBody(desktop, ".nd-dock-btn")).toContain("color: var(--muted);");
+    expect(cssRuleBody(desktop, ".nd-nmenu-icon")).toContain("color: var(--muted);");
     for (const state of ["open", "minimized", "focused"]) {
-      const rule = cssRules(desktop).find((r) => r.selectors.includes(`.nd-dock-btn[data-state="${state}"]`) && /(?:^|;)\s*color:/.test(r.body));
+      const rule = cssRules(desktop).find((r) => r.selectors.includes(`.nd-nmenu-tile[data-state="${state}"] .nd-nmenu-icon`) && /(?:^|;)\s*color:/.test(r.body));
       expect({ state, body: rule?.body }).toEqual({ state, body: expect.stringContaining("color: var(--ink);") });
     }
-    for (const { file, css } of allCss()) expect({ file, tone: /\.nd-dock-btn\[data-tone/.test(css) }).toEqual({ file, tone: false });
-    expect(read("desktop/Dock.tsx")).not.toMatch(/data-tone/);
+    for (const { file, css } of allCss()) expect({ file, tone: /\.nd-nmenu-(?:tile|icon)\[data-tone/.test(css) }).toEqual({ file, tone: false });
+    expect(read("desktop/NMenu.tsx")).not.toMatch(/data-tone/);
     // O tom do aplicativo fica no ícone da barra de título.
     expect(read("desktop/Window.tsx")).toMatch(/className="nd-titlebar-icon" style=\{\{ color: `var\(--icon-\$\{meta\.tone\}\)` \}\}/);
   });
@@ -256,15 +258,6 @@ function visiblePrimaries(root: Element): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('[data-variant="primary"]')].filter((el) => el.closest("[hidden], [inert]") === null);
 }
 
-/** Abre todas as janelas fechadas pelo dock. */
-async function openAllWindows(): Promise<void> {
-  for (const button of [...document.querySelectorAll<HTMLElement>('.nd-dock-btn[data-state="closed"]')]) {
-    await act(async () => {
-      fireEvent.click(button);
-    });
-  }
-  await settle();
-}
 
 const P1 = makeProject("p1", "Loja");
 
@@ -299,7 +292,7 @@ describe("no máximo uma primária visível por janela", () => {
     const make = STATES[name];
     if (make === undefined) throw new Error("estado ausente");
     await renderShell({ url: "/?space=p1", projects: [P1], states: make() });
-    await openAllWindows();
+    await openAllApps();
     const windows = [...document.querySelectorAll<HTMLElement>("[data-window]")].filter((w) => !w.hidden);
     expect(windows.length).toBeGreaterThanOrEqual(10);
     const counts = windows.map((w) => ({ window: w.getAttribute("data-window"), primaries: visiblePrimaries(w).length }));
@@ -313,7 +306,7 @@ describe("no máximo uma primária visível por janela", () => {
     const make = STATES["concluído"];
     if (make === undefined) throw new Error("estado ausente");
     await renderShell({ url: "/?space=p1", projects: [P1], states: make() });
-    await openAllWindows();
+    await openAllApps();
     // As janelas do preset Concluído (Relatório, App, Conversa e Execução) e a barra superior.
     const preset = new Set<string>(presetWindows("done"));
     const all = visiblePrimaries(document.body).filter((el) => {
@@ -330,7 +323,7 @@ describe("no máximo uma primária visível por janela", () => {
     const make = STATES["plano aguardando aprovação"];
     if (make === undefined) throw new Error("estado ausente");
     await renderShell({ url: "/?space=p1", projects: [P1], states: make() });
-    await openAllWindows();
+    await openAllApps();
     const plan = document.querySelector<HTMLElement>('[data-window="plan"]');
     if (plan === null) throw new Error("Plano ausente");
     const primaries = visiblePrimaries(plan);

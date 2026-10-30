@@ -110,7 +110,8 @@ describe("troca de modo (largura < 1024 px)", () => {
     media = installMatchMedia(false);
     const { server } = await renderShell({ url: "/?space=p1", projects: [P1], states: planning() });
     expect(root().hasAttribute("data-mobile")).toBe(false);
-    expect(screen.getByRole("navigation", { name: "Dock" })).toBeTruthy();
+    // O botão N (spec 137) é do desktop, sem dock; o celular continua com a barra de baixo própria.
+    expect(document.querySelector("[data-nbutton]")).not.toBeNull();
     const conversation = windowEl("conversation");
     const plan = windowEl("plan");
     const before = { conversation: geometry(conversation), plan: geometry(plan) };
@@ -124,7 +125,7 @@ describe("troca de modo (largura < 1024 px)", () => {
 
     await media.set(true);
     expect(root().getAttribute("data-mobile")).toBe("true");
-    expect(screen.queryByRole("navigation", { name: "Dock" })).toBeNull();
+    expect(document.querySelector("[data-nbutton]")).toBeNull();
     expect(tabs()).toBeTruthy();
     // Uma janela por vez: a Conversa (primeira aba do planejamento); o Plano fica oculto.
     expect(visibleWindows()).toEqual(["conversation"]);
@@ -148,7 +149,7 @@ describe("troca de modo (largura < 1024 px)", () => {
 
     await media.set(false);
     expect(root().hasAttribute("data-mobile")).toBe(false);
-    expect(screen.getByRole("navigation", { name: "Dock" })).toBeTruthy();
+    expect(document.querySelector("[data-nbutton]")).not.toBeNull();
     expect(windowEl("conversation")).toBe(conversation);
     expect(windowEl("plan")).toBe(plan);
     expect(visibleWindows().sort()).toEqual(["conversation", "plan"]);
@@ -193,9 +194,11 @@ describe("troca de modo (largura < 1024 px)", () => {
     await media.set(false);
     expect(visibleWindows().sort()).toEqual(["conversation", "files"]);
     expect(geometry(windowEl("files"))).toBe("300px,60px,520px,400px");
-    expect(server.model.ui.p1?.data.layouts).toEqual({ planning: { current: layout } });
+    // De volta ao desktop, o arranjo salvo (sem versão, do tempo do dock) é regravado uma vez com a
+    // versão (137/T02); nenhuma janela ia até a borda antiga, então a geometria é a mesma.
+    expect(server.model.ui.p1?.data.layouts).toEqual({ planning: { current: { v: 2, ...layout } } });
     // Nem de passagem o arranjo da tela pequena foi gravado.
-    expect(uiPuts(server.calls).filter((p) => p.section !== "mobile")).toEqual([]);
+    expect(uiPuts(server.calls).filter((p) => p.section !== "mobile")).toEqual([{ url: expect.stringMatching(/ui-state$/), section: "layouts.planning.current" }]);
   });
 });
 

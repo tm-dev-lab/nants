@@ -11,19 +11,25 @@ built in (React). The server keeps the global configuration, orchestrates the Ar
 Developer and the Reviewer over the `.sdd/` folder of each project, and publishes everything over
 REST and SSE. Usage is described in `README.md`.
 
-The interface is a desktop: a top bar, a work area with free floating windows, and a dock.
+The interface is a desktop: a top bar and a work area with free floating windows that reaches the
+bottom edge (no space is reserved below the windows). The N button, rendered by `Desktop` in the
+top bar `header`, opens the Nants menu (`NMenu`): search, the grid of apps (the same `kinds` the
+`Desktop` shows), the open and minimized windows and the shortcuts (Alt+0 opens and closes it,
+Alt+1 to Alt+9 open the apps in its order, Ctrl+K stays the launcher).
 
 - **Spaces**: one per project. The URL is `/?space=<id>`; any other path is normalized with
   `replaceState`. Only the windows of the active space are mounted.
 - **Windows**: Conversation, Plan, Board, Activity, Files, App, Costs, Report, Settings, Project
   and Getting started, one per type, each with a live status subtitle and an empty state.
 - **Layouts per phase**: planning, execution and done, with the current arrangement and "my
-  layout" per category; switching layouts can be undone.
+  layout" per category; switching layouts can be undone. A saved arrangement carries a version
+  (`LAYOUT_VERSION`); one saved without it, for the older and shorter work area, goes once through
+  `migrateLayout` (`presets.ts`), which extends the windows that reached the old bottom edge.
 - **Saved state**: `/api/ui-state` (global) and `/api/projects/:id/ui-state`, with `rev`, PUT per
   section and 409 on conflict; `BroadcastChannel` between tabs; the phone only writes the `mobile`
   section.
-- **Needs you**: `/api/attention` feeds the bell, the floating notices, the dock badges, the tab
-  title and the favicon.
+- **Needs you**: `/api/attention` feeds the bell, the floating notices, the app badges (in
+  the Nants menu, with a dot on the N, and on the phone), the tab title and the favicon.
 - **Getting started**: `/api/readiness` defines what is missing (machine, connection, agents); the
   server blocks actions with 412 `prereq_missing` and the interface explains why and leads to the
   fix.
@@ -48,9 +54,10 @@ src/agents/         LLM clients and the specification runner
 src/harness/        worktrees, allowlist, tools, Docker Compose
 src/sdd/            specifications, tasks and SDD states
 web/src/main.tsx    mounts the Shell
-web/src/desktop/    Shell, Desktop, Window, Dock, top bar, launcher, phone,
+web/src/desktop/    Shell, Desktop, Window, NMenu (the Nants menu), top bar, launcher, phone,
                     window manager (windows.ts, presets.ts, shortcuts.ts, focus.ts,
-                    gestures.ts, animation.ts), ui-state (uiState.ts) and tokens (theme/)
+                    gestures.ts, animation.ts), app state and badges (appState.ts), ui-state
+                    (uiState.ts) and tokens (theme/)
 web/src/apps/       one folder per window, registered in apps/registry.ts; apps/shared/ for
                     what several windows use
 web/src/            API client (api/), store, event stream (liveStream.ts) and pure rules
@@ -58,7 +65,7 @@ web/src/            API client (api/), store, event stream (liveStream.ts) and p
 
 A window is an `AppDefinition` in `apps/registry.ts`: `Content` (in `memo`, reads data through
 `useSpace()`/`useShell()` and store selectors) and `summarize` (a pure function that gives the
-subtitle, the dock badge and the empty state). Space data comes from `useSpaceData`, called once
+subtitle, the app badge shown in the Nants menu and on the phone, and the empty state). Space data comes from `useSpaceData`, called once
 by the Shell; high frequency slices (messages, activities) are read through selectors.
 
 ## Commands

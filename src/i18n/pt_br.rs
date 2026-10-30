@@ -250,6 +250,18 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("report.traceability.no_task", "sem tarefa declarada"),
     // Runner: tarefa de correção criada pela verificação final (spec 107), gravada no Txx.md.
     ("runner.final_fix_title", "Correção da verificação final"),
+    // Spec 137 T12: a causa da falha do run (`RunnerError::describe_in`) no idioma do projeto; o
+    // detalhe livre de dentro segue como veio.
+    ("runner.error.invalid_id", "identificador inválido para {name}: {value}"),
+    ("runner.error.config", "configuração inválida: {detail}"),
+    ("runner.error.invalid", "estado inválido: {detail}"),
+    ("runner.error.dependencies_pending", "tarefa {task} com dependências não DONE: {pending}"),
+    ("runner.error.io", "erro de I/O em {path}: {error}"),
+    ("runner.error.tests", "falha ao executar teste: {detail}"),
+    ("runner.error.docker", "ambiente docker: {detail}"),
+    ("runner.error.role", "falha do papel {role}: {detail}"),
+    ("runner.error.external_edit", "{path} modificado externamente"),
+    ("runner.error.cancelled", "execução cancelada"),
     // Runner: mensagens do agente `tests` na conversa (spec 113 T04), no idioma do projeto.
     ("runner.tests.passed_command", "testes ✓{place} (`{command}`)"),
     ("runner.tests.passed_checks", "testes ✓{place} · {checks}"),
@@ -260,6 +272,10 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.tests.rerun", "A rodada de testes falhou. Repetindo uma vez, sem mudança no código, para conferir se o teste é instável."),
     ("runner.tests.rerun_skipped", "A rodada de testes falhou com as mesmas linhas de falha que o Desenvolvedor já tinha visto nesta mesma versão do código. A falha se repete: sem nova rodada para conferir se o teste é instável."),
     ("runner.tests.rerun_skipped_missing_program", "A rodada de testes falhou com o código {code}, que indica programa ausente ou não executável. É falha do ambiente, não teste instável: sem nova rodada para conferir instabilidade."),
+    ("runner.offline.start", "Rodada offline: a bateria roda de novo sem internet, por causa dos critérios (offline). Os serviços do projeto, como o banco, seguem acessíveis."),
+    ("runner.offline.passed", "A rodada offline (sem internet) passou em {secs} s."),
+    ("runner.offline.failed", "A rodada offline (sem internet) falhou em {secs} s, depois da rodada normal verde. Os critérios (offline) pedem que a bateria passe sem rede: algo nos testes ainda baixa ou acessa um endereço de fora."),
+    ("runner.offline.host", "A rodada offline não rodou: ela precisa do ambiente Docker do projeto para cortar a internet."),
     ("runner.tests.flaky", "A rodada falhou e passou na repetição sem mudança no código: segue como aprovada, com alerta de teste instável. Falhas da primeira rodada: {tests}"),
     ("runner.flaky.entry", "Tentativa {attempt}: a rodada falhou e passou na repetição sem mudança no código. Falhas da primeira rodada: {tests}"),
     ("runner.flaky.unnamed", "nenhum teste identificado na saída"),
@@ -348,6 +364,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("runner.block.revised", "definição revisada; retomar"),
     ("runner.block.blocked", "tarefa BLOCKED"),
     ("runner.block.recurring", "apontamentos HIGH recorrentes ({findings}): o Arquiteto decide antes de uma nova tentativa"),
+    ("runner.block.kept_recurring", "apontamentos mantidos pelo Arquiteto voltaram sem progresso ({findings}): decisão final do Arquiteto, sem nova tentativa com a mesma exigência"),
     // Runner: orçamento da spec atingido (motivo do bloqueio com o código `budget`).
     ("runner.budget.tokens", "orçamento da spec atingido: {tokens} de {max} tokens"),
     ("runner.budget.usd", "orçamento da spec atingido: US$ {cost} de US$ {max}"),
@@ -368,6 +385,8 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("approvals.judge_refusal", "A aprovação automática não liberou sozinha ({reason}); aguardando você: {command}"),
     // Execução pausada pelo orçamento: aviso do Arquiteto na conversa.
     ("runs.budget_paused", "Execução pausada: {reason}. Aumente ou remova o limite e use Retomar."),
+    // Spec 137 T12: o relançamento recusado sem a recusa da API (projeto ou reserva sumiram).
+    ("runs.relaunch_unavailable", "o projeto ou a reserva da execução não estava mais disponível"),
     ("runs.env_choice_reason", "Ajustar o ambiente docker (opção «{label}» escolhida por você)"),
     // Mensagens do sistema na conversa (spec 115 T03): o texto de reserva de `SystemNotice` e das
     // linhas `agent: system` com `code`; o mesmo texto de `system.<code>` da web (paridade testada).
@@ -395,6 +414,11 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ),
     // Spec 133 T11: o provedor recusou o turno do Arquiteto; a evidência vai nos `params`.
     ("system.chat.provider_failed", "O provedor do modelo do Arquiteto falhou neste turno ({provider})."),
+    // Spec 137 T12: o turno cortado e a mensagem só com imagem, gravados no `.chat.jsonl` no idioma
+    // do projeto.
+    ("system.chat.timeout_turn", "O turno foi cortado por inatividade; envie a mensagem novamente."),
+    ("system.chat.timeout_turn_saved", "O turno foi cortado por demora, mas o plano foi salvo; veja o cartão do plano."),
+    ("system.chat.image_only", "(imagem)"),
     // Spec 128 T02: uma linha por rodada do consenso do plano.
     (
         "system.plan.consensus_round",
@@ -439,6 +463,27 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ),
     // Spec 131 T06: a linha do pedido liberado pela aprovação automática (o detalhe é o pedido).
     ("system.run.auto_approved", "aprovada automaticamente: {detail}"),
+    // Spec 137 T12: mensagens do sistema do run gravadas no diálogo no idioma do projeto, com o
+    // mesmo texto que a web monta pelo `code`.
+    ("system.run.stopped", "Execução parada pelo usuário. Use Continuar para retomar."),
+    ("system.run.failed", "A execução foi interrompida por erro interno; confira o estado do projeto."),
+    ("system.run.failed_cause", "A execução foi interrompida: {cause}; confira o estado do projeto."),
+    (
+        "system.run.docker_migration",
+        "Ajustei o test_command/checks do projeto para rodarem dentro do workspace (sem 'docker compose'): em modo docker o Nants já executa esses comandos no serviço workspace.",
+    ),
+    ("system.run.relaunch_failed", "O relançamento em modo docker foi recusado; use Retomar. Motivo: {message}"),
+    ("system.run.relaunch_failed_detail", "Detalhe técnico: {detail}"),
+    ("system.image.unavailable", "Este modelo não gera imagens neste provedor; usando ilustrações em SVG/CSS."),
+    ("system.image.failed", "Geração de imagem falhou ({failure}): {path}. O Desenvolvedor seguirá com SVG/CSS se necessário."),
+    (
+        "system.image.suspended.one",
+        "O provedor respondeu sem uma imagem que o Nants consiga ler ({count} tentativa); a geração pode ter sido cobrada pelo provedor. As imagens restantes seguem pelo fallback do plano.",
+    ),
+    (
+        "system.image.suspended.other",
+        "O provedor respondeu sem uma imagem que o Nants consiga ler ({count} tentativas); a geração pode ter sido cobrada pelo provedor. As imagens restantes seguem pelo fallback do plano.",
+    ),
     // Runner: findings gerados e notas da convergência na mensagem do Revisor (spec 115 T03), no
     // idioma do projeto (o Desenvolvedor também lê, no corpo da tarefa).
     // Spec 129 T04: marcadores estruturais das mensagens do Desenvolvedor e do Revisor, escritos no
@@ -501,6 +546,7 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("system.task.recurring_arbitration", "Os apontamentos {findings} da {task} continuam abertos depois de várias revisões. O Arquiteto decide cada um antes de uma nova tentativa."),
     ("system.task.recurring_recovery", "Os apontamentos {findings} da {task} continuam abertos depois de várias revisões. O Arquiteto analisa a tarefa antes de uma nova tentativa."),
     ("system.task.recurring_unavailable", "A decisão do Arquiteto sobre os apontamentos recorrentes da {task} ({findings}) ficou indisponível; eles continuam cobrados na próxima tentativa."),
+    ("system.task.kept_recurring", "Os apontamentos {findings} da {task} foram mantidos pelo Arquiteto e voltaram sem progresso. Eles não voltam ao Desenvolvedor: o Arquiteto toma a decisão final (aceitar como está, rebaixar para pendência que não bloqueia ou mudar o plano)."),
     ("system.task.dev_resumed_steps", "O Desenvolvedor atingiu o limite de passos na {task} (tentativa {attempt}). O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa."),
     ("system.task.dev_resumed_repeated", "O Desenvolvedor parou na {task} (tentativa {attempt}) por repetir a mesma chamada sem progresso. O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa."),
     ("system.task.dev_resumed_stalled", "O Desenvolvedor parou por falta de progresso na {task} (tentativa {attempt}). O Nants retoma o trabalho uma vez, numa sessão nova com o que já foi feito e o que falta, antes dos testes e da revisão; a retomada não conta como tentativa."),
@@ -988,6 +1034,15 @@ nants uninstall --purge  remove também a configuração e os dados; nunca os pr
     ("sdd.free_title.decisions", "Decisões"),
     ("sdd.free_title.sources", "Fontes consultadas"),
     ("sdd.free_title.cited_example", "Contrato do relatório mensal"),
+    // Spec 137 T12 (135 P6): os perfis de especialista no idioma do projeto. Os títulos das seções e a
+    // linha de papel são lidos nas formas de todos os idiomas.
+    ("sdd.profile.user_notes", "Notas do usuário"),
+    ("sdd.profile.lessons", "Lições do projeto"),
+    ("sdd.profile.role_developer", "Você é um desenvolvedor especialista em {stack} neste projeto."),
+    ("sdd.profile.role_reviewer", "Você é um revisor especialista em {stack} neste projeto."),
+    ("sdd.profile.role_prefix", "Você é um"),
+    ("sdd.profile.role_mark", "especialista"),
+    ("sdd.profile.lessons_reason", "lições da spec {spec}"),
     // Spec 133 T11 (D4): mensagens que o Nants injeta como turno do usuário no meio da sessão de um
     // modelo (conferência final, lembretes, avisos de passos, reperguntas, continuações), no idioma
     // do projeto. Os títulos estruturais citados vêm de `markers` e as etiquetas lidas por parser

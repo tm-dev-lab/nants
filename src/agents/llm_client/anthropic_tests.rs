@@ -1036,7 +1036,7 @@ fn server_tool_blocks_are_anthropic_blocks() {
 /// histórico; e o JSON. A chave, o modelo, o preço e o teto de gasto vêm de [`live_tests`]; o uso e
 /// o custo de cada pedido saem no relatório. Sem novas tentativas.
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_ANTHROPIC_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real da Anthropic com a chave do usuário"]
 async fn anthropic_live_text_and_tool() {
@@ -1188,7 +1188,7 @@ async fn anthropic_live_text_and_tool() {
 /// cache (`cache_control` do adaptador) e o segundo o lê; o custo usa o preço da leitura e o da
 /// escrita.
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_ANTHROPIC_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real da Anthropic com a chave do usuário"]
 async fn anthropic_live_cache() {
@@ -1222,7 +1222,7 @@ async fn anthropic_live_cache() {
 /// busca dinâmica for descartada pela entrada inválida, o aviso de nova tentativa (T11) chega antes
 /// da busca básica.
 ///
-/// Roteiro: `docs/live-tests.md`.
+/// Só roda com `--ignored` e a chave em `NANTS_LIVE_ANTHROPIC_KEY_FILE`, por `scripts/test.sh`.
 #[tokio::test]
 #[ignore = "chama a API real da Anthropic com a chave do usuário e faz uma busca paga"]
 async fn anthropic_live_web_search() {

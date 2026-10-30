@@ -46,7 +46,7 @@ import { useMobileMode } from "./viewport";
 import { Launcher } from "./Launcher";
 import type { LauncherItem } from "./launcher";
 import { NewProjectDialog } from "./NewProjectDialog";
-import { dockSlotAria } from "./shortcuts";
+import { appSlotAria, shortcutById } from "./shortcuts";
 import {
   ShellContext,
   SpaceContext,
@@ -72,7 +72,7 @@ import { networkStateValue, parseNetworkState } from "./network";
 import type { FrameScheduler } from "./useWindowGesture";
 import { usePageVisible, isWindowVisible } from "./useWindowVisibility";
 import { useWindowHost } from "./windowHost";
-import { DOCK_ORDER, WINDOW_META } from "./windowMeta";
+import { APP_ORDER, WINDOW_META } from "./windowMeta";
 import { workspaceForViewport } from "./metrics";
 import { canUndo, MIN_WINDOW_H, WINDOW_KINDS, type Layout, type WindowAction, type WindowKind, type Workspace } from "./windows";
 import { SpaceLoading, SpaceNotFound, Welcome } from "./Welcome";
@@ -340,7 +340,7 @@ function latestSeq(messages: readonly ChatMessage[]): number {
 }
 
 /**
- * Mensagens novas da Conversa chegadas com a janela fora de vista (selo do dock). Assina só a CONTAGEM: o streaming não re-renderiza o desktop.
+ * Mensagens novas da Conversa chegadas com a janela fora de vista (selo do app). Assina só a CONTAGEM: o streaming não re-renderiza o desktop.
  */
 function useConversationUnseen(projectId: string | null, visible: boolean): number {
   const seenRef = useRef<{ projectId: string | null; seq: number } | null>(null);
@@ -370,6 +370,7 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
   const hostAct = useRef<((action: WindowAction) => void) | null>(null);
   const [stopSignal, setStopSignal] = useState(0);
   const [resumeSignal, setResumeSignal] = useState(0);
+  const [nMenuSignal, setNMenuSignal] = useState(0);
   const [architectRequest, setArchitectRequest] = useState<ArchitectRequest | null>(null);
   const mobile = shared.mobile;
   const mobileRef = useRef(mobile);
@@ -613,12 +614,12 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
   );
   const windows = useWindowSpecs(apps, summaryInput);
 
-  const dockKinds = useMemo<WindowKind[] | undefined>(() => {
+  const appKinds = useMemo<WindowKind[] | undefined>(() => {
     if (space !== null) return undefined;
     // Boas-vindas: só as janelas globais.
     return state.layout.windows.setup?.open === true ? ["settings", "setup"] : ["settings"];
   }, [space, state.layout.windows.setup?.open]);
-  const effectiveDock = dockKinds ?? DOCK_ORDER.filter((k) => k !== "setup" || state.layout.windows.setup?.open === true);
+  const effectiveKinds = appKinds ?? APP_ORDER.filter((k) => k !== "setup" || state.layout.windows.setup?.open === true);
 
   // --- Lançador ---
   const goToAttention = useCallback(() => {
@@ -645,6 +646,18 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
         { id: "open-settings", group: "actions", label: t("launcher.openSettings"), icon: "settings", run: () => openWindow("settings") },
         { id: "open-setup", group: "actions", label: t("window.gettingStarted"), icon: "setup", run: openSetup },
       ];
+      // Menu do N (spec 137): só no desktop; o celular tem a barra de baixo própria.
+      const nMenuKeys = shortcutById("nMenu");
+      if (!mobileRef.current) {
+        items.push({
+          id: "open-nmenu",
+          group: "actions",
+          label: t("launcher.openNMenu"),
+          icon: "switcher",
+          ...(nMenuKeys !== undefined ? { keys: nMenuKeys.keys, aria: nMenuKeys.aria } : {}),
+          run: () => setNMenuSignal((n) => n + 1),
+        });
+      }
       // Só com o plano revisando (desabilitado) ou aguardando; planejando, sem o item.
       if (space !== null && (space.planStage === "reviewing" || space.planStage === "awaiting")) {
         const reason = approvePlanBlocker(space, readiness);
@@ -687,11 +700,11 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
           },
         });
       }
-      effectiveDock.forEach((kind, index) => {
+      effectiveKinds.forEach((kind, index) => {
         const win = state.layout.windows[kind];
-        const status = win?.open !== true ? undefined : win.mode === "minimized" ? t("dock.state.minimized") : t("dock.state.open");
+        const status = win?.open !== true ? undefined : win.mode === "minimized" ? t("windowState.minimized") : t("windowState.open");
         const slot = index + 1;
-        const aria = dockSlotAria(slot);
+        const aria = appSlotAria(slot);
         items.push({
           id: `window-${kind}`,
           group: "windows",
@@ -712,7 +725,7 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
       }
       return items;
     },
-    [space, readiness, attentionTotal, effectiveDock, state.layout, windows, projects, spaceId, openNewProject, openWindow, openSetup, approvePlan, goToAttention, switchSpace, lang],
+    [space, readiness, attentionTotal, effectiveKinds, state.layout, windows, projects, spaceId, openNewProject, openWindow, openSetup, approvePlan, goToAttention, switchSpace, lang],
   );
 
   // --- Novo projeto ---
@@ -840,7 +853,7 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
           dispatch={dispatch}
           globalState={shared.globalState}
           windows={windows}
-          {...(dockKinds !== undefined ? { dockKinds } : {})}
+          {...(appKinds !== undefined ? { appKinds } : {})}
           topBar={topBar}
           onOpenLauncher={openLauncher}
           {...(emptyContent !== undefined ? { emptyContent } : {})}
@@ -848,6 +861,8 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
           {...(props.createObserver !== undefined ? { createObserver: props.createObserver } : {})}
           {...(props.scheduler !== undefined ? { scheduler: props.scheduler } : {})}
           {...(mobileControl !== undefined ? { mobile: mobileControl } : {})}
+          {...(config?.version !== undefined ? { version: config.version } : {})}
+          nMenuSignal={nMenuSignal}
         />
       </SpaceContext.Provider>
     </ShellContext.Provider>

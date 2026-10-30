@@ -7,7 +7,7 @@
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState } from "../../test-utils";
@@ -47,7 +47,7 @@ interface Options {
 }
 
 async function openFiles({ taskActive = false, truncated = false, ui, extra = {} }: Options = {}) {
-  // Planejamento (Conversa + Plano): a janela Arquivos só abre pelo dock, depois das rotas falsas.
+  // Planejamento (Conversa + Plano): a janela Arquivos só abre pelo menu do N, depois das rotas falsas.
   const view = await renderShell({
     url: "/?space=p1",
     projects: [P1],
@@ -73,7 +73,7 @@ async function openFiles({ taskActive = false, truncated = false, ui, extra = {}
     return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Arquivos" }));
+    activateApp("Arquivos");
   });
   await settle();
   return { ...view, state };
@@ -140,7 +140,7 @@ describe("Arquivos: árvore", () => {
     const view = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: makeProjectState({ id: "p1", name: "Loja" }) } });
     view.server.reply("GET", /\/files\?/, () => ({ status: 409, body: { error: "segredo do servidor" } }));
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Arquivos" }));
+      activateApp("Arquivos");
     });
     await settle();
     const alert = within(files()).getByRole("alert");
@@ -325,10 +325,9 @@ describe("Arquivos: responsividade e desempenho", () => {
   it("janela minimizada não relê nada com eventos; ao restaurar, atualiza uma vez", async () => {
     const { server } = await openFiles();
     await within(files()).findByRole("tree");
-    const dockButton = within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Arquivos" });
-    // Em foco: o clique no dock minimiza.
+    // Em foco: o item no menu do N minimiza.
     await act(async () => {
-      fireEvent.click(dockButton);
+      activateApp("Arquivos");
     });
     await settle();
     expect((document.querySelector('[data-window="files"]') as HTMLElement).hidden).toBe(true);
@@ -340,7 +339,7 @@ describe("Arquivos: responsividade e desempenho", () => {
     await settle();
     expect(fileCalls(server)).toBe(before);
     await act(async () => {
-      fireEvent.click(dockButton);
+      activateApp("Arquivos");
     });
     await settle();
     expect(fileCalls(server)).toBe(before + 1);
@@ -375,7 +374,7 @@ describe("Arquivos: responsividade e desempenho", () => {
     const fileApi = (): number => view.server.calls.filter((c) => /\/api\/projects\/p1\/files?\?/.test(c.url)).length;
     expect(fileApi()).toBe(0);
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Arquivos" }));
+      activateApp("Arquivos");
     });
     await settle();
     expect(win.hidden).toBe(false);

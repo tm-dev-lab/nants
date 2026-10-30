@@ -1,5 +1,5 @@
 /*
- * Moldura nos dois idiomas (spec 101, T02): barra superior, dock, lançador e busca, barras de
+ * Moldura nos dois idiomas (spec 101, T02): barra superior, menu do N, lançador e busca, barras de
  * título e controles, menu da janela, folha de atalhos, Personalizar, aprovação automática,
  * boas-vindas e estados vazios. Em en, nenhuma frase pt-BR conhecida (as do dicionário) nem
  * acento do português fica visível ou nos rótulos acessíveis; em pt-BR, os textos de hoje.
@@ -15,9 +15,9 @@ import { ptBR, type MessageKey } from "../i18n/ptBR";
 import { bindLanguageToUiState } from "../i18n/uiStateBinding";
 import { makeProject, makeProjectState } from "../test-utils";
 import { BRAND_NAME, BRAND_SLOGAN } from "./brand";
-import { renderShell, settle, TEST_UI_DEPS } from "./shell-test-utils";
+import { activateApp, inNMenu, openAllApps, renderShell, settle, TEST_UI_DEPS } from "./shell-test-utils";
 import { UI_SECTIONS, UiStateSync } from "./uiState";
-import { DOCK_ORDER } from "./windowMeta";
+import { APP_ORDER } from "./windowMeta";
 
 afterEach(() => {
   cleanup();
@@ -80,20 +80,10 @@ function portugueseLeftovers(): string[] {
   });
 }
 
-function dock(): HTMLElement {
-  return screen.getByRole("navigation", { name: "Dock" });
-}
 
-/** Abre todas as janelas pelo dock (cada uma mostra o estado vazio padrão). */
+/** Abre todas as janelas pelo menu do N (cada uma mostra o estado vazio padrão). */
 async function openAllWindows(): Promise<void> {
-  for (const kind of DOCK_ORDER) {
-    const button = dock().querySelector<HTMLButtonElement>(`[data-kind="${kind}"]`);
-    if (button === null || button.getAttribute("data-state") !== "closed") continue;
-    await act(async () => {
-      fireEvent.click(button);
-    });
-  }
-  await settle();
+  await openAllApps();
 }
 
 async function renderSpace(lang: Lang, apps: AppRegistry = FRAME_ONLY) {
@@ -111,8 +101,8 @@ const t = (lang: Lang, key: MessageKey): string => (lang === "en" ? en[key] : pt
 /** Percorre a moldura inteira (janelas, menu, lançador, atalhos, Personalizar, aprovação automática). */
 async function walkFrame(lang: Lang, check: (where: string) => void): Promise<void> {
   await openAllWindows();
-  expect(document.querySelectorAll("[data-window]")).toHaveLength(DOCK_ORDER.length - 1);
-  expect(document.querySelectorAll("[data-empty-state]")).toHaveLength(DOCK_ORDER.length - 1);
+  expect(document.querySelectorAll("[data-window]")).toHaveLength(APP_ORDER.length - 1);
+  expect(document.querySelectorAll("[data-empty-state]")).toHaveLength(APP_ORDER.length - 1);
   check("janelas");
   const conversation = screen.getByRole("region", { name: t(lang, "window.conversation") });
   await act(async () => {
@@ -163,14 +153,14 @@ describe("moldura em inglês", () => {
     expect(within(welcome).getByRole("button", { name: "New project" })).toBeTruthy();
     expect(within(welcome).getByRole("button", { name: "Getting started" })).toBeTruthy();
     expect(within(welcome).getByText("Your projects")).toBeTruthy();
-    expect(within(dock()).getByRole("button", { name: "Settings" })).toBeTruthy();
+    expect(inNMenu((menu) => within(menu).getByRole("button", { name: "Settings" }))).toBeTruthy();
     expect(portugueseLeftovers()).toEqual([]);
   });
 
-  it("espaço aberto: barra, dock, títulos, controles, menus e diálogos sem frase pt-BR", async () => {
+  it("espaço aberto: barra, menu do N, títulos, controles, menus e diálogos sem frase pt-BR", async () => {
     await renderSpace("en");
     expect(
-      DOCK_ORDER.filter((k) => k !== "setup").map((kind) => dock().querySelector(`[data-kind="${kind}"]`)?.getAttribute("aria-label")),
+      inNMenu((menu) => APP_ORDER.filter((k) => k !== "setup").map((kind) => menu.querySelector(`.nd-nmenu-tile[data-kind="${kind}"]`)?.getAttribute("aria-label"))),
     ).toEqual(["Conversation", "Plan", "Board", "Activity", "Files", "App", "Run", "Report", "Costs", "Knowledge", "Project", "Settings"]);
     expect(screen.getByRole("switch", { name: "Auto-approve" }).textContent).toBe("Auto");
     expect(document.querySelector("[data-search]")?.textContent).toContain("Search or ask");
@@ -220,7 +210,7 @@ describe("moldura em pt-BR (igual a hoje)", () => {
   it("espaço aberto: nomes das janelas, barra e diálogos em português", async () => {
     await renderSpace("pt-BR");
     expect(
-      DOCK_ORDER.filter((k) => k !== "setup").map((kind) => dock().querySelector(`[data-kind="${kind}"]`)?.getAttribute("aria-label")),
+      inNMenu((menu) => APP_ORDER.filter((k) => k !== "setup").map((kind) => menu.querySelector(`.nd-nmenu-tile[data-kind="${kind}"]`)?.getAttribute("aria-label"))),
     ).toEqual(["Conversa", "Plano", "Quadro", "Atividade", "Arquivos", "App", "Execução", "Relatório", "Custos", "Conhecimento", "Projeto", "Configurações"]);
     expect(screen.getByRole("switch", { name: "Aprovação automática" }).textContent).toBe("Automático");
     expect(document.querySelector("[data-search]")?.textContent).toContain("Buscar ou pedir");
@@ -248,7 +238,7 @@ describe("Configurações, Aparência: Idioma / Language", () => {
   async function openAppearance(lang: Lang) {
     const view = await renderSpace(lang, DEFAULT_APPS);
     await act(async () => {
-      fireEvent.click(within(dock()).getByRole("button", { name: t(lang, "window.settings") }));
+      activateApp(t(lang, "window.settings"));
     });
     await settle();
     const settings = screen.getByRole("region", { name: t(lang, "window.settings") });
@@ -279,9 +269,9 @@ describe("Configurações, Aparência: Idioma / Language", () => {
     await settle();
     expect(getLanguage()).toBe("en");
     expect(document.documentElement.lang).toBe("en");
-    // Ao vivo: a mesma árvore, agora em inglês (dock, título da janela, abas, barra).
+    // Ao vivo: a mesma árvore, agora em inglês (menu do N, título da janela, abas, barra).
     expect(view.container.ownerDocument.body.firstChild).toBe(before);
-    expect(within(dock()).getByRole("button", { name: "Conversation" })).toBeTruthy();
+    expect(inNMenu((menu) => within(menu).getByRole("button", { name: "Conversation" }))).toBeTruthy();
     const settings = screen.getByRole("region", { name: "Settings" });
     expect(within(settings).getByRole("tab", { name: /^Appearance/ }).getAttribute("aria-selected")).toBe("true");
     expect(within(settings).getByRole("button", { name: "English" }).getAttribute("aria-pressed")).toBe("true");
@@ -297,7 +287,7 @@ describe("Configurações, Aparência: Idioma / Language", () => {
     });
     await settle();
     expect(getLanguage()).toBe("pt-BR");
-    expect(within(dock()).getByRole("button", { name: "Conversa" })).toBeTruthy();
+    expect(inNMenu((menu) => within(menu).getByRole("button", { name: "Conversa" }))).toBeTruthy();
     await waitFor(() => expect(server.model.ui.global?.data[UI_SECTIONS.language]).toEqual({ lang: "pt-BR" }));
   });
 

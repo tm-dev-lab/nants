@@ -6,7 +6,7 @@
  */
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import type { SpaceData } from "../../desktop/useSpaceData";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
@@ -70,7 +70,7 @@ async function mount(lang: Lang, { taskActive = false, truncated = false, listFa
     return { status: 404, body: { error: "não encontrado", code: "not_found" } };
   });
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: NAME[lang] }));
+    activateApp(NAME[lang]);
   });
   await settle();
   return view;

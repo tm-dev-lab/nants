@@ -1,10 +1,7 @@
 /*
- * Marca na barra superior (spec 093, decisão 8; spec 094, decisão 4): símbolo e um bloco de duas
- * linhas, centrado na barra: "Nants" em cima e, embaixo, o slogan INTEIRO numa linha só (sem
- * aumentar a altura da barra). O texto vem só de `BRAND_SLOGAN`; se não couber na largura, some
- * (nunca quebra) antes de qualquer controle, e continua para leitores de tela.
+ * Símbolo da marca (spec 093, decisão 8). Na barra de cima ele é o botão N (spec 137, `NMenu.tsx`):
+ * o nome e o slogan saíram da barra e ficam no topo do menu, o slogan logo depois do nome.
  */
-import { BRAND_NAME, BRAND_SLOGAN } from "../brand";
 import { BRAND } from "../theme/tokens";
 
 /** Símbolo "N" (três peças nas cores da marca). Decorativo: o nome vem ao lado. */
@@ -21,19 +18,5 @@ export function NantsSymbol({ size = 20 }: { size?: number }) {
         d="M185 9 Q185 -5 199 3 L271 48 Q285 57 285 72 V237 Q285 251 273 243 L229 215 Q215 207 215 193 V130 Q215 116 203 108 L196 104 Q185 98 185 85 Z"
       />
     </svg>
-  );
-}
-
-export function BrandMark() {
-  return (
-    <div className="nd-brand" data-brand="">
-      <NantsSymbol size={22} />
-      <span className="nd-brand-text">
-        <span className="nd-brand-name">{BRAND_NAME}</span>
-        <span className="nd-brand-slogan" data-brand-slogan="">
-          {BRAND_SLOGAN}
-        </span>
-      </span>
-    </div>
   );
 }

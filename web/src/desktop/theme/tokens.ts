@@ -6,7 +6,7 @@
  * - os papéis de parede (Pontos, Nebulosa, Aurora e Liso), com versão por tema;
  * - o material "titânio com reflexo" (095/T01, `--chrome`, `--chrome-muted`, `--hi`, `--lo`,
  *   `--bevel`): base opaca de 3 paradas com faixa de luz, ponto de brilho e faixa diagonal por cima,
- *   na barra superior, nas barras de título, no dock e nos segmentados; as sobreposições são `--overlay`;
+ *   na barra superior, nas barras de título e nos segmentados; as sobreposições são `--overlay`;
  * - a estrutura interna das janelas sem borda (095/T01): `--divider`, `--lane` e `--card-edge`;
  * - a escala de acabamento (094/T06): raios `--r-*`, espaços `--sp-*`, fontes `--fs-*`/`--fw-*`,
  *   elevação `--elev-1..4`, estados `--state-*` e os tamanhos de ícone;
@@ -76,12 +76,12 @@ export const DANGER_INK = {
  * Os valores são os do mockup e o reflexo nunca fica abaixo dele (decisão do Arquiteto na revisão
  * da T01). O contraste (C-01) é medido onde o conteúdo fica: `titaniumExtremes` (em `contrast.ts`)
  * amostra uma grade x × y com o alfa real de cada camada em cada ponto, na área de conteúdo das
- * superfícies de titânio (`CHROME_SURFACES`): de 25% a 75% da altura nas barras, nos títulos e no
- * dock, onde os controles são centralizados. Os testes exigem 4,5:1 (texto) e 3:1 (ícone e foco)
+ * superfícies de titânio (`CHROME_SURFACES`): de 25% a 75% da altura nas barras e nos títulos,
+ * onde os controles são centralizados. Os testes exigem 4,5:1 (texto) e 3:1 (ícone e foco)
  * na amostra mais clara e na mais escura. O que não fecha se resolve nas cores do conteúdo sobre o
  * cromo (`chromeInk`, `chromeMuted`, `chromeIcon`, `chromePillInk`), nunca no reflexo.
  *
- * O titânio fica SÓ na barra superior, nas barras de título, no dock (e nas abas do celular) e nos
+ * O titânio fica SÓ na barra superior, nas barras de título (e nas abas do celular) e nos
  * controles segmentados. As sobreposições (menus, popovers, lançador, avisos, dicas) são uma
  * superfície sólida elevada (`overlay`), como no mockup (decisão do Arquiteto na revisão 1 da T01).
  */
@@ -129,7 +129,7 @@ export const TONES: readonly Tone[] = ["violet", "cyan", "amber", "green", "rose
 
 /**
  * Raios (px). Raios aninhados são concêntricos: o interno é o externo menos o padding entre eles
- * (menu `lg` − `sp-1` = item `md`; dock `2xl` − `sp-2` = ícone `lg`; lançador `xl` − `sp-2` da lista =
+ * (menu `lg` − `sp-1` = item `md`; lançador `xl` − `sp-2` da lista =
  * resultado `md`; pílula `lg` − `sp-1` = Parar `md`). O `xl` (16) é o raio do lançador (095/T02).
  */
 export const RADII = { xs: 4, sm: 6, md: 8, lg: 12, xl: 16, "2xl": 20, pill: 999 } as const;
@@ -142,7 +142,7 @@ export const SPACE = { 1: 4, 2: 8, 3: 12, 4: 16, 5: 20, 6: 24, 8: 32, 10: 40, 12
  * O corpo do app é 14 px; os controles (título de janela, botão, pílula, linha densa) ficam em 13.
  */
 export const FONT_SIZES = {
-  /** Selos e contadores mínimos (selo do dock, pílula pequena). */
+  /** Selos e contadores mínimos (selo dos apps, pílula pequena). */
   micro: "10px",
   /** Legenda: hora, rótulo em caixa alta e `<kbd>`. */
   caption: "11px",
@@ -179,10 +179,10 @@ export type IconSize = (typeof ICON_SIZES)[number];
 export const ICON_STROKE = 1.8;
 
 /** Níveis de elevação (sombra) e o papel de cada um. */
-type Elevation = "dock" | "back" | "menu" | "front";
-export const ELEVATIONS: readonly Elevation[] = ["dock", "back", "menu", "front"];
-/** `--elev-1` dock, `--elev-2` janela atrás, `--elev-3` menu/popover, `--elev-4` janela em foco e diálogo. */
-export const ELEVATION_LEVEL: Readonly<Record<Elevation, number>> = { dock: 1, back: 2, menu: 3, front: 4 };
+type Elevation = "raised" | "back" | "menu" | "front";
+export const ELEVATIONS: readonly Elevation[] = ["raised", "back", "menu", "front"];
+/** `--elev-1` superfície elevada baixa (era a do dock, que saiu na 137/T02), `--elev-2` janela atrás, `--elev-3` menu/popover, `--elev-4` janela em foco e diálogo. */
+export const ELEVATION_LEVEL: Readonly<Record<Elevation, number>> = { raised: 1, back: 2, menu: 3, front: 4 };
 
 /**
  * Bisel do titânio: a borda de luz no topo (`--hi`) e a linha escura na base (`--lo`), que separa a
@@ -264,8 +264,24 @@ interface ThemeTokens {
   /** Véu atrás das sobreposições modais (lançador, diálogos): escurece a janela de trás. */
   scrim: string;
   shadow: string;
-  /** Material titânio com reflexo (barra superior, títulos, dock e segmentados). */
+  /** Material titânio com reflexo (barra superior, títulos e segmentados). */
   titanium: Titanium;
+  /**
+   * Menu do N (spec 137, `reference/menu-n.dc.html`): o botão em relevo discreto na barra (brilho em
+   * cima e sombra curta embaixo) que afunda com o menu aberto (sombra interna e fundo mais escuro,
+   * sem contorno colorido), o ponto rosa de novidade com o anel na cor do titânio, a sombra do
+   * menu (um degrau acima das sobreposições) e o véu que escurece a área de trabalho.
+   */
+  nMenu: {
+    buttonBg: string;
+    buttonBgOpen: string;
+    buttonShadow: string;
+    buttonShadowOpen: string;
+    dot: string;
+    dotRing: string;
+    shadow: string;
+    scrim: string;
+  };
   /**
    * Superfície sólida elevada das sobreposições (menus, popovers, sino, folha de atalhos,
    * Personalizar, lançador, avisos, toasts e dicas; classe `.nd-overlay`), como no mockup
@@ -285,14 +301,14 @@ interface ThemeTokens {
   chromeInk: string;
   /** Texto secundário, borda de controle e ícone neutro sobre o titânio. */
   chromeMuted: string;
-  /** Ícones por tom sobre o titânio (dock, barras), também em hover, pressionado e foco do dock. */
+  /** Ícones por tom sobre o titânio (barras), também em hover, pressionado e foco. */
   chromeIcon: Readonly<Record<Tone, string>>;
   /** Texto das pílulas sobre o titânio (pílula de execução); o rosa também é o `--danger-ink` lá. */
   chromePillInk: Readonly<Record<Tone, string>>;
   // Bordas que identificam componentes (≥ 3:1).
   edgeStrong: string;
   /**
-   * Indicador de seleção (item escolhido num grupo, janela em foco no dock): ≥ 3:1. Nunca é a
+   * Indicador de seleção (item escolhido num grupo, app em foco): ≥ 3:1. Nunca é a
    * moldura da janela, que não tem borda (095/T01): a sombra e o contraste da superfície a separam.
    */
   selectedEdge: string;
@@ -321,7 +337,7 @@ interface ThemeTokens {
   accentSoft: string;
   // Ícones por tom.
   icon: Readonly<Record<Tone, string>>;
-  // Selo do dock.
+  // Selo dos apps (menu do N e celular).
   badgeBg: string;
   badgeInk: string;
   // Prévia de encaixe.
@@ -367,6 +383,18 @@ export const THEMES: Readonly<Record<ThemeName, ThemeTokens>> = {
       edgeTop: "rgba(255, 255, 255, 0.16)",
       edgeBottom: "rgba(0, 0, 0, 0.45)",
     },
+    nMenu: {
+      buttonBg: "linear-gradient(180deg, #34343F, #1F1F28)",
+      buttonBgOpen: "linear-gradient(180deg, #121219, #1A1A23)",
+      buttonShadow:
+        "inset 0 1px 0 rgba(255, 255, 255, 0.14), inset 0 -2px 0 rgba(0, 0, 0, 0.35), 0 3px 8px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.06)",
+      buttonShadowOpen: "inset 0 3px 8px rgba(0, 0, 0, 0.7), inset 0 1px 2px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 255, 255, 0.06)",
+      dot: "#F43F5E",
+      // A base do titânio no meio da barra: o anel separa o ponto do botão.
+      dotRing: "0 0 0 2px #2B2B35",
+      shadow: "0 28px 70px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.07), inset 0 1px 0 rgba(255, 255, 255, 0.06)",
+      scrim: "rgba(0, 0, 0, 0.55)",
+    },
     /*
      * No ponto mais claro das barras (faixa de 25% a 75%, L≈0,12) o `--ink` (#F4F4F6) cai para 4,2:1 com a
      * camada de pressionado, o `--muted` para 2,4:1 e os ícones violeta e rosa para 2,2:1. Sobre o
@@ -406,10 +434,10 @@ export const THEMES: Readonly<Record<ThemeName, ThemeTokens>> = {
     statePress: "rgba(255, 255, 255, 0.12)",
     /*
      * Janelas sem borda (095/T01): dois níveis de sombra nas janelas, `back` (atrás) e `front` (em
-     * foco, a `winShadow` do mockup). Menus e dock mantêm os níveis 3 e 1 (C-16).
+     * foco, a `winShadow` do mockup). Menus mantêm o nível 3 (C-16).
      */
     elevation: {
-      dock: "0 8px 24px rgba(0, 0, 0, 0.36), 0 1px 2px rgba(0, 0, 0, 0.4)",
+      raised: "0 8px 24px rgba(0, 0, 0, 0.36), 0 1px 2px rgba(0, 0, 0, 0.4)",
       back: "0 20px 36px -16px rgba(0, 0, 0, 0.7), 0 4px 12px rgba(0, 0, 0, 0.38)",
       menu: "0 16px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.32)",
       front: "0 36px 80px -24px rgba(0, 0, 0, 0.85), 0 10px 28px rgba(0, 0, 0, 0.45)",
@@ -469,6 +497,17 @@ export const THEMES: Readonly<Record<ThemeName, ThemeTokens>> = {
       edgeTop: "rgba(255, 255, 255, 0.95)",
       edgeBottom: "rgba(17, 17, 27, 0.07)",
     },
+    nMenu: {
+      buttonBg: "linear-gradient(180deg, #FFFFFF, #ECECF2)",
+      buttonBgOpen: "linear-gradient(180deg, #E2E2EA, #ECECF2)",
+      buttonShadow:
+        "inset 0 1px 0 #FFFFFF, inset 0 -2px 0 rgba(17, 17, 27, 0.08), 0 3px 8px rgba(17, 17, 27, 0.14), 0 1px 2px rgba(17, 17, 27, 0.1), 0 0 0 1px rgba(17, 17, 27, 0.06)",
+      buttonShadowOpen: "inset 0 3px 8px rgba(17, 17, 27, 0.22), inset 0 1px 2px rgba(17, 17, 27, 0.18), 0 1px 0 rgba(255, 255, 255, 0.9)",
+      dot: "#F43F5E",
+      dotRing: "0 0 0 2px #DEDEE5",
+      shadow: "0 28px 70px rgba(17, 17, 27, 0.28), 0 0 0 1px rgba(17, 17, 27, 0.06)",
+      scrim: "rgba(17, 17, 27, 0.28)",
+    },
     // No ponto mais escuro (L≈0,66) o `--muted` (#5B5B66) fica em 3,8:1 com o pressionado e o verde
     // em 2,8:1; o ciano, em 3,0:1: sobre o titânio escurecem um passo.
     chromeInk: "#16161F",
@@ -501,7 +540,7 @@ export const THEMES: Readonly<Record<ThemeName, ThemeTokens>> = {
     stateHover: "rgba(17, 17, 27, 0.05)",
     statePress: "rgba(17, 17, 27, 0.09)",
     elevation: {
-      dock: "0 8px 24px rgba(30, 30, 60, 0.12), 0 1px 2px rgba(30, 30, 60, 0.1)",
+      raised: "0 8px 24px rgba(30, 30, 60, 0.12), 0 1px 2px rgba(30, 30, 60, 0.1)",
       back: "0 20px 36px -16px rgba(40, 28, 80, 0.24), 0 4px 12px rgba(40, 28, 80, 0.08)",
       menu: "0 16px 40px rgba(30, 30, 60, 0.16), 0 2px 8px rgba(30, 30, 60, 0.08)",
       front: "0 30px 70px -22px rgba(40, 28, 80, 0.32), 0 6px 18px rgba(40, 28, 80, 0.1)",
@@ -662,6 +701,14 @@ export function themeVariables(theme: ThemeName): CssVariables {
     "--shadow": t.shadow,
     "--chrome": titaniumCss(t.titanium),
     "--overlay": t.overlay,
+    "--nbtn-bg": t.nMenu.buttonBg,
+    "--nbtn-bg-open": t.nMenu.buttonBgOpen,
+    "--elev-nbtn": t.nMenu.buttonShadow,
+    "--elev-nbtn-open": t.nMenu.buttonShadowOpen,
+    "--ndot": t.nMenu.dot,
+    "--ring-ndot": t.nMenu.dotRing,
+    "--elev-nmenu": t.nMenu.shadow,
+    "--nmenu-scrim": t.nMenu.scrim,
     "--overlay-edge": t.overlayEdge,
     "--chrome-ink": t.chromeInk,
     "--chrome-muted": t.chromeMuted,

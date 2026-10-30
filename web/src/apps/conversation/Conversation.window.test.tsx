@@ -1,14 +1,14 @@
 /*
  * Janela Conversa montada pelo shell (spec 093, T06): bloqueio por prontidão (`readiness.chat`),
  * 412 `prereq_missing`, o cartão "Plano pronto · Abrir Plano", o plano pronto que abre sem roubar
- * o foco, o pedido do lançador, a rolagem salva no ui-state, os selos do dock e o arrasto de
+ * o foco, o pedido do lançador, a rolagem salva no ui-state, os selos dos apps e o arrasto de
  * imagem que não vira gesto do desktop.
  */
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApiEvent, ProjectState } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { notReady, READY, renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, appBadge, notReady, READY, renderShell, settle } from "../../desktop/shell-test-utils";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
 
@@ -37,11 +37,6 @@ function field(): HTMLTextAreaElement {
   return within(conversation()).getByRole("textbox", { name: "Mensagem para o Arquiteto" }) as HTMLTextAreaElement;
 }
 
-function dockButton(kind: string): HTMLElement {
-  const el = document.querySelector<HTMLElement>(`.nd-dock-btn[data-kind="${kind}"]`);
-  if (el === null) throw new Error(`dock sem ${kind}`);
-  return el;
-}
 
 describe("Conversa: prontidão para conversar", () => {
   it("sem readiness.chat: campo, anexar e enviar desabilitados, com o que falta e Configurar na aba certa", async () => {
@@ -117,8 +112,8 @@ describe("Conversa: plano pronto", () => {
     await settle();
     expect(screen.getByRole("region", { name: "Plano" })).toBeTruthy();
     expect(document.activeElement).toBe(field());
-    // Destaque no dock: selo de plano pronto.
-    expect(dockButton("plan").querySelector("[data-badge]")?.textContent).toBe("1");
+    // Destaque no menu do N: selo de plano pronto.
+    expect(appBadge("plan")).toBe("1");
   });
 });
 
@@ -136,9 +131,9 @@ describe("Conversa: pedidos e selos", () => {
     expect(document.activeElement).toBe(field());
   });
 
-  it("selo da Conversa no dock: pedidos pendentes e mensagens novas com a janela minimizada", async () => {
+  it("selo da Conversa no menu do N: pedidos pendentes e mensagens novas com a janela minimizada", async () => {
     const { stream } = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: planning() } });
-    expect(dockButton("conversation").querySelector("[data-badge]")).toBeNull();
+    expect(appBadge("conversation")).toBeNull();
     // Minimiza a Conversa: mensagens novas ao vivo passam a contar.
     fireEvent.click(within(conversation()).getByRole("button", { name: "Minimizar" }));
     await settle();
@@ -150,7 +145,7 @@ describe("Conversa: pedidos e selos", () => {
       });
     });
     await settle();
-    expect(dockButton("conversation").querySelector("[data-badge]")?.textContent).toBe("1");
+    expect(appBadge("conversation")).toBe("1");
     // Pedido de permissão pendente também conta.
     await act(async () => {
       stream().emit("permission_requested", {
@@ -160,11 +155,11 @@ describe("Conversa: pedidos e selos", () => {
       });
     });
     await settle();
-    expect(dockButton("conversation").querySelector("[data-badge]")?.textContent).toBe("2");
+    expect(appBadge("conversation")).toBe("2");
     // Restaurar a janela zera as novas; o pedido continua.
-    fireEvent.click(dockButton("conversation"));
+    activateApp("Conversa");
     await settle();
-    expect(dockButton("conversation").querySelector("[data-badge]")?.textContent).toBe("1");
+    expect(appBadge("conversation")).toBe("1");
     expect(appStore.getState().permissions.p1).toHaveLength(1);
   });
 });

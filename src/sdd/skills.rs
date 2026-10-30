@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::i18n::{self, Lang};
 use crate::sdd::split_frontmatter;
 
 /// Diretório dos perfis, relativo à raiz do projeto.
@@ -17,12 +18,44 @@ pub const ROLES: [&str; 2] = ["developer", "reviewer"];
 pub const MAX_PROFILE_BYTES: usize = 2048;
 /// Limite próprio da seção de lições (cabeçalho incluído): até 5 lições de 300 bytes.
 pub const MAX_LESSONS_SECTION_BYTES: usize = 1700;
-/// Seção do usuário, preservada literalmente pelo Arquiteto.
-pub const USER_NOTES_SECTION: &str = "## Notas do usuário";
-/// Seção de lições, atualizada só no turno pós-spec.
-pub const LESSONS_SECTION: &str = "## Lições do projeto";
+/// Seção do usuário, preservada pelo conteúdo pelo Arquiteto (chave do dicionário, spec 137 T12):
+/// o título sai no idioma do projeto e é lido nas formas de todos os idiomas.
+pub const USER_NOTES_KEY: &str = "sdd.profile.user_notes";
+/// Seção de lições, atualizada só no turno pós-spec (chave do dicionário, como a de cima).
+pub const LESSONS_KEY: &str = "sdd.profile.lessons";
 /// Máximo de entradas em `stack`.
 const MAX_STACK_ITEMS: usize = 8;
+
+/// Cabeçalho `## <título>` da seção `key` ([`USER_NOTES_KEY`] ou [`LESSONS_KEY`]) no idioma.
+pub fn heading(lang: Lang, key: &str) -> String {
+    format!("## {}", i18n::text(lang, key))
+}
+
+/// A linha é o cabeçalho da seção `key` em algum idioma (perfis antigos, em pt, continuam lidos).
+pub fn is_heading(line: &str, key: &str) -> bool {
+    let line = line.trim_end();
+    i18n::forms(key).iter().any(|t| line.strip_prefix("## ") == Some(*t))
+}
+
+/// Texto da seção `key` com o título em qualquer idioma (a primeira que aparecer no corpo).
+pub fn section_of(body: &str, key: &str) -> Option<String> {
+    let first = body.lines().find(|l| is_heading(l, key))?;
+    section(body, first.trim_end())
+}
+
+/// Linha de papel do perfil no idioma (spec 137 T12): "Você é um desenvolvedor especialista em
+/// <stack> neste projeto." ou a forma do Revisor.
+pub fn role_line(lang: Lang, role: &str, stack: &str) -> String {
+    let key = if role == "reviewer" { "sdd.profile.role_reviewer" } else { "sdd.profile.role_developer" };
+    i18n::tr(lang, key, &[("stack", stack)])
+}
+
+/// A linha abre o perfil com o papel em algum idioma: começa pelo prefixo e cita o especialista.
+fn is_role_line(line: &str) -> bool {
+    Lang::ALL.into_iter().any(|lang| {
+        line.starts_with(&i18n::text(lang, "sdd.profile.role_prefix")) && line.contains(&i18n::text(lang, "sdd.profile.role_mark"))
+    })
+}
 
 /// Caminho relativo do perfil do papel.
 pub fn rel_path(role: &str) -> String {
@@ -83,13 +116,13 @@ pub fn section(body: &str, title_line: &str) -> Option<String> {
     found.then(|| out.trim().to_string())
 }
 
-/// Separa o texto sem a seção `## Lições do projeto` e o tamanho em bytes dessa seção.
+/// Separa o texto sem a seção de lições (título em qualquer idioma) e o tamanho em bytes dessa seção.
 fn split_lessons_size(content: &str) -> (usize, usize) {
     let mut rest = 0;
     let mut lessons = 0;
     let mut inside = false;
     for line in content.split_inclusive('\n') {
-        if line.trim_end() == LESSONS_SECTION {
+        if is_heading(line, LESSONS_KEY) {
             inside = true;
         } else if inside && line.starts_with("## ") {
             inside = false;
@@ -116,14 +149,14 @@ pub fn validate(role: &str, content: &str, existing: Option<&str>) -> Result<(),
     validate_with(role, content, existing, false)
 }
 
-/// Gravação do Arquiteto (spec 064): além de [`validate`], o corpo abre com a linha de papel
-/// ("Você é um ... especialista ..."). Perfis antigos sem a linha seguem lidos e injetados.
+/// Gravação do Arquiteto (spec 064): além de [`validate`], o corpo abre com a linha de papel em
+/// algum idioma ([`role_line`]; spec 137 T12). Perfis antigos sem a linha seguem lidos e injetados.
 pub fn validate_architect(role: &str, content: &str, existing: Option<&str>) -> Result<(), &'static str> {
     validate_with(role, content, existing, false)?;
     let profile = parse(content).ok_or("frontmatter do perfil ausente ou inválido")?;
     let first = profile.body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    if !(first.starts_with("Você é um") && first.contains("especialista")) {
-        return Err("perfil deve abrir com a linha de papel: 'Você é um <papel> especialista em <stack> neste projeto.'");
+    if !is_role_line(first) {
+        return Err("perfil deve abrir com a linha de papel no idioma do projeto: 'Você é um <papel> especialista em <stack> neste projeto.' ou 'You are an expert <role> in <stack> for this project.'");
     }
     Ok(())
 }
@@ -142,7 +175,7 @@ pub fn validate_with(
         return Err("perfil acima de 2 KiB (a seção de lições tem limite próprio)");
     }
     if lessons > MAX_LESSONS_SECTION_BYTES {
-        return Err("seção '## Lições do projeto' acima do limite");
+        return Err("seção de lições do projeto acima do limite");
     }
     if content.contains("://") {
         return Err("perfil não pode conter URLs ('://'); cite referências só por nome");
@@ -168,14 +201,15 @@ pub fn validate_with(
     if let Some(old) = existing {
         let old_profile = parse(old);
         let old_body = old_profile.as_ref().map_or(old, |p| p.body.as_str());
-        if let Some(notes) = section(old_body, USER_NOTES_SECTION) {
-            if section(&profile.body, USER_NOTES_SECTION).as_deref() != Some(notes.as_str()) {
-                return Err("a seção '## Notas do usuário' é do usuário: preserve-a literalmente");
+        // Spec 137 T12: comparadas pelo conteúdo, com o título em qualquer idioma.
+        if let Some(notes) = section_of(old_body, USER_NOTES_KEY) {
+            if section_of(&profile.body, USER_NOTES_KEY).as_deref() != Some(notes.as_str()) {
+                return Err("a seção de notas do usuário é do usuário: preserve o conteúdo literalmente");
             }
         }
-        if let Some(lessons) = section(old_body, LESSONS_SECTION).filter(|_| !server_update) {
-            if section(&profile.body, LESSONS_SECTION).as_deref() != Some(lessons.as_str()) {
-                return Err("a seção '## Lições do projeto' é atualizada ao concluir a spec: preserve-a literalmente");
+        if let Some(lessons) = section_of(old_body, LESSONS_KEY).filter(|_| !server_update) {
+            if section_of(&profile.body, LESSONS_KEY).as_deref() != Some(lessons.as_str()) {
+                return Err("a seção de lições do projeto é atualizada ao concluir a spec: preserve o conteúdo literalmente");
             }
         }
         if !server_update && old.trim() != content.trim() {
@@ -222,16 +256,17 @@ pub fn clean_lessons(candidates: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Reescreve só a seção `## Lições do projeto` (e `updated_at`, `source_spec`, `reason` do
-/// frontmatter) de um perfil existente, preservando o resto literalmente (inclusive as notas do
-/// usuário). `None` se o perfil não for interpretável ou não houver lições.
-pub fn with_lessons(content: &str, lessons: &[String], spec_id: &str, today: &str) -> Option<String> {
+/// Reescreve só a seção de lições (e `updated_at`, `source_spec`, `reason` do frontmatter) de um
+/// perfil existente, preservando o resto literalmente (inclusive as notas do usuário). A seção e o
+/// `reason` saem no idioma `lang` do projeto; a seção antiga é achada com o título em qualquer
+/// idioma (spec 137 T12). `None` se o perfil não for interpretável ou não houver lições.
+pub fn with_lessons(lang: Lang, content: &str, lessons: &[String], spec_id: &str, today: &str) -> Option<String> {
     if lessons.is_empty() {
         return None;
     }
     parse(content)?;
     let (yaml, body) = split_frontmatter(content).ok()?;
-    let reason = format!("lições da spec {spec_id}");
+    let reason = i18n::tr(lang, "sdd.profile.lessons_reason", &[("spec", spec_id)]);
     let mut seen = [false; 3];
     let mut fm = String::new();
     for line in yaml.lines() {
@@ -253,10 +288,10 @@ pub fn with_lessons(content: &str, lessons: &[String], spec_id: &str, today: &st
     if !seen[2] {
         fm.push_str(&format!("reason: {reason}\n"));
     }
-    let section_text = format!("{LESSONS_SECTION}\n{}\n", lessons.join("\n"));
+    let section_text = format!("{}\n{}\n", heading(lang, LESSONS_KEY), lessons.join("\n"));
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
     let mut new_body = String::new();
-    if let Some(start) = lines.iter().position(|l| l.trim_end() == LESSONS_SECTION) {
+    if let Some(start) = lines.iter().position(|l| is_heading(l, LESSONS_KEY)) {
         let end = lines[start + 1..].iter().position(|l| l.starts_with("## ")).map_or(lines.len(), |p| start + 1 + p);
         lines[..start].iter().for_each(|l| new_body.push_str(l));
         new_body.push_str(&section_text);
@@ -264,7 +299,7 @@ pub fn with_lessons(content: &str, lessons: &[String], spec_id: &str, today: &st
             new_body.push('\n');
         }
         lines[end..].iter().for_each(|l| new_body.push_str(l));
-    } else if let Some(notes) = lines.iter().position(|l| l.trim_end() == USER_NOTES_SECTION) {
+    } else if let Some(notes) = lines.iter().position(|l| is_heading(l, USER_NOTES_KEY)) {
         lines[..notes].iter().for_each(|l| new_body.push_str(l));
         new_body.push_str(&section_text);
         new_body.push('\n');
@@ -462,21 +497,53 @@ mod tests {
     fn with_lessons_replaces_only_its_section_and_keeps_user_notes() {
         let base = doc("developer", "", &format!("{BODY}## Notas do usuário\n- usar sempre cljfmt\n"));
         let lessons = vec!["- a (T01/F-01)".to_string()];
-        let once = with_lessons(&base, &lessons, "064-y", "2026-10-17").expect("novo");
+        let once = with_lessons(Lang::PtBr, &base, &lessons, "064-y", "2026-10-17").expect("novo");
         validate("developer", &once, Some(&base)).expect("válido sobre o antigo");
         let p = parse(&once).expect("parse");
         assert_eq!((p.meta.source_spec.as_str(), p.meta.updated_at.as_str()), ("064-y", "2026-10-17"));
-        assert_eq!(section(&p.body, LESSONS_SECTION).as_deref(), Some("- a (T01/F-01)"));
-        assert_eq!(section(&p.body, USER_NOTES_SECTION).as_deref(), Some("- usar sempre cljfmt"));
-        assert!(p.body.find(LESSONS_SECTION) < p.body.find(USER_NOTES_SECTION));
+        assert_eq!(section_of(&p.body, LESSONS_KEY).as_deref(), Some("- a (T01/F-01)"));
+        assert_eq!(section_of(&p.body, USER_NOTES_KEY).as_deref(), Some("- usar sempre cljfmt"));
+        assert!(p.body.find(&heading(Lang::PtBr, LESSONS_KEY)) < p.body.find(&heading(Lang::PtBr, USER_NOTES_KEY)));
         // segunda rodada substitui a seção e troca o motivo.
-        let twice = with_lessons(&once, &["- b (T02)".to_string()], "065-z", "2026-10-18").expect("troca");
+        let twice = with_lessons(Lang::PtBr, &once, &["- b (T02)".to_string()], "065-z", "2026-10-18").expect("troca");
         let p2 = parse(&twice).expect("parse");
-        assert_eq!(section(&p2.body, LESSONS_SECTION).as_deref(), Some("- b (T02)"));
+        assert_eq!(section_of(&p2.body, LESSONS_KEY).as_deref(), Some("- b (T02)"));
         assert_eq!(p2.meta.reason.as_deref(), Some("lições da spec 065-z"));
-        assert_eq!(twice.matches(LESSONS_SECTION).count(), 1);
-        assert!(with_lessons(&base, &[], "x", "d").is_none());
-        assert!(with_lessons("lixo", &lessons, "x", "d").is_none());
+        assert_eq!(twice.matches(&heading(Lang::PtBr, LESSONS_KEY)).count(), 1);
+        assert!(with_lessons(Lang::PtBr, &base, &[], "x", "d").is_none());
+        assert!(with_lessons(Lang::PtBr, "lixo", &lessons, "x", "d").is_none());
+    }
+
+    /// Spec 137 T12 (135 P6): perfil de projeto en. A linha de papel e as seções saem em inglês, o
+    /// validador aceita as duas formas e as notas do usuário são comparadas pelo conteúdo, com o título
+    /// em qualquer idioma; o perfil antigo, em pt, continua lido.
+    #[test]
+    fn english_profile_uses_english_titles_and_reads_the_old_portuguese_ones() {
+        let en_role = role_line(Lang::En, "developer", "Clojure");
+        assert_eq!(en_role, "You are an expert developer in Clojure for this project.");
+        assert_eq!(role_line(Lang::PtBr, "reviewer", "Clojure"), "Você é um revisor especialista em Clojure neste projeto.");
+        let en = doc("developer", "", &format!("{en_role}\n{BODY}"));
+        validate_architect("developer", &en, None).expect("linha de papel em inglês");
+        let en_rev = doc("reviewer", "", &format!("{}\n{BODY}", role_line(Lang::En, "reviewer", "Clojure")));
+        validate_architect("reviewer", &en_rev, None).expect("revisor em inglês");
+        // Notas do usuário em pt num perfil antigo: o Arquiteto pode trocar o título para o idioma do projeto.
+        let old = doc("developer", "", &format!("{en_role}\n{BODY}## Notas do usuário\n- usar sempre cljfmt\n"));
+        let renamed = doc("developer", "reason: lesson\n", &format!("{en_role}\n{BODY}## User notes\n- usar sempre cljfmt\n"));
+        validate("developer", &renamed, Some(&old)).expect("mesmo conteúdo, título em inglês");
+        let altered = doc("developer", "reason: lesson\n", &format!("{en_role}\n{BODY}## User notes\n- other\n"));
+        assert!(validate("developer", &altered, Some(&old)).is_err(), "conteúdo das notas protegido");
+        // Lições: a seção antiga em pt é trocada pela do idioma do projeto, e o motivo sai em inglês.
+        let with_pt = doc("developer", "", &format!("{en_role}\n{BODY}## Lições do projeto\n- a (T01)\n## Notas do usuário\n- n\n"));
+        let out = with_lessons(Lang::En, &with_pt, &["- b (T02)".to_string()], "002-x", "2026-10-30").expect("lições");
+        validate_with("developer", &out, Some(&with_pt), true).expect("servidor");
+        let p = parse(&out).expect("parse");
+        assert_eq!(p.meta.reason.as_deref(), Some("lessons from spec 002-x"));
+        assert_eq!(section_of(&p.body, LESSONS_KEY).as_deref(), Some("- b (T02)"));
+        assert!(out.contains("## Project lessons\n") && !out.contains("Lições do projeto"), "{out}");
+        assert_eq!(section_of(&p.body, USER_NOTES_KEY).as_deref(), Some("- n"));
+        // Leitura tolerante dos dois idiomas.
+        assert!(is_heading("## Lições do projeto", LESSONS_KEY) && is_heading("## Project lessons  ", LESSONS_KEY));
+        assert!(!is_heading("## Lessons", LESSONS_KEY));
     }
 
     #[test]

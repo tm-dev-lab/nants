@@ -29,6 +29,14 @@ const MAX_OUTPUT: usize = 64 * 1024;
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(900);
 const POLL: Duration = Duration::from_millis(20);
 
+/// Spec 137 T09: chave, no override, da rede da rodada offline. É uma rede `internal: true`: corta
+/// a saída para a internet e mantém os serviços irmãos (um banco usado pelos testes) acessíveis pelo
+/// nome. Não se usa `network_mode: none` porque ele não combina com `networks` (o Compose recusa os
+/// dois juntos) e isolaria o `workspace` também dos serviços irmãos.
+pub const OFFLINE_NETWORK: &str = "nants-offline";
+/// Arquivo do override da rodada offline, ao lado do override de sempre.
+const OFFLINE_OVERRIDE_FILE: &str = "override-offline.yaml";
+
 /// Uma chamada a `docker` (args fixos, sem shell).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposeCall {
@@ -584,6 +592,12 @@ impl ComposeEnv {
 
     /// Como [`Self::load`]; `run_command` (já normalizado) vira o `command` do workspace no override.
     fn load_with(&self, dir: &Path, run_command: Option<&str>) -> Result<(Value, PathBuf, String), String> {
+        self.load_variant(dir, run_command, None)
+    }
+
+    /// Como [`Self::load_with`]; com `offline` (o nome da rede interna), grava o override da rodada
+    /// offline ([`OFFLINE_OVERRIDE_FILE`]), com a rede `internal: true` (spec 137 T09).
+    fn load_variant(&self, dir: &Path, run_command: Option<&str>, offline: Option<&str>) -> Result<(Value, PathBuf, String), String> {
         let current = env_hash(dir).ok_or("ambiente docker sem .nants/compose.yaml")?;
         let approved = self.approved.lock().unwrap_or_else(PoisonError::into_inner).clone();
         if let Some(set) = &approved {
@@ -608,6 +622,7 @@ impl ComposeEnv {
             self.lan_ports.filter(|_| run_command.is_some()),
             &mut remaps,
             self.limits,
+            offline,
         )?;
         let workspace = doc.get("services").and_then(|s| s.get(WORKSPACE_SERVICE));
         *self.applied.lock().unwrap_or_else(PoisonError::into_inner) = Some(self.limits.effective(workspace));
@@ -622,6 +637,10 @@ impl ComposeEnv {
     pub fn prepare(&self, dir: &Path) -> Result<(), String> {
         let (doc, ov, current) = self.load(dir)?;
         self.step(&self.call(dir, &ov, &["down", "-v", "--remove-orphans"], PREPARE_TIMEOUT), "down")?;
+        // Spec 137 T09: a rede da rodada offline não está no compose de sempre, então o `down` não a
+        // remove. Se o Nants morreu no meio de uma rodada offline, ela sobra; sai aqui, pelo nome
+        // (melhor esforço: o `-f` já ignora a rede que não existe).
+        let _ = self.remove_offline_network(dir);
         let has_build = doc
             .get("services")
             .and_then(|s| s.get(WORKSPACE_SERVICE))
@@ -631,13 +650,95 @@ impl ComposeEnv {
             self.step(&self.call(dir, &ov, &["build", WORKSPACE_SERVICE], PREPARE_TIMEOUT), "build")?;
         }
         *self.built.lock().unwrap_or_else(PoisonError::into_inner) = Some(current);
-        let support: Vec<String> = service_names(&doc).into_iter().filter(|s| s != WORKSPACE_SERVICE).collect();
-        if !support.is_empty() {
-            let mut tail = vec!["up", "-d", "--wait"];
-            tail.extend(support.iter().map(String::as_str));
-            self.step(&self.call(dir, &ov, &tail, PREPARE_TIMEOUT), "up")?;
+        self.up_support(dir, &ov, &support_services(&doc))
+    }
+
+    /// `up -d --wait` dos serviços de apoio `support` (nada sem serviço de apoio).
+    fn up_support(&self, dir: &Path, ov: &Path, support: &[String]) -> Result<(), String> {
+        if support.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let mut tail = vec!["up", "-d", "--wait"];
+        tail.extend(support.iter().map(String::as_str));
+        self.step(&self.call(dir, ov, &tail, PREPARE_TIMEOUT), "up")
+    }
+
+    /// `docker network rm -f <rede da rodada offline>`: a rede que não existe não é erro.
+    fn remove_offline_network(&self, dir: &Path) -> Result<(), String> {
+        let net = self.offline_network_name();
+        let out = self.runner.run(&self.docker_call(dir, &["network", "rm", "-f", net.as_str()]))?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(format!("docker network rm falhou: {}", diagnose(&out)))
+        }
+    }
+
+    /// Nome (no Docker) da rede interna da rodada offline deste projeto.
+    pub fn offline_network_name(&self) -> String {
+        format!("{}-{OFFLINE_NETWORK}", self.project_name())
+    }
+
+    /// Spec 137 T09: a rodada offline. Roda `command` no `workspace` como [`Self::exec_watched`],
+    /// mas pelo override da rodada offline: o `workspace` fica só na rede `internal: true` (sem
+    /// internet) e os serviços de apoio entram nela também, sem sair das redes deles (seguem
+    /// acessíveis pelo nome). Não recria o estado (`down -v`) nem instala nada: vem depois da
+    /// rodada normal verde e usa o mesmo cache de dependências (a worktree, a pasta pessoal e os
+    /// volumes). No fim, também quando falha, os serviços de apoio voltam ao override de sempre e
+    /// a rede interna é removida; se isso falhar, os serviços de apoio saem com os volumes anônimos
+    /// deles (`rm -s -f -v`, os nomeados ficam) e a rede sai pelo nome. `Err` = falha do Docker (o código de saída do comando vai no resultado).
+    pub fn exec_offline(
+        &self,
+        dir: &Path,
+        command: &str,
+        timeout: Duration,
+        progress: Option<&Arc<CommandProgress>>,
+    ) -> Result<ComposeOutput, String> {
+        let net = self.offline_network_name();
+        let (doc, ov, _) = self.load_variant(dir, None, Some(&net))?;
+        let support = support_services(&doc);
+        // A sobra de uma rodada anterior interrompida sai antes (melhor esforço, como no `prepare`).
+        let _ = self.remove_offline_network(dir);
+        let ran = self.up_support(dir, &ov, &support).and_then(|()| {
+            let name = unique_container_name(&self.project_name(), "offline");
+            let tail = ["run", "--rm", "--name", name.as_str(), "-T", "--entrypoint", "sh", WORKSPACE_SERVICE, "-lc", command];
+            let ran = self.runner.run_watched(&self.call(dir, &ov, &tail, timeout), progress);
+            self.stop_if_left_running(dir, &name, ran)
+        });
+        let cleanup = self.leave_offline(dir, &ov, &support);
+        let out = ran?;
+        cleanup?;
+        if !out.success() && is_docker_failure(&out.output) {
+            return Err(format!("{DOCKER_UNAVAILABLE}: {}", diagnose(&out)));
+        }
+        Ok(out)
+    }
+
+    /// Fim da rodada offline: serviços de apoio de volta ao override de sempre e a rede interna
+    /// removida; na falha, `rm -s -f -v` dos serviços de apoio pelo override offline (só os volumes
+    /// anônimos deles saem; os nomeados, o cache, ficam) e a rede pelo nome.
+    fn leave_offline(&self, dir: &Path, offline_ov: &Path, support: &[String]) -> Result<(), String> {
+        let remove_net = || self.remove_offline_network(dir);
+        let back = if support.is_empty() {
+            Ok(())
+        } else {
+            self.load(dir).and_then(|(_, ov, _)| self.up_support(dir, &ov, support))
+        };
+        if back.and_then(|()| remove_net()).is_ok() {
+            return Ok(());
+        }
+        // Revisão 1 (F-01): `rm --stop --force --volumes` (o `rm -s -f -v`) em vez de `down` sem `-v`. O `down` removeria os
+        // containers e deixaria órfãos (sem rótulo, fora do alcance do próximo `down -v`) os volumes
+        // anônimos presos a eles, como o `VOLUME` da imagem do postgres. O `rm -v` apaga só esses;
+        // os volumes nomeados (o cache de dependências) ficam.
+        let removed = if support.is_empty() {
+            Ok(())
+        } else {
+            let mut tail = vec!["rm", "--stop", "--force", "--volumes"];
+            tail.extend(support.iter().map(String::as_str));
+            self.step(&self.call(dir, offline_ov, &tail, PREPARE_TIMEOUT), "rm")
+        };
+        removed.and_then(|()| remove_net())
     }
 
     /// `docker compose run --rm --entrypoint sh workspace -lc <command>` (o entrypoint do compose do
@@ -1333,7 +1434,7 @@ fn override_yaml(
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
 ) -> Result<String, String> {
-    override_yaml_with(project_id, worktree, doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host())
+    override_yaml_with(project_id, worktree, doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host(), None)
 }
 
 /// Porta do host livre para bind em `ip`?
@@ -1430,8 +1531,12 @@ fn override_yaml_with(
     free: &dyn Fn(&str, u16) -> bool,
     alloc: &dyn Fn(&str) -> Option<u16>,
     limits: ContainerLimits,
+    offline: Option<&str>,
 ) -> Result<String, String> {
     let label = Value::Sequence(vec![Value::String(format!("nants.project={project_id}"))]);
+    if offline.is_some() && doc.get("networks").and_then(|n| n.get(OFFLINE_NETWORK)).is_some() {
+        return Err(format!("compose.yaml usa o nome de rede reservado `{OFFLINE_NETWORK}`"));
+    }
     let abs = worktree.canonicalize().map_err(|e| format!("worktree inválida: {e}"))?;
     let src = abs.to_string_lossy().replace('$', "$$");
     let mut services = Mapping::new();
@@ -1506,6 +1611,9 @@ fn override_yaml_with(
                 }
             }
         }
+        if offline.is_some() {
+            svc.insert("networks".into(), offline_service_networks(&name, base));
+        }
         services.insert(Value::String(name), Value::Mapping(svc));
     }
     let mut root = Mapping::new();
@@ -1521,7 +1629,49 @@ fn override_yaml_with(
             root.insert(top.into(), Value::Mapping(out));
         }
     }
+    if let Some(name) = offline {
+        let mut def = Mapping::new();
+        def.insert("name".into(), Value::String(name.to_string()));
+        def.insert("internal".into(), Value::Bool(true));
+        def.insert("labels".into(), label.clone());
+        let nets = root.entry("networks".into()).or_insert_with(|| Value::Mapping(Mapping::new()));
+        if let Value::Mapping(m) = nets {
+            m.insert(OFFLINE_NETWORK.into(), Value::Mapping(def));
+        }
+    }
     serde_yaml::to_string(&Value::Mapping(root)).map_err(|e| format!("override inválido: {e}"))
+}
+
+/// Serviços de apoio (todos menos o `workspace`).
+fn support_services(doc: &Value) -> Vec<String> {
+    service_names(doc).into_iter().filter(|s| s != WORKSPACE_SERVICE).collect()
+}
+
+/// Spec 137 T09: redes de um serviço na rodada offline, com `!override` (a lista do compose do
+/// projeto é substituída, não concatenada). O `workspace` fica só na rede interna; os serviços de
+/// apoio ficam nas redes deles (a `default`, quando o compose não lista nenhuma) e na interna.
+fn offline_service_networks(name: &str, base: Option<&Value>) -> Value {
+    let mut nets = Mapping::new();
+    if name != WORKSPACE_SERVICE {
+        match base.and_then(|b| b.get("networks")) {
+            Some(Value::Sequence(list)) => {
+                for n in list {
+                    nets.insert(n.clone(), Value::Null);
+                }
+            }
+            Some(Value::Mapping(m)) => {
+                for (k, v) in m {
+                    nets.insert(k.clone(), v.clone());
+                }
+            }
+            _ => {}
+        }
+        if nets.is_empty() {
+            nets.insert("default".into(), Value::Null);
+        }
+    }
+    nets.insert(OFFLINE_NETWORK.into(), Value::Null);
+    Value::Tagged(Box::new(serde_yaml::value::TaggedValue { tag: serde_yaml::value::Tag::new("override"), value: Value::Mapping(nets) }))
 }
 
 /// Grava o override em `dir` (privado): remove o arquivo anterior (unlink não segue symlink) e
@@ -1536,9 +1686,10 @@ fn write_override(
     lan_ports: Option<ViewPorts>,
     remaps: &mut Vec<(u16, u16)>,
     limits: ContainerLimits,
+    offline: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let text = override_yaml_with(project_id, worktree, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc, limits)?;
-    let path = dir.join("override.yaml");
+    let text = override_yaml_with(project_id, worktree, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc, limits, offline)?;
+    let path = dir.join(if offline.is_some() { OFFLINE_OVERRIDE_FILE } else { "override.yaml" });
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1701,15 +1852,17 @@ mod tests {
         let env = env_with(&fake);
         env.prepare(&dir).expect("prepare");
         env.exec(&dir, "cargo test", Duration::from_secs(5)).expect("exec");
-        assert_eq!(fake.subcommands(), vec!["down", "build", "up", "run"]);
+        assert_eq!(fake.subcommands(), vec!["down", "network", "build", "up", "run"]);
         let calls = fake.calls.lock().expect("lock");
         assert_eq!(&calls[0].args[..5], ["compose", "-p", "nants-p1-test", "-f", ".nants/compose.yaml"]);
         assert_eq!(&calls[0].args[7..], ["down", "-v", "--remove-orphans"]);
-        assert_eq!(&calls[2].args[7..], ["up", "-d", "--wait", "db"]);
-        assert_eq!(&calls[3].args[7..10], ["run", "--rm", "--name"]);
-        assert!(calls[3].args[10].starts_with("nants-p1-test-exec-"), "{:?}", calls[3].args);
-        assert_eq!(&calls[3].args[11..], ["-T", "--entrypoint", "sh", "workspace", "-lc", "cargo test"]);
-        assert_eq!(calls[3].cwd, dir);
+        // Spec 137 T09: o `down` não conhece a rede da rodada offline; a sobra sai pelo nome.
+        assert_eq!(calls[1].args, ["network", "rm", "-f", "nants-p1-test-nants-offline"]);
+        assert_eq!(&calls[3].args[7..], ["up", "-d", "--wait", "db"]);
+        assert_eq!(&calls[4].args[7..10], ["run", "--rm", "--name"]);
+        assert!(calls[4].args[10].starts_with("nants-p1-test-exec-"), "{:?}", calls[4].args);
+        assert_eq!(&calls[4].args[11..], ["-T", "--entrypoint", "sh", "workspace", "-lc", "cargo test"]);
+        assert_eq!(calls[4].cwd, dir);
     }
 
     /// Lê o override gravado de uma chamada do Compose (o segundo `-f`).
@@ -1753,6 +1906,119 @@ mod tests {
             assert_eq!(v["services"][svc]["mem_limit"].as_u64(), Some(host.memory), "{svc}");
             assert_eq!(v["services"][svc]["pids_limit"].as_u64(), Some(host.pids), "{svc}");
         }
+    }
+
+    /// Redes (sem a tag `!override`) de um serviço do override da rodada offline.
+    fn offline_nets(ov: &Value, svc: &str) -> Vec<String> {
+        let Value::Tagged(t) = &ov["services"][svc]["networks"] else { panic!("sem !override: {ov:?}") };
+        assert_eq!(t.tag, serde_yaml::value::Tag::new("override"));
+        t.value.as_mapping().expect("mapa").keys().filter_map(|k| k.as_str().map(String::from)).collect()
+    }
+
+    /// Spec 137 T09 (critérios 1 e 2): a rodada offline entra pelo override, com uma rede
+    /// `internal: true` com nome e rótulo do projeto. O `workspace` fica só nela; os serviços de
+    /// apoio ficam nas redes deles e nela; os limites da 134/T08 seguem em todo serviço.
+    #[test]
+    fn offline_override_puts_workspace_only_on_the_internal_network() {
+        const MIB: u64 = 1024 * 1024;
+        let compose = "services:\n  workspace:\n    image: alpine\n    networks: [back]\n  db:\n    image: postgres:16\n    networks:\n      back:\n        aliases: [banco]\n  cache:\n    image: redis\nnetworks:\n  back: {}\n";
+        let dir = project("offline-ov", compose);
+        let doc: Value = serde_yaml::from_str(compose).expect("yaml");
+        let cap = ContainerLimits { memory: 256 * MIB, pids: 64 };
+        let text = override_yaml_with("p1", &dir, &doc, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("nants-p1-test-nants-offline")).expect("ov");
+        let ov: Value = serde_yaml::from_str(&text).expect("yaml");
+        assert_eq!(offline_nets(&ov, "workspace"), vec![OFFLINE_NETWORK]);
+        assert_eq!(offline_nets(&ov, "db"), vec!["back", OFFLINE_NETWORK]);
+        assert_eq!(offline_nets(&ov, "cache"), vec!["default", OFFLINE_NETWORK]);
+        let Value::Tagged(db) = &ov["services"]["db"]["networks"] else { panic!("tag") };
+        assert_eq!(db.value["back"]["aliases"][0].as_str(), Some("banco"), "as opções da rede do projeto ficam");
+        let net = &ov["networks"][OFFLINE_NETWORK];
+        assert_eq!(net["internal"].as_bool(), Some(true), "{text}");
+        assert_eq!(net["name"].as_str(), Some("nants-p1-test-nants-offline"));
+        assert_eq!(net["labels"][0].as_str(), Some("nants.project=p1"));
+        assert_eq!(ov["networks"]["back"]["labels"][0].as_str(), Some("nants.project=p1"));
+        assert!(!text.contains("network_mode"), "{text}");
+        for svc in ["workspace", "db", "cache"] {
+            assert_eq!(ov["services"][svc]["mem_limit"].as_u64(), Some(256 * MIB), "{svc}");
+            assert_eq!(ov["services"][svc]["pids_limit"].as_u64(), Some(64), "{svc}");
+            assert_eq!(ov["services"][svc]["labels"][0].as_str(), Some("nants.project=p1"), "{svc}");
+        }
+
+        // A rodada normal não ganha rede nenhuma do Nants.
+        let normal = override_yaml("p1", &dir, &doc, None, None).expect("ov");
+        assert!(!normal.contains(OFFLINE_NETWORK) && !normal.contains("internal"), "{normal}");
+
+        // O nome reservado no compose do projeto é recusado (não se mistura com a rede dele).
+        let clash: Value = serde_yaml::from_str("services:\n  workspace:\n    image: alpine\nnetworks:\n  nants-offline: {}\n").expect("yaml");
+        let err = override_yaml_with("p1", &dir, &clash, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("x")).expect_err("reservado");
+        assert!(err.contains(OFFLINE_NETWORK), "{err}");
+    }
+
+    /// Spec 137 T09 (critérios 1 e 3): a rodada offline não recria o estado (sem `down -v`, sem
+    /// build, sem instalação): liga os serviços de apoio à rede interna, roda o comando no
+    /// `workspace` pelo override offline, devolve os serviços ao override de sempre e remove a rede.
+    #[test]
+    fn exec_offline_runs_on_the_offline_override_and_removes_the_network() {
+        let dir = project("offline-seq", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        let env = env_with(&fake);
+        let out = env.exec_offline(&dir, "npm test", Duration::from_secs(5), None).expect("offline");
+        assert!(out.success());
+        assert_eq!(fake.subcommands(), vec!["network", "up", "run", "up", "network"]);
+        let calls = fake.calls.lock().expect("lock");
+        // A sobra de uma rodada interrompida sai antes do `up` (o `-f` ignora a rede que não existe).
+        assert_eq!(calls[0].args, ["network", "rm", "-f", "nants-p1-test-nants-offline"]);
+        assert!(calls[1].args[6].ends_with(OFFLINE_OVERRIDE_FILE), "{:?}", calls[1].args);
+        assert_eq!(&calls[1].args[7..], ["up", "-d", "--wait", "db"]);
+        assert!(calls[2].args[6].ends_with(OFFLINE_OVERRIDE_FILE));
+        assert_eq!(&calls[2].args[7..10], ["run", "--rm", "--name"]);
+        assert!(calls[2].args[10].starts_with("nants-p1-test-offline-"), "{:?}", calls[2].args);
+        assert_eq!(&calls[2].args[11..], ["-T", "--entrypoint", "sh", "workspace", "-lc", "npm test"]);
+        assert_eq!(offline_nets(&override_of(&calls[2]), "workspace"), vec![OFFLINE_NETWORK]);
+        // Volta ao override de sempre (sem a rede interna) e remove a rede pelo nome.
+        assert!(calls[3].args[6].ends_with("/override.yaml"), "{:?}", calls[3].args);
+        assert!(override_of(&calls[3])["networks"].get(OFFLINE_NETWORK).is_none());
+        assert_eq!(calls[4].args, ["network", "rm", "-f", "nants-p1-test-nants-offline"]);
+        assert!(calls.iter().all(|c| !c.args.iter().any(|a| a == "-v")), "o cache de dependências fica");
+        drop(calls);
+
+        // Sem serviço de apoio: só o comando e a remoção da rede.
+        let solo = project("offline-solo", "services:\n  workspace:\n    image: alpine\n");
+        let fake = Arc::new(FakeRunner::default());
+        env_with(&fake).exec_offline(&solo, "make test", Duration::from_secs(5), None).expect("offline");
+        assert_eq!(fake.subcommands(), vec!["network", "run", "network"]);
+    }
+
+    /// Spec 137 T09: o comando que falha devolve o código (é resultado, não falha do Docker) e a
+    /// rede sai mesmo assim; se a volta falhar, um `down` sem `-v` pelo override offline remove tudo.
+    #[test]
+    fn exec_offline_cleans_up_on_failure() {
+        let dir = project("offline-fail", COMPOSE);
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 7, "getaddrinfo ENOTFOUND registry.npmjs.org");
+        let out = env_with(&fake).exec_offline(&dir, "npm test", Duration::from_secs(5), None).expect("resultado");
+        assert_eq!(out.code, Some(7));
+        assert_eq!(fake.subcommands(), vec!["network", "up", "run", "up", "network"]);
+
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("network", 1, "network has active endpoints");
+        let err = env_with(&fake).exec_offline(&dir, "npm test", Duration::from_secs(5), None).expect_err("rede ficou");
+        assert!(err.contains("network rm"), "{err}");
+        assert_eq!(fake.subcommands(), vec!["network", "up", "run", "up", "network", "rm", "network"]);
+        let calls = fake.calls.lock().expect("lock");
+        // Revisão 1 (F-01): os serviços de apoio saem com os volumes anônimos deles (nada órfão); o
+        // `-v` do `rm` não alcança os volumes nomeados, e nenhum `down` roda.
+        assert_eq!(&calls[5].args[7..], ["rm", "--stop", "--force", "--volumes", "db"]);
+        assert!(calls[5].args[6].ends_with(OFFLINE_OVERRIDE_FILE));
+        assert!(calls.iter().all(|c| crate::harness::compose::fake::sub_of(&c.args) != "down"), "nenhum down, nem com -v");
+        drop(calls);
+
+        // A volta dos serviços de apoio falha: o mesmo caminho de recuperação.
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("up", 1, "dependency failed to start");
+        let err = env_with(&fake).exec_offline(&dir, "npm test", Duration::from_secs(5), None).expect_err("up falhou");
+        assert!(err.contains("up"), "{err}");
+        assert_eq!(fake.subcommands(), vec!["network", "up", "up", "rm", "network"], "o up offline e o da volta falham");
     }
 
     /// Spec 134 T08 (critério 2): no tempo limite o `docker compose` do host morre, mas o container
@@ -2178,7 +2444,7 @@ mod tests {
         let dir = project("busy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234), ContainerLimits::host()).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert_eq!(remaps, vec![(3000, 41234)]);
         let v: Value = serde_yaml::from_str(&text).expect("parse");
         let Value::Tagged(t) = &v["services"]["workspace"]["ports"] else { panic!("sem tag: {text}") };
@@ -2187,9 +2453,9 @@ mod tests {
         assert_eq!(list[1].as_str(), Some("127.0.0.1:5173:5173"));
         // Tudo livre: nenhum override de portas; sem comando (-test): idem.
         let mut none = Vec::new();
-        let free = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None, ContainerLimits::host()).expect("ov");
+        let free = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None, ContainerLimits::host(), None).expect("ov");
         assert!(none.is_empty() && !free.contains("ports"), "{free}");
-        let test = override_yaml_with("p1", &dir, &doc, None, None, &mut none, &|_, _| false, &|_| Some(1), ContainerLimits::host()).expect("ov");
+        let test = override_yaml_with("p1", &dir, &doc, None, None, &mut none, &|_, _| false, &|_| Some(1), ContainerLimits::host(), None).expect("ov");
         assert!(none.is_empty() && !test.contains("ports"), "{test}");
     }
 
@@ -2253,7 +2519,7 @@ mod tests {
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         // A porta pedida (5173) está livre, mas em `--lan` a do host vem da faixa mesmo assim.
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234), ContainerLimits::host()).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert!(text.contains("ports: !override"), "{text}");
         assert!(remaps.is_empty(), "{remaps:?}");
         let list = lan_list(&text);
@@ -2279,7 +2545,7 @@ mod tests {
         let dir = project("lanbusy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let busy = |ip: &str, p: u16| ip == "0.0.0.0" && p != 3001 && p != 3003;
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234), ContainerLimits::host()).expect("ov");
+        let text = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         let list = lan_list(&text);
         assert_eq!(list.iter().filter_map(Value::as_str).collect::<Vec<_>>(), ["0.0.0.0:3002:5173", "0.0.0.0:3004:8000", "0.0.0.0:3005:8001"]);
     }
@@ -2290,11 +2556,11 @@ mod tests {
         let dir = project("lanfull", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let expected = "Todas as portas de visualização (3001 a 3010) estão em uso. Pare outro app na Execução e tente de novo.";
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234), ContainerLimits::host()).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
         assert_eq!(err, expected);
         // Uma livre só, duas portas pedidas: também esgota (nunca repete nem sai da faixa).
         let one = |_: &str, p: u16| p == 3010;
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234), ContainerLimits::host()).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
         assert_eq!(err, expected);
         // No `up_run` real (sonda de verdade): faixa de uma porta ocupada por um listener.
         let l = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind");
@@ -2314,7 +2580,7 @@ mod tests {
         let off = override_yaml("p1", &dir, &doc, Some("npm run dev"), None).expect("ov");
         assert!(!off.contains("ports"), "{off}");
         // Byte a byte igual ao de antes: o `--lan` não interfere sem faixa, e o `-test` ignora a faixa.
-        let with_busy = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234), ContainerLimits::host()).expect("ov");
+        let with_busy = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert_eq!(lan_list(&with_busy)[0].as_str(), Some("127.0.0.1:41234:5173"));
         assert_eq!(lan_list(&with_busy)[1].as_str(), Some("127.0.0.1::8080"));
         let test_kind = override_yaml("p1", &dir, &doc, None, None).expect("ov");
@@ -2691,6 +2957,47 @@ mod tests {
             .output()
             .expect("docker ps");
         assert!(String::from_utf8_lossy(&left.stdout).trim().is_empty(), "container de comando ainda vivo");
+    }
+
+    /// Teste real (spec 137 T09): na rodada offline o `workspace` não sai para a internet, mas
+    /// alcança o serviço irmão pelo nome; no fim, a rede interna não sobra e o irmão volta à rede de
+    /// sempre. NÃO roda sem pedido: `NANTS_TEST_REAL_DOCKER=1 scripts/test.sh cargo test --lib --
+    /// --ignored real_offline_round_cuts_internet_and_keeps_siblings`. A imagem (precisa de `bash` e
+    /// `perl`, como a `ubuntu:24.04`) vem de `NANTS_TEST_OFFLINE_IMAGE`; nada é baixado nem
+    /// construído além dela. Limites pequenos, tempo curto e a limpeza ([`RealCleanup`]) até no pânico.
+    #[test]
+    #[ignore]
+    fn real_offline_round_cuts_internet_and_keeps_siblings() {
+        const MIB: u64 = 1024 * 1024;
+        let image = std::env::var("NANTS_TEST_OFFLINE_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".into());
+        // O irmão responde uma linha a cada conexão na porta 8080 (`$$`: escape do Compose).
+        let server = "perl -MIO::Socket::INET -e '$$s=IO::Socket::INET->new(LocalPort=>8080,Listen=>5,ReuseAddr=>1) or die; while($$c=$$s->accept){print $$c \"irmao-ok\\n\"; close $$c}'";
+        let compose = format!(
+            "services:\n  workspace:\n    image: {image}\n    command: sleep infinity\n  db:\n    image: {image}\n    command: [\"sh\", \"-c\", {}]\n",
+            serde_json::to_string(server).expect("json")
+        );
+        let dir = project("realoffline", &compose);
+        fs::write(
+            dir.join("sonda.sh"),
+            "getent hosts db >/dev/null && echo dns=ok\n\
+             for i in 1 2 3 4 5 6 7 8 9 10; do l=$(timeout 3 cat < /dev/tcp/db/8080 2>/dev/null) && { echo \"irmao=$l\"; break; }; sleep 1; done\n\
+             if timeout 5 bash -c ': < /dev/tcp/1.1.1.1/80' 2>/dev/null; then echo internet=sim; else echo internet=nao; fi\n",
+        )
+        .expect("sonda");
+        let id = format!("itestoff{}", std::process::id());
+        let env = ComposeEnv::real(id.clone()).with_limits(ContainerLimits { memory: 256 * MIB, pids: 64 });
+        let env = env.with_approved_hashes(vec![env_hash(&dir).expect("hash")]);
+        let _cleanup = RealCleanup { env: &env, dir: dir.clone(), label: format!("nants.project={id}") };
+        env.prepare(&dir).expect("prepare");
+        let out = env.exec_offline(&dir, "bash /work/sonda.sh", Duration::from_secs(90), None).expect("docker");
+        assert!(out.success(), "{}", out.output);
+        assert!(out.output.contains("dns=ok") && out.output.contains("irmao=irmao-ok"), "{}", out.output);
+        assert!(out.output.contains("internet=nao"), "{}", out.output);
+        let net = Command::new("docker").args(["network", "inspect", env.offline_network_name().as_str()]).output().expect("inspect");
+        assert!(!net.status.success(), "a rede interna sobrou");
+        // O irmão segue de pé, na rede de sempre: a rodada normal seguinte o alcança.
+        let after = env.exec(&dir, "bash -c 'timeout 5 cat < /dev/tcp/db/8080'", Duration::from_secs(60)).expect("docker");
+        assert!(after.output.contains("irmao-ok"), "{}", after.output);
     }
 
     /// Teste real do `-run`: sobe, lê a porta publicada e os logs, derruba com volumes.

@@ -11,7 +11,7 @@ import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApiEvent, UsageView } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, settle } from "../../desktop/shell-test-utils";
 import { fakeResizeObservers } from "../../desktop/test-utils";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
@@ -70,7 +70,7 @@ async function openCosts(extra: Parameters<typeof renderShell>[0] = {}, project:
   view.server.reply("GET", /\/api\/projects\/p1\/usage/, (_b, url) => ({ status: 200, body: url.includes("spec=") ? SPEC : project }));
   view.server.reply("PUT", /\/api\/projects\/p1\/specs\/s1\/budget/, (body) => ({ status: 200, body }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Custos" }));
+    activateApp("Custos");
   });
   await settle();
   return view;
@@ -187,7 +187,7 @@ describe("Custos: em destaque (095/T05)", () => {
     });
     view.server.reply("GET", /\/api\/projects\/p1\/usage/, (_b, url) => ({ status: 200, body: url.includes("spec=") ? { ...SPEC, budget: null } : PROJECT }));
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Custos" }));
+      activateApp("Custos");
     });
     await settle();
     await waitFor(() => expect(costs().querySelector("[data-costs-budget] summary")?.textContent).toBe("Definir um orçamento para a spec"));
@@ -269,7 +269,7 @@ describe("Custos: tudo do indicador de custo", () => {
     const view = await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: makeProjectState({ id: "p1", name: "Loja", specs: [spec] }) } });
     view.server.reply("GET", /\/api\/projects\/p1\/usage/, () => ({ status: 500, body: { error: "falha" } }));
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Custos" }));
+      activateApp("Custos");
     });
     await settle();
     expect(costs().textContent).toContain("Nenhum custo registrado neste projeto ainda.");

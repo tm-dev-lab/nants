@@ -59,9 +59,24 @@ describe("códigos do servidor", () => {
       expect(isMessageCode(code)).toBe(true);
     }
     for (const code of SYSTEM_CODES) {
-      expect(Object.keys(ptBR), code).toContain(`system.${code}`);
+      // Código com `{count}` tem as formas `.one` e `.other` (spec 137 T12).
+      const keys = Object.hasOwn(ptBR, `system.${code}`) ? [`system.${code}`] : [`system.${code}.one`, `system.${code}.other`];
+      for (const key of keys) {
+        expect(Object.keys(ptBR), code).toContain(key);
+        expect(Object.keys(en), code).toContain(key);
+      }
       expect(isMessageCode(code)).toBe(true);
     }
+  });
+
+  it("código com plural escolhe .one ou .other pelo count (spec 137 T12)", () => {
+    const one = translateCode("system", "image.suspended", { count: 1 }, "en");
+    expect(one).toContain("(1 attempt)");
+    expect(translateCode("system", "image.suspended", { count: 3 }, "en")).toContain("(3 attempts)");
+    expect(translateCode("system", "image.suspended", { count: 2 }, "pt-BR")).toContain("(2 tentativas)");
+    expect(translateCode("system", "image.suspended", { count: 1 }, "pt-BR")).toContain("(1 tentativa)");
+    expect(translateCode("system", "image.suspended", {}, "en")).toBeNull();
+    expect(systemMessageText({ text: "reserva", code: "image.suspended", params: { count: 2 } }, "en")).toContain("(2 attempts)");
   });
 
   it("formato do code e dos params", () => {

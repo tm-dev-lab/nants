@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState, SpecStatus } from "../../api/types";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
-import { renderShell, settle, type RenderShellOptions } from "../../desktop/shell-test-utils";
+import { activateApp, renderShell, type RenderShellOptions, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { appStore } from "../../store";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
@@ -119,9 +119,9 @@ describe("Relatório: conteúdo", () => {
 
   it("relatório sendo escrito: sem a faixa, com o aviso; subtítulo acompanha", async () => {
     await mount(state("COMPLETED", true), () => ({ status: 404 }));
-    // Escrevendo o relatório, a fase é "finalizando" (layout de execução): abre pelo dock.
+    // Escrevendo o relatório, a fase é "finalizando" (layout de execução): abre pelo menu do N.
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Relatório" }));
+      activateApp("Relatório");
     });
     await settle();
     const win = reportWindow();
@@ -136,7 +136,7 @@ describe("Relatório: vazio e resumo", () => {
   it("spec ainda em execução: estado vazio com 'Abrir o Quadro'", async () => {
     await renderShell({ url: "/?space=p1", projects: [P1], states: { p1: state("IN_PROGRESS") } });
     await act(async () => {
-      fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name: "Relatório" }));
+      activateApp("Relatório");
     });
     await settle();
     const win = reportWindow();

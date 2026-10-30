@@ -2,7 +2,7 @@
  * Registro das janelas (apps) do desktop. Cada tarefa (T06 a T09) acrescenta aqui o app dela:
  * - `Content`: o conteúdo da janela. Recebe o tamanho do contêiner e lê os dados pelos contextos
  *   (`useSpace()`, `useShell()`); nunca dispara a carga do espaço (isso é do shell).
- * - `summarize`: o subtítulo vivo, o selo do dock e o estado vazio, a partir dos dados do
+ * - `summarize`: o subtítulo vivo, o selo do app (menu do N e celular) e o estado vazio, a partir dos dados do
  *   espaço (função pura, recalculada pelo shell quando os dados mudam).
  * - `scroll`: quem rola o conteúdo (spec 094, decisão 4). `"app"`: o app tem a própria área de
  *   rolagem, marcada com a classe `nd-app-scroll` (exatamente uma), e o conteúdo da janela não
@@ -12,7 +12,7 @@
  */
 import { createElement, memo, type ComponentType } from "react";
 import type { AttentionProject, Readiness } from "../desktop/api";
-import type { DockBadge } from "../desktop/Dock";
+import type { AppBadge } from "../desktop/appState";
 import type { ContainerSize } from "../desktop/useContainerSize";
 import type { SpaceData } from "../desktop/useSpaceData";
 import type { WindowEmpty, WindowScroll } from "../desktop/Window";
@@ -64,7 +64,7 @@ export interface AppSummaryInput {
 
 export interface AppSummary {
   subtitle?: string;
-  badge?: DockBadge;
+  badge?: AppBadge;
   empty?: WindowEmpty;
 }
 

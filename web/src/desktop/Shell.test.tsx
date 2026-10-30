@@ -5,7 +5,7 @@ import { makeProject, makeProjectState, makeSpec, makeTask } from "../test-utils
 import { ptBR } from "../i18n/ptBR";
 import { BRAND_NAME, BRAND_PRODUCT_LINE_KEY, BRAND_SLOGAN } from "./brand";
 import { findForbiddenGlyphs } from "./glyphs";
-import { NO_ATTENTION, notReady, READY, renderShell, settle } from "./shell-test-utils";
+import { inNMenu, NO_ATTENTION, notReady, READY, renderShell, settle } from "./shell-test-utils";
 import { appStore } from "../store";
 
 afterEach(() => {
@@ -44,8 +44,10 @@ describe("Shell: boas-vindas e marca", () => {
     expect(logo?.textContent).toBe(BRAND_NAME);
     expect(logo?.nextElementSibling).toBe(slogan);
     expect(slogan.nextElementSibling).toBe(product);
-    expect(within(topbar()).getByText(BRAND_SLOGAN)).toBeTruthy();
-    expect(within(topbar()).getByText("Nants")).toBeTruthy();
+    // Spec 137: na barra só o botão N; o nome e o slogan (logo depois) ficam no topo do menu.
+    expect(within(topbar()).queryByText(BRAND_SLOGAN)).toBeNull();
+    const head = inNMenu((menu) => menu.querySelector("[data-nmenu-head]")?.textContent ?? "");
+    expect(head).toContain(`${BRAND_NAME}${BRAND_SLOGAN}`);
     expect(within(welcome).getByRole("button", { name: "Novo projeto" })).toBeTruthy();
     fireEvent.click(within(welcome).getByRole("button", { name: "Primeiros passos" }));
     expect(screen.getByRole("region", { name: "Primeiros passos" })).toBeTruthy();
@@ -272,6 +274,8 @@ describe("Shell: barra superior", () => {
     expect(pill.textContent).toContain("Executando");
     expect(pill.textContent).toContain("Carrinho de compras");
     expect(pill.textContent).toContain("T02 de 3");
+    // 137/T03: a pílula é a única parte da barra que encolhe; o texto inteiro fica na dica.
+    expect(pill.getAttribute("title")).toMatch(/^Executando: Carrinho de compras · T02 de 3/);
     expect(findForbiddenGlyphs(pill)).toEqual([]);
     fireEvent.click(within(pill).getByRole("button", { name: "Parar" }));
     const dialog = screen.getByRole("alertdialog", { name: "Parar a execução?" });

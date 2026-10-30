@@ -134,7 +134,7 @@ pub const BLOCK_REVISED: &str = "revised";
 /// Códigos estáveis dos motivos de bloqueio gravados em `next_action_code` (spec 114 T02). Cada um
 /// tem o texto `runner.block.<código>` nos dois dicionários, menos o orçamento (`runner.budget.*`,
 /// montado pelo [`BudgetGuard`]).
-pub const BLOCK_CODES: [&str; 23] = [
+pub const BLOCK_CODES: [&str; 24] = [
     "budget",
     "docker",
     "external_edit",
@@ -158,6 +158,7 @@ pub const BLOCK_CODES: [&str; 23] = [
     BLOCK_REVISED,
     "blocked",
     "recurring",
+    "kept_recurring",
 ];
 
 /// Motivo de bloqueio (spec 114 T02): o código estável, lido pelas máquinas, e o texto para a
@@ -203,6 +204,9 @@ pub fn failure_header(exit_code: Option<i32>, timed_out: bool) -> String {
 }
 /// Marcador, dentro da evidência, que separa a saída dos testes da seção de checagens.
 pub const CHECKS_MARK: &str = "\n\n## Checagens\n";
+/// Spec 137 T09: separa, em `test_evidence`, a seção da rodada offline (a evidência dos critérios
+/// `(offline)`). Estrutural, igual nos dois idiomas, como o próprio marcador.
+pub const OFFLINE_EVIDENCE_MARK: &str = "\n\n## (offline)\n";
 /// Separa, em `test_evidence`, a seção "Critérios" do Desenvolvedor (matriz critério → evidência).
 pub const DEV_CRITERIA_MARK: &str = "\n\n## Critérios do Desenvolvedor\n";
 /// Spec 133 T07: separa, em `test_evidence`, os avisos explícitos do Desenvolvedor (depois dos critérios).
@@ -599,6 +603,33 @@ pub enum RunnerError {
     /// Cancelamento cooperativo solicitado; o estado persistido não foi alterado por esta etapa.
     #[error("execução cancelada")]
     Cancelled,
+}
+
+impl RunnerError {
+    /// Causa no idioma `lang` (spec 137 T12): o prefixo de cada variante sai do dicionário
+    /// (`runner.error.*`); o detalhe livre de dentro (SddError, GitError, io, stderr, provedor) segue
+    /// como está, porque é log técnico. O `Display` continua em pt-BR para os logs.
+    pub fn describe_in(&self, lang: Lang) -> String {
+        let tr = |key: &str, params: &[(&str, &str)]| i18n::tr(lang, &format!("runner.error.{key}"), params);
+        match self {
+            RunnerError::InvalidId { name, value } => tr("invalid_id", &[("name", name), ("value", &format!("{value:?}"))]),
+            RunnerError::Config(detail) => tr("config", &[("detail", detail)]),
+            RunnerError::Invalid(detail) => tr("invalid", &[("detail", detail)]),
+            RunnerError::DependenciesPending { task, pending } => {
+                tr("dependencies_pending", &[("task", task), ("pending", &pending.join(", "))])
+            }
+            RunnerError::Sdd(_) | RunnerError::Git(_) => self.to_string(),
+            RunnerError::Io { path, source } => {
+                tr("io", &[("path", &path.display().to_string()), ("error", &source.to_string())])
+            }
+            RunnerError::Tests(detail) => tr("tests", &[("detail", detail)]),
+            RunnerError::Docker(detail) => tr("docker", &[("detail", detail)]),
+            RunnerError::Port { role, message } => tr("role", &[("role", role), ("detail", message)]),
+            RunnerError::Provider { role, failure, .. } => tr("role", &[("role", role), ("detail", &failure.describe_in(lang))]),
+            RunnerError::ExternalEdit { path } => tr("external_edit", &[("path", path)]),
+            RunnerError::Cancelled => tr("cancelled", &[]),
+        }
+    }
 }
 
 /// Classe do bloqueio: define se a recuperação agêntica se aplica (só `Quality`).
@@ -1104,9 +1135,9 @@ pub fn render_criteria(criteria: &[CriterionCheck]) -> String {
 /// critérios já gravados. A atual sai do dicionário ([`markers::HUMAN_CHECK`]).
 const LEGACY_HUMAN_CHECK_MARK: &str = "verificação humana — não bloqueia";
 
-/// `true` se o critério (linha de checklist) começa com `(manual)`, sem diferenciar maiúsculas,
-/// depois de marcadores como `-`, `*`, `1.` e `[ ]`/`[x]`; ou se já carrega a marca de verificação humana.
-pub fn is_manual_criterion(line: &str) -> bool {
+/// Texto do critério (linha de checklist) sem os marcadores do começo, como `-`, `*`, `1.` e
+/// `[ ]`/`[x]`.
+fn criterion_text(line: &str) -> &str {
     let mut t = line.trim();
     loop {
         let before = t;
@@ -1128,10 +1159,33 @@ pub fn is_manual_criterion(line: &str) -> bool {
             break;
         }
     }
+    t
+}
+
+/// `true` se o critério (linha de checklist) começa com `(manual)`, sem diferenciar maiúsculas,
+/// depois de marcadores como `-`, `*`, `1.` e `[ ]`/`[x]`; ou se já carrega a marca de verificação humana.
+pub fn is_manual_criterion(line: &str) -> bool {
+    let t = criterion_text(line);
     let end = line.trim_end();
     t.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("(manual)"))
         || markers::ends_with_bracketed(end, markers::HUMAN_CHECK)
         || end.ends_with(&format!("[{LEGACY_HUMAN_CHECK_MARK}]"))
+}
+
+/// Marcador estrutural da rodada offline nos critérios (spec 137 T09). Igual nos dois idiomas, como
+/// o `(manual)`: é lido por parser, não por pessoa.
+pub const OFFLINE_MARKER: &str = "(offline)";
+
+/// `true` se o critério (linha de checklist) começa com [`OFFLINE_MARKER`], sem diferenciar
+/// maiúsculas, depois de marcadores como `-`, `*`, `1.` e `[ ]`/`[x]`. Um critério assim só vale
+/// provado pela rodada offline (sem internet), que roda depois da rodada normal verde.
+pub fn is_offline_criterion(line: &str) -> bool {
+    criterion_text(line).get(..OFFLINE_MARKER.len()).is_some_and(|p| p.eq_ignore_ascii_case(OFFLINE_MARKER))
+}
+
+/// Itens [`OFFLINE_MARKER`] dos critérios de aceitação (texto sem marcador de lista nem caixa).
+pub fn offline_criteria(acceptance: &str) -> Vec<String> {
+    acceptance.lines().filter(|l| is_offline_criterion(l)).map(|l| criterion_text(l).to_string()).collect()
 }
 
 /// Itens `(manual)` dos critérios de aceitação (texto sem marcador de lista).
@@ -2989,6 +3043,14 @@ pub struct TaskRunner {
 /// Resultado do container mantido da instalação que também confere a persistência (spec 131 T05).
 type KeptSlot = Arc<Mutex<Option<KeptRun>>>;
 
+/// Como uma rodada roda no Docker: o container efêmero de sempre, o mantido até o `docker diff`
+/// (spec 131 T05, com o resultado em `KeptSlot`) ou a rodada offline (spec 137 T09).
+enum Round {
+    Plain,
+    Kept(KeptSlot),
+    Offline,
+}
+
 /// Rótulo (`stage`) da atividade ao vivo da verificação final.
 pub const FINAL_VERIFICATION_STAGE: &str = "final_verification";
 
@@ -3154,12 +3216,13 @@ impl TaskRunner {
         command: &str,
         fresh: bool,
     ) -> Result<TestResult, RunnerError> {
-        self.exec_cmd_watched(settings, dir, command, fresh, None, None).await
+        self.exec_cmd_watched(settings, dir, command, fresh, None, Round::Plain).await
     }
 
     /// Como [`Self::exec_cmd`], com o progresso da saída em `progress` enquanto roda (spec 123 T01).
     /// Spec 131 T05: com `kept` (só no Docker), o comando roda num container mantido até o `docker
-    /// diff` ([`ComposeEnv::run_kept`]) e o resultado completo fica em `kept`.
+    /// diff` ([`ComposeEnv::run_kept`]) e o resultado completo fica em `kept`. Spec 137 T09: com
+    /// [`Round::Offline`], roda pela rede interna ([`ComposeEnv::exec_offline`]), sem recriar o estado.
     async fn exec_cmd_watched(
         &self,
         settings: &Settings,
@@ -3167,7 +3230,7 @@ impl TaskRunner {
         command: &str,
         fresh: bool,
         progress: Option<Arc<CommandProgress>>,
-        kept: Option<KeptSlot>,
+        round: Round,
     ) -> Result<TestResult, RunnerError> {
         if settings.environment != Environment::Docker {
             return match progress {
@@ -3182,16 +3245,17 @@ impl TaskRunner {
         let (dir, command) = (dir.to_path_buf(), command.to_string());
         let env = Arc::clone(&compose);
         let joined = tokio::task::spawn_blocking(move || {
-            if fresh {
+            if fresh && !matches!(round, Round::Offline) {
                 compose.prepare(&dir)?;
             }
-            let out = match &kept {
-                Some(slot) => compose.run_kept(&dir, &command, TEST_TIMEOUT, progress.as_ref()).map(|run| {
+            let out = match &round {
+                Round::Kept(slot) => compose.run_kept(&dir, &command, TEST_TIMEOUT, progress.as_ref()).map(|run| {
                     let output = run.output.clone();
                     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(run);
                     output
                 }),
-                None => compose.exec_watched(&dir, &command, TEST_TIMEOUT, progress.as_ref()),
+                Round::Offline => compose.exec_offline(&dir, &command, TEST_TIMEOUT, progress.as_ref()),
+                Round::Plain => compose.exec_watched(&dir, &command, TEST_TIMEOUT, progress.as_ref()),
             };
             // Devolve ao usuário o que um container root (imagens antigas) tenha criado.
             let _ = compose.repair_ownership(&dir);
@@ -3247,7 +3311,7 @@ impl TaskRunner {
         attempt: u32,
     ) -> (Result<TestResult, RunnerError>, Duration) {
         let started = std::time::Instant::now();
-        let out = self.run_tracked_inner(settings, dir, command, fresh, check, place, task_id, attempt, None).await;
+        let out = self.run_tracked_inner(settings, dir, command, fresh, check, place, task_id, attempt, Round::Plain).await;
         let elapsed = started.elapsed();
         if let (None, Ok(result)) = (check, &out) {
             let limit = self.round_limit(settings);
@@ -3281,7 +3345,7 @@ impl TaskRunner {
         place: &str,
         task_id: &str,
         attempt: u32,
-        kept: Option<KeptSlot>,
+        round: Round,
     ) -> Result<TestResult, RunnerError> {
         let (kind, what) = match check {
             Some(name) => (CommandKind::Check, format!("Checagem {name}")),
@@ -3297,6 +3361,9 @@ impl TaskRunner {
         stage_params.insert("attempt".into(), serde_json::Value::from(attempt));
         if let Some(name) = check {
             stage_params.insert("check".into(), serde_json::Value::from(name));
+        }
+        if matches!(round, Round::Offline) {
+            stage_params.insert("offline".into(), serde_json::Value::from(true));
         }
         let run_id = format!(
             "{}-{}-{}",
@@ -3322,7 +3389,7 @@ impl TaskRunner {
         // Spec 123 T01: enquanto a rodada corre, um sinal de vida a cada intervalo com o progresso
         // real da saída (bytes e última linha). Antes, só saíam o início e o fim.
         let progress = Arc::new(CommandProgress::new());
-        let work = self.exec_cmd_watched(settings, dir, command, fresh, Some(progress.clone()), kept);
+        let work = self.exec_cmd_watched(settings, dir, command, fresh, Some(progress.clone()), round);
         tokio::pin!(work);
         let mut ticker = tokio::time::interval(self.command_heartbeat.max(Duration::from_millis(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3918,6 +3985,21 @@ impl TaskRunner {
                     attempt: Some(attempt),
                 });
             }
+            // Spec 137 T09: os critérios `(offline)` pedem a rodada offline, que só roda depois da
+            // rodada normal verde (e das checagens), com o mesmo cache de dependências.
+            let mut offline_text = String::new();
+            let offline = offline_criteria(&section_text(&task.body, ACCEPTANCE).unwrap_or_default());
+            if test.passed && !offline.is_empty() {
+                self.check_cancel()?;
+                match self.offline_round(settings, task, &wt, attempt, &suite_label, &offline).await {
+                    Ok(Ok(section)) => offline_text = section,
+                    Ok(Err(failed)) => test = failed,
+                    Err(RunnerError::Docker(reason)) => {
+                        return self.block(task, self.block_reason("docker", &[("reason", &reason)]), BlockKind::Environmental);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             if test.passed {
                 let crit = if dev_criteria.is_empty() { String::new() } else { format!("{DEV_CRITERIA_MARK}{dev_criteria}") };
                 let pend = if dev_pending.is_empty() { String::new() } else { format!("{DEV_PENDING_MARK}{dev_pending}") };
@@ -3930,7 +4012,7 @@ impl TaskRunner {
                     Some((command, lines)) => format!("\n{}{}\n", flaky_pass_warning(&self.scrub(command)), flaky_list(lines)),
                     None => String::new(),
                 };
-                task.frontmatter.test_evidence = Some(format!("{}{silent}{flaky_note}{checks_text}{crit}{pend}", test.output));
+                task.frontmatter.test_evidence = Some(format!("{}{silent}{flaky_note}{checks_text}{offline_text}{crit}{pend}", test.output));
                 // Vincula a evidência ao sha e ao que foi rodado: só então a base pode reaproveitá-la.
                 task.frontmatter.tested_sha = Git::new(wt.clone()).rev_parse("HEAD").ok();
                 task.frontmatter.tested_signature = Some(test_signature(settings));
@@ -3974,6 +4056,53 @@ impl TaskRunner {
         }
     }
 
+    /// Spec 137 T09: a rodada offline dos critérios `(offline)`, depois da rodada normal verde. Roda
+    /// `command` (a bateria da rodada final) no `workspace` sem internet, pela rede interna do
+    /// override ([`ComposeEnv::exec_offline`]), sem recriar o estado nem instalar: o mesmo cache de
+    /// dependências da rodada normal. Entra no registro de rodadas com a marca offline.
+    /// `Ok(section)`: passou; a seção ([`OFFLINE_EVIDENCE_MARK`]) vai à evidência, com os critérios
+    /// que ela prova. `Err(result)`: falhou; o resultado volta ao Desenvolvedor como falha de testes.
+    /// Fora do Docker não há como cortar a rede: a seção diz que a rodada não rodou.
+    async fn offline_round(
+        &self,
+        settings: &Settings,
+        task: &Task,
+        wt: &Path,
+        attempt: u32,
+        command: &str,
+        criteria: &[String],
+    ) -> Result<Result<String, TestResult>, RunnerError> {
+        let lang = self.lang.get();
+        let listed: String = criteria.iter().map(|c| format!("- {}\n", self.scrub(c))).collect();
+        if settings.environment != Environment::Docker {
+            let note = i18n::text(lang, "runner.offline.host");
+            self.tests_message(task, attempt, note.clone());
+            return Ok(Ok(format!("{OFFLINE_EVIDENCE_MARK}{note}\n{listed}")));
+        }
+        self.tests_message(task, attempt, i18n::text(lang, "runner.offline.start"));
+        let task_id = task.frontmatter.id.clone();
+        let started = std::time::Instant::now();
+        let out = self.run_tracked_inner(settings, wt, command, false, None, "", &task_id, attempt, Round::Offline).await?;
+        let elapsed = started.elapsed();
+        let run = capabilities::SuiteRun::measured(elapsed, self.round_limit(settings), out.passed, out.timed_out, rfc3339_of(std::time::SystemTime::now())).offline();
+        // Melhor esforço, como a rodada normal: sem o estado gravado, a rodada segue igual.
+        let _ = capabilities::update(&self.repo_root, |c| c.push_run(run));
+        let secs = elapsed.as_secs().max(1).to_string();
+        if !out.passed {
+            let note = i18n::tr(lang, "runner.offline.failed", &[("secs", &secs)]);
+            self.tests_message(task, attempt, note.clone());
+            let output = format!("{note}\n{listed}\n{}", out.output);
+            return Ok(Err(TestResult { output, ..out }));
+        }
+        let note = i18n::tr(lang, "runner.offline.passed", &[("secs", &secs)]);
+        self.tests_message(task, attempt, note.clone());
+        Ok(Ok(format!(
+            "{OFFLINE_EVIDENCE_MARK}{note}\n{listed}$ {}\n{}\n",
+            self.scrub(command),
+            tail_bytes(self.scrub(&out.output).trim_end(), CHECK_TAIL_BYTES)
+        )))
+    }
+
     /// Spec 124 T04: seção das capacidades do ambiente para o papel `audience` (redigida).
     fn capabilities_section(&self, audience: capabilities::Audience) -> String {
         self.scrub(&capabilities::prompt_section(&capabilities::read(&self.repo_root), audience))
@@ -4013,6 +4142,41 @@ impl TaskRunner {
         };
         let at = rfc3339_of(std::time::SystemTime::now());
         let _ = capabilities::update(&self.repo_root, |c| c.apply_probe(environment_name(settings), &key, probe, at));
+    }
+
+    /// Spec 137 T08 (C-10): quando a branch mexe no README.md de um projeto Docker, a primeira
+    /// palavra de cada comando de executar e testar dele é conferida com `command -v` pela sonda do
+    /// workspace (`ComposeEnv::probe`), e o resultado vai ao Revisor como fato. Encaixe: a revisão da
+    /// tarefa é o único ponto em que a tarefa de documentação passa pelo Revisor com fatos do
+    /// ambiente (as capacidades); o relatório final não é revisado. Sinal: sem README alterado, sem
+    /// comandos, sem Docker ou com a sonda falhando, nada é acrescentado.
+    async fn usage_commands_section(&self, settings: &Settings, root: &Git, branch: &str, worktree: &Path) -> String {
+        use crate::sdd::usage_commands;
+        if settings.environment != Environment::Docker {
+            return String::new();
+        }
+        let Some(compose) = self.compose.clone() else { return String::new() };
+        let touched = root
+            .changed_paths(&settings.base_branch, branch)
+            .is_ok_and(|paths| paths.iter().any(|p| p == usage_commands::README_REL));
+        if !touched {
+            return String::new();
+        }
+        let Some(bytes) = crate::sdd::images::read_regular_nofollow(&worktree.join(usage_commands::README_REL), usage_commands::README_MAX_BYTES) else {
+            return String::new();
+        };
+        let commands = usage_commands::commands_from_readme(&String::from_utf8_lossy(&bytes));
+        if commands.is_empty() {
+            return String::new();
+        }
+        let script = usage_commands::probe_script(&commands);
+        let dir = worktree.to_path_buf();
+        let joined = tokio::task::spawn_blocking(move || compose.probe(&dir, &script, usage_commands::PROBE_TIMEOUT)).await;
+        let output = match joined {
+            Ok(Ok(out)) if !out.timed_out => out.output,
+            _ => return String::new(),
+        };
+        self.scrub(&crate::agents::prompts::usage_commands_facts(&usage_commands::parse_probe(&commands, &output)))
     }
 
     /// Spec 124 T04: rodada que passou de 70% do limite avisa na conversa (o Desenvolvedor e o
@@ -4221,7 +4385,7 @@ impl TaskRunner {
         let footprint = self.footprint_pending(settings);
         let slot: Option<KeptSlot> = footprint.as_ref().map(|_| Arc::new(Mutex::new(None)));
         let mut out = self
-            .run_tracked_inner(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt, slot.clone())
+            .run_tracked_inner(settings, dir, command, true, Some(INSTALL_STEP), place, task_id, attempt, slot.clone().map_or(Round::Plain, Round::Kept))
             .await?;
         if let (Some(spec_id), Some(slot)) = (footprint, slot) {
             let kept = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -4764,6 +4928,8 @@ impl TaskRunner {
             .as_deref()
             .and_then(|sha| root.changed_paths(sha, &branch).ok());
         let worktree = self.worktree_path(&task.frontmatter.spec_id, &task.frontmatter.id);
+        // Spec 137 T08: a tarefa que mexe no README recebe os comandos dele conferidos no ambiente.
+        let usage_facts = self.usage_commands_section(settings, &root, &branch, &worktree).await;
         // Spec 082 T03: capturas gravadas a partir do início da execução de testes da evidência
         // (`tested_at`); sem esse instante, nenhuma.
         let screenshots = match task.frontmatter.tested_at.as_deref().and_then(crate::sdd::screenshots::parse_rfc3339) {
@@ -4819,7 +4985,10 @@ impl TaskRunner {
             references: self.references(&task.frontmatter.spec_id),
             images: crate::sdd::images::SpecImages::load(&self.spec_dir(&task.frontmatter.spec_id)),
             planned_images: self.planned_images(task),
-            environment: self.capabilities_section(capabilities::Audience::Reviewer),
+            environment: match usage_facts.as_str() {
+                "" => self.capabilities_section(capabilities::Audience::Reviewer),
+                facts => format!("{}\n\n{}", self.capabilities_section(capabilities::Audience::Reviewer), facts).trim().to_string(),
+            },
             review_number: finding_track::next_review(&registry),
             task_observations: String::new(),
         };
@@ -4988,6 +5157,17 @@ impl TaskRunner {
                         self.block_reason_counted("rejections", u64::from(task.frontmatter.attempts)),
                         BlockKind::Quality,
                     );
+                }
+                // Spec 137 T11: o apontamento que o Arquiteto manteve e que voltou sem progresso não
+                // volta ao Desenvolvedor. Vai ao Arquiteto como decisão final pelo caminho da
+                // recuperação (bloqueio por qualidade e análise: aceitar como está, rebaixar para
+                // pendência que não bloqueia ou mudar o plano), que já conta os ciclos e chega ao humano.
+                let kept = finding_reply::kept_without_progress(&result.findings);
+                if !kept.is_empty() {
+                    let task_id = task.frontmatter.id.clone();
+                    let joined = kept.iter().map(|f| f.id.as_str()).collect::<Vec<_>>().join(", ");
+                    self.notice(&task_id, "task.kept_recurring", &[("task", &task_id), ("findings", &joined)]);
+                    return self.block(task, self.block_reason("kept_recurring", &[("findings", &joined)]), BlockKind::Quality);
                 }
                 // A reprovação fica gravada antes de qualquer turno do Arquiteto: uma interrupção no
                 // meio da decisão antecipada retoma pela correção, nunca pela mesma revisão.
@@ -10427,18 +10607,19 @@ mod tests {
             .with_compose(Arc::new(crate::harness::compose::fake::test_env("rok", fake.clone())));
         assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let subs = fake.subcommands();
-        // worktree: down, build, up, run(test), run(medida das capacidades, spec 124 T04), run(check);
-        // base: down, up, run(test), run(check)
+        // worktree: down, network rm (sobra da rodada offline, spec 137 T09), up, run(test),
+        // run(medida das capacidades, spec 124 T04), run(check); base: down, network rm, up, run(test), run(check)
         assert_eq!(subs.iter().filter(|s| *s == "down").count(), 2, "{subs:?}");
         assert_eq!(subs.iter().filter(|s| *s == "run").count(), 5, "{subs:?}");
         assert_eq!(subs[0], "down");
-        assert_eq!(subs[1], "up", "sem build: workspace usa image");
-        assert_eq!(subs[2], "run");
+        assert_eq!(subs[1], "network");
+        assert_eq!(subs[2], "up", "sem build: workspace usa image");
+        assert_eq!(subs[3], "run");
         let calls = fake.calls.lock().unwrap();
-        assert!(calls[2].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make test".into()]));
-        assert!(calls[3].args.ends_with(&["workspace".into(), "-c".into(), capabilities::PROBE_SCRIPT.into()]));
-        assert!(calls[4].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make build".into()]));
-        assert_eq!(calls[5].args[7], "down", "estado limpo antes do test_command na base");
+        assert!(calls[3].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make test".into()]));
+        assert!(calls[4].args.ends_with(&["workspace".into(), "-c".into(), capabilities::PROBE_SCRIPT.into()]));
+        assert!(calls[5].args.ends_with(&["--entrypoint".into(), "sh".into(), "workspace".into(), "-lc".into(), "make build".into()]));
+        assert_eq!(calls[6].args[7], "down", "estado limpo antes do test_command na base");
     }
 
     #[tokio::test]
@@ -10462,6 +10643,123 @@ mod tests {
         }
         assert_eq!(fx.read_task("T01").frontmatter.status, TaskStatus::Blocked);
         assert!(rev.inputs().is_empty());
+    }
+
+    /// Spec 137 T09: o marcador `(offline)` é estrutural (igual nos dois idiomas), lido depois dos
+    /// marcadores de lista e da caixa, sem diferenciar maiúsculas, só no começo do critério.
+    #[test]
+    fn offline_marker_is_parsed_like_manual() {
+        assert!(is_offline_criterion("- (offline) os testes passam sem rede"));
+        assert!(is_offline_criterion("2. [ ] (Offline) the suite passes without network access"));
+        assert!(is_offline_criterion("* [x] (OFFLINE) x"));
+        assert!(!is_offline_criterion("- roda (offline) no meio"));
+        assert!(!is_offline_criterion("- (manual) abrir no navegador"));
+        assert!(!is_manual_criterion("- (offline) x"));
+        assert_eq!(
+            offline_criteria("1. a\n- [ ] (offline) b sem rede\n- (manual) c\n3) (offline) d"),
+            vec!["(offline) b sem rede".to_string(), "(offline) d".to_string()]
+        );
+        assert!(offline_criteria("## Critérios\n- só testes").is_empty());
+    }
+
+    /// Runner de compose que falha a primeira rodada offline (o comando, não o Docker) e delega o
+    /// resto ao falso de sempre.
+    struct FirstOfflineFails {
+        inner: Arc<crate::harness::compose::fake::FakeRunner>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::harness::compose::ComposeRunner for FirstOfflineFails {
+        fn run(&self, call: &crate::harness::compose::ComposeCall) -> Result<crate::harness::compose::ComposeOutput, String> {
+            let out = self.inner.run_watched(call, None)?;
+            let offline_run = crate::harness::compose::fake::sub_of(&call.args) == "run"
+                && call.args.iter().any(|a| a.ends_with("override-offline.yaml"));
+            if offline_run && !self.failed.swap(true, Ordering::SeqCst) {
+                return Ok(crate::harness::compose::ComposeOutput { code: Some(1), output: "getaddrinfo ENOTFOUND registry.example\n".into(), timed_out: false });
+            }
+            Ok(out)
+        }
+    }
+
+    fn offline_task() -> Task {
+        let mut t = task("T01", TaskStatus::Todo, &[]);
+        t.body = "## Objetivo\nFazer T01.\n\n## Critérios de Aceitação\n- arquivo criado\n- (offline) testes passam sem rede\n".into();
+        t
+    }
+
+    /// Spec 137 T09 (critérios 3 e 5): a rodada offline só roda depois da rodada normal verde e das
+    /// checagens, sem recriar o estado (sem `down` entre elas), pelo override offline; o resultado
+    /// entra no registro de rodadas com a marca offline e na evidência do critério marcado.
+    #[tokio::test]
+    async fn offline_round_runs_after_the_green_round_and_becomes_evidence() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("offline-ok", "make test");
+        enable_docker(&fx);
+        fx.add_task(&offline_task());
+        let fake = Arc::new(FakeRunner::default());
+        let (dev, rev, rec) = (FakeDev::default(), base_moving_reviewer(fx.repo.clone()), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("roff", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let calls = fake.calls.lock().unwrap();
+        let is_offline = |c: &crate::harness::compose::ComposeCall| c.args.iter().any(|a| a.ends_with("override-offline.yaml"));
+        let offline_run = calls.iter().position(|c| is_offline(c) && crate::harness::compose::fake::sub_of(&c.args) == "run").expect("rodada offline");
+        let normal_run = calls.iter().position(|c| c.args.last().map(String::as_str) == Some("make test")).expect("rodada normal");
+        let check = calls.iter().position(|c| c.args.last().map(String::as_str) == Some("make build")).expect("checagem");
+        assert!(normal_run < check && check < offline_run, "ordem: normal, checagem, offline");
+        assert_eq!(calls[offline_run].args.last().map(String::as_str), Some("make test"), "a mesma bateria");
+        assert!(calls[normal_run + 1..offline_run].iter().all(|c| crate::harness::compose::fake::sub_of(&c.args) != "down"), "sem recriar o estado entre as rodadas");
+        assert_eq!(calls.iter().filter(|c| is_offline(c) && crate::harness::compose::fake::sub_of(&c.args) == "run").count(), 1, "só na worktree");
+        let net = calls.iter().rposition(|c| c.args.first().map(String::as_str) == Some("network")).expect("rede removida");
+        assert!(net > offline_run);
+        // A sobra de uma rodada interrompida sai antes do `up` da rodada offline.
+        let offline_up = calls.iter().position(|c| is_offline(c) && crate::harness::compose::fake::sub_of(&c.args) == "up").expect("up offline");
+        assert_eq!(calls[offline_up - 1].args, ["network", "rm", "-f", "nants-roff-test-nants-offline"]);
+        drop(calls);
+        let caps = capabilities::read(&fx.repo);
+        assert_eq!(caps.runs.iter().filter(|r| r.offline).count(), 1, "{:?}", caps.runs);
+        assert!(caps.runs.iter().any(|r| !r.offline && r.passed));
+        let evidence = fx.read_task("T01").frontmatter.test_evidence.unwrap_or_default();
+        let section = evidence.split(OFFLINE_EVIDENCE_MARK).nth(1).expect("seção offline na evidência");
+        assert!(section.contains("- (offline) testes passam sem rede") && section.contains("$ make test"), "{evidence}");
+        assert!(section.contains(&i18n::tr(Lang::PtBr, "runner.offline.passed", &[("secs", "1")])), "{evidence}");
+    }
+
+    /// Spec 137 T09: sem critério `(offline)`, nenhuma rodada offline; e a rodada offline que falha
+    /// volta ao Desenvolvedor como falha de testes, com o aviso e os critérios.
+    #[tokio::test]
+    async fn offline_round_failure_goes_back_to_the_developer() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("offline-fail", "make test");
+        enable_docker(&fx);
+        fx.add_task(&offline_task());
+        let fake = Arc::new(FakeRunner::default());
+        let compose = Arc::new(FirstOfflineFails { inner: fake.clone(), failed: std::sync::atomic::AtomicBool::new(false) });
+        let (dev, rev, rec) = (FakeDev::default(), base_moving_reviewer(fx.repo.clone()), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("rofff", compose)));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let briefs = dev.briefs();
+        assert_eq!(briefs.len(), 2, "a falha offline volta ao Desenvolvedor");
+        let back = briefs[1].test_output.clone().unwrap_or_default();
+        assert!(back.contains(&i18n::tr(Lang::PtBr, "runner.offline.failed", &[("secs", "1")])), "{back}");
+        assert!(back.contains("- (offline) testes passam sem rede") && back.contains("ENOTFOUND"), "{back}");
+        let caps = capabilities::read(&fx.repo);
+        assert_eq!(caps.runs.iter().filter(|r| r.offline).map(|r| r.passed).collect::<Vec<_>>(), vec![false, true]);
+
+        // Sem o marcador: nada de override offline.
+        let plain = Fixture::new("offline-none", "make test");
+        enable_docker(&plain);
+        plain.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fake = Arc::new(FakeRunner::default());
+        let (dev, rev, rec) = (FakeDev::default(), base_moving_reviewer(plain.repo.clone()), Recorder::default());
+        let runner = plain
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("roffn", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert!(fake.calls.lock().unwrap().iter().all(|c| !c.args.iter().any(|a| a.ends_with("override-offline.yaml"))));
     }
 
     /// Spec 134 T08: a suíte que morreu pelo limite de memória ou de processos do container ganha a
@@ -11957,7 +12255,8 @@ mod tests {
 
     /// Spec 126 T02: o apontamento aberto há 3 revisões vai ao Arquiteto antes da nova tentativa,
     /// sem contestação e antes de esgotar as tentativas; depois do `keep` ele segue obrigatório e não
-    /// dispara de novo (uma vez por apontamento).
+    /// dispara de novo (uma vez por apontamento). Spec 137 T11: a tentativa seguinte recebe a decisão;
+    /// se ele volta aberto na revisão dela, vai à decisão final (`kept_recurring`), sem esperar o limite.
     #[tokio::test]
     async fn recurrence_three_goes_to_the_architect_once_before_the_attempts_run_out() {
         let fx = Fixture::new("recorrencia-tres", "true");
@@ -11976,10 +12275,12 @@ mod tests {
         let briefs = dev.briefs();
         assert!(briefs[2].findings[0].arbitration.is_none(), "a 3ª tentativa ainda não tinha a decisão");
         assert_eq!(briefs[3].findings[0].arbitration.as_ref().map(|a| a.decision), Some(ArbitrationDecision::Keep), "a 4ª recebe a decisão");
+        assert_eq!(briefs.len(), 4, "o mantido que voltou não vai a uma 5ª tentativa");
         let t = fx.read_task("T01");
-        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"), "segue até o limite com o apontamento obrigatório");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("kept_recurring"), "decisão final antes do limite");
+        assert_eq!((t.frontmatter.attempts, t.frontmatter.max_attempts), (4, 6));
         let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
-        assert_eq!((f1.early_review, f1.recurrence), (3, 6));
+        assert_eq!((f1.early_review, f1.recurrence), (3, 4));
         assert_eq!(f1.arbitration.map(|a| (a.decision, a.review)), Some((ArbitrationDecision::Keep, 4)));
         let codes: Vec<String> = notices(&rec).into_iter().map(|(c, _)| c).collect();
         assert_eq!(codes.iter().filter(|c| *c == "task.recurring_arbitration").count(), 1, "{codes:?}");
@@ -12108,6 +12409,149 @@ mod tests {
         assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"), "não dispara de novo");
         assert_eq!(notices(&rec).iter().filter(|(c, _)| c == "task.recurring_recovery").count(), 1);
         assert!(arbiter.facts().is_empty());
+    }
+
+    /// Spec 137 T11, o cenário do Test 11: a guarda de rede que o Revisor cobra recorre, a decisão
+    /// antecipada a mantém (`keep`) e, na revisão da tentativa que recebeu a decisão, o Revisor a
+    /// declara de novo com outro id e `continues`. Ela não volta ao Desenvolvedor: a tarefa fica
+    /// BLOQUEADA por qualidade (`kept_recurring`) com tentativas sobrando e vai à análise de
+    /// recuperação, a decisão final. O RETRY da recuperação zera as tentativas, e o mantido que volta
+    /// de novo sem progresso também não ganha outra tentativa.
+    #[tokio::test]
+    async fn kept_finding_back_without_progress_goes_to_the_final_decision() {
+        let fx = Fixture::new("mantido-sem-progresso", "true");
+        fx.add_task(&task_with_attempts("T01", crate::sdd::DEFAULT_LIMIT));
+        let dev = FakeDev::default();
+        let guard = || at("F-01", "src/net.rs:1", "Falta guarda de socket e DNS nos testes", None);
+        let rev = FakeReviewer::new(move |n, _| match n {
+            3 => rejected(vec![Finding {
+                continues: "F-01".into(),
+                ..at("F-02", "src/net_guard.rs:9", "Egress do navegador ainda sem bloqueio", Some(FindingState::New))
+            }]),
+            _ => rejected(vec![guard()]),
+        });
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"keep","reason":"a guarda é exigida"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("{outcome:?}") };
+        assert_eq!(kind, BlockKind::Quality, "vai à análise de recuperação do servidor");
+        assert!(reason.contains("(F-01)"), "{reason}");
+        assert_eq!(arbiter.facts().len(), 1, "a arbitragem decidiu uma vez");
+        let briefs = dev.briefs();
+        assert_eq!(briefs.len(), 4, "a 4ª tentativa recebeu o keep; não há 5ª");
+        assert_eq!(briefs[3].findings[0].arbitration.as_ref().map(|a| a.decision), Some(ArbitrationDecision::Keep));
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Blocked);
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("kept_recurring"));
+        assert_eq!((t.frontmatter.attempts, t.frontmatter.max_attempts), (4, 5), "antes de esgotar as tentativas");
+        let f1 = read_registry(&t.body).unwrap().into_iter().find(|f| f.id == "F-01").expect("F-01");
+        assert_eq!((f1.state, f1.recurrence, f1.last_review), (Some(FindingState::Open), 4, 4), "a continuação ficou com o id mantido");
+        assert_eq!(f1.arbitration.map(|a| a.decision), Some(ArbitrationDecision::Keep));
+        let kept: Vec<_> = notices(&rec).into_iter().filter(|(c, _)| c == "task.kept_recurring").collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1.get("findings").and_then(|v| v.as_str()), Some("F-01"));
+        assert_eq!(kept[0].1.get("task").and_then(|v| v.as_str()), Some("T01"));
+        // A recuperação continua zerando as tentativas (RETRY).
+        runner.record_recovery(SPEC, "T01", true, "- Causa raiz: x\n- Estratégia: outra").unwrap();
+        assert_eq!(fx.read_task("T01").frontmatter.attempts, 0);
+        let again = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(again, Outcome::Blocked { kind: BlockKind::Quality, .. }), "{again:?}");
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.next_action_code.as_deref(), t.frontmatter.attempts), (Some("kept_recurring"), 1));
+        assert_eq!(dev.briefs().len(), 5, "uma tentativa no ciclo novo, e o mantido volta à decisão final");
+        assert_eq!(arbiter.facts().len(), 1, "a arbitragem não decide de novo");
+    }
+
+    /// Spec 137 T11: depois da arbitragem de uma contestação, a revisão seguinte ainda julga o código
+    /// da contestação; o Desenvolvedor recebe o `keep` na tentativa seguinte, e só a revisão dela leva
+    /// o mantido aberto à decisão final.
+    #[tokio::test]
+    async fn kept_after_a_contest_gets_one_informed_attempt() {
+        let fx = Fixture::new("mantido-contestado", "true");
+        fx.add_task(&task_with_attempts("T01", 6));
+        let dev = answering_dev(|id| format!("{id}: contested (environment): sem rede no container"));
+        let rev = FakeReviewer::new(|_, _| rejected(vec![gpu()]));
+        let arbiter = FakeArbiter::new(|_| r#"{"decisions":[{"id":"F-01","decision":"keep","reason":"dá para testar com software"}]}"#.to_string());
+        let rec = Recorder::default();
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(outcome, Outcome::Blocked { kind: BlockKind::Quality, .. }), "{outcome:?}");
+        let briefs = dev.briefs();
+        assert_eq!(briefs.len(), 3, "a 3ª tentativa é a primeira com a decisão");
+        assert!(briefs[1].findings[0].arbitration.is_none());
+        assert_eq!(briefs[2].findings[0].arbitration.as_ref().map(|a| a.decision), Some(ArbitrationDecision::Keep));
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.next_action_code.as_deref(), t.frontmatter.attempts), (Some("kept_recurring"), 3));
+        assert_eq!(arbiter.facts().len(), 1);
+    }
+
+    /// Desenvolvedor que pergunta ao Arquiteto em toda tentativa (a orientação entra na tarefa em
+    /// disco) e responde aos apontamentos como o `inner`.
+    #[derive(Clone)]
+    struct AlwaysAskingDev {
+        inner: FakeDev,
+        editor: TaskEditor,
+    }
+
+    impl DeveloperPort for AlwaysAskingDev {
+        fn implement<'a>(&'a self, brief: &'a DevBrief) -> Fut<'a, Result<DevReport, RunnerError>> {
+            Box::pin(async move {
+                let n = self.inner.briefs().len() + 1;
+                let entry = format!("### Pergunta (developer)\nq{n}\n\nResposta: a{n}");
+                self.editor.apply_advice(&brief.spec_id, &brief.task_id, &entry, &[], None).unwrap();
+                self.inner.implement(brief).await
+            })
+        }
+    }
+
+    /// Spec 137 T11 (trava de regressão): com arbitragem a cada revisão e pergunta ao Arquiteto a cada
+    /// tentativa, a tarefa fica BLOQUEADA (`rejections`) exatamente na tentativa `max_attempts`, nem
+    /// antes nem depois; o RETRY da recuperação zera a contagem, e o ciclo novo tem de novo
+    /// `max_attempts` tentativas.
+    #[tokio::test]
+    async fn max_attempts_holds_within_each_cycle_after_arbitration_and_questions() {
+        let fx = Fixture::new("limite-por-ciclo", "true");
+        fx.add_task(&task_with_attempts("T01", 4));
+        let baselines: SharedBaselines = Default::default();
+        let editor = TaskEditor::new(fx.repo.clone(), Arc::clone(&baselines));
+        let inner = answering_dev(|id| format!("{id}: contested (out_of_scope): é de outra tarefa"));
+        let dev = AlwaysAskingDev { inner, editor };
+        // Um apontamento novo por revisão, cada um num arquivo: nenhum recorre.
+        let rev = FakeReviewer::new(|n, _| {
+            rejected(vec![at(&format!("F-{:02}", n + 1), &format!("src/m{n}.rs:1"), &format!("Lacuna distinta {n}"), Some(FindingState::New))])
+        });
+        let arbiter = FakeArbiter::new(|n| {
+            format!(r#"{{"decisions":[{{"id":"F-{:02}","decision":"manual","reason":"verificação manual"}}]}}"#, n + 1)
+        });
+        let rec = Recorder::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(dev.clone()),
+            Box::new(rev.clone()),
+            Box::new(ScriptedTests::default()),
+            Box::new(rec.clone()),
+        )
+        .with_baselines(baselines)
+        .with_arbiter(Arc::new(arbiter.clone()));
+        let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(outcome, Outcome::Blocked { kind: BlockKind::Quality, .. }), "{outcome:?}");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Blocked);
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("rejections"));
+        assert_eq!((t.frontmatter.attempts, t.frontmatter.max_attempts), (4, 4), "bloqueia na tentativa max_attempts");
+        assert_eq!((rev.inputs().len(), dev.inner.briefs().len()), (4, 4));
+        assert_eq!(arbiter.facts().len(), 3, "cada contestação foi arbitrada antes da revisão seguinte");
+        assert_eq!(section_text(&t.body, ADVICE_SECTION).unwrap_or_default().matches("### Pergunta (developer)").count(), 4);
+        // O reset da recuperação continua: o ciclo novo tem de novo 4 tentativas.
+        runner.record_recovery(SPEC, "T01", true, "- Causa raiz: x\n- Estratégia: outra").unwrap();
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.status, t.frontmatter.attempts), (TaskStatus::Todo, 0));
+        let again = runner.run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(again, Outcome::Blocked { kind: BlockKind::Quality, .. }), "{again:?}");
+        let t = fx.read_task("T01");
+        assert_eq!((t.frontmatter.next_action_code.as_deref(), t.frontmatter.attempts), (Some("rejections"), 4));
+        assert_eq!(rev.inputs().len(), 8, "4 revisões em cada ciclo");
     }
 
     /// Spec 124 T02: o dispensado que volta com o mesmo id (ou o mesmo problema) vira observação; com
@@ -15487,6 +15931,64 @@ mod tests {
         assert_eq!(caps.runs.last().and_then(|r| r.limit_ms), Some(u64::try_from(TEST_TIMEOUT.as_millis()).unwrap()));
     }
 
+    /// Spec 137 T08 (C-10): a tarefa que mexe no README de um projeto Docker leva ao Revisor os
+    /// comandos de executar e testar conferidos com `command -v` pela sonda (simulada) do workspace.
+    #[tokio::test]
+    async fn readme_commands_are_checked_in_the_workspace_and_reach_the_reviewer() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("usage-cmds", "make test");
+        enable_docker(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let readme = "# Svc\n\n## How to run\n```sh\ndocker compose -f .nants/compose.yaml run --rm --service-ports workspace sh -lc 'npm start'\n```\n\n## How to test\n```console\n$ curl -s http://localhost:8080/health\n{\"status\":\"UP\"}\n```\n`GET /health` retorna 200.\n";
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "nants-cmd:ok:npm\nnants-cmd:missing:curl\n");
+        let rev = FakeReviewer::new(|_, _| approved(vec![]));
+        let rec = Recorder::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(FilesDev(vec![("README.md", readme)])),
+            Box::new(rev.clone()),
+            Box::new(ScriptedTests::default()),
+            Box::new(rec.clone()),
+        )
+        .with_compose(Arc::new(crate::harness::compose::fake::test_env("usagecmd", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let probes: Vec<_> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a.contains("command -v")))
+            .cloned()
+            .collect();
+        assert_eq!(probes.len(), 1, "uma conferência por revisão");
+        assert!(probes[0].args.iter().any(|a| a.contains("exec sh -lc 'for w in npm curl;")), "{:?}", probes[0].args);
+        assert!(probes[0].args.contains(&"--no-deps".to_string()) && probes[0].args.contains(&"workspace".to_string()));
+        let env = &rev.inputs()[0].environment;
+        assert!(env.contains("Comandos do guia de uso conferidos no ambiente"), "{env}");
+        assert!(env.contains("- `curl`: AUSENTE na imagem (em: `curl -s http://localhost:8080/health`)"), "{env}");
+        assert!(env.contains("- `npm`: presente na imagem"), "{env}");
+        assert!(!env.contains("`GET`"), "código em linha não é comando: {env}");
+    }
+
+    /// Spec 137 T08: sem README na branch, nada é conferido nem acrescentado ao Revisor.
+    #[tokio::test]
+    async fn without_readme_change_no_command_check_runs() {
+        use crate::harness::compose::fake::FakeRunner;
+        let fx = Fixture::new("usage-cmds-none", "make test");
+        enable_docker(&fx);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let fake = Arc::new(FakeRunner::default());
+        fake.reply("run", 0, "nants-cmd:missing:curl\n");
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx
+            .runner(&dev, &rev, ScriptedTests::default(), &rec)
+            .with_compose(Arc::new(crate::harness::compose::fake::test_env("usagecmd0", fake.clone())));
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.args.iter().any(|a| a.contains("command -v"))));
+        assert!(!rev.inputs()[0].environment.contains("Comandos do guia de uso"));
+    }
+
 
     /// Spec 129 T02: `docker diff` com `n` arquivos gravados fora de `/work` (mais os diretórios `C`
     /// e `A` deles), uma entrada `D` e uma em `/work`.
@@ -15553,10 +16055,10 @@ mod tests {
         runner.arm_install_footprint(SPEC);
         let install = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
         assert!(matches!(install, Install::Ran { clean: false }));
-        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "prepare, instalação mantida, diff e remoção");
+        assert_eq!(fake.subcommands(), vec!["down", "network", "up", "run", "diff", "rm"], "prepare, instalação mantida, diff e remoção");
         let calls = fake.calls.lock().unwrap().clone();
-        assert!(!calls[2].args.iter().any(|a| a == "--rm") && calls[2].args.ends_with(&["-lc".into(), "make deps".into()]), "{:?}", calls[2].args);
-        assert!(calls[2].args.contains(&"nants.project=footprint-above".to_string()));
+        assert!(!calls[3].args.iter().any(|a| a == "--rm") && calls[3].args.ends_with(&["-lc".into(), "make deps".into()]), "{:?}", calls[3].args);
+        assert!(calls[3].args.contains(&"nants.project=footprint-above".to_string()));
         // spec.md: o registro (com o tempo e o limite em entradas) e o aviso com os caminhos principais.
         let section = footprint_section(&fx).expect("seção do Arquiteto");
         let count = INSTALL_FOOTPRINT_LIMIT + 8;
@@ -15595,7 +16097,7 @@ mod tests {
         runner.arm_install_footprint(SPEC);
         let install = runner.ensure_installed(&settings, &fx.repo, "", "T01", 1, false).await.unwrap();
         assert!(matches!(install, Install::Failed(..)));
-        assert_eq!(fake.subcommands(), vec!["down", "up", "run", "diff", "rm"], "o container sai do mesmo jeito");
+        assert_eq!(fake.subcommands(), vec!["down", "network", "up", "run", "diff", "rm"], "o container sai do mesmo jeito");
         assert!(footprint_section(&fx).is_none(), "não marcada como feita nem com contagem");
         assert!(outside_work_notices(&rec).is_empty());
         assert_eq!(runner.footprint_pending(&settings).as_deref(), Some(SPEC), "fica para a próxima instalação");

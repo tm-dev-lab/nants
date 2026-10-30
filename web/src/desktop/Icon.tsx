@@ -2,7 +2,7 @@
  * Ícones SVG do desktop (spec 093, decisão 14): um só conjunto, traço único `ICON_STROKE` (1.8) e
  * tamanhos da escala `ICON_SIZES` (14/16/18/20, spec 094, T06), sempre decorativos
  * (`aria-hidden`); o nome acessível fica no botão ou no texto ao lado. Inclui os ícones das
- * janelas, do dock e da aparência.
+ * janelas, do menu do N e da aparência.
  *
  * Os desenhos (paths) vêm do Lucide (https://lucide.dev), licença ISC. Parte do Lucide vem do
  * Feather, licenciado sob MIT.

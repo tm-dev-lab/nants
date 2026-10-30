@@ -8,7 +8,7 @@ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appErrorMessage, appExitedText } from "../../copy";
 import { rangeLabel } from "../../desktop/network";
-import { notReady, settle } from "../../desktop/shell-test-utils";
+import { activateApp, notReady, settle } from "../../desktop/shell-test-utils";
 import { windowSubtitleId } from "../../desktop/windowMeta";
 import { setLanguage } from "../../i18n";
 import { portugueseLeftovers } from "../../i18n/ptLeftovers";
@@ -28,18 +28,18 @@ afterEach(() => {
 type Lang = "pt-BR" | "en";
 const RUN_NAME: Readonly<Record<Lang, string>> = { "pt-BR": "Execução", en: "Run" };
 
-async function dock(name: string): Promise<void> {
+async function openApp(name: string): Promise<void> {
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Dock" })).getByRole("button", { name }));
+    activateApp(name);
   });
   await settle();
 }
 
-/** Monta no idioma pedido e abre as janelas pelo dock (com os nomes do idioma). */
+/** Monta no idioma pedido e abre as janelas pelo menu do N (com os nomes do idioma). */
 async function mount(lang: Lang, options: Parameters<typeof mountRun>[0] = {}, windows: readonly ("app" | "run")[] = ["app"]) {
   setLanguage(lang, { persist: false });
   const view = await mountRun({ ...options, open: [] });
-  for (const w of windows) await dock(w === "app" ? "App" : RUN_NAME[lang]);
+  for (const w of windows) await openApp(w === "app" ? "App" : RUN_NAME[lang]);
   return view;
 }
 

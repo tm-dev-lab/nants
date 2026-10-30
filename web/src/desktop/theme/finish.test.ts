@@ -48,7 +48,7 @@ const rel = (full: string): string => relative(SRC, full).split(sep).join("/");
 const allCss = (): { file: string; css: string }[] =>
   ["desktop", "apps"].flatMap((d) => walk(join(SRC, d), /\.css$/)).map((full) => ({ file: rel(full), css: readFileSync(full, "utf8") }));
 
-/** Classes que os componentes combinam com o titânio (barra, títulos, dock, abas do celular e segmentados). */
+/** Classes que os componentes combinam com o titânio (barra, títulos, abas do celular e segmentados). */
 function materialClassNames(): Set<string> {
   const out = new Set<string>();
   for (const full of walk(SRC, /\.tsx$/).filter((f) => !f.endsWith(".test.tsx"))) {
@@ -132,7 +132,6 @@ describe("raios aninhados concêntricos (interno = externo − padding)", () => 
   /** `pad`: onde está o padding entre o externo e os internos, quando não é o do próprio externo. */
   const cases: { label: string; outer: [string, string]; inner: [string, string][]; pad?: [string, string] }[] = [
     { label: "menu e itens", outer: [desktopCss, ".nd-menu"], inner: [[desktopCss, ".nd-menu-item"]] },
-    { label: "dock e ícones", outer: [desktopCss, ".nd-dock"], inner: [[desktopCss, ".nd-dock-btn"]] },
     {
       // 095/T02: o campo encosta no topo do painel (raio só em cima, igual ao do painel); os
       // resultados ficam na lista com padding de 8 px.
@@ -175,7 +174,6 @@ describe("raios aninhados concêntricos (interno = externo − padding)", () => 
    * raio maior que o padding lateral precisa estar em `cases` (o teste de cobertura confere).
    */
   const EXEMPT: ReadonlyMap<string, string> = new Map([
-    [".nd-dock-btn", "botão sem filhos encostados (só o ícone centrado)"],
     [".nd-toast-more", "rótulo de texto (`--r-md`), sem controle dentro"],
   ]);
 
@@ -228,7 +226,7 @@ describe("raios aninhados concêntricos (interno = externo − padding)", () => 
 
 describe("elevação por tema", () => {
   for (const theme of THEME_NAMES) {
-    it(`${theme}: 4 níveis (dock, janela atrás, menu, janela em foco) com a sombra crescendo`, () => {
+    it(`${theme}: 4 níveis (elevada baixa, janela atrás, menu, janela em foco) com a sombra crescendo`, () => {
       const vars = themeVariables(theme);
       expect(ELEVATIONS.map((e) => ELEVATION_LEVEL[e])).toEqual([1, 2, 3, 4]);
       const blurs = ELEVATIONS.map((e) => maxBlur(THEMES[theme].elevation[e]));
@@ -241,11 +239,10 @@ describe("elevação por tema", () => {
     for (const e of ELEVATIONS) expect(maxAlpha(THEMES.light.elevation[e])).toBeLessThan(maxAlpha(THEMES.dark.elevation[e]));
   });
 
-  it("janela atrás --elev-2, em foco --elev-4; menus e popovers --elev-3; dock --elev-1", () => {
+  it("janela atrás --elev-2, em foco --elev-4; menus e popovers --elev-3", () => {
     expect(cssRuleBody(desktopCss, ".nd-window")).toContain("box-shadow: var(--elev-2)");
     expect(cssRuleBody(desktopCss, '.nd-window[data-active="true"]')).toContain("box-shadow: var(--elev-4)");
     expect(cssRuleBody(desktopCss, ".nd-menu")).toContain("box-shadow: var(--bevel), var(--elev-3)");
-    expect(cssRuleBody(desktopCss, ".nd-dock")).toContain("box-shadow: var(--bevel), var(--elev-1)");
   });
 });
 
@@ -259,9 +256,9 @@ describe("material titânio com reflexo consistente", () => {
 
   const materialClasses = materialClassNames;
 
-  it("barra superior, barras de título, dock, abas do celular e segmentados usam o titânio; as sobreposições não", () => {
+  it("barra superior, barras de título, abas do celular e segmentados usam o titânio; as sobreposições não", () => {
     const classes = materialClasses();
-    for (const cls of ["nd-topbar", "nd-titlebar", "nd-dock", "nd-segment", "nd-mobile-tabs"]) expect(classes).toContain(cls);
+    for (const cls of ["nd-topbar", "nd-titlebar", "nd-segment", "nd-mobile-tabs"]) expect(classes).toContain(cls);
     // Decisão do Arquiteto na revisão 1 da T01: menus, popovers, avisos e dicas são sólidos (`.nd-overlay`).
     for (const cls of ["nd-menu", "nd-popover", "nd-tip", "nd-toast", "nd-bar-alert", "nd-hint", "nd-launcher"]) expect(classes).not.toContain(cls);
     // Todo controle segmentado é titânio.
@@ -411,12 +408,12 @@ describe("estados iguais em todos os controles", () => {
   });
 });
 
-describe("janelas, barras e dock sem borda (095/T01, decisão 2)", () => {
-  /** A moldura, as barras e o dock: em qualquer CSS, com ou sem `.nd-root` e estados, e em `@media`. */
-  const FRAME = /^(?:\.nd-root(?:\[[^\]]*\])* )?\.nd-(?:window|topbar|titlebar|dock|dock-btn|mobile-tabs|chrome)(?:\[[^\]]*\]|:[\w-]+(?:\([^)]*\))?)*$/;
+describe("janelas e barras sem borda (095/T01, decisão 2)", () => {
+  /** A moldura e as barras: em qualquer CSS, com ou sem `.nd-root` e estados, e em `@media`. */
+  const FRAME = /^(?:\.nd-root(?:\[[^\]]*\])* )?\.nd-(?:window|topbar|titlebar|mobile-tabs|chrome)(?:\[[^\]]*\]|:[\w-]+(?:\([^)]*\))?)*$/;
 
   /**
-   * Bordas declaradas numa regra. Só o reset `border: 0`/`none` (o do `<button>` do dock) não conta:
+   * Bordas declaradas numa regra. Só o reset `border: 0`/`none` (o de um `<button>`) não conta:
    * ele tira a borda nativa, não desenha uma.
    */
   const borders = (body: string): string[] =>
@@ -424,7 +421,7 @@ describe("janelas, barras e dock sem borda (095/T01, decisão 2)", () => {
       .filter((m) => !(m[1] === "border" && /^(?:0|none)$/.test((m[2] ?? "").trim())))
       .map((m) => `${m[1]}: ${(m[2] ?? "").trim()}`);
 
-  it("nenhuma regra da moldura, das barras ou do dock declara border (nem 0,5 px), em nenhum contexto", () => {
+  it("nenhuma regra da moldura ou das barras declara border (nem 0,5 px), em nenhum contexto", () => {
     const offenders: string[] = [];
     let seen = 0;
     for (const { file, css } of allCss()) {
@@ -441,7 +438,7 @@ describe("janelas, barras e dock sem borda (095/T01, decisão 2)", () => {
   it("a checagem pega borda na moldura, inclusive no celular e no contraste alto; o reset do botão passa", () => {
     const sample =
       ".nd-window { border: 0.5px solid red; } @media (x) { .nd-root .nd-titlebar { border-bottom: 1px solid red; } } " +
-      '.nd-root[data-mobile="true"] .nd-window { border-width: 0.5px; } .nd-dock-btn { border: 0; } .nd-dock { border-radius: 4px; }';
+      '.nd-root[data-mobile="true"] .nd-window { border-width: 0.5px; } .nd-topbar { border: 0; } .nd-titlebar { border-radius: 4px; }';
     const hits = cssRules(sample).filter((r) => r.selectors.some((s) => FRAME.test(s)) && borders(r.body).length > 0);
     expect(hits.map((r) => r.selectors[0])).toEqual([".nd-window", ".nd-root .nd-titlebar", '.nd-root[data-mobile="true"] .nd-window']);
   });

@@ -1,8 +1,10 @@
 /*
- * Medidas fixas do desktop (spec 094, decisão 4; spec 095, C-06): barra superior, barra de título,
- * dock e a folga do dock. O CSS (`theme/desktop.css`) declara as mesmas medidas como variáveis na
- * `.nd-root` (`--topbar-h`, `--titlebar-h`, `--dock-h`, `--dock-gap`), e a área de trabalho
- * desconta o dock inteiro. Um teste confere que o CSS e estas constantes não divergem.
+ * Medidas fixas do desktop (spec 094, decisão 4; spec 095, C-06): barra superior e barra de título.
+ * O CSS (`theme/desktop.css`) declara as mesmas medidas como variáveis na `.nd-root`
+ * (`--topbar-h`, `--titlebar-h`). Um teste confere que o CSS e estas constantes não divergem.
+ *
+ * Sem dock (spec 137/T02): a área de trabalho vai da barra de cima até a borda de baixo. A margem
+ * em volta das janelas é a mesma nos quatro lados (a folga dos presets, `PRESET_GAP`).
  */
 import type { Workspace } from "./windows";
 
@@ -13,25 +15,16 @@ export const TOPBAR_HEIGHT = 44;
  * abre logo abaixo dela e a alça leste começa depois dela.
  */
 export const TITLEBAR_HEIGHT = 44;
-/** Botão do dock (px): 44, com ícone de 20 (095/T02, `reference/Main.dc.html`). */
-export const DOCK_BUTTON = 44;
-/** Altura do dock (px): o botão e o padding de 8 px (`--sp-2`) em cima e embaixo. */
-export const DOCK_HEIGHT = DOCK_BUTTON + 2 * 8;
-/** Folga entre o dock e a borda inferior, e entre o dock e a área de trabalho (px). */
-export const DOCK_GAP = 12;
-/** Menor altura de viewport em que o dock precisa caber inteiro (px). */
+/** Menor altura de viewport do modo desktop (px). */
 export const MIN_DESKTOP_HEIGHT = 600;
 
-/** Altura reservada abaixo da área de trabalho: o dock e as duas folgas. */
-export const DOCK_RESERVE = DOCK_HEIGHT + 2 * DOCK_GAP;
+/**
+ * Altura que o dock reservava embaixo da área de trabalho até a spec 137 (o dock de 60 px e as
+ * duas folgas de 12). Só a migração dos layouts salvos antes da 137 a usa (`presets.ts`).
+ */
+export const LEGACY_DOCK_RESERVE = 84;
 
-/** Área de trabalho para uma viewport: sem a barra superior e sem o dock (nunca negativa). */
+/** Área de trabalho para uma viewport: sem a barra superior (nunca negativa). */
 export function workspaceForViewport(width: number, height: number): Workspace {
-  return { w: Math.max(0, Math.floor(width)), h: Math.max(0, Math.floor(height) - TOPBAR_HEIGHT - DOCK_RESERVE) };
-}
-
-/** Faixa vertical ocupada pelo dock numa viewport de altura `height` (px, a partir do topo). */
-export function dockBand(height: number): { top: number; bottom: number } {
-  const bottom = height - DOCK_GAP;
-  return { top: bottom - DOCK_HEIGHT, bottom };
+  return { w: Math.max(0, Math.floor(width)), h: Math.max(0, Math.floor(height) - TOPBAR_HEIGHT) };
 }

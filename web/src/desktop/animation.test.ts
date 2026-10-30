@@ -3,13 +3,14 @@ import { animationFor, playAnimation, prefersReducedMotion, transformFor, waitFo
 
 const win = { x: 100, y: 50, w: 800, h: 600 };
 const max = { x: 0, y: 0, w: 1600, h: 900 };
-const dock = { x: 500, y: 880, w: 48, h: 48 };
+// Destino de minimizar e origem de restaurar: o botão N da barra de cima (137/T02).
+const nButton = { x: 16, y: 4, w: 36, h: 36 };
 
 describe("animationFor (FLIP)", () => {
   it("reduced motion desliga todas", () => {
     expect(animationFor(win, max, true)).toBeNull();
-    expect(animationFor(win, dock, true, "minimize")).toBeNull();
-    expect(animationFor(dock, win, true, "restore")).toBeNull();
+    expect(animationFor(win, nButton, true, "minimize")).toBeNull();
+    expect(animationFor(nButton, win, true, "restore")).toBeNull();
   });
 
   it("maximizar: a caixa já está no destino; parte do inverso da origem até a identidade", () => {
@@ -24,12 +25,12 @@ describe("animationFor (FLIP)", () => {
     expect(animationFor(win, { ...win }, false)).toBeNull();
   });
 
-  it("minimizar: vai da janela até o ícone do dock e some; restaurar é o inverso", () => {
-    const m = animationFor(win, dock, false, "minimize");
+  it("minimizar: vai da janela até o botão N e some; restaurar é o inverso", () => {
+    const m = animationFor(win, nButton, false, "minimize");
     expect(m?.keyframes[0]).toEqual({ transform: "translate(0px, 0px) scale(1, 1)", opacity: 1 });
-    expect(m?.keyframes[1]).toEqual({ transform: transformFor(dock, win), opacity: 0 });
-    const r = animationFor(dock, win, false, "restore");
-    expect(r?.keyframes[0]).toEqual({ transform: transformFor(dock, win), opacity: 0 });
+    expect(m?.keyframes[1]).toEqual({ transform: transformFor(nButton, win), opacity: 0 });
+    const r = animationFor(nButton, win, false, "restore");
+    expect(r?.keyframes[0]).toEqual({ transform: transformFor(nButton, win), opacity: 0 });
     expect(r?.keyframes[1]).toEqual({ transform: "translate(0px, 0px) scale(1, 1)", opacity: 1 });
   });
 

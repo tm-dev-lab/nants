@@ -264,7 +264,7 @@
 
 /*
  * Item do Alternador (095/T07, A-09): uma LINHA separada pela `--divider`, sem cartão nem contorno;
- * ícone neutro como no dock. Aberta não é selecionada: só o item da vista atual (`aria-current`)
+ * ícone neutro como na grade do menu do N. Aberta não é selecionada: só o item da vista atual (`aria-current`)
  * ganha o fundo `--lane` (bloco comum de estados, em desktop.css), nunca uma borda colorida.
  */
 .nd-switcher-item {

@@ -4,6 +4,9 @@
  *
  * Spec 123 T02: durante uma operação longa a fase mostra o que roda ("Testes · 7 min"). Sem espaço,
  * os detalhes encolhem com reticências e o botão nunca passa por cima dos controles ao lado.
+ *
+ * Spec 137 T03: a pílula é a única parte da barra que encolhe. O título e os detalhes saem antes;
+ * a fase é a última, com reticências; o texto inteiro fica na dica (`title`) da pílula.
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { getUsage, resumeSpec, stopSpec, type ApiFailure } from "../../api/client";
@@ -163,6 +166,9 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
   const details = [progress, usage].filter((x): x is string => x !== null);
   const specId = activeSpec?.id ?? null;
   const specTitle = activeSpec?.title ?? t("run.noSpec");
+  // Dica da pílula (137/T03): a faixa de status é a única parte da barra que encolhe, com
+  // reticências; o texto inteiro (fase, título e detalhes) fica aqui.
+  const fullStatus = [specTitle !== "" ? `${PHASE_LABELS[phase]}: ${specTitle}` : PHASE_LABELS[phase], ...details].join(" · ");
 
   async function stop(): Promise<void> {
     if (specId === null) return;
@@ -208,6 +214,7 @@ export function RunPill({ space, stopSignal = 0, resumeSignal = 0 }: RunPillProp
       className="nd-run-pill"
       role="group"
       aria-label={`${PHASE_LABELS[phase]}: ${specTitle}`}
+      title={fullStatus}
       data-run-pill=""
       data-tone={tone}
       data-phase={phase}

@@ -3,8 +3,9 @@
  * projetos, histórico, atividades, diálogo, uso, atenção, prontidão, ui-state (com `rev` e 409)
  * e as mutações usadas pela barra. Cada chamada fica registrada em `calls`.
  */
-import { act, render } from "@testing-library/react";
+import { act, fireEvent, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { flushSync } from "react-dom";
 import type { ChatHistoryTurn, ConnectionView, DialogMessage, ProjectState, ProjectEntry } from "../api/types";
 import type { AppRegistry } from "../apps/registry";
 import { FakeEventSource, installFakeEventSource, installFetch, makeConfig, resetStore, type RouteReply } from "../test-utils";
@@ -190,4 +191,56 @@ export async function renderShell(options: RenderShellOptions = {}) {
     return source;
   };
   return { server, fetchMock, view, stream };
+}
+
+/**
+ * Abre o menu do N (spec 137), se ainda não estiver aberto, e devolve o painel. Síncrono: serve
+ * dentro de `act(async () => ...)`.
+ */
+export function openNMenu(): HTMLElement {
+  const button = document.querySelector<HTMLButtonElement>("[data-nbutton]");
+  if (button === null) throw new Error("botão N ausente");
+  // `flushSync`: dentro de um `act` o React só desenha no fim; o menu precisa estar na tela agora.
+  if (button.getAttribute("aria-expanded") !== "true") flushSync(() => fireEvent.click(button));
+  const panel = document.querySelector<HTMLElement>("[data-nmenu]");
+  if (panel === null) throw new Error("menu do N ausente");
+  return panel;
+}
+
+/**
+ * Ativa um app pelo menu do N, como o clique no item da grade: abre, foca, restaura ou minimiza a
+ * janela que está em foco. Síncrono, como o `fireEvent`.
+ */
+export function activateApp(name: string | RegExp): void {
+  const panel = openNMenu();
+  const grid = panel.querySelector<HTMLElement>("[data-nmenu-grid]");
+  if (grid === null) throw new Error("grade do menu do N ausente");
+  fireEvent.click(within(grid).getByRole("button", { name }));
+}
+
+/** Roda `fn` com o menu do N aberto e o fecha depois (Esc), se foi aberto aqui. */
+export function inNMenu<T>(fn: (menu: HTMLElement) => T): T {
+  const wasOpen = document.querySelector("[data-nbutton]")?.getAttribute("aria-expanded") === "true";
+  const out = fn(openNMenu());
+  if (!wasOpen) flushSync(() => fireEvent.keyDown(window, { key: "Escape" }));
+  return out;
+}
+
+/** Selo do app no menu do N (`null` sem selo). */
+export function appBadge(kind: string): string | null {
+  return inNMenu((menu) => menu.querySelector(`.nd-nmenu-tile[data-kind="${kind}"] [data-badge]`)?.textContent ?? null);
+}
+
+/** Abre pelo menu do N, um a um, todos os apps fechados da grade. */
+export async function openAllApps(): Promise<void> {
+  // Teto: um app que não abre não prende o teste num laço.
+  for (let round = 0; round < 20; round += 1) {
+    const kind = inNMenu((menu) => menu.querySelector('.nd-nmenu-tile[data-state="closed"]')?.getAttribute("data-kind") ?? null);
+    if (kind === null) break;
+    await act(async () => {
+      const tile = openNMenu().querySelector<HTMLElement>(`.nd-nmenu-tile[data-kind="${kind}"]`);
+      if (tile !== null) fireEvent.click(tile);
+    });
+  }
+  await settle();
 }

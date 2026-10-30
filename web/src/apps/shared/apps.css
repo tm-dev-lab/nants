@@ -1999,7 +1999,7 @@ ol.nd-md-list {
 .nd-permission-toasts {
   position: absolute;
   right: 12px;
-  bottom: 104px;
+  bottom: var(--float-bottom);
   width: min(380px, calc(100% - 24px));
   display: flex;
   flex-direction: column;
@@ -2052,22 +2052,86 @@ ol.nd-md-list {
  */
 .nd-role-conn {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--sp-1) var(--sp-3);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  min-width: 0;
   margin: 0;
   font-size: var(--fs-label);
   color: var(--muted);
 }
 
+/*
+ * Spec 137 T05: cada linha numa linha só. Na primeira, só o nome da conexão encolhe (com
+ * reticências); o papel, o modelo e a seta ficam inteiros.
+ */
 .nd-role-conn .nd-role-conn-trigger {
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  align-self: flex-start;
   gap: 0 var(--sp-1);
+  min-width: 0;
   max-width: 100%;
+  white-space: nowrap;
   color: var(--ink3);
   font-weight: var(--fw-regular);
   text-align: left;
   text-decoration: none;
+}
+
+.nd-role-conn-trigger > span,
+.nd-role-conn-trigger > svg {
+  flex-shrink: 0;
+}
+
+.nd-role-conn-trigger > .nd-role-conn-name {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Segunda linha: quem trabalha agora, ou o papel pausado. */
+.nd-role-conn-now,
+.nd-role-conn .nd-role-conn-alert {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  min-height: 20px;
+  padding: 0 var(--sp-1);
+  white-space: nowrap;
+}
+
+.nd-role-conn-now {
+  color: var(--ink3);
+}
+
+.nd-role-conn-now .nd-dot {
+  margin-right: var(--sp-1);
+}
+
+.nd-role-conn-now .nd-strong {
+  font-size: inherit;
+  color: var(--ink2);
+}
+
+.nd-role-conn-now-lead {
+  flex-shrink: 0;
+}
+
+/* O nome da conexão encolhe primeiro; o modelo, só depois. */
+.nd-role-conn-now-name {
+  flex-shrink: 10;
+  min-width: 3ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nd-role-conn-now-model {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nd-role-conn-trigger .nd-strong {

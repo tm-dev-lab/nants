@@ -356,7 +356,13 @@ impl ProviderFailure {
     /// `provider_bad_response (incompleta: content_filter)`, `provider_http_400 (código:
     /// invalid_value)`; os demais ficam só com o código.
     pub fn describe(&self) -> String {
-        match self.detail() {
+        self.describe_in(Lang::PtBr)
+    }
+
+    /// Como [`Self::describe`], com o detalhe no idioma `lang` (spec 137 T12): o texto de reserva
+    /// gravado no diálogo de um projeto sai no idioma dele.
+    pub fn describe_in(&self, lang: Lang) -> String {
+        match self.detail_in(lang) {
             Some(detail) => format!("{self} ({detail})"),
             None => self.to_string(),
         }

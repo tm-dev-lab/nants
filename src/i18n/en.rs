@@ -241,6 +241,18 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("report.traceability.no_task", "no task declared"),
     // Runner: tarefa de correção criada pela verificação final (spec 107), gravada no Txx.md.
     ("runner.final_fix_title", "Final verification fix"),
+    // Spec 137 T12: the run failure cause (`RunnerError::describe_in`) in the project language; the
+    // free detail from inside stays as it came.
+    ("runner.error.invalid_id", "invalid identifier for {name}: {value}"),
+    ("runner.error.config", "invalid configuration: {detail}"),
+    ("runner.error.invalid", "invalid state: {detail}"),
+    ("runner.error.dependencies_pending", "task {task} has dependencies that are not DONE: {pending}"),
+    ("runner.error.io", "I/O error in {path}: {error}"),
+    ("runner.error.tests", "could not run the tests: {detail}"),
+    ("runner.error.docker", "docker environment: {detail}"),
+    ("runner.error.role", "the {role} role failed: {detail}"),
+    ("runner.error.external_edit", "{path} was modified externally"),
+    ("runner.error.cancelled", "run cancelled"),
     // Runner: `tests` agent messages in the conversation (spec 113 T04), in the project language.
     ("runner.tests.passed_command", "tests ✓{place} (`{command}`)"),
     ("runner.tests.passed_checks", "tests ✓{place} · {checks}"),
@@ -251,6 +263,10 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.tests.rerun", "The test round failed. Running it once more, with no code change, to check whether the test is flaky."),
     ("runner.tests.rerun_skipped", "The test round failed with the same failure lines the Developer had already seen on this same version of the code. The failure repeats: no extra round to check whether the test is flaky."),
     ("runner.tests.rerun_skipped_missing_program", "The test round failed with code {code}, which means a missing or non-executable program. This is an environment failure, not a flaky test: no extra round to check for flakiness."),
+    ("runner.offline.start", "Offline round: the test suite runs again without internet access, because of the (offline) criteria. The project services, such as the database, stay reachable."),
+    ("runner.offline.passed", "The offline round (no internet) passed in {secs} s."),
+    ("runner.offline.failed", "The offline round (no internet) failed in {secs} s, after the regular round passed. The (offline) criteria require the suite to pass without network access: something in the tests still downloads or reaches an outside address."),
+    ("runner.offline.host", "The offline round did not run: it needs the project Docker environment to cut off internet access."),
     ("runner.tests.flaky", "The round failed and passed on the rerun with no code change: it goes on as passed, with a flaky test alert. Failures in the first round: {tests}"),
     ("runner.flaky.entry", "Attempt {attempt}: the round failed and passed on the rerun with no code change. Failures in the first round: {tests}"),
     ("runner.flaky.unnamed", "no test identified in the output"),
@@ -337,6 +353,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("runner.block.revised", "definition revised; resume"),
     ("runner.block.blocked", "task BLOCKED"),
     ("runner.block.recurring", "recurring HIGH findings ({findings}): the Architect decides before a new attempt"),
+    ("runner.block.kept_recurring", "findings kept by the Architect came back without progress ({findings}): final decision by the Architect, without a new attempt on the same requirement"),
     ("runner.budget.tokens", "spec budget reached: {tokens} of {max} tokens"),
     ("runner.budget.usd", "spec budget reached: US$ {cost} of US$ {max}"),
     ("runner.final_fix.reason", "Final verification: {met} of {total} criteria met. Create a fix task?"),
@@ -353,6 +370,8 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("approvals.judge_auto", "{command} (judge: {reason})"),
     ("approvals.judge_refusal", "Automatic approval did not allow this on its own ({reason}); waiting for you: {command}"),
     ("runs.budget_paused", "Run paused: {reason}. Raise or remove the limit and use Resume."),
+    // Spec 137 T12: the refused relaunch without the API refusal (project or reservation gone).
+    ("runs.relaunch_unavailable", "the project or the run reservation was no longer available"),
     ("runs.env_choice_reason", "Adjust the docker environment (option \"{label}\" chosen by you)"),
     // System messages in the conversation (spec 115 T03): the same text as `system.<code>` on the web.
     (
@@ -379,6 +398,11 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ),
     // Spec 133 T11: the provider refused the Architect turn; the evidence goes in the `params`.
     ("system.chat.provider_failed", "The Architect's model provider failed on this turn ({provider})."),
+    // Spec 137 T12: the cut turn and the image-only message, recorded in `.chat.jsonl` in the
+    // project language.
+    ("system.chat.timeout_turn", "The turn was cut short for inactivity; send the message again."),
+    ("system.chat.timeout_turn_saved", "The turn was cut short for taking too long, but the plan was saved; see the plan card."),
+    ("system.chat.image_only", "(image)"),
     // Spec 128 T02: uma linha por rodada do consenso do plano.
     (
         "system.plan.consensus_round",
@@ -423,6 +447,27 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ),
     // Spec 131 T06: the line of a request approved by automatic approval (the detail is the request).
     ("system.run.auto_approved", "approved automatically: {detail}"),
+    // Spec 137 T12: run system messages recorded in the dialog in the project language, with the
+    // same text the web builds from the `code`.
+    ("system.run.stopped", "Run stopped by the user. Use Continue to resume."),
+    ("system.run.failed", "The run was interrupted by an internal error; check the project state."),
+    ("system.run.failed_cause", "The run was interrupted: {cause}; check the project state."),
+    (
+        "system.run.docker_migration",
+        "I adjusted the project test_command/checks to run inside the workspace (without 'docker compose'): in docker mode Nants already runs these commands in the workspace service.",
+    ),
+    ("system.run.relaunch_failed", "The relaunch in docker mode was refused; use Resume. Reason: {message}"),
+    ("system.run.relaunch_failed_detail", "Technical detail: {detail}"),
+    ("system.image.unavailable", "This model does not generate images on this provider; using SVG/CSS illustrations."),
+    ("system.image.failed", "Image generation failed ({failure}): {path}. The Developer will use SVG/CSS if needed."),
+    (
+        "system.image.suspended.one",
+        "The provider answered without an image Nants can read ({count} attempt); the generation may have been charged by the provider. The remaining images follow the plan fallback.",
+    ),
+    (
+        "system.image.suspended.other",
+        "The provider answered without an image Nants can read ({count} attempts); the generation may have been charged by the provider. The remaining images follow the plan fallback.",
+    ),
     // Runner: generated findings and convergence notes in the Reviewer message (spec 115 T03).
     // Spec 129 T04: structural markers of the Developer and Reviewer messages, written in the
     // project language; readers accept the form of every language (`i18n::forms`).
@@ -484,6 +529,7 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("system.task.recurring_arbitration", "Findings {findings} of {task} are still open after several reviews. The Architect decides each one before a new attempt."),
     ("system.task.recurring_recovery", "Findings {findings} of {task} are still open after several reviews. The Architect analyzes the task before a new attempt."),
     ("system.task.recurring_unavailable", "The Architect's decision on the recurring findings of {task} ({findings}) was unavailable; they are still required in the next attempt."),
+    ("system.task.kept_recurring", "Findings {findings} of {task} were kept by the Architect and came back without progress. They do not go back to the Developer: the Architect makes the final decision (accept as is, downgrade to a non-blocking pending item, or change the plan)."),
     ("system.task.dev_resumed_steps", "The Developer reached the step limit on {task} (attempt {attempt}). Nants resumes the work once, in a new session with what was done and what is left, before tests and review; the resumption does not count as an attempt."),
     ("system.task.dev_resumed_repeated", "The Developer stopped on {task} (attempt {attempt}) after repeating the same call with no progress. Nants resumes the work once, in a new session with what was done and what is left, before tests and review; the resumption does not count as an attempt."),
     ("system.task.dev_resumed_stalled", "The Developer stopped for lack of progress on {task} (attempt {attempt}). Nants resumes the work once, in a new session with what was done and what is left, before tests and review; the resumption does not count as an attempt."),
@@ -967,6 +1013,15 @@ nants uninstall --purge  also removes the settings and data; never the projects 
     ("sdd.free_title.decisions", "Decisions"),
     ("sdd.free_title.sources", "Sources consulted"),
     ("sdd.free_title.cited_example", "Monthly report contract"),
+    // Spec 137 T12 (135 P6): expert profiles in the project language. Section titles and the role
+    // line are read in the forms of every language.
+    ("sdd.profile.user_notes", "User notes"),
+    ("sdd.profile.lessons", "Project lessons"),
+    ("sdd.profile.role_developer", "You are an expert developer in {stack} for this project."),
+    ("sdd.profile.role_reviewer", "You are an expert reviewer in {stack} for this project."),
+    ("sdd.profile.role_prefix", "You are"),
+    ("sdd.profile.role_mark", "expert"),
+    ("sdd.profile.lessons_reason", "lessons from spec {spec}"),
     // Spec 133 T11 (D4): messages Nants injects as a user turn in the middle of a model session
     // (final check, reminders, step notices, re-asks, continuations), in the project language. The
     // structural titles they cite come from `markers`, and the tags a parser reads

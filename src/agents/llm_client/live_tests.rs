@@ -1,5 +1,5 @@
 //! Apoio dos testes ao vivo por provedor (spec 132 T11): a chave, o modelo, o preço e o teto de
-//! gasto. O roteiro de uso está em `docs/live-tests.md`.
+//! gasto. Os testes ficam marcados com `#[ignore]` e só rodam com `--ignored`, por `scripts/test.sh`.
 //!
 //! - **Chave:** lida só aqui, do arquivo em `NANTS_LIVE_ANTHROPIC_KEY_FILE` ou
 //!   `NANTS_LIVE_GEMINI_KEY_FILE`, e nunca impressa nem gravada em outro lugar.

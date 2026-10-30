@@ -3847,9 +3847,11 @@ fn walk(
 mod generate_image;
 pub mod kb;
 pub use generate_image::{
-    image_suspended_notice, ChargedBrake, ImageGenLink, ImageGenerator, IMAGE_SUSPENDED_MSG, IMAGE_UNAVAILABLE_MSG,
-    IMAGE_PACE_NOTICE, IMAGE_UNAVAILABLE_NOTICE, MAX_CHARGED_FAILURES, REASON_SUSPENDED,
+    ChargedBrake, ImageGenLink, ImageGenerator, IMAGE_SUSPENDED_MSG, IMAGE_UNAVAILABLE_MSG, IMAGE_PACE_NOTICE,
+    MAX_CHARGED_FAILURES, REASON_SUSPENDED,
 };
+#[cfg(test)]
+pub(crate) use generate_image::image_suspended_notice;
 #[cfg(test)]
 pub(crate) use generate_image::testing as generate_image_testing;
 
