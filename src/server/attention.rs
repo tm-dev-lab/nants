@@ -58,7 +58,7 @@ pub struct PausedOrStalled {
 }
 
 /// `code` das paradas pelo provedor, que o sino detalha com o papel.
-const PROVIDER_STOP_CODES: [&str; 8] = [
+pub const PROVIDER_STOP_CODES: [&str; 8] = [
     "run.provider_failed",
     "run.provider_failed_detail",
     "run.plan_limit",
@@ -90,6 +90,8 @@ pub fn provider_stop(root: &Path, spec_id: &str) -> (Option<String>, Option<&'st
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiskAttention {
     pub plan_awaiting_approval: bool,
+    /// A spec do plano que espera aprovação (spec 138 T03: o cartão do Nanty aprova esta spec).
+    pub plan_spec_id: Option<String>,
     pub paused_or_stalled: Option<PausedOrStalled>,
 }
 
@@ -116,6 +118,10 @@ pub struct ProjectAttention {
     pub pending_choices: bool,
     pub plan_awaiting_approval: bool,
     pub paused_or_stalled: Option<PausedOrStalled>,
+    /// A spec do plano que espera aprovação, só para o Nanty (spec 138 T03): fora da resposta do
+    /// `/api/attention`, que segue igual.
+    #[serde(skip)]
+    pub plan_spec_id: Option<String>,
 }
 
 impl ProjectAttention {
@@ -195,11 +201,19 @@ async fn project_attention(
         // Com o turno do Arquiteto em andamento o plano ainda pode mudar: o cliente não deixa aprovar.
         plan_awaiting_approval: disk.plan_awaiting_approval && !turn_open,
         paused_or_stalled: disk.paused_or_stalled,
+        plan_spec_id: disk.plan_spec_id.filter(|_| !turn_open),
     }
 }
 
 /// Monta a visão de atenção de todos os projetos cadastrados.
 pub async fn build_attention(state: &AppState) -> AttentionView {
+    let projects = projects_attention(state).await.into_iter().map(|(_, _, item)| item).collect();
+    AttentionView { setup_incomplete: setup_incomplete(state).await, projects }
+}
+
+/// Os projetos com algum item da visão de atenção, com o id cadastrado e a pasta (o Nanty, spec 138
+/// T02, observa por aqui: a mesma fonte do sino, sem a prontidão da máquina).
+pub(crate) async fn projects_attention(state: &AppState) -> Vec<(String, PathBuf, ProjectAttention)> {
     let projects: Vec<(String, String, String)> = {
         let cfg = state.config().read().await;
         cfg.projects.iter().map(|p| (p.id.clone(), p.name.clone(), p.path.clone())).collect()
@@ -214,10 +228,10 @@ pub async fn build_attention(state: &AppState) -> AttentionView {
         }
         let item = project_attention(state, &secrets, review_now, (&id, &name, &path)).await;
         if item.has_items() {
-            out.push(item);
+            out.push((id, PathBuf::from(path), item));
         }
     }
-    AttentionView { setup_incomplete: setup_incomplete(state).await, projects: out }
+    out
 }
 
 /// `GET /api/attention`

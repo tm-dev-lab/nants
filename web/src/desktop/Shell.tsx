@@ -32,6 +32,7 @@ import { attentionFor } from "../apps/attention/attentionModel";
 import { PermissionToasts } from "../apps/attention/PermissionToasts";
 import { DEFAULT_APPS, type AppRegistry, type AppSummary, type AppSummaryInput } from "../apps/registry";
 import { useKbSnapshot } from "../apps/knowledge/kbStore";
+import { useNanty } from "../apps/nanty/nantyStore";
 import { PHASE_LABELS, phaseForProject } from "../phase";
 import { appStore, useAppStore, type ChatMessage } from "../store";
 import { planApprovable } from "../apps/plan/summary";
@@ -607,17 +608,18 @@ function SessionDesktop({ shared, space, projectUi }: { shared: Shared; space: S
   const conversationUnseen = useConversationUnseen(space?.projectId ?? null, conversationVisible);
   const spaceAttention = attentionFor(attention, space?.projectId ?? null);
   const knowledge = useKbSnapshot(space?.projectId ?? null);
+  const nanty = useNanty();
   const summaryInput = useMemo<AppSummaryInput>(
-    () => ({ space, readiness, projectCount: projects.length, attention: spaceAttention, conversationUnseen, knowledge }),
+    () => ({ space, readiness, projectCount: projects.length, attention: spaceAttention, conversationUnseen, knowledge, nanty, globalAttention: attention }),
     // `lang`: os resumos (subtítulos, selos, estados vazios) são refeitos no idioma novo.
-    [space, readiness, projects.length, spaceAttention, conversationUnseen, knowledge, lang],
+    [space, readiness, projects.length, spaceAttention, conversationUnseen, knowledge, nanty, attention, lang],
   );
   const windows = useWindowSpecs(apps, summaryInput);
 
   const appKinds = useMemo<WindowKind[] | undefined>(() => {
     if (space !== null) return undefined;
-    // Boas-vindas: só as janelas globais.
-    return state.layout.windows.setup?.open === true ? ["settings", "setup"] : ["settings"];
+    // Boas-vindas: só as janelas globais (o Nanty é de sistema, spec 138 T04).
+    return state.layout.windows.setup?.open === true ? ["nanty", "settings", "setup"] : ["nanty", "settings"];
   }, [space, state.layout.windows.setup?.open]);
   const effectiveKinds = appKinds ?? APP_ORDER.filter((k) => k !== "setup" || state.layout.windows.setup?.open === true);
 

@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
+- **Nanty, the agent above the projects.** Nanty watches your projects and the machine (a plan
+  waiting for you, a paused or blocked run, unusual cost, low disk, leftover Docker resources and
+  the milestones) with no model and no cost, and tells you in its own window and on Telegram, with
+  the reason of every notice. It suggests the next step with buttons and does on its own only the
+  safe actions you allow: each action of a fixed catalog is off, ask first or automatic, the
+  actions that are only yours stay locked, and anything you ask in free text comes back as a card
+  to confirm. From the first day it tries again after a passing provider failure, switches a role
+  to the reserve you chose when its credit runs out, and cleans leftover containers and networks
+  of stopped projects. On Telegram, you create your own bot in BotFather and pair it with a single
+  use code; it has commands, quiet hours, a morning summary and voice notes both ways (Google
+  Gemini, then OpenAI, then text). Its spend has a daily budget and shows apart in Costs. Nanty
+  sleeps while Nants is closed, and what waited comes back as old cards that never decide anything.
+- **Docker resources, explained.** **Settings > Machine** and the docs show how to see and remove
+  the resources with the `nants.project` label yourself, and why to check first: they may belong
+  to another Nants installation.
 - **The Nants menu.** The N at the top left opens a menu with search, the grid of apps with their
   badges, the open and minimized windows and the shortcuts. A pink dot on the N means an app has
   something new. **Alt+0** opens and closes it; **Alt+1** to **Alt+9** and **Ctrl+K** work as
@@ -40,6 +55,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- **A blank screen when opening a project** whose recovery offered to revise a task (Test 14). The
+  screen now reads that option in both formats, and an error inside one window shows in that window
+  only, with **Reload the window**, while the rest of Nants keeps working.
+- **Tests that start the `nants` executable** now use their own temporary home, data and
+  configuration folders, so a test run never touches your Nants data.
 - **The App window in Console mode** keeps its title bar controls on the right, and no text or log
   line spills out of its columns or of the window.
 - **Evidence checks** no longer read an image reference (such as `mcr.microsoft.com/openjdk/jdk:21`),

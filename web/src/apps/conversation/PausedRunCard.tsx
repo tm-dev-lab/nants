@@ -151,7 +151,20 @@ function EnvironmentFiles({ option }: { option: RecoveryOption }) {
   );
 }
 
+/** Marcador de lista no início de uma linha de critério: `- `, `* `, `• `, `1. ` ou `1) `. */
+const BULLET = /^(?:[-*\u2022]|\d{1,3}[.)])\s+/;
+
+/**
+ * Critérios de uma opção `revise_task` como lista. O servidor manda um texto com uma linha por
+ * critério (spec 073); a lista é aceita por compatibilidade. Qualquer outra forma vira lista vazia.
+ */
+function acceptanceLines(value: unknown): string[] {
+  const lines = typeof value === "string" ? value.split(/\r?\n/) : Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+  return lines.map((l) => l.trim().replace(BULLET, "").trim()).filter((l) => l.length > 0);
+}
+
 function OptionBody({ option }: { option: RecoveryOption }) {
+  const acceptance = option.kind === "revise_task" ? acceptanceLines(option.acceptance) : [];
   return (
     <div className="nd-stack-xs nd-muted">
       {option.kind === "environment" && option.files !== undefined ? <EnvironmentFiles option={option} /> : null}
@@ -159,9 +172,9 @@ function OptionBody({ option }: { option: RecoveryOption }) {
       {option.kind === "revise_task" ? (
         <div className="nd-stack-xs">
           {option.objective !== undefined ? <p className="nd-break">{option.objective}</p> : null}
-          {option.acceptance !== undefined && option.acceptance.length > 0 ? (
+          {acceptance.length > 0 ? (
             <ul className="nd-bullets">
-              {option.acceptance.map((a, i) => (
+              {acceptance.map((a, i) => (
                 <li key={i} className="nd-break">
                   {a}
                 </li>

@@ -28,6 +28,11 @@ describe("parser dos eventos de recuperação", () => {
     for (const decision of ["SPLIT", "ADJUST", "ASK", "REVISE_TASK", "REVISE_CONFIG", "MIGRATE_ENVIRONMENT"]) {
       expect(parseApiEvent(ev("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 1, decision }))).not.toBeNull();
     }
+    // Spec 138 T13: o servidor manda `options_analysis: null` quando a análise não foi gravada.
+    const options = [{ id: "o1", label: "x", kind: "guidance", text: "y" }];
+    expect(
+      parseApiEvent(ev("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 1, decision: "ESCALATE", options, options_analysis: null })),
+    ).not.toBeNull();
   });
   it("ignora inválidos", () => {
     expect(parseApiEvent(ev("recovery_started", { spec_id: "s1", task_id: "T01", cycle: "1" }))).toBeNull();

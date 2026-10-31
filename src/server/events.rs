@@ -41,7 +41,7 @@ const SECRET_MASK: &str = "***";
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 const TRUNCATED_SUFFIX: &str = "...[truncado]";
 /// Nomes de chave que nunca podem aparecer em payloads (case-insensitive).
-const SECRET_KEYS: [&str; 8] = [
+const SECRET_KEYS: [&str; 9] = [
     "api_key",
     "api-key",
     "apikey",
@@ -50,6 +50,8 @@ const SECRET_KEYS: [&str; 8] = [
     "password",
     "secret",
     "token",
+    // Token do bot do Telegram do Nanty (spec 138 T01).
+    "bot_token",
 ];
 
 /// Tipos de evento publicados pela API.
@@ -99,6 +101,9 @@ pub enum EventType {
     /// Documento da base de conhecimento mudou (spec 134/T02): `id`, `status`, `status_reason` e
     /// `doc` (a entrada redigida), ou `id` e `removed: true`.
     KbUpdated,
+    /// Algo da janela do Nanty mudou (spec 138 T01): `part` = `feed`, `conversation`, `avatar` ou
+    /// `status`. Global (sem `project_id`); a janela relê pela API.
+    NantyChanged,
 }
 
 impl EventType {
@@ -128,6 +133,7 @@ impl EventType {
             Self::DevicesChanged => "devices_changed",
             Self::DeviceCodeLocked => "device_code_locked",
             Self::KbUpdated => "kb_updated",
+            Self::NantyChanged => "nanty_changed",
         }
     }
 }
@@ -255,6 +261,8 @@ impl SecretSet {
             }
             values.extend(userinfo_candidates(&conn.base_url));
         }
+        // Token do bot do Nanty (spec 138 T01): o literal, ou o valor resolvido de `env:NOME`.
+        values.extend(config.nanty.telegram.resolve_token());
         Self::new(values)
     }
 
@@ -1011,7 +1019,7 @@ fn event_stream_with_ping(
 }
 
 /// Completa quando o shutdown estiver acionado (ou o emissor sumir).
-async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() {
             return;
@@ -1109,6 +1117,26 @@ mod tests {
         assert!(!out.contains("rio"), "{out}");
         assert!(!out.contains("nha"), "{out}");
         assert_eq!(out, "a *** b *** c *** d *** e *** f ***");
+    }
+
+    /// Spec 138 T01: o token do bot do Nanty (literal ou `env:`) entra no conjunto de segredos, e a
+    /// chave `bot_token` some dos payloads.
+    #[test]
+    fn secret_set_covers_the_nanty_bot_token_and_payload_key() {
+        let literal = format!("{}:{}", 7_654_321, "BOT-literal-SEGREDO");
+        let mut cfg = Config::default();
+        cfg.nanty.telegram.bot_token = literal.clone();
+        let out = SecretSet::from_config(&cfg).scrub_exact(&format!("falhou {literal} aqui"));
+        assert_eq!(out, "falhou *** aqui");
+        let var = "NANTS_TEST_138_T01_SECRET_BOT";
+        std::env::set_var(var, "bot-do-env-SEGREDO");
+        cfg.nanty.telegram.bot_token = format!("env:{var}");
+        let set = SecretSet::from_config(&cfg);
+        std::env::remove_var(var);
+        assert_eq!(set.scrub_exact("x bot-do-env-SEGREDO y"), "x *** y");
+        let mut payload = json!({"bot_token": "abc", "nested": {"BOT_TOKEN": "x", "ok": 1}});
+        strip_secrets(&mut payload);
+        assert_eq!(payload, json!({"nested": {"ok": 1}}));
     }
 
     #[test]

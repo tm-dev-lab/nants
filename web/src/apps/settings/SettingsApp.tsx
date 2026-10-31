@@ -37,6 +37,7 @@ import { useAppStore } from "../../store";
 import type { AppContentProps } from "../registry";
 import "../shared/apps.css";
 import { AgentsForm } from "./AgentsForm";
+import { NantyAgentRow } from "../nanty/NantyAgentRow";
 import { ConnectionRow } from "./ConnectionRow";
 import { ConnectionForm } from "./ConnectionForm";
 import { dismissChatgptReturn, isPlanConnection, loginErrorText, useChatgptReturn } from "./chatgptPlan";
@@ -201,7 +202,13 @@ function AgentsTab({ onGoTo }: { onGoTo: (tab: SettingsWindowTab) => void }) {
       </div>
     );
   }
-  return <AgentsForm agents={config.agents} connections={config.connections} onSaved={() => void shell.reloadReadiness()} />;
+  return (
+    <div className="nd-stack">
+      <AgentsForm agents={config.agents} connections={config.connections} onSaved={() => void shell.reloadReadiness()} />
+      {/* Spec 138 T11: o Nanty numa linha, com o modelo atual; os campos dele ficam na janela dele. */}
+      <NantyAgentRow connections={config.connections} />
+    </div>
+  );
 }
 
 function PricingTab() {

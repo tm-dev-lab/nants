@@ -1,5 +1,6 @@
 //! Configuração global do usuário (`~/.config/nants/config.toml`).
 
+mod nanty;
 mod schema;
 mod view_ports;
 
@@ -12,6 +13,11 @@ use std::path::{Path, PathBuf};
 pub use schema::{
     default_image_price, AgentConfig, DEFAULT_PROJECTS_ROOT, Agents, MAX_STEPS_RANGE, Config, Connection, ConnectionKind, ANTHROPIC_BASE_URL, CHATGPT_PLAN_BASE_URL, GOOGLE_GEMINI_BASE_URL, Effort, PriceSource, Pricing, Project, ServerConfig, WireApi,
     LanViewPortsConfig, valid_override_url,
+};
+pub use nanty::{
+    parse_hhmm, ActionLevel, DigestEmpty, NantyConfig, NantyFilter, NantyRoute, NantyTelegram, NantyVoice, Urgency, VoiceRoute,
+    DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE, DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_VOICE, DEFAULT_TRANSCRIBE_MODEL,
+    DEFAULT_VOICE_MAX_INPUT_SECS, GB_BYTES,
 };
 pub use view_ports::{ViewPorts, DEFAULT_VIEW_PORTS, MAX_VIEW_PORTS, MIN_VIEW_PORT, VIEW_PORTS_EXHAUSTED_PREFIX};
 

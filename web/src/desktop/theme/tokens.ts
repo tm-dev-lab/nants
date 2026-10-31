@@ -46,6 +46,22 @@ export const BRAND = {
   amber: "#FBBF24",
 } as const;
 
+/**
+ * Cores do Nanty (spec 138 T04, `reference/Avatar.dc.html`): a cabeça e as antenas nas três cores
+ * da marca, o traço escuro dos olhos e da boca, o brilho dos olhos, o "z" do sono e o ponto âmbar
+ * de "esperando você". Iguais nos dois temas, como o símbolo; `photo` é o círculo da foto do bot.
+ */
+export const NANTY = {
+  head: BRAND.violet,
+  antennaLeft: BRAND.cyan,
+  antennaRight: BRAND.amber,
+  feature: "#1B1530",
+  shine: "#FFFFFF",
+  sleep: "#AEAEB8",
+  waiting: "#F59E0B",
+  photo: "#1B1530",
+} as const;
+
 /** Variantes escuras da marca: ícones, pílulas e chips no tema claro (decisão 13). */
 export const BRAND_DARK = {
   cyan: "#0E7490",

@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import type { ChatHistoryTurn, ConnectionView, DialogMessage, ProjectState, ProjectEntry } from "../api/types";
 import type { AppRegistry } from "../apps/registry";
+import { resetNantyStore } from "../apps/nanty/nantyStore";
 import { FakeEventSource, installFakeEventSource, installFetch, makeConfig, resetStore, type RouteReply } from "../test-utils";
 import type { Attention, Readiness } from "./api";
 import { Shell } from "./Shell";
@@ -32,7 +33,68 @@ interface FakeServerOptions {
   dialog?: DialogMessage[];
   /** Histórico do chat do Arquiteto por projeto. */
   chat?: Record<string, ChatHistoryTurn[]>;
+  /**
+   * Nanty (spec 138 T04 e T10): `GET /api/nanty/status`, `/api/nanty/feed`, `/api/nanty/conversation`
+   * e `/api/nanty/usage` (padrão: atento, sem cartões, sem mensagens e sem gasto).
+   */
+  nanty?: { status?: unknown; feed?: unknown; conversation?: unknown; usage?: unknown; config?: unknown; telegram?: unknown };
 }
+
+export const NANTY_STATUS = {
+  instance: "active",
+  avatar: "attentive",
+  model_configured: false,
+  telegram_configured: false,
+  telegram_paired: false,
+};
+
+export const NANTY_EMPTY_FEED = {
+  waiting: [],
+  done: [],
+  planned: [],
+  today: { day: "2026-10-30", spend: { day: "2026-10-30", usd: 0, input_tokens: 0, output_tokens: 0, unpriced_turns: 0 }, budget_usd: 0.5, waiting: 0, done: 0 },
+};
+
+/** `GET /api/nanty/config` (T11): os valores iniciais, sem modelo e sem Telegram. Só com `nanty.config`. */
+export const NANTY_CONFIG = {
+  now: "09:41",
+  connection_id: "",
+  model: "",
+  effort: "low",
+  daily_budget_usd: 0.5,
+  daily_budget_tokens: 200000,
+  quiet_start: "22:00",
+  quiet_end: "07:00",
+  digest_time: "08:00",
+  digest_empty: "short",
+  lang: "pt-BR",
+  excluded_projects: [],
+  actions: {},
+  catalog: [
+    { id: "approve_plan", kind: "executes", level: "ask", default_level: "ask" },
+    { id: "resume_run", kind: "executes", level: "ask", default_level: "ask" },
+    { id: "retry_provider", kind: "executes", level: "auto", default_level: "auto" },
+    { id: "swap_reserve", kind: "executes", level: "auto", default_level: "auto" },
+    { id: "clean_orphans", kind: "executes", level: "auto", default_level: "auto" },
+    { id: "pause_run", kind: "executes", level: "ask", default_level: "ask" },
+    { id: "allow_command_always", kind: "person_only", level: "ask", default_level: "ask" },
+    { id: "change_channel", kind: "person_only", level: "ask", default_level: "ask" },
+  ],
+  reserve: {},
+  voice: { enabled: false, order: [], transcribe: { connection_id: "", model: "" }, max_input_secs: 300 },
+  telegram: { bot_token_masked: "", paired: false, hold_while_visible: true, visible_hold_secs: 180 },
+};
+
+/** `GET /api/nanty/telegram` (T11): sem bot. Só com `nanty.telegram`. */
+export const NANTY_TELEGRAM = { health: "not_configured", bot_token_masked: "", configured: false, paired: false, pairing: { state: "closed" } };
+
+const NANTY_ZERO_SPEND = { day: "2026-10-30", usd: 0, input_tokens: 0, output_tokens: 0, unpriced_turns: 0, voice_calls: 0 };
+
+export const NANTY_EMPTY_USAGE = {
+  budget: { mode: "usd", day: "2026-10-30", spent_usd: 0, budget_usd: 0.5, tokens: 0, budget_tokens: 200000, unpriced_turns: 0, unpriced: false, plan: false, quota_shared: false, exhausted: false },
+  today: NANTY_ZERO_SPEND,
+  history: [],
+};
 
 export const READY: Readiness = {
   chat: { ok: true, missing: [] },
@@ -66,6 +128,12 @@ export function fakeNantsServer(options: FakeServerOptions = {}) {
     readiness: options.readiness ?? READY,
     connections: options.connections ?? [],
     ui: { ...(options.ui ?? {}) } as Record<string, { rev: number; data: Record<string, unknown> }>,
+    nantyStatus: options.nanty?.status ?? NANTY_STATUS,
+    nantyFeed: options.nanty?.feed ?? NANTY_EMPTY_FEED,
+    nantyConversation: options.nanty?.conversation ?? { messages: [] },
+    nantyUsage: options.nanty?.usage ?? NANTY_EMPTY_USAGE,
+    nantyConfig: options.nanty?.config,
+    nantyTelegram: options.nanty?.telegram,
   };
   const calls: ServerCall[] = [];
   const overrides: { method: string; pattern: RegExp; reply: (body: unknown, url: string) => RouteReply }[] = [];
@@ -100,6 +168,12 @@ export function fakeNantsServer(options: FakeServerOptions = {}) {
     }
     if (method === "GET" && url === "/api/attention") return json(200, model.attention);
     if (method === "GET" && url === "/api/readiness") return json(200, model.readiness);
+    if (method === "GET" && url === "/api/nanty/status") return json(200, model.nantyStatus);
+    if (method === "GET" && url === "/api/nanty/feed") return json(200, model.nantyFeed);
+    if (method === "GET" && url === "/api/nanty/conversation") return json(200, model.nantyConversation);
+    if (method === "GET" && url === "/api/nanty/usage") return json(200, model.nantyUsage);
+    if (method === "GET" && url === "/api/nanty/config" && model.nantyConfig !== undefined) return json(200, model.nantyConfig);
+    if (method === "GET" && url === "/api/nanty/telegram" && model.nantyTelegram !== undefined) return json(200, model.nantyTelegram);
     if (method === "POST" && url === "/api/readiness/refresh") return json(200, model.readiness);
     const scope = uiScope(url);
     if (scope !== null) {
@@ -170,6 +244,7 @@ export interface RenderShellOptions extends FakeServerOptions {
 /** Monta o shell com o servidor falso, o EventSource falso e a URL pedida. */
 export async function renderShell(options: RenderShellOptions = {}) {
   resetStore();
+  resetNantyStore();
   installFakeEventSource();
   const server = fakeNantsServer(options);
   const fetchMock = installFetch(server.handler);

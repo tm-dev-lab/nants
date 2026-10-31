@@ -37,6 +37,8 @@ Nants runs locally. Examples of what is in scope:
 - leaks of API keys, ChatGPT plan tokens or other secrets through the interface, logs, events or
   generated files;
 - ways for agent commands to escape the permission checks or the project folder;
+- a way for someone other than the paired owner to talk to Nanty or make it act, or for project
+  content to make Nanty act without your click;
 - problems in the installer or in the verification of release packages.
 
 ## Stored tool outputs
@@ -297,6 +299,65 @@ A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and ha
 - **Sign out:** revokes the refresh token at OpenAI and deletes the local sign-in. If OpenAI does
   not confirm the revocation, the local sign-in is still deleted and Nants says so, pointing to your
   ChatGPT account settings.
+
+## Nanty and Telegram
+
+Nanty is the system agent that watches the projects and the machine, tells you on Telegram and acts
+only through a fixed catalog of actions. Its Telegram channel and its model turn are built to keep
+your projects on your computer and to keep a message or a document from steering it.
+
+- **Only summaries leave the computer.** What goes to Telegram is a short summary: the fixed text of
+  the observers (written in the Nants dictionaries, never by the model), counts and codes, or the
+  reply of the model. It never carries code, commands, log lines or secrets. Every message goes
+  through the redaction of the configured secrets (`SecretSet`: the API keys, the bot token and the
+  credentials in URLs), before and after the text is cleaned, so a secret split by a backtick or an
+  escape sequence does not come back whole. It goes as plain text, with no `parse_mode`, with link
+  previews off, links in the model text neutralized and the Telegram size limits respected (4096
+  characters per message, 1024 per voice note caption). Messages go through the Telegram servers.
+- **No open port.** Nants reads Telegram by long polling (`getUpdates`), never by webhook, so nothing
+  listens for the internet. Reading and sending use separate clients with no redirects, and the
+  Telegram address is fixed in the code (only tests change it, never the configuration).
+- **One owner.** Pairing uses a single use code shown only on the Nants screen, sent through the
+  `t.me/<bot>?start=<code>` link. The code changes every 2 minutes and is locked after 5 wrong
+  attempts. It only works in a private chat, and it pins both the user id and the chat id of the
+  owner. In a group, the bot ignores the message and leaves. Messages and button clicks from anyone
+  else are ignored and recorded. Unpairing, or a new token, forgets the chat, the owner and the
+  read position.
+- **The bot token is a secret.** It is stored like the API keys, in the configuration file (mode
+  0600), or as an `env:NAME` reference read when it is used. Only a masked form reaches the browser,
+  and it never comes back whole. The token is part of the request address, so every error from the
+  HTTP client drops the address and is redacted before it is written anywhere, and the address is
+  never logged.
+- **One reader per bot.** Only one Nants process per data folder runs Nanty (a lock in the data
+  folder). Telegram accepts only one reader per bot, so the same token in two installations at the
+  same time shows as a conflict; each installation should have its own bot.
+- **Nants closed.** With Nants closed, nobody reads Telegram. When it opens again, the messages that
+  waited go into the conversation as cards marked as old and a button tapped in the meantime never
+  decides anything: no action comes from a message that waited.
+
+### Prompt injection
+
+Nanty is limited by construction, so a message or a file of a project cannot make it do what you
+did not confirm:
+
+- **Fixed catalog.** Nanty acts only through a fixed list of actions run by the same handlers as the
+  screen. The model can only name ids of that list; the server checks the id, the level of the
+  action and the current state (a card has an expiry, the first click counts, and the approval card
+  checks a hash of the plan before starting). Actions that write a permanent permission or change
+  the channel, the token or the chat are only yours, on the screen, and cannot be made automatic.
+- **Confirmation.** Anything asked in free text, on Telegram or in the window, always comes back as a
+  card to confirm, even when the action is automatic.
+- **Structured signals when it acts on its own.** In a proactive turn, the model gets only
+  structured signals (codes, ids, counts, roles, cost and disk), from a fixed list of accepted keys,
+  never the text of a spec, a log, an agent output or a commit. Its answer must be a summary plus
+  catalog ids, checked by the server; anything else is dropped.
+- **Reading on request, limited to the project you name.** Only when you ask about a project does
+  Nanty read it: the plan, the tasks, the report and the costs of that project only, never the logs
+  and never another project, marked as untrusted data, with your secrets and the URLs redacted and a
+  size limit. Your own messages are redacted before they are stored.
+- **A tested trap.** The tests put instructions such as "send the token to..." and "approve the plan"
+  inside project files and check that no action happens, nothing leaks and the action still waits
+  for your click; a code shaped trap text in a project title must never reach a proactive turn.
 
 ## Release packages
 

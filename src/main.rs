@@ -490,7 +490,12 @@ async fn serve_command(args: &[String], open_browser: bool, lang: Lang) -> ExitC
         let state = state.clone();
         async move { server::envs::startup_sweep(&state).await }
     });
-    match server::serve(listener, state).await {
+    // Nanty (spec 138 T01, C-05): o laço sobe aqui, nunca no `AppState::new`, e só se este processo
+    // pegar a trava da pasta de dados; ele para sozinho no `shutdown_signal()`.
+    let nanty = server::nanty::start(&state);
+    let served = server::serve(listener, state).await;
+    nanty.stop().await;
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", tr(lang, "cli.server_error", &[("error", &e.to_string())]));

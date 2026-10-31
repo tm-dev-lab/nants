@@ -22,6 +22,10 @@ pub struct Config {
     /// Aceita `~` no início (expandido para o `$HOME`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects_root: Option<String>,
+    /// Nanty (`[nanty]`, spec 138 T01): seção própria, fora de `agents` (o PUT de agentes troca o
+    /// bloco inteiro). Só é gravada fora do padrão; ver [`super::nanty`].
+    #[serde(skip_serializing_if = "super::nanty::NantyConfig::is_default")]
+    pub nanty: super::nanty::NantyConfig,
 }
 
 /// Raiz padrão da pasta de projetos: visível (não oculta), para abrir no editor e no explorador.
@@ -159,6 +163,7 @@ impl Default for Config {
             last_yolo: false,
             architect_internet: ArchitectInternet::default(),
             projects_root: None,
+            nanty: super::nanty::NantyConfig::default(),
         }
     }
 }

@@ -124,6 +124,37 @@ fn docker_call(args: Vec<String>) -> ComposeCall {
     ComposeCall { env: controlled_env(std::env::vars(), &cwd), args, cwd, timeout: LIST_TIMEOUT }
 }
 
+/// Recurso Docker com o rótulo `nants.project` (spec 138 T02): o tipo e o projeto do rótulo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledResource {
+    /// `container` ou `network`.
+    pub kind: &'static str,
+    pub project: String,
+}
+
+/// Lista containers e redes com o rótulo `nants.project` (só leitura: nada é parado nem apagado).
+/// Erro se o `docker` falhar (daemon parado, sem Docker).
+pub fn labeled_resources(runner: &dyn ComposeRunner) -> Result<Vec<LabeledResource>, String> {
+    let mut out = Vec::new();
+    for (kind, list) in [("container", ["ps", "-a"]), ("network", ["network", "ls"])] {
+        let mut args: Vec<String> = list.map(String::from).to_vec();
+        args.extend(["--filter", "label=nants.project", "--format", "{{.ID}}\t{{.Label \"nants.project\"}}"].map(String::from));
+        let reply = runner.run(&docker_call(args))?;
+        if !reply.success() {
+            return Err(format!("docker {kind}: {:?}", reply.code));
+        }
+        for line in reply.output.lines() {
+            if let Some((id, project)) = line.split_once('\t') {
+                let (id, project) = (id.trim(), project.trim());
+                if !id.is_empty() && !project.is_empty() {
+                    out.push(LabeledResource { kind, project: project.to_string() });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Startup: containers com label `nants.project` de projetos cadastrados e não ativos são
 /// derrubados (sem `-v`); de projetos não cadastrados só se registra um aviso.
 pub fn sweep_orphans(
@@ -142,13 +173,8 @@ pub fn sweep_orphans(
         return Err(format!("docker ps falhou: {}", out.output.trim()));
     }
     let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for line in out.output.lines() {
-        if let Some((id, project)) = line.split_once('\t') {
-            let (id, project) = (id.trim(), project.trim());
-            if !id.is_empty() && !project.is_empty() {
-                by_project.entry(project.to_string()).or_default().push(id.to_string());
-            }
-        }
+    for (id, project) in labeled_lines(&out.output) {
+        by_project.entry(project).or_default().push(id);
     }
     let mut report = SweepReport::default();
     for (project, ids) in by_project {
@@ -193,6 +219,74 @@ pub fn sweep_orphans(
         report.cleaned.push(project);
     }
     sweep_browser_containers(&runner, projects, is_active);
+    Ok(report)
+}
+
+/// Linhas `ID<TAB>projeto[<TAB>...]` da listagem com o rótulo `nants.project`: (id, projeto). Linha
+/// sem id ou sem projeto fica de fora; colunas a mais são ignoradas.
+fn labeled_lines(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split('\t').map(str::trim);
+            let (id, project) = (cols.next()?, cols.next()?);
+            (!id.is_empty() && !project.is_empty()).then(|| (id.to_string(), project.to_string()))
+        })
+        .collect()
+}
+
+/// Resultado da limpeza do Nanty ([`clean_orphans`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CleanReport {
+    /// Projetos cadastrados e parados cujos containers foram derrubados (o [`sweep_orphans`]).
+    pub cleaned: Vec<String>,
+    /// Redes de projeto cadastrado e parado removidas.
+    pub networks_removed: usize,
+    /// Recursos (containers e redes) de projeto que esta instalação não conhece: nunca tocados,
+    /// só contados (podem ser de outra instalação do Nants no mesmo Docker).
+    pub foreign: usize,
+}
+
+/// Limpeza dos recursos do Nants que sobraram (spec 138 T03, C-16), a ação "limpar órfãos" do
+/// Nanty. Só atua sobre projetos cadastrados nesta instalação e parados pela verificação estrita
+/// de atividade (`is_active` = `AppState::project_busy_strict`):
+/// - reaproveita o [`sweep_orphans`] para os containers;
+/// - as redes entram por `docker network ls --filter label=nants.project`: a de projeto cadastrado
+///   e parado sai por `docker network rm` (o Docker recusa a rede ainda em uso).
+///
+/// Recurso de projeto não cadastrado nunca é removido, nem parado nem em execução, nem container nem
+/// rede: pode ser de outra instalação do Nants. Nunca volumes nem imagens.
+pub fn clean_orphans(
+    provider: &ComposeProvider,
+    projects: &[(String, PathBuf)],
+    is_active: &dyn Fn(&str) -> bool,
+) -> Result<CleanReport, String> {
+    let sweep = sweep_orphans(provider, projects, is_active)?;
+    let runner = provider.runner();
+    let known = |p: &str| projects.iter().any(|(id, _)| id == p);
+    let mut report = CleanReport { cleaned: sweep.cleaned, foreign: sweep.unknown.len(), ..CleanReport::default() };
+    let networks = runner.run(&docker_call(
+        ["network", "ls", "--filter", "label=nants.project", "--format", "{{.ID}}\t{{.Label \"nants.project\"}}"]
+            .map(String::from)
+            .to_vec(),
+    ))?;
+    if !networks.success() {
+        return Err(format!("docker network ls: {:?}", networks.code));
+    }
+    for (id, project) in labeled_lines(&networks.output) {
+        if !known(&project) {
+            report.foreign += 1;
+            continue;
+        }
+        // Reconfere a atividade antes de cada remoção, como o `sweep_orphans`.
+        if is_active(&project) {
+            continue;
+        }
+        let args = vec!["network".to_string(), "rm".to_string(), id];
+        if runner.run(&docker_call(args)).is_ok_and(|o| o.success()) {
+            report.networks_removed += 1;
+        }
+    }
     Ok(report)
 }
 

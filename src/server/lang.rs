@@ -41,6 +41,8 @@ pub async fn capture(State(state): State<AppState>, req: Request, next: Next) ->
     if mutating {
         if let Some(lang) = header_lang(req.headers()) {
             state.set_lang(path_project(req.uri().path()), lang);
+            // Spec 138 T01 (C-08): o idioma do Nanty fica gravado na configuração.
+            super::nanty::remember_lang(&state, lang).await;
         }
     }
     next.run(req).await
@@ -95,7 +97,9 @@ mod tests {
     async fn middleware_records_the_language_only_on_mutating_requests() {
         use axum::routing::{get, post};
         use tower::ServiceExt;
-        let state = AppState::new(PathBuf::from("/tmp/nants-lang2.toml"), crate::config::Config::default(), 0);
+        let dir = std::env::temp_dir().join(format!("nants-lang-mw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = AppState::new(dir.join("config.toml"), crate::config::Config::default(), 0);
         let app = axum::Router::new()
             .route("/api/projects/:id/chat", post(|| async { "ok" }).get(|| async { "ok" }))
             .route("/api/projects/:id/state", get(|| async { "ok" }))
@@ -115,5 +119,30 @@ mod tests {
         assert_eq!(state.project_lang("p1").get(), Lang::En);
         app.oneshot(send("POST", "/api/projects/p1/chat", "xx")).await.expect("post");
         assert_eq!(state.project_lang("p1").get(), Lang::En, "valor desconhecido não muda nada");
+        // Spec 138 T01 (C-08): o idioma do Nanty fica gravado e sobrevive a um reinício.
+        assert_eq!(state.config().read().await.nanty.lang.as_deref(), Some("en"));
+        let saved = crate::config::Config::load_from(&dir.join("config.toml")).expect("relê");
+        assert_eq!(saved.nanty.lang.as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn nanty_language_is_written_only_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("nants-lang-nanty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let state = AppState::new(path.clone(), crate::config::Config::default(), 0);
+        crate::server::nanty::remember_lang(&state, Lang::PtBr).await;
+        assert_eq!(crate::config::Config::load_from(&path).expect("lê").nanty.lang.as_deref(), Some("pt-BR"));
+        // Revisão 1 (F-03): só o idioma vai para a seção; os valores provisórios ficam no código.
+        let text = std::fs::read_to_string(&path).expect("texto");
+        assert_eq!(text.split("[nanty]").nth(1).map(str::trim), Some("lang = \"pt-BR\""), "{text}");
+        std::fs::remove_file(&path).expect("apaga");
+        crate::server::nanty::remember_lang(&state, Lang::PtBr).await;
+        assert!(!path.exists(), "o mesmo idioma não regrava a configuração");
+        crate::server::nanty::remember_lang(&state, Lang::En).await;
+        let cfg = crate::config::Config::load_from(&path).expect("lê");
+        assert_eq!(crate::server::nanty::nanty_lang(&cfg.nanty), Lang::En);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

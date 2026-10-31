@@ -421,11 +421,12 @@ mod tests {
         // apontamento de tarefa grande da revisão do plano (`plan_review.`); a spec 125, os títulos do
         // ARCHITECTURE.md (`architecture.`); a spec 133 T08, os títulos livres da spec (`sdd.`); a spec 133
         // T11, as mensagens injetadas como turno do usuário na sessão de um modelo (`agent.`); a spec 134
-        // T02, o motivo do estado de um documento da base de conhecimento (`kb.`).
-        const PREFIXES: [&str; 24] = [
+        // T02, o motivo do estado de um documento da base de conhecimento (`kb.`); a spec 138 T01, os
+        // avisos do Nanty (`nanty.`).
+        const PREFIXES: [&str; 25] = [
             "runner.", "advisor.", "survey.", "report.", "ui.", "approvals.", "runs.", "serverError.", "approval.", "system.", "cli.",
             "doctor.", "uninstall.", "devices.", "recovery.", "allowlist.", "commit.", "chatgpt.", "provider.", "plan_review.",
-            "architecture.", "sdd.", "agent.", "kb.",
+            "architecture.", "sdd.", "agent.", "kb.", "nanty.",
         ];
         for (key, _) in en::MESSAGES {
             assert!(PREFIXES.iter().any(|p| key.starts_with(p)), "chave fora das famílias da sentinela: {key}");

@@ -2,7 +2,10 @@
 //! sem depender do Docker real nem da rede, e confere as linhas e o código de saída.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+#[path = "support/isolated_bin.rs"]
+mod isolated_bin;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -37,12 +40,10 @@ fn run_doctor(dir: &Path, bin: &Path) -> Output {
 
 /// `nants doctor` com o locale dado em `LC_ALL` (spec 102: LC_ALL > LC_MESSAGES > LANG).
 fn run_doctor_in(dir: &Path, bin: &Path, lc_all: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nants"))
+    isolated_bin::nants(dir)
         .args(["doctor", "--config"])
         .arg(dir.join("config.toml"))
         .env("PATH", bin)
-        .env("HOME", dir)
-        .env("XDG_DATA_HOME", dir.join("data"))
         // Endereço inválido de propósito: o item da versão não consulta a rede no teste.
         .env("NANTS_RELEASES_URL", "ftp://sem-rede.invalid")
         .env("LC_ALL", lc_all)

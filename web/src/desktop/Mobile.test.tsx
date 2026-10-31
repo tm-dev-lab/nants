@@ -258,6 +258,8 @@ describe("Alternador", () => {
       "Relatório",
       "Custos",
       "Conhecimento",
+      // Spec 138 T04: o Nanty, janela de sistema, também no Alternador.
+      "Nanty",
       "Projeto",
       "Configurações",
     ]);

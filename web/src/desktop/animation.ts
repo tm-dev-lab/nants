@@ -108,3 +108,15 @@ export function prefersReducedMotion(win: Pick<Window, "matchMedia"> | undefined
   if (win === undefined || typeof win.matchMedia !== "function") return false;
   return win.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
+
+/**
+ * Acompanha o `prefers-reduced-motion` (spec 138 T04: o avatar do Nanty para na pose quando a
+ * pessoa pede menos movimento e volta a se mexer quando ela desliga). Sem `matchMedia`, nada.
+ */
+export function subscribeReducedMotion(listener: () => void, win: Pick<Window, "matchMedia"> | undefined = globalThis.window): () => void {
+  if (win === undefined || typeof win.matchMedia !== "function") return () => undefined;
+  const query = win.matchMedia("(prefers-reduced-motion: reduce)");
+  if (typeof query.addEventListener !== "function") return () => undefined;
+  query.addEventListener("change", listener);
+  return () => query.removeEventListener("change", listener);
+}

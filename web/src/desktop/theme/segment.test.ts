@@ -54,7 +54,7 @@ describe("controle segmentado: uma classe só", () => {
 
   it("todo filho de um `.nd-segment` usa `.nd-segment-item`, com o texto num `<span>`", () => {
     const groups = sources.filter((s) => s.file.endsWith(".tsx") && /className="nd-segment[\s"]/.test(s.text));
-    expect(groups.map((g) => g.file).sort()).toEqual(["apps/app/ConsolePanel.tsx", "apps/files/FilesApp.tsx", "apps/knowledge/KnowledgeApp.tsx", "apps/knowledge/editor/KbEditor.tsx", "apps/settings/AgentsForm.tsx"]);
+    expect(groups.map((g) => g.file).sort()).toEqual(["apps/app/ConsolePanel.tsx", "apps/files/FilesApp.tsx", "apps/knowledge/KnowledgeApp.tsx", "apps/knowledge/editor/KbEditor.tsx", "apps/nanty/NantyApp.tsx", "apps/nanty/NantyRules.tsx", "apps/nanty/NantySettings.tsx", "apps/settings/AgentsForm.tsx"]);
     for (const { file, text } of groups) {
       const items = [...text.matchAll(/className="nd-segment-item"[\s\S]*?<\/(?:button|label)>/g)].map((m) => m[0]);
       expect({ file, items: items.length > 0 }).toEqual({ file, items: true });
@@ -114,6 +114,7 @@ describe("controle segmentado: escolhido neutro no titânio", () => {
     for (const s of [
       '.nd-root .nd-tab[aria-selected="true"]',
       '.nd-root .nd-settings-tab[aria-selected="true"]',
+      '.nd-root .nd-nanty-tab[aria-selected="true"]',
       '.nd-root .nd-option[data-checked="true"]',
       '.nd-root .nd-radio-card[data-checked="true"]',
       '.nd-root .nd-board-item[data-selected="true"]',

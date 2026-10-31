@@ -21,6 +21,7 @@ import { appStore } from "../../store";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { notReady, READY, renderShell, settle } from "../../desktop/shell-test-utils";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
+import reviseTaskOption from "./fixtures/reviseTaskOption.json";
 
 afterEach(() => {
   cleanup();
@@ -495,5 +496,21 @@ describe("Execução pausada: natureza do bloqueio e recuperação", () => {
     fireEvent.click(within(card()).getByRole("button", { name: "Cancelar" }));
     expect(within(card()).queryByRole("button", { name: RECOVERY_CONFIRM })).toBeNull();
     expect(server.count("POST", CHOICE)).toBe(0);
+  });
+
+  it("revise_task com os critérios em texto (resposta real do servidor) vira lista, sem erro", async () => {
+    // Spec 138 T13: o servidor manda `acceptance` como texto; `.map` sobre ele deixava a tela branca.
+    const option = reviseTaskOption as RecoveryOption;
+    expect(typeof option.acceptance).toBe("string");
+    await open(stateWith(withOptions([option])));
+    const items = Array.from(card().querySelectorAll("ul.nd-bullets li")).map((li) => li.textContent);
+    expect(items).toEqual(["GET /api/itens responde 200 com a lista", "POST /api/itens recusa corpo sem nome", "A lista vem ordenada pelo nome"]);
+    expect(within(card()).getByText("Entregar só a API de itens, sem a tela.")).toBeTruthy();
+    expect(within(card()).getByRole("button", { name: "Escolher: Revisar a tarefa: só a API" })).toBeTruthy();
+  });
+
+  it("revise_task com os critérios em lista (forma antiga) continua aceita", async () => {
+    await open(stateWith(withOptions()));
+    expect(Array.from(card().querySelectorAll("ul.nd-bullets li")).map((li) => li.textContent)).toEqual(["GET responde"]);
   });
 });

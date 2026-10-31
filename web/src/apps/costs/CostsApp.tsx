@@ -11,13 +11,17 @@
  *   gravado, quando o provedor informa a escrita; spec 132), barras por papel
  *   e por tarefa, o ritmo do provedor, a tabela por categoria com TOTAL, as chamadas sem preço com
  *   "Configurar", as buscas na web, as imagens, por agente e por modelo;
- * - orçamento da spec (`<details>` recolhido): o formulário do limite, editável.
+ * - orçamento da spec (`<details>` recolhido): o formulário do limite, editável;
+ * - o gasto do Nanty (spec 138 T10, C-17), no fim e à parte do projeto, quando ele gastou algo
+ *   (inclusive com o projeto sem consumo).
  *
  * Responsividade por `data-size`: estreita, as tabelas viram listas empilhadas. Falha de carga
  * não mostra números (informativo). A atividade ao vivo só chega aqui pelo aviso do limitador
  * (um texto): a rajada de eventos não re-renderiza a janela.
  */
-import { memo, useId, useState, type FormEvent } from "react";
+import { memo, useId, useState, type FormEvent, type ReactNode } from "react";
+import { useNantyUsage } from "../nanty/nantyStore";
+import { hasNantySpend, NantyCosts } from "./NantyCosts";
 import { putBudget } from "../../api/client";
 import type { ContextSummary, NamedUsage, PlanUsageTotals, SpecBudget, UsageTotals } from "../../api/types";
 import { imagesCostHint, imagesCostLine, webSearchCostLine } from "../../copy";
@@ -69,15 +73,24 @@ function CostsContentView({ size }: AppContentProps) {
   const pacing = useAppStore((s) => pacingNotice(s.activities[projectId]));
   // Limite salvo nesta sessão (por spec): a barra acompanha sem esperar a releitura do uso.
   const [saved, setSaved] = useState<{ spec: string; budget: SpecBudget } | null>(null);
+  // O gasto do Nanty (spec 138 T10, C-17): à parte do projeto, no fim da página.
+  const nantyUsage = useNantyUsage();
+  const nanty = hasNantySpend(nantyUsage) ? <NantyCosts usage={nantyUsage} /> : null;
+  const narrow = size === "narrow";
   if (space === null) return null;
-  if (project === null) {
-    return <EmptyState icon="costs" message={t("windowEmpty.costs")} />;
-  }
+  const empty = (message: string) =>
+    nanty === null ? (
+      <EmptyState icon="costs" message={message} />
+    ) : (
+      <CostsPage narrow={narrow}>
+        <EmptyState icon="costs" message={message} />
+        {nanty}
+      </CostsPage>
+    );
+  if (project === null) return empty(t("windowEmpty.costs"));
   const totals = project.total;
   // Sem consumo: estado vazio próprio, nenhum número zerado em destaque.
-  if (!hasConsumption(totals)) {
-    return <EmptyState icon="costs" message={t("costs.noConsumption")} />;
-  }
+  if (!hasConsumption(totals)) return empty(t("costs.noConsumption"));
   // Só pelo plano ChatGPT: sem total em dólar (nada foi cobrado por chave), só a seção do plano.
   const apiUsage = hasApiConsumption(totals);
   const unpriced = totals.cost_usd === null;
@@ -94,7 +107,6 @@ function CostsContentView({ size }: AppContentProps) {
   const progress = spec === null || specView === null ? null : budgetProgress(specView.total, budget);
   const hasLimit = budget !== null && (budget.max_tokens !== undefined || budget.max_usd !== undefined);
   const top = topCostItems(totals, project.by_agent ?? [], agentLabel);
-  const narrow = size === "narrow";
   // Área Contexto (spec 122; 123/T03): a linha do projeto (sem efeito ainda, diz isso) e, com spec
   // ativa e efeito nela, a da spec; os detalhes por projeto e pela spec ativa.
   const projectContext = hasContextArea(project.context) ? project.context : null;
@@ -107,7 +119,7 @@ function CostsContentView({ size }: AppContentProps) {
         );
   const openPricing = (): void => shell.openSettings("pricing");
   return (
-    <div className="nd-app-scroll nd-app-page nd-costs" data-costs="" data-costs-layout={narrow ? "stacked" : "table"}>
+    <CostsPage narrow={narrow}>
       {apiUsage ? (
         <section className="nd-costs-total" aria-label={t("costs.projectCost")}>
           {unpriced ? (
@@ -235,6 +247,16 @@ function CostsContentView({ size }: AppContentProps) {
           </div>
         </details>
       ) : null}
+      {nanty}
+    </CostsPage>
+  );
+}
+
+/** A página da janela (a única área de rolagem dela). */
+function CostsPage({ narrow, children }: { narrow: boolean; children: ReactNode }) {
+  return (
+    <div className="nd-app-scroll nd-app-page nd-costs" data-costs="" data-costs-layout={narrow ? "stacked" : "table"}>
+      {children}
     </div>
   );
 }

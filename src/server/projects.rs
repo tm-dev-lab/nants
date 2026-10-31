@@ -1385,7 +1385,11 @@ pub(super) fn disk_attention(
                 r.status == super::plan_review::STATUS_PENDING || r.status == super::plan_review::STATUS_RUNNING
             }),
         paused_or_stalled: None,
+        plan_spec_id: None,
     };
+    if out.plan_awaiting_approval {
+        out.plan_spec_id = Some(active.id.clone());
+    }
     if running || active.status != Some(SpecStatus::InProgress) {
         return out;
     }

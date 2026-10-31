@@ -14,7 +14,8 @@ toml = "0.8"
 thiserror = "1"
 libc = "0.2.190"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `multipart` (spec 138 T09): o `sendVoice` do Telegram manda o áudio como arquivo. Rust puro.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 futures-util = { version = "0.3", default-features = false }
@@ -31,6 +32,10 @@ base64 = "0.22"
 # medição em 20 PDFs reais contra pdf-extract, pdf_oxide, oxidize-pdf e lopdf (números na T02).
 # Sem as features padrão (`ai`, `refine`, `fast-parse`): só a leitura do texto.
 unpdf = { version = "0.51", default-features = false }
+# Voz do Nanty (spec 138 T09): o PCM de 24 kHz do Gemini vira nota de voz (Opus em OGG). Rust puro,
+# sem C, sem build.rs e sem dependências (BSD-3-Clause); escolhido por medição (cerca de 0,7 MB no
+# x86_64 e 0,56 MB no aarch64, números na T09).
+opus-pure = "0.2.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

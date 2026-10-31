@@ -66,6 +66,7 @@ export const KNOWN_EVENT_TYPES: readonly ApiEventType[] = [
   "devices_changed",
   "device_code_locked",
   "kb_updated",
+  "nanty_changed",
 ];
 
 const LAGGED = "lagged";
@@ -286,7 +287,7 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
         typeof p.decision === "string" &&
         RECOVERY_DECISIONS.includes(p.decision) &&
         (p.options === undefined || Array.isArray(p.options)) &&
-        (p.options_analysis === undefined || (typeof p.options_analysis === "number" && Number.isFinite(p.options_analysis)))
+        (p.options_analysis === undefined || p.options_analysis === null || (typeof p.options_analysis === "number" && Number.isFinite(p.options_analysis)))
       );
     case "app_started":
       return isStr(p.spec_id) && optionalOrNull(p.url, isStr);
@@ -314,6 +315,8 @@ function validPayload(type: ApiEventType, p: Record<string, unknown>): boolean {
     case "devices_changed":
     case "device_code_locked":
       return p.reason === undefined || isStr(p.reason);
+    case "nanty_changed":
+      return isStr(p.part);
     case "kb_updated":
       return (
         isStr(p.id) &&

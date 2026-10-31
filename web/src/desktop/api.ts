@@ -39,7 +39,7 @@ interface EscalationOptionRef {
 }
 
 export type PausedOrStalled =
-  | { kind: "paused"; spec_id: string; task_id: string; analysis?: string; escalation_options?: EscalationOptionRef[] }
+  | { kind: "paused"; spec_id: string; task_id: string; analysis?: number; escalation_options?: EscalationOptionRef[] }
   | { kind: "stalled"; spec_id: string; stop_code?: string; role?: AttentionAgent };
 
 export interface AttentionProject {
@@ -93,8 +93,8 @@ function parsePaused(value: unknown): PausedOrStalled | null {
   const taskId = str(value.task_id, 64);
   if (taskId === null) return null;
   const out: PausedOrStalled = { kind: "paused", spec_id: specId, task_id: taskId };
-  const analysis = str(value.analysis, 16_384);
-  if (analysis !== null) out.analysis = analysis;
+  // Número da análise que ofereceu as opções (`Option<usize>` no servidor).
+  if (typeof value.analysis === "number" && Number.isSafeInteger(value.analysis) && value.analysis >= 0) out.analysis = value.analysis;
   if (Array.isArray(value.escalation_options)) {
     out.escalation_options = value.escalation_options.flatMap((o): EscalationOptionRef[] => {
       if (!isRecord(o)) return [];

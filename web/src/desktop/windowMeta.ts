@@ -61,6 +61,7 @@ export const WINDOW_META: Readonly<Record<WindowKind, WindowMeta>> = {
   costs: meta("window.costs", "costs", "amber", "windowEmpty.costs"),
   report: meta("window.report", "report", "green", "windowEmpty.report", { label: "windowEmpty.openBoard", open: "board" }),
   knowledge: meta("window.knowledge", "knowledge", "cyan", "windowEmpty.knowledge"),
+  nanty: meta("window.nanty", "nanty", "violet", "windowEmpty.nanty"),
   settings: meta("window.settings", "settings", "muted", "windowEmpty.settings"),
   project: meta("window.project", "project", "cyan", "windowEmpty.project"),
   setup: meta("window.gettingStarted", "setup", "amber", "windowEmpty.gettingStarted"),
@@ -68,7 +69,7 @@ export const WINDOW_META: Readonly<Record<WindowKind, WindowMeta>> = {
 
 /**
  * Ordem dos apps (095/T03, C-04; o menu do N na 137): Alt+1…9 cobre as nove primeiras (até Custos); Conhecimento
- * (spec 134 T06), Projeto, Configurações e Primeiros passos ficam pelo lançador (sem Alt+0). Primeiros passos entra no
+ * (spec 134 T06), Nanty (spec 138 T04, janela de sistema), Projeto, Configurações e Primeiros passos ficam pelo lançador (sem Alt+0). Primeiros passos entra no
  * fim, quando aberto.
  */
 export const APP_ORDER: readonly WindowKind[] = [
@@ -82,6 +83,7 @@ export const APP_ORDER: readonly WindowKind[] = [
   "report",
   "costs",
   "knowledge",
+  "nanty",
   "project",
   "settings",
   "setup",

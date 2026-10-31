@@ -7,12 +7,16 @@
  * - `configLoader` (`config`/`configError` no store);
  * - `/api/attention`: na abertura, no `lagged`, na reconexão, na retomada e por eventos
  *   relevantes, com no máximo 1 consulta a cada 500 ms;
- * - `/api/readiness`: na abertura, na ressincronização e quando o shell pede.
+ * - `/api/readiness`: na abertura, na ressincronização e quando o shell pede;
+ * - Nanty (spec 138 T04): o `nanty_changed` e as ressincronizações releem o status e o feed;
+ * - Nanty (spec 138 T07): o aviso de aba visível (`nantyPresence`), que segura o Telegram.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isConsoleEvent, publishConsoleEvent } from "../api/consoleEvents";
 import { isDeviceEvent, publishDeviceEvent } from "../api/deviceEvents";
 import { applyKbEvent } from "../apps/knowledge/kbStore";
+import { applyNantyEvent, resyncNanty } from "../apps/nanty/nantyStore";
+import { installNantyPresence } from "../apps/nanty/nantyPresence";
 import type { ApiEvent } from "../api/types";
 import { loadConfig } from "../configLoader";
 import { handleLiveEvent, useLiveStream } from "../liveStream";
@@ -82,11 +86,16 @@ export function useDesktopRuntime(options: DesktopRuntimeOptions = {}): DesktopR
     };
   }, [intervalMs]);
 
-  // Config, prontidão e a classe da aba oculta: uma vez.
+  // Config, prontidão, a classe da aba oculta e o aviso de aba visível do Nanty: uma vez.
   useEffect(() => {
     void loadConfig();
     void reloadReadiness();
-    return installPageVisibility();
+    const offVisibility = installPageVisibility();
+    const offPresence = installNantyPresence();
+    return () => {
+      offVisibility();
+      offPresence();
+    };
   }, [reloadReadiness]);
 
   // Fluxo global: uma conexão por aba.
@@ -100,13 +109,22 @@ export function useDesktopRuntime(options: DesktopRuntimeOptions = {}): DesktopR
       else if (event.event_type === "kb_updated") {
         if (event.project_id !== null) applyKbEvent(event.project_id);
       }
+      // Nanty (spec 138 T04): relê a parte que mudou (o avatar, o feed).
+      else if (event.event_type === "nanty_changed") applyNantyEvent(event.payload.part)
       else handleLiveEvent(event);
       if (isAttentionEvent(event)) feedRef.current?.request();
     },
-    onLagged: () => feedRef.current?.request(),
-    onReconnected: () => feedRef.current?.request(),
+    onLagged: () => {
+      feedRef.current?.request();
+      resyncNanty();
+    },
+    onReconnected: () => {
+      feedRef.current?.request();
+      resyncNanty();
+    },
     onResync: () => {
       feedRef.current?.request();
+      resyncNanty();
       void reloadReadiness();
     },
   });

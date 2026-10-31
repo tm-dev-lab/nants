@@ -1,0 +1,8 @@
+{
+  "id": "o2",
+  "label": "Revisar a tarefa: só a API",
+  "kind": "revise_task",
+  "objective": "Entregar só a API de itens, sem a tela.",
+  "acceptance": "- GET /api/itens responde 200 com a lista\n- POST /api/itens recusa corpo sem nome\n\n3. A lista vem ordenada pelo nome",
+  "allowed_scope": ["src/api/**", "tests/**"]
+}

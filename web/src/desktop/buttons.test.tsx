@@ -61,6 +61,7 @@ const SPECIAL: ReadonlyMap<string, string> = new Map([
   ["nd-nmenu-chip", "janela aberta no menu do N (foca ou restaura; estado pelo ponto)"],
   ["nd-tab", "aba (Atividade e outras janelas)"],
   ["nd-settings-tab", "aba de Configurações"],
+  ["nd-nanty-tab", "aba da janela do Nanty, no slot da barra de título como em Configurações"],
   ["nd-segment-item", "item do controle segmentado (Console e Arquivos; nas Configurações é um rótulo de rádio)"],
   ["nd-choice", "opção visual em grade (Aparência)"],
   ["nd-conn-method", "cartão de como conectar (chave de API ou plano ChatGPT, spec 116)"],

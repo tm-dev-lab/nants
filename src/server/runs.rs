@@ -654,6 +654,12 @@ impl RunRegistry {
         })
     }
 
+    /// `true` com qualquer vaga do projeto ocupada, inclusive as reservas internas (`__app__`,
+    /// `__survey__`, `__report__`): a verificação estrita de atividade do Nanty (spec 138 T03, C-16).
+    pub fn holds(&self, project_id: &str) -> bool {
+        self.lock().contains_key(project_id)
+    }
+
     /// `true` quando a reserva do projeto é a geração do relatório final (sem execução ativa).
     pub fn is_report(&self, project_id: &str) -> bool {
         self.lock().get(project_id).is_some_and(|slot| slot.name == REPORT_RESERVATION)
@@ -724,7 +730,7 @@ impl Drop for RunGuard {
 /// Modo da execução: aprovação de spec `AWAITING_APPROVAL` ou retomada de spec `IN_PROGRESS` com
 /// tarefas BLOCKED. As fases A e B são as mesmas; só a validação inicial e a escrita da fase B mudam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Approve,
     Resume,
 }
@@ -769,7 +775,8 @@ pub async fn stop_spec(
     }
 }
 
-async fn stop(state: &AppState, id: &str, spec_id: &str, body: &[u8]) -> Result<Response, Rejection> {
+/// Parada de uma execução; também chamada por dentro, sem HTTP (spec 138 T03, C-03).
+pub(crate) async fn stop(state: &AppState, id: &str, spec_id: &str, body: &[u8]) -> Result<Response, Rejection> {
     validate_project_id(id)?;
     validate_spec_id(spec_id)?;
     parse_body(body)?;
@@ -1004,8 +1011,9 @@ fn env_choice_reason(lang: crate::i18n::Lang, label: &str) -> String {
 }
 
 /// Validações rápidas e reserva da execução. Todo o restante roda em task própria ([`launch`]):
-/// cancelar este future (desconexão do cliente) não interrompe gravação nem execução.
-async fn start(
+/// cancelar este future (desconexão do cliente) não interrompe gravação nem execução. Também chamada
+/// por dentro, sem HTTP, pelo Nanty (spec 138 T03, C-03): 202 é sucesso; a recusa traz o `code`.
+pub(crate) async fn start(
     state: &AppState,
     id: &str,
     spec_id: &str,
@@ -4239,6 +4247,9 @@ mod tests {
         git(&root, &["commit", "-qm", "chore: cita a base"]);
         let state = state(&root, Script::Complete);
         let mut rx = state.events().subscribe();
+        // O instante antes da aprovação: o fim do plano tem de cair entre ele e o fim do teste, sem
+        // um teto fixo de duração (sob carga a execução até o "integrated" pode passar de minutos).
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let (status, body) = call(&state, approve_req(PROJECT, SPEC, "")).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         collect_until(&mut rx, "integrated").await;
@@ -4252,7 +4263,7 @@ mod tests {
         // Spec 136 T05: a aprovação concluída fecha a sessão do plano das menções.
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let closed = crate::kb::mention::plan_closed_ts(&root).expect("fim do plano gravado");
-        assert!(closed + 120 >= now && closed <= now, "{closed} vs {now}");
+        assert!(before <= closed && closed <= now, "{before} <= {closed} <= {now}");
         assert!(root.join(".sdd/kb/mentions/.closed.json").is_file());
     }
 

@@ -735,16 +735,28 @@ export type RecoveryDecision =
 
 type RecoveryOptionKind = "config" | "environment" | "guidance" | "revise_task";
 
+/** Checagem proposta numa opção `config` (espelha `sdd::schema::Check`). */
+interface RecoveryCheck {
+  name: string;
+  command: string;
+  blocking?: boolean;
+}
+
 /** Opção de recuperação gerada pelo Arquiteto e validada pelo servidor (spec 073). */
 export interface RecoveryOption {
   id: string;
   label: string;
   kind: RecoveryOptionKind;
   test_command?: string;
-  checks?: string[];
+  /** Config: checagens propostas, como o `Check` do servidor (`sdd::schema::Check`). */
+  checks?: RecoveryCheck[];
   text?: string;
   objective?: string;
-  acceptance?: string[];
+  /**
+   * Revise_task: critérios de aceitação. O servidor grava e manda um texto (uma linha por critério);
+   * a lista é aceita por compatibilidade. Ler com `acceptanceLines`.
+   */
+  acceptance?: string | string[];
   allowed_scope?: string[];
   /** Config: "Antes:\n…\n\nDepois:\n…". */
   diff?: string;
@@ -766,7 +778,8 @@ export interface RecoveryChoiceResult {
 interface RecoveryDecidedPayload extends RecoveryStartedPayload {
   decision: RecoveryDecision;
   options?: RecoveryOption[];
-  options_analysis?: number;
+  /** `null` quando a análise não foi gravada (o servidor manda `Option<usize>`). */
+  options_analysis?: number | null;
 }
 
 type ProjectStatusPayload =
@@ -1030,7 +1043,16 @@ export type ApiEvent =
   | ApiEventEnvelope<"app_exec_finished", AppExecFinishedPayload>
   | ApiEventEnvelope<"devices_changed", DevicesChangedPayload>
   | ApiEventEnvelope<"device_code_locked", DeviceCodeLockedPayload>
-  | ApiEventEnvelope<"kb_updated", KbUpdatedPayload>;
+  | ApiEventEnvelope<"kb_updated", KbUpdatedPayload>
+  | ApiEventEnvelope<"nanty_changed", NantyChangedPayload>;
+
+/**
+ * `nanty_changed` (spec 138 T01): o que mudou no Nanty (`feed`, `conversation`, `avatar` ou
+ * `status`). Global (sem projeto); a interface relê a parte pela API.
+ */
+interface NantyChangedPayload {
+  part: string;
+}
 
 /**
  * `kb_updated` (spec 134 T02): um documento da base de conhecimento mudou de estado

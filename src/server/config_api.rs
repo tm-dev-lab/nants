@@ -631,45 +631,137 @@ pub async fn put_projects_root(State(state): State<AppState>, body: Bytes) -> Re
 /// `PUT /api/config/agents`: substitui a configuração dos três papéis.
 pub async fn put_agents(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let agents: Agents = parse_body(&body)?;
+    let saved = write_agents(&state, |_| Ok(Some(agents))).await?;
+    Ok(Json(agents_view(&saved.unwrap_or_default())).into_response())
+}
 
+/// Grava os agentes sob o `config().write()`: `change` recebe os atuais e devolve os novos (ou
+/// `None` para não mudar nada). Os três papéis são validados antes de gravar; com mudança, a
+/// estimativa de preço dos modelos em uso é pré-cadastrada em segundo plano. Devolve os agentes
+/// gravados (`None` sem mudança). O `PUT /api/config/agents` e o [`set_role_connection`] passam por
+/// aqui (spec 138 T03, C-03).
+async fn write_agents(
+    state: &AppState,
+    change: impl FnOnce(&Agents) -> Result<Option<Agents>, ApiError>,
+) -> Result<Option<Agents>, ApiError> {
     let mut guard = state.config().write().await;
+    let Some(agents) = change(&guard.agents)? else {
+        return Ok(None);
+    };
     validate_agent("architect", &agents.architect, &guard.connections)?;
     validate_agent("developer", &agents.developer, &guard.connections)?;
     validate_agent("reviewer", &agents.reviewer, &guard.connections)?;
 
     let mut next = guard.clone();
     next.agents = agents;
-    persist(&state, &next).await?;
-    let response = Json(agents_view(&next.agents)).into_response();
+    persist(state, &next).await?;
+    let saved = next.agents.clone();
     *guard = next;
     drop(guard);
     // Segundo plano: pré-cadastra a estimativa dos modelos em uso sem atrasar a resposta.
+    spawn_pricing_autofill(state);
+    Ok(Some(saved))
+}
+
+/// Pré-cadastra em segundo plano a estimativa de preço dos modelos em uso (os agentes e o Nanty),
+/// sem atrasar a resposta (spec 138 T11: o modelo, a voz e as reservas do Nanty mudaram).
+pub(crate) fn spawn_pricing_autofill(state: &AppState) {
     let bg = state.clone();
     tokio::spawn(async move {
         let _ = autofill_pricing(&bg, false).await;
     });
-    Ok(response)
 }
 
-/// Modelos em uso pelos três agentes (sem repetição, sem vazios), com o tipo da conexão de cada um
-/// (spec 132 T02: o preço do catálogo segue o provedor). O mesmo modelo em conexões de tipos
-/// diferentes fica com o tipo nativo, quando houver.
+/// Resultado de [`set_role_connection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleSwap {
+    /// Gravado; o valor que o papel tinha antes (conexão e modelo).
+    Done { previous: (String, String) },
+    /// Nada gravado: o valor atual não é o esperado (outra mudança veio no meio).
+    Changed { current: (String, String) },
+}
+
+/// O papel de agente pelo nome (`architect`, `developer` ou `reviewer`).
+fn role_slot<'a>(agents: &'a mut Agents, role: &str) -> Option<&'a mut AgentConfig> {
+    match role {
+        "architect" => Some(&mut agents.architect),
+        "developer" => Some(&mut agents.developer),
+        "reviewer" => Some(&mut agents.reviewer),
+        _ => None,
+    }
+}
+
+/// Troca a conexão e o modelo de um papel (`architect`, `developer` ou `reviewer`) por dentro, sem
+/// HTTP (spec 138 T03, C-03), sob o mesmo `config().write()` e as mesmas validações do
+/// `PUT /api/config/agents`. Com `expected`, só grava se o valor atual for esse (comparar e trocar:
+/// o desfazer do Nanty). O esforço e o teto de passos do papel ficam como estão.
+pub async fn set_role_connection(
+    state: &AppState,
+    role: &str,
+    connection_id: &str,
+    model: &str,
+    expected: Option<(&str, &str)>,
+) -> Result<RoleSwap, ApiError> {
+    let mut outcome = None;
+    write_agents(state, |current| {
+        let mut next = current.clone();
+        let agent = role_slot(&mut next, role).ok_or_else(|| {
+            ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "connection_missing", super::error::params([("role", json!(role))]))
+        })?;
+        let now = (agent.connection_id.clone(), agent.model.clone());
+        if expected.is_some_and(|(c, m)| (c, m) != (now.0.as_str(), now.1.as_str())) {
+            outcome = Some(RoleSwap::Changed { current: now });
+            return Ok(None);
+        }
+        agent.connection_id = connection_id.to_string();
+        agent.model = model.to_string();
+        outcome = Some(RoleSwap::Done { previous: now });
+        Ok(Some(next))
+    })
+    .await?;
+    outcome.ok_or_else(|| ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "internal", Map::new()))
+}
+
+/// Modelos em uso pelos três agentes e pelo Nanty (spec 138 T01: o dele, os da voz e as reservas),
+/// sem repetição e sem vazios, com o tipo da conexão de cada um (spec 132 T02: o preço do catálogo
+/// segue o provedor). O mesmo modelo em conexões de tipos diferentes fica com o tipo nativo, quando
+/// houver.
 fn models_in_use(cfg: &Config) -> Vec<(String, ConnectionKind)> {
     let mut out: Vec<(String, ConnectionKind)> = Vec::new();
-    for agent in [&cfg.agents.architect, &cfg.agents.developer, &cfg.agents.reviewer] {
-        if agent.model.trim().is_empty() {
+    let agents = [&cfg.agents.architect, &cfg.agents.developer, &cfg.agents.reviewer]
+        .map(|a| (a.connection_id.as_str(), a.model.as_str()));
+    // A voz do Nanty (spec 138 T10): com ela ligada, entram os modelos que a fala e a transcrição
+    // usam de fato, inclusive os iniciais quando a configuração deixa o modelo vazio.
+    let voice = nanty_voice_models(cfg);
+    let voice = voice.iter().map(|(c, m)| (c.as_str(), m.as_str()));
+    for (connection_id, model) in agents.into_iter().chain(cfg.nanty.routes()).chain(voice) {
+        if model.trim().is_empty() {
             continue;
         }
         let kind = cfg
             .connections
             .iter()
-            .find(|c| c.id == agent.connection_id)
+            .find(|c| c.id == connection_id)
             .map_or(ConnectionKind::ApiKey, |c| c.kind);
-        match out.iter_mut().find(|(m, _)| *m == agent.model) {
+        match out.iter_mut().find(|(m, _)| m == model) {
             Some(entry) if kind.is_native() && !entry.1.is_native() => entry.1 = kind,
             Some(_) => {}
-            None => out.push((agent.model.clone(), kind)),
+            None => out.push((model.to_string(), kind)),
         }
+    }
+    out
+}
+
+/// Os pares `(conexão, modelo)` efetivos da voz do Nanty (a ordem da fala e a transcrição), só com a
+/// voz ligada.
+fn nanty_voice_models(cfg: &Config) -> Vec<(String, String)> {
+    if !cfg.nanty.voice.enabled {
+        return Vec::new();
+    }
+    let (steps, _) = super::nanty::voice::chain(cfg);
+    let mut out: Vec<(String, String)> = steps.into_iter().map(|s| (s.connection.id, s.model)).collect();
+    if let Some((conn, model)) = super::nanty::voice::transcriber(cfg) {
+        out.push((conn.id, model));
     }
     out
 }
@@ -1617,6 +1709,83 @@ mod pricing_estimate_tests {
         let offline = state(["gpt-4o", "gpt-4o", "gpt-4o"], None, false);
         let v = json_of(post_autofill(State(offline), q("")).await.expect("ok")).await;
         assert_eq!(v, serde_json::json!({}));
+    }
+
+    /// Spec 138 T01: o modelo do Nanty, os da voz e as reservas entram nos modelos em uso (o preço
+    /// é buscado), sem repetir os dos agentes.
+    #[test]
+    fn modelos_do_nanty_entram_nos_modelos_em_uso() {
+        let mut cfg = Config::default();
+        cfg.agents.architect.model = "m-a".into();
+        cfg.connections.push(Connection::native("g", "g", ConnectionKind::GoogleGemini, "k"));
+        cfg.nanty.model = "m-nanty".into();
+        cfg.nanty.voice.order.push(crate::config::VoiceRoute { connection_id: "g".into(), model: "m-voz".into(), voice: String::new() });
+        cfg.nanty.reserve.insert("developer".into(), crate::config::NantyRoute { connection_id: "c".into(), model: "m-a".into() });
+        let models = models_in_use(&cfg);
+        assert_eq!(
+            models,
+            [
+                ("m-a".to_string(), ConnectionKind::ApiKey),
+                ("m-nanty".to_string(), ConnectionKind::ApiKey),
+                ("m-voz".to_string(), ConnectionKind::GoogleGemini),
+            ]
+        );
+    }
+
+    /// Spec 138 T10: com a voz ligada, os modelos que a fala e a transcrição usam de fato entram nos
+    /// modelos em uso (inclusive os iniciais, com o modelo vazio na configuração), para a janela
+    /// Custos ter preço; com a voz desligada, não.
+    #[test]
+    fn modelos_efetivos_da_voz_entram_com_a_voz_ligada() {
+        let mut cfg = Config::default();
+        cfg.connections.push(Connection::native("g", "g", ConnectionKind::GoogleGemini, "k"));
+        cfg.connections.push(Connection {
+            id: "o".into(), name: "o".into(), base_url: "https://api.openai.com/v1".into(),
+            api_key: "k".into(), wire_api: WireApi::default(),
+            kind: Default::default(),
+            base_url_override: None,
+        });
+        let names = |cfg: &Config| models_in_use(cfg).into_iter().map(|(m, _)| m).collect::<Vec<_>>();
+        assert!(names(&cfg).is_empty(), "voz desligada: nada entra");
+        cfg.nanty.voice.enabled = true;
+        let models = models_in_use(&cfg);
+        assert!(models.contains(&(crate::config::DEFAULT_GEMINI_TTS_MODEL.to_string(), ConnectionKind::GoogleGemini)), "{models:?}");
+        assert!(models.contains(&(crate::config::DEFAULT_OPENAI_TTS_MODEL.to_string(), ConnectionKind::ApiKey)), "{models:?}");
+        assert!(models.contains(&(crate::config::DEFAULT_TRANSCRIBE_MODEL.to_string(), ConnectionKind::GoogleGemini)), "{models:?}");
+    }
+
+    /// Spec 138 T01 (C-04): o PUT de agentes troca só o bloco dos agentes; a seção `[nanty]`
+    /// continua na memória e no arquivo. E o `GET /api/config` não leva o token do bot.
+    #[tokio::test]
+    async fn put_de_agentes_nao_apaga_o_nanty_e_get_config_nao_leva_o_token() {
+        let st = state(["x", "x", "x"], None, false);
+        let token = format!("{}:{}", 5_550_001, "BOT-segredo-do-teste");
+        {
+            let mut cfg = st.config().write().await;
+            cfg.connections.push(Connection {
+                id: "c".into(), name: "n".into(), base_url: "https://a.example/v1".into(),
+                api_key: "k".into(), wire_api: WireApi::default(),
+                kind: Default::default(),
+                base_url_override: None,
+            });
+            cfg.nanty.model = "m-nanty".into();
+            cfg.nanty.excluded_projects.push("p9".into());
+            cfg.nanty.telegram.bot_token = token.clone();
+            cfg.nanty.telegram.chat_id = Some(12);
+        }
+        let body = r#"{"architect":{"connection_id":"c","model":"m1","effort":"low"},
+            "developer":{"connection_id":"c","model":"m1","effort":"low"},
+            "reviewer":{"connection_id":"c","model":"m1","effort":"high"}}"#;
+        put_agents(State(st.clone()), Bytes::from(body)).await.expect("ok");
+        let expected = st.config().read().await.nanty.clone();
+        assert_eq!(expected.model, "m-nanty");
+        assert_eq!(expected.telegram.bot_token, token);
+        let saved = Config::load_from(st.config_path()).expect("relê");
+        assert_eq!(saved.agents.reviewer.effort, Effort::High);
+        assert_eq!(saved.nanty, expected, "o arquivo mantém a seção do Nanty");
+        let view = json_of(get_config(State(st.clone())).await).await.to_string();
+        assert!(!view.contains("BOT-segredo"), "{view}");
+        let _ = std::fs::remove_dir_all(st.config_path().parent().expect("dir"));
     }
 
     #[tokio::test]

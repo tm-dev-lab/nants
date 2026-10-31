@@ -5,7 +5,8 @@
  *   menu, minimizar, maximizar/restaurar e fechar (ícone + `aria-label`); arrasta para mover,
  *   duplo clique maximiza/restaura; Shift+F10/tecla Menu abrem o menu da janela;
  * - alças de redimensionar na borda direita, na inferior e no canto (≥ 10 px de área útil);
- * - conteúdo (`[data-window-content]`) com `useContainerSize` (`data-size`) e estado vazio padrão;
+ * - conteúdo (`[data-window-content]`) com `useContainerSize` (`data-size`) e estado vazio padrão,
+ *   dentro de uma fronteira de erro (138/T13): um erro de renderização fica na janela;
  * - animações FLIP (`animationFor`) ao maximizar, restaurar, encaixar, minimizar até o botão N
  *   (137/T02) e restaurar a partir dele. O estado nunca espera a animação; nenhuma depois de um gesto;
  * - minimizada = `hidden` + `inert` (durante a animação de saída, só `inert`);
@@ -37,15 +38,17 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useT } from "../i18n/react";
+import { AppGlyph } from "./AppGlyph";
 import { ANIMATION_MS, animationFor, playAnimation, waitForAnimations } from "./animation";
 import { EmptyState, type EmptyAction } from "./EmptyState";
 import { N_BUTTON_ID, windowHiddenAttrs, windowTitleBarId, windowTitleId } from "./focus";
-import { Icon } from "./Icon";
+import { Icon, type IconName } from "./Icon";
 import { TITLEBAR_HEIGHT } from "./metrics";
 import { matchShortcut, shortcutById, shortcutContext } from "./shortcuts";
 import { useContainerSize, type ContainerSize } from "./useContainerSize";
 import { useWindowGesture, type GestureCommit } from "./useWindowGesture";
 import { useWindowHost } from "./windowHost";
+import { WindowErrorBoundary } from "./WindowErrorBoundary";
 import { WindowMenu } from "./WindowMenu";
 import {
   keyboardGestureStep,
@@ -119,6 +122,17 @@ function rectOf(element: Element | null): Rect | null {
 }
 
 const canAnimate = (): boolean => typeof HTMLElement !== "undefined" && typeof HTMLElement.prototype.animate === "function";
+
+/**
+ * O conteúdo da janela, dentro da fronteira de erro (spec 138 T13): até a função `children(size)`
+ * roda aqui, para um erro nela ficar na janela.
+ */
+function WindowContent({ children, size, icon, empty }: { children: WindowProps["children"]; size: ContainerSize; icon: IconName; empty: WindowEmpty }) {
+  const rendered = typeof children === "function" ? children(size) : children;
+  const isEmpty = rendered === null || rendered === undefined || rendered === false;
+  if (!isEmpty) return <>{rendered}</>;
+  return <EmptyState icon={icon} message={empty.message} {...(empty.action !== undefined ? { action: empty.action } : {})} />;
+}
 
 function WindowView({ kind, win, workspace, active, subtitle, empty, children, scroll = "window", tools }: WindowProps) {
   const host = useWindowHost();
@@ -333,8 +347,6 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
   };
 
   // --- Conteúdo ---
-  const rendered = typeof children === "function" ? children(size) : children;
-  const isEmpty = rendered === null || rendered === undefined || rendered === false;
   const emptyState = empty ?? { message: meta.empty.message };
 
   const { hidden, inert } = windowHiddenAttrs(win);
@@ -407,7 +419,7 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
         onKeyDown={onTitleKeyDown}
       >
         <span className="nd-titlebar-icon" style={{ color: `var(--icon-${meta.tone})` }}>
-          <Icon name={meta.icon} size={16} />
+          <AppGlyph kind={kind} size={16} />
         </span>
         <span id={titleId} className="nd-title">
           {meta.title}
@@ -468,7 +480,11 @@ function WindowView({ kind, win, workspace, active, subtitle, empty, children, s
       {mobile ? toolsElement : null}
       <div ref={contentRef} className="nd-content" data-window-content="" data-scroll={scroll}>
         <WindowToolsSlot.Provider value={toolsContext}>
-          {isEmpty ? <EmptyState icon={meta.icon} message={emptyState.message} {...(emptyState.action !== undefined ? { action: emptyState.action } : {})} /> : rendered}
+          <WindowErrorBoundary>
+            <WindowContent size={size} icon={meta.icon} empty={emptyState}>
+              {children}
+            </WindowContent>
+          </WindowErrorBoundary>
         </WindowToolsSlot.Provider>
       </div>
       {win.mode === "normal" && !mobile ? (

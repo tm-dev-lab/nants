@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboa
 import { localized, tp } from "../i18n";
 import { useT } from "../i18n/react";
 import { BRAND_NAME, BRAND_SLOGAN } from "./brand";
+import { AppGlyph } from "./AppGlyph";
 import { appItemState, BADGE_MAX, type AppBadge } from "./appState";
 import { N_BUTTON_ID } from "./focus";
 import { trapTab } from "./focusTrap";
@@ -312,7 +313,7 @@ export function NMenu({ kinds, layout, subtitles, badges, version, closing, pane
                     onClick={() => onActivate(kind)}
                   >
                     <span className="nd-nmenu-icon" aria-hidden="true">
-                      <Icon name={meta.icon} size={18} />
+                      <AppGlyph kind={kind} size={18} />
                     </span>
                     <span className="nd-nmenu-tile-label" aria-hidden="true">
                       {meta.title}

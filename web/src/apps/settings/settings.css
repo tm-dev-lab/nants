@@ -298,9 +298,11 @@
 
 /*
  * Acesso pela rede (spec 097), abaixo da Máquina: separada por divisória, sem caixa. O script do
- * WSL fica num bloco recolhido, em fundo `--lane` (como os comandos), rolando na horizontal.
+ * WSL fica num bloco recolhido, em fundo `--lane` (como os comandos), rolando na horizontal. A seção
+ * Docker (spec 138 T12) segue o mesmo desenho.
  */
-.nd-settings-network {
+.nd-settings-network,
+.nd-settings-docker {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
@@ -309,7 +311,8 @@
   min-width: 0;
 }
 
-.nd-settings-network > p {
+.nd-settings-network > p,
+.nd-settings-docker > p {
   margin: 0;
 }
 

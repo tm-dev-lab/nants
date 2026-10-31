@@ -33,7 +33,14 @@ describe("/api/attention (parser e contagem)", () => {
           ],
           pending_choices: true,
           plan_awaiting_approval: false,
-          paused_or_stalled: { kind: "paused", spec_id: "s1", task_id: "T02", escalation_options: [{ id: "o1", kind: "guidance" }, { id: "o2", kind: "x" }] },
+          paused_or_stalled: {
+            kind: "paused",
+            spec_id: "s1",
+            task_id: "T02",
+            // Número, como o `Option<usize>` do servidor (spec 138 T13).
+            analysis: 3,
+            escalation_options: [{ id: "o1", kind: "guidance" }, { id: "o2", kind: "x" }],
+          },
         },
         { name: "sem id" },
       ],
@@ -44,6 +51,7 @@ describe("/api/attention (parser e contagem)", () => {
       kind: "paused",
       spec_id: "s1",
       task_id: "T02",
+      analysis: 3,
       escalation_options: [{ id: "o1", kind: "guidance" }],
     });
     // 1 permissão + escolhas + pausa + setup.

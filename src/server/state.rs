@@ -209,6 +209,12 @@ pub struct AppState {
     kb_queue: super::kb_queue::KbQueue,
     /// IPv4 de rede do Windows conferidos há pouco (spec 112), com o instante da conferência.
     windows_ips: Arc<tokio::sync::Mutex<Option<(Instant, Option<Vec<std::net::Ipv4Addr>>)>>>,
+    /// Nanty (spec 138 T01): estado e arquivos em `<pasta de dados>/nanty`. O laço de fundo não
+    /// nasce aqui: o `main.rs` o liga com `nanty::start`.
+    nanty: Arc<super::nanty::Nanty>,
+    /// Endereço da API do Telegram (spec 138 T06). Fixo em produção; só os testes trocam, pelo
+    /// [`Self::with_telegram_api`] (um servidor falso local). Nunca vem da configuração.
+    telegram_api: Arc<str>,
     /// Pausas de teste (vazio em produção).
     #[cfg(test)]
     gates: Arc<Mutex<Vec<PauseGate>>>,
@@ -229,6 +235,11 @@ impl AppState {
             Some(Arc::new(std::env::temp_dir().join(format!("nants-test-data-{}", std::process::id()))));
         let devices = Arc::new(super::devices::DeviceStore::new(
             data_dir.as_deref().map(|d| d.join(super::devices::DEVICES_FILE)),
+        ));
+        let nanty = Arc::new(super::nanty::Nanty::new(
+            data_dir.as_deref().map(|d| d.join(super::nanty::NANTY_DIR)),
+            events.clone(),
+            super::nanty::clock::system_clock(),
         ));
         Self {
             apps: AppManager::new(events.clone()),
@@ -291,6 +302,12 @@ impl AppState {
             #[cfg(test)]
             kb_queue: super::kb_queue::KbQueue::idle(),
             windows_ips: Arc::new(tokio::sync::Mutex::new(None)),
+            nanty,
+            #[cfg(not(test))]
+            telegram_api: Arc::from(super::nanty::telegram::TELEGRAM_API),
+            // Testes nunca falam com o Telegram real: sem o servidor falso, um endereço morto.
+            #[cfg(test)]
+            telegram_api: Arc::from("http://127.0.0.1:9"),
             #[cfg(test)]
             gates: Arc::new(Mutex::new(Vec::new())),
         }
@@ -404,8 +421,47 @@ impl AppState {
     /// Substitui o diretório de dados do Nants (testes: diretório temporário próprio).
     pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
         self.devices = Arc::new(super::devices::DeviceStore::new(Some(dir.join(super::devices::DEVICES_FILE))));
+        let probe = self.nanty.probe();
+        self.nanty = Arc::new(super::nanty::Nanty::new(
+            Some(dir.join(super::nanty::NANTY_DIR)),
+            self.events.clone(),
+            self.nanty.clock(),
+        ));
+        self.nanty.set_probe(probe);
         self.data_dir = Some(Arc::new(dir));
         self
+    }
+
+    /// O Nanty deste processo (spec 138).
+    pub fn nanty(&self) -> &Arc<super::nanty::Nanty> {
+        &self.nanty
+    }
+
+    /// Troca o relógio do Nanty (testes: hora local fixa). Chame depois de [`Self::with_data_dir`].
+    pub fn with_nanty_clock(mut self, clock: super::nanty::clock::NantyClock) -> Self {
+        let dir = self.data_dir().map(|d| d.join(super::nanty::NANTY_DIR));
+        let probe = self.nanty.probe();
+        self.nanty = Arc::new(super::nanty::Nanty::new(dir, self.events.clone(), clock));
+        self.nanty.set_probe(probe);
+        self
+    }
+
+    /// Troca a sonda do disco e do Docker do Nanty (testes).
+    pub fn with_nanty_probe(self, probe: Arc<dyn super::nanty::observe::NantyProbe>) -> Self {
+        self.nanty.set_probe(probe);
+        self
+    }
+
+    /// Troca o endereço da API do Telegram (testes: o servidor falso local). Nunca pela
+    /// configuração (spec 138 T06, C-09).
+    pub fn with_telegram_api(mut self, base: &str) -> Self {
+        self.telegram_api = Arc::from(base.trim_end_matches('/'));
+        self
+    }
+
+    /// Endereço da API do Telegram.
+    pub fn telegram_api(&self) -> &str {
+        &self.telegram_api
     }
 
     /// Diretório de dados do Nants, se conhecido.
@@ -503,6 +559,19 @@ impl AppState {
     pub fn project_active(&self, project_id: &str) -> bool {
         self.apps.is_busy(project_id)
             || self.runs.active(project_id).is_some()
+            || self.busy_chats.lock().unwrap_or_else(|e| e.into_inner()).contains(project_id)
+    }
+
+    /// Verificação estrita de atividade (spec 138 T03, C-16), para a limpeza do Nanty: qualquer vaga
+    /// no registro de execuções (inclusive `__app__`, `__survey__` e `__report__`), app vivo, em
+    /// partida ou com o container encerrado ainda guardado, comando no Console (ou o `-run` que ele
+    /// levantou) e turno de chat.
+    pub fn project_busy_strict(&self, project_id: &str) -> bool {
+        self.runs.holds(project_id)
+            || self.apps.is_busy(project_id)
+            || self.apps.is_docker_running(project_id)
+            || self.apps.console().is_busy(project_id)
+            || self.apps.console().has_raised(project_id)
             || self.busy_chats.lock().unwrap_or_else(|e| e.into_inner()).contains(project_id)
     }
 

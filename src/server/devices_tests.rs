@@ -840,7 +840,9 @@ enum GetEffect {
     /// - `/api/system/prereqs` e `/api/readiness`: rodam o diagnóstico da máquina (só leitura) e
     ///   guardam o resultado em memória;
     /// - `/api/devices/code`: troca o código vencido da janela já aberta, como o relógio faria
-    ///   no próximo acesso (não abre janela nem zera erros).
+    ///   no próximo acesso (não abre janela nem zera erros);
+    /// - `/api/nanty/telegram` (spec 138 T06): o mesmo para o código de pareamento do Telegram (não
+    ///   abre janela, não zera erros e não muda a configuração).
     Cache,
     /// Altera estado, só com um segredo próprio na URL.
     Secret,
@@ -888,6 +890,16 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/readiness", GetEffect::Cache),
     ("/api/fs/browse", GetEffect::Read),
     ("/api/events", GetEffect::Read),
+    // Nanty (spec 138 T01): só leitura do estado em memória e dos arquivos do Nanty; o idioma só é
+    // gravado em POST, PUT e DELETE (`server::lang::capture`).
+    ("/api/nanty/config", GetEffect::Read),
+    ("/api/nanty/feed", GetEffect::Read),
+    ("/api/nanty/conversation", GetEffect::Read),
+    ("/api/nanty/status", GetEffect::Read),
+    ("/api/nanty/usage", GetEffect::Read),
+    // Spec 138 T09: só lê o áudio de uma mensagem da conversa, pelo id validado.
+    ("/api/nanty/audio/:id", GetEffect::Read),
+    ("/api/nanty/telegram", GetEffect::Cache),
     ("devices::PAIR_LINK_PATH", GetEffect::Secret),
     ("/api/devices", GetEffect::Read),
     ("/api/devices/code", GetEffect::Cache),
@@ -1007,6 +1019,48 @@ const KB_WRITE_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/projects/x/kb/docs/doc-0123abcd"),
     ("PUT", "/api/projects/x/kb/overview"),
 ];
+
+/// Rotas de decisão do Nanty (spec 138 T03): decidir um cartão e desfazer mudam estado e
+/// configuração; pedem dispositivo autorizado fora do loopback real, como qualquer rota da API.
+/// O canal do Telegram (T06): gravar o token, parear, desparear e o envio de teste também.
+const NANTY_WRITE_ROUTES: &[&str] = &[
+    "/api/nanty/cards/0123456789abcdef/decide",
+    "/api/nanty/undo/0123456789abcdef",
+    "/api/nanty/telegram/token",
+    "/api/nanty/telegram/pair",
+    "/api/nanty/telegram/unpair",
+    "/api/nanty/telegram/test",
+    // T07: o aviso de aba visível também muda o envio ao Telegram.
+    "/api/nanty/presence",
+    // T08: a mensagem da janela ao Nanty (grava na conversa e chama o modelo).
+    "/api/nanty/conversation",
+];
+
+#[tokio::test]
+async fn nanty_decision_routes_require_a_device() {
+    let dir = TempDir::new("nanty-write");
+    let clock = Clock::new();
+    let state = lan_state(&dir, &clock);
+    for uri in NANTY_WRITE_ROUTES {
+        let resp = send(&state, req(Method::POST, uri, NAT_PEER, None, Some(json!({"token": "x", "answer": "yes"})))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(json_body(resp).await["code"], CODE_DEVICE_REQUIRED, "{uri}");
+    }
+    // T11: os Ajustes e o nível de uma ação (PUT).
+    for uri in ["/api/nanty/config", "/api/nanty/actions/approve_plan"] {
+        let resp = send(&state, req(Method::PUT, uri, NAT_PEER, None, Some(json!({"level": "auto"})))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(json_body(resp).await["code"], CODE_DEVICE_REQUIRED, "{uri}");
+    }
+    let body = router_body();
+    assert!(body.contains("get(nanty::api::get_config).put(nanty::settings::put_config)"));
+    assert!(body.contains("\"/api/nanty/actions/:id\", put(nanty::settings::put_action)"));
+    assert!(body.contains("\"/api/nanty/cards/:id/decide\", post(") && body.contains("\"/api/nanty/undo/:id\", post("));
+    for path in ["token", "pair", "unpair", "test"] {
+        assert!(body.contains(&format!("\"/api/nanty/telegram/{path}\", post(")), "{path}");
+    }
+    assert!(body.contains("\"/api/nanty/conversation\", get(nanty::api::get_conversation).post(nanty::api::post_conversation)"));
+}
 
 #[tokio::test]
 async fn kb_write_routes_require_a_device() {

@@ -4,13 +4,15 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[path = "support/fake_docker.rs"]
 mod fake_docker;
 use fake_docker::without_real_docker;
+#[path = "support/isolated_bin.rs"]
+mod isolated_bin;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -49,9 +51,9 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Inicia o binário com `args` e devolve o filho e as linhas do stdout (drenadas numa thread).
-fn spawn(args: &[&str], browser: Option<&Path>) -> (ChildGuard, mpsc::Receiver<String>) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nants"));
+/// Inicia o binário com `args` (`HOME` e XDG em `home`) e devolve o filho e as linhas do stdout (drenadas numa thread).
+fn spawn(home: &Path, args: &[&str], browser: Option<&Path>) -> (ChildGuard, mpsc::Receiver<String>) {
+    let mut cmd = isolated_bin::nants(home);
     without_real_docker(&mut cmd);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     // Mensagens em pt-BR (spec 102: o terminal segue LC_ALL > LC_MESSAGES > LANG).
@@ -107,6 +109,7 @@ fn nants_sem_subcomando_abre_o_navegador_pelo_browser() {
     let browser = fake_browser(&dir, &out);
     let config = write_config(&dir, 3000);
     let (_guard, rx) = spawn(
+        &dir,
         &["--port", "0", "--config", config.to_str().expect("utf8")],
         Some(&browser),
     );
@@ -127,7 +130,7 @@ fn no_open_e_serve_nao_abrem_o_navegador() {
         let config = write_config(&dir, 3000);
         let mut args = extra.clone();
         args.extend(["--port", "0", "--config", config.to_str().expect("utf8")]);
-        let (_guard, rx) = spawn(&args, Some(&browser));
+        let (_guard, rx) = spawn(&dir, &args, Some(&browser));
         let (url, _) = wait_line(&rx, "nants listening on ");
         assert!(url.starts_with("http://127.0.0.1:"), "{url}");
         std::thread::sleep(Duration::from_millis(800));
@@ -145,7 +148,7 @@ fn porta_ocupada_sem_port_usa_a_proxima_e_informa() {
     }
     let dir = temp_dir("fallback");
     let config = write_config(&dir, port);
-    let (_guard, rx) = spawn(&["serve", "--config", config.to_str().expect("utf8")], None);
+    let (_guard, rx) = spawn(&dir, &["serve", "--config", config.to_str().expect("utf8")], None);
     let (url, before) = wait_line(&rx, "nants listening on ");
     let chosen: u16 = url.rsplit(':').next().and_then(|p| p.parse().ok()).expect("porta");
     assert!(chosen > port && chosen <= port + 20, "porta {chosen} fora da faixa após {port}");
@@ -161,7 +164,7 @@ fn port_explicita_ocupada_falha_com_mensagem_clara() {
     let port = busy.local_addr().expect("addr").port();
     let dir = temp_dir("explicit");
     let config = write_config(&dir, 3000);
-    let output = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
+    let output = without_real_docker(&mut isolated_bin::nants(&dir))
         .args(["serve", "--port", &port.to_string(), "--config", config.to_str().expect("utf8")])
         .env("LC_ALL", "pt_BR.UTF-8")
         .stdin(Stdio::null())
@@ -178,7 +181,9 @@ fn port_explicita_ocupada_falha_com_mensagem_clara() {
 
 #[test]
 fn ajuda_menciona_no_open() {
-    let output = Command::new(env!("CARGO_BIN_EXE_nants")).arg("--help").output().expect("spawn");
+    let dir = temp_dir("help");
+    let output = isolated_bin::nants(&dir).arg("--help").output().expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--no-open") && stdout.contains("nants serve"), "{stdout}");
@@ -187,20 +192,20 @@ fn ajuda_menciona_no_open() {
 /// Spec 102: ajuda e erros no idioma do terminal; a linha `nants listening on` não muda.
 #[test]
 fn ajuda_e_erros_seguem_o_locale_do_terminal() {
+    let dir = temp_dir("locale-listen");
     let help = |locale: &str| {
-        let out = Command::new(env!("CARGO_BIN_EXE_nants")).arg("--help").env("LC_ALL", locale).output().expect("spawn");
+        let out = isolated_bin::nants(&dir).arg("--help").env("LC_ALL", locale).output().expect("spawn");
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout).to_string()
     };
     assert!(help("pt_BR.UTF-8").starts_with("uso: nants"));
     assert!(help("C").starts_with("usage: nants"));
     assert!(help("en_US.UTF-8").contains("checks the environment"));
-    let out = Command::new(env!("CARGO_BIN_EXE_nants")).arg("bogus").env("LC_ALL", "C").output().expect("spawn");
+    let out = isolated_bin::nants(&dir).arg("bogus").env("LC_ALL", "C").output().expect("spawn");
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("unknown command: bogus"));
 
-    let dir = temp_dir("locale-listen");
     let config = write_config(&dir, 0);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nants"));
+    let mut cmd = isolated_bin::nants(&dir);
     without_real_docker(&mut cmd);
     cmd.args(["serve", "--port", "0", "--config", config.to_str().expect("utf8")])
         .env("LC_ALL", "C")

@@ -1266,6 +1266,7 @@
 .nd-root .nd-tab:hover:not(:disabled),
 .nd-root .nd-tree-item:hover:not(:disabled),
 .nd-root .nd-settings-tab:hover:not(:disabled),
+.nd-root .nd-nanty-tab:hover:not(:disabled),
 .nd-root .nd-option:hover:not(:disabled),
 .nd-root .nd-board-check:hover:not(:disabled),
 .nd-root .nd-board-card:hover:not(:disabled),
@@ -1294,6 +1295,7 @@
 .nd-root .nd-tab:active:not(:disabled),
 .nd-root .nd-tree-item:active:not(:disabled),
 .nd-root .nd-settings-tab:active:not(:disabled),
+.nd-root .nd-nanty-tab:active:not(:disabled),
 .nd-root .nd-option:active:not(:disabled),
 .nd-root .nd-board-check:active:not(:disabled),
 .nd-root .nd-board-card:active:not(:disabled),
@@ -1308,6 +1310,7 @@
 .nd-root .nd-board-item[data-selected="true"],
 .nd-root .nd-tab[aria-selected="true"],
 .nd-root .nd-settings-tab[aria-selected="true"],
+.nd-root .nd-nanty-tab[aria-selected="true"],
 .nd-root .nd-option[data-checked="true"],
 .nd-root .nd-radio-card[data-checked="true"],
 .nd-root .nd-step[aria-current="step"],
@@ -1387,6 +1390,7 @@
 .nd-root .nd-tab:disabled,
 .nd-root .nd-segment-item:disabled,
 .nd-root .nd-settings-tab:disabled,
+.nd-root .nd-nanty-tab:disabled,
 .nd-root .nd-option:disabled,
 .nd-root .nd-board-card:disabled {
   opacity: var(--o-disabled);

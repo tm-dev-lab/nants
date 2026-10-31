@@ -5,7 +5,11 @@
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+#[path = "support/isolated_bin.rs"]
+mod isolated_bin;
+use isolated_bin::{config_home, data_home};
 
 struct TempDir(PathBuf);
 
@@ -31,15 +35,8 @@ fn touch(path: &Path) {
 }
 
 fn uninstall(home: &Path, args: &[&str], lang: &str) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nants"));
-    cmd.arg("uninstall")
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("cfg"))
-        .env("XDG_DATA_HOME", home.join("dados"))
-        .env("LANG", lang)
+    let mut cmd = isolated_bin::nants_env_clear(home);
+    cmd.arg("uninstall").args(args).env("PATH", "/usr/bin:/bin").env("LANG", lang)
         .stdin(Stdio::null());
     // Sessão nova: sem terminal de controle, /dev/tty não abre.
     unsafe {
@@ -61,8 +58,8 @@ fn without_a_terminal_nothing_is_removed_and_the_message_explains() {
     let h = &t.0;
     let files = [
         h.join(".local/bin/nants"),
-        h.join("cfg/nants/config.toml"),
-        h.join("dados/nants/ui/state.json"),
+        config_home(h).join("nants/config.toml"),
+        data_home(h).join("nants/ui/state.json"),
         h.join("NantsProjects/app/README.md"),
     ];
     files.iter().for_each(|f| touch(f));
@@ -73,8 +70,8 @@ fn without_a_terminal_nothing_is_removed_and_the_message_explains() {
     let all = text(&out);
     assert!(!out.status.success(), "{all}");
     assert!(all.contains("Sem terminal para confirmar") && all.contains("nants uninstall --purge"), "{all}");
-    assert!(all.contains(&h.join("cfg/nants").display().to_string()), "{all}");
-    assert!(all.contains(&h.join("dados/nants").display().to_string()), "{all}");
+    assert!(all.contains(&config_home(h).join("nants").display().to_string()), "{all}");
+    assert!(all.contains(&data_home(h).join("nants").display().to_string()), "{all}");
     assert!(all.contains(&h.join("NantsProjects").display().to_string()), "{all}");
     assert!(all.contains("docker ps -a --filter label=nants.project"), "{all}");
     assert!(files.iter().all(|f| f.exists()), "nada removido sem confirmação");
@@ -92,9 +89,9 @@ fn purge_with_unreadable_config_does_not_plan_to_remove_config_or_data() {
     let h = &t.0;
     touch(&h.join(".local/bin/nants"));
     // Configuração inválida que apontaria os projetos para dentro da pasta de dados.
-    std::fs::create_dir_all(h.join("cfg/nants")).expect("pasta");
-    std::fs::write(h.join("cfg/nants/config.toml"), "projects_root = \"dados/nants/projetos\" [quebrado").expect("config");
-    touch(&h.join("dados/nants/projetos/app/README.md"));
+    std::fs::create_dir_all(config_home(h).join("nants")).expect("pasta");
+    std::fs::write(config_home(h).join("nants/config.toml"), "projects_root = \".local/share/nants/projetos\" [quebrado").expect("config");
+    touch(&data_home(h).join("nants/projetos/app/README.md"));
 
     let out = uninstall(h, &["--purge"], "pt_BR.UTF-8");
     let all = text(&out);
@@ -102,7 +99,7 @@ fn purge_with_unreadable_config_does_not_plan_to_remove_config_or_data() {
     assert!(plan.contains("o executável") && !plan.contains("a configuração:") && !plan.contains("os dados do Nants:"), "{all}");
     assert!(all.contains("não pôde ser lida"), "{all}");
     assert!(!all.contains("NantsProjects"), "sem a configuração, a pasta dos projetos é desconhecida: {all}");
-    assert!(h.join("dados/nants/projetos/app/README.md").exists());
+    assert!(data_home(h).join("nants/projetos/app/README.md").exists());
 }
 
 #[test]

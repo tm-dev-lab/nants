@@ -3,6 +3,8 @@
  * versão, o detalhe e o comando de correção para copiar (o Nants nunca o executa), e "Verificar de
  * novo", que confere a máquina no servidor (`POST /api/readiness/refresh`) e relê a lista.
  * Em `--lan`, abaixo, a seção "Acesso pela rede" (spec 097, `NetworkSection`).
+ * A seção Docker (spec 138 T12) mostra como ver e remover os recursos com o rótulo `nants.project`,
+ * com o aviso de que podem ser de outra instalação do Nants (o aviso `docker_foreign` aponta para ela).
  * No fim, a versão do Nants (spec 103 T03), que vem só do `Cargo.toml` por `GET /api/config`.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -42,6 +44,36 @@ function CopyFix({ text, label }: { text: string; label: string }) {
         {state === "copied" ? t("common.copied") : state === "failed" ? t("common.copyManually") : t("common.copy")}
       </button>
     </span>
+  );
+}
+
+/** Os comandos do Docker para ver e remover os recursos do Nants (só texto: o Nants nunca os roda). */
+const DOCKER_COMMANDS = [
+  { id: "ps", command: "docker ps -a --filter label=nants.project", label: "settings.docker.ps" },
+  { id: "networks", command: "docker network ls --filter label=nants.project", label: "settings.docker.networks" },
+  { id: "rm", command: "docker rm <id>", label: "settings.docker.rm" },
+  { id: "networkRm", command: "docker network rm <id>", label: "settings.docker.networkRm" },
+] as const;
+
+/** Seção Docker da aba Máquina (spec 138 T12): os recursos com o rótulo `nants.project`. */
+function DockerHelp() {
+  const { t } = useT();
+  return (
+    <section className="nd-settings-docker" aria-label={t("settings.docker.title")} data-docker-help="">
+      <h3 className="nd-strong">{t("settings.docker.title")}</h3>
+      <p className="nd-field-hint">{t("settings.docker.intro")}</p>
+      <ul className="nd-prereq-list" aria-label={t("settings.docker.list")}>
+        {DOCKER_COMMANDS.map((item) => (
+          <li key={item.id} className="nd-prereq" data-docker-command={item.id}>
+            <span className="nd-muted">{t(item.label)}</span>
+            <CopyFix text={item.command} label={t(item.label)} />
+          </li>
+        ))}
+      </ul>
+      <p className="nd-field-hint" data-docker-warning="">
+        {t("settings.docker.warning")}
+      </p>
+    </section>
   );
 }
 
@@ -131,6 +163,7 @@ export function MachineTab() {
           {busy ? t("common.checking") : t("common.checkAgain")}
         </button>
       </div>
+      <DockerHelp />
       <NetworkSection />
       {version !== undefined && version !== "" ? (
         <p className="nd-muted" data-nants-version="">

@@ -22,6 +22,8 @@ use tokio::sync::oneshot;
 #[path = "support/fake_docker.rs"]
 mod fake_docker;
 use fake_docker::without_real_docker;
+#[path = "support/isolated_bin.rs"]
+mod isolated_bin;
 
 /// Chave literal usada nas configs de teste: nunca pode aparecer em respostas.
 const SECRET_KEY: &str = "sk-SMOKE-LITERAL-KEY-98765";
@@ -190,7 +192,9 @@ async fn servidor_in_process_serve_spa_api_e_desliga_limpo() {
     let addr = format!("127.0.0.1:{port}");
     let host = format!("127.0.0.1:{port}");
 
-    let state = AppState::new(temp_dir("inproc").join("config.toml"), smoke_config(), port);
+    let dir = temp_dir("inproc");
+    // Pasta de dados temporária: o servidor em processo não toca na pasta real do usuário.
+    let state = AppState::new(dir.join("config.toml"), smoke_config(), port).with_data_dir(dir.join("data"));
     let (tx, rx) = oneshot::channel::<()>();
     let server = tokio::spawn(serve_with_shutdown(listener, state, async move {
         let _ = rx.await;
@@ -205,6 +209,7 @@ async fn servidor_in_process_serve_spa_api_e_desliga_limpo() {
         .expect("serve terminou em menos de 2 s")
         .expect("task do servidor");
     assert!(result.is_ok(), "{result:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Processo filho do binário real; mata em Drop para não vazar em caso de falha.
@@ -260,7 +265,7 @@ async fn binario_real_serve_com_porta_efemera_e_encerra_com_sigint() {
     let dir = temp_dir("bin");
     let config = write_config(&dir);
 
-    let mut child = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
+    let mut child = without_real_docker(&mut isolated_bin::nants(&dir))
         .args(["serve", "--port", "0", "--config"])
         .arg(&config)
         .stdin(Stdio::null())
@@ -302,7 +307,8 @@ async fn binario_real_serve_com_porta_efemera_e_encerra_com_sigint() {
 
 #[test]
 fn binario_recusa_bind_nao_loopback_sem_allow_remote() {
-    let output = without_real_docker(&mut Command::new(env!("CARGO_BIN_EXE_nants")))
+    let dir = temp_dir("remote");
+    let output = without_real_docker(&mut isolated_bin::nants(&dir))
         .args(["serve", "--host", "0.0.0.0", "--port", "0"])
         .stdin(Stdio::null())
         .output()
@@ -311,4 +317,5 @@ fn binario_recusa_bind_nao_loopback_sem_allow_remote() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--allow-remote"), "{stderr}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("listening"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

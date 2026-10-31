@@ -1575,3 +1575,31 @@ mod refused_config {
         assert!(refusal_correction(Lang::PtBr, "x").starts_with("O servidor recusou"));
     }
 }
+
+/// Spec 138 T13: o fixture da web (`reviseTaskOption.json`) é exatamente o que o servidor manda numa
+/// opção `revise_task`: `acceptance` é um texto com uma linha por critério, não uma lista.
+#[test]
+fn revise_task_option_fixture_matches_the_server_serialization() {
+    let option = RecoveryOption {
+        id: "o2".into(),
+        label: "Revisar a tarefa: só a API".into(),
+        kind: OptionKind::ReviseTask,
+        test_command: None,
+        checks: None,
+        text: None,
+        objective: Some("Entregar só a API de itens, sem a tela.".into()),
+        acceptance: Some(
+            "- GET /api/itens responde 200 com a lista\n- POST /api/itens recusa corpo sem nome\n\n3. A lista vem ordenada pelo nome"
+                .into(),
+        ),
+        allowed_scope: Some(vec!["src/api/**".into(), "tests/**".into()]),
+        diff: None,
+        files: None,
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/apps/conversation/fixtures/reviseTaskOption.json");
+    let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture")).expect("json");
+    assert_eq!(serde_json::to_value(&option).expect("serializa"), fixture);
+    assert!(fixture["acceptance"].is_string());
+    let back: RecoveryOption = serde_json::from_value(fixture).expect("o fixture volta ao tipo do servidor");
+    assert_eq!(back, option);
+}

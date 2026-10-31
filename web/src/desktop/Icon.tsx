@@ -72,6 +72,7 @@ export type IconName =
   | "sparkles"
   | "arrow-right"
   | "arrow-down"
+  | "arrow-up"
   | "send"
   | "paperclip"
   | "image"
@@ -97,6 +98,7 @@ export type IconName =
   | "home"
   | "switcher"
   | "knowledge"
+  | "nanty"
   | "upload"
   | "outline"
   | "bold"
@@ -108,7 +110,9 @@ export type IconName =
   | "code"
   | "file-plus"
   | "lock"
-  | "columns";
+  | "columns"
+  | "mic"
+  | "pause";
 
 const PATHS: Readonly<Record<IconName, ReactNode>> = {
   close: <path d="M18 6 6 18M6 6l12 12" />,
@@ -300,6 +304,7 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
   ),
   "arrow-right": <path d="M5 12h14m-7-7 7 7-7 7" />,
   "arrow-down": <path d="M12 5v14m-7-7 7 7 7-7" />,
+  "arrow-up": <path d="M12 19V5m-7 7 7-7 7 7" />,
   send: <path d="M12 19V5m-7 7 7-7 7 7" />,
   paperclip: (
     <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551" />
@@ -315,6 +320,14 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
     <>
       <path d="M12 7v14" />
       <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </>
+  ),
+  // Nanty (spec 138 T04): a cabeça e as antenas do avatar em traço; desenho próprio, não do Lucide.
+  nanty: (
+    <>
+      <rect width="15" height="12" x="4.5" y="9" rx="6" />
+      <path d="M9.5 9C9 6.5 7.5 4.5 4.5 4M14.5 9c.5-2.5 2-4.5 5-5" />
+      <path d="M10 14v1M14 14v1" />
     </>
   ),
   upload: <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />,
@@ -342,6 +355,19 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
     <>
       <rect width="18" height="18" x="3" y="3" rx="2" />
       <path d="M12 3v18" />
+    </>
+  ),
+  // Nanty (spec 138 T10): o gravar da conversa e o pausar da nota de voz.
+  mic: (
+    <>
+      <rect width="6" height="11" x="9" y="3" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+    </>
+  ),
+  pause: (
+    <>
+      <rect width="4" height="16" x="6" y="4" rx="1" />
+      <rect width="4" height="16" x="14" y="4" rx="1" />
     </>
   ),
   message: <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />,

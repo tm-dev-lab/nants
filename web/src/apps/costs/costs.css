@@ -372,3 +372,9 @@
 .nd-costs-pacing > span {
   min-width: 0;
 }
+
+/* O gasto do Nanty (spec 138 T10, C-17): à parte do projeto, depois de uma divisória. */
+.nd-costs-nanty {
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--divider);
+}

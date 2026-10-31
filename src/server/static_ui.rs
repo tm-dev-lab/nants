@@ -438,6 +438,8 @@ mod tests {
             ("/brand/favicon.ico", "image/x-icon"),
             ("/brand/icon-192.png", "image/png"),
             ("/brand/apple-touch-icon.png", "image/png"),
+            // Spec 138 T04: a foto do bot do Nanty (a pose "atento"), baixada pela janela do Nanty.
+            ("/brand/nanty-bot.png", "image/png"),
             ("/brand/site.webmanifest", "application/manifest+json"),
         ] {
             let resp = static_handler(Method::GET, path.parse().expect("uri"), HeaderMap::new()).await;

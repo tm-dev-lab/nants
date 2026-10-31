@@ -392,6 +392,11 @@ const SAME_TEXT_FAMILIES: &[(&str, &str, &str)] = &[
         "linha do resumo do que mudou no plano (spec 131 T06): o servidor a escreve ao Revisor no idioma do projeto e a web a monta pelo mesmo código",
     ),
     (
+        "nanty.",
+        "nanty.",
+        "o porquê de cada aviso, o nome das ações e o resultado do cartão do Nanty (spec 138): o servidor os escreve no Telegram e a janela os monta pelo mesmo código",
+    ),
+    (
         "runner.marker.",
         "marker.",
         "marcador estrutural da mensagem do Revisor (spec 129 T04): o servidor o escreve no idioma do projeto e a web o lê em qualquer idioma pelas mesmas formas",

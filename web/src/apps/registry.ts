@@ -11,7 +11,7 @@
  * Sem `Content`, a janela mostra o estado vazio do tipo.
  */
 import { createElement, memo, type ComponentType } from "react";
-import type { AttentionProject, Readiness } from "../desktop/api";
+import type { Attention, AttentionProject, Readiness } from "../desktop/api";
 import type { AppBadge } from "../desktop/appState";
 import type { ContainerSize } from "../desktop/useContainerSize";
 import type { SpaceData } from "../desktop/useSpaceData";
@@ -35,6 +35,9 @@ import { ExecutionContent } from "./execution/ExecutionApp";
 import { executionSummary } from "./execution/executionModel";
 import { FilesContent } from "./files/FilesApp";
 import { KnowledgeContent } from "./knowledge/KnowledgeApp";
+import { NantyContent } from "./nanty/NantyApp";
+import { nantySummary } from "./nanty/nantyModel";
+import type { NantySnapshot } from "./nanty/nantyStore";
 import { kbSummaryText } from "./knowledge/knowledgeModel";
 import type { KbState } from "./knowledge/kbStore";
 import { filesSummary } from "./files/filesModel";
@@ -60,6 +63,10 @@ export interface AppSummaryInput {
   conversationUnseen?: number;
   /** Lista da base de conhecimento do espaço ativo (spec 134 T06), para o subtítulo vivo. */
   knowledge?: KbState | null;
+  /** Estado do Nanty (spec 138 T04): o avatar e os cartões abertos, para o selo e o subtítulo. */
+  nanty?: NantySnapshot;
+  /** O `/api/attention` inteiro (todos os projetos): o selo do Nanty não repete o sino (C-07). */
+  globalAttention?: Attention | null;
 }
 
 export interface AppSummary {
@@ -98,6 +105,11 @@ export const DEFAULT_APPS: AppRegistry = {
       const subtitle = space === null ? undefined : kbSummaryText(knowledge ?? null);
       return subtitle === undefined ? {} : { subtitle };
     },
+  },
+  nanty: {
+    Content: NantyContent,
+    scroll: "app",
+    summarize: ({ nanty, globalAttention }) => nantySummary({ status: nanty?.status ?? null, feed: nanty?.feed ?? null, attention: globalAttention ?? null }),
   },
   execution: { Content: ExecutionContent, summarize: executionSummary, scroll: "app" },
   settings: { Content: SettingsContent, summarize: settingsSummary, scroll: "app" },

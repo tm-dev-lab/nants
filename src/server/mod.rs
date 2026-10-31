@@ -36,6 +36,7 @@ pub mod kb_queue;
 pub mod kb_read;
 pub mod lan;
 pub mod lang;
+pub mod nanty;
 pub mod live_activity;
 pub mod models_api;
 pub mod models_native;
@@ -220,6 +221,28 @@ pub fn router(state: AppState) -> Router {
         .route("/api/readiness/refresh", post(readiness::post_refresh))
         .route("/api/fs/browse", get(fs_browse::browse))
         .route("/api/events", get(events::stream_events))
+        // Nanty (spec 138 T01): leitura; a janela acompanha pelo `nanty_changed` do stream global.
+        .route("/api/nanty/config", get(nanty::api::get_config).put(nanty::settings::put_config))
+        // Spec 138 T11: o nível de uma ação do catálogo (a aba Regras).
+        .route("/api/nanty/actions/:id", put(nanty::settings::put_action))
+        .route("/api/nanty/feed", get(nanty::api::get_feed))
+        // T08: a janela também escreve ao Nanty (pede dispositivo, como toda rota que muda algo).
+        .route("/api/nanty/conversation", get(nanty::api::get_conversation).post(nanty::api::post_conversation))
+        .route("/api/nanty/status", get(nanty::api::get_status))
+        .route("/api/nanty/usage", get(nanty::api::get_usage))
+        // Spec 138 T09: os áudios da conversa, só pelo id de uma mensagem que ainda está nela.
+        .route("/api/nanty/audio/:id", get(nanty::voice::get_audio))
+        // Nanty (spec 138 T03): decidir um cartão e desfazer, com as proteções das rotas que mudam algo.
+        .route("/api/nanty/cards/:id/decide", post(nanty::api::post_decide))
+        .route("/api/nanty/undo/:id", post(nanty::api::post_undo))
+        // Nanty (spec 138 T06): o canal do Telegram (saúde, token, pareamento e teste).
+        .route("/api/nanty/telegram", get(nanty::telegram::api::get_telegram))
+        .route("/api/nanty/telegram/token", post(nanty::telegram::api::post_token))
+        .route("/api/nanty/telegram/pair", post(nanty::telegram::api::post_pair))
+        .route("/api/nanty/telegram/unpair", post(nanty::telegram::api::post_unpair))
+        .route("/api/nanty/telegram/test", post(nanty::telegram::api::post_test))
+        // Nanty (spec 138 T07, C-07): a aba avisa se está visível (o Telegram espera).
+        .route("/api/nanty/presence", post(nanty::api::post_presence))
         // Dispositivos autorizados na rede local (spec 112).
         .route(devices::PAIR_LINK_PATH, get(devices::get_pair_link))
         .route(devices::PAIR_API_PATH, post(devices::post_pair))

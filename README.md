@@ -52,7 +52,7 @@ and you decide at every step.
 - **Agents with roles.** Architect, Developer and Reviewer work from a specification with
   acceptance criteria, and every task runs in an isolated Git worktree.
 - **A desktop in your browser.** Every app (Conversation, Plan, Board, Activity, Files, App, Run,
-  Report, Costs, Knowledge, Project and Settings) opens in a window you can move, snap, resize and
+  Report, Costs, Knowledge, Nanty, Project and Settings) opens in a window you can move, snap, resize and
   minimize, and the windows use the whole screen down to the bottom edge. The **N** at the top left
   opens the Nants menu: search, the grid of apps with their badges, the open and minimized windows
   (a click focuses or restores one) and the shortcuts. A pink dot on the N means an app has
@@ -232,6 +232,9 @@ and you decide at every step.
   Nants also trims and summarizes the agents' history on its own, so they spend less without
   losing what matters, and the Context area of the Costs window shows the effect, with an
   estimate of the tokens that later calls no longer resend.
+- **Nanty, the agent above the projects.** Nanty watches your projects and the machine, tells you
+  on Telegram (text or voice) what needs you, suggests the next step with buttons and does on its
+  own only the safe actions you allow. See [Nanty](#nanty).
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
 - **Your provider.** Any OpenAI compatible provider, Anthropic (Claude), Google Gemini (AI Studio)
   or your ChatGPT plan, with one connection and one model per role. See
@@ -435,6 +438,148 @@ from the Nants menu (the N at the top left) or with Ctrl+K.
 
 See [SECURITY.md](SECURITY.md#knowledge-base) for the redaction and its limits.
 
+## Nanty
+
+Nanty is the Nants agent that sits above the projects. It watches your projects and the machine,
+tells you on Telegram what needs you, suggests the next step and does on its own only the safe
+actions you allow. Open it from the Nants menu (the N at the top left), in any space, even with no
+project open. The observers and the feed in the window are on from the start and cost nothing;
+Telegram, the model and the voice need you to set them up in the **Settings** tab of the Nanty
+window.
+
+- **What it watches.** A plan waiting for your approval, a run blocked or paused (credit, quota or
+  budget), a review going in circles, unusual cost, low disk space, low space in the temporary
+  folder, leftover Docker resources of Nants and the milestones (a task delivered, a spec done,
+  the app ready). The watching is done by code, with no model and no cost: a check with nothing
+  new calls nothing.
+- **Notices that do not flood.** Notices are grouped by project and type, wait a little before the
+  first one and do not repeat for a while. A notice that follows from another (a blocked run when
+  the credit ran out) stays quiet behind it. Every notice says why, in one line written by Nants
+  (the observer, the facts and the time), never by the model, and a proactive card only carries
+  counts and codes, never the text of the project.
+- **The window.** The feed has **Waiting for you**, **Done on its own** (with **Undo** where it
+  makes sense), **Planned** (including the morning summary) and **Today**, with the conversation on
+  the right. Its animated ant shows what Nanty is doing: watching, thinking, talking, sleeping or
+  waiting for you, and stays still when your system asks for reduced motion. The badge of the
+  Nanty app counts only what the bell does not already show.
+
+### Create the bot and pair it
+
+Each Nants installation uses its own Telegram bot. Creating one is free.
+
+1. On Telegram, open a chat with `@BotFather`, send `/newbot` and choose the name and the username
+   of the bot.
+2. Copy the token it sends and paste it in **Nanty > Settings > Telegram**. The token is kept like
+   the API keys (an `env:NAME` reference works too) and never comes back whole to the screen.
+3. Click **Create the pairing code** and tap **Open the bot on Telegram**: the link
+   (`t.me/<bot>?start=<code>`) opens your private chat with the bot, and **Start** sends the code.
+   The code works only once, only shows on that screen and changes every 2 minutes; 5 wrong
+   attempts lock it. Only a private chat pairs: in a group, the bot ignores the message and leaves.
+   From then on, Nanty talks only to you and ignores anyone else.
+4. **Send a test message** to check it. **Unpair**, or a new token, forgets the chat.
+
+**The bot photo.** Telegram does not accept an animated bot photo. In the same tab, click
+**Download the image**, open `@BotFather`, send `/setuserpic`, pick your bot and send the image.
+
+**One bot per installation.** Every person who installs Nants creates their own bot and pairs it
+with their own Nants, so installations never share a bot. Telegram accepts only one reader per
+bot: the same token in two installations at the same time shows **bot in use by another program**;
+create another bot in BotFather for the other one. Two Nants processes on the same data folder
+never compete for it: only one runs Nanty, and the other says that Nanty is active in another
+instance.
+
+### Rules
+
+The **Rules** tab lists the fixed catalog of actions. Each action has one level: **off**, **ask
+first** or **automatic**. Nanty never does anything outside this catalog.
+
+- **Automatic from the first day:** try again after a passing provider failure (up to 2 times, with
+  a wait between them); switch a role to the reserve connection you chose and continue, when its
+  credit runs out or it reaches its spend limit; and clean the leftover containers and networks
+  with the `nants.project` label of stopped projects of this installation. A plan or quota limit
+  only gets a notice.
+- **Ask first:** approve a plan, resume a paused run and pause a run (only when you ask). The
+  approval card checks that the plan is still the one it showed you.
+- **Only you:** allowing a command "always" and changing where Nanty talks to you (the channel,
+  the token or the chat). This band is locked: no Nanty action does it.
+- **Free text always asks.** Anything you ask in your own words comes back as a card to confirm,
+  even when the action is automatic.
+- **Cards.** Every card has buttons (yes, no, remind me later in 1 hour) and an expiry. The state
+  is checked again at the click; the first click counts, in the window or on Telegram, and the
+  other one gets "already decided". After a no, the offer only comes back with a new fact. A switch
+  to the reserve can be undone for 24 hours, as long as nobody changed that role since. Every
+  decision goes to the record, with who decided: automatic, Telegram or the window.
+
+### Conversation and commands
+
+The conversation is the same in the window and on Telegram, with where each message came from.
+
+- **Commands**, answered with no model, in both languages: `/status` (the notices, what was done
+  today and the model spend), `/summary` (the summary now), `/pause` (pauses the run in progress,
+  after you confirm the card), `/quiet` (mutes the notices for 1 hour, or `/quiet 3` for 3 hours,
+  up to 24) and `/help`. The Portuguese ones (`/resumo`, `/pausar`, `/silencio`, `/ajuda`) work
+  too.
+- **Free text** goes to the model of Nanty. To have it look at a project, mention its name: it
+  reads only that project (the plan, the tasks, the report and the costs, never the logs), as
+  untrusted data and with your secrets redacted. The reply to a message from the window stays in
+  the window.
+- **Quiet hours and the morning summary.** By default, quiet from 22:00 to 07:00 and the summary at
+  08:00, in the time of the computer running Nants. In quiet hours only the urgent gets through,
+  and silently; the rest goes into the summary. While a Nants tab is visible, a notice waits a few
+  minutes before going to Telegram, and what you decide in the window meanwhile does not go; you
+  can turn that off in Settings.
+
+### Voice
+
+Voice is off until you turn it on in Settings. With it on, Nanty answers a voice note you send on
+Telegram with a voice note, always with the text in the caption (and the whole text in a message
+of its own when the caption cut it). Text gets text, and the notices and the summary stay in text.
+
+- **Order of the connections:** by default, your Google Gemini connections, then the OpenAI ones,
+  then text only. You can set your own order.
+- **Your voice notes** are transcribed only by a Google Gemini connection, up to 5 minutes, and
+  the transcription shows in the conversation.
+- When the voice fails or the budget is used up, the text goes anyway: the notice is never lost.
+
+### Cost and budget
+
+The model only runs when an observer fires or when you ask. Nanty has a daily budget for the model
+and the voice, US$ 0.50 by default. A model without a price (or a ChatGPT plan connection) counts
+tokens instead, 200,000 a day by default, and Settings says so; with the same plan connection as
+the roles, the plan quota is the same one. When the budget runs out, the notices go on with the
+fixed text of the observer, without the model summary and without voice, and the commands still
+work. The **Costs** window shows the Nanty spend apart from the projects.
+
+### Nants closed, Nanty asleep
+
+Nanty only works while Nants is running. With Nants closed it sleeps: there are no notices, and
+Telegram keeps your messages for up to 24 hours. When Nants opens again, those messages go into the
+conversation as cards marked as old, and a button tapped in the meantime becomes an old card too:
+an old click never decides anything, and nothing is done from a message that waited. Decide again
+on the current notice.
+
+See [SECURITY.md](SECURITY.md#nanty-and-telegram) for what leaves your computer and how Nanty is
+protected against prompt injection.
+
+## Docker resources
+
+Everything Nants creates in Docker for a project carries the `nants.project` label, with the
+project id as its value, and is removed at the end. Nanty cleans the leftovers of stopped projects
+of this installation (a rule in the Nanty **Rules** tab). Resources of a project this installation
+does not know are never touched: they may belong to another Nants installation (another data
+folder on this computer, or another user). To see them and, if you want, remove them yourself:
+
+```sh
+docker ps -a --filter label=nants.project       # containers
+docker network ls --filter label=nants.project  # networks
+docker rm <id>                                  # removes a container
+docker network rm <id>                          # removes a network
+```
+
+Check before you remove: these resources may belong to another Nants installation. Compare the
+label value with the ids of your projects (in `~/.config/nants/config.toml`), because a resource of
+another installation may still be in use.
+
 ## Use it from your phone (local network)
 
 By default, Nants opens only on your computer. To open it from your phone or another device on
@@ -532,6 +677,9 @@ executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized
   `.sdd/specs/<spec>/provider-errors.jsonl`, out of the project's repository. Nants does not
   write the request it sent there; the provider's message may quote parts of it, with your
   configured keys redacted (see [SECURITY.md](SECURITY.md#provider-failure-log)).
+- **Nanty sends only summaries.** On Telegram, Nanty sends short summaries in plain text, with no
+  code, logs or secrets, and listens by long polling, with no open port. Your messages go through
+  the Telegram servers.
 - **The knowledge base stays in the project.** It lives in `.sdd/kb/`, out of the project's
   repository; only the excerpts the agents read go to your provider.
 - The server listens only on your computer (`127.0.0.1`) by default.

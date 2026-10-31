@@ -201,6 +201,29 @@ pub fn task_alert(root: &Path, spec_id: &str, task_id: &str) -> Option<CostAlert
     alerts(&spend, &task_states(root, spec_id)).remove(task_id)
 }
 
+/// Tarefas ainda não concluídas com aviso de custo nas specs em andamento do projeto em `root`
+/// (spec 138 T02: o observador de custo do Nanty). Só leitura; pastas ilegíveis contam zero.
+pub fn open_alert_count(root: &Path) -> usize {
+    if safe_fs::check_chain(root, SPECS_REL).is_err() {
+        return 0;
+    }
+    super::projects::real_children(&root.join(SPECS_REL), true)
+        .iter()
+        .filter(|name| !name.starts_with('.'))
+        .filter(|name| {
+            super::projects::read_spec(root, &format!("{SPECS_REL}/{name}/spec.md"))
+                .is_ok_and(|spec| spec.frontmatter.status == crate::sdd::SpecStatus::InProgress)
+        })
+        .map(|name| {
+            let tasks = task_states(root, name);
+            alerts(&spend_by_task(root, name), &tasks)
+                .keys()
+                .filter(|id| tasks.iter().any(|(t, done)| t == *id && !done))
+                .count()
+        })
+        .sum()
+}
+
 /// Linha dos FATOS do Arquiteto (texto de prompt, não de pessoa).
 pub fn architect_line(alert: &CostAlert) -> String {
     let basis = match (alert.basis, alert.ratio, alert.median_tokens, alert.median_calls) {

@@ -5,6 +5,7 @@
  */
 import { memo } from "react";
 import { useT } from "../i18n/react";
+import { AppGlyph } from "./AppGlyph";
 import { BADGE_MAX, type AppBadge } from "./appState";
 import { Icon } from "./Icon";
 import { WINDOW_META } from "./windowMeta";
@@ -54,7 +55,7 @@ function MobileSwitcherView({ kinds, open, subtitles, badges, current = null, on
                 onClick={() => onOpen(kind)}
               >
                 <span className="nd-switcher-icon">
-                  <Icon name={meta.icon} size={20} />
+                  <AppGlyph kind={kind} size={20} />
                 </span>
                 <span className="nd-switcher-text">
                   <span className="nd-switcher-name">{meta.title}</span>

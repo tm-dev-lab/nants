@@ -328,6 +328,7 @@ describe("estados iguais em todos os controles", () => {
     ".nd-segment-item",
     ".nd-tab",
     ".nd-settings-tab",
+    ".nd-nanty-tab",
     ".nd-launcher-item",
     ".nd-folder-item",
     ".nd-tree-item",

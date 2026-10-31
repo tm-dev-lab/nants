@@ -1187,7 +1187,8 @@ function reduceEventBody(state: AppState, event: ApiEvent, nextId: number, seq: 
       const { spec_id, task_id, cycle, decision, options, options_analysis } = event.payload;
       const pauses = pausesForHuman(decision);
       const entry: RecoveryEntry = { phase: pauses ? "escalate" : "retry", cycle };
-      if (pauses && options !== undefined && options.length > 0 && options_analysis !== undefined) {
+      // `options_analysis` vem `null` quando a análise não foi gravada: sem número, a escolha não vale.
+      if (pauses && options !== undefined && options.length > 0 && typeof options_analysis === "number") {
         entry.options = options;
         entry.options_analysis = options_analysis;
       }

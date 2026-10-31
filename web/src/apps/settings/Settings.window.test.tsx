@@ -120,6 +120,24 @@ describe("Configurações: abas", () => {
     expect(line?.textContent).toBe("Nants versão 0.1.0");
   });
 
+  it("a aba Máquina tem a seção Docker com os comandos do rótulo nants.project e o aviso de outra instalação (spec 138 T12)", async () => {
+    await openSettings({ ui: { p1: { rev: 1, data: { selection: { settingsTab: "machine" } } } } });
+    const docker = settings().querySelector("[data-docker-help]");
+    expect(docker).not.toBeNull();
+    expect(within(docker as HTMLElement).getByRole("heading", { name: "Docker" })).toBeTruthy();
+    const commands = [...(docker as HTMLElement).querySelectorAll("[data-docker-command] code")].map((c) => c.textContent);
+    expect(commands).toEqual([
+      "docker ps -a --filter label=nants.project",
+      "docker network ls --filter label=nants.project",
+      "docker rm <id>",
+      "docker network rm <id>",
+    ]);
+    expect(docker?.querySelector("[data-docker-warning]")?.textContent).toContain("podem ser de outra instalação do Nants");
+    expect(findForbiddenGlyphs(settings())).toEqual([]);
+    act(() => setLanguage("en", { persist: false }));
+    expect(document.querySelector("[data-docker-warning]")?.textContent).toContain("may belong to another Nants installation");
+  });
+
   it("a versão do Nants em Configurações segue o idioma (spec 103 T03, dicionário da spec 101)", async () => {
     await openSettings({ ui: { p1: { rev: 1, data: { selection: { settingsTab: "machine" } } } } });
     act(() => setLanguage("en", { persist: false }));

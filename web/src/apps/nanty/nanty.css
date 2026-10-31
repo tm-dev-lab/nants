@@ -1,0 +1,1278 @@
+/*
+ * Nanty (spec 138 T04): o avatar e a moldura da janela. Só tokens (variáveis do tema).
+ *
+ * Avatar (`reference/Avatar.dc.html`): a espessura dos traços e as animações dos cinco estados.
+ * As animações só valem com `data-motion="live"` (o componente lê o `prefers-reduced-motion` pelo
+ * `animation.ts`) e dentro do `@media (prefers-reduced-motion: no-preference)`; parado, cada estado
+ * fica na pose do desenho. A aba oculta pausa tudo (`html.page-hidden`, em `styles.css`).
+ */
+.nd-nanty {
+  flex-shrink: 0;
+  display: block;
+}
+
+.nd-nanty[data-mood="sleeping"] {
+  opacity: 0.62;
+  overflow: visible;
+}
+
+.nd-nanty[data-mood="waiting"] {
+  overflow: visible;
+}
+
+.nd-nanty-antenna,
+.nd-nanty-line {
+  fill: none;
+  stroke-linecap: round;
+}
+
+.nd-nanty-antenna {
+  stroke-width: 4;
+}
+
+.nd-nanty-line {
+  stroke-width: 2.6;
+}
+
+.nd-nanty-line[data-weight="thin"] {
+  stroke-width: 2.4;
+}
+
+.nd-nanty-wave {
+  stroke-width: 2;
+  opacity: 0;
+}
+
+.nd-nanty-sway[data-side="left"],
+.nd-nanty-wiggle[data-side="left"],
+.nd-nanty-droop[data-side="left"] {
+  transform-origin: 25px 22px;
+}
+
+.nd-nanty-sway[data-side="right"],
+.nd-nanty-wiggle[data-side="right"],
+.nd-nanty-droop[data-side="right"] {
+  transform-origin: 39px 22px;
+}
+
+.nd-nanty-tilt {
+  transform-origin: 32px 22px;
+}
+
+.nd-nanty-breathe {
+  transform-origin: 32px 40px;
+}
+
+.nd-nanty-blink,
+.nd-nanty-talk,
+.nd-nanty-wave {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@keyframes nd-nanty-tip {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes nd-nanty-blink {
+  0%,
+  90%,
+  100% {
+    transform: scaleY(1);
+  }
+  94% {
+    transform: scaleY(0.1);
+  }
+}
+
+@keyframes nd-nanty-sway-left {
+  0%,
+  100% {
+    transform: rotate(0);
+  }
+  50% {
+    transform: rotate(-5deg);
+  }
+}
+
+@keyframes nd-nanty-sway-right {
+  0%,
+  100% {
+    transform: rotate(0);
+  }
+  50% {
+    transform: rotate(5deg);
+  }
+}
+
+@keyframes nd-nanty-talk {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes nd-nanty-tilt {
+  0%,
+  100% {
+    transform: rotate(-7deg);
+  }
+  50% {
+    transform: rotate(7deg);
+  }
+}
+
+@keyframes nd-nanty-look {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  30% {
+    transform: translate(-1.6px, -1px);
+  }
+  65% {
+    transform: translate(1.6px, -1px);
+  }
+}
+
+@keyframes nd-nanty-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.045);
+  }
+}
+
+@keyframes nd-nanty-droop {
+  0%,
+  100% {
+    transform: rotate(0);
+  }
+  50% {
+    transform: rotate(4deg);
+  }
+}
+
+@keyframes nd-nanty-z {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  25% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(6px, -12px);
+  }
+}
+
+@keyframes nd-nanty-perk {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  20% {
+    transform: translateY(-3px);
+  }
+  40% {
+    transform: translateY(0);
+  }
+}
+
+@keyframes nd-nanty-wave {
+  0% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.2);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nd-nanty[data-motion="live"] .nd-nanty-tip {
+    animation: nd-nanty-tip 1.8s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-blink {
+    animation: nd-nanty-blink 3.8s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-sway[data-side="left"] {
+    animation: nd-nanty-sway-left 3s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-sway[data-side="right"] {
+    animation: nd-nanty-sway-right 3s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-wiggle[data-side="left"] {
+    animation: nd-nanty-sway-left 0.45s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-wiggle[data-side="right"] {
+    animation: nd-nanty-sway-right 0.45s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-talk {
+    animation: nd-nanty-talk 0.32s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-tilt {
+    animation: nd-nanty-tilt 2.6s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-look {
+    animation: nd-nanty-look 3.2s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-breathe {
+    animation: nd-nanty-breathe 3.6s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-droop[data-side="left"] {
+    animation: nd-nanty-droop 3.6s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-droop[data-side="right"] {
+    animation: nd-nanty-droop 3.6s ease-in-out infinite reverse;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-z {
+    animation: nd-nanty-z 2.8s ease-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-z[data-z="2"] {
+    animation-delay: 1.4s;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-perk {
+    animation: nd-nanty-perk 1.3s ease-in-out infinite;
+  }
+
+  .nd-nanty[data-motion="live"] .nd-nanty-wave {
+    animation: nd-nanty-wave 1.4s ease-out infinite;
+  }
+}
+
+/* --- A janela --- */
+
+.nd-nanty-app {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+
+.nd-nanty-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.nd-nanty-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--muted);
+  font: var(--fw-medium) var(--fs-control) var(--font-sans);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.nd-nanty-tabs[data-compact="true"] .nd-nanty-tab {
+  padding: 0 var(--sp-2);
+}
+
+.nd-root .nd-nanty-tab:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 4px var(--focus-inner);
+}
+
+.nd-nanty-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-4) var(--sp-5);
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-nanty-empty {
+  margin: auto;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  text-align: center;
+  padding: var(--sp-6) var(--sp-4);
+}
+
+.nd-nanty-empty-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-empty-text {
+  margin: 0;
+  color: var(--muted);
+  line-height: var(--lh-body);
+}
+
+.nd-nanty-empty-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+
+/* Foto do bot (Ajustes): a pose "atento" num círculo escuro, com o passo a passo. */
+.nd-nanty-photo {
+  margin-top: var(--sp-2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  text-align: left;
+}
+
+.nd-nanty-photo-img {
+  flex-shrink: 0;
+}
+
+.nd-nanty-photo-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-photo-title {
+  color: var(--ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-photo-link {
+  color: var(--ink);
+  font-size: var(--fs-label);
+  font-weight: var(--fw-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/*
+ * --- Aba Feed (T10, `reference/Main.dc.html`) ---
+ * O painel é a área de rolagem do app; na aba Feed ele não rola: o feed e a conversa têm rolagem
+ * própria, lado a lado na janela larga, um de cada vez nas outras (o seletor no topo).
+ */
+.nd-nanty-app[data-tab="feed"] .nd-nanty-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.nd-nanty-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+.nd-nanty-split[data-split="false"] {
+  flex-direction: column;
+}
+
+.nd-nanty-switch {
+  flex-shrink: 0;
+  margin: var(--sp-3) var(--sp-4) 0;
+  align-self: flex-start;
+}
+
+.nd-nanty-feed-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--sp-5) var(--sp-6);
+}
+
+.nd-nanty-split[data-split="false"] .nd-nanty-feed-pane {
+  padding: var(--sp-4) var(--sp-4);
+}
+
+.nd-nanty-feed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-width: 0;
+}
+
+.nd-nanty-feed .nd-nanty-empty {
+  margin: 0 auto;
+  padding: var(--sp-4) var(--sp-4);
+}
+
+.nd-nanty-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.nd-nanty-section-label {
+  margin: 0;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nd-nanty-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+  color: var(--ink2);
+}
+
+.nd-nanty-card[data-variant="waiting"] {
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-4);
+  background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--lane);
+}
+
+.nd-nanty-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.nd-nanty-card-title {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-time {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-nanty-facts {
+  margin: 0;
+  font-size: var(--fs-control);
+  color: var(--ink2);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-why {
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-actions .nd-btn {
+  max-width: 100%;
+  height: auto;
+  min-height: 32px;
+  white-space: normal;
+  text-align: left;
+}
+
+.nd-nanty-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-card-foot .nd-btn {
+  margin-left: auto;
+}
+
+/* Linha única (previsto): o ponto vazado, o título, o texto e a ação à direita. */
+.nd-nanty-row {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+}
+
+.nd-nanty-row .nd-dot {
+  box-sizing: border-box;
+  background: transparent;
+  border: 2px solid var(--muted);
+}
+
+.nd-nanty-row-text {
+  min-width: 0;
+  font-size: var(--fs-control);
+  color: var(--ink2);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-row-action {
+  margin-left: auto;
+}
+
+.nd-nanty-today {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-today-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: var(--sp-1) 0;
+  font-size: var(--fs-control);
+  color: var(--ink2);
+}
+
+.nd-nanty-today-item .nd-nanty-time {
+  margin-left: 0;
+}
+
+.nd-nanty-today-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* O resultado de uma decisão: uma linha discreta; o que não foi feito fica em âmbar. */
+.nd-nanty-notice {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--ink);
+  font-size: var(--fs-control);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-notice[data-tone="warn"] {
+  color: var(--pill-amber-ink);
+}
+
+/* --- Conversa (fixa à direita na janela larga) --- */
+.nd-nanty-chat {
+  flex: 0 0 auto;
+  width: min(440px, 42%);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface2);
+  border-left: 1px solid var(--divider);
+}
+
+.nd-nanty-split[data-split="false"] .nd-nanty-chat {
+  flex: 1;
+  width: auto;
+  border-left: 0;
+}
+
+.nd-nanty-chat-head {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5) var(--sp-2);
+}
+
+.nd-nanty-chat-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-chat-sub {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-nanty-chat-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: var(--sp-1) var(--sp-5) var(--sp-2);
+  list-style: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.nd-nanty-msg {
+  display: flex;
+  min-width: 0;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-msg[data-from="person"] {
+  flex-direction: column;
+  align-items: flex-end;
+  margin-left: auto;
+  max-width: 85%;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-msg[data-from="nanty"] {
+  max-width: 92%;
+}
+
+.nd-nanty-msg-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-bubble {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-xs) var(--r-lg) var(--r-lg) var(--r-lg);
+  background: var(--card);
+  box-shadow: var(--card-edge);
+  color: var(--ink2);
+  font-size: var(--fs-control);
+  line-height: var(--lh-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-bubble > p {
+  margin: 0;
+}
+
+.nd-nanty-bubble > p + p {
+  margin-top: var(--sp-1);
+}
+
+.nd-nanty-msg[data-from="person"] .nd-nanty-bubble {
+  border-radius: var(--r-lg) var(--r-lg) var(--r-xs) var(--r-lg);
+  background: var(--accent-soft);
+  box-shadow: none;
+  color: var(--ink);
+}
+
+.nd-nanty-msg-meta {
+  font-size: var(--fs-caption);
+  color: var(--muted);
+}
+
+.nd-nanty-voice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  box-shadow: var(--card-edge);
+}
+
+.nd-nanty-voice-track {
+  position: relative;
+  flex: 1;
+  min-width: 64px;
+  height: 4px;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  overflow: hidden;
+}
+
+.nd-nanty-voice-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+}
+
+.nd-nanty-voice-time {
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-nanty-voice-note {
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-label);
+  color: var(--muted);
+}
+
+.nd-nanty-chat-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-control);
+}
+
+.nd-nanty-chat-empty > p {
+  margin: 0;
+}
+
+.nd-nanty-commands {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-command {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+}
+
+.nd-nanty-command > dt {
+  color: var(--ink);
+}
+
+.nd-nanty-command > dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.nd-nanty-chat-error {
+  margin: 0 var(--sp-5);
+  font-size: var(--fs-label);
+  color: var(--danger-ink);
+}
+
+.nd-nanty-chat .nd-nanty-notice {
+  margin: 0 var(--sp-5);
+}
+
+.nd-nanty-composer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  margin: var(--sp-3) var(--sp-5) var(--sp-4);
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  box-shadow: var(--card-edge);
+}
+
+/* O anel de foco é o do campo inteiro, como no campo da Conversa; os botões têm o próprio. */
+.nd-root .nd-nanty-composer:has(.nd-nanty-input:focus-visible) {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.nd-nanty-input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: var(--fs-body) var(--font-sans);
+}
+
+.nd-root .nd-nanty-input:focus,
+.nd-root .nd-nanty-input:focus-visible {
+  outline: none;
+}
+
+.nd-nanty-input::placeholder {
+  color: var(--muted);
+}
+
+.nd-nanty-record {
+  display: inline-flex;
+}
+
+/* Celular e janela estreita: margens menores, nada passa da largura. */
+.nd-nanty-app[data-size="narrow"] .nd-nanty-chat-head,
+.nd-nanty-app[data-size="narrow"] .nd-nanty-chat-list {
+  padding-left: var(--sp-4);
+  padding-right: var(--sp-4);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-composer {
+  margin: var(--sp-2) var(--sp-4) var(--sp-3);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-chat-error,
+.nd-nanty-app[data-size="narrow"] .nd-nanty-chat .nd-nanty-notice {
+  margin: 0 var(--sp-4);
+}
+
+/*
+ * --- Aba Regras (T11, `reference/Rules.dc.html`) ---
+ * O título, o texto do topo e as ações por grupo: o nome e a nota à esquerda, o seletor de três
+ * posições à direita. A faixa "só você" leva o cadeado, sem seletor. Na janela estreita, o seletor
+ * desce para baixo do nome.
+ */
+.nd-nanty-rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-width: 0;
+  max-width: 920px;
+}
+
+.nd-nanty-rules-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-heading {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-lede {
+  margin: 0;
+  max-width: 760px;
+  color: var(--ink2);
+  line-height: var(--lh-body);
+}
+
+.nd-nanty-rule {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3) var(--sp-4);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+}
+
+.nd-nanty-rule[data-locked="true"] > .nd-icon {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.nd-nanty-rule-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-rule-name {
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-rule-note,
+.nd-nanty-rule-lock {
+  font-size: var(--fs-label);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-rule-lock {
+  color: var(--ink2);
+}
+
+.nd-nanty-levels {
+  flex-shrink: 0;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-rule:not([data-locked="true"]) {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-levels {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/*
+ * --- Aba Ajustes (T11, `reference/Settings.dc.html`) ---
+ * Cartões numa grade de duas colunas na janela larga; uma coluna na média, na estreita e no
+ * celular. O "Salvar" fica no fim, fixo na base da área de rolagem.
+ */
+.nd-nanty-settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+.nd-nanty-prefs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-4);
+  align-content: start;
+  min-width: 0;
+}
+
+.nd-nanty-app[data-size="wide"] .nd-nanty-prefs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.nd-nanty-pref {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+}
+
+.nd-nanty-pref-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-3);
+  min-width: 0;
+}
+
+.nd-nanty-pref-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-pref-value {
+  font-size: var(--fs-control);
+  color: var(--ink2);
+}
+
+.nd-nanty-pref-text {
+  margin: 0;
+  color: var(--ink2);
+  font-size: var(--fs-control);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-pref-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr));
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.nd-nanty-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-inline > .nd-input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.nd-nanty-subfield {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+/* A barra do gasto do dia: a trilha neutra e o preenchimento no acento (rosa quando acabou). */
+.nd-nanty-meter {
+  position: relative;
+  height: 6px;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  overflow: hidden;
+}
+
+.nd-nanty-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+}
+
+.nd-nanty-meter[data-over="true"] .nd-nanty-meter-fill {
+  background: var(--icon-rose);
+}
+
+/* O estado do Telegram: o ponto no tom e o texto ao lado. */
+.nd-nanty-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-control);
+  color: var(--ink2);
+}
+
+.nd-nanty-pairing {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+}
+
+.nd-nanty-code {
+  color: var(--ink);
+  font-size: var(--fs-heading);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.06em;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-steps-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-control);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-steps-list {
+  margin: 0;
+  padding-left: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--ink2);
+  font-size: var(--fs-control);
+}
+
+.nd-nanty-pref .nd-nanty-photo {
+  margin-top: 0;
+}
+
+/* A ordem da voz: o número, o nome e os botões de subir, descer e tirar. */
+.nd-nanty-order {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-order-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  min-height: 32px;
+  color: var(--ink2);
+  font-size: var(--fs-control);
+}
+
+.nd-nanty-order-n {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-xs);
+  background: var(--control);
+  color: var(--ink);
+  font-size: var(--fs-caption);
+}
+
+.nd-nanty-order-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-order-tools {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-reserve {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.nd-nanty-reserve-row {
+  display: grid;
+  grid-template-columns: minmax(80px, auto) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-reserve-role {
+  color: var(--ink2);
+  font-size: var(--fs-control);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-reserve-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.nd-nanty-projects {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-projects .nd-check {
+  overflow-wrap: anywhere;
+}
+
+/*
+ * A barra do "Salvar": fixa na base da área de rolagem, com o fundo da janela (--surface) na largura
+ * toda. As margens negativas cobrem o recuo do painel (--sp-5 dos lados, --sp-4 embaixo), para nada
+ * do conteúdo aparecer ao lado nem abaixo dela. Na janela estreita e no celular, ela não é fixa:
+ * fica no fim, depois do último cartão.
+ */
+.nd-nanty-savebar {
+  position: sticky;
+  bottom: calc(-1 * var(--sp-4));
+  z-index: 1;
+  margin: 0 calc(-1 * var(--sp-5)) calc(-1 * var(--sp-4));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5) var(--sp-4);
+  background: var(--surface);
+  border-top: 1px solid var(--divider);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-savebar {
+  position: static;
+  margin: 0;
+  padding: var(--sp-3) 0 0;
+  border-top: 0;
+  background: transparent;
+}
+
+.nd-nanty-savebar .nd-nanty-notice {
+  flex: 1 1 200px;
+}
+
+.nd-nanty-prefs-state {
+  padding: var(--sp-4) 0;
+}
+
+/* --- Configurações > Agentes: a linha do Nanty (T11) --- */
+.nd-nanty-agent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  min-width: 0;
+}
+
+.nd-nanty-agent-text {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-agent-text > .nd-role-title {
+  margin: 0;
+}
+
+.nd-nanty-agent-model {
+  margin: 0;
+  color: var(--ink2);
+  overflow-wrap: anywhere;
+}
