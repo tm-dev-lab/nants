@@ -1777,15 +1777,18 @@ mod tests {
         let running = crate::server::plan_review::view(&root, "001-exemplo", &secrets).expect("revisando");
         assert_eq!(running.status, "running", "o turno não esperou a revisão");
         gate.notify_one();
-        let mut done = None;
-        for _ in 0..400 {
-            done = crate::server::plan_review::view(&root, "001-exemplo", &secrets).filter(|v| v.status == "ok");
-            if done.is_some() {
-                break;
+        // A revisão termina em segundo plano: com a máquina ocupada, ela pode demorar; o prazo só
+        // existe para o teste não ficar preso se ela nunca terminar.
+        let limit = std::time::Instant::now() + Duration::from_secs(60);
+        let done = loop {
+            let view = crate::server::plan_review::view(&root, "001-exemplo", &secrets).expect("revisão gravada");
+            if view.status == "ok" {
+                break view;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(done.expect("revisão concluída").issues.len(), 1);
+            assert!(std::time::Instant::now() < limit, "a revisão não terminou: {}", view.status);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(done.issues.len(), 1);
     }
 
     #[tokio::test]

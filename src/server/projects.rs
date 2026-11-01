@@ -1363,7 +1363,7 @@ pub(super) fn disk_attention(
     running: bool,
     review_now: Option<SystemTime>,
 ) -> super::attention::DiskAttention {
-    use super::attention::{DiskAttention, EscalationOption, PausedOrStalled};
+    use super::attention::{DiskAttention, EscalationOption, PausedOrStalled, SpecProgress};
     // Mesma visão do `build_state_at`: basta o SDD inicializado; `settings.yaml` ilegível não
     // esconde as specs (o `/state` também as lista).
     if !sdd_initialized(root) {
@@ -1386,6 +1386,16 @@ pub(super) fn disk_attention(
             }),
         paused_or_stalled: None,
         plan_spec_id: None,
+        progress: Some(SpecProgress {
+            spec_id: active.id.clone(),
+            done: active.tasks.iter().filter(|t| t.status == Some(TaskStatus::Done)).count(),
+            total: active.tasks.len(),
+            current_task: active
+                .tasks
+                .iter()
+                .find(|t| !matches!(t.status, Some(TaskStatus::Todo | TaskStatus::Done | TaskStatus::Blocked) | None))
+                .map(|t| t.id.clone()),
+        }),
     };
     if out.plan_awaiting_approval {
         out.plan_spec_id = Some(active.id.clone());

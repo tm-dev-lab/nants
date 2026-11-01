@@ -2795,7 +2795,7 @@ mod gemini_tests;
 mod limit_client_tests;
 
 #[cfg(test)]
-mod live_tests;
+pub(crate) mod live_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

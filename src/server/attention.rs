@@ -93,6 +93,19 @@ pub struct DiskAttention {
     /// A spec do plano que espera aprovação (spec 138 T03: o cartão do Nanty aprova esta spec).
     pub plan_spec_id: Option<String>,
     pub paused_or_stalled: Option<PausedOrStalled>,
+    /// O andamento da spec ativa (spec 139 T02): a mesma spec que a atenção escolheu.
+    pub progress: Option<SpecProgress>,
+}
+
+/// Andamento da spec ativa (a mesma escolha de [`super::projects::disk_attention`]): tarefas
+/// concluídas, total e a tarefa em andamento. Só ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpecProgress {
+    pub spec_id: String,
+    pub done: usize,
+    pub total: usize,
+    /// A primeira tarefa que já saiu de TODO e ainda não terminou (nem está BLOCKED).
+    pub current_task: Option<String>,
 }
 
 /// Pedido de permissão pendente, só com ids e rótulos fixos.
@@ -122,6 +135,9 @@ pub struct ProjectAttention {
     /// `/api/attention`, que segue igual.
     #[serde(skip)]
     pub plan_spec_id: Option<String>,
+    /// O andamento da spec ativa, só para o Nanty (spec 139 T02): fora da resposta.
+    #[serde(skip)]
+    pub progress: Option<SpecProgress>,
 }
 
 impl ProjectAttention {
@@ -202,6 +218,7 @@ async fn project_attention(
         plan_awaiting_approval: disk.plan_awaiting_approval && !turn_open,
         paused_or_stalled: disk.paused_or_stalled,
         plan_spec_id: disk.plan_spec_id.filter(|_| !turn_open),
+        progress: disk.progress,
     }
 }
 
@@ -211,27 +228,50 @@ pub async fn build_attention(state: &AppState) -> AttentionView {
     AttentionView { setup_incomplete: setup_incomplete(state).await, projects }
 }
 
-/// Os projetos com algum item da visão de atenção, com o id cadastrado e a pasta (o Nanty, spec 138
-/// T02, observa por aqui: a mesma fonte do sino, sem a prontidão da máquina).
+/// O que a visão de atenção lê uma vez para todos os projetos: os segredos e a espera da revisão do
+/// plano.
+pub(crate) struct AttentionContext {
+    secrets: std::sync::Arc<SecretSet>,
+    review_now: Option<SystemTime>,
+}
+
+pub(crate) async fn attention_context(state: &AppState) -> AttentionContext {
+    // Mesma espera da revisão do plano do estado do projeto (spec 092 T02).
+    let review_now = super::plan_review::reviewer_configured(state).await.then(SystemTime::now);
+    AttentionContext { secrets: state.secret_set().await, review_now }
+}
+
+/// Os projetos com algum item da visão de atenção, com o id cadastrado e a pasta (a mesma fonte do
+/// sino, sem a prontidão da máquina).
 pub(crate) async fn projects_attention(state: &AppState) -> Vec<(String, PathBuf, ProjectAttention)> {
     let projects: Vec<(String, String, String)> = {
         let cfg = state.config().read().await;
         cfg.projects.iter().map(|p| (p.id.clone(), p.name.clone(), p.path.clone())).collect()
     };
-    let secrets = state.secret_set().await;
-    // Mesma espera da revisão do plano do estado do projeto (spec 092 T02).
-    let review_now = super::plan_review::reviewer_configured(state).await.then(SystemTime::now);
+    let ctx = attention_context(state).await;
     let mut out = Vec::new();
     for (id, name, path) in projects {
         if validate_project_id(&id).is_err() {
             continue;
         }
-        let item = project_attention(state, &secrets, review_now, (&id, &name, &path)).await;
+        let item = project_attention(state, &ctx.secrets, ctx.review_now, (&id, &name, &path)).await;
         if item.has_items() {
             out.push((id, PathBuf::from(path), item));
         }
     }
     out
+}
+
+/// A visão de atenção de UM projeto cadastrado, tenha ou não algum item (o Nanty, spec 139 T02, lê
+/// cada projeto por aqui: a mesma leitura do sino). O contexto vem de [`attention_context`], montado
+/// uma vez por varredura. `None` com o id inválido (o sino também o deixa de fora).
+pub(crate) async fn attention_with(
+    state: &AppState,
+    ctx: &AttentionContext,
+    project: &crate::config::Project,
+) -> Option<ProjectAttention> {
+    validate_project_id(&project.id).ok()?;
+    Some(project_attention(state, &ctx.secrets, ctx.review_now, (&project.id, &project.name, &project.path)).await)
 }
 
 /// `GET /api/attention`

@@ -270,6 +270,32 @@ async fn notice_only_codes_get_no_action() {
 
 // ---- Cada ação em cada nível ----
 
+/// Spec 139 T08 (vindo da revisão da T04): com o silêncio de tudo ligado, o cartão de oferta novo sai
+/// como o filtro manda: o normal vai ao resumo, e o urgente vai sem som.
+#[tokio::test]
+async fn the_silence_of_everything_rules_the_new_offer_card_like_the_filter() {
+    let w = World::new("silence-offer", |_| {});
+    super::silence::apply(&w.nanty(), super::silence::Request::Hours(1), crate::server::nanty::store::Channel::Web);
+    w.round(&[plan()]).await;
+    let card = w.card("p1:plan_waiting").expect("cartão");
+    assert_eq!(card.action.as_deref(), Some("approve_plan"));
+    assert_eq!(card.delivery, Some(super::store::Delivery::Digest));
+    drop(w);
+
+    // O urgente já avisado, sem cartão aberto: a oferta nasce aqui, sem som.
+    let w = World::new("silence-urgent", |c| {
+        c.nanty.urgency.insert("plan_waiting".into(), crate::config::Urgency::Urgent);
+    });
+    super::silence::apply(&w.nanty(), super::silence::Request::Hours(1), crate::server::nanty::store::Channel::Web);
+    w.round(&[plan()]).await;
+    w.nanty().update(|st| {
+        st.cards.retain(|c| c.group != "p1:plan_waiting");
+        true
+    });
+    w.round(&[plan()]).await;
+    assert_eq!(w.card("p1:plan_waiting").expect("cartão").delivery, Some(super::store::Delivery::Silent));
+}
+
 #[tokio::test]
 async fn approve_plan_in_each_level() {
     // Pergunta antes (o padrão): cartão com o `spec_id`, o hash do plano e um token.
@@ -905,6 +931,39 @@ async fn post(state: &AppState, uri: &str, body: Value) -> (StatusCode, Value) {
     let status = resp.status();
     let bytes = resp.into_body().collect().await.expect("corpo").to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Spec 139 T12, F-03: o clique nunca dá silêncio além da hora mostrada no cartão.
+#[tokio::test]
+async fn a_late_click_never_stretches_the_silence_past_the_card() {
+    use super::silence::{self, Request as Silence};
+    use super::store::Channel;
+    const MIN: u64 = 60_000;
+    let w = World::new("silence-late", |_| {});
+    let nanty = w.nanty();
+    let cfg = w.state.config().read().await.clone();
+    let local = clock::local_time_at(nanty.now().epoch_ms).expect("hora local");
+    let answer = |card: &Card| (card.id.clone(), card.token.clone().expect("token"));
+
+    // Uma hora do relógio, meia hora à frente: o cartão vence nela, antes das 4 horas de validade.
+    let minutes = u32::from(local.hour) * 60 + u32::from(local.minute) + 30;
+    let wanted = Silence::Clock(u8::try_from(minutes / 60 % 24).expect("hora"), u8::try_from(minutes % 60).expect("minuto"));
+    let (until, _) = silence::propose(&nanty, &cfg, wanted, Channel::Web);
+    let card = w.card(silence::GROUP_SET).expect("cartão");
+    assert_eq!(card.expires_at_ms, until);
+    let (id, token) = answer(&card);
+    w.advance(40 * MIN);
+    let out = act::decide(&w.state, &id, &token, Answer::Yes, DecidedBy::Web).await.expect("decide");
+    assert_eq!(out.outcome, "expired", "depois da hora mostrada");
+    assert!(silence::global_until(&nanty.snapshot(), nanty.now().epoch_ms).is_none(), "nada calou");
+
+    // Por horas: o clique atrasado, ainda válido, fica na hora que o cartão mostrou.
+    let (until, _) = silence::propose(&nanty, &cfg, Silence::Hours(2), Channel::Web);
+    let (id, token) = answer(&w.card(silence::GROUP_SET).expect("cartão"));
+    w.advance(30 * MIN);
+    let out = act::decide(&w.state, &id, &token, Answer::Yes, DecidedBy::Web).await.expect("decide");
+    assert_eq!(out.outcome, "silenced");
+    assert_eq!(silence::global_until(&nanty.snapshot(), nanty.now().epoch_ms), Some(until));
 }
 
 #[tokio::test]

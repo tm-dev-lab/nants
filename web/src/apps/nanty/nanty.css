@@ -590,6 +590,26 @@
   overflow-wrap: anywhere;
 }
 
+/* O silêncio ligado (spec 139 T04): uma linha discreta no topo do feed, com o botão de desligar. */
+.nd-nanty-silence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+}
+
+.nd-nanty-silence-text {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink);
+  font-size: var(--fs-control);
+  overflow-wrap: anywhere;
+}
+
 /* O resultado de uma decisão: uma linha discreta; o que não foi feito fica em âmbar. */
 .nd-nanty-notice {
   margin: 0;
@@ -1130,52 +1150,18 @@
   margin-top: 0;
 }
 
-/* A ordem da voz: o número, o nome e os botões de subir, descer e tirar. */
-.nd-nanty-order {
+/* O estado da voz (o que o servidor respondeu) e o atalho para as Conexões. */
+.nd-nanty-voice-state {
   margin: 0;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-1);
-}
-
-.nd-nanty-order-item {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-  min-height: 32px;
-  color: var(--ink2);
-  font-size: var(--fs-control);
-}
-
-.nd-nanty-order-n {
-  flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--r-xs);
-  background: var(--control);
-  color: var(--ink);
-  font-size: var(--fs-caption);
-}
-
-.nd-nanty-order-name {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-1);
   overflow-wrap: anywhere;
 }
 
-.nd-nanty-order-tools {
-  display: inline-flex;
-  flex-shrink: 0;
-  gap: var(--sp-1);
+.nd-nanty-voice-where {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-width: 0;
 }
 
 .nd-nanty-reserve {
@@ -1187,18 +1173,23 @@
 .nd-nanty-reserve-row {
   display: grid;
   grid-template-columns: minmax(80px, auto) minmax(0, 1fr) minmax(0, 1fr);
-  align-items: center;
+  align-items: start;
   gap: var(--sp-2);
   min-width: 0;
 }
 
 .nd-nanty-reserve-role {
+  padding-top: var(--sp-2);
   color: var(--ink2);
   font-size: var(--fs-control);
 }
 
 .nd-nanty-app[data-size="narrow"] .nd-nanty-reserve-row {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-reserve-role {
+  padding-top: 0;
 }
 
 .nd-nanty-projects {

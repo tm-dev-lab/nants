@@ -40,7 +40,7 @@ pub enum JournalKind {
     /// A conversa (T08): o que a pessoa mandou (comando, texto livre) e o código da resposta, com o
     /// canal e os cartões pedidos. Nunca o texto da pessoa nem o do modelo.
     Conversation,
-    /// A voz (T09): a fala (cada passo da ordem, com o motivo em código quando cai para o próximo)
+    /// A voz (T09): a fala (com o motivo em código quando cai para o texto), a migração da voz antiga
     /// e a transcrição da nota de voz, com tokens e custo. Nunca o texto nem o áudio.
     Voice,
 }

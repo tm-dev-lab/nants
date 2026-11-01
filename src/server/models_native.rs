@@ -98,8 +98,8 @@ pub(super) fn classify(err: &LlmError, with_model: bool) -> Failure {
     }
 }
 
-/// O 400 do Gemini para a chave recusada (`API_KEY_INVALID`).
-fn key_rejected(body: &str) -> bool {
+/// O 400 do Gemini para a chave recusada (`API_KEY_INVALID`). Vale também para a voz do Nanty.
+pub(crate) fn key_rejected(body: &str) -> bool {
     body.contains("API_KEY_INVALID") || body.contains("API key not valid")
 }
 

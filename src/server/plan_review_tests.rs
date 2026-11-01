@@ -1695,3 +1695,314 @@ fn mention_issue_is_one_server_point_in_the_project_language() {
     let parsed = parse_issues(&json!({"issues": [{"task": null, "kind": MENTIONED_UNUSED, "text": "x"}]}).to_string(), &SecretSet::default());
     assert!(parsed.is_none_or(|p| p.is_empty()));
 }
+
+// ---- Bateria viável desde o início (spec 139 T11) ----
+
+/// Modelo simulado que faz o que a instrução pede, só com o que o servidor manda: para cada etapa do
+/// bloco da bateria, procura a preparação dela na primeira tarefa do plano. Quem julga é ele, e o
+/// resultado depende das etapas e das tarefas que chegaram no pedido.
+struct BatteryReviewer;
+
+impl ChatBackend for BatteryReviewer {
+    fn complete<'a>(&'a self, req: &'a ChatRequest) -> Pin<Box<dyn Future<Output = Reply> + Send + 'a>> {
+        Box::pin(async move {
+            let instructed = req.messages[0].content.contains(INFEASIBLE_TEST_COMMAND);
+            let plan = req.messages.iter().map(|m| m.content.as_str()).find(|c| c.starts_with(crate::agents::plan_review::PLAN_FACTS_LABEL));
+            let plan = plan.unwrap_or_default();
+            let first_task = plan.split("### tasks/T01.md").nth(1).and_then(|t| t.split("### tasks/T02.md").next()).unwrap_or_default();
+            let block = plan.split(BATTERY_HEADING).nth(1).unwrap_or_default();
+            let steps = block.lines().filter(|l| l.trim_start().starts_with("- etapa ")).filter_map(|l| l.split('`').nth(1));
+            let issues: Vec<_> = steps
+                .filter(|step| instructed && !first_task.contains(&format!("Prepara {step}.")))
+                .map(|step| json!({"task": "T01", "kind": INFEASIBLE_TEST_COMMAND, "text": format!("A etapa {step} só fica executável depois da T01.")}))
+                .collect();
+            text(&json!({"issues": issues}).to_string())
+        })
+    }
+}
+
+/// Plano de duas tarefas com a bateria `suite-a && suite-b`: a T01 prepara `t01`, a T02 prepara `t02`.
+fn battery_plan(tag: &str, t01: &str, t02: &str) -> PathBuf {
+    let root = tmp(tag);
+    let task = |id: &str, extra: &str| EXAMPLE_TASK_MD.replace("\"T01\"", &format!("\"{id}\"")).replace("Critério verificável.", &format!("Critério verificável. {extra}"));
+    write_plan(&root, "AWAITING_APPROVAL", &task("T01", t01));
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/tasks/T02.md")), task("T02", t02)).expect("T02");
+    fs::write(root.join(".sdd/settings.yaml"), "base_branch: main\nmerge_strategy: squash\ntest_command: \"suite-a && suite-b\"\n").expect("settings");
+    fs::create_dir_all(root.join(".git/info")).expect("git");
+    root
+}
+
+/// Spec 139 T11: a bateria `a && b` em que `b` só fica viável numa tarefa posterior gera o
+/// apontamento, que não trava: a revisão termina `ok` e a vista mostra o ponto como os demais.
+#[tokio::test]
+async fn battery_step_only_viable_in_a_later_task_is_flagged_without_blocking() {
+    let root = battery_plan("battery-late", "Prepara suite-a.", "Prepara suite-b.");
+    let st = state(&root, true, Arc::new(BatteryReviewer));
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.status, STATUS_OK);
+    assert_eq!(rec.issues.len(), 1, "{:?}", rec.issues);
+    assert_eq!(rec.issues[0].kind, INFEASIBLE_TEST_COMMAND);
+    assert_eq!(rec.issues[0].task.as_deref(), Some("T01"));
+    assert!(rec.issues[0].text.contains("suite-b"), "{}", rec.issues[0].text);
+    let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
+    assert_eq!(shown.status, STATUS_OK);
+    assert_eq!(shown.issues.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>(), vec![INFEASIBLE_TEST_COMMAND], "o tipo novo chega à tela");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11: com todas as etapas viáveis desde a primeira tarefa, nenhum apontamento.
+#[tokio::test]
+async fn viable_battery_is_not_flagged() {
+    let root = battery_plan("battery-ok", "Prepara suite-a. Prepara suite-b.", "Outra entrega.");
+    let st = state(&root, true, Arc::new(BatteryReviewer));
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.status, STATUS_OK);
+    assert!(rec.issues.is_empty(), "{:?}", rec.issues);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11: a instrução é genérica: cobre os dois comandos, a ordem das tarefas e o teste de
+/// fumaça pela própria ferramenta, sem nome de ferramenta nenhuma.
+#[test]
+fn battery_instruction_is_generic_and_asks_for_a_smoke_test_the_tool_runs() {
+    let p = plan_review_system().split_whitespace().collect::<Vec<_>>().join(" ");
+    for token in [
+        "Para cada etapa do test_command e do full_test_command",
+        "antes ou junto dessa primeira tarefa",
+        "teste de fumaça que a própria ferramenta da etapa encontre e rode",
+        "só a configuração não basta",
+        "missing_dependency|infeasible_test_command|too_large",
+    ] {
+        assert!(p.contains(token), "{token}: {p}");
+    }
+    let lower = p.to_lowercase();
+    for tool in ["playwright", "vitest", "jest", "pytest", "cypress", "npm", "npx", "cargo", "node --test"] {
+        assert!(!lower.contains(tool), "{tool}");
+    }
+    assert!(ISSUE_KINDS.contains(&INFEASIBLE_TEST_COMMAND));
+}
+
+/// Spec 139 T11: o plano leva as etapas pelo analisador do runner, redigidas, com a regra da
+/// aprovação: a configuração vence no `test_command`, a spec no `full_test_command`.
+#[test]
+fn plan_lists_each_step_of_both_commands() {
+    let root = tmp("battery-section");
+    write_plan(&root, "AWAITING_APPROVAL", EXAMPLE_TASK_MD);
+    let settings = |body: &str| fs::write(root.join(".sdd/settings.yaml"), format!("base_branch: main\nmerge_strategy: squash\n{body}")).expect("settings");
+    let plan_of = |secrets: &SecretSet| build_plan(&root, SPEC, secrets).expect("plano");
+
+    settings(&format!("test_command: \"unit --token {SECRET} && 'e2e  run' && smoke\"\nfull_test_command: \"todos\"\n"));
+    let plan = plan_of(&SecretSet::new(vec![SECRET.to_string()]));
+    assert!(!plan.contains(SECRET), "{plan}");
+    let block = plan.split(BATTERY_HEADING).nth(1).expect("bloco");
+    assert!(block.contains("- test_command, roda a cada entrega de cada tarefa:\n"), "{block}");
+    assert!(block.contains("  - etapa 2 de 3: `'e2e  run'`\n  - etapa 3 de 3: `smoke`\n"), "{block}");
+    assert!(block.contains("- full_test_command, roda antes da revisão de cada tarefa:\n  - etapa 1 de 1: `todos`\n"), "{block}");
+
+    // O comando que o analisador não divide é uma etapa só.
+    settings("test_command: \"a; b\"\n");
+    let plan = plan_of(&SecretSet::default());
+    assert!(plan.contains("  - etapa 1 de 1: `a; b`\n"), "{plan}");
+
+    // A spec propõe: o `test_command` dela vale com a configuração vazia, e o `full_test_command`
+    // dela vence o da configuração.
+    settings("test_command: \"\"\nfull_test_command: \"antigo\"\n");
+    let proposed = EXAMPLE_SPEC_MD.replacen("test_command: \"cargo test\"\n", "test_command: \"proposto && outro\"\nfull_test_command: \"novo\"\n", 1);
+    fs::write(root.join(format!(".sdd/specs/{SPEC}/spec.md")), proposed).expect("spec");
+    let plan = plan_of(&SecretSet::default());
+    assert!(plan.contains("  - etapa 1 de 2: `proposto`\n  - etapa 2 de 2: `outro`\n"), "{plan}");
+    assert!(plan.contains("  - etapa 1 de 1: `novo`\n") && !plan.contains("`antigo`"), "{plan}");
+    assert!(battery_section(None, None, &SecretSet::default()).is_empty(), "sem comando, sem bloco");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Grava a tarefa de outra spec, com o estado e a evidência dados.
+fn evidence_task(root: &Path, spec: &str, status: crate::sdd::TaskStatus, evidence: &str) {
+    let dir = root.join(format!(".sdd/specs/{spec}/tasks"));
+    fs::create_dir_all(&dir).expect("tasks");
+    let mut task = crate::sdd::Task::parse(EXAMPLE_TASK_MD).expect("tarefa");
+    task.frontmatter.status = status;
+    task.frontmatter.test_evidence = Some(evidence.to_string());
+    fs::write(dir.join("T01.md"), task.render().expect("render")).expect("gravar");
+}
+
+/// Evidência de uma rodada que saiu com `code` na etapa `step`, como o runner grava.
+fn step_evidence(code: i32, step: &str, lang: crate::i18n::Lang) -> String {
+    let note = crate::i18n::tr(lang, "runner.tests.failed_step", &[("index", "2"), ("total", "2"), ("step", step)]);
+    format!("{}sh: 1: programa: not found\n\n{note}\n", crate::agents::runner::failure_header(Some(code), false))
+}
+
+/// A bateria `suite-a && suite-b` na configuração do projeto, com o plano de sempre.
+fn measured_root(tag: &str) -> PathBuf {
+    let root = plan_root(tag);
+    fs::write(root.join(".sdd/settings.yaml"), "base_branch: main\nmerge_strategy: squash\ntest_command: \"suite-a && suite-b\"\n").expect("settings");
+    root
+}
+
+/// Spec 139 T11: a parte determinística aponta só a saída 126/127 já medida na bateria do plano,
+/// com a etapa (C-22) nos dois idiomas; "No tests found" (saída 1) e tempo limite são do modelo, e o
+/// que voltou a passar não conta.
+#[test]
+fn only_a_measured_126_or_127_is_a_server_point() {
+    use crate::agents::runner::failure_header;
+    use crate::i18n::Lang;
+    use crate::sdd::TaskStatus::{Blocked, Done};
+    let root = measured_root("measured");
+    let battery = battery_steps(&root, SPEC, &SecretSet::default());
+    assert!(measured_not_runnable(&root, &battery).is_empty(), "sem medição, sem ponto");
+    evidence_task(&root, "010-a", Blocked, &step_evidence(127, "suite-b", Lang::PtBr));
+    evidence_task(&root, "020-b", Blocked, &step_evidence(126, "suite-a", Lang::En));
+    evidence_task(&root, "030-c", Blocked, &step_evidence(1, "suite-b", Lang::PtBr));
+    evidence_task(&root, "040-d", Blocked, &format!("{}`suite-b`", failure_header(None, true)));
+    evidence_task(&root, "050-e", Blocked, "sh: 1: `suite-b`: not found\nexit code 127");
+    evidence_task(&root, "060-f", Done, &step_evidence(127, "suite-b", Lang::PtBr));
+    let measured = measured_not_runnable(&root, &battery);
+    assert_eq!(measured, vec!["010-a/T01 (127): `suite-b`".to_string(), "020-b/T01 (126): `suite-a`".to_string()]);
+
+    let pt = with_not_runnable_items(Vec::new(), &measured, &[], Lang::PtBr);
+    assert_eq!(pt.len(), 1);
+    assert_eq!(pt[0].issue.kind, COMMAND_NOT_RUNNABLE);
+    assert_eq!(pt[0].issue.task, None);
+    assert_eq!(
+        pt[0].issue.text,
+        "A bateria deste plano já falhou com comando não encontrado (127) ou não executável (126). Diga qual tarefa torna o programa disponível antes da primeira rodada, ou recuse explicando por que não se aplica. Medido em 010-a/T01 (127): `suite-b`, 020-b/T01 (126): `suite-a`."
+    );
+    let en = with_not_runnable_items(Vec::new(), &measured, &[], Lang::En);
+    assert_eq!(
+        en[0].issue.text,
+        "This plan's test battery has already failed with command not found (127) or not executable (126). Say which task makes the program available before the first run, or decline and explain why it does not apply. Measured in 010-a/T01 (127): `suite-b`, 020-b/T01 (126): `suite-a`."
+    );
+    assert!(with_not_runnable_items(Vec::new(), &[], &[], Lang::PtBr).is_empty());
+
+    // Um ponto só, com teto na lista, e nunca cede a vaga aos do modelo nem ao do ciclo.
+    let many: Vec<String> = (0..6).map(|i| format!("0{i}0-x/T01 (127): `a`")).collect();
+    assert!(with_not_runnable_items(Vec::new(), &many, &[], Lang::PtBr)[0].issue.text.contains("+2"));
+    let full: Vec<ReviewItem> = (0..MAX_ISSUES)
+        .map(|i| ReviewItem { issue: PlanIssue::new(None, "scope", &format!("p{i}")), reference: None, new_argument: false })
+        .collect();
+    let out = with_cycle_items(with_not_runnable_items(full, &measured, &[], Lang::PtBr), &["T01".to_string(), "T02".to_string()], Lang::PtBr);
+    assert_eq!(out.len(), MAX_ISSUES);
+    assert!(out.iter().any(|i| i.issue.kind == COMMAND_NOT_RUNNABLE), "{out:?}");
+    // O modelo não emite o tipo, e o registro volta legível.
+    assert!(!ISSUE_KINDS.contains(&COMMAND_NOT_RUNNABLE) && known_kind(COMMAND_NOT_RUNNABLE));
+    let parsed = parse_issues(&json!({"issues": [{"task": null, "kind": COMMAND_NOT_RUNNABLE, "text": "x"}]}).to_string(), &SecretSet::default());
+    assert!(parsed.is_none_or(|p| p.is_empty()));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11 (F-01): a tarefa bloqueada de outra bateria não diz respeito ao plano. O comando de
+/// uma etapa, sem nota do runner, vale pelo texto na saída; sem ele, nada. A etapa sai redigida.
+#[test]
+fn measurement_only_counts_for_the_battery_of_the_reviewed_plan() {
+    use crate::agents::runner::failure_header;
+    use crate::i18n::Lang;
+    use crate::sdd::TaskStatus::Blocked;
+    let root = measured_root("measured-other");
+    evidence_task(&root, "010-a", Blocked, &step_evidence(127, "outra-bateria", Lang::PtBr));
+    // O nome solto na saída não é a nota do runner: a etapa precisa estar entre crases.
+    evidence_task(&root, "020-b", Blocked, &format!("{}suite-b: not found", failure_header(Some(127), false)));
+    assert!(measured_not_runnable(&root, &battery_steps(&root, SPEC, &SecretSet::default())).is_empty());
+
+    let settings = "base_branch: main\nmerge_strategy: squash\ntest_command: \"unica-suite\"\n";
+    fs::write(root.join(".sdd/settings.yaml"), settings).expect("settings");
+    let single = battery_steps(&root, SPEC, &SecretSet::default());
+    assert!(measured_not_runnable(&root, &single).is_empty(), "sem o texto do comando na saída, não aponta");
+    evidence_task(&root, "030-c", Blocked, &format!("{}> unica-suite\nsh: 1: unica-suite: not found", failure_header(Some(127), false)));
+    assert_eq!(measured_not_runnable(&root, &single), vec!["030-c/T01 (127): `unica-suite`".to_string()]);
+    // O cabeçalho do Nants não casa com o comando.
+    fs::write(root.join(".sdd/settings.yaml"), settings.replace("unica-suite", "falha")).expect("settings");
+    assert!(measured_not_runnable(&root, &battery_steps(&root, SPEC, &SecretSet::default())).is_empty());
+
+    // Redigida: a etapa na evidência já vem com o segredo trocado, e o ponto cita a forma redigida.
+    fs::write(root.join(".sdd/settings.yaml"), format!("base_branch: main\nmerge_strategy: squash\ntest_command: \"suite-a --token {SECRET} && suite-b\"\n")).expect("settings");
+    let secrets = SecretSet::new(vec![SECRET.to_string()]);
+    let redacted = scrub_text(&secrets, &format!("suite-a --token {SECRET}"));
+    evidence_task(&root, "040-d", Blocked, &step_evidence(127, &redacted, Lang::PtBr));
+    let found = measured_not_runnable(&root, &battery_steps(&root, SPEC, &secrets));
+    assert_eq!(found, vec![format!("040-d/T01 (127): `{redacted}`")]);
+    assert!(!found[0].contains(SECRET), "{found:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11: pelo fluxo da revisão, a saída 127 medida na bateria vira ponto mesmo com o modelo
+/// sem nada a apontar, e a revisão termina `ok`: um apontamento, nunca um bloqueio.
+#[tokio::test]
+async fn measured_exit_code_reaches_the_review_as_a_point_that_does_not_block() {
+    use crate::i18n::Lang;
+    let root = measured_root("measured-flow");
+    evidence_task(&root, "000-antes", crate::sdd::TaskStatus::Blocked, &step_evidence(127, "suite-b", Lang::PtBr));
+    let st = state(&root, true, Scripted::new(vec![text("{\"issues\": []}")]));
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.status, STATUS_OK);
+    assert_eq!(rec.issues.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>(), vec![COMMAND_NOT_RUNNABLE], "{:?}", rec.issues);
+    assert!(rec.issues[0].text.contains("000-antes/T01 (127): `suite-b`"), "{}", rec.issues[0].text);
+    let shown = view(&root, SPEC, &SecretSet::default()).expect("vista");
+    assert_eq!(shown.issues.len(), 1, "o ponto do servidor chega à tela");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11 (F-01): em projeto com tarefa bloqueada de outra bateria, a revisão não traz o ponto
+/// nem abre rodada.
+#[tokio::test]
+async fn unrelated_blocked_task_adds_no_point_to_the_review() {
+    use crate::i18n::Lang;
+    let root = measured_root("measured-unrelated");
+    evidence_task(&root, "000-antes", crate::sdd::TaskStatus::Blocked, &step_evidence(127, "outra-bateria", Lang::PtBr));
+    let reviewer = Scripted::new(vec![review(&[])]);
+    let architect = Architect::new(Vec::new());
+    let st = consensus_state(&root, reviewer, architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert!(rec.issues.is_empty(), "{:?}", rec.issues);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    assert!(internal_turns(&root).is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11 (F-01): o aceite do Arquiteto fecha o ponto, que não depende do plano: uma rodada,
+/// duas revisões e consenso, sem chegar ao teto. Mudou a lista medida, ele volta.
+#[tokio::test]
+async fn accepted_not_runnable_point_does_not_reopen() {
+    use crate::i18n::Lang;
+    let root = measured_root("measured-accept");
+    evidence_task(&root, "000-antes", crate::sdd::TaskStatus::Blocked, &step_evidence(127, "suite-b", Lang::PtBr));
+    let reviewer = Scripted::new(vec![review(&[]), review(&[])]);
+    let architect = Architect::new(vec![vec![decided(&[("P1", DECISION_ACCEPT, "agree", "A T01 instala o programa.")])]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.rounds[0].issues.len(), 1, "{:?}", rec.rounds);
+    assert!(rec.issues.is_empty(), "{:?}", rec.issues);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_CONSENSUS));
+    assert_eq!(internal_turns(&root).len(), 1);
+    assert_eq!(reviewer.requests().len(), 2);
+
+    // A mesma lista continua fechada; outra medição é fato novo.
+    let measured = vec!["000-antes/T01 (127): `suite-b`".to_string()];
+    assert!(with_not_runnable_items(Vec::new(), &measured, &rec.points, Lang::PtBr).is_empty());
+    let other = vec!["000-antes/T02 (127): `suite-b`".to_string()];
+    assert_eq!(with_not_runnable_items(Vec::new(), &other, &rec.points, Lang::PtBr).len(), 1);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 139 T11 (F-01): a recusa termina em disputa na revisão seguinte, a prevista depois de todo
+/// turno, sem rodada extra.
+#[tokio::test]
+async fn rejected_not_runnable_point_ends_disputed_without_an_extra_round() {
+    use crate::i18n::Lang;
+    let root = measured_root("measured-reject");
+    evidence_task(&root, "000-antes", crate::sdd::TaskStatus::Blocked, &step_evidence(127, "suite-b", Lang::PtBr));
+    let reviewer = Scripted::new(vec![review(&[]), review(&[])]);
+    let architect = Architect::new(vec![vec![decided(&[("P1", DECISION_REJECT, "not_worth_cost", "O bloqueio é de outra entrega.")])]]);
+    let st = consensus_state(&root, reviewer.clone(), architect);
+    assert_eq!(run(&st, &root).await, 1);
+    let rec = record(&root);
+    assert_eq!(rec.outcome.as_deref(), Some(OUTCOME_DISPUTED));
+    assert_eq!(internal_turns(&root).len(), 1);
+    assert_eq!(reviewer.requests().len(), 2);
+    assert!(rec.issues.iter().all(|i| i.disputed && i.kind == COMMAND_NOT_RUNNABLE) && rec.issues.len() == 1, "{:?}", rec.issues);
+    let _ = fs::remove_dir_all(&root);
+}

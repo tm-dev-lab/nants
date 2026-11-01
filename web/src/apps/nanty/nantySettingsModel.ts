@@ -1,13 +1,14 @@
 /*
  * Modelo puro da aba Ajustes do Nanty (spec 138 T11): o rascunho editável, o pedido com só o que
- * mudou (o servidor também só grava o que difere do padrão), a ordem da voz, o orçamento do dia e
+ * mudou (o servidor também só grava o que difere do padrão), o estado da voz, o orçamento do dia e
  * o tempo da janela de pareamento.
  *
  * Os números ficam como texto no rascunho (o que a pessoa digitou); o pedido só sai com todos
  * válidos, nas mesmas faixas do servidor (`server::nanty::settings`). O servidor segue a autoridade.
  */
+import type { ApiFailure, ApiResult } from "../../api/client";
 import type { ConnectionKind, ConnectionView, Effort } from "../../api/types";
-import type { NantyRole, NantyRoute, NantySettings, NantySettingsPatch, NantyVoiceRoute } from "./nantyApi";
+import type { NantyLanguage, NantyRole, NantyRoute, NantySettings, NantySettingsPatch, NantyVoiceOption, NantyVoices } from "./nantyApi";
 import { NANTY_ROLES } from "./nantyApi";
 
 /** Faixas do servidor (`server::nanty::settings`). */
@@ -16,7 +17,6 @@ export const NANTY_LIMITS = {
   budgetTokens: { min: 0, max: 100_000_000 },
   voiceInputSecs: { min: 5, max: 1800 },
   visibleHoldSecs: { min: 0, max: 3600 },
-  voiceSteps: 5,
 } as const;
 
 export type NantyNumberField = "daily_budget_usd" | "daily_budget_tokens" | "max_input_secs" | "visible_hold_secs";
@@ -31,12 +31,17 @@ export interface NantyDraft {
   quiet_end: string;
   digest_time: string;
   digest_empty: "short" | "skip";
+  /** Idioma próprio do Nanty (spec 139 T05). */
+  language: NantyLanguage;
   /** Projetos fora da observação. */
   excluded: string[];
   reserve: Record<NantyRole, NantyRoute>;
   voice_enabled: boolean;
-  voice_order: NantyVoiceRoute[];
-  transcribe: NantyRoute;
+  /** A conexão do Gemini da voz; vazia = automática. */
+  voice_connection_id: string;
+  speech_model: string;
+  voice_name: string;
+  transcribe_model: string;
   max_input_secs: string;
   hold_while_visible: boolean;
   visible_hold_secs: string;
@@ -57,11 +62,14 @@ export function draftOf(s: NantySettings): NantyDraft {
     quiet_end: s.quiet_end,
     digest_time: s.digest_time,
     digest_empty: s.digest_empty,
+    language: s.language,
     excluded: [...s.excluded_projects],
     reserve,
     voice_enabled: s.voice.enabled,
-    voice_order: s.voice.order.map((r) => ({ ...r })),
-    transcribe: { ...s.voice.transcribe },
+    voice_connection_id: s.voice.connection_id,
+    speech_model: s.voice.speech_model,
+    voice_name: s.voice.voice,
+    transcribe_model: s.voice.transcribe_model,
     max_input_secs: String(s.voice.max_input_secs),
     hold_while_visible: s.telegram.hold_while_visible,
     visible_hold_secs: String(s.telegram.visible_hold_secs),
@@ -89,8 +97,6 @@ export function invalidNumbers(d: NantyDraft): NantyNumberField[] {
 
 const sameRoute = (a: NantyRoute, b: NantyRoute): boolean => a.connection_id === b.connection_id && a.model.trim() === b.model.trim();
 const sameList = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
-const sameVoiceOrder = (a: readonly NantyVoiceRoute[], b: readonly NantyVoiceRoute[]): boolean =>
-  a.length === b.length && a.every((r, i) => b[i] !== undefined && sameRoute(r, b[i]) && r.voice === b[i].voice);
 const trimRoute = (r: NantyRoute): NantyRoute => ({ connection_id: r.connection_id, model: r.model.trim() });
 
 /**
@@ -112,6 +118,7 @@ export function settingsPatch(saved: NantySettings, d: NantyDraft): NantySetting
   if (d.quiet_end !== base.quiet_end) patch.quiet_end = d.quiet_end;
   if (d.digest_time !== base.digest_time) patch.digest_time = d.digest_time;
   if (d.digest_empty !== base.digest_empty) patch.digest_empty = d.digest_empty;
+  if (d.language !== base.language) patch.language = d.language;
   const excluded = [...d.excluded].sort();
   if (!sameList(excluded, [...base.excluded].sort())) patch.excluded_projects = excluded;
   if (NANTY_ROLES.some((role) => !sameRoute(d.reserve[role], base.reserve[role]))) {
@@ -121,8 +128,10 @@ export function settingsPatch(saved: NantySettings, d: NantyDraft): NantySetting
   }
   const voice: NonNullable<NantySettingsPatch["voice"]> = {};
   if (d.voice_enabled !== base.voice_enabled) voice.enabled = d.voice_enabled;
-  if (!sameVoiceOrder(d.voice_order, base.voice_order)) voice.order = d.voice_order.map((r) => ({ ...trimRoute(r), voice: r.voice }));
-  if (!sameRoute(d.transcribe, base.transcribe)) voice.transcribe = trimRoute(d.transcribe);
+  if (d.voice_connection_id !== base.voice_connection_id) voice.connection_id = d.voice_connection_id;
+  if (d.speech_model.trim() !== base.speech_model) voice.speech_model = d.speech_model.trim();
+  if (d.voice_name.trim() !== base.voice_name) voice.voice = d.voice_name.trim();
+  if (d.transcribe_model.trim() !== base.transcribe_model) voice.transcribe_model = d.transcribe_model.trim();
   const maxInput = Number(d.max_input_secs.trim());
   if (maxInput !== saved.voice.max_input_secs) voice.max_input_secs = maxInput;
   if (Object.keys(voice).length > 0) patch.voice = voice;
@@ -134,39 +143,58 @@ export function settingsPatch(saved: NantySettings, d: NantyDraft): NantySetting
   return patch;
 }
 
-/** Move o passo `index` da voz uma posição (`-1` sobe, `1` desce); fora da lista, igual. */
-export function moveStep<T>(list: readonly T[], index: number, delta: -1 | 1): T[] {
-  const to = index + delta;
-  if (index < 0 || index >= list.length || to < 0 || to >= list.length) return [...list];
-  const out = [...list];
-  const [item] = out.splice(index, 1);
-  if (item !== undefined) out.splice(to, 0, item);
-  return out;
-}
-
-/**
- * A conexão serve para a fala? Só o Google Gemini e as por chave (a fala da OpenAI): a mesma regra
- * do servidor (`voice::speaks`). Sem `kind` = por chave.
- */
-export function speaks(kind: ConnectionKind | undefined): boolean {
-  const k = kind ?? "api_key";
-  return k === "google_gemini" || k === "api_key";
-}
-
-/** A conexão serve para a transcrição? Só o Google Gemini (`voice::transcribes` do servidor). */
-export function transcribes(kind: ConnectionKind | undefined): boolean {
+/** A conexão serve para a voz? Só o Google Gemini, que fala e transcreve (`voice_capable` do servidor). */
+export function voiceCapable(kind: ConnectionKind | undefined): boolean {
   return kind === "google_gemini";
 }
 
 /**
- * O aviso de uma conexão gravada na voz: `gone` (não existe mais), `unusable` (o tipo não serve
- * para o caminho) ou `null` (vazia ou certa).
+ * O aviso da conexão gravada na voz: `gone` (não existe mais), `unusable` (não é do Gemini) ou
+ * `null` (vazia ou certa).
  */
-export function voiceWarning(id: string, connections: readonly ConnectionView[], usable: (kind: ConnectionKind | undefined) => boolean): "gone" | "unusable" | null {
+export function voiceWarning(id: string, connections: readonly ConnectionView[]): "gone" | "unusable" | null {
   if (id === "") return null;
   const conn = connections.find((c) => c.id === id);
   if (conn === undefined) return "gone";
-  return usable(conn.kind) ? null : "unusable";
+  return voiceCapable(conn.kind) ? null : "unusable";
+}
+
+/** A resposta de `GET /api/nanty/voices`, na forma do cartão Voz. */
+export type VoiceCheck =
+  | { status: "loading" }
+  | { status: "ready"; connection_id: string; voices: NantyVoiceOption[]; speech_models: { id: string }[] }
+  | { status: "no_key" }
+  | { status: "no_connection" }
+  /** A lista não veio: `connection_id` e `reason` (o código do motivo), quando o provedor é que falhou. */
+  | { status: "failed"; connection_id: string | null; reason: string | null; error: ApiFailure };
+
+export function voiceCheckOf(result: ApiResult<NantyVoices>): VoiceCheck {
+  if (result.ok) return { status: "ready", connection_id: result.data.connection_id, voices: result.data.voices, speech_models: result.data.speech_models };
+  const { error } = result;
+  if (error.code === "nanty_voice_no_key") return { status: "no_key" };
+  if (error.code === "nanty_voice_no_connection") return { status: "no_connection" };
+  const params = error.code === "nanty_voice_list_failed" ? error.params : undefined;
+  const textOf = (value: unknown): string | null => (typeof value === "string" ? value : null);
+  return { status: "failed", connection_id: textOf(params?.connection_id), reason: textOf(params?.reason), error };
+}
+
+export type VoiceState = "ready" | "no_key" | "key_refused" | "no_connection";
+
+/** O provedor recusou a chave: repetir não resolve, e toda fala cairia em texto. */
+export function keyRefused(check: VoiceCheck): boolean {
+  return check.status === "failed" && check.reason === "auth";
+}
+
+/**
+ * O estado que a tela mostra, sempre o do servidor. Uma falha passageira do provedor na lista não
+ * muda a regra (a conexão existe e tem chave), e por isso continua pronta; a chave recusada não está
+ * pronta; sem resposta do servidor, nada a afirmar.
+ */
+export function voiceState(check: VoiceCheck): VoiceState | null {
+  if (check.status === "loading") return null;
+  if (keyRefused(check)) return "key_refused";
+  if (check.status === "failed") return check.connection_id === null ? null : "ready";
+  return check.status;
 }
 
 /** Fração gasta do orçamento do dia (0 a 1), em US$ ou em tokens. */

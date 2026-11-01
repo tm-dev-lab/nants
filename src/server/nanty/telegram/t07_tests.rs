@@ -88,7 +88,7 @@ async fn card_goes_with_buttons_and_is_edited_after_the_click() {
     assert!(body.get("parse_mode").is_none(), "texto puro: {body}");
     assert_eq!(body["link_preview_options"]["is_disabled"], true);
     assert!(body.get("disable_notification").is_none(), "o push vai com som");
-    assert!(body["text"].as_str().is_some_and(|t| t.contains("Observador de atenção")), "{body}");
+    assert!(body["text"].as_str().is_some_and(|t| t.contains("Um plano espera a sua aprovação")), "{body}");
     let rows = body["reply_markup"]["inline_keyboard"].as_array().cloned().unwrap_or_default();
     let datas: Vec<String> = rows.iter().flat_map(|r| r.as_array().cloned().unwrap_or_default()).filter_map(|b| b["callback_data"].as_str().map(str::to_string)).collect();
     assert_eq!(datas, [callback_data(&id, &tok, Answer::Yes), callback_data(&id, &tok, Answer::No), callback_data(&id, &tok, Answer::Later)]);
@@ -111,7 +111,7 @@ async fn card_goes_with_buttons_and_is_edited_after_the_click() {
     let decided = w.state.nanty().snapshot().decided;
     let time = clock::local_time_at(decided[0].at_ms).map(|t| format!("{:02}:{:02}", t.hour, t.minute)).unwrap_or_default();
     let line = tr(Lang::PtBr, "nanty.telegram.decided.telegram", &[("answer", &pt("nanty.telegram.answer.no")), ("time", &time)]);
-    assert!(text.contains("Observador de atenção") && text.ends_with(&line), "{text}");
+    assert!(text.contains("Um plano espera a sua aprovação") && text.ends_with(&line), "{text}");
     until("registro fechado", || sent(&w, &id).is_none()).await;
     // Duplicado: "já decidido", sem outra edição.
     fake.push(click_on(102, OWNER, OWNER, 1, &callback_data(&id, &tok, Answer::Yes)));
@@ -131,8 +131,9 @@ async fn expired_resolved_and_unknown_cards() {
     let _out = start_outbox(&w);
     until("conectado", || w.health() == Health::Connected).await;
     live_after(&fake, 0).await;
-    let mut short = card("p1:plan_waiting", Delivery::Push, Some("approve_plan"));
-    short.expires_at_ms = clock::now_ms() + 400;
+    // O cartão vence por ordem do teste, depois de enviado: com um prazo real de centenas de ms, a
+    // máquina ocupada o vencia antes do envio (a fila não manda cartão vencido).
+    let short = card("p1:plan_waiting", Delivery::Push, Some("approve_plan"));
     let (short_id, short_tok) = (short.id.clone(), short.token.clone().unwrap_or_default());
     let resolved = card("p2:run_blocked", Delivery::Push, None);
     let resolved_id = resolved.id.clone();
@@ -145,7 +146,10 @@ async fn expired_resolved_and_unknown_cards() {
     let short_msg = sent(&w, &short_id).and_then(|r| r.message_id).unwrap_or_default();
 
     // Vencido: o clique responde que expirou e a mensagem vira "expirou".
-    tokio::time::sleep(Duration::from_millis(450)).await;
+    w.state.nanty().update(|st| {
+        st.cards.iter_mut().filter(|c| c.id == short_id).for_each(|c| c.expires_at_ms = 1);
+        true
+    });
     fake.push(click_on(200, OWNER, OWNER, short_msg, &callback_data(&short_id, &short_tok, Answer::Later)));
     until("resposta", || fake.calls("answerCallbackQuery").len() == 1).await;
     assert_eq!(fake.calls("answerCallbackQuery")[0].0["text"], json!(pt("nanty.outcome.expired")));

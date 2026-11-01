@@ -59,6 +59,13 @@ export function nantyBadgeCount(feed: NantyFeed | null, attention: Attention | n
   return feed.waiting.filter((card) => !coveredByAttention(card, attention)).length;
 }
 
+/** Os cartões que a conversa pode citar: os que esperam a pessoa e o botão de desligar o silêncio. */
+export function chatCards(feed: NantyFeed | null): NantyCard[] {
+  if (feed === null) return [];
+  const off = feed.silence?.card ?? null;
+  return off === null ? feed.waiting : [...feed.waiting, off];
+}
+
 /** Estado do avatar: o do servidor; sem leitura ainda, atento. */
 export function nantyMood(status: NantyStatus | null): NantyMood {
   return status?.avatar ?? "attentive";
@@ -176,6 +183,8 @@ export function feedSections(feed: NantyFeed | null, nowMs: number): FeedSection
 const EXECUTES: readonly string[] = ["approve_plan", "resume_run", "retry_provider", "swap_reserve", "clean_orphans", "pause_run"];
 /** Ações que só abrem o Nants: na janela, abrem a janela do projeto. */
 const LINKS: readonly string[] = ["open_nants", "raise_limit"];
+/** O silêncio da conversa (spec 139 T04): o botão da ação, sem "lembrar depois"; só a confirmação tem o "não". */
+const SILENCE: readonly string[] = ["set_silence", "end_silence"];
 
 export type CardChoice = NantyAnswer | "open";
 
@@ -192,6 +201,8 @@ const ACTION_KEYS: Readonly<Record<string, MessageKey>> = {
   clean_orphans: "nanty.action.clean_orphans",
   pause_run: "nanty.action.pause_run",
   remind_later: "nanty.action.remind_later",
+  set_silence: "nanty.action.set_silence",
+  end_silence: "nanty.action.end_silence",
   open_nants: "nanty.action.open_nants",
   raise_limit: "nanty.action.raise_limit",
   allow_command_always: "nanty.action.allow_command_always",
@@ -208,12 +219,18 @@ function actionLabel(action: string): string {
 /**
  * Os botões do cartão, os mesmos do Telegram: a ação oferecida (se a pessoa pode fazê-la por aqui),
  * "não" (com ação) e "lembrar depois". Sem token, nenhum. O link "abrir no Nants" abre a janela do
- * projeto; sem projeto, ele não aparece.
+ * projeto; sem projeto, ele não aparece. O silêncio da conversa (spec 139 T04) leva só a ação (e o
+ * "não", na confirmação).
  */
 export function cardButtons(card: NantyCard): CardButton[] {
   if (card.token === undefined) return [];
   const out: CardButton[] = [];
   const action = card.action;
+  if (action !== undefined && SILENCE.includes(action)) {
+    out.push({ choice: "yes", label: actionLabel(action) });
+    if (action === "set_silence") out.push({ choice: "no", label: t("nanty.feed.no") });
+    return out;
+  }
   if (action !== undefined) {
     if (EXECUTES.includes(action)) out.push({ choice: "yes", label: actionLabel(action) });
     else if (LINKS.includes(action) && card.project_id !== null) out.push({ choice: "open", label: actionLabel(action) });

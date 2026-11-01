@@ -232,6 +232,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/nanty/usage", get(nanty::api::get_usage))
         // Spec 138 T09: os áudios da conversa, só pelo id de uma mensagem que ainda está nela.
         .route("/api/nanty/audio/:id", get(nanty::voice::get_audio))
+        // Spec 139 T07: as vozes do Gemini para os Ajustes (cache curto em memória).
+        .route("/api/nanty/voices", get(nanty::voice::get_voices))
         // Nanty (spec 138 T03): decidir um cartão e desfazer, com as proteções das rotas que mudam algo.
         .route("/api/nanty/cards/:id/decide", post(nanty::api::post_decide))
         .route("/api/nanty/undo/:id", post(nanty::api::post_undo))

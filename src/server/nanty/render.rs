@@ -51,9 +51,9 @@ pub fn code_text(lang: Lang, code: &str, params: &Map<String, Value>) -> String 
     }
 }
 
-/// As linhas extras de uma mensagem (`params.lines`: cada uma `{code, params}`), no idioma.
-fn lines_text(lang: Lang, params: &Map<String, Value>) -> Vec<String> {
-    let Some(lines) = params.get("lines").and_then(Value::as_array) else { return Vec::new() };
+/// As linhas extras de uma mensagem (`params.<field>`: cada uma `{code, params}`), no idioma.
+fn lines_text(lang: Lang, params: &Map<String, Value>, field: &str) -> Vec<String> {
+    let Some(lines) = params.get(field).and_then(Value::as_array) else { return Vec::new() };
     lines
         .iter()
         .filter_map(|line| {
@@ -65,17 +65,59 @@ fn lines_text(lang: Lang, params: &Map<String, Value>) -> Vec<String> {
 }
 
 /// Texto de uma mensagem do Nanty para o Telegram: o texto fixo do dicionário, as linhas extras e o
-/// texto do modelo, como veio.
+/// texto do modelo, como veio. O idioma é o gravado na mensagem (`message.lang`, spec 139 T05);
+/// `lang` só vale para a mensagem sem idioma (as gravadas antes).
+///
+/// Spec 139 T06 (C-11): com o texto do modelo, as linhas extras (a lista fixa) não entram: o modelo
+/// já as contou. O texto fixo fica como a frase curta do servidor junto do texto do modelo (o porquê
+/// do resumo, a confirmação do silêncio), e o porquê dos avisos guardados (`params.why`, C-06 da
+/// 138) sai sempre, do dicionário.
+///
+/// Spec 139 T12: a fala do modelo vem primeiro, e a frase do servidor fecha a mensagem (do contrário,
+/// a conversa parece invertida: a confirmação antes da resposta). Só o título do resumo
+/// ([`super::digest::LEAD`]) abre o texto.
 pub fn message_text(lang: Lang, message: &ConversationMessage) -> String {
+    let text = model_text(message);
+    let fixed = fixed_parts(lang, message);
     let mut parts: Vec<String> = Vec::new();
-    if let Some(code) = &message.code {
-        parts.push(code_text(lang, code, &message.params));
-        parts.extend(lines_text(lang, &message.params));
-    }
-    if let Some(text) = message.text.as_deref().filter(|t| !t.trim().is_empty()) {
-        parts.push(text.to_string());
+    match text {
+        Some(text) if closes(message) => {
+            parts.push(text.to_string());
+            parts.extend(fixed);
+        }
+        Some(text) => {
+            parts.extend(fixed);
+            parts.push(text.to_string());
+        }
+        None => parts.extend(fixed),
     }
     parts.join("\n")
+}
+
+fn model_text(message: &ConversationMessage) -> Option<&str> {
+    message.text.as_deref().filter(|t| !t.trim().is_empty())
+}
+
+/// A frase do servidor fecha a mensagem: há texto do modelo antes dela, e ela não é título.
+fn closes(message: &ConversationMessage) -> bool {
+    model_text(message).is_some() && message.code.as_deref().is_some_and(|code| code != super::digest::LEAD)
+}
+
+/// O texto fixo da mensagem, no idioma gravado nela.
+fn fixed_parts(lang: Lang, message: &ConversationMessage) -> Vec<String> {
+    let lang = super::language::tagged(message.lang.as_deref()).unwrap_or(lang);
+    let Some(code) = &message.code else { return Vec::new() };
+    let mut parts = vec![code_text(lang, code, &message.params)];
+    if model_text(message).is_none() {
+        parts.extend(lines_text(lang, &message.params, "lines"));
+    }
+    parts.extend(lines_text(lang, &message.params, super::digest::WHY));
+    parts
+}
+
+/// A frase do servidor que fecha a mensagem, quando há: o corte da legenda e da fala a preserva.
+pub fn closing(lang: Lang, message: &ConversationMessage) -> Option<String> {
+    closes(message).then(|| fixed_parts(lang, message).join("\n"))
 }
 
 /// Texto do porquê de um cartão para o Telegram (o texto fixo do observador, C-06).

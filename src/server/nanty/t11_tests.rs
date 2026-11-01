@@ -95,7 +95,7 @@ async fn put_config_changes_only_what_was_sent_and_writes_only_what_differs() {
         Method::PUT,
         "/api/nanty/config",
         Some(json!({
-            "voice": {"enabled": true, "order": [{"connection_id": "c2"}], "transcribe": {"connection_id": "c1", "model": "m-t"}},
+            "voice": {"enabled": true, "connection_id": "c1", "voice": "Puck", "transcribe_model": "m-t"},
             "telegram": {"hold_while_visible": false},
             "reserve": {"developer": {"connection_id": "c2", "model": "m-r"}, "reviewer": {"connection_id": "", "model": ""}},
             "excluded_projects": ["p2", "p2", "p3"],
@@ -105,8 +105,15 @@ async fn put_config_changes_only_what_was_sent_and_writes_only_what_differs() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["voice"]["enabled"], true);
-    assert_eq!(body["voice"]["order"][0]["connection_id"], "c2");
+    assert_eq!((body["voice"]["connection_id"].as_str(), body["voice"]["voice"].as_str()), (Some("c1"), Some("Puck")));
+    assert_eq!(body["voice"]["speech_model"], crate::config::DEFAULT_GEMINI_TTS_MODEL, "o inicial, sem gravar");
+    assert_eq!(body["voice"]["transcribe_model"], "m-t");
+    // Spec 139 T09: a forma antiga saiu da resposta.
+    assert!(body["voice"].get("order").is_none() && body["voice"].get("transcribe").is_none(), "{body}");
     assert_eq!(body["voice"]["max_input_secs"], 300, "o que não veio fica");
+    let file = saved(&data);
+    let voice = file.split("[nanty.voice]").nth(1).expect("voz");
+    assert!(!voice.contains("speech_model") && !voice.contains("order") && voice.contains("voice = \"Puck\""), "{file}");
     assert_eq!((body["telegram"]["hold_while_visible"].as_bool(), body["telegram"]["visible_hold_secs"].as_u64()), (Some(false), Some(180)));
     assert_eq!(body["reserve"]["developer"]["model"], "m-r");
     assert!(body["reserve"].get("reviewer").is_none(), "conexão vazia = sem reserva");
@@ -138,13 +145,14 @@ async fn invalid_values_come_back_coded_and_change_nothing() {
         (json!({"connection_id": "nao-existe"}), "connection_id"),
         (json!({"reserve": {"chefe": {"connection_id": "c1", "model": "m"}}}), "reserve"),
         (json!({"reserve": {"developer": {"connection_id": "c1", "model": " "}}}), "reserve.developer"),
-        (json!({"voice": {"order": [{"connection_id": "nao-existe"}]}}), "voice.order"),
         (json!({"voice": {"max_input_secs": 2}}), "voice.max_input_secs"),
-        // A conexão de um tipo que o caminho não usa (as regras de `voice::speaks` e `transcribes`).
-        (json!({"voice": {"transcribe": {"connection_id": "c2", "model": ""}}}), "voice.transcribe"),
-        (json!({"voice": {"transcribe": {"connection_id": "c3", "model": ""}}}), "voice.transcribe"),
-        (json!({"voice": {"order": [{"connection_id": "c3"}]}}), "voice.order"),
-        (json!({"voice": {"order": [{"connection_id": "c1"}, {"connection_id": "c3"}]}}), "voice.order"),
+        // Spec 139 T07: só o Gemini fala e transcreve (as regras de `voice::speaks` e `transcribes`).
+        (json!({"voice": {"connection_id": "c2"}}), "voice.connection_id"),
+        (json!({"voice": {"connection_id": "c3"}}), "voice.connection_id"),
+        (json!({"voice": {"connection_id": "nao-existe"}}), "voice.connection_id"),
+        (json!({"voice": {"voice": "../x"}}), "voice.voice"),
+        (json!({"voice": {"speech_model": "a b"}}), "voice.speech_model"),
+        (json!({"voice": {"transcribe_model": "m?x"}}), "voice.transcribe_model"),
         (json!({"telegram": {"visible_hold_secs": 99_999}}), "telegram.visible_hold_secs"),
         (json!({"excluded_projects": ["../x"]}), "excluded_projects"),
     ];
@@ -273,4 +281,55 @@ async fn paired_uses_the_chat_and_the_owner_everywhere() {
         }
         let _ = std::fs::remove_dir_all(&data);
     }
+}
+
+/// Spec 139 T05 (C-13): o idioma próprio do Nanty passa pelo `PUT`, validado; `follow` é o padrão e
+/// não vai para o arquivo; o idioma da interface lembrado (`lang`) continua fora do `PUT`.
+#[tokio::test]
+async fn the_nanty_language_goes_through_put_and_is_written_only_when_not_the_default() {
+    let data = dir("language");
+    let st = state(&data, |c| c.nanty.lang = Some("pt-BR".into()));
+    let (status, body) = call(&st, Method::GET, "/api/nanty/config", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((body["language"].as_str(), body["lang"].as_str()), (Some("follow"), Some("pt-BR")), "padrão: seguir a conversa");
+    let (status, body) = call(&st, Method::PUT, "/api/nanty/config", Some(json!({"language": "en"}))).await;
+    assert_eq!((status, body["language"].as_str()), (StatusCode::OK, Some("en")), "{body}");
+    assert_eq!(body["lang"], "pt-BR", "a interface lembrada não muda");
+    let section = saved(&data).split("[nanty]").nth(1).map(str::to_string).unwrap_or_default();
+    assert!(section.contains("language = \"en\""), "{section}");
+    for bad in ["fr", "", "EN", "pt"] {
+        let (status, resp) = call(&st, Method::PUT, "/api/nanty/config", Some(json!({"language": bad}))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        assert_eq!((resp["code"].as_str(), resp["params"]["field"].as_str()), (Some("nanty_config_invalid"), Some("language")), "{bad}");
+    }
+    let (status, body) = call(&st, Method::PUT, "/api/nanty/config", Some(json!({"language": "follow"}))).await;
+    assert_eq!((status, body["language"].as_str()), (StatusCode::OK, Some("follow")));
+    let section = saved(&data).split("[nanty]").nth(1).map(str::to_string).unwrap_or_default();
+    assert!(!section.contains("language ="), "o padrão sai do arquivo: {section}");
+    assert_eq!(st.config().read().await.nanty.lang.as_deref(), Some("pt-BR"));
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Spec 139 T09: `order` e `transcribe` saíram do `PUT`, como campos desconhecidos; a forma nova
+/// troca a conexão e volta à automática e ao inicial com vazio.
+#[tokio::test]
+async fn the_old_voice_form_is_refused_and_empty_goes_back_to_the_defaults() {
+    let data = dir("voice-old");
+    let st = state(&data, |cfg| {
+        cfg.connections.push(Connection { kind: ConnectionKind::GoogleGemini, ..connection("c4") });
+    });
+    let put = |body: Value| call(&st, Method::PUT, "/api/nanty/config", Some(body));
+    for body in [json!({"voice": {"order": [{"connection_id": "c1"}]}}), json!({"voice": {"transcribe": {"connection_id": "c1", "model": ""}}})] {
+        let (status, resp) = put(body.clone()).await;
+        assert_eq!((status, resp["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("json_invalid_fields")), "{body}");
+    }
+    assert!(st.config().read().await.nanty.voice.is_default());
+    let (status, body) = put(json!({"voice": {"connection_id": "c4", "speech_model": "gemini-3.8-flash-lite-tts", "transcribe_model": "m-t"}})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = st.config().read().await.nanty.voice.clone();
+    assert_eq!((v.connection_id.as_str(), v.speech_model.as_str(), v.transcribe_model.as_str()), ("c4", "gemini-3.8-flash-lite-tts", "m-t"));
+    let (status, _) = put(json!({"voice": {"connection_id": "", "speech_model": "", "voice": "", "transcribe_model": ""}})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(st.config().read().await.nanty.voice.is_default(), "tudo de volta ao inicial");
+    let _ = std::fs::remove_dir_all(&data);
 }

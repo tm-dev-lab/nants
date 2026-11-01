@@ -1092,10 +1092,6 @@
   border: 1px solid var(--muted);
 }
 
-.nd-nmenu-indicator[data-indicator="focused"] {
-  width: 12px;
-}
-
 .nd-nmenu-empty {
   margin: 0;
   padding: var(--sp-4) var(--sp-1);

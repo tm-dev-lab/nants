@@ -18,6 +18,7 @@
 import { request, type ApiFailure, type ApiResult } from "../../api/client";
 import { parseCodeParams, isMessageCode, type CodeParams, type Coded } from "../../api/codes";
 import { ptBR } from "../../i18n/ptBR";
+import { isLang, type Lang } from "../../i18n/lang";
 import type { Effort } from "../../api/types";
 import type { NantyMood } from "./NantyAvatar";
 
@@ -111,8 +112,16 @@ export interface NantyPlanned {
   at_ms: number;
 }
 
+/** O silêncio de tudo ligado (spec 139 T04): o fim (`HH:MM`) e o cartão com o botão de desligar. */
+interface NantySilence {
+  until: string;
+  card: NantyCard | null;
+}
+
 export interface NantyFeed {
+  /** Os cartões que esperam a pessoa (o botão de desligar o silêncio fica fora: é um controle). */
   waiting: NantyCard[];
+  silence?: NantySilence | null;
   done?: NantyDone[];
   planned?: NantyPlanned[];
   today: { spend_usd: number; budget_usd: number };
@@ -139,6 +148,13 @@ export interface NantyMessage {
   params: CodeParams;
   /** Linhas extras (`params.lines`), cada uma com o seu código. */
   lines: Coded[];
+  /**
+   * O porquê dos avisos guardados no resumo (`params.why`, spec 139 T06): sai sempre, com ou sem
+   * o texto do modelo (C-06 da 138).
+   */
+  why: Coded[];
+  /** Idioma da mensagem (spec 139 T05): o texto fixo é montado nele; `null` nas gravadas antes. */
+  lang: Lang | null;
   card_ids: string[];
   /** A pessoa falou por nota de voz: o `text` é a transcrição. */
   voice: boolean;
@@ -280,21 +296,32 @@ function list<T>(value: unknown, parse: (v: unknown) => T | null): T[] {
   return Array.isArray(value) ? value.map(parse).filter((v): v is T => v !== null) : [];
 }
 
+function parseSilence(value: unknown): NantySilence | null {
+  if (!isRecord(value)) return null;
+  const until = str(value.until, 8);
+  if (until === null) return null;
+  return { until, card: parseCard(value.card) };
+}
+
 export function parseNantyFeed(value: unknown): NantyFeed | null {
   if (!isRecord(value) || !Array.isArray(value.waiting)) return null;
   const today = isRecord(value.today) ? value.today : {};
   const spend = isRecord(today.spend) ? num(today.spend.usd) : null;
+  const silence = parseSilence(value.silence);
   return {
     waiting: list(value.waiting, parseCard),
+    ...(silence === null ? {} : { silence }),
     done: list(value.done, parseDone),
     planned: list(value.planned, parsePlanned),
     today: { spend_usd: spend ?? 0, budget_usd: num(today.budget_usd) ?? 0 },
   };
 }
 
-function parseLines(value: unknown): Coded[] {
-  if (!isRecord(value) || !Array.isArray(value.lines)) return [];
-  return value.lines.flatMap((line: unknown) => (isRecord(line) && isMessageCode(line.code) ? [{ code: line.code, params: params(line.params) }] : []));
+function parseLines(value: unknown, field: "lines" | "why" = "lines"): Coded[] {
+  if (!isRecord(value)) return [];
+  const list = value[field];
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((line: unknown) => (isRecord(line) && isMessageCode(line.code) ? [{ code: line.code, params: params(line.params) }] : []));
 }
 
 function parseAudio(value: unknown): NantyAudio | null {
@@ -322,6 +349,8 @@ function parseMessage(value: unknown): NantyMessage | null {
     code,
     params: params(value.params),
     lines: parseLines(value.params),
+    why: parseLines(value.params, "why"),
+    lang: isLang(value.lang) ? value.lang : null,
     card_ids: Array.isArray(value.card_ids) ? value.card_ids.filter((c): c is string => str(c, 64) !== null) : [],
     voice: value.voice === true,
     audio: parseAudio(value.audio),
@@ -439,15 +468,28 @@ export interface NantyRoute {
   model: string;
 }
 
-export interface NantyVoiceRoute extends NantyRoute {
-  voice: string;
-}
-
+/** A voz (spec 139 T07 e T09): uma conexão do Gemini (vazia = automática), para falar e transcrever. */
 interface NantyVoiceSettings {
   enabled: boolean;
-  order: NantyVoiceRoute[];
-  transcribe: NantyRoute;
+  connection_id: string;
+  speech_model: string;
+  voice: string;
+  transcribe_model: string;
   max_input_secs: number;
+}
+
+/** Uma voz da lista do Gemini: `id` é o que se grava; `name` é o rótulo do combobox. */
+export interface NantyVoiceOption {
+  id: string;
+  name: string;
+}
+
+/** `GET /api/nanty/voices`: a conexão que respondeu (a automática já resolvida) e as vozes. */
+export interface NantyVoices {
+  connection_id: string;
+  voices: NantyVoiceOption[];
+  /** Os modelos de fala: a lista de modelos da conexão é só de texto. */
+  speech_models: { id: string }[];
 }
 
 /** A configuração do Nanty (`GET /api/nanty/config`), sem o token (só o canal o mostra, mascarado). */
@@ -463,12 +505,24 @@ export interface NantySettings {
   quiet_end: string;
   digest_time: string;
   digest_empty: "short" | "skip";
-  lang: "pt-BR" | "en";
+  /** Idioma da interface lembrado: o de "seguir a conversa" sem histórico. */
+  lang: Lang;
+  /** Idioma próprio do Nanty para os avisos e o resumo (spec 139 T05). */
+  language: NantyLanguage;
   excluded_projects: string[];
   catalog: NantyCatalogEntry[];
   reserve: Partial<Record<NantyRole, NantyRoute>>;
   voice: NantyVoiceSettings;
   telegram: { paired: boolean; hold_while_visible: boolean; visible_hold_secs: number };
+}
+
+/** O idioma próprio do Nanty: seguir a conversa (o padrão), português ou inglês. */
+export type NantyLanguage = "follow" | Lang;
+
+export const NANTY_LANGUAGES: readonly NantyLanguage[] = ["follow", "pt-BR", "en"];
+
+function isNantyLanguage(value: unknown): value is NantyLanguage {
+  return typeof value === "string" && (NANTY_LANGUAGES as readonly string[]).includes(value);
 }
 
 /** O pedido de `PUT /api/nanty/config`: só o que mudou. */
@@ -482,6 +536,7 @@ export interface NantySettingsPatch {
   quiet_end?: string;
   digest_time?: string;
   digest_empty?: "short" | "skip";
+  language?: NantyLanguage;
   excluded_projects?: string[];
   reserve?: Partial<Record<NantyRole, NantyRoute>>;
   voice?: Partial<NantyVoiceSettings>;
@@ -523,10 +578,26 @@ function parseRoute(value: unknown): NantyRoute | null {
   return { connection_id: plain(value.connection_id, 64), model: plain(value.model) };
 }
 
-function parseVoiceRoute(value: unknown): NantyVoiceRoute | null {
-  const route = parseRoute(value);
-  if (route === null || route.connection_id === "" || !isRecord(value)) return null;
-  return { ...route, voice: plain(value.voice) };
+/** A descrição só entra no rótulo se é curta: o provedor manda até 500 caracteres. */
+const VOICE_NOTE_MAX = 40;
+
+function parseVoiceOption(value: unknown): NantyVoiceOption | null {
+  if (!isRecord(value)) return null;
+  const id = str(value.id, 128);
+  if (id === null) return null;
+  const description = plain(value.description, VOICE_NOTE_MAX);
+  const notes = [plain(value.language_code, 32), description].filter((note) => note !== "");
+  const title = plain(value.display_name) || id;
+  return { id, name: notes.length > 0 ? `${title} (${notes.join(", ")})` : title };
+}
+
+export function parseNantyVoices(value: unknown): NantyVoices | null {
+  if (!isRecord(value)) return null;
+  const seen = new Set<string>();
+  const voices = list(value.voices, parseVoiceOption).filter((voice) => !seen.has(voice.id) && seen.add(voice.id).size > 0);
+  const speech = Array.isArray(value.speech_models) ? value.speech_models : [];
+  const speech_models = speech.map((model) => plain(model)).filter((id) => id !== "").map((id) => ({ id }));
+  return { connection_id: plain(value.connection_id, 64), voices, speech_models };
 }
 
 function parseCatalogEntry(value: unknown): NantyCatalogEntry | null {
@@ -566,13 +637,16 @@ export function parseNantySettings(value: unknown): NantySettings | null {
     digest_time: digest,
     digest_empty: value.digest_empty === "skip" ? "skip" : "short",
     lang: value.lang === "en" ? "en" : "pt-BR",
+    language: isNantyLanguage(value.language) ? value.language : "follow",
     excluded_projects: Array.isArray(value.excluded_projects) ? value.excluded_projects.filter((p): p is string => str(p, 64) !== null) : [],
     catalog: list(value.catalog, parseCatalogEntry),
     reserve,
     voice: {
       enabled: voice.enabled === true,
-      order: list(voice.order, parseVoiceRoute),
-      transcribe: parseRoute(voice.transcribe) ?? { connection_id: "", model: "" },
+      connection_id: plain(voice.connection_id, 64),
+      speech_model: plain(voice.speech_model),
+      voice: plain(voice.voice),
+      transcribe_model: plain(voice.transcribe_model),
       max_input_secs: count(voice.max_input_secs),
     },
     telegram: {
@@ -629,6 +703,14 @@ export function putNantyLevel(id: string, level: NantyLevel): Promise<ApiResult<
   return request<unknown>({ method: "PUT", path: `/api/nanty/actions/${encodeURIComponent(id)}`, body: JSON.stringify({ level }) }).then(
     parsed(parseNantySettings),
   );
+}
+
+/**
+ * As vozes e o estado da voz da conexão do rascunho. O parâmetro vai sempre: vazio é a automática;
+ * sem ele, o servidor responderia pela conexão gravada.
+ */
+export function getNantyVoices(connectionId: string): Promise<ApiResult<NantyVoices>> {
+  return request<unknown>({ method: "GET", path: `/api/nanty/voices?connection_id=${encodeURIComponent(connectionId)}` }).then(parsed(parseNantyVoices));
 }
 
 export function getNantyTelegram(): Promise<ApiResult<NantyTelegram>> {

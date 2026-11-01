@@ -433,7 +433,7 @@ async fn budget_runs_out_and_notices_keep_the_fixed_text_without_model() {
     let disk = w.nanty().snapshot().cards.into_iter().find(|c| c.group == "*:disk_low").expect("aviso de disco");
     assert_eq!(disk.code, "nanty.why.disk_low");
     let text = render::card_text(Lang::PtBr, &disk);
-    assert!(text.starts_with("Observador de disco") && text.contains("5 GB"), "{text}");
+    assert!(text.starts_with("O espaço livre em disco") && text.contains("5 GB"), "{text}");
     assert_eq!(w.nanty().conversation().len(), 1, "só o resumo do primeiro turno");
 
     // Outro dia: o orçamento volta, e o dia anterior vai para o histórico.
@@ -515,7 +515,7 @@ async fn model_text_is_recorded_as_it_came_with_the_language_and_the_prompt_asks
     assert!(message.code.is_none(), "o texto do modelo não vira código");
     // O cartão guarda o código e os parâmetros; o Telegram monta o texto no idioma, na hora.
     assert_eq!(card.params["since"], json!("12:00"));
-    assert_eq!(render::card_text(Lang::En, &card), "Attention observer: a plan has been waiting for your approval since 12:00.");
+    assert_eq!(render::card_text(Lang::En, &card), "A plan has been waiting for your approval since 12:00.");
     assert_eq!(render::message_text(Lang::PtBr, message), "A plan is waiting for your approval.");
 }
 
@@ -545,15 +545,20 @@ fn telegram_text_is_built_from_code_and_params_in_each_language() {
     assert!(message.text.is_none() && message.lang.is_none());
     let pt = render::message_text(Lang::PtBr, &message);
     let en = render::message_text(Lang::En, &message);
+    // Spec 139 T06: uma frase por fato, sem os zeros (nada pausado não vira "Pausados: 0").
     assert_eq!(
         pt,
-        "Bom dia. Projetos observados: 1.234. Em andamento: 1. Pausados: 0. Esperando você: 2. Avisos guardados: 1.\n\
-         Custo dos projetos ontem: US$ 1,50, com 25.000 tokens no total.\n\
-         Menor espaço livre em disco: 40 GB.\n\
-         Observador de custo: 1 tarefa passou do patamar de custo, visto às 03:10."
+        "Bom dia. Aqui vai como estão os projetos.\n\
+         1 projeto está rodando.\n\
+         2 avisos esperam a sua decisão.\n\
+         Ontem os projetos gastaram US$ 1,50, em 25.000 tokens no total.\n\
+         O disco com menos espaço está com 40 GB livres.\n\
+         Guardei 1 aviso para este resumo:\n\
+         1 tarefa passou do patamar de custo; percebi às 03:10."
     );
-    assert!(en.starts_with("Good morning. Projects watched: 1,234.") && en.contains("US$ 1.50, with 25,000 tokens"), "{en}");
-    assert!(en.ends_with("1 task went over the cost threshold, seen at 03:10."), "{en}");
+    assert!(en.starts_with("Good morning. Here is how the projects are doing.\n1 project is running.") && en.contains("US$ 1.50, using 25,000 tokens"), "{en}");
+    assert!(en.ends_with("1 task went over the cost threshold; I noticed at 03:10."), "{en}");
+    assert!(!pt.contains(": 0") && !pt.contains(" 0 ") && !en.contains(": 0"), "nenhum zero");
 }
 
 // ---- Resumo da manhã ----
@@ -581,7 +586,7 @@ fn empty_day_is_short_or_silent_by_config() {
     let short = digest::compose(&facts, &crate::config::NantyConfig::default(), "m".into(), 1).expect("curta");
     assert_eq!(short.code.as_deref(), Some(digest::QUIET));
     assert_eq!(short.params, json!({"projects": 3}).as_object().cloned().unwrap_or_default());
-    assert_eq!(render::message_text(Lang::PtBr, &short), "Bom dia. Nada pede a sua atenção agora. Projetos observados: 3.");
+    assert_eq!(render::message_text(Lang::PtBr, &short), "Bom dia. Está tudo tranquilo: nada pede a sua atenção agora.");
     let skip = crate::config::NantyConfig { digest_empty: DigestEmpty::Skip, ..Default::default() };
     assert!(digest::compose(&facts, &skip, "m".into(), 1).is_none());
     // Custo sozinho não é destaque; pausado, esperando, aviso guardado ou disco baixo são.
@@ -634,15 +639,31 @@ async fn morning_digest_is_built_from_facts_with_the_model_only_when_there_is_so
     assert!(snap.digest.is_empty(), "os avisos guardados entraram no resumo");
     let messages = w.nanty().conversation();
     let message = messages.last().expect("resumo");
-    assert_eq!(message.code.as_deref(), Some(digest::MORNING));
-    assert_eq!((message.params["projects"].as_u64(), message.params["waiting"].as_u64(), message.params["items"].as_u64()), (Some(1), Some(1), Some(1)));
-    let lines = message.params["lines"].as_array().expect("linhas");
-    // Ontem: 100.000 × 10 + 10.000 × 20 por milhão = US$ 1,20; o modelo sem preço conta só tokens.
-    assert_eq!(lines[0]["code"], "nanty.digest.cost_partial");
-    assert_eq!(lines[0]["params"]["cost_usd"], json!(1.2));
-    assert_eq!(lines[0]["params"]["tokens"], json!(110_500));
-    assert_eq!(lines[1]["code"], "nanty.why.task_delivered");
+    // Spec 139 T06 (C-11): com o texto do modelo, as linhas de contagem, custo e disco saem; ficam a
+    // frase curta do servidor e o porquê de cada aviso guardado, do dicionário (C-06 da 138), junto
+    // do texto dele.
+    assert_eq!(message.code.as_deref(), Some(digest::LEAD));
+    assert!(message.params.get("lines").is_none(), "{:?}", message.params);
+    let why = message.params[digest::WHY].as_array().expect("o porquê dos avisos guardados");
+    assert_eq!((why[0]["code"].as_str(), why[0]["params"]["count"].as_u64()), (Some("nanty.digest.held"), Some(1)));
+    assert_eq!(why[1]["code"], "nanty.why.task_delivered");
     assert_eq!(message.text.as_deref(), Some("O disco está baixo e um plano espera você."));
+    assert_eq!(
+        render::message_text(Lang::PtBr, message),
+        "Resumo da manhã.\nGuardei 1 aviso para este resumo:\nUma tarefa foi entregue às 02:00.\nO disco está baixo e um plano espera você."
+    );
+    assert_eq!(
+        render::message_text(Lang::En, &crate::server::nanty::store::ConversationMessage { lang: None, ..message.clone() }),
+        "Morning summary.\nI saved 1 notice for this summary:\nA task was delivered at 02:00.\nO disco está baixo e um plano espera você."
+    );
+    // A reserva (sem o modelo) é montada dos mesmos fatos. Ontem: 100.000 × 10 + 10.000 × 20 por
+    // milhão = US$ 1,20; o modelo sem preço conta só tokens.
+    let facts = digest::gather(&w.state, &w.nanty(), &w.nanty().now()).await;
+    let reserve = digest::compose(&facts, &crate::config::NantyConfig::default(), "r".into(), 1).expect("reserva");
+    let lines = reserve.params["lines"].as_array().expect("linhas");
+    let cost = lines.iter().find(|l| l["code"] == "nanty.digest.cost_partial").expect("custo");
+    assert_eq!(cost["params"]["cost_usd"], json!(1.2));
+    assert_eq!(cost["params"]["tokens"], json!(110_500));
     assert_eq!((message.lang.as_deref(), message.actions.as_slice()), (Some("pt-BR"), ["open_nants".to_string()].as_slice()));
 
     // A entrada do modelo do resumo também é só estruturada.

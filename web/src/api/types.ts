@@ -455,7 +455,7 @@ export interface PlanIssue {
   /** Id estável do ponto na spec (`P1`, spec 128); ausente nos registros antigos. */
   id?: string;
   task: string | null;
-  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "too_large" | "mentioned_unused" | string;
+  kind: "contradiction" | "untestable" | "scope" | "uncovered_criterion" | "missing_dependency" | "infeasible_test_command" | "too_large" | "mentioned_unused" | "command_not_runnable" | string;
   text: string;
   /** Repete um ponto recusado pelo Arquiteto sem argumento novo (spec 128). */
   disputed?: boolean;

@@ -2866,7 +2866,7 @@ fn history_call_ids(history: &[ChatMessage]) -> HashSet<String> {
 
 /// Substitui `tool_call_id` vazio por `nants-synth-<n>`, com `n` do contador monotônico da execução
 /// e sem colidir com ids já existentes (histórico ou a própria resposta).
-fn assign_missing_call_ids(message: &mut ChatMessage, history: &[ChatMessage], seq: &mut usize) {
+pub(crate) fn assign_missing_call_ids(message: &mut ChatMessage, history: &[ChatMessage], seq: &mut usize) {
     if message.tool_calls.iter().all(|c| !c.id.trim().is_empty()) {
         return;
     }
@@ -2889,7 +2889,7 @@ fn assign_missing_call_ids(message: &mut ChatMessage, history: &[ChatMessage], s
 
 /// Garante que cada id de chamada da resposta é único no histórico inteiro e na própria resposta.
 /// Falha antes de executar qualquer ferramenta da resposta.
-fn check_call_ids(message: &ChatMessage, history: &[ChatMessage]) -> Result<(), String> {
+pub(crate) fn check_call_ids(message: &ChatMessage, history: &[ChatMessage]) -> Result<(), String> {
     let mut seen = history_call_ids(history);
     for call in &message.tool_calls {
         if !seen.insert(call.id.clone()) {

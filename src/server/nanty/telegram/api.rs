@@ -211,7 +211,7 @@ pub async fn post_test(State(state): State<AppState>) -> Result<Json<Value>, Api
         return Err(coded(StatusCode::CONFLICT, "nanty_telegram_not_paired"));
     };
     let client = TelegramClient::new(state.telegram_api(), token, Duration::ZERO).map_err(send_error)?;
-    let text = tr(nanty_lang(&cfg), "nanty.telegram.test", &[]);
+    let text = tr(nanty_lang(&cfg, state.nanty()), "nanty.telegram.test", &[]);
     client.send_message(chat_id, &text).await.map_err(send_error)?;
     Ok(view_json(&state).await)
 }

@@ -85,7 +85,7 @@ describe("feed do Nanty", () => {
     expect(plan.querySelector("h4")?.textContent).toBe("Plano esperando a sua aprovação");
     // C-18: só contagens e códigos (o projeto pelo nome cadastrado, a spec e a idade).
     expect(plan.querySelector("[data-nanty-facts]")?.textContent).toBe("Loja · Spec s1 · há 3 h");
-    expect(plan.querySelector("[data-nanty-why]")?.textContent).toBe("Observador de atenção: um plano espera a sua aprovação desde 14:02.");
+    expect(plan.querySelector("[data-nanty-why]")?.textContent).toBe("Um plano espera a sua aprovação desde 14:02.");
     const buttons = within(plan).getAllByRole("button").map((b) => b.textContent);
     expect(buttons).toEqual(["Aprovar o plano", "Não", "Lembrar depois"]);
     // Só a ação do primeiro cartão é a primária da janela.
@@ -126,6 +126,37 @@ describe("feed do Nanty", () => {
     expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Feito.");
     expect(win.querySelector("[data-nanty-notice]")?.getAttribute("data-tone")).toBe("ok");
     expect(view.server.count("GET", /^\/api\/nanty\/feed$/)).toBeGreaterThan(feedReads);
+  });
+
+  it("spec 139 T04: o silêncio ligado é uma linha no topo, com o botão de desligar, fora de Esperando você", async () => {
+    const off = {
+      id: "dddddddddddddddd",
+      project_id: null,
+      group: "*:end_silence",
+      code: "nanty.card.end_silence",
+      params: { until: "15:30" },
+      action: "end_silence",
+      token: "tok-off",
+      created_at_ms: NOW,
+      expires_at_ms: NOW + 3600_000,
+    };
+    const { view, win } = await open({ ...NANTY_EMPTY_FEED, waiting: [], silence: { until_ms: NOW + 3600_000, until: "15:30", card: off } });
+    expect(win.querySelector('[data-nanty-section="waiting"]')).toBeNull();
+    const line = win.querySelector<HTMLElement>("[data-nanty-silence]") as HTMLElement;
+    expect(line.textContent).toContain("Avisos em silêncio até 15:30. O urgente continua chegando, sem som.");
+    expect(within(line).getAllByRole("button").map((b) => b.textContent)).toEqual(["Desligar o silêncio"]);
+    const posted: unknown[] = [];
+    view.server.reply("POST", /^\/api\/nanty\/cards\/dddddddddddddddd\/decide$/, (body) => {
+      posted.push(body);
+      return { status: 200, body: { outcome: "silence_ended", code: "nanty.outcome.silence_ended", params: {} } };
+    });
+    await act(async () => {
+      fireEvent.click(within(line).getByRole("button", { name: "Desligar o silêncio" }));
+    });
+    await settle();
+    expect(posted).toEqual([{ token: "tok-off", answer: "yes" }]);
+    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Silêncio desligado: os avisos voltam a sair.");
+    expect(win.querySelector("[data-nanty-notice]")?.getAttribute("data-tone")).toBe("ok");
   });
 
   it("cartão vencido e token trocado: o texto do código, sem quebrar a janela", async () => {

@@ -36,8 +36,19 @@ function nantyWindow(): HTMLElement {
   return win;
 }
 
-async function open(tab: "Regras" | "Ajustes", extra: RenderShellOptions["nanty"] = {}) {
-  const view = await renderShell({ ...SPACE, nanty: { config: NANTY_CONFIG, telegram: NANTY_TELEGRAM, ...extra } });
+type ShellView = Awaited<ReturnType<typeof renderShell>>;
+
+/** A lista de modelos da conexão, para os combobox: uma rota, antes de abrir a janela. */
+function modelsReply(view: ShellView): void {
+  view.server.reply("GET", /^\/api\/config\/connections\/[^/]+\/models/, () => ({
+    status: 200,
+    body: { models: [{ id: "gemini-3.8-flash" }, { id: "gemini-3.8-flash-tts" }, { id: "gemini-3.8-flash-lite-tts" }], truncated: false },
+  }));
+}
+
+async function open(tab: "Regras" | "Ajustes", extra: RenderShellOptions["nanty"] = {}, before?: (view: ShellView) => void, connections: ConnectionView[] = CONNS) {
+  const view = await renderShell({ ...SPACE, connections, nanty: { config: NANTY_CONFIG, telegram: NANTY_TELEGRAM, ...extra } });
+  before?.(view);
   await act(async () => activateApp("Nanty"));
   await settle();
   const win = nantyWindow();
@@ -158,12 +169,12 @@ describe("Ajustes", () => {
       return { status: 422, body: { error: "x", code: "nanty_config_invalid", params: { field: "reserve.developer" } } };
     });
     const dev = panel.querySelector<HTMLElement>('[data-nanty-reserve="developer"]') as HTMLElement;
-    expect(within(dev).getByRole("textbox", { name: "Modelo de reserva do papel Desenvolvedor" }).getAttribute("placeholder")).toBe("Modelo");
+    expect(within(dev).getByRole("combobox", { name: "Modelo de reserva do papel Desenvolvedor" }).getAttribute("placeholder")).toBe("Modelo");
     await act(async () => {
       fireEvent.change(within(dev).getByRole("combobox", { name: "Conexão de reserva do papel Desenvolvedor" }), { target: { value: "oai" } });
     });
     await act(async () => {
-      fireEvent.change(within(dev).getByRole("textbox", { name: "Modelo de reserva do papel Desenvolvedor" }), { target: { value: "gpt-x" } });
+      fireEvent.change(within(dev).getByRole("combobox", { name: "Modelo de reserva do papel Desenvolvedor" }), { target: { value: "gpt-x" } });
       fireEvent.click(within(panel).getByRole("switch", { name: "Responder em voz" }));
       fireEvent.click(within(panel).getByRole("switch", { name: "Esperar com uma aba do Nants aberta" }));
       fireEvent.click(within(panel).getByRole("checkbox", { name: "Blog" }));
@@ -183,56 +194,40 @@ describe("Ajustes", () => {
     expect(panel.querySelector("[data-nanty-save-notice]")?.textContent).toBe("Os ajustes não foram salvos: o ajuste reserve.developer do Nanty tem um valor fora do aceito");
   });
 
-  it("número fora da faixa trava o salvar com a dica; a ordem da voz sobe, desce e sai", async () => {
-    const { win } = await open("Ajustes", { config: { ...NANTY_CONFIG, voice: { ...NANTY_CONFIG.voice, enabled: true, order: [{ connection_id: "gem", model: "", voice: "" }] } } });
+  it("spec 139 T05: o seletor do idioma do Nanty substitui o atalho da Aparência e grava só o idioma", async () => {
+    const { view, win } = await open("Ajustes");
+    const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;
+    const card = panel.querySelector<HTMLElement>('[data-nanty-pref="lang"]') as HTMLElement;
+    expect(within(card).queryByRole("button")).toBeNull();
+    const select = within(card).getByLabelText("Avisos e resumo da manhã") as HTMLSelectElement;
+    expect(select.value).toBe("follow");
+    expect([...select.options].map((o) => o.textContent)).toEqual(["Seguir a conversa", "Português", "Inglês"]);
+    expect(card.querySelector("[data-nanty-lang]")?.textContent).toContain("(português)");
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 200, body: { ...NANTY_CONFIG, language: "en" } };
+    });
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "en" } });
+    });
+    expect(card.querySelector("[data-nanty-lang]")).toBeNull();
+    await act(async () => {
+      fireEvent.click(panel.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ language: "en" }]);
+    expect((within(card).getByLabelText("Avisos e resumo da manhã") as HTMLSelectElement).value).toBe("en");
+  });
+
+  it("número fora da faixa trava o salvar com a dica", async () => {
+    const { win } = await open("Ajustes");
     const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;
     await act(async () => {
       fireEvent.change(within(panel).getByLabelText("Orçamento em US$"), { target: { value: "5000" } });
     });
     expect(panel.textContent).toContain("Use um número de 0 a 1.000.");
     expect((panel.querySelector("[data-nanty-save]") as HTMLButtonElement).disabled).toBe(true);
-    const order = panel.querySelector<HTMLElement>("[data-nanty-voice-order]") as HTMLElement;
-    expect([...order.querySelectorAll("[data-nanty-voice-step]")].map((s) => s.getAttribute("data-nanty-voice-step"))).toEqual(["gem", "text"]);
-    await act(async () => {
-      fireEvent.change(within(panel).getByLabelText("Adicionar uma conexão à ordem"), { target: { value: "oai" } });
-    });
-    await act(async () => {
-      fireEvent.click(within(order).getByRole("button", { name: "Subir OpenAI direto" }));
-    });
-    expect([...order.querySelectorAll("[data-nanty-voice-step]")].map((s) => s.getAttribute("data-nanty-voice-step"))).toEqual(["oai", "gem", "text"]);
-    await act(async () => {
-      fireEvent.click(within(order).getByRole("button", { name: "Tirar Gemini pessoal da ordem" }));
-    });
-    expect([...order.querySelectorAll("[data-nanty-voice-step]")].map((s) => s.getAttribute("data-nanty-voice-step"))).toEqual(["oai", "text"]);
-  });
-
-  it("a voz oferece só as conexões que servem; a incompatível já gravada aparece com aviso", async () => {
-    const plan: ConnectionView = { id: "plan", name: "Plano ChatGPT", base_url: "https://chatgpt.com/backend-api/codex", api_key_masked: "", kind: "chatgpt_plan" };
-    const claude: ConnectionView = { id: "claude", name: "Anthropic", base_url: "https://api.anthropic.com", api_key_masked: "********1234", kind: "anthropic" };
-    const voice = { ...NANTY_CONFIG.voice, enabled: true, order: [{ connection_id: "plan", model: "", voice: "" }], transcribe: { connection_id: "oai", model: "" } };
-    const view = await renderShell({ ...SPACE, connections: [...CONNS, plan, claude], nanty: { config: { ...NANTY_CONFIG, voice }, telegram: NANTY_TELEGRAM } });
-    await act(async () => activateApp("Nanty"));
-    await settle();
-    const win = nantyWindow();
-    await act(async () => {
-      fireEvent.click(within(win).getByRole("tab", { name: "Ajustes" }));
-    });
-    await settle();
-    const card = win.querySelector<HTMLElement>('[data-nanty-pref="voice"]') as HTMLElement;
-    const options = (label: string) => [...(within(card).getByLabelText(label) as HTMLSelectElement).options].map((o) => o.value);
-    // A ordem: Gemini e por chave; nem o plano nem a Anthropic.
-    expect(options("Adicionar uma conexão à ordem")).toEqual(["", "gem", "oai"]);
-    // A transcrição: só o Gemini (e a gravada, incompatível, para não sumir sem aviso).
-    expect(options("Conexão que transcreve os seus áudios")).toEqual(["", "gem", "oai"]);
-    expect(card.querySelector('[data-nanty-voice-warn="transcribe"]')?.textContent).toBe("A conexão OpenAI direto não transcreve áudio. Escolha uma do Google Gemini.");
-    expect(card.querySelector('[data-nanty-voice-warn="plan"]')?.textContent).toBe("Plano ChatGPT não serve para a voz. Escolha uma conexão do Google Gemini ou uma por chave de API.");
-    // Escolher o Gemini tira o aviso.
-    await act(async () => {
-      fireEvent.change(within(card).getByLabelText("Conexão que transcreve os seus áudios"), { target: { value: "gem" } });
-    });
-    expect(card.querySelector('[data-nanty-voice-warn="transcribe"]')).toBeNull();
-    expect(options("Conexão que transcreve os seus áudios")).toEqual(["", "gem"]);
-    expect(view.server.count("PUT", /^\/api\/nanty\/config$/)).toBe(0);
   });
 
   it("orçamento sem preço conta tokens; a barra do gasto; a hora do Nants no formato da tela", async () => {
@@ -245,8 +240,8 @@ describe("Ajustes", () => {
     const hours = win.querySelector<HTMLElement>('[data-nanty-pref="hours"]') as HTMLElement;
     expect(hours.querySelector("[data-nanty-now]")?.textContent).toBe("Hora do Nants agora: 09:41");
     expect(hours.querySelector("[data-nanty-hours-summary]")?.textContent).toBe("Silêncio das 22:00 às 07:00. Resumo às 08:00.");
-    // O idioma do Nanty: o da interface.
-    expect(win.querySelector('[data-nanty-pref="lang"]')?.textContent).toContain("O Nanty fala em Português (Brasil)");
+    // O idioma do Nanty (spec 139 T05): seguir a conversa, com o da interface antes da primeira.
+    expect(win.querySelector('[data-nanty-pref="lang"] [data-nanty-lang]')?.textContent).toContain("vale o da interface (português)");
     cleanup();
     setLanguage("en", { persist: false });
     const en = await open("Settings" as "Ajustes");
@@ -270,6 +265,294 @@ describe("Ajustes", () => {
     expect(within(win).getByRole("tab", { name: "Settings" }).getAttribute("aria-selected")).toBe("true");
     expect(document.activeElement?.hasAttribute("data-nanty-digest-time")).toBe(true);
     expect(view.server.count("GET", /^\/api\/nanty\/config$/)).toBeGreaterThan(0);
+  });
+});
+
+describe("cartão Voz", () => {
+  const PLAN: ConnectionView = { id: "plan", name: "Plano ChatGPT", base_url: "https://chatgpt.com/backend-api/codex", api_key_masked: "", kind: "chatgpt_plan" };
+  const voiceCard = (win: HTMLElement) => win.querySelector<HTMLElement>('[data-nanty-pref="voice"]') as HTMLElement;
+  const state = (card: HTMLElement) => card.querySelector("[data-nanty-voice-state]");
+  const withVoice = (voice: object) => ({ config: { ...NANTY_CONFIG, voice: { ...NANTY_CONFIG.voice, ...voice } } });
+  const voicesFail = (status: number, code: string, params: object = {}) => (view: ShellView) => view.server.reply("GET", /^\/api\/nanty\/voices/, () => ({ status, body: { error: "x", code, params } }));
+
+  it("um seletor só, com as conexões do Gemini pelo nome e o tipo; modelos e voz à vista; sem a ordem", async () => {
+    const { view, win } = await open("Ajustes", {}, modelsReply, [...CONNS, PLAN]);
+    const card = voiceCard(win);
+    const select = within(card).getByLabelText("Conexão do Gemini para a voz") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.textContent)).toEqual(["Automática: a primeira com chave", "Gemini pessoal (Google Gemini)"]);
+    expect(card.querySelectorAll("select")).toHaveLength(1);
+    expect(card.textContent).not.toMatch(/ordem|tentativa|transcreve os seus/i);
+    expect((within(card).getByLabelText("Modelo de fala") as HTMLInputElement).value).toBe("gemini-3.8-flash-tts");
+    expect((within(card).getByLabelText("Voz") as HTMLInputElement).value).toBe("Kore");
+    expect((within(card).getByLabelText("Modelo de transcrição") as HTMLInputElement).value).toBe("gemini-3.8-flash");
+    expect(card.textContent).toContain("cadastradas em Configurações > Conexões");
+    // O texto diz o que acontece de fato (T08): o áudio do aviso nasce no Telegram.
+    expect(card.textContent).toContain("Na janela, as respostas têm áudio; os avisos saem em áudio no Telegram.");
+    // A escolha grava só a conexão, com o campo novo.
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 200, body: { ...NANTY_CONFIG, voice: { ...NANTY_CONFIG.voice, connection_id: "gem" } } };
+    });
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "gem" } });
+    });
+    await settle();
+    await act(async () => {
+      fireEvent.click(win.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ voice: { connection_id: "gem" } }]);
+    expect(view.server.count("GET", /^\/api\/nanty\/voices\?connection_id=gem$/)).toBeGreaterThan(0);
+  });
+
+  it("a conexão gravada que não serve fica à vista, com o aviso, até a troca", async () => {
+    const { win } = await open("Ajustes", withVoice({ connection_id: "oai" }), modelsReply);
+    const card = voiceCard(win);
+    const select = within(card).getByLabelText("Conexão do Gemini para a voz") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.value)).toEqual(["", "gem", "oai"]);
+    expect(card.querySelector("[data-nanty-voice-warn]")?.textContent).toBe("A conexão OpenAI direto não é do Google Gemini. Escolha outra na lista.");
+    expect(state(card)?.getAttribute("data-nanty-voice-state")).toBe("no_connection");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "gem" } });
+    });
+    await settle();
+    expect(card.querySelector("[data-nanty-voice-warn]")).toBeNull();
+    expect([...select.options].map((o) => o.value)).toEqual(["", "gem"]);
+    expect(state(card)?.getAttribute("data-nanty-voice-state")).toBe("ready");
+  });
+
+  it("os estados do servidor: pronta (com a conexão resolvida), sem chave e sem conexão", async () => {
+    const ready = await open("Ajustes", {}, modelsReply);
+    expect(state(voiceCard(ready.win))?.textContent).toBe("Pronta, pela conexão Gemini pessoal");
+    cleanup();
+    const noKey = await open("Ajustes", {}, voicesFail(409, "nanty_voice_no_key"));
+    expect(state(voiceCard(noKey.win))?.textContent).toBe("Sem chave");
+    expect(voiceCard(noKey.win).querySelector('[data-nanty-voice-why="no_key"]')?.textContent).toContain("Coloque a chave em Configurações > Conexões");
+    expect(within(voiceCard(noKey.win)).getByLabelText("Conexão do Gemini para a voz")).toBeTruthy();
+    cleanup();
+    const gone = await open("Ajustes", withVoice({ connection_id: "sumiu" }));
+    expect(state(voiceCard(gone.win))?.textContent).toBe("Sem conexão");
+    expect(voiceCard(gone.win).querySelector("[data-nanty-voice-warn]")?.textContent).toBe("A conexão sumiu não existe mais. Escolha outra.");
+  });
+
+  it("sem conexão do Gemini: explica e o atalho abre Configurações > Conexões", async () => {
+    const { view, win } = await open("Ajustes", {}, (v) => {
+      v.server.reply("GET", /^\/api\/system\/prereqs$/, () => ({ status: 200, body: [] }));
+    }, [CONNS[1] as ConnectionView]);
+    const card = voiceCard(win);
+    expect(state(card)?.textContent).toBe("Sem conexão");
+    expect(card.querySelector('[data-nanty-voice-why="no_connection"]')?.textContent).toContain("você ainda não tem nenhuma");
+    expect(within(card).queryByLabelText("Conexão do Gemini para a voz")).toBeNull();
+    const shortcut = within(card).getByRole("button", { name: "Criar uma conexão do Gemini" });
+    expect(shortcut.getAttribute("data-variant")).toBe("primary");
+    await act(async () => {
+      fireEvent.click(shortcut);
+    });
+    await settle();
+    const settings = screen.getByRole("region", { name: "Configurações" });
+    expect(within(settings).getByRole("tab", { name: /^Conexões/ }).getAttribute("aria-selected")).toBe("true");
+    expect(view.server.count("GET", /^\/api\/nanty\/voices/)).toBeGreaterThan(0);
+  });
+
+  it("com conexão, o atalho é um botão secundário com ícone e leva ao mesmo lugar", async () => {
+    const { win } = await open("Ajustes", {}, (v) => {
+      modelsReply(v);
+      v.server.reply("GET", /^\/api\/system\/prereqs$/, () => ({ status: 200, body: [] }));
+    });
+    const shortcut = within(voiceCard(win)).getByRole("button", { name: "Abrir Conexões" });
+    // Sem variante é o secundário do `.nd-btn`, igual a "Salvar o token".
+    expect(shortcut.classList.contains("nd-btn")).toBe(true);
+    expect(shortcut.hasAttribute("data-variant")).toBe(false);
+    expect(shortcut.querySelector("svg")).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(shortcut);
+    });
+    await settle();
+    expect(within(screen.getByRole("region", { name: "Configurações" })).getByRole("tab", { name: /^Conexões/ }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("a rota de vozes falha: a tela segue usável, com o erro traduzido, o texto livre e os modelos", async () => {
+    const { view, win } = await open("Ajustes", {}, (v) => {
+      modelsReply(v);
+      voicesFail(502, "nanty_voice_list_failed", { reason: "provider_error", connection_id: "gem" })(v);
+    });
+    const card = voiceCard(win);
+    expect(state(card)?.textContent).toBe("Pronta, pela conexão Gemini pessoal");
+    expect(card.querySelector("[data-nanty-voices-failed]")?.textContent).toBe("o Google Gemini não devolveu a lista de vozes; tente de novo. Você pode digitar o nome da voz.");
+    const voice = within(card).getByLabelText("Voz") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.change(voice, { target: { value: "Puck" } });
+    });
+    expect(voice.value).toBe("Puck");
+    // A lista de modelos não depende da de vozes.
+    await act(async () => {
+      fireEvent.click(within(card).getByLabelText("Modelo de fala"));
+    });
+    expect(within(card).getAllByRole("option").map((o) => o.textContent)).toContain("gemini-3.8-flash-lite-tts");
+    // "Atualizar lista" tenta de novo.
+    view.server.reply("GET", /^\/api\/nanty\/voices/, () => ({ status: 200, body: { connection_id: "gem", voices: [{ id: "Kore", display_name: "Kore" }] } }));
+    const row = within(card).getByLabelText("Voz").closest(".nd-field") as HTMLElement;
+    await act(async () => {
+      fireEvent.click(within(row).getByRole("button", { name: "Atualizar lista" }));
+    });
+    await settle();
+    expect(card.querySelector("[data-nanty-voices-failed]")).toBeNull();
+  });
+
+  it("a chave recusada: não diz pronta, explica onde trocar, e os modelos e o texto livre seguem", async () => {
+    const { win } = await open("Ajustes", {}, (v) => {
+      modelsReply(v);
+      voicesFail(502, "nanty_voice_list_failed", { reason: "auth", connection_id: "gem" })(v);
+    });
+    const card = voiceCard(win);
+    expect(state(card)?.getAttribute("data-nanty-voice-state")).toBe("key_refused");
+    expect(state(card)?.textContent).toBe("Chave recusada");
+    expect(state(card)?.querySelector(".nd-dot")?.getAttribute("data-tone")).toBe("amber");
+    expect(card.querySelector('[data-nanty-voice-why="key_refused"]')?.textContent).toContain("Troque a chave em Configurações > Conexões");
+    expect(card.textContent).not.toContain("tente de novo");
+    expect(within(card).getByRole("button", { name: "Abrir Conexões" })).toBeTruthy();
+    const voice = within(card).getByLabelText("Voz") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.change(voice, { target: { value: "Puck" } });
+    });
+    expect(voice.value).toBe("Puck");
+    await act(async () => {
+      fireEvent.click(within(card).getByLabelText("Modelo de fala"));
+    });
+    expect(within(card).getAllByRole("option").map((o) => o.textContent)).toContain("gemini-3.8-flash-lite-tts");
+  });
+
+  it("em inglês, a chave recusada também vem do dicionário", async () => {
+    setLanguage("en", { persist: false });
+    const { win } = await open("Settings" as "Ajustes", {}, (v) => {
+      modelsReply(v);
+      voicesFail(502, "nanty_voice_list_failed", { reason: "auth", connection_id: "gem" })(v);
+    });
+    const card = voiceCard(win);
+    expect(state(card)?.textContent).toBe("Key refused");
+    expect(card.querySelector('[data-nanty-voice-why="key_refused"]')?.textContent).toContain("Replace the key in Settings > Connections");
+  });
+
+  it("a gravada sumiu: escolher a Automática mostra o que ela resolve, antes e depois de salvar", async () => {
+    const { view, win } = await open("Ajustes", withVoice({ connection_id: "sumiu" }), modelsReply);
+    const card = voiceCard(win);
+    expect(state(card)?.textContent).toBe("Sem conexão");
+    expect(view.server.count("GET", /^\/api\/nanty\/voices\?connection_id=sumiu$/)).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.change(within(card).getByLabelText("Conexão do Gemini para a voz"), { target: { value: "" } });
+    });
+    await settle();
+    expect(view.server.count("GET", /^\/api\/nanty\/voices\?connection_id=$/)).toBeGreaterThan(0);
+    expect(state(card)?.textContent).toBe("Pronta, pela conexão Gemini pessoal");
+    expect(card.querySelector("[data-nanty-voice-warn]")).toBeNull();
+    // As vozes e os modelos são os da conexão resolvida.
+    await act(async () => {
+      fireEvent.click(within(card).getByLabelText("Voz"));
+    });
+    expect(within(card).getAllByRole("option").map((o) => o.textContent)).toContain("Kore (pt-BR, Firm)");
+    expect(view.server.count("GET", /^\/api\/config\/connections\/gem\/models/)).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.blur(within(card).getByLabelText("Voz"));
+    });
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 200, body: NANTY_CONFIG };
+    });
+    await act(async () => {
+      fireEvent.click(win.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ voice: { connection_id: "" } }]);
+    expect(state(card)?.textContent).toBe("Pronta, pela conexão Gemini pessoal");
+    expect((within(card).getByLabelText("Conexão do Gemini para a voz") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("sem resposta do servidor: nenhum estado inventado, e o erro traduzido", async () => {
+    const { win } = await open("Ajustes", {}, voicesFail(500, "nanty_config_invalid", { field: "voice" }));
+    const card = voiceCard(win);
+    expect(state(card)).toBeNull();
+    expect(card.querySelector("[data-nanty-voices-failed]")?.textContent).toContain("Você pode digitar o nome da voz.");
+  });
+});
+
+describe("combobox de modelos nos Ajustes", () => {
+  const options = (root: HTMLElement) => within(within(root).getByRole("listbox")).getAllByRole("option").map((o) => o.textContent);
+  const choose = async (input: HTMLElement, name: string, root: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(input);
+    });
+    await act(async () => {
+      fireEvent.click(within(root).getByRole("option", { name }));
+    });
+  };
+
+  it("Modelo, Reserva, fala e transcrição: a lista completa, sem filtro por nome, e o texto livre", async () => {
+    const config = { ...NANTY_CONFIG, connection_id: "gem", model: "gemini-3.8-flash", reserve: { developer: { connection_id: "gem", model: "gemini-3.8-flash" } } };
+    const { view, win } = await open("Ajustes", { config }, modelsReply);
+    const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;
+    const all = ["gemini-3.8-flash", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"];
+    const model = panel.querySelector<HTMLElement>('[data-nanty-pref="model"]') as HTMLElement;
+    const reserve = panel.querySelector<HTMLElement>('[data-nanty-reserve="developer"]') as HTMLElement;
+    const voice = panel.querySelector<HTMLElement>('[data-nanty-pref="voice"]') as HTMLElement;
+    // A fala tem a lista própria, da rota de vozes: a da conexão é só de texto.
+    const speech = ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"];
+    for (const [root, input, expected] of [
+      [model, within(model).getByRole("combobox", { name: "Modelo" }), all],
+      [reserve, within(reserve).getByRole("combobox", { name: "Modelo de reserva do papel Desenvolvedor" }), all],
+      [voice, within(voice).getByRole("combobox", { name: "Modelo de fala" }), speech],
+      [voice, within(voice).getByRole("combobox", { name: "Modelo de transcrição" }), all],
+    ] as const) {
+      await act(async () => {
+        fireEvent.click(input);
+      });
+      expect(options(root)).toEqual(expected);
+      await act(async () => {
+        fireEvent.blur(input);
+      });
+    }
+    // A mesma conexão: uma carga só, compartilhada entre os quatro campos.
+    expect(view.server.count("GET", /^\/api\/config\/connections\/gem\/models/)).toBe(1);
+    // A lista de vozes vem da rota, com o rótulo; o valor gravado é o id.
+    const voiceInput = within(voice).getByLabelText("Voz") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.change(voiceInput, { target: { value: "" } });
+    });
+    await choose(voiceInput, "Kore (pt-BR, Firm)", voice);
+    expect(voiceInput.value).toBe("Kore");
+    await choose(within(voice).getByLabelText("Modelo de fala"), "gemini-3.8-flash-lite-tts", voice);
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 200, body: config };
+    });
+    await act(async () => {
+      fireEvent.change(within(model).getByRole("combobox", { name: "Modelo" }), { target: { value: "modelo-que-nao-esta-na-lista" } });
+    });
+    await act(async () => {
+      fireEvent.click(panel.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ model: "modelo-que-nao-esta-na-lista", voice: { speech_model: "gemini-3.8-flash-lite-tts" } }]);
+  });
+
+  it("a lista falha: o campo segue aceitando texto, com o erro; sem conexão, fica travado", async () => {
+    const { view, win } = await open("Ajustes", {}, (v) => v.server.reply("GET", /^\/api\/config\/connections\/[^/]+\/models/, () => ({ status: 200, body: { models: [], error: "http_error", status: 401 } })));
+    const card = win.querySelector<HTMLElement>('[data-nanty-pref="model"]') as HTMLElement;
+    const model = within(card).getByRole("combobox", { name: "Modelo" }) as HTMLInputElement;
+    expect(model.disabled).toBe(true);
+    await act(async () => {
+      fireEvent.change(within(card).getByLabelText("Conexão do modelo"), { target: { value: "oai" } });
+    });
+    await settle();
+    expect(model.disabled).toBe(false);
+    expect(card.querySelector(".nd-field-warn")).not.toBeNull();
+    await act(async () => {
+      fireEvent.change(model, { target: { value: "gpt-x" } });
+    });
+    expect(model.value).toBe("gpt-x");
+    expect(view.server.count("GET", /^\/api\/config\/connections\/oai\/models/)).toBeGreaterThan(0);
   });
 });
 
@@ -397,9 +680,9 @@ describe("em inglês", () => {
     setLanguage("en", { persist: false });
     const telegram = { health: "connected", bot_username: "NantsNantyBot", bot_token_masked: MASKED, configured: true, paired: false, pairing: { state: "open", code: "AbCdEfGh12345_-z", link: "https://t.me/NantsNantyBot?start=AbCdEfGh12345_-z", seconds_to_next: 60, expires_in: 300 } };
     const budget = { mode: "tokens", spent_usd: 0, budget_usd: 0.5, tokens: 10, budget_tokens: 200_000, unpriced_turns: 1, unpriced: true, exhausted: false };
-    const config = { ...NANTY_CONFIG, lang: "en", voice: { ...NANTY_CONFIG.voice, order: [{ connection_id: "gem", model: "", voice: "" }] } };
-    const { win } = await open("Settings" as "Ajustes", { config, telegram, status: { ...NANTY_STATUS, budget } });
-    const leftovers = (root: HTMLElement) => portugueseLeftovers(root).filter((text) => !/^(Loja|Blog|Gemini pessoal|OpenAI direto)$/.test(text));
+    const config = { ...NANTY_CONFIG, lang: "en", voice: { ...NANTY_CONFIG.voice, connection_id: "gem" } };
+    const { win } = await open("Settings" as "Ajustes", { config, telegram, status: { ...NANTY_STATUS, budget } }, modelsReply);
+    const leftovers = (root: HTMLElement) => portugueseLeftovers(root).filter((text) => !/^(Loja|Blog|Gemini pessoal|Gemini pessoal \(Google Gemini\)|OpenAI direto)$/.test(text));
     expect(leftovers(win)).toEqual([]);
     expect(findForbiddenGlyphs(win)).toEqual([]);
     await act(async () => {
@@ -468,6 +751,9 @@ describe("Configurações > Agentes", () => {
     await settle();
     const row = settings.querySelector<HTMLElement>("[data-nanty-agent]") as HTMLElement;
     expect(row.querySelector("[data-nanty-agent-model]")?.textContent).toBe("Modelo gemini-flash, pela conexão Gemini pessoal.");
+    // Fora da janela do Nanty, o ícone de linha: o avatar colorido fica lá dentro.
+    expect(row.querySelector('svg[data-icon="nanty"]')).not.toBeNull();
+    expect(row.querySelector("svg[data-nanty-avatar]")).toBeNull();
     // Sem duplicar os campos: nenhum campo na linha.
     expect(row.querySelectorAll("input, select")).toHaveLength(0);
     await act(async () => {

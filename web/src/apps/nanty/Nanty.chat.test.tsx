@@ -39,7 +39,13 @@ const MESSAGES = [
     from: "nanty",
     channel: "web",
     code: "nanty.chat.status",
-    params: { waiting: 1, done: 0, planned: 2, lines: [{ code: "nanty.chat.status_budget_usd", params: { spent: 0.06, budget: 0.5 } }] },
+    params: {
+      lines: [
+        { code: "nanty.chat.status_waiting", params: { count: 1 } },
+        { code: "nanty.chat.status_planned", params: { count: 2 } },
+        { code: "nanty.chat.status_budget_usd", params: { spent: 0.06, budget: 0.5 } },
+      ],
+    },
   },
   { id: "m5", at_ms: AT + 4000, from: "nanty", channel: "web", code: "nanty.chat.pause_card", params: { project: "Loja" }, card_ids: ["aaaaaaaaaaaaaaaa"] },
 ];
@@ -88,10 +94,63 @@ describe("conversa do Nanty", () => {
     expect(msg("m2").querySelector("[data-nanty-origin]")?.textContent).toBe("Nanty, pelo Telegram · voz e texto · 14:20");
     expect(msg("m3").querySelector("[data-nanty-origin]")?.textContent).toBe("você, pela janela · 14:20");
     expect(msg("m4").querySelector(".nd-nanty-bubble")?.textContent).toBe(
-      "O Nanty está atento. Esperando você: 1. Feito hoje: 0. Previsto: 2.Gasto do modelo hoje: US$ 0,06 de US$ 0,50.",
+      "Estou acompanhando os projetos por aqui.1 aviso espera a sua decisão.Além do resumo da manhã, tenho 2 coisas marcadas para depois.Hoje gastei US$ 0,06 dos US$ 0,50 do dia com o modelo.",
     );
     // A transcrição da nota de voz da pessoa é o texto dela.
     expect(msg("m1").querySelector(".nd-nanty-bubble")?.textContent).toBe("olha a Loja pra mim");
+  });
+
+  it("spec 139 T05: o texto fixo sai no idioma gravado na mensagem, não no da interface", async () => {
+    playsOgg(true);
+    const params = { lines: [{ code: "nanty.chat.status_waiting", params: { count: 1 } }] };
+    await open([
+      { id: "e1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.chat.status", params, lang: "en" },
+      { id: "e2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.chat.status", params, lang: "pt-BR" },
+      { id: "e3", at_ms: AT + 2000, from: "nanty", channel: "web", code: "nanty.chat.status", params },
+    ]);
+    expect(msg("e1").querySelector(".nd-nanty-bubble")?.textContent).toBe("I am keeping an eye on the projects.1 notice is waiting for your decision.");
+    expect(msg("e2").querySelector(".nd-nanty-bubble")?.textContent).toBe("Estou acompanhando os projetos por aqui.1 aviso espera a sua decisão.");
+    // Sem idioma (as gravadas antes): o da interface.
+    expect(msg("e3").querySelector(".nd-nanty-bubble")?.textContent).toBe("Estou acompanhando os projetos por aqui.1 aviso espera a sua decisão.");
+  });
+
+  it("spec 139 T06: com o texto do modelo, a lista fixa não entra; ficam a frase curta e o porquê dos avisos guardados", async () => {
+    playsOgg(true);
+    const lines = [{ code: "nanty.digest.running", params: { count: 1 } }];
+    await open([
+      {
+        id: "d1",
+        at_ms: AT,
+        from: "nanty",
+        channel: "web",
+        code: "nanty.digest.lead",
+        params: { lines, why: [{ code: "nanty.digest.held", params: { count: 1 } }, { code: "nanty.why.task_delivered", params: { since: "02:00" } }] },
+        text: "O Test 14 parou de madrugada.",
+        lang: "pt-BR",
+      },
+      {
+        id: "d3",
+        at_ms: AT + 2000,
+        from: "nanty",
+        channel: "web",
+        code: "nanty.digest.lead",
+        params: { why: [{ code: "nanty.digest.held", params: { count: 1 } }, { code: "nanty.why.task_delivered", params: { since: "02:00" } }] },
+        text: "Test 14 stopped overnight.",
+        lang: "en",
+      },
+      { id: "d2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.digest.morning", params: { lines }, lang: "pt-BR" },
+      { id: "c1", at_ms: AT + 3000, from: "nanty", channel: "web", code: "nanty.chat.confirm", params: {}, text: "Deixei o cartão pronto.", lang: "pt-BR" },
+      { id: "c2", at_ms: AT + 4000, from: "nanty", channel: "web", code: "nanty.chat.confirm", params: {}, lang: "pt-BR" },
+    ]);
+    const paragraphs = (id: string) => Array.from(msg(id).querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
+    // O porquê dos avisos guardados sai sempre, do dicionário (C-06 da 138).
+    expect(paragraphs("d1")).toEqual(["Resumo da manhã.", "Guardei 1 aviso para este resumo:", "Uma tarefa foi entregue às 02:00.", "O Test 14 parou de madrugada."]);
+    expect(paragraphs("d3")).toEqual(["Morning summary.", "I saved 1 notice for this summary:", "A task was delivered at 02:00 AM.", "Test 14 stopped overnight."]);
+    // Sem o texto do modelo, a reserva: uma frase por fato.
+    expect(paragraphs("d2")).toEqual(["Bom dia. Aqui vai como estão os projetos.", "1 projeto está rodando."]);
+    // Spec 139 T12: a fala do modelo primeiro, e a frase do servidor fecha; sem ela, o servidor sozinho.
+    expect(paragraphs("c1")).toEqual(["Deixei o cartão pronto.", "Confirme no cartão: nada é feito sem o seu toque."]);
+    expect(paragraphs("c2")).toEqual(["Confirme no cartão: nada é feito sem o seu toque."]);
   });
 
   it("nota de voz tocável pela rota da T09: o áudio com Range é do servidor; aqui, tocar e pausar", async () => {
@@ -124,6 +183,28 @@ describe("conversa do Nanty", () => {
     }
   });
 
+  it("spec 139 T08: a resposta da janela e o aviso têm o tocador junto do texto, sem tocar sozinho", async () => {
+    playsOgg(true);
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play");
+    try {
+      await open([
+        { id: "w1", at_ms: AT, from: "nanty", channel: "web", text: "A Loja segue bem.", lang: "pt-BR", reply_to: "m0", audio: AUDIO },
+        { id: "w2", at_ms: AT + 1000, from: "nanty", channel: "telegram", code: "nanty.why.plan_waiting", params: { since: "10:00" }, lang: "pt-BR", card_ids: ["aaaaaaaaaaaaaaaa"], audio: { ...AUDIO, id: "fedcba9876543210" } },
+      ]);
+      expect(msg("w1").querySelector("[data-nanty-origin]")?.textContent).toBe("Nanty, na janela · voz e texto · 14:20");
+      expect(msg("w1").querySelector(".nd-nanty-bubble")?.textContent).toBe("A Loja segue bem.");
+      expect(msg("w2").querySelector(".nd-nanty-bubble")?.textContent).toContain("Um plano espera a sua aprovação");
+      for (const id of ["w1", "w2"]) {
+        const audio = msg(id).querySelector<HTMLAudioElement>('[data-nanty-voice="player"] audio');
+        expect(audio?.getAttribute("preload")).toBe("none");
+        expect(audio?.hasAttribute("autoplay")).toBe(false);
+      }
+      expect(play).not.toHaveBeenCalled();
+    } finally {
+      play.mockRestore();
+    }
+  });
+
   it("navegador sem Ogg/Opus: a transcrição fica, com um aviso discreto e o baixar", async () => {
     playsOgg(false);
     await open();
@@ -145,6 +226,8 @@ describe("conversa do Nanty", () => {
   it("enviar: o POST com o texto, o campo limpa e a conversa se relê; o SSE traz a resposta", async () => {
     const view = await open([]);
     expect(chat().querySelector("[data-nanty-chat-empty]")?.textContent).toContain("/resumo");
+    expect(chat().querySelector("[data-nanty-chat-empty]")?.textContent).toContain("como você falaria com alguém do time");
+    expect(chat().querySelector("[data-nanty-chat-empty]")?.textContent).not.toContain("cite o nome");
     const posted: unknown[] = [];
     view.server.reply("POST", /^\/api\/nanty\/conversation$/, (body) => {
       posted.push(body);

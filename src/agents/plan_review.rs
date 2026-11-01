@@ -297,10 +297,12 @@ mod tests {
     #[test]
     fn prompt_is_short_and_lists_the_contract() {
         let p = plan_review_system();
-        for kind in ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", "too_large"] {
+        for kind in ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", "infeasible_test_command", "too_large"] {
             assert!(p.contains(kind), "{kind}");
         }
         assert!(p.contains("Preferência") && p.contains("lista vazia") && p.contains("No máximo 8"));
+        // Spec 139 T11: +~560 bytes (etapa da bateria que só fica executável depois da primeira
+        // tarefa que roda o comando, com o teste de fumaça da própria ferramenta; teto 3350 -> 3950).
         // Spec 133 T08: +~180 bytes (regra do idioma: título criado pelo agente sai no idioma do
         // projeto, os estruturais sem traduzir; teto 3150 -> 3350).
         // Spec 128 T03: +~550 bytes (ação fora do sandbox no untestable, critérios longos no
@@ -309,6 +311,6 @@ mod tests {
         // Spec 124 T04: +~170 bytes (critério que depende de capacidade ausente é untestable; teto 2400 -> 2600).
         // Spec 122 T05: +~200 bytes (ações independentes na mesma resposta; teto 2200 -> 2400).
         // Spec 122 T02: +~200 bytes (íntegra das saídas cortadas; teto 2000 -> 2200).
-        assert!(p.len() < 3350, "{}", p.len());
+        assert!(p.len() < 3950, "{}", p.len());
     }
 }

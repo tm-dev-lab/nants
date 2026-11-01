@@ -1138,13 +1138,26 @@ const CONTROL_WORDS: [&str; 6] = ["exit", "return", "false", ":", "break", "cont
 /// aspas (`;`, `||`, `|`, `&`, quebra de linha, subshell, agrupamento, redirecionamento, crase,
 /// barra invertida), aspas abertas ou etapa vazia.
 fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
-    let mut steps: Vec<Vec<String>> = Vec::new();
+    Some(scan_steps(command)?.into_iter().map(|(words, _)| words).collect())
+}
+
+/// Spec 139 T01: as etapas de [`parse_steps`] como o texto original de cada uma (aspas e espaços
+/// internos preservados, sem os espaços das pontas), para o runner saber qual etapa do `&&` falhou.
+/// Mesmas regras: `None` para qualquer outra construção de shell.
+pub(crate) fn command_steps(command: &str) -> Option<Vec<String>> {
+    Some(scan_steps(command)?.into_iter().map(|(_, range)| command[range].trim().to_string()).collect())
+}
+
+/// O analisador de [`parse_steps`]: cada etapa com as palavras e o trecho (em bytes) do comando.
+fn scan_steps(command: &str) -> Option<Vec<(Vec<String>, std::ops::Range<usize>)>> {
+    let mut steps: Vec<(Vec<String>, std::ops::Range<usize>)> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut start = 0usize;
+    let mut chars = command.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
         if let Some(q) = quote {
             if c == q {
                 quote = None;
@@ -1164,7 +1177,7 @@ fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
                     in_word = false;
                 }
             }
-            '&' if chars.peek() == Some(&'&') => {
+            '&' if chars.peek().map(|(_, n)| *n) == Some('&') => {
                 chars.next();
                 if in_word {
                     words.push(std::mem::take(&mut word));
@@ -1173,7 +1186,8 @@ fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
                 if words.is_empty() {
                     return None;
                 }
-                steps.push(std::mem::take(&mut words));
+                steps.push((std::mem::take(&mut words), start..at));
+                start = at + 2;
             }
             '&' | ';' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`' | '<' | '>' | '\\' => return None,
             _ => {
@@ -1191,7 +1205,7 @@ fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
     if words.is_empty() {
         return None;
     }
-    steps.push(words);
+    steps.push((words, start..command.len()));
     Some(steps)
 }
 
@@ -2635,9 +2649,14 @@ pub fn command_did_not_run(evidence: &str) -> bool {
     if !first.starts_with(TEST_FAILURE_MARK) {
         return false;
     }
-    first == format!("{TEST_FAILURE_MARK}: tempo limite]")
-        || first == format!("{TEST_FAILURE_MARK}: código 126]")
-        || first == format!("{TEST_FAILURE_MARK}: código 127]")
+    first == format!("{TEST_FAILURE_MARK}: tempo limite]") || missing_program_code(evidence).is_some()
+}
+
+/// Spec 139 T11: o código 126 ou 127 (programa não executável ou não encontrado) medido pelo runner,
+/// lido SÓ do cabeçalho estruturado da primeira linha da evidência. Qualquer outro código: `None`.
+pub fn missing_program_code(evidence: &str) -> Option<u8> {
+    let first = evidence.lines().next().unwrap_or("").trim();
+    [126, 127].into_iter().find(|code| first == format!("{TEST_FAILURE_MARK}: código {code}]"))
 }
 
 /// Cauda de `text` com até `max` bytes (em fronteira de caractere).

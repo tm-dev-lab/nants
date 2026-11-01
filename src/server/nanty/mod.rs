@@ -29,13 +29,15 @@
 //!
 //! **Conversa (T08):** a mesma no Telegram e na janela ([`chat`]): comandos fixos sem modelo, texto
 //! livre com o modelo e cartão de confirmação para toda ação pedida, e a leitura a pedido do projeto
-//! citado ([`read`]), como dado não confiável.
+//! citado ([`read`]), como dado não confiável. Desde a spec 139 T03, o texto livre vai a um laço de
+//! agente ([`agent`]) com ferramentas só de leitura ([`tools`]), memória e resposta em texto puro.
 //!
-//! **Voz (T09):** a nota de voz do dono é transcrita e segue como texto; a resposta a ela sai em voz,
-//! com legenda, pela ordem das conexões ([`voice`]). Os áudios ficam na pasta do Nanty e saem junto
-//! com as mensagens antigas da conversa.
+//! **Voz (T09; spec 139 T07 e T08):** a nota de voz do dono é transcrita e segue como texto. Com a
+//! voz ligada, toda saída do Nanty fala, só pelo Gemini e com volta para o texto ([`voice`]). Os
+//! áudios ficam na pasta do Nanty e saem junto com as mensagens antigas da conversa.
 
 pub mod act;
+pub mod agent;
 pub mod actions;
 pub mod api;
 pub mod chat;
@@ -45,13 +47,16 @@ pub mod filter;
 pub mod instance;
 pub mod journal;
 pub mod jsonl;
+pub mod language;
 pub mod observe;
 pub mod read;
 pub mod render;
 pub mod settings;
 pub mod signals;
+pub mod silence;
 pub mod store;
 pub mod telegram;
+pub mod tools;
 pub mod turn;
 pub mod voice;
 
@@ -156,6 +161,10 @@ pub struct Nanty {
     backend: Mutex<Option<Arc<dyn crate::agents::chat::ChatBackend>>>,
     /// O canal do Telegram (T06): saúde, bot e pareamento, em memória.
     telegram: telegram::Link,
+    /// A lista de vozes do Gemini, guardada por pouco tempo (spec 139 T07).
+    voices: voice::VoicesCache,
+    /// A vez de cada mensagem que fala (spec 139 T08): saem na ordem em que entraram na conversa.
+    speech_turn: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Nanty {
@@ -204,6 +213,8 @@ impl Nanty {
             turns: turn::TurnQueue::default(),
             backend: Mutex::new(None),
             telegram: telegram::Link::default(),
+            voices: voice::VoicesCache::default(),
+            speech_turn: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -452,17 +463,38 @@ impl Nanty {
         if !self.owns() {
             return;
         }
+        self.keep_message(message);
+        self.send_out(message);
+    }
+
+    /// Só a fila de saída, para a mensagem já gravada (T07: a fala do Nanty também vai ao Telegram).
+    pub fn send_out(&self, message: &ConversationMessage) {
+        if self.owns() {
+            self.telegram.outbox().push_message(message, self.now().epoch_ms);
+        }
+    }
+
+    /// Só grava na conversa, sem passar pela fila de saída (só o dono grava): o que já saiu no
+    /// Telegram, como a nota de voz de um aviso, ou o que espera a fala (spec 139 T08). Gravar de novo
+    /// o mesmo id atualiza a mensagem ([`Self::conversation`]).
+    pub fn keep_message(&self, message: &ConversationMessage) {
+        if !self.owns() {
+            return;
+        }
         if self.store.as_ref().is_some_and(|s| s.conversation().append(message).is_err()) {
             terminal_notice("nanty.log.save_failed");
         }
         self.changed(Part::Conversation);
-        // T07: a fala do Nanty também vai ao Telegram, pela fila de saída.
-        self.telegram.outbox().push_message(message, self.now().epoch_ms);
     }
 
-    /// A conversa (as últimas mensagens, da mais velha para a mais nova).
+    /// A conversa (as últimas mensagens, da mais velha para a mais nova), com as linhas do mesmo id
+    /// fundidas ([`store::merged_lines`]). Cada mensagem tem no máximo duas linhas, então o dobro do
+    /// limite sempre traz as últimas [`CONVERSATION_TAIL`].
     pub fn conversation(&self) -> Vec<ConversationMessage> {
-        self.store.as_ref().map(|s| s.conversation().tail(CONVERSATION_TAIL)).unwrap_or_default()
+        let lines = self.store.as_ref().map(|s| s.conversation().tail(CONVERSATION_TAIL * 2)).unwrap_or_default();
+        let mut merged = store::merged_lines(lines);
+        merged.drain(..merged.len().saturating_sub(CONVERSATION_TAIL));
+        merged
     }
 
     /// Pensando ou falando (`None` volta ao estado derivado).
@@ -484,16 +516,51 @@ impl Nanty {
         if now.within(cfg.quiet_window()) {
             return Avatar::Sleeping;
         }
-        if lock(&self.state).cards.iter().any(|c| c.expires_at_ms > now.epoch_ms) {
+        if lock(&self.state).cards.iter().any(|c| c.expires_at_ms > now.epoch_ms && c.awaits_person()) {
             return Avatar::Waiting;
         }
         Avatar::Attentive
     }
 }
 
-/// Idioma das mensagens do Nanty (o gravado na configuração; sem ele, pt-BR).
-pub fn nanty_lang(cfg: &NantyConfig) -> Lang {
-    cfg.lang.as_deref().and_then(Lang::from_tag).unwrap_or_default()
+impl Nanty {
+    /// O idioma da mensagem da pessoa ([`language::person_lang`]); o que veio de um sinal dela vira
+    /// o último idioma da pessoa (grava só se mudou, sem avisar a janela).
+    pub fn note_person_lang(&self, cfg: &NantyConfig, channel: store::Channel, text: Option<&str>) -> Lang {
+        let (lang, signal, pending) = {
+            let st = lock(&self.state);
+            let (lang, signal) = language::person_lang(cfg, &st, channel, text);
+            // Sem texto dela (a encaminhada, a nota sem fala), a pendência fica como está.
+            let pending = text.map_or_else(|| st.person_lang_pending.clone(), |t| language::pending_after(&st, t).map(|l| l.tag().to_string()));
+            (lang, signal, pending)
+        };
+        self.update_quiet(|st| {
+            let spoken = if signal { Some(lang.tag().to_string()) } else { st.person_lang.clone() };
+            let changed = st.person_lang != spoken || st.person_lang_pending != pending;
+            st.person_lang = spoken;
+            st.person_lang_pending = pending;
+            changed
+        });
+        lang
+    }
+
+    /// Guarda o `language_code` do dono no Telegram (spec 139 T05), quando é pt ou en.
+    pub fn note_telegram_lang(&self, code: Option<&str>) {
+        let Some(lang) = code.and_then(language::from_language_code) else { return };
+        let tag = lang.tag();
+        self.update_quiet(|st| {
+            let changed = st.telegram_lang.as_deref() != Some(tag);
+            st.telegram_lang = Some(tag.to_string());
+            changed
+        });
+    }
+}
+
+/// Idioma do Nanty para os avisos proativos, o resumo e o que não responde a uma mensagem (spec 139
+/// T05): o `[nanty] language` escolhido; com `follow`, o último idioma da pessoa e, sem ele, o da
+/// interface lembrado ([`language::resolve`]).
+pub fn nanty_lang(cfg: &NantyConfig, nanty: &Nanty) -> Lang {
+    language::resolve(cfg, &lock(&nanty.state))
 }
 
 /// Grava o idioma da interface na configuração do Nanty quando ele muda (spec 138 T01, C-08): o
@@ -557,6 +624,18 @@ pub fn start(state: &AppState) -> NantyLoop {
             return NantyLoop { handle: None, telegram: None };
         }
     }
+    // Spec 139 T07 (C-16): a voz antiga migrada ao carregar ganha a linha do registro, e o arquivo
+    // passa à forma nova (os campos antigos nunca são gravados). Tudo com a trava de escrita (T08):
+    // a varredura de início pode estar lendo a configuração, e nenhuma outra gravação passa no meio.
+    let (st, n) = (state.clone(), Arc::clone(&nanty));
+    tokio::spawn(async move {
+        let mut cfg = st.config().write().await;
+        let Some(done) = cfg.nanty.voice.migrated.take() else { return };
+        n.record(&voice::migration_entry(&n, &done));
+        if let Err(e) = super::config_api::persist(&st, &cfg).await {
+            n.record(&voice::migration_unsaved(&n, e.code().unwrap_or("config_save_failed")));
+        }
+    });
     // Assina antes de soltar a tarefa: nenhum evento escapa entre o início e o laço.
     let rx = state.events().subscribe();
     let shutdown = state.shutdown_signal();
@@ -686,3 +765,6 @@ mod t03_tests;
 
 #[cfg(test)]
 mod t05_tests;
+
+#[cfg(test)]
+mod t06_tests;

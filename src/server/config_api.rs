@@ -752,14 +752,14 @@ fn models_in_use(cfg: &Config) -> Vec<(String, ConnectionKind)> {
     out
 }
 
-/// Os pares `(conexão, modelo)` efetivos da voz do Nanty (a ordem da fala e a transcrição), só com a
-/// voz ligada.
+/// Os pares `(conexão, modelo)` efetivos da voz do Nanty (a fala e a transcrição, na mesma conexão
+/// do Gemini), só com a voz ligada.
 fn nanty_voice_models(cfg: &Config) -> Vec<(String, String)> {
     if !cfg.nanty.voice.enabled {
         return Vec::new();
     }
-    let (steps, _) = super::nanty::voice::chain(cfg);
-    let mut out: Vec<(String, String)> = steps.into_iter().map(|s| (s.connection.id, s.model)).collect();
+    let mut out: Vec<(String, String)> =
+        super::nanty::voice::speaker(cfg).into_iter().map(|s| (s.connection.id, s.model)).collect();
     if let Some((conn, model)) = super::nanty::voice::transcriber(cfg) {
         out.push((conn.id, model));
     }
@@ -1719,7 +1719,9 @@ mod pricing_estimate_tests {
         cfg.agents.architect.model = "m-a".into();
         cfg.connections.push(Connection::native("g", "g", ConnectionKind::GoogleGemini, "k"));
         cfg.nanty.model = "m-nanty".into();
-        cfg.nanty.voice.order.push(crate::config::VoiceRoute { connection_id: "g".into(), model: "m-voz".into(), voice: String::new() });
+        // A voz desligada não entra, mesmo com o modelo escolhido (spec 139 T07: só os efetivos).
+        cfg.nanty.voice.connection_id = "g".into();
+        cfg.nanty.voice.speech_model = "m-voz".into();
         cfg.nanty.reserve.insert("developer".into(), crate::config::NantyRoute { connection_id: "c".into(), model: "m-a".into() });
         let models = models_in_use(&cfg);
         assert_eq!(
@@ -1727,9 +1729,10 @@ mod pricing_estimate_tests {
             [
                 ("m-a".to_string(), ConnectionKind::ApiKey),
                 ("m-nanty".to_string(), ConnectionKind::ApiKey),
-                ("m-voz".to_string(), ConnectionKind::GoogleGemini),
             ]
         );
+        cfg.nanty.voice.enabled = true;
+        assert!(models_in_use(&cfg).contains(&("m-voz".to_string(), ConnectionKind::GoogleGemini)));
     }
 
     /// Spec 138 T10: com a voz ligada, os modelos que a fala e a transcrição usam de fato entram nos
@@ -1750,7 +1753,7 @@ mod pricing_estimate_tests {
         cfg.nanty.voice.enabled = true;
         let models = models_in_use(&cfg);
         assert!(models.contains(&(crate::config::DEFAULT_GEMINI_TTS_MODEL.to_string(), ConnectionKind::GoogleGemini)), "{models:?}");
-        assert!(models.contains(&(crate::config::DEFAULT_OPENAI_TTS_MODEL.to_string(), ConnectionKind::ApiKey)), "{models:?}");
+        assert!(!models.iter().any(|(_, k)| *k == ConnectionKind::ApiKey), "só o Gemini fala (spec 139 T07): {models:?}");
         assert!(models.contains(&(crate::config::DEFAULT_TRANSCRIBE_MODEL.to_string(), ConnectionKind::GoogleGemini)), "{models:?}");
     }
 

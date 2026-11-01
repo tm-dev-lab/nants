@@ -9,6 +9,8 @@
  * - **Resultado:** o que a decisão disse (`nanty.outcome.*`) ou o erro da rota (cartão vencido,
  *   token trocado), pelo dicionário, numa linha de estado no topo; a janela nunca quebra.
  * - **Desfazer:** no "feito" que ainda tem o desfazer válido.
+ * - **Silêncio (spec 139 T04):** ligado, uma linha discreta no topo diz até quando, com o botão
+ *   "Desligar o silêncio"; ele é um controle, não entra em "Esperando você".
  */
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { formatTime } from "../../i18n";
@@ -71,6 +73,17 @@ export function CardActions({ card, decisions, primary, origin = "feed" }: { car
           {b.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+function SilenceLine({ until, card, decisions }: { until: string; card: NantyCard | null; decisions: NantyDecisions }) {
+  const { t } = useT();
+  const text = card === null ? null : nantyCodeText(card.code, card.params ?? {});
+  return (
+    <div className="nd-nanty-silence" data-nanty-silence="">
+      <p className="nd-nanty-silence-text">{text ?? t("nanty.chat.status_silence", { until: clockText(until) })}</p>
+      {card !== null ? <CardActions card={card} decisions={decisions} primary={false} /> : null}
     </div>
   );
 }
@@ -190,6 +203,7 @@ export function NantyFeedView({ status, feed, decisions, onChangeDigestTime, emp
           {notice.text}
         </p>
       ) : null}
+      {feed?.silence ? <SilenceLine until={feed.silence.until} card={feed.silence.card} decisions={decisions} /> : null}
       {calm ? empty : null}
       {sections.waiting.length > 0 ? (
         <Section id="waiting" label={t("nanty.feed.waiting")} count={sections.waiting.length}>

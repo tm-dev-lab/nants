@@ -141,7 +141,7 @@ pub(super) fn parse_max_searches(raw: Option<&str>) -> Result<u32, String> {
 }
 
 /// Preços passados por variável: `entrada,saída[,cache lido[,escrita de cache]]` em US$ por 1M.
-pub(super) fn parse_prices(raw: &str) -> Option<Pricing> {
+pub(crate) fn parse_prices(raw: &str) -> Option<Pricing> {
     let parts: Vec<f64> = raw.split(',').map(|p| p.trim().parse::<f64>().ok()).collect::<Option<Vec<f64>>>()?;
     if !(2..=4).contains(&parts.len()) || parts.iter().any(|p| !p.is_finite() || *p < 0.0) {
         return None;
@@ -192,7 +192,7 @@ pub(super) fn pick_latest_haiku(list: &Value) -> Option<String> {
 /// O Flash mais recente com raciocínio da lista do Gemini (`GET /v1beta/models`): `thinking: true`,
 /// `generateContent` e o nome `gemini-<versão>-flash` (sem lite, imagem, áudio ou prévia), a maior
 /// versão.
-pub(super) fn pick_latest_flash(list: &Value) -> Option<String> {
+pub(crate) fn pick_latest_flash(list: &Value) -> Option<String> {
     let mut best: Option<(Vec<u32>, String)> = None;
     for m in list["models"].as_array().into_iter().flatten() {
         let name = m["name"].as_str().unwrap_or_default().trim_start_matches("models/");

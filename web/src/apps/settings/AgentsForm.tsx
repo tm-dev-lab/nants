@@ -9,21 +9,19 @@
  * O campo Modelo é um combobox: a lista vem de `GET .../models` da conexão salva (uma carga por
  * endpoint, compartilhada entre papéis); a entrada manual é sempre permitida.
  */
-import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { getConnectionModels, putAgents, type ApiResult } from "../../api/client";
-import type { AgentConfig, Agents, ConnectionView, Effort, ModelsResult } from "../../api/types";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { putAgents } from "../../api/client";
+import type { AgentConfig, Agents, ConnectionView, Effort } from "../../api/types";
 import { Icon } from "../../desktop/Icon";
 import type { Tone } from "../../desktop/theme/tokens";
 import {
   connectionKindOf,
   DEFAULT_MAX_STEPS,
-  describeModelsError,
   EFFORT_OPTIONS,
   effortHint,
   hasStepsLimit,
   MAX_STEPS_MAX,
   MAX_STEPS_MIN,
-  MODELS_MESSAGES,
   parseMaxSteps,
   ROLE_INFO,
   ROLE_ORDER,
@@ -35,6 +33,8 @@ import { t } from "../../i18n";
 import { useT } from "../../i18n/react";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { appStore } from "../../store";
+import { ModelCombobox } from "../shared/ModelCombobox";
+import { modelsHint, useConnectionModels, type ModelsEntry } from "../shared/useConnectionModels";
 
 
 const ROLE_TONE: Readonly<Record<AgentRole, Tone>> = { architect: "violet", developer: "cyan", reviewer: "amber" };
@@ -93,32 +93,6 @@ function validateAgents(draft: Agents, connections: readonly ConnectionView[], s
   return found;
 }
 
-/** Modelo da lista: `id` é o que se grava e envia; `name` (plano ChatGPT, spec 116) é o rótulo. */
-interface ModelOption {
-  id: string;
-  name?: string;
-}
-
-type ModelsEntry =
-  | { status: "loading" }
-  | { status: "ready"; models: ModelOption[]; truncated: boolean }
-  | { status: "error"; message: string };
-
-function endpointKey(connection: ConnectionView): string {
-  return `${connection.id}|${connection.base_url}|${connection.api_key_masked}`;
-}
-
-function toModelsEntry(outcome: ApiResult<ModelsResult>): ModelsEntry {
-  if (!outcome.ok) return { status: "error", message: t("settings.models.requestFailed", { message: apiFailureText(outcome.error) }) };
-  const data = outcome.data;
-  if (typeof data.error === "string") return { status: "error", message: describeModelsError(data.error, data.status) };
-  const models = data.models.flatMap((model): ModelOption[] => {
-    if (typeof model?.id !== "string") return [];
-    return typeof model.name === "string" && model.name.trim() !== "" ? [{ id: model.id, name: model.name }] : [{ id: model.id }];
-  });
-  return { status: "ready", models, truncated: data.truncated === true };
-}
-
 interface AgentsFormProps {
   agents: Agents;
   connections: readonly ConnectionView[];
@@ -136,10 +110,6 @@ export function AgentsForm({ agents, connections, onSaved }: AgentsFormProps) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const [models, setModels] = useState<ReadonlyMap<string, ModelsEntry>>(() => new Map());
-  const entriesRef = useRef<Map<string, ModelsEntry>>(new Map());
-  const tokensRef = useRef<Map<string, number>>(new Map());
-  const activeRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -150,33 +120,10 @@ export function AgentsForm({ agents, connections, onSaved }: AgentsFormProps) {
   // Com "mesmo modelo", o que vale é o Arquiteto.
   const effective = same ? withSameModel(draft) : draft;
 
-  const activeConns = new Map<string, ConnectionView>();
-  for (const role of ROLE_ORDER) {
-    const conn = connections.find((c) => c.id === effective[role].connection_id);
-    if (conn !== undefined) activeConns.set(endpointKey(conn), conn);
-  }
-  const savedKey = [...activeConns.keys()].sort().join("\n");
-
-  function storeEntry(key: string, entry: ModelsEntry | null): void {
-    if (entry === null) entriesRef.current.delete(key);
-    else entriesRef.current.set(key, entry);
-    setModels(new Map(entriesRef.current));
-  }
-
-  function loadModels(conn: ConnectionView, refresh: boolean): void {
-    const key = endpointKey(conn);
-    const token = (tokensRef.current.get(key) ?? 0) + 1;
-    tokensRef.current.set(key, token);
-    storeEntry(key, { status: "loading" });
-    void getConnectionModels(conn.id, { refresh }).then((outcome) => {
-      if (!mountedRef.current || tokensRef.current.get(key) !== token) return;
-      if (!activeRef.current.has(key)) {
-        storeEntry(key, null);
-        return;
-      }
-      storeEntry(key, toModelsEntry(outcome));
-    });
-  }
+  const models = useConnectionModels(
+    ROLE_ORDER.flatMap((role) => connections.filter((c) => c.id === effective[role].connection_id)),
+    connections,
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -185,28 +132,12 @@ export function AgentsForm({ agents, connections, onSaved }: AgentsFormProps) {
     };
   }, []);
 
-  useEffect(() => {
-    const active = new Set(savedKey === "" ? [] : savedKey.split("\n"));
-    activeRef.current = active;
-    const keyById = new Map(connections.map((c) => [c.id, endpointKey(c)]));
-    for (const [key, entry] of [...entriesRef.current]) {
-      const id = key.split("|")[0] ?? key;
-      const stale = keyById.has(id) && keyById.get(id) !== key;
-      const droppable = stale || (active.has(key) ? entry.status === "error" : entry.status !== "ready");
-      if (droppable) entriesRef.current.delete(key);
-    }
-    setModels(new Map(entriesRef.current));
-    for (const [key, conn] of activeConns) {
-      if (!entriesRef.current.has(key)) loadModels(conn, false);
-    }
-  }, [savedKey]);
-
   function patch(role: AgentRole, change: Partial<AgentConfig>): void {
     setDraft((d) => ({ ...d, [role]: { ...d[role], ...change } }));
     setSaved(false);
     if (change.connection_id !== undefined) {
       const conn = connections.find((c) => c.id === change.connection_id);
-      if (conn !== undefined && entriesRef.current.get(endpointKey(conn))?.status === "error") loadModels(conn, false);
+      if (conn !== undefined) models.retryFailed(conn);
     }
   }
 
@@ -289,8 +220,8 @@ export function AgentsForm({ agents, connections, onSaved }: AgentsFormProps) {
                 connections={connections}
                 errors={errors[role]}
                 follows={follows}
-                modelsEntry={conn !== undefined ? models.get(endpointKey(conn)) : undefined}
-                onRefresh={conn !== undefined ? () => loadModels(conn, true) : undefined}
+                modelsEntry={models.entryOf(conn)}
+                onRefresh={conn !== undefined ? () => models.load(conn, true) : undefined}
                 onChange={(change) => patch(role, change)}
                 {...(hasStepsLimit(role)
                   ? {
@@ -365,16 +296,7 @@ function RoleCard({
   const ready = modelsEntry?.status === "ready" ? modelsEntry : null;
   const notListed = switched && ready !== null && !ready.truncated && agent.model.trim() !== "" && !ready.models.some((m) => m.id === agent.model);
 
-  let hint: string | null = null;
-  let warn = false;
-  if (follows) hint = t("settings.agents.follows");
-  else if (loading) hint = MODELS_MESSAGES.loading;
-  else if (modelsEntry?.status === "error") {
-    hint = modelsEntry.message;
-    warn = true;
-  } else if (ready !== null && ready.models.length === 0) hint = MODELS_MESSAGES.empty;
-  else if (ready?.truncated === true) hint = MODELS_MESSAGES.truncated;
-  else if (notListed) hint = MODELS_MESSAGES.notListed;
+  const hint = follows ? { text: t("settings.agents.follows"), warn: false } : modelsHint(modelsEntry, notListed);
 
   return (
     <section aria-label={info.label} className="nd-role-card" data-role={role}>
@@ -435,8 +357,8 @@ function RoleCard({
           }}
         />
         {hint !== null ? (
-          <p aria-live="polite" className={warn ? "nd-field-warn" : "nd-field-hint"}>
-            {hint}
+          <p aria-live="polite" className={hint.warn ? "nd-field-warn" : "nd-field-hint"}>
+            {hint.text}
           </p>
         ) : null}
         {errors?.model !== undefined ? <p className="nd-field-error">{errors.model}</p> : null}
@@ -490,116 +412,5 @@ function RoleCard({
         </div>
       ) : null}
     </section>
-  );
-}
-
-/** Combobox do modelo (texto livre sempre aceito; a lista filtra pela digitação). */
-function ModelCombobox({
-  id,
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  id: string;
-  value: string;
-  options: readonly ModelOption[];
-  disabled: boolean;
-  onChange: (model: string) => void;
-}) {
-  const labelOf = (option: ModelOption): string => option.name ?? option.id;
-  const listId = useId();
-  const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1);
-  const [typed, setTyped] = useState("");
-  const query = typed.trim().toLowerCase();
-  const filtered = query === "" ? [...options] : options.filter((m) => m.id.toLowerCase().includes(query) || labelOf(m).toLowerCase().includes(query));
-  const visible = open && !disabled && filtered.length > 0;
-  const current = visible && active < filtered.length ? active : -1;
-  const optionId = (index: number): string => `${listId}-opt-${index}`;
-
-  const close = (): void => {
-    setOpen(false);
-    setActive(-1);
-    setTyped("");
-  };
-  const choose = (model: string): void => {
-    onChange(model);
-    close();
-  };
-  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>): void => {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      if (filtered.length === 0) return;
-      event.preventDefault();
-      const delta = event.key === "ArrowDown" ? 1 : -1;
-      if (!visible) {
-        setOpen(true);
-        setTyped("");
-        setActive(delta > 0 ? 0 : filtered.length - 1);
-        return;
-      }
-      const base = current < 0 ? (delta > 0 ? -1 : filtered.length) : current;
-      setActive((base + delta + filtered.length) % filtered.length);
-    } else if (event.key === "Enter") {
-      if (visible) {
-        event.preventDefault();
-        if (current >= 0) choose(filtered[current]?.id ?? value);
-        else close();
-      }
-    } else if (event.key === "Escape") {
-      if (visible) {
-        event.preventDefault();
-        event.stopPropagation();
-        close();
-      }
-    }
-  };
-
-  return (
-    <div className="nd-combo">
-      <input
-        id={id}
-        type="text"
-        role="combobox"
-        className="nd-input"
-        aria-autocomplete="list"
-        aria-expanded={visible}
-        aria-controls={visible ? listId : undefined}
-        aria-activedescendant={current >= 0 ? optionId(current) : undefined}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => {
-          onChange(event.target.value);
-          setOpen(true);
-          setActive(-1);
-          setTyped(event.target.value);
-        }}
-        onClick={() => {
-          setOpen(true);
-          setTyped("");
-        }}
-        onBlur={close}
-        onKeyDown={onKeyDown}
-        autoComplete="off"
-        spellCheck={false}
-      />
-      {visible ? (
-        <ul id={listId} role="listbox" aria-label={t("settings.agents.models")} className="nd-combo-list">
-          {filtered.map((model, index) => (
-            <li
-              key={model.id}
-              id={optionId(index)}
-              role="option"
-              aria-selected={model.id === value}
-              data-active={index === current ? "true" : undefined}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => choose(model.id)}
-            >
-              {labelOf(model)}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
   );
 }

@@ -79,6 +79,10 @@ pub struct User {
     pub is_bot: bool,
     #[serde(default)]
     pub username: Option<String>,
+    /// Idioma do aplicativo da pessoa (IETF, como `pt-br` ou `en`), quando o Telegram informa (spec
+    /// 139 T05): a terceira pista do idioma da conversa.
+    #[serde(default)]
+    pub language_code: Option<String>,
 }
 
 /// Chat de uma mensagem (`private`, `group`, `supergroup` ou `channel`).
@@ -105,6 +109,67 @@ pub struct Message {
     /// Nota de voz (T09).
     #[serde(default)]
     pub voice: Option<VoiceNote>,
+    /// A mensagem foi encaminhada (spec 139 T04, C-07): de quem veio. Só a presença conta.
+    #[serde(default)]
+    pub forward_origin: Option<serde_json::Value>,
+    /// A forma antiga do encaminhamento (a data da mensagem original).
+    #[serde(default)]
+    pub forward_date: Option<i64>,
+    /// O trecho citado da mensagem respondida (spec 139 T04).
+    #[serde(default)]
+    pub quote: Option<TextQuote>,
+    /// A mensagem respondida (spec 139 T04): de quem é e o texto.
+    #[serde(default)]
+    pub reply_to_message: Option<RepliedMessage>,
+    /// Resposta a uma mensagem de outro chat (spec 139 T04): sempre de terceiro.
+    #[serde(default)]
+    pub external_reply: Option<serde_json::Value>,
+}
+
+/// O trecho citado (`TextQuote`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TextQuote {
+    #[serde(default)]
+    pub text: String,
+}
+
+/// A mensagem respondida, só com o que conta para saber se é de terceiro.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RepliedMessage {
+    #[serde(default)]
+    pub from: Option<User>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+impl Message {
+    /// O texto de terceiro que a mensagem traz (spec 139 T04, C-07): encaminhada (`forward_origin`)
+    /// ou com a citação de outra pessoa (`external_reply`, ou a resposta a uma mensagem que não é do
+    /// dono nem de um bot, que no chat privado só pode ser o próprio Nanty). `None` sem terceiro.
+    pub fn relayed(&self, owner_id: i64) -> Option<crate::server::nanty::store::Relayed> {
+        let forwarded = self.forward_origin.is_some() || self.forward_date.is_some();
+        let replied_third = self
+            .reply_to_message
+            .as_ref()
+            .and_then(|r| r.from.as_ref())
+            .is_some_and(|u| u.id != owner_id && !u.is_bot);
+        let third_party = self.external_reply.is_some() || replied_third;
+        if !forwarded && !third_party {
+            return None;
+        }
+        let quote = third_party
+            .then(|| {
+                let quoted = self.quote.as_ref().map(|q| q.text.clone()).filter(|t| !t.trim().is_empty());
+                let replied = replied_third
+                    .then(|| self.reply_to_message.as_ref().and_then(|r| r.text.clone().or_else(|| r.caption.clone())))
+                    .flatten();
+                quoted.or(replied)
+            })
+            .flatten();
+        Some(crate::server::nanty::store::Relayed { forwarded, third_party, quote })
+    }
 }
 
 /// Nota de voz recebida (T09): o id do arquivo, a duração (segundos) e o tamanho, quando o Telegram
@@ -334,6 +399,17 @@ impl TelegramClient {
         self.call(false, "editMessageText", &body).await.map(|_| ())
     }
 
+    /// `editMessageCaption` (spec 139 T08, C-14): a legenda de uma nota de voz, em texto puro e no
+    /// limite de 1024; sem `reply_markup`, a mensagem perde os botões.
+    pub async fn edit_caption(&self, chat_id: i64, message_id: i64, caption: &str) -> Result<(), TgError> {
+        let body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "caption": super::format::fit(caption, super::format::MAX_CAPTION_CHARS),
+        });
+        self.call(false, "editMessageCaption", &body).await.map(|_| ())
+    }
+
     /// `editMessageReplyMarkup` sem teclado: tira os botões e mantém o texto.
     pub async fn clear_buttons(&self, chat_id: i64, message_id: i64) -> Result<(), TgError> {
         let body = json!({ "chat_id": chat_id, "message_id": message_id });
@@ -386,9 +462,18 @@ impl TelegramClient {
     }
 
     /// `sendVoice` (T09, C-12): a nota de voz (Opus em OGG) como arquivo, com a legenda em texto
-    /// puro (sem `parse_mode`), cortada no limite de 1024; `silent` manda sem som. Devolve o
-    /// `message_id`.
-    pub async fn send_voice(&self, chat_id: i64, ogg: Vec<u8>, caption: &str, duration_secs: u32, silent: bool) -> Result<Option<i64>, TgError> {
+    /// puro (sem `parse_mode`), cortada no limite de 1024; `silent` manda sem som; `keyboard` são as
+    /// linhas de botões inline, que no multipart vão como JSON em texto (spec 139 T08, C-14). Devolve
+    /// o `message_id`.
+    pub async fn send_voice(
+        &self,
+        chat_id: i64,
+        ogg: Vec<u8>,
+        caption: &str,
+        duration_secs: u32,
+        silent: bool,
+        keyboard: Option<Value>,
+    ) -> Result<Option<i64>, TgError> {
         let part = reqwest::multipart::Part::bytes(ogg)
             .file_name("nanty.ogg")
             .mime_str("audio/ogg")
@@ -401,10 +486,19 @@ impl TelegramClient {
         if silent {
             form = form.text("disable_notification", "true");
         }
+        if let Some(rows) = keyboard {
+            form = form.text("reply_markup", json!({ "inline_keyboard": rows }).to_string());
+        }
         let url = format!("{}/bot{}/sendVoice", self.base, self.token);
         let resp = self.send.post(url).timeout(FILE_TIMEOUT).multipart(form).send().await.map_err(|e| self.network(e))?;
         let result = self.envelope(resp).await?;
         Ok(result.get("message_id").and_then(Value::as_i64))
+    }
+
+    /// `sendChatAction` (spec 139 T03, C-09): o "digitando" (`typing`) ou o "gravando áudio"
+    /// (`record_voice`, T08) no chat, que o Telegram mostra por até 5 segundos ou até a próxima mensagem do bot.
+    pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), TgError> {
+        self.call(false, "sendChatAction", &json!({ "chat_id": chat_id, "action": action })).await.map(|_| ())
     }
 
     /// `leaveChat`: o bot sai de um grupo.

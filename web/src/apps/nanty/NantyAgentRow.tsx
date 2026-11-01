@@ -5,9 +5,9 @@
 import "./nanty.css";
 import { useEffect, useState } from "react";
 import type { ConnectionView } from "../../api/types";
+import { Icon } from "../../desktop/Icon";
 import { useShell } from "../../desktop/shellContext";
 import { useT } from "../../i18n/react";
-import { NantyAvatar } from "./NantyAvatar";
 import { getNantySettings, type NantySettings } from "./nantyApi";
 import { requestNantyTab } from "./nantyStore";
 
@@ -35,7 +35,7 @@ export function NantyAgentRow({ connections }: { connections: readonly Connectio
 
   return (
     <section className="nd-nanty-agent" data-nanty-agent="" aria-label={t("settings.agents.nanty.title")}>
-      <NantyAvatar mood="attentive" size={32} label={t("settings.agents.nanty.title")} />
+      <Icon name="nanty" size={20} />
       <div className="nd-nanty-agent-text">
         <h4 className="nd-role-title" data-tone="violet">
           {t("settings.agents.nanty.title")}

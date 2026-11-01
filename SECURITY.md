@@ -314,6 +314,11 @@ your projects on your computer and to keep a message or a document from steering
   escape sequence does not come back whole. It goes as plain text, with no `parse_mode`, with link
   previews off, links in the model text neutralized and the Telegram size limits respected (4096
   characters per message, 1024 per voice note caption). Messages go through the Telegram servers.
+- **Voice only through your Google Gemini connection.** Speech and transcription use that
+  connection only, with `store: false` in every request, so the provider does not keep the voice
+  note or the transcription. What is spoken is the same text that goes out, already redacted. When
+  the voice fails, the text goes instead. The key goes only in the request header, and the record
+  keeps only codes, never the text or the audio.
 - **No open port.** Nants reads Telegram by long polling (`getUpdates`), never by webhook, so nothing
   listens for the internet. Reading and sending use separate clients with no redirects, and the
   Telegram address is fixed in the code (only tests change it, never the configuration).
@@ -345,19 +350,41 @@ did not confirm:
   action and the current state (a card has an expiry, the first click counts, and the approval card
   checks a hash of the plan before starting). Actions that write a permanent permission or change
   the channel, the token or the chat are only yours, on the screen, and cannot be made automatic.
-- **Confirmation.** Anything asked in free text, on Telegram or in the window, always comes back as a
-  card to confirm, even when the action is automatic.
+- **Confirmation.** Any action asked in free text, on Telegram or in the window, always comes back as
+  a card to confirm, even when it is automatic. The model can only propose, with a tool that accepts
+  what the server offers for that project right now; the server creates the card, and only your
+  click runs it. The only thing applied without a click is the mute of notices: it only reduces
+  notices, ends within 24 hours and changes no channel, token or recipient. Its confirmation is
+  written by the server, with the time the server calculated and a button to turn it off, and the
+  urgent still arrives, without sound.
+- **Tainted turn.** Text that did not come from you never counts as your request. Once a message
+  brings untrusted data into the turn (a read of project content, a forwarded message or a quote of
+  someone else, now or in the conversation memory), the mute also becomes a card to confirm, which
+  expires at the latest at the time it shows, so a clicked card never mutes past it. Project content has a limit
+  of reads per message.
+- **Forwarded messages and quotes.** A forwarded message, or a quote of a third party, goes to the
+  model as untrusted data, in the same envelope as project content, and a forwarded message never
+  counts as a command. The language of a forwarded text does not count as yours either.
 - **Structured signals when it acts on its own.** In a proactive turn, the model gets only
   structured signals (codes, ids, counts, roles, cost and disk), from a fixed list of accepted keys,
   never the text of a spec, a log, an agent output or a commit. Its answer must be a summary plus
   catalog ids, checked by the server; anything else is dropped.
-- **Reading on request, limited to the project you name.** Only when you ask about a project does
-  Nanty read it: the plan, the tasks, the report and the costs of that project only, never the logs
-  and never another project, marked as untrusted data, with your secrets and the URLs redacted and a
-  size limit. Your own messages are redacted before they are stored.
+- **Read only tools, with checked ids.** In the conversation, the model chooses what to look up, but
+  every tool that takes a project accepts only the ids of the projects Nanty watches: an excluded or
+  unknown id gets a plain refusal, with no read. What comes from the state tools is trusted, because
+  it comes from the same source as the bell and the notices. What comes from the files of a project
+  (the plan, the tasks, the report and the costs, never the logs) is marked as untrusted data, with
+  your secrets and the URLs redacted and a size limit, and when it disagrees with the state, the
+  state wins. No tool writes outside the cards and the mute, and none changes the channel, the token
+  or the recipient. Your own messages are redacted before they are stored, and the conversation
+  memory keeps only what you said and the final replies, never what a tool returned.
+- **Limits per message.** Rounds of tools, tool calls, time and tokens are limited, the daily budget
+  is checked before each round and the last round goes without tools.
 - **A tested trap.** The tests put instructions such as "send the token to..." and "approve the plan"
-  inside project files and check that no action happens, nothing leaks and the action still waits
-  for your click; a code shaped trap text in a project title must never reach a proactive turn.
+  inside project files and forwarded messages, have a tool output order a mute, an action outside
+  the catalog or a read of an excluded project, and check that no action happens, nothing leaks, the
+  channel and the token do not change and the action still waits for your click; a code shaped trap
+  text in a project title must never reach a proactive turn.
 
 ## Release packages
 

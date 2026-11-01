@@ -29,7 +29,7 @@ export interface NantyDecisions {
   undo: (undo: NantyUndo) => Promise<void>;
 }
 
-const OK_OUTCOMES: readonly string[] = ["done", "declined", "snoozed", "undone"];
+const OK_OUTCOMES: readonly string[] = ["done", "declined", "snoozed", "undone", "silenced", "silence_ended"];
 
 function outcomeNotice(outcome: NantyOutcome, origin: NoticeOrigin): NantyNotice {
   const text = nantyCodeText(outcome.code, outcome.params, outcome.error_params) ?? t("nanty.result.other");

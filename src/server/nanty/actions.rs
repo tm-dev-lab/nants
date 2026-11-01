@@ -8,6 +8,9 @@
 //!   trocar para a reserva (que já inclui a retomada) e limpar órfãos começam em "automática".
 //! - **Opções do cartão, sem nível:** lembrar depois (silêncio com validade), abrir no Nants e
 //!   aumentar o limite (o orçamento estourado é só sinal: o runner já pausou, C-01).
+//! - **Silêncio da conversa (spec 139 T04, C-08):** confirmar o silêncio (o cartão do turno com dado
+//!   não confiável) e desligar o silêncio (o botão da confirmação). Sem nível: só mudam o silêncio de
+//!   tudo, com validade, e nunca o canal.
 //! - **Faixa "só a pessoa":** propriedade do catálogo. Nunca vira automática e o Nanty nunca a
 //!   executa: liberar um comando "sempre" e mudar canal, token ou destinatário.
 //!
@@ -38,6 +41,10 @@ pub enum ActionId {
     /// sempre com o cartão de confirmação; nenhum observador a sugere.
     PauseRun,
     RemindLater,
+    /// Confirmar o silêncio pedido na conversa (spec 139 T04): o cartão do turno contaminado.
+    SetSilence,
+    /// Desligar o silêncio de tudo (spec 139 T04): o botão da confirmação do silêncio.
+    EndSilence,
     OpenNants,
     RaiseLimit,
     AllowCommandAlways,
@@ -55,6 +62,9 @@ pub enum ActionKind {
     Link,
     /// Faixa "só a pessoa": nunca automática e nunca executada pelo Nanty.
     PersonOnly,
+    /// O silêncio da conversa (spec 139 T04): sem nível; o "sim" liga ou desliga o silêncio de tudo,
+    /// e nada mais. O modelo nunca o propõe pelo catálogo.
+    Silence,
 }
 
 /// Uma entrada do catálogo.
@@ -73,7 +83,7 @@ const fn entry_of(id: ActionId, kind: ActionKind, default_level: ActionLevel, un
 }
 
 /// O catálogo inteiro. Nenhuma ação fora daqui.
-pub const CATALOG: [CatalogEntry; 11] = [
+pub const CATALOG: [CatalogEntry; 13] = [
     entry_of(ActionId::ApprovePlan, ActionKind::Executes, ActionLevel::Ask, false),
     entry_of(ActionId::ResumeRun, ActionKind::Executes, ActionLevel::Ask, false),
     entry_of(ActionId::RetryProvider, ActionKind::Executes, ActionLevel::Auto, false),
@@ -81,6 +91,8 @@ pub const CATALOG: [CatalogEntry; 11] = [
     entry_of(ActionId::CleanOrphans, ActionKind::Executes, ActionLevel::Auto, false),
     entry_of(ActionId::PauseRun, ActionKind::Executes, ActionLevel::Ask, false),
     entry_of(ActionId::RemindLater, ActionKind::CardOption, ActionLevel::Ask, false),
+    entry_of(ActionId::SetSilence, ActionKind::Silence, ActionLevel::Ask, false),
+    entry_of(ActionId::EndSilence, ActionKind::Silence, ActionLevel::Ask, false),
     entry_of(ActionId::OpenNants, ActionKind::Link, ActionLevel::Ask, false),
     entry_of(ActionId::RaiseLimit, ActionKind::Link, ActionLevel::Ask, false),
     entry_of(ActionId::AllowCommandAlways, ActionKind::PersonOnly, ActionLevel::Ask, false),
@@ -97,6 +109,8 @@ impl ActionId {
             ActionId::CleanOrphans => "clean_orphans",
             ActionId::PauseRun => "pause_run",
             ActionId::RemindLater => "remind_later",
+            ActionId::SetSilence => "set_silence",
+            ActionId::EndSilence => "end_silence",
             ActionId::OpenNants => "open_nants",
             ActionId::RaiseLimit => "raise_limit",
             ActionId::AllowCommandAlways => "allow_command_always",
@@ -126,7 +140,7 @@ pub fn level(cfg: &NantyConfig, id: ActionId) -> Option<ActionLevel> {
     let entry = id.entry();
     let configured = cfg.actions.get(id.as_str()).copied().unwrap_or(entry.default_level);
     match entry.kind {
-        ActionKind::CardOption | ActionKind::Link => None,
+        ActionKind::CardOption | ActionKind::Link | ActionKind::Silence => None,
         ActionKind::Executes => Some(configured),
         ActionKind::PersonOnly => Some(match configured {
             ActionLevel::Auto => ActionLevel::Ask,

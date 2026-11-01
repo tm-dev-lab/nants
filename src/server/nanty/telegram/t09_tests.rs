@@ -38,7 +38,7 @@ fn voice_update(update_id: i64, from: i64, duration: u64, size: Option<u64>) -> 
     }})
 }
 
-/// Mundo pareado com a voz ligada (Gemini e OpenAI simulados), a escuta e a fila de saída.
+/// Mundo pareado com a voz ligada (o Gemini simulado), a escuta e a fila de saída.
 async fn world(tag: &str, edit: impl FnOnce(&mut Config)) -> (World, std::sync::Arc<Fake>, std::sync::Arc<FakeVoice>) {
     let tk = token(tag);
     let (fake, base) = fake_server(&tk).await;
@@ -93,9 +93,8 @@ async fn the_owner_voice_note_is_heard_and_answered_in_voice() {
     assert!(voice_call["voice_bytes"].as_u64().unwrap_or(0) > 100, "{voice_call}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(fake.sent_texts().is_empty(), "a legenda levou o texto inteiro");
-    // O Gemini falou (o primeiro da ordem) e o gasto contou a transcrição e a fala.
+    // O Gemini falou e o gasto contou a transcrição e a fala.
     assert_eq!(voice_fake.calls("gemini").len(), 1);
-    assert!(voice_fake.calls("openai").is_empty());
     let spend = w.state.nanty().snapshot().spend_on(&w.state.nanty().now().day_key());
     assert_eq!(spend.voice_calls, 2);
     // Os dois áudios são servidos à janela.
@@ -135,6 +134,23 @@ async fn a_long_text_goes_as_a_short_caption_and_the_full_text_apart() {
     assert!(text_at.duration_since(voice_at) >= super::tests::FAST.send_gap, "intervalo da fila");
 }
 
+/// Spec 139 T12: a frase do servidor fecha a mensagem e sobrevive ao corte da legenda.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_line_stays_in_a_cut_caption() {
+    let (w, fake, _voice) = world("t09-closing", |_| {}).await;
+    let _out = start_outbox(&w);
+    let long = "Projeto Loja segue bem. ".repeat(80);
+    let mut message = spoken_reply(&w, &long);
+    message.code = Some("nanty.chat.confirm".into());
+    message.lang = Some("pt-BR".into());
+    w.state.nanty().push_message(&message);
+    until("texto à parte", || !fake.sent_texts().is_empty()).await;
+    let line = crate::i18n::tr(Lang::PtBr, "nanty.chat.confirm", &[]);
+    let caption = sends(&fake, "sendVoice")[0]["caption"].as_str().unwrap_or_default().to_string();
+    assert!(caption.encode_utf16().count() <= 1024 && caption.ends_with(&format!("…\n{line}")), "{caption}");
+    assert!(fake.sent_texts()[0].ends_with(&line), "o texto completo também fecha com ela");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_voice_note_falls_back_to_the_text() {
     let (w, fake, _voice) = world("t09-refused", |_| {}).await;
@@ -153,8 +169,8 @@ async fn a_refused_voice_note_falls_back_to_the_text() {
 async fn every_voice_failing_answers_in_text() {
     let (w, fake, voice_fake) = world("t09-text", |_| {}).await;
     let _out = start_outbox(&w);
+    // Só o Gemini fala (spec 139 T07): ele cai e a resposta vai em texto.
     lock(&voice_fake.gemini).push_back(Reply::Status(500));
-    lock(&voice_fake.openai).push_back(Reply::Status(503));
     fake.push(voice_update(81, OWNER, 2, None));
     until("resposta em texto", || !fake.sent_texts().is_empty()).await;
     assert!(fake.calls("sendVoice").is_empty());
@@ -167,19 +183,21 @@ async fn every_voice_failing_answers_in_text() {
 async fn duration_and_size_are_checked_before_the_download() {
     let (w, fake, voice_fake) = world("t09-limits", |cfg| cfg.nanty.voice.max_input_secs = 60).await;
     let _out = start_outbox(&w);
+    // A recusa também é fala do Nanty (spec 139 T08): a voz segue ligada, então vai como nota.
+    let captions = |fake: &Fake| sends(fake, "sendVoice").iter().filter_map(|b| b["caption"].as_str().map(str::to_string)).collect::<Vec<_>>();
     // Longa demais: nem o `getFile`.
     fake.push(voice_update(90, OWNER, 61, Some(1000)));
-    until("recusa da duração", || fake.sent_texts().len() == 1).await;
-    assert_eq!(fake.sent_texts()[0], tr(Lang::PtBr, "nanty.voice.too_long", &[("max", "60")]));
+    until("recusa da duração", || captions(&fake).len() == 1).await;
+    assert_eq!(captions(&fake)[0], tr(Lang::PtBr, "nanty.voice.too_long", &[("max", "60")]));
     // Acima de 20 MB pelo que a mensagem informa: nem o `getFile`.
     fake.push(voice_update(91, OWNER, 5, Some(MAX_INPUT_BYTES + 1)));
-    until("recusa do tamanho", || fake.sent_texts().len() == 2).await;
-    assert_eq!(fake.sent_texts()[1], tr(Lang::PtBr, "nanty.voice.too_big", &[("max", "20")]));
+    until("recusa do tamanho", || captions(&fake).len() == 2).await;
+    assert_eq!(captions(&fake)[1], tr(Lang::PtBr, "nanty.voice.too_big", &[("max", "20")]));
     assert!(fake.calls("getFile").is_empty());
     // Sem tamanho na mensagem, mas o `getFile` diz que passa: sem download.
     lock(&fake.files).insert(FILE_ID.into(), (Some(MAX_INPUT_BYTES + 1), FILE_PATH.into()));
     fake.push(voice_update(92, OWNER, 5, None));
-    until("recusa no getFile", || fake.sent_texts().len() == 3).await;
+    until("recusa no getFile", || captions(&fake).len() == 3).await;
     assert_eq!(fake.calls("getFile").len(), 1);
     assert!(fake.calls("download").is_empty(), "nada baixado");
     assert!(voice_fake.calls("transcribe").is_empty());
@@ -248,6 +266,6 @@ async fn the_download_never_shows_the_token() {
     let client = TelegramClient::new(&dead, tk.clone(), Duration::ZERO).expect("cliente");
     let err = client.download(FILE_PATH, 1000).await.expect_err("sem rede").to_string();
     assert!(!err.contains(&tk) && !err.contains("file/bot"), "{err}");
-    let err = client.send_voice(1, small_ogg(), "oi", 1, false).await.expect_err("sem rede").to_string();
+    let err = client.send_voice(1, small_ogg(), "oi", 1, false, None).await.expect_err("sem rede").to_string();
     assert!(!err.contains(&tk) && !err.contains("sendVoice"), "{err}");
 }

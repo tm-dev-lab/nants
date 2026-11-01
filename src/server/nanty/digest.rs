@@ -6,9 +6,12 @@
 //! - **Do que é feito:** só fatos ([`DigestFacts`]): os projetos observados, quantos estão em
 //!   andamento e pausados, o que espera a pessoa (cartões abertos e os avisos guardados para o
 //!   resumo, como os da noite), o custo dos projetos no dia anterior e o menor espaço livre em disco.
-//! - **O modelo** entra só se houver o que destacar e houver orçamento; o texto dele vai junto, como
-//!   veio e com o idioma marcado. A mensagem fixa (`code` + `params`) sai sempre.
+//! - **O modelo** entra só se houver o que destacar e houver orçamento; o texto dele vai como veio e
+//!   com o idioma marcado. Com ele, a lista fixa sai e fica só a frase curta do servidor junto
+//!   (spec 139 T06, C-11, [`with_model_text`]); sem ele, a mensagem fixa (`code` + `params`) é a
+//!   reserva, com uma frase por fato e sem zeros.
 //! - **Dia vazio:** `[nanty] digest_empty` decide entre a mensagem curta e nenhuma.
+//! - **Voz (spec 139 T08):** com a voz ligada, o resumo sai como nota de voz com legenda.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,7 +114,7 @@ pub fn state_facts(st: &NantyState, now_ms: u64) -> DigestFacts {
         waiting: st
             .cards
             .iter()
-            .filter(|c| c.expires_at_ms > now_ms && c.urgency != Some(Urgency::Digest))
+            .filter(|c| c.expires_at_ms > now_ms && c.urgency != Some(Urgency::Digest) && c.awaits_person())
             .count() as u64,
         items: st.digest.clone(),
         disk_low,
@@ -193,32 +196,93 @@ pub fn compose(facts: &DigestFacts, cfg: &NantyConfig, id: String, at_ms: u64) -
     params.insert("paused".into(), json!(facts.paused));
     params.insert("waiting".into(), json!(facts.waiting));
     params.insert("items".into(), json!(facts.items.len()));
+    // Spec 139 T06: só o que não é zero vira frase, e cada número na frase dele.
     let mut lines = Vec::new();
+    for (count, code) in [
+        (facts.running, "nanty.digest.running"),
+        (facts.paused, "nanty.digest.paused"),
+        (facts.waiting, "nanty.chat.status_waiting"),
+    ] {
+        if count > 0 {
+            lines.push(line(code, json!({ "count": count })));
+        }
+    }
     if facts.tokens_yesterday > 0 {
-        let code = if facts.unpriced_yesterday { "nanty.digest.cost_partial" } else { "nanty.digest.cost" };
-        lines.push(line(code, json!({ "cost_usd": (facts.cost_yesterday_usd * 100.0).round() / 100.0, "tokens": facts.tokens_yesterday })));
+        let usd = (facts.cost_yesterday_usd * 100.0).round() / 100.0;
+        let tokens = json!({ "cost_usd": usd, "tokens": facts.tokens_yesterday });
+        // Sem nada com preço (o plano, por exemplo), só os tokens: nada de "US$ 0,00".
+        let code = match (usd > 0.0, facts.unpriced_yesterday) {
+            (false, _) => "nanty.digest.tokens",
+            (true, true) => "nanty.digest.cost_partial",
+            (true, false) => "nanty.digest.cost",
+        };
+        lines.push(line(code, tokens));
     }
     if let Some(gb) = facts.disk_free_gb {
         lines.push(line("nanty.digest.disk", json!({ "free_gb": gb })));
     }
-    for item in facts.items.iter().rev().take(MAX_DIGEST_LINES).rev() {
-        let mut p = item.params.clone();
-        if let Some(project) = &item.project_id {
-            p.insert("project_id".into(), json!(project));
-        }
-        lines.push(line(&item.code, Value::Object(p)));
-    }
     if !lines.is_empty() {
         params.insert("lines".into(), Value::Array(lines));
+    }
+    let why = held_why(facts);
+    if !why.is_empty() {
+        params.insert(WHY.into(), Value::Array(why));
     }
     let mut message = ConversationMessage::from_nanty(id, at_ms, Channel::Web, MORNING, params);
     message.project_id = None;
     Some(message)
 }
 
+/// Campo de `params` com o porquê dos avisos guardados (spec 139 T06, C-06 da 138): o cabeçalho
+/// `nanty.digest.held` e um `nanty.why.*` por aviso, cada um `{code, params}`. Fica à parte de
+/// `lines` porque sai sempre, com ou sem o texto do modelo: os avisos guardados não viram cartão,
+/// então o porquê deles só existe aqui.
+pub const WHY: &str = "why";
+
+/// O porquê dos avisos guardados (os mais recentes, até [`MAX_DIGEST_LINES`]), do dicionário.
+fn held_why(facts: &DigestFacts) -> Vec<Value> {
+    let held: Vec<&DigestItem> = facts.items.iter().rev().take(MAX_DIGEST_LINES).rev().collect();
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![line("nanty.digest.held", json!({ "count": facts.items.len() }))];
+    for item in held {
+        let mut p = item.params.clone();
+        if let Some(project) = &item.project_id {
+            p.insert("project_id".into(), json!(project));
+        }
+        out.push(line(&item.code, Value::Object(p)));
+    }
+    out
+}
+
+/// Código da frase curta que vai junto do texto do modelo no resumo da manhã (spec 139 T06, C-11):
+/// diz por que a mensagem chegou.
+pub const LEAD: &str = "nanty.digest.lead";
+
+/// O resumo com o texto do modelo (spec 139 T06, C-11): as linhas de contagem, custo e disco saem;
+/// ficam a frase curta do servidor ([`LEAD`]), o porquê de cada aviso guardado ([`WHY`], do
+/// dicionário) e o texto do modelo.
+pub fn with_model_text(message: &mut ConversationMessage, facts: &DigestFacts, text: String) {
+    let mut params = Map::new();
+    let why = held_why(facts);
+    if !why.is_empty() {
+        params.insert(WHY.into(), Value::Array(why));
+    }
+    message.code = Some(LEAD.to_string());
+    message.params = params;
+    message.text = Some(text);
+}
+
 /// A entrada do modelo para o resumo: só fatos estruturados.
 pub fn digest_input(facts: &DigestFacts, st: &NantyState) -> TurnInput {
-    let mut input = TurnInput::new(TurnKind::MorningDigest);
+    summary_input(TurnKind::MorningDigest, facts, st)
+}
+
+/// A entrada do resumo de um tipo (o da manhã ou o `/resumo`, spec 139 T06): só fatos
+/// estruturados, sem contagem zerada (zero não é fato).
+pub fn summary_input(kind: TurnKind, facts: &DigestFacts, st: &NantyState) -> TurnInput {
+    let mut input = TurnInput::new(kind);
     input.signals = st.alerts.values().filter_map(SignalFact::of_alert).take(turn::MAX_SIGNALS_IN).collect();
     input.signals.extend(
         facts.items.iter().rev().take(turn::MAX_SIGNALS_IN).filter_map(|item| {
@@ -240,7 +304,9 @@ pub fn digest_input(facts: &DigestFacts, st: &NantyState) -> TurnInput {
         ("waiting", facts.waiting),
         ("digest_items", facts.items.len() as u64),
     ] {
-        input.counts.insert(name, value);
+        if value > 0 {
+            input.counts.insert(name, value);
+        }
     }
     if facts.tokens_yesterday > 0 {
         input.tokens.insert("projects_yesterday", facts.tokens_yesterday);
@@ -284,17 +350,18 @@ pub async fn maybe_send(state: &AppState, nanty: &Arc<Nanty>) -> bool {
         record(nanty, "digest.skipped", consumed);
         return false;
     };
+    // O resumo segue o idioma do Nanty (spec 139 T05), o texto fixo e o do modelo.
+    message.lang = Some(nanty_lang(&cfg, nanty).tag().to_string());
     if facts.has_highlights() {
         let input = digest_input(&facts, &snapshot);
         if let TurnOutcome::Reply(reply) = turn::run(state, nanty, &input).await {
-            message.text = Some(reply.summary);
-            message.lang = Some(nanty_lang(&cfg).tag().to_string());
+            with_model_text(&mut message, &facts, reply.summary);
             message.actions = reply.actions.iter().map(|a| a.as_str().to_string()).collect();
         }
     }
     record(nanty, "digest.sent", consumed);
-    let n = Arc::clone(nanty);
-    let _ = tokio::task::spawn_blocking(move || n.push_message(&message)).await;
+    // Spec 139 T08: o resumo entra na conversa agora; com a voz ligada, a fala vem depois.
+    super::voice::deliver(state, nanty, &mut message, false).await;
     true
 }
 

@@ -1,7 +1,8 @@
 /*
- * Ícone de um app onde ele aparece (barra de título, menu do N e alternador do celular). O Nanty
- * (spec 138 T04) aparece pelo avatar colorido, no estado atual que vem da API; os demais, pelo ícone
- * do conjunto. Decorativo: o nome do app fica no texto ao lado.
+ * Ícone de um app na barra de título da janela. O Nanty (spec 138 T04) aparece pelo avatar colorido,
+ * no estado atual que vem da API; os demais, pelo ícone do conjunto. Fora da janela (menu do N,
+ * busca, alternador do celular) todo app, o Nanty inclusive, usa o ícone de linha do conjunto
+ * (spec 139 G8). Decorativo: o nome do app fica no texto ao lado.
  */
 import { NantyAvatar } from "../apps/nanty/NantyAvatar";
 import { nantyMood } from "../apps/nanty/nantyModel";

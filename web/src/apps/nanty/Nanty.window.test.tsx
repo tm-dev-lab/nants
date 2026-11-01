@@ -1,7 +1,8 @@
 /*
  * Janela do Nanty no shell (spec 138 T04, critérios 2, 3 e 6): janela de sistema em qualquer
  * espaço (inclusive sem projeto), no menu do N, no lançador e no Alternador do celular; abas na
- * barra de título; o avatar no estado que vem da API; e o selo sem duplicar o sino.
+ * barra de título; o avatar no estado que vem da API; e o selo sem duplicar o sino. Spec 139 G8: fora
+ * da janela, o ícone de linha do conjunto, igual ao dos outros apps.
  */
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -45,11 +46,12 @@ async function openNanty(): Promise<HTMLElement> {
 }
 
 describe("janela do Nanty", () => {
-  it("no menu do N com o avatar, e abre com as abas Feed, Regras e Ajustes na barra de título", async () => {
+  it("no menu do N com o ícone de linha, e abre com as abas Feed, Regras e Ajustes na barra de título", async () => {
     await renderShell({ ...SPACE, nanty: { config: NANTY_CONFIG, telegram: NANTY_TELEGRAM } });
     const tile = openNMenu().querySelector<HTMLElement>('.nd-nmenu-tile[data-kind="nanty"]');
     expect(tile?.getAttribute("aria-label")).toBe("Nanty");
-    expect(tile?.querySelector("svg[data-nanty-avatar]")?.getAttribute("data-mood")).toBe("attentive");
+    expect(tile?.querySelector('.nd-nmenu-icon > svg[data-icon="nanty"]')).not.toBeNull();
+    expect(tile?.querySelector("svg[data-nanty-avatar]")).toBeNull();
     fireEvent.keyDown(window, { key: "Escape" });
 
     const win = await openNanty();
@@ -108,6 +110,31 @@ describe("janela do Nanty", () => {
     expect(nantyWindow().hidden).toBe(false);
   });
 
+  it("na grade do menu, com a janela aberta, igual aos outros apps: mesmo ícone de linha, mesmo ponto", async () => {
+    await renderShell(SPACE);
+    await openNanty();
+    await act(async () => activateApp("Conversa"));
+    await settle();
+    await act(async () => activateApp("Nanty"));
+    await settle();
+    const panel = openNMenu();
+    const nanty = panel.querySelector<HTMLElement>('.nd-nmenu-tile[data-kind="nanty"]') as HTMLElement;
+    const other = panel.querySelector<HTMLElement>('.nd-nmenu-tile[data-kind="conversation"]') as HTMLElement;
+    expect(nanty.getAttribute("data-state")).toBe("focused");
+    expect(other.getAttribute("data-state")).toBe("open");
+    // Nada colorido no menu: o avatar só existe na barra de título da janela, fora do painel.
+    expect(panel.querySelector("svg[data-nanty-avatar]")).toBeNull();
+    for (const el of [nanty, other]) {
+      const svg = el.querySelector(".nd-nmenu-icon > svg") as SVGElement;
+      expect(svg.getAttribute("stroke")).toBe("currentColor");
+      expect(svg.getAttribute("width")).toBe("18");
+      expect(el.querySelectorAll(".nd-nmenu-indicator")).toHaveLength(1);
+    }
+    const chip = panel.querySelector<HTMLElement>('.nd-nmenu-chip[data-kind="nanty"]');
+    expect(chip?.querySelector('svg[data-icon="nanty"]')).not.toBeNull();
+    expect(panel.querySelector('.nd-nmenu-chip[data-kind="conversation"] svg[data-icon="conversation"]')).not.toBeNull();
+  });
+
   it("o avatar segue a API: o nanty_changed relê o estado", async () => {
     const view = await renderShell(SPACE);
     const win = await openNanty();
@@ -138,7 +165,10 @@ describe("selo do Nanty (C-07)", () => {
     expect(appBadge("nanty")).toBe("2");
     expect(document.querySelector("[data-nbutton-dot]")).not.toBeNull();
     const tile = openNMenu().querySelector<HTMLElement>('.nd-nmenu-tile[data-kind="nanty"]');
-    expect(tile?.querySelector("svg[data-nanty-avatar]")?.getAttribute("data-mood")).toBe("waiting");
+    // O selo continua sobre o ícone de linha: o estado "esperando você" não pede o avatar no menu.
+    expect(tile?.querySelector('svg[data-icon="nanty"]')).not.toBeNull();
+    expect(tile?.querySelector("svg[data-nanty-avatar]")).toBeNull();
+    expect(tile?.querySelector("[data-badge]")?.textContent).toBe("2");
     expect(tile?.textContent).toContain("2 avisos esperando você");
   });
 
@@ -156,7 +186,7 @@ describe("selo do Nanty (C-07)", () => {
 });
 
 describe("celular", () => {
-  it("o Nanty está no Alternador, com o avatar e o selo, e abre em tela cheia", async () => {
+  it("o Nanty está no Alternador, com o ícone de linha e o selo, e abre em tela cheia", async () => {
     const original = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       media: query,
@@ -173,7 +203,8 @@ describe("celular", () => {
     await settle();
     const switcher = screen.getByRole("region", { name: "Janelas" });
     const item = switcher.querySelector<HTMLElement>('.nd-switcher-item[data-kind="nanty"]');
-    expect(item?.querySelector("svg[data-nanty-avatar]")).not.toBeNull();
+    expect(item?.querySelector('.nd-switcher-icon > svg[data-icon="nanty"]')?.getAttribute("width")).toBe("20");
+    expect(item?.querySelector("svg[data-nanty-avatar]")).toBeNull();
     expect(item?.querySelector("[data-badge]")?.textContent).toBe("1");
     await act(async () => {
       fireEvent.click(item as HTMLElement);

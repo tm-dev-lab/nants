@@ -55,23 +55,62 @@ event bus / periodic scan
                   hours; fixed urgency table; the why line of each notice comes from the dictionary
   -> act.rs       a card per offer (token, expiry, plan hash), the level of each catalog id
                   (actions.rs), automatic actions, atomic decision, state check, undo
-  -> turn.rs      model turn in a single queue, inside the daily budget: structured signals only
-                  (signals.rs) when proactive; chat.rs and read.rs for the conversation and the
-                  reading on request of the cited project
-  -> telegram/    long polling, pairing, outbox (one message per second, edits, quiet sends),
-                  format.rs (plain text, redaction, limits); voice/ for speech and transcription
+  -> turn.rs      proactive model turn in a single queue, inside the daily budget: structured
+                  signals only (signals.rs)
+  -> telegram/    long polling, pairing, outbox (one message per second, edits, quiet sends, speech
+                  outside the queue), format.rs (plain text, redaction, limits); voice/ for speech
+                  and transcription
+
+person message (Telegram or window)
+  -> chat.rs      command, or free text; forwarded text and third party quotes are marked
+  -> agent.rs     loop with the same turn queue and budget: the model picks tools until the text
+  -> tools.rs     read only tools, ids checked against the watched projects; proposals and mute
+  -> silence.rs   mute applied at once, or a card when the turn is tainted
+  -> voice/       the text enters the conversation, then the speech joins the same message
 ```
 
 - **Modules.** `mod.rs` (the loop, the lock and the bus subscriber), `observe.rs`, `filter.rs`,
   `actions.rs` (the fixed catalog) and `act.rs` (offers and execution through the existing
   handlers, called in process, never over HTTP), `signals.rs`, `turn.rs`, `digest.rs` (the morning
-  summary), `chat.rs` (commands and free text), `read.rs` (the reading on request, from the project
-  snapshot, as untrusted data), `render.rs` (`code` plus `params` to text), `store.rs` (cards,
-  silences, the conversation, the spend of the day), `journal.rs` and `jsonl.rs` (the record, JSONL
-  with rotation), `clock.rs` (local time through `localtime_r`, injectable in tests),
+  summary), `chat.rs` (commands, free text and the reserve with no model), `agent.rs` (the
+  conversation loop), `tools.rs` (the conversation tools), `silence.rs` (the mute of everything),
+  `language.rs` (the language of the person and of Nanty), `read.rs` (the reading on request, from
+  the project snapshot, as untrusted data), `render.rs` (`code` plus `params` to text), `store.rs`
+  (cards, silences, the conversation, the spend of the day), `journal.rs` and `jsonl.rs` (the record,
+  JSONL with rotation), `clock.rs` (local time through `localtime_r`, injectable in tests),
   `instance.rs`, `settings.rs` and `api.rs` (the `/api/nanty/*` routes and the window events),
   `telegram/` (`client.rs`, `pairing.rs`, `outbox.rs`, `format.rs`, `api.rs`) and `voice/`
-  (`provider.rs` for the provider chain, `encode.rs` for the Opus voice note in pure Rust).
+  (`provider.rs` for the Google Gemini calls: speech, transcription with `store: false`, the voice
+  list and the speech models; `encode.rs` for the Opus voice note in pure Rust).
+- **One source of truth.** `observe::project_facts(state, cfg, id)` gives the facts of a project with
+  one phase of explicit precedence (paused, stopped by the provider, plan waiting, running, stopped
+  with nothing pending), read from the same attention context as the bell. The observer and the
+  `project_status` tool both use it, so the conversation and the notices cannot disagree. Zeros and
+  default values are not facts.
+- **Conversation loop.** `agent.rs` reuses the call id functions of the agents, the `ChatBackend` and
+  the `provider_items`, resent as they came. Limits come from `[nanty.chat]` (rounds, deadline, calls
+  per reply, tokens per message, memory, `project_details` per turn), written only when they change;
+  the budget is checked before each round, every call gets a result and the last round has no tools.
+  The system prompt and the tools form a stable prefix with a fixed `cache_key`; the project list,
+  the notices and the memory come after it, in the person's message. The final text is plain text
+  and goes through `format::clean`; the JSON answer is only for notices and summaries.
+- **Tools.** `project_status`, `system_status` and `nanty_activity` are trusted; `project_details`
+  is not: it goes in the untrusted data envelope and taints the turn (`Session::tainted`), as does a
+  forwarded message or a third party quote. `propose_action` accepts only what `act::requestable`
+  offers. `set_silence` takes `hours` or `until` (`HH:MM`, its next occurrence, at most 24 hours away)
+  and applies at once in a clean turn; in a tainted turn it becomes a card that keeps the same
+  request and expires at the latest at the time it shows. The urgent still arrives during a mute, without sound:
+  `filter.rs` treats it like quiet hours.
+- **Text of a message.** With model text, `render::message_text` puts Nanty's words first and the
+  server sentence last (`render::closing`), so the cut of the caption and of the speech keeps it.
+  Only the summary (`digest::LEAD`) opens with the title and the kept whys. The why of each notice always comes
+  from the dictionary.
+- **Voice.** Gemini only, then text; the OpenAI steps of an old `order` are read, dropped with a line
+  in the record and never written. `voice::deliver` stores the text first, then generates the speech
+  outside the send queue, one at a time and with a deadline, and sends the message once.
+  `GET /api/nanty/voices` serves the Settings: `voices` (filtered to Portuguese and English, keeping
+  the ones with no language stated) and `speech_models` (the names with a `tts` part), with a short
+  cache.
 - **Lifecycle.** The loop starts in `main.rs`, like the startup sweep, never in `AppState::new`
   (tests build the state without it), and stops on `shutdown_signal()`. A `Lagged` from the event
   bus triggers a full sweep. With Nants closed, Nanty sleeps; on return, what Telegram kept becomes
@@ -82,8 +121,28 @@ event bus / periodic scan
   never see each other; the only possible conflict is the same bot token in two of them, which
   Telegram reports as a conflict (409).
 - **Language.** What comes from the dictionary is stored as `code` and `params`, and the web
-  translates it; the Telegram copy is built with `tr(lang, ...)` at send time, in the Nanty
-  language kept in the configuration.
+  translates it; the Telegram copy is built with `tr(lang, ...)` at send time, in the `lang` stored
+  in each message. The conversation answers in the language of the person (`language::person_lang`:
+  the text, then the last language of the person, the Telegram `language_code` and the Nanty
+  language; leaving the last language takes more than one clue, so a project name does not switch
+  it). Notices and summaries follow `[nanty] language`: `follow` (the default), `pt-BR` or `en`. The
+  `server::lang` middleware remembers only the interface language, which `follow` uses as the last
+  resort.
+
+## Runs that do not spin
+
+- **Gate with no progress.** The runner signs each failure of the test round with the exit code, the
+  step of the `&&` command that failed and the normalized error lines (no times, ports or temporary
+  paths). The same signature in two cycles in a row goes to recovery on the second cycle, with the
+  same `BlockKind`, count and evidence as the limit of 5 cycles; a tree with no change is extra
+  evidence, and the Developer's prose is never read. The failed step is a fact for the Developer and
+  for recovery.
+- **Plan review.** `src/server/plan_review.rs` sends the steps of the test commands to the model,
+  which answers with an `infeasible_test_command` finding when a step only becomes runnable after the
+  first task that runs the command, with no list of tools in the code. The objective check,
+  `command_not_runnable`, is a point of the server, read from the exit 126 or 127 the runner already
+  measured on a step of the battery under review. Both go through the Architect and never block the
+  approval.
 
 ## Stack
 
@@ -148,5 +207,6 @@ scripts/test.sh cargo test                     # server
 - Server on loopback by default; `Host` and `Origin` guard; CSP without inline scripts or CDNs.
 - API keys never leave the server (only the mask); no secret in text, events or logs.
 - Nanty: Telegram only by long polling (no open port), one paired owner, plain text summaries
-  only, actions only from the fixed catalog, free text always confirmed by a card.
+  only, actions only from the fixed catalog, confirmed by a card when asked in free text (the mute
+  is the one exception, and becomes a card in a tainted turn), read only tools with checked ids.
 - Every project runs in Docker; the embedded app probe always uses `127.0.0.1`.

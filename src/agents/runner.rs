@@ -440,6 +440,30 @@ pub const CHECKS_FROM_DEV_MARK: &str = "Checagens bloqueantes reaproveitadas da 
 pub const FLAKY_SECTION: &str = "Testes instáveis";
 /// Linhas de falha guardadas por rodada instável.
 const FLAKY_MAX_LINES: usize = 10;
+
+/// Spec 139 T01: a assinatura de uma falha do gate, comparada entre dois ciclos seguidos: o código de
+/// saída (e o tempo limite), a etapa do `&&` que falhou e as linhas de erro normalizadas
+/// ([`capabilities::stable_failure_lines`]: sem tempos, portas nem caminhos temporários). Só a
+/// saída dos testes entra; a prosa do Desenvolvedor, nunca.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureSignature {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    step: Option<usize>,
+    lines: Vec<String>,
+}
+
+impl FailureSignature {
+    /// A assinatura de `test`, com as linhas tiradas de `output` (a saída já redigida).
+    fn of(test: &TestResult, output: &str) -> Self {
+        Self {
+            exit_code: test.exit_code,
+            timed_out: test.timed_out,
+            step: test.failed_step,
+            lines: capabilities::stable_failure_lines(output, FLAKY_MAX_LINES),
+        }
+    }
+}
 /// Primeira linha da evidência reaproveitada da rodada do Desenvolvedor (spec 124 T05): o Revisor
 /// sabe de onde veio a saída. Marcador lido por modelo, como o [`FLAKY_PASS_WARNING`].
 pub const DEV_REUSED_MARK: &str = "Resultado reaproveitado da rodada do Desenvolvedor, mesmo comando sobre a mesma árvore:";
@@ -2569,6 +2593,9 @@ pub struct TestResult {
     pub exit_code: Option<i32>,
     /// `true` quando o tempo limite foi excedido.
     pub timed_out: bool,
+    /// Spec 139 T01: a etapa do encadeamento `&&` que falhou (1 = a primeira), quando o executor a
+    /// identificou ([`instrument_steps`]). `None`: comando de uma etapa, que não falhou ou sem como saber.
+    pub failed_step: Option<usize>,
 }
 
 /// Papel Desenvolvedor: implementa o pedido dentro da worktree.
@@ -2915,11 +2942,96 @@ fn limit_mark(lang: Lang, hit: LimitHit, limits: ContainerLimits) -> String {
     format!("\n[{text}]\n")
 }
 
+/// Spec 139 T01: começo da linha que a forma instrumentada do comando ([`instrument_steps`]) imprime
+/// quando uma etapa falha, seguido da senha da rodada, do número da etapa e de `]`. Marcador
+/// estrutural lido pelo runner e tirado da saída ([`take_failed_step`]); a pessoa nunca o vê.
+const FAILED_STEP_MARK: &str = "[nants:failed-step ";
+
+/// Spec 139 T01: um comando instrumentado ([`instrument_steps`]) e o começo exato do marcador desta
+/// rodada (com a senha aleatória): a saída do próprio teste não consegue forjar a etapa.
+#[derive(Debug, Clone)]
+struct Instrumented {
+    script: String,
+    mark: String,
+}
+
+/// Senha aleatória de uma rodada instrumentada. Sem o gerador do sistema, o relógio e um contador.
+fn step_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        bytes = (nanos ^ SEQ.fetch_add(1, Ordering::SeqCst).rotate_left(32) ^ u64::from(std::process::id())).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `true` se há `#` fora de aspas: no começo de palavra, ele comentaria o fechamento dos
+/// agrupamentos da forma instrumentada. Na dúvida (qualquer `#` fora de aspas), não instrumenta.
+fn has_unquoted_hash(command: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' => return true,
+            None => {}
+        }
+    }
+    false
+}
+
+/// Spec 139 T01: o comando de várias etapas `&&` ([`crate::server::recovery::command_steps`]) na forma
+/// que diz qual etapa falhou: cada etapa, num agrupamento do próprio shell (o `cd` e o `export`
+/// valem para as seguintes, como antes), imprime o marcador da rodada ao falhar e devolve o mesmo
+/// código de saída, que encerra o encadeamento como o `&&` original. `None` para o comando de uma
+/// etapa, com outra construção de shell ou com `#` fora de aspas: ele roda exatamente como veio.
+fn instrument_steps(command: &str) -> Option<Instrumented> {
+    if has_unquoted_hash(command) {
+        return None;
+    }
+    let steps = crate::server::recovery::command_steps(command)?;
+    if steps.len() < 2 {
+        return None;
+    }
+    let mark = format!("{FAILED_STEP_MARK}{} ", step_nonce());
+    let wrapped: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| format!("{{ {step} || {{ nants_step_rc=$?; printf '\\n{mark}{}]\\n'; (exit $nants_step_rc); }}; }}", i + 1))
+        .collect();
+    Some(Instrumented { script: wrapped.join(" && "), mark })
+}
+
+/// Spec 139 T01: tira da saída as linhas do marcador `mark` desta rodada e devolve a etapa da última
+/// (a que encerrou o encadeamento). Linha parecida com outra senha é saída do teste e fica. Sem
+/// marcador (saída cortada, tempo limite), `None`.
+fn take_failed_step(output: &mut String, mark: &str) -> Option<usize> {
+    if !output.contains(mark) {
+        return None;
+    }
+    let mut step = None;
+    let mut kept = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        let parsed = line.trim().strip_prefix(mark).and_then(|rest| rest.strip_suffix(']')).and_then(|n| n.parse::<usize>().ok());
+        match parsed {
+            Some(n) => step = Some(n),
+            None => kept.push_str(line),
+        }
+    }
+    *output = kept;
+    step
+}
+
 /// Executa `command` com `sh -c` em `dir`. Após o timeout, mata o processo e não espera os pipes.
+/// Spec 139 T01: o comando de várias etapas `&&` roda instrumentado e a etapa que falhou vai em
+/// [`TestResult::failed_step`].
 fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang, progress: Option<&CommandProgress>) -> Result<TestResult, RunnerError> {
+    let instrumented = instrument_steps(command);
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg(command)
+        .arg(instrumented.as_ref().map_or(command, |i| i.script.as_str()))
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2981,6 +3093,7 @@ fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang, progress:
     }
 
     let mut output = String::from_utf8_lossy(&capture.buf).into_owned();
+    let failed_step = instrumented.as_ref().and_then(|i| take_failed_step(&mut output, &i.mark));
     if capture.truncated {
         output.push_str(&format!("\n[{}]\n", i18n::text(lang, "runner.output.truncated")));
     }
@@ -2992,6 +3105,7 @@ fn run_shell(dir: &Path, command: &str, timeout: Duration, lang: Lang, progress:
         exit_code,
         timed_out,
         output,
+        failed_step,
     })
 }
 
@@ -3242,7 +3356,9 @@ impl TaskRunner {
             .compose
             .clone()
             .ok_or_else(|| RunnerError::Docker("projeto em modo docker sem executor de compose".into()))?;
-        let (dir, command) = (dir.to_path_buf(), command.to_string());
+        // Spec 139 T01: no `workspace`, o comando de várias etapas roda instrumentado como no host.
+        let instrumented = instrument_steps(command);
+        let (dir, command) = (dir.to_path_buf(), instrumented.as_ref().map_or_else(|| command.to_string(), |i| i.script.clone()));
         let env = Arc::clone(&compose);
         let joined = tokio::task::spawn_blocking(move || {
             if fresh && !matches!(round, Round::Offline) {
@@ -3264,13 +3380,14 @@ impl TaskRunner {
         .await
         .map_err(|e| RunnerError::Tests(format!("execução interrompida: {e}")))?;
         let mut out = joined.map_err(RunnerError::Docker)?;
+        let failed_step = instrumented.as_ref().and_then(|i| take_failed_step(&mut out.output, &i.mark));
         if out.timed_out {
             out.output.push_str(&timed_out_mark(self.lang.get(), TEST_TIMEOUT));
         }
         if let Some(hit) = limits::detect_hit(out.code, out.timed_out, &out.output) {
             out.output.push_str(&limit_mark(self.lang.get(), hit, env.workspace_limits()));
         }
-        Ok(TestResult { passed: out.success(), output: out.output, exit_code: out.code, timed_out: out.timed_out })
+        Ok(TestResult { passed: out.success(), output: out.output, exit_code: out.code, timed_out: out.timed_out, failed_step })
     }
 
     /// `exec_cmd` com os eventos de início/fim ao vivo (`RunnerEvent::CommandRun`). `check` =
@@ -3403,7 +3520,7 @@ impl TaskRunner {
                         run_id: run_id.clone(),
                         task_id: task_id.to_string(),
                         output_bytes: snap.bytes,
-                        last_line: snap.last_line.map(|line| self.scrub(&line)),
+                        last_line: snap.last_line.filter(|line| !line.contains(FAILED_STEP_MARK)).map(|line| self.scrub(&line)),
                     });
                 }
             }
@@ -3779,6 +3896,8 @@ impl TaskRunner {
         let mut resume_used = false;
         let mut resume_cause: Option<DevStop> = None;
         let max_cycles = settings.max_test_cycles;
+        // Spec 139 T01: a assinatura da última falha do gate e a árvore em que ela aconteceu.
+        let mut last_failure: Option<(FailureSignature, Option<String>)> = None;
         // Spec 092 T03: a falha de geração vale para a tentativa inteira (todas as sessões).
         self.developer.begin_attempt(&task.frontmatter.id);
         // Spec 124 T02: as respostas aos apontamentos são desta tentativa (as sessões se somam).
@@ -3881,6 +4000,8 @@ impl TaskRunner {
             } else {
                 None
             };
+            // Spec 139 T01: o comando cuja etapa que falhou vai como fato.
+            let failed_command = if fast.as_ref().is_some_and(|f| !f.passed) { settings.test_command.clone() } else { suite_label.clone() };
             // Spec 126 T01: a rodada limpa final (a que vai ao Revisor) instala do zero.
             let mut test = match fast {
                 Some(f) if !f.passed => {
@@ -3966,7 +4087,7 @@ impl TaskRunner {
                     // exit_code/timed_out do primeiro bloqueante que falhou: 126/127 e timeout seguem
                     // reconhecidos como ambiente (spec 018) em vez de qualidade.
                     let (exit_code, timed_out) = (blocking_failed[0].exit_code, blocking_failed[0].timed_out);
-                    test = TestResult { passed: false, output, exit_code, timed_out };
+                    test = TestResult { passed: false, output, exit_code, timed_out, failed_step: None };
                 } else {
                     checks_text = format!("{CHECKS_MARK}{}", checks_section(&outcomes));
                     if !checks_from_dev.is_empty() {
@@ -4021,6 +4142,24 @@ impl TaskRunner {
                 self.transition(task, TaskStatus::InReview, "aguardar revisor")?;
                 return Ok(Step::Next);
             }
+            // Spec 139 T01: a etapa do `&&` que falhou vira fato na saída (Desenvolvedor, recuperação
+            // e evidência) e na conversa; com ela, a assinatura da falha, antes dos artefatos.
+            let step_note = self.failed_step_note(&failed_command, test.failed_step);
+            if let Some(note) = &step_note {
+                test.output = format!("{}\n\n{note}\n", test.output.trim_end());
+            }
+            let signature = FailureSignature::of(&test, &self.scrub(&test.output));
+            let repeated = last_failure.as_ref().filter(|(previous, _)| *previous == signature);
+            let same_tree = repeated.is_some_and(|(_, previous_tree)| previous_tree.is_some() && *previous_tree == tree);
+            // Spec 139 T01: a mesma assinatura em dois ciclos seguidos é falta de progresso: vai à
+            // recuperação já, com o mesmo bloqueio do limite de ciclos (tipo, contagem real e
+            // evidência). A árvore sem mudança entra como fato a mais. Falha que muda segue até o limite.
+            let early = repeated.is_some() && failed_runs + 1 < max_cycles;
+            last_failure = Some((signature, tree.clone()));
+            let no_progress_note = early.then(|| self.no_progress_note(max_cycles, same_tree));
+            if let Some(note) = &no_progress_note {
+                test.output = format!("{}\n\n{note}\n", test.output.trim_end());
+            }
             // Artefatos de falha (spec 079): seguem com a saída para o Desenvolvedor, a recuperação
             // e `test_evidence`.
             test.output.push_str(&crate::sdd::failure_artifacts::collect(
@@ -4033,17 +4172,24 @@ impl TaskRunner {
             task.frontmatter.tested_sha = None;
             task.frontmatter.tested_signature = None;
             task.frontmatter.tested_at = None;
+            let cycle = i18n::tr(
+                self.lang.get(),
+                "runner.tests.failed_cycle",
+                &[("count", &failed_runs.to_string()), ("max", &max_cycles.to_string())],
+            );
             self.events.emit(RunnerEvent::AgentMessage {
                 agent: "tests".into(),
-                text: i18n::tr(
-                    self.lang.get(),
-                    "runner.tests.failed_cycle",
-                    &[("count", &failed_runs.to_string()), ("max", &max_cycles.to_string())],
-                ),
+                text: match &step_note {
+                    Some(note) => format!("{cycle}\n{note}"),
+                    None => cycle,
+                },
                 task_id: Some(task.frontmatter.id.clone()),
                 attempt: Some(attempt),
             });
-            if failed_runs >= max_cycles {
+            if failed_runs >= max_cycles || early {
+                if let Some(note) = no_progress_note {
+                    self.tests_message(task, attempt, note);
+                }
                 // A última falha fica registrada: é o fato que o Arquiteto analisa na recuperação.
                 task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(test.exit_code, test.timed_out), test.output));
                 return self.block(
@@ -4292,6 +4438,32 @@ impl TaskRunner {
             self.after_failed_round(settings, dir, t);
         }
         (out, elapsed, note)
+    }
+
+    /// Spec 139 T01: o fato da etapa do `&&` de `command` que falhou (`step`, 1 = a primeira), no
+    /// idioma do projeto, com o texto redigido da etapa. `None` sem etapa ou com etapa fora do comando.
+    fn failed_step_note(&self, command: &str, step: Option<usize>) -> Option<String> {
+        let index = step?;
+        let steps = crate::server::recovery::command_steps(command)?;
+        let text = steps.get(index.checked_sub(1)?)?;
+        let key = if index == 1 { "runner.tests.failed_step_first" } else { "runner.tests.failed_step" };
+        Some(i18n::tr(
+            self.lang.get(),
+            key,
+            &[("index", &index.to_string()), ("total", &steps.len().to_string()), ("step", &self.scrub(text))],
+        ))
+    }
+
+    /// Spec 139 T01: o registro da parada por falta de progresso, com a árvore sem mudança como fato
+    /// a mais quando for o caso.
+    fn no_progress_note(&self, max_cycles: u32, same_tree: bool) -> String {
+        let lang = self.lang.get();
+        let note = i18n::tr(lang, "runner.tests.no_progress", &[("max", &max_cycles.to_string())]);
+        if same_tree {
+            format!("{note} {}", i18n::text(lang, "runner.tests.no_progress_same_tree"))
+        } else {
+            note
+        }
     }
 
     /// Spec 126 T01: a rodada que falhou com 126/127 (programa ausente ou não executável, em
@@ -4546,6 +4718,7 @@ impl TaskRunner {
             output: format!("{DEV_REUSED_MARK} `{command}` ({short})\n{}", self.scrub(&run.output)),
             exit_code: Some(0),
             timed_out: false,
+            failed_step: None,
         }
     }
 
@@ -7874,7 +8047,7 @@ mod tests {
                 } else {
                     format!("falha {n}")
                 };
-                Ok(TestResult { passed, output, exit_code: None, timed_out: false })
+                Ok(TestResult { passed, output, exit_code: None, timed_out: false, failed_step: None })
             })
         }
     }
@@ -10558,7 +10731,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_failing_test_command_blocks_after_three_cycles() {
+    /// Spec 139 T01: o comando real que falha sempre igual não tem progresso possível: bloqueia no
+    /// segundo ciclo, com a mesma evidência e o mesmo motivo do limite de ciclos.
+    async fn real_failing_test_command_without_progress_blocks_on_the_second_cycle() {
         let fx = Fixture::new("teste-real", "false");
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let dev = FakeDev::default();
@@ -10571,8 +10746,9 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, Outcome::Blocked { .. }));
-        assert_eq!(dev.briefs().len(), MAX_TEST_CYCLES as usize);
+        assert_eq!(dev.briefs().len(), 2);
         assert!(rev.inputs().is_empty(), "revisor nunca chamado");
+        assert_eq!(fx.read_task("T01").frontmatter.next_action_code.as_deref(), Some("tests_failed"));
         assert_eq!(fx.read_task("T01").frontmatter.status, TaskStatus::Blocked);
         assert_eq!(fx.feat_commits(), 0);
         let evidence = fx.read_task("T01").frontmatter.test_evidence.unwrap_or_default();
@@ -11011,7 +11187,7 @@ mod tests {
     impl TestExecutor for SlowShell {
         fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
             if command.contains("SLOW") {
-                return Box::pin(async { Ok(TestResult { passed: false, output: String::new(), exit_code: None, timed_out: true }) });
+                return Box::pin(async { Ok(TestResult { passed: false, output: String::new(), exit_code: None, timed_out: true, failed_step: None }) });
             }
             self.0.run(dir, command)
         }
@@ -11345,7 +11521,8 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, Outcome::Blocked { .. }));
         let briefs = dev.briefs();
-        assert_eq!(briefs.len(), MAX_TEST_CYCLES as usize);
+        // Spec 139 T01: a checagem que falha sempre igual bloqueia no segundo ciclo.
+        assert_eq!(briefs.len(), 2);
         assert!(briefs[1].test_output.as_deref().unwrap_or("").contains("build-quebrado"));
         assert!(rev.inputs().is_empty());
         let texts = tests_texts(&rec);
@@ -13688,6 +13865,7 @@ mod tests {
                     output: format!("SAIDA {command}"),
                     exit_code: Some(if failed { 1 } else { 0 }),
                     timed_out: false,
+                    failed_step: None,
                 })
             })
         }
@@ -15629,7 +15807,7 @@ mod tests {
                 *self.calls.lock().unwrap() += 1;
                 let (passed, output, wait) = self.script.lock().unwrap().pop_front().unwrap_or((true, "ok", Duration::ZERO));
                 tokio::time::sleep(wait).await;
-                Ok(TestResult { passed, output: output.into(), exit_code: Some(i32::from(!passed)), timed_out: false })
+                Ok(TestResult { passed, output: output.into(), exit_code: Some(i32::from(!passed)), timed_out: false, failed_step: None })
             })
         }
 
@@ -15678,9 +15856,9 @@ mod tests {
                 let mut calls = self.calls.lock().unwrap();
                 *calls += 1;
                 Ok(if *calls == 1 {
-                    TestResult { passed: false, output: "sh: go: not found".into(), exit_code: Some(self.code), timed_out: false }
+                    TestResult { passed: false, output: "sh: go: not found".into(), exit_code: Some(self.code), timed_out: false, failed_step: None }
                 } else {
-                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false }
+                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false, failed_step: None }
                 })
             })
         }
@@ -15721,7 +15899,9 @@ mod tests {
         let fx = Fixture::new("flaky-twice", "make test");
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let fail = (false, "FAIL e2e/render.spec.ts", Duration::ZERO);
-        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, fail, fail, (true, "ok", Duration::ZERO)]);
+        // A falha da 2ª sessão é outra: com a mesma, o gate pararia por falta de progresso (spec 139).
+        let other = (false, "FAIL e2e/outro.spec.ts", Duration::ZERO);
+        let tests = TimedTests::new(Duration::from_secs(600), vec![fail, fail, other, (true, "ok", Duration::ZERO)]);
         let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
         let outcome = fx.runner(&dev, &rev, tests.clone(), &rec).run_task(SPEC, "T01").await.unwrap();
         assert_eq!(outcome, Outcome::Done);
@@ -15768,6 +15948,114 @@ mod tests {
             })),
             ..FakeDev::default()
         }
+    }
+
+    /// Spec 139 T01: a forma instrumentada diz qual etapa do `&&` falhou, com o mesmo código de
+    /// saída, o `cd` valendo para as etapas seguintes e o marcador fora da saída. Comando de uma
+    /// etapa, com outra construção de shell ou que passou: sem etapa.
+    #[test]
+    fn shell_reports_the_failed_step_of_an_and_chain() {
+        let dir = env::temp_dir();
+        let run = |command: &str| run_shell(&dir, command, Duration::from_secs(20), Lang::PtBr, None).unwrap();
+        let r = run("echo um && sh -c 'echo dois; exit 3' && echo tres");
+        assert_eq!((r.passed, r.exit_code, r.failed_step), (false, Some(3), Some(2)));
+        assert!(r.output.contains("um") && r.output.contains("dois") && !r.output.contains("tres"), "{}", r.output);
+        assert!(!r.output.contains(FAILED_STEP_MARK), "{}", r.output);
+        let r = run("false && echo nunca");
+        assert_eq!((r.exit_code, r.failed_step), (Some(1), Some(1)));
+        let r = run("cd / && pwd && false");
+        assert_eq!(r.failed_step, Some(3));
+        assert!(r.output.lines().any(|l| l.trim() == "/"), "o cd vale para as etapas seguintes: {}", r.output);
+        let r = run("echo a && echo b");
+        assert_eq!((r.passed, r.failed_step), (true, None));
+        assert_eq!(r.output, "a\nb\n");
+        assert_eq!(run("false").failed_step, None);
+        assert_eq!(run("echo a; false").failed_step, None);
+        assert!(instrument_steps("make test").is_none());
+        // `#` fora de aspas comentaria o fechamento: roda como veio.
+        assert!(instrument_steps("echo a && echo b # c").is_none());
+        let r = run("echo a && echo b # c");
+        assert_eq!((r.passed, r.exit_code, r.failed_step), (true, Some(0), None));
+        assert_eq!(r.output, "a\nb\n");
+        assert!(instrument_steps("echo '#a' && echo \"b#\"").is_some());
+        // A senha muda a cada rodada, e a saída do teste não forja a etapa.
+        let (one, two) = (instrument_steps("a && b").unwrap(), instrument_steps("a && b").unwrap());
+        assert_ne!(one.mark, two.mark);
+        let forged = format!("{FAILED_STEP_MARK}0000000000000000 1]");
+        let mut out = format!("x\n{forged}\n\n{}2]\ny\n", one.mark);
+        assert_eq!(take_failed_step(&mut out, &one.mark), Some(2));
+        assert_eq!(out, format!("x\n{forged}\n\ny\n"));
+        let r = run(&format!("echo '{forged}' && false"));
+        assert_eq!(r.failed_step, Some(2), "{}", r.output);
+    }
+
+    /// Spec 139 T01 (reprodução do nerd-stickers-store, com projeto sintético e modelo simulado): o
+    /// comando `a && b` em que `b` falha sempre igual ("nenhum teste encontrado", fora do alcance do
+    /// Desenvolvedor). O gate não espera os cinco ciclos: bloqueia no segundo, com o mesmo tipo, o
+    /// código `tests_failed` com a contagem real e a evidência com o cabeçalho de falha, e a etapa que
+    /// falhou como fato para o Desenvolvedor, a recuperação e a conversa. A repetição única para
+    /// conferir teste instável continua no primeiro ciclo. Com a árvore igual, ela entra como fato.
+    #[tokio::test]
+    async fn same_failure_in_two_cycles_goes_to_recovery_on_the_second() {
+        let command = "echo 'ok 1 - unit passes' && sh -c 'echo \"Error: No tests found\"; exit 1'";
+        for idle in [true, false] {
+            let fx = Fixture::new(&format!("sem-progresso-{idle}"), command);
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let dev = FakeDev { idle_after_first: idle, ..FakeDev::default() };
+            let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let outcome = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap();
+            let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("bloqueada") };
+            assert_eq!(kind, BlockKind::Quality);
+            assert_eq!(reason, "test_command falhou 2 vezes na mesma tentativa");
+            assert_eq!(dev.briefs().len(), 2, "recuperação no segundo ciclo");
+            assert!(rev.inputs().is_empty());
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.status, TaskStatus::Blocked);
+            assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("tests_failed"));
+            let step = "Etapa que falhou: 2 de 2 do comando de testes, `sh -c 'echo \"Error: No tests found\"; exit 1'`. As etapas antes dela passaram.";
+            let evidence = t.frontmatter.test_evidence.unwrap_or_default();
+            assert!(evidence.starts_with(&failure_header(Some(1), false)), "{evidence}");
+            assert!(evidence.contains("No tests found") && evidence.contains(step), "{evidence}");
+            assert!(evidence.contains("Sem progresso: a mesma falha se repetiu em dois ciclos seguidos"), "{evidence}");
+            let tree_note = "O código entregue também não mudou entre os dois ciclos.";
+            assert_eq!(evidence.contains(tree_note), idle, "a árvore igual é fato a mais: {evidence}");
+            assert!(!evidence.contains(FAILED_STEP_MARK), "{evidence}");
+            let back = dev.briefs()[1].test_output.clone().unwrap_or_default();
+            assert!(back.contains(step) && !back.contains(FAILED_STEP_MARK), "{back}");
+            let texts = tests_texts(&rec);
+            assert_eq!(texts.iter().filter(|t| t.starts_with("A rodada de testes falhou. Repetindo uma vez")).count(), 1, "{texts:?}");
+            assert!(texts.contains(&format!("test_command falhou (1/{MAX_TEST_CYCLES})\n{step}")), "{texts:?}");
+            assert!(texts.contains(&format!("test_command falhou (2/{MAX_TEST_CYCLES})\n{step}")), "{texts:?}");
+            assert!(texts.iter().any(|t| t.starts_with("Sem progresso:") && t.contains(&format!("limite de {MAX_TEST_CYCLES} ciclos"))), "{texts:?}");
+        }
+    }
+
+    /// Spec 139 T01: a falha que muda a cada ciclo (outra saída, de verdade) segue até o limite de
+    /// ciclos, como antes; a que só muda em tempos, caminhos temporários e portas é a mesma falha.
+    #[tokio::test]
+    async fn changing_failure_keeps_the_cycle_limit_and_volatile_noise_does_not_count() {
+        // A saída lista os arquivos que o Desenvolvedor simulado grava a cada sessão: muda sempre.
+        let fx = Fixture::new("falha-muda", "true && sh -c 'ls out-*.txt; exit 1'");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap();
+        let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("bloqueada") };
+        assert_eq!(kind, BlockKind::Quality);
+        assert_eq!(reason, format!("test_command falhou {MAX_TEST_CYCLES} vezes na mesma tentativa"));
+        assert_eq!(dev.briefs().len(), MAX_TEST_CYCLES as usize);
+        assert!(!tests_texts(&rec).iter().any(|t| t.starts_with("Sem progresso:")));
+        let evidence = fx.read_task("T01").frontmatter.test_evidence.unwrap_or_default();
+        assert!(evidence.starts_with(&failure_header(Some(1), false)) && evidence.contains("Etapa que falhou: 2 de 2"), "{evidence}");
+
+        // Só o ruído muda (pid no caminho temporário e na porta, nanossegundos na duração).
+        let noisy = "true && sh -c 'echo \"FAIL /tmp/run-$$/cart.test.js ($(date +%N)ms) on localhost:$(($$ % 60000 + 1024))\"; exit 1'";
+        let fx = Fixture::new("falha-ruido", noisy);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap();
+        assert!(matches!(outcome, Outcome::Blocked { kind: BlockKind::Quality, .. }));
+        assert_eq!(dev.briefs().len(), 2);
+        assert!(tests_texts(&rec).iter().any(|t| t.starts_with("Sem progresso:")));
     }
 
     /// Spec 133 T05: a falha que o Desenvolvedor já viu (mesmo comando, mesma árvore, mesmas linhas)
@@ -16183,10 +16471,16 @@ mod tests {
     impl TestExecutor for CmdTests {
         fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
             Box::pin(async move {
-                self.calls.lock().unwrap().push((dir.to_path_buf(), command.to_string()));
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push((dir.to_path_buf(), command.to_string()));
+                    calls.len()
+                };
                 let passed = self.fails.lock().unwrap().get_mut(command).and_then(VecDeque::pop_front).unwrap_or(true);
-                let output = if passed { format!("{command}: ok") } else { format!("{command}: FAILED") };
-                Ok(TestResult { passed, output, exit_code: Some(i32::from(!passed)), timed_out: false })
+                // Spec 139 T01: cada falha é diferente da anterior (a chamada vai junto), para o gate
+                // não ver a mesma falha em dois ciclos seguidos.
+                let output = if passed { format!("{command}: ok") } else { format!("{command}: FAILED (chamada {call})") };
+                Ok(TestResult { passed, output, exit_code: Some(i32::from(!passed)), timed_out: false, failed_step: None })
             })
         }
     }
@@ -16651,9 +16945,9 @@ mod tests {
                         output.push_str(&format!("npm notice New minor version of npm available! line {i}\n"));
                     }
                     output.push_str("npm notice To update run: npm install -g npm@11.21.1\n");
-                    return Ok(TestResult { passed: false, output, exit_code: Some(2), timed_out: false });
+                    return Ok(TestResult { passed: false, output, exit_code: Some(2), timed_out: false, failed_step: None });
                 }
-                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false })
+                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false, failed_step: None })
             })
         }
     }
@@ -16696,9 +16990,9 @@ mod tests {
                                   npm notice To update run: npm install -g npm@11.21.1\nnpm notice\n\
                                   [error] Unable to write file \".nants/compose.yaml\":\n\
                                   [error] EROFS: read-only file system, open '/work/.nants/compose.yaml'\n";
-                    return Ok(TestResult { passed: false, output: output.into(), exit_code: Some(2), timed_out: false });
+                    return Ok(TestResult { passed: false, output: output.into(), exit_code: Some(2), timed_out: false, failed_step: None });
                 }
-                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false })
+                Ok(TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false, failed_step: None })
             })
         }
     }
@@ -16767,9 +17061,9 @@ mod tests {
                 let installed = calls.iter().any(|(d, c)| d == dir && c == "make deps");
                 calls.push((dir.to_path_buf(), command.to_string()));
                 Ok(if self.needs.iter().any(|n| n == command) && !installed {
-                    TestResult { passed: false, output: format!("> {command}\nsh: 1: tsc: not found"), exit_code: Some(127), timed_out: false }
+                    TestResult { passed: false, output: format!("> {command}\nsh: 1: tsc: not found"), exit_code: Some(127), timed_out: false, failed_step: None }
                 } else {
-                    TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false }
+                    TestResult { passed: true, output: format!("{command}: ok"), exit_code: Some(0), timed_out: false, failed_step: None }
                 })
             })
         }
@@ -16794,9 +17088,9 @@ mod tests {
                 calls.push(command.to_string());
                 let first_test = command == "make test" && calls.iter().filter(|c| *c == "make test").count() == 1;
                 Ok(if first_test {
-                    TestResult { passed: false, output: "sh: vitest: not found".into(), exit_code: Some(127), timed_out: false }
+                    TestResult { passed: false, output: "sh: vitest: not found".into(), exit_code: Some(127), timed_out: false, failed_step: None }
                 } else {
-                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false }
+                    TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false, failed_step: None }
                 })
             })
         }
@@ -16815,7 +17109,7 @@ mod tests {
                 let installed = home.join(".local/bin/tool").exists();
                 let cached = home.join(".cache/pkg").exists();
                 self.seen.lock().unwrap().push((command.to_string(), installed, cached));
-                Ok(TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false })
+                Ok(TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false, failed_step: None })
             })
         }
     }

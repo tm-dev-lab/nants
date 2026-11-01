@@ -119,7 +119,13 @@ pub fn outcome_text(lang: Lang, outcome: &Outcome) -> String {
         let params = outcome.params.get("error_params").and_then(Value::as_object).cloned().unwrap_or_default();
         fallback_text_in(lang, code, &params)
     });
-    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    // Os outros parâmetros de texto (a hora do silêncio, spec 139 T04) entram como vieram.
+    let mut pairs: Vec<(&str, &str)> = outcome
+        .params
+        .iter()
+        .filter(|(k, _)| k.as_str() != "error")
+        .filter_map(|(k, v)| v.as_str().map(|v| (k.as_str(), v)))
+        .collect();
     if let Some(text) = &error {
         pairs.push(("error", text.as_str()));
     }
@@ -473,8 +479,9 @@ pub async fn tick(state: &AppState, nanty: &Arc<Nanty>) {
 
     let mut run_now: Vec<Job> = Vec::new();
     let mut journal: Vec<JournalEntry> = Vec::new();
-    let quiet = now.within(cfg.nanty.quiet_window());
     nanty.update(|st| {
+        // O silêncio de tudo vale como o horário de silêncio, igual ao filtro (spec 139 T08).
+        let quiet = now.within(cfg.nanty.quiet_window()) || super::silence::global_until(st, now_ms).is_some();
         let mut changed = false;
         for (group, plan) in plans {
             let Some(alert) = st.alerts.get(&group).cloned() else { continue };
@@ -629,6 +636,9 @@ enum Claim {
     Link(ActionId, Card),
     PersonOnly,
     Execute(Card),
+    /// O silêncio da conversa (spec 139 T04): ligado até o fim (`HH:MM`) ou desligado.
+    Silenced(Card, u64),
+    Unsilenced(Card),
 }
 
 /// Decide um cartão: `yes`, `no` ou `later` (web ou Telegram). O primeiro clique vale; o segundo
@@ -677,6 +687,34 @@ pub async fn decide(
                 at_ms: now_ms,
             });
         };
+        // O silêncio da conversa (spec 139 T04): o "sim" liga ou desliga o silêncio de tudo, o "não"
+        // fecha o cartão, e não há "lembrar depois".
+        if let Some(a) = action.filter(|a| a.entry().kind == ActionKind::Silence) {
+            match answer {
+                Answer::Later => {
+                    claim = Claim::Invalid;
+                    return false;
+                }
+                Answer::No => {
+                    decided(st);
+                    claim = Claim::Declined(card);
+                }
+                Answer::Yes if a == ActionId::SetSilence => {
+                    decided(st);
+                    // O mesmo pedido do cartão (spec 139 T12), nunca além da hora que ele mostra.
+                    let until = super::silence::card_end(&card.params, now_ms);
+                    let channel = if by == DecidedBy::Telegram { Channel::Telegram } else { Channel::Web };
+                    super::silence::apply_in(st, now_ms, until, channel);
+                    claim = Claim::Silenced(card, until);
+                }
+                Answer::Yes => {
+                    decided(st);
+                    super::silence::end_in(st);
+                    claim = Claim::Unsilenced(card);
+                }
+            }
+            return true;
+        }
         match answer {
             Answer::Later => {
                 decided(st);
@@ -710,7 +748,7 @@ pub async fn decide(
                 true
             }
             Answer::Yes => match action.map(|a| (a, a.entry().kind)) {
-                None | Some((_, ActionKind::CardOption)) => {
+                None | Some((_, ActionKind::CardOption | ActionKind::Silence)) => {
                     claim = Claim::Invalid;
                     false
                 }
@@ -770,6 +808,14 @@ pub async fn decide(
             Ok(out)
         }
         Claim::Execute(card) => Ok(execute_card(state, &nanty, card, by).await),
+        Claim::Silenced(card, until) => {
+            journal_decision(card.action.as_deref(), None);
+            Ok(Outcome::new("silenced").with("until", super::silence::hhmm(until)))
+        }
+        Claim::Unsilenced(card) => {
+            journal_decision(card.action.as_deref(), None);
+            Ok(Outcome::new("silence_ended"))
+        }
     }
 }
 

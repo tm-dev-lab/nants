@@ -108,6 +108,13 @@ and you decide at every step.
   sends only those points to the Architect, or you approve anyway. With nothing open, the plan
   shows as ready. When the back and forth changed the plan, the Conversation also shows the final
   list of tasks.
+- **A test battery that can run from the start.** For each step of the test command, the plan
+  review checks which task makes it runnable: it has to come before or with the first task that
+  runs the command. If not, the review raises a finding, which the Architect answers like any
+  other and which never blocks your approval. When the plan needs minimal infrastructure, the
+  review asks for a smoke test that the tool of that step really finds and runs. The only check
+  done by code is objective: a step of this plan's battery that already ended with exit code 126
+  or 127 (not executable or not found), with the measured step in the finding.
 - **A plan that says how to see it working.** No field the Architect writes in the spec header is
   dropped in silence: one that would be lost (for example, a `run_command` over 500 characters) is
   refused with the reason in the same turn. With no `run_command`, the Architect is asked how you
@@ -131,6 +138,12 @@ and you decide at every step.
   close to its time limit, you get a warning to split or focus it. A failed round is run once more
   with no change, and if it passes the task goes on with a flaky test alert. When the round fails
   with the same failure lines the Developer already saw on the same code, there is no extra round.
+- **No more cycles with no progress.** When the same failure repeats in two cycles in a row (the
+  same exit code, the same step of a command like `a && b` and the same error lines, without times
+  or temporary paths), the task goes to recovery on the second cycle, whether the code changed or
+  not, with the same record the limit of 5 cycles leaves. While the failure keeps changing, the
+  limit stays at 5. The check reads the test output, never what the Developer says about it. The
+  step that failed goes to the Developer and to recovery.
 - **Offline round.** A property of the environment, such as "the tests do not reach the internet",
   is proven by the environment and not by guards in the code. The Architect marks such a criterion
   with `(offline)` at its start (the marker is the same in both languages). After the regular test
@@ -233,8 +246,8 @@ and you decide at every step.
   losing what matters, and the Context area of the Costs window shows the effect, with an
   estimate of the tokens that later calls no longer resend.
 - **Nanty, the agent above the projects.** Nanty watches your projects and the machine, tells you
-  on Telegram (text or voice) what needs you, suggests the next step with buttons and does on its
-  own only the safe actions you allow. See [Nanty](#nanty).
+  on Telegram (text or voice) what needs you, talks with you in plain words, suggests the next step
+  with buttons and does on its own only the safe actions you allow. See [Nanty](#nanty).
 - **English and Portuguese.** The whole interface in both languages; the agents follow your choice.
 - **Your provider.** Any OpenAI compatible provider, Anthropic (Claude), Google Gemini (AI Studio)
   or your ChatGPT plan, with one connection and one model per role. See
@@ -442,8 +455,9 @@ See [SECURITY.md](SECURITY.md#knowledge-base) for the redaction and its limits.
 
 Nanty is the Nants agent that sits above the projects. It watches your projects and the machine,
 tells you on Telegram what needs you, suggests the next step and does on its own only the safe
-actions you allow. Open it from the Nants menu (the N at the top left), in any space, even with no
-project open. The observers and the feed in the window are on from the start and cost nothing;
+actions you allow. You talk to it the way you would talk to someone on your team, in the window or
+on Telegram, by text or by voice. Open it from the Nants menu (the N at the top left), in any space,
+even with no project open. The observers and the feed in the window are on from the start and cost nothing;
 Telegram, the model and the voice need you to set them up in the **Settings** tab of the Nanty
 window.
 
@@ -456,7 +470,8 @@ window.
   first one and do not repeat for a while. A notice that follows from another (a blocked run when
   the credit ran out) stays quiet behind it. Every notice says why, in one line written by Nants
   (the observer, the facts and the time), never by the model, and a proactive card only carries
-  counts and codes, never the text of the project.
+  counts and codes, never the text of the project. With a model, Nanty words the notice and the
+  morning summary itself, from those same facts, and the line with the reason stays.
 - **The window.** The feed has **Waiting for you**, **Done on its own** (with **Undo** where it
   makes sense), **Planned** (including the morning summary) and **Today**, with the conversation on
   the right. Its animated ant shows what Nanty is doing: watching, thinking, talking, sleeping or
@@ -502,8 +517,10 @@ first** or **automatic**. Nanty never does anything outside this catalog.
   approval card checks that the plan is still the one it showed you.
 - **Only you:** allowing a command "always" and changing where Nanty talks to you (the channel,
   the token or the chat). This band is locked: no Nanty action does it.
-- **Free text always asks.** Anything you ask in your own words comes back as a card to confirm,
-  even when the action is automatic.
+- **Free text always asks.** Any action you ask for in your own words comes back as a card to
+  confirm, even when it is automatic. The one exception is the mute, which only reduces notices,
+  has an end time and never changes the channel: see [Conversation and
+  commands](#conversation-and-commands).
 - **Cards.** Every card has buttons (yes, no, remind me later in 1 hour) and an expiry. The state
   is checked again at the click; the first click counts, in the window or on Telegram, and the
   other one gets "already decided". After a no, the offer only comes back with a new fact. A switch
@@ -512,34 +529,74 @@ first** or **automatic**. Nanty never does anything outside this catalog.
 
 ### Conversation and commands
 
-The conversation is the same in the window and on Telegram, with where each message came from.
+The conversation is the same in the window and on Telegram, with where each message came from. You
+talk to Nanty the way you would talk to someone on your team: there is no phrase to learn, and
+everything below works in your own words. The reply to a message from the window stays in the
+window.
 
-- **Commands**, answered with no model, in both languages: `/status` (the notices, what was done
-  today and the model spend), `/summary` (the summary now), `/pause` (pauses the run in progress,
-  after you confirm the card), `/quiet` (mutes the notices for 1 hour, or `/quiet 3` for 3 hours,
-  up to 24) and `/help`. The Portuguese ones (`/resumo`, `/pausar`, `/silencio`, `/ajuda`) work
-  too.
-- **Free text** goes to the model of Nanty. To have it look at a project, mention its name: it
-  reads only that project (the plan, the tasks, the report and the costs, never the logs), as
-  untrusted data and with your secrets redacted. The reply to a message from the window stays in
-  the window.
+- **It looks things up.** With a model set, every message goes to a small agent loop with read only
+  tools: the state of a project (the same source as the bell and the notices), what was read from
+  its files (the plan, the tasks, the report and the costs, never the logs, as untrusted data and
+  with your secrets redacted), the machine (disk, temporary folder, leftovers, budget and mute) and
+  what Nanty did today. It works out which project you mean: a number ("the 14"), part of the name,
+  no accents, or its state ("the one that got stuck"). When in doubt, it asks. On Telegram, you see
+  "typing" while it works.
+- **It remembers.** The last 12 messages of the last 3 hours, with the time, so a follow up question
+  just works, plus the open notices. It keeps only what you said and its final replies, never what
+  the tools returned.
+- **Actions.** Ask for an action in your own words and Nanty proposes it: the server creates the
+  card, and only your click runs it.
+- **Mute in a sentence.** "Quiet for 2 hours" or "quiet until 9" mutes the notices right away, for up
+  to 24 hours; a clock time means its next occurrence, to the exact minute. The confirmation is
+  written by the server, with the end time and a button to turn it off. During a mute, as in quiet
+  hours, the urgent still arrives, without sound, and the rest goes into the summary. Asking to turn
+  it off works the same way. Right after reading project content, or with forwarded text in the
+  conversation, the mute becomes a card to confirm, which expires at the latest at the time it shows.
+- **Commands are shortcuts.** You never need them: `/status` (the notices, what was done today and
+  the model spend), `/summary` (the summary now), `/pause` (pauses the run in progress, after you
+  confirm the card), `/quiet` (mutes the notices for 1 hour, or `/quiet 3` for 3 hours, up to 24;
+  `/quiet 0` or `/quiet off` turns it off) and `/help`. The Portuguese ones (`/resumo`, `/pausar`,
+  `/silencio`, `/ajuda`) work too. With a model and budget, `/status` and `/summary` are written by
+  the model from the same facts.
+- **The order of a message.** Nanty's own words come first, and a sentence written by the server
+  (the confirmation of a mute, for example) closes the message. Only in a summary with model text
+  do the title and the reasons of the notices it kept come first.
+- **Without a model,** with the budget used up or after a failure, Nanty answers with short fixed
+  text in your language. It still finds a project by its name or number and says how it stands, and
+  the commands keep working.
+- **Language.** Nanty answers in the language you wrote or spoke in (Portuguese or English), no
+  matter the language of the interface. The notices and the morning summary follow the
+  **Nanty language** card in Settings: **Follow the conversation** (the default: the last language you
+  used, and before the first conversation the interface language), Portuguese or English.
 - **Quiet hours and the morning summary.** By default, quiet from 22:00 to 07:00 and the summary at
-  08:00, in the time of the computer running Nants. In quiet hours only the urgent gets through,
-  and silently; the rest goes into the summary. While a Nants tab is visible, a notice waits a few
+  08:00, in the time of the computer running Nants. In quiet hours, as during a mute, only the urgent
+  gets through, and silently; the rest goes into the summary. While a Nants tab is visible, a notice waits a few
   minutes before going to Telegram, and what you decide in the window meanwhile does not go; you
   can turn that off in Settings.
 
 ### Voice
 
-Voice is off until you turn it on in Settings. With it on, Nanty answers a voice note you send on
-Telegram with a voice note, always with the text in the caption (and the whole text in a message
-of its own when the caption cut it). Text gets text, and the notices and the summary stay in text.
+Voice is off until you turn it on in Settings. With it on, everything Nanty says on Telegram goes as
+a voice note with the text in the caption: replies, notices with their buttons and the morning
+summary (and the whole text in a message of its own when the caption cut it). In the window, replies
+have audio too, with a player that never starts on its own. With it off, text only.
 
-- **Order of the connections:** by default, your Google Gemini connections, then the OpenAI ones,
-  then text only. You can set your own order.
-- **Your voice notes** are transcribed only by a Google Gemini connection, up to 5 minutes, and
-  the transcription shows in the conversation.
-- When the voice fails or the budget is used up, the text goes anyway: the notice is never lost.
+- **Only Google Gemini, then text.** One Google Gemini connection speaks and transcribes; by
+  default, the first one with a key. When Gemini fails, the reply goes in text.
+- **The Voice card.** It has one selector, **Gemini connection for voice**, with the Google Gemini
+  connections saved in Settings > Connections and a shortcut to them, and it says whether voice is
+  ready, has no key, had its key refused or has no connection. The speech model, the voice and the
+  transcription model stay in view, with autocomplete and free typing: the speech list shows only
+  the speech models of that connection, and the voice list comes from Gemini, with the voices in
+  Portuguese and English (and the ones with no language stated).
+- **Your voice notes** are transcribed by that connection, up to 5 minutes, with storage off at the
+  provider (`store: false`), and the transcription shows in the conversation.
+- A configuration from before, with OpenAI in the voice order, keeps working: the first Google
+  Gemini step becomes the voice connection and the OpenAI steps leave, with a line in the Nanty
+  record.
+- When the voice fails, takes too long or the budget is used up, the text goes anyway: the notice is
+  never lost. A note Telegram refuses goes out as text with its buttons, a burst of notices stays in
+  text, and every notice has one audio at most.
 
 ### Cost and budget
 
@@ -548,7 +605,9 @@ and the voice, US$ 0.50 by default. A model without a price (or a ChatGPT plan c
 tokens instead, 200,000 a day by default, and Settings says so; with the same plan connection as
 the roles, the plan quota is the same one. When the budget runs out, the notices go on with the
 fixed text of the observer, without the model summary and without voice, and the commands still
-work. The **Costs** window shows the Nanty spend apart from the projects.
+work. Each message of the conversation also has its own limits, in the `[nanty.chat]` section of the
+configuration: 5 rounds of tools, 2 minutes and 60,000 tokens by default. The **Costs** window shows
+the Nanty spend apart from the projects.
 
 ### Nants closed, Nanty asleep
 
@@ -677,9 +736,9 @@ executable. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized
   `.sdd/specs/<spec>/provider-errors.jsonl`, out of the project's repository. Nants does not
   write the request it sent there; the provider's message may quote parts of it, with your
   configured keys redacted (see [SECURITY.md](SECURITY.md#provider-failure-log)).
-- **Nanty sends only summaries.** On Telegram, Nanty sends short summaries in plain text, with no
-  code, logs or secrets, and listens by long polling, with no open port. Your messages go through
-  the Telegram servers.
+- **Nanty sends only summaries.** On Telegram, Nanty sends short summaries in plain text (or a voice
+  note of that same text), with no code, logs or secrets, and listens by long polling, with no open
+  port. Your messages go through the Telegram servers.
 - **The knowledge base stays in the project.** It lives in `.sdd/kb/`, out of the project's
   repository; only the excerpts the agents read go to your provider.
 - The server listens only on your computer (`127.0.0.1`) by default.

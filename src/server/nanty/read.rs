@@ -1,4 +1,4 @@
-//! Leitura a pedido do projeto citado na conversa (spec 138 T08, C-13).
+//! Leitura a pedido de um projeto na conversa (spec 138 T08, C-13; spec 139 T03: a ferramenta `project_details`).
 //!
 //! - **De onde:** o snapshot do projeto (`server::snapshot`, o mesmo do Arquiteto), que já trata o
 //!   texto do projeto como não confiável, redige segredos e URLs antes do corte por campo e tem teto;
@@ -6,7 +6,8 @@
 //!   `usage.jsonl` (só números).
 //! - **Sem logs:** nenhum `run.log`, saída de agente, trilha ou diálogo entra; os códigos de parada
 //!   já chegam pelos sinais estruturados.
-//! - **Só o projeto citado:** a conversa chama isto para um projeto só, o que a pessoa citou.
+//! - **Só o projeto pedido:** a ferramenta `project_details` ([`super::tools`]) chama isto para um projeto
+//!   observado só, o id que o modelo pediu e o servidor conferiu.
 //! - **Dado não confiável:** o texto lido vai em `untrusted`; o prompt manda tratar tudo ali como dado
 //!   e nunca como instrução. O caminho do projeto na máquina fica de fora.
 

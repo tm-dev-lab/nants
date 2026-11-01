@@ -899,6 +899,8 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/nanty/usage", GetEffect::Read),
     // Spec 138 T09: só lê o áudio de uma mensagem da conversa, pelo id validado.
     ("/api/nanty/audio/:id", GetEffect::Read),
+    // Spec 139 T07: lê a lista de vozes do Gemini e guarda o cache em memória; não muda nada.
+    ("/api/nanty/voices", GetEffect::Cache),
     ("/api/nanty/telegram", GetEffect::Cache),
     ("devices::PAIR_LINK_PATH", GetEffect::Secret),
     ("/api/devices", GetEffect::Read),

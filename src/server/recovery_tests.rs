@@ -375,6 +375,68 @@ fn repeated_test_command_is_refused_and_previous_is_kept() {
     assert!(validate_config(&root, &extra, &SecretSet::default()).is_ok());
 }
 
+/// Spec 139 T11: a etapa do `&&` que falhou chega à recuperação como fato, pelo texto que o runner
+/// grava na evidência: depois de uma saída longa, com a nota de falta de progresso e os artefatos
+/// atrás dela, e no idioma do projeto. Com 127, também na nota de ambiente.
+#[test]
+fn failed_step_of_the_gate_reaches_the_recovery_facts() {
+    use crate::agents::runner::failure_header;
+    for lang in [Lang::PtBr, Lang::En] {
+        let step = "npx-tool run";
+        let params = [("index", "2"), ("total", "2"), ("step", step)];
+        let note = crate::i18n::tr(lang, "runner.tests.failed_step", &params);
+        let no_progress = crate::i18n::tr(lang, "runner.tests.no_progress", &[("max", "5")]);
+        let artifacts = format!("\n\n{}\n\n### saida/erro.md\nDetalhe do artefato", crate::sdd::failure_artifacts::SECTION);
+        let body = format!("{}\n\n{note}\n\n{no_progress}\n{artifacts}", "linha de log\n".repeat(4000));
+        let write = |code: i32, tag: &str| {
+            let root = choice_root(tag, "BLOCKED", "");
+            let path = root.join(".sdd/specs/s1/tasks/T01.md");
+            let mut task = Task::parse(&std::fs::read_to_string(&path).expect("T01")).expect("parse");
+            task.frontmatter.test_evidence = Some(format!("{}{body}", failure_header(Some(code), false)));
+            std::fs::write(&path, task.render().expect("render")).expect("T01");
+            load(&root, "s1", "T01", &SecretSet::default()).expect("load")
+        };
+        let quality = write(1, &format!("step-fact-{lang:?}"));
+        assert!(quality.facts.contains(&note), "{}", quality.facts);
+        assert!(!quality.environmental);
+        let missing = write(127, &format!("step-fact-127-{lang:?}"));
+        assert!(missing.facts.contains(&note) && missing.environmental, "{}", missing.facts);
+        assert!(missing.env_note.contains(&note), "{}", missing.env_note);
+    }
+}
+
+/// Spec 139 T11: só 126 e 127 do cabeçalho estruturado; o tempo limite continua em
+/// [`command_did_not_run`], fora do erro de forma.
+#[test]
+fn missing_program_code_reads_only_the_structured_header() {
+    let h = crate::agents::runner::failure_header;
+    assert_eq!(missing_program_code(&format!("{}x", h(Some(127), false))), Some(127));
+    assert_eq!(missing_program_code(&format!("{}x", h(Some(126), false))), Some(126));
+    for other in [format!("{}x", h(Some(1), false)), format!("{}x", h(Some(127), true)), "sh: foo: command not found\nexit code 127".to_string(), String::new()] {
+        assert_eq!(missing_program_code(&other), None, "{other}");
+    }
+    assert!(command_did_not_run(&format!("{}x", h(None, true))));
+}
+
+/// Spec 139 T01: as etapas com o texto original (aspas e espaços internos ficam), pelas mesmas
+/// regras de `parse_steps`.
+#[test]
+fn command_steps_keep_the_original_text_of_each_step() {
+    assert_eq!(
+        command_steps("node --test tests/unit  &&   npx playwright test"),
+        Some(vec!["node --test tests/unit".to_string(), "npx playwright test".to_string()])
+    );
+    assert_eq!(
+        command_steps(r#"echo "a && b" && sh -c 'x;  y'"#),
+        Some(vec![r#"echo "a && b""#.to_string(), "sh -c 'x;  y'".to_string()])
+    );
+    assert_eq!(command_steps("make test"), Some(vec!["make test".to_string()]));
+    for bad in ["npm test; exit 0", "npm test || true", "&& npm test", "npm ci &&", "(npm test)", "echo 'aberta"] {
+        assert_eq!(command_steps(bad), None, "{bad}");
+    }
+    assert_eq!(parse_steps("a  'b c' && d"), Some(vec![vec!["a".to_string(), "b c".to_string()], vec!["d".to_string()]]));
+}
+
 #[test]
 fn contains_command_requires_whole_chained_steps() {
     assert!(contains_command("npm ci && npm test", "npm test"));

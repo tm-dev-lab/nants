@@ -157,13 +157,25 @@ fn silences_hold_until_they_expire() {
     assert!(st.silences.is_empty(), "o silêncio vencido sai do estado");
     assert_eq!(st.cards.len(), 3);
 
-    // Silêncio de tudo (sem projeto e sem grupo) cala também o sistema e os marcos.
+    // Spec 139 T04 (C-08): o silêncio de tudo (sem projeto e sem grupo, o pedido na conversa) vale
+    // como o horário de silêncio: o urgente continua chegando, sem som, e o resto vai ao resumo, sem
+    // se perder. Nada é calado.
     let mut all = NantyState::default();
     all.silences.push(Silence { project_id: None, group: None, until_ms: NOON_MS + HOUR });
     let disk = Signal::new(SignalKind::DiskLow, None).fact("min_gb", 5).fact("count", 1);
     let spec = Signal::new(SignalKind::SpecDone, Some("p1"));
-    apply(&mut all, &[disk, spec], &[SignalKind::DiskLow], &cfg, noon_plus(0));
-    assert!(all.cards.is_empty() && all.digest.is_empty());
+    let out = apply(&mut all, &[disk.clone(), spec], &[SignalKind::DiskLow], &cfg, noon_plus(0));
+    assert!(!codes(&out, JournalKind::Filter).iter().any(|c| c == "silenced"), "{:?}", codes(&out, JournalKind::Filter));
+    let urgent = cards_of(&all, "*:disk_low");
+    assert_eq!(urgent.len(), 1);
+    assert_eq!(urgent[0].delivery, Some(Delivery::Silent), "o urgente chega sem som");
+    assert_eq!(cards_of(&all, "p1:spec_done")[0].delivery, Some(Delivery::Digest), "o resto vai ao resumo");
+    assert_eq!(all.digest.len(), 1);
+    // Vencido o silêncio de tudo, o urgente novo volta com som.
+    let mut later = NantyState::default();
+    later.silences.push(Silence { project_id: None, group: None, until_ms: NOON_MS + 10 * MIN });
+    apply(&mut later, &[disk], &[SignalKind::DiskLow], &cfg, noon_plus(10 * MIN));
+    assert_eq!(cards_of(&later, "*:disk_low")[0].delivery, Some(Delivery::Push));
 }
 
 #[test]
@@ -304,7 +316,7 @@ fn proactive_card_carries_only_counts_and_codes() {
     let facts = ProjectFacts {
         project_id: "p1".into(),
         plan_waiting: true,
-        blocked: Some(BlockedTask { task_id: "T03".into(), code: Some("budget".into()), attempts: 2 }),
+        blocked: Some(BlockedTask { task_id: "T03".into(), code: Some("budget".into()), attempts: 2, max_attempts: 3 }),
         stop_code: Some("run.billing".into()),
         role: Some("developer"),
         cost_alerts: 1,
@@ -328,7 +340,7 @@ fn project_observer_maps_attention_tasks_and_cost() {
     let base = ProjectFacts { project_id: "p1".into(), ..ProjectFacts::default() };
     assert!(project_signals(&base).is_empty());
     let kinds = |f: &ProjectFacts| project_signals(f).into_iter().map(|s| s.kind).collect::<Vec<_>>();
-    let task = |code: Option<&str>| BlockedTask { task_id: "T01".into(), code: code.map(Into::into), attempts: 1 };
+    let task = |code: Option<&str>| BlockedTask { task_id: "T01".into(), code: code.map(Into::into), attempts: 1, max_attempts: 3 };
     assert_eq!(kinds(&ProjectFacts { plan_waiting: true, ..base.clone() }), [SignalKind::PlanWaiting]);
     assert_eq!(kinds(&ProjectFacts { blocked: Some(task(Some("budget"))), ..base.clone() }), [SignalKind::Budget]);
     assert_eq!(kinds(&ProjectFacts { blocked: Some(task(Some("kept_recurring"))), ..base.clone() }), [SignalKind::ReviewLoop]);

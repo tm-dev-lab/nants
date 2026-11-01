@@ -68,6 +68,7 @@ export const NANTY_CONFIG = {
   digest_time: "08:00",
   digest_empty: "short",
   lang: "pt-BR",
+  language: "follow",
   excluded_projects: [],
   actions: {},
   catalog: [
@@ -81,7 +82,7 @@ export const NANTY_CONFIG = {
     { id: "change_channel", kind: "person_only", level: "ask", default_level: "ask" },
   ],
   reserve: {},
-  voice: { enabled: false, order: [], transcribe: { connection_id: "", model: "" }, max_input_secs: 300 },
+  voice: { enabled: false, connection_id: "", speech_model: "gemini-3.8-flash-tts", voice: "Kore", transcribe_model: "gemini-3.8-flash", max_input_secs: 300 },
   telegram: { bot_token_masked: "", paired: false, hold_while_visible: true, visible_hold_secs: 180 },
 };
 
@@ -159,6 +160,15 @@ export function fakeNantsServer(options: FakeServerOptions = {}) {
     return m?.[1] ?? null;
   };
 
+  /** `GET /api/nanty/voices`, com a regra do servidor: sem parâmetro, a gravada; vazio, a automática. */
+  const nantyVoices = (url: string): RouteReply => {
+    const saved = (model.nantyConfig as { voice?: { connection_id?: string } } | undefined)?.voice?.connection_id ?? "";
+    const wanted = new URL(url, "http://nants.test").searchParams.get("connection_id") ?? saved;
+    const gemini = model.connections.find((c) => c.kind === "google_gemini" && (wanted === "" || c.id === wanted));
+    if (gemini === undefined) return json(409, { error: "x", code: "nanty_voice_no_connection", params: {} });
+    return json(200, { connection_id: gemini.id, voice: "Kore", voices: [{ id: "Kore", display_name: "Kore", type: "prebuilt", language_code: "pt-BR", gender: "female", description: "Firm" }], speech_models: ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"] });
+  };
+
   const handler = (method: string, url: string, body: unknown): RouteReply => {
     calls.push({ method, url, body });
     const override = overrides.find((o) => o.method === method && o.pattern.test(url));
@@ -174,6 +184,7 @@ export function fakeNantsServer(options: FakeServerOptions = {}) {
     if (method === "GET" && url === "/api/nanty/usage") return json(200, model.nantyUsage);
     if (method === "GET" && url === "/api/nanty/config" && model.nantyConfig !== undefined) return json(200, model.nantyConfig);
     if (method === "GET" && url === "/api/nanty/telegram" && model.nantyTelegram !== undefined) return json(200, model.nantyTelegram);
+    if (method === "GET" && url.startsWith("/api/nanty/voices")) return nantyVoices(url);
     if (method === "POST" && url === "/api/readiness/refresh") return json(200, model.readiness);
     const scope = uiScope(url);
     if (scope !== null) {

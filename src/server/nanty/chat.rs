@@ -8,45 +8,64 @@
 //! - **O texto da pessoa é redigido antes de ser gravado:** o [`SecretSet`] troca qualquer segredo
 //!   conhecido (as chaves das conexões e o token do bot) por `***`, e só então a mensagem entra na
 //!   conversa e no modelo.
-//! - **Comandos fixos, sem modelo ([`COMMANDS`]):** só letras latinas minúsculas, números e `_`, nos
-//!   dois idiomas, sempre aceitos os dois conjuntos: status, resumo, pausar (vira cartão de
-//!   confirmação) e silêncio, mais a ajuda. O Telegram recebe a lista por idioma (`setMyCommands`).
-//! - **Texto livre:** vai ao modelo pela fila única dos turnos ([`turn::run_call`]), com o orçamento
-//!   do dia. Quando o texto pede uma ação, o modelo só propõe ids do que [`act::requestable`] ofereceu,
-//!   e o servidor sempre responde com um cartão de confirmação ([`act::request_card`]), mesmo para a
-//!   ação automática. A resposta do modelo passa pelo `clean` da T07 antes de ser gravada.
-//! - **Leitura a pedido (C-13, [`super::read`]):** só do projeto citado pelo nome. Projeto que não
-//!   existe ou citação ambígua: o Nanty pede para escolher, sem chamar o modelo. A leitura entra no
-//!   prompt como dado não confiável.
+//! - **Comandos fixos ([`COMMANDS`]):** só letras latinas minúsculas, números e `_`, nos dois
+//!   idiomas, sempre aceitos os dois conjuntos: status, resumo, pausar (vira cartão de confirmação) e
+//!   silêncio, mais a ajuda. O Telegram recebe a lista por idioma (`setMyCommands`). Spec 139 T06:
+//!   com modelo e orçamento, o status e o resumo são escritos pelo modelo, a partir dos mesmos fatos
+//!   (o turno com a entrada estruturada); sem ele, a reserva do dicionário, uma frase por fato e sem
+//!   zeros.
+//! - **Texto livre (spec 139 T03, C-01):** com modelo, vai sempre ao laço de agente
+//!   ([`super::agent`]), sem casamento por nome antes: o modelo resolve o projeto pela intenção e
+//!   consulta o que precisa pelas ferramentas de leitura ([`super::tools`]). A resposta final é texto
+//!   puro e passa pelo `clean` da T07 antes de ser gravada. A quem escreveu pelo Telegram, o
+//!   "digitando" fica ligado enquanto o laço roda.
+//! - **Ações e silêncio pela conversa (spec 139 T04, G3):** o pedido de ação em frase livre vira o
+//!   cartão de confirmação pela ferramenta `propose_action` (sempre, mesmo para a ação automática: só
+//!   o clique executa), e a mensagem cita o cartão. O silêncio pedido em frase livre vale direto, com
+//!   a confirmação do servidor e o botão para desligar ([`super::silence`]); num turno contaminado,
+//!   vira cartão.
+//! - **Texto de terceiro (spec 139 T04, C-07):** a mensagem encaminhada (ou com a citação de outra
+//!   pessoa) vai ao modelo como dado não confiável e contamina o turno; a encaminhada nunca vale como
+//!   comando.
+//! - **Reserva sem modelo** (sem modelo, sem orçamento, fila cheia ou falha): o [`cite`] acha o
+//!   projeto citado, com normalização (sem acento; "14" casa com "Test 14"), e o Nanty diz a fase dele
+//!   pela fonte única; citação ambígua ou desconhecida vira a lista para escolher, com os candidatos
+//!   prováveis primeiro. O `cite` também serve ao atalho `/pausar <nome>`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::act::{self, NoCard, Requestable};
 use super::actions::ActionId;
+use super::agent::{self, Ended, Session, SilenceEffect};
 use super::journal::{JournalEntry, JournalKind};
-use super::store::{AudioRef, Channel, ConversationMessage, Silence, Speaker};
+use super::silence::Request;
+use super::store::{AudioRef, Channel, ConversationMessage, Relayed, Speaker};
 use super::telegram::format;
-use super::turn::{self, Call, SignalFact, TurnKind, TurnOutcome};
-use super::{digest, nanty_lang, Nanty};
-use crate::config::{Config, DigestEmpty, Project, Urgency};
+use super::turn::{TurnInput, TurnKind, TurnOutcome};
+use super::{digest, nanty_lang, tools, turn, Nanty};
+use crate::config::{Config, DigestEmpty, NantyConfig, Project, Urgency};
 use crate::i18n::{tr, Lang};
 use crate::server::events::SecretSet;
 use crate::server::state::AppState;
 
 /// Maior mensagem da pessoa guardada (o limite do Telegram).
 pub const MAX_PERSON_CHARS: usize = 4096;
+/// Folga do texto do modelo para a frase do servidor que fecha a mensagem (spec 139 T12): ela nunca
+/// cai no corte do limite do Telegram.
+const CLOSING_ROOM: usize = 300;
+/// Maior citação de terceiro guardada (spec 139 T05, vindo da revisão da T04): o trecho do
+/// `quote` do Telegram vai até 1024 caracteres; a resposta a uma mensagem de terceiro sem trecho
+/// traz o texto dela inteiro, que fica neste corte.
+pub const MAX_QUOTE_CHARS: usize = 1024;
 /// Silêncio do comando sem número, em horas.
 pub const SILENCE_DEFAULT_HOURS: u64 = 1;
 /// Maior silêncio pelo comando, em horas.
 pub const SILENCE_MAX_HOURS: u64 = 24;
-/// Projetos listados quando o Nanty pede para escolher.
+/// Projetos listados quando o Nanty pede para escolher (os que casam com a citação nunca são
+/// cortados).
 const MAX_LISTED_PROJECTS: usize = 10;
-/// Cartões de confirmação de uma resposta do modelo.
-const MAX_REQUESTED_CARDS: usize = turn::MAX_MODEL_ACTIONS;
 
 /// Um comando fixo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,14 +165,19 @@ pub fn parse(text: &str) -> Parsed<'_> {
 /// O texto da pessoa como fica gravado: os segredos conhecidos viram `***` (antes do corte, para
 /// nunca sobrar um pedaço) e o corte fica no limite. `None` sem texto.
 pub fn redact(secrets: &SecretSet, raw: &str) -> Option<String> {
+    redact_to(secrets, raw, MAX_PERSON_CHARS)
+}
+
+/// Como [`redact`], com o corte em `max` caracteres.
+fn redact_to(secrets: &SecretSet, raw: &str, max: usize) -> Option<String> {
     let scrubbed = secrets.scrub_exact(raw.trim());
-    let text: String = scrubbed.trim().chars().take(MAX_PERSON_CHARS).collect();
+    let text: String = scrubbed.trim().chars().take(max).collect();
     (!text.trim().is_empty()).then_some(text)
 }
 
 /// Grava a mensagem da pessoa na conversa (redigida) e a devolve. `None` sem texto.
-pub fn person_message(nanty: &Nanty, secrets: &SecretSet, channel: Channel, raw: &str) -> Option<ConversationMessage> {
-    person_message_with(nanty, secrets, channel, Some(raw), false, None)
+pub fn person_message(nanty: &Nanty, cfg: &NantyConfig, secrets: &SecretSet, channel: Channel, raw: &str) -> Option<ConversationMessage> {
+    person_message_with(nanty, cfg, secrets, channel, Some(raw), false, None)
 }
 
 /// Como [`person_message`], com a marca da nota de voz (T09): o texto é a transcrição (redigida do
@@ -161,16 +185,39 @@ pub fn person_message(nanty: &Nanty, secrets: &SecretSet, channel: Channel, raw:
 /// marca, `None` sem texto.
 pub fn person_message_with(
     nanty: &Nanty,
+    cfg: &NantyConfig,
     secrets: &SecretSet,
     channel: Channel,
     raw: Option<&str>,
     voice: bool,
     audio: Option<AudioRef>,
 ) -> Option<ConversationMessage> {
+    person_message_from(nanty, cfg, secrets, channel, raw, voice, audio, None)
+}
+
+/// Como [`person_message_with`], com o texto de terceiro que a mensagem traz (spec 139 T04): a
+/// citação também é redigida e cortada em [`MAX_QUOTE_CHARS`] antes de ser gravada. O idioma da
+/// mensagem (spec 139 T05) é resolvido aqui ([`super::language::person_lang`]) e gravado em `lang`;
+/// quando vem de um sinal dela (o texto ou o `language_code`), vira o último idioma da pessoa.
+#[allow(clippy::too_many_arguments)]
+pub fn person_message_from(
+    nanty: &Nanty,
+    cfg: &NantyConfig,
+    secrets: &SecretSet,
+    channel: Channel,
+    raw: Option<&str>,
+    voice: bool,
+    audio: Option<AudioRef>,
+    relayed: Option<Relayed>,
+) -> Option<ConversationMessage> {
+    let relayed = relayed.map(|r| Relayed { quote: r.quote.as_deref().and_then(|q| redact_to(secrets, q, MAX_QUOTE_CHARS)), ..r });
     let text = raw.and_then(|r| redact(secrets, r));
     if text.is_none() && !voice {
         return None;
     }
+    // O texto encaminhado é de terceiro: não diz o idioma de quem encaminhou.
+    let own = text.as_deref().filter(|_| !relayed.as_ref().is_some_and(|r| r.forwarded));
+    let lang = nanty.note_person_lang(cfg, channel, own);
     let message = ConversationMessage {
         id: super::new_id(),
         at_ms: nanty.now().epoch_ms,
@@ -180,12 +227,13 @@ pub fn person_message_with(
         text,
         code: None,
         params: Map::new(),
-        lang: None,
+        lang: Some(lang.tag().to_string()),
         card_ids: Vec::new(),
         actions: Vec::new(),
         reply_to: None,
         voice,
         audio,
+        relayed,
     };
     nanty.push_message(&message);
     Some(message)
@@ -199,21 +247,29 @@ pub fn spawn_reply(state: &AppState, person: ConversationMessage) {
     });
 }
 
-/// A resposta à mensagem da pessoa: o comando (sem modelo) ou o texto livre (com o modelo). Sai pelo
+/// A resposta à mensagem da pessoa: o comando (o status e o resumo pelo modelo, quando há; o resto fixo) ou o texto livre (com o modelo). Sai pelo
 /// canal da mensagem. Devolve a resposta gravada.
 pub async fn reply(state: &AppState, person: &ConversationMessage) -> Option<ConversationMessage> {
     let nanty = Arc::clone(state.nanty());
     let text = person.text.clone()?;
     let cfg = state.config().read().await.clone();
-    let lang = nanty_lang(&cfg.nanty);
+    // Spec 139 T05: a resposta sai no idioma de quem falou, o resolvido na mensagem dela.
+    let lang = super::language::tagged(person.lang.as_deref()).unwrap_or_else(|| nanty_lang(&cfg.nanty, &nanty));
     let channel = person.channel;
-    let (kind, mut message) = match parse(&text) {
+    // A mensagem encaminhada é de terceiro: nunca vale como comando (C-07).
+    let forwarded = person.relayed.as_ref().is_some_and(|r| r.forwarded);
+    let parsed = if forwarded { Parsed::Text } else { parse(&text) };
+    let (kind, mut message) = match parsed {
         Parsed::Command(command, args) => (command.as_str(), command_reply(state, &nanty, &cfg, lang, command, args, channel).await),
         Parsed::Unknown => ("unknown", fixed(&nanty, "nanty.chat.unknown_command", with_commands(lang))),
-        Parsed::Text => ("text", converse(state, &nanty, &cfg, lang, &text, channel).await),
+        Parsed::Text => ("text", converse(state, &nanty, &cfg, lang, person, &text).await),
     };
     message.channel = channel;
     message.reply_to = Some(person.id.clone());
+    // Toda mensagem leva o idioma (T05): o `render` e a janela montam o texto fixo nele.
+    if message.lang.is_none() {
+        message.lang = Some(lang.tag().to_string());
+    }
     let mut entry = JournalEntry::new(nanty.now().epoch_ms, JournalKind::Conversation, "chat.reply");
     entry.project_id = message.project_id.clone();
     entry.params.insert("input".into(), json!(kind));
@@ -223,11 +279,9 @@ pub async fn reply(state: &AppState, person: &ConversationMessage) -> Option<Con
         entry.params.insert("reply".into(), json!(code));
     }
     nanty.record(&entry);
-    // T09: a quem falou por voz no Telegram, com a voz ligada, a resposta também vai em voz.
-    super::voice::attach_speech(state, &nanty, person, &mut message).await;
-    let n = Arc::clone(&nanty);
-    let saved = message.clone();
-    let _ = tokio::task::spawn_blocking(move || n.push_message(&saved)).await;
+    // Spec 139 T08: o texto entra na conversa agora; com a voz ligada, a fala vem depois, e quem
+    // escreveu pelo Telegram vê o "gravando áudio" enquanto ela é gerada.
+    super::voice::deliver(state, &nanty, &mut message, channel == Channel::Telegram).await;
     Some(message)
 }
 
@@ -251,10 +305,6 @@ fn hhmm(at_ms: u64) -> String {
     super::clock::local_time_at(at_ms).map(|t| format!("{:02}:{:02}", t.hour, t.minute)).unwrap_or_default()
 }
 
-fn round_cents(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
-}
-
 // ---- Comandos ----
 
 async fn command_reply(
@@ -267,65 +317,113 @@ async fn command_reply(
     channel: Channel,
 ) -> ConversationMessage {
     match command {
-        Command::Status => status(nanty, cfg),
-        Command::Summary => summary(state, nanty, cfg).await,
+        Command::Status => status(state, nanty, cfg, lang).await,
+        Command::Summary => summary(state, nanty, cfg, lang).await,
         Command::Pause => pause(state, nanty, cfg, args, channel).await,
-        Command::Silence => silence(nanty, args),
-        Command::Help => fixed(nanty, "nanty.chat.help", with_commands(lang)),
+        Command::Silence => silence(nanty, args, channel),
+        // Spec 139 T13: a conversa livre depende do modelo; sem ele, a ajuda não a promete.
+        Command::Help => {
+            let code = if turn::model_route(cfg).is_some() { "nanty.chat.help" } else { "nanty.chat.help_no_model" };
+            fixed(nanty, code, with_commands(lang))
+        }
     }
 }
 
-/// O silêncio de tudo ainda valendo agora (o mais longo).
-fn global_silence(nanty: &Nanty, now_ms: u64) -> Option<u64> {
-    nanty
-        .snapshot()
-        .silences
-        .iter()
-        .filter(|s| s.project_id.is_none() && s.group.is_none() && s.until_ms > now_ms)
-        .map(|s| s.until_ms)
-        .max()
+/// O atalho escrito pelo modelo (spec 139 T06, G4): com modelo e orçamento, o turno com a entrada
+/// estruturada, no idioma de quem falou. `None` sem modelo, sem orçamento, com a fila cheia, com
+/// falha ou com a resposta inválida: fica a reserva do dicionário.
+async fn written(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, input: &TurnInput, lang: Lang) -> Option<ConversationMessage> {
+    turn::model_route(cfg)?;
+    match turn::run_in(state, nanty, input, lang).await {
+        TurnOutcome::Reply(reply) => Some(turn::model_message(nanty, lang, &reply, Vec::new())),
+        TurnOutcome::Skipped(_) => None,
+    }
 }
 
-/// `status`: o que espera a pessoa, o que foi feito hoje, o previsto, o silêncio e o orçamento.
-fn status(nanty: &Nanty, cfg: &Config) -> ConversationMessage {
+/// Uma linha extra, `{code, params}`, como no resumo da manhã.
+fn line(code: &str, params: Value) -> Value {
+    json!({ "code": code, "params": params })
+}
+
+/// `status`: o que espera a pessoa, o que foi feito hoje, o previsto, o silêncio e o orçamento. Com
+/// modelo, o texto é dele, a partir desses fatos (spec 139 T06); sem ele, uma frase por fato, sem
+/// zeros.
+async fn status(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, lang: Lang) -> ConversationMessage {
     let now = nanty.now();
     let snap = nanty.snapshot();
-    let waiting = snap.cards.iter().filter(|c| c.expires_at_ms > now.epoch_ms && c.urgency != Some(Urgency::Digest)).count();
+    let waiting = snap
+        .cards
+        .iter()
+        .filter(|c| c.expires_at_ms > now.epoch_ms && c.urgency != Some(Urgency::Digest) && c.awaits_person())
+        .count() as u64;
     let start = digest::day_start_ms(&now);
-    let mut params = Map::new();
-    params.insert("waiting".into(), json!(waiting));
-    params.insert("done".into(), json!(snap.done.iter().filter(|d| d.at_ms >= start).count()));
-    // O previsto conta também o resumo da manhã, que está sempre agendado: o mesmo número da seção
-    // "Previsto" da janela (T10).
-    params.insert("planned".into(), json!(snap.planned.len() + 1));
-    // As linhas extras vão em `params.lines`, cada uma `{code, params}`, como no resumo da manhã.
-    let line = |code: &str, params: Value| json!({ "code": code, "params": params });
+    let done = snap.done.iter().filter(|d| d.at_ms >= start).count() as u64;
+    // O resumo da manhã está sempre agendado: o previsto aqui é o que vem além dele.
+    let planned = snap.planned.len() as u64;
+    let silence = tools::global_silence(nanty, now.epoch_ms);
+
+    let mut input = TurnInput::new(TurnKind::Status);
+    for (name, value) in [("waiting", waiting), ("done_today", done), ("planned_later", planned)] {
+        if value > 0 {
+            input.counts.insert(name, value);
+        }
+    }
+    input.signals = snap
+        .alerts
+        .values()
+        .filter(|a| a.project_id.as_deref().is_none_or(|p| cfg.nanty.observes(p)))
+        .filter_map(turn::SignalFact::of_alert)
+        .take(turn::MAX_SIGNALS_IN)
+        .collect();
+    input.silenced_until = silence.map(hhmm);
+    let view = turn::budget_view(cfg, &snap.spend_on(&now.day_key()));
+    match view.mode {
+        turn::BudgetMode::Usd => {
+            if view.spent_usd > 0.0 {
+                input.cost_usd.insert("nanty_today", (view.spent_usd * 10_000.0).round() / 10_000.0);
+            }
+            input.cost_usd.insert("nanty_daily_budget", view.budget_usd);
+        }
+        turn::BudgetMode::Tokens => {
+            if view.tokens > 0 {
+                input.tokens.insert("nanty_today", view.tokens);
+            }
+            input.tokens.insert("nanty_daily_budget", view.budget_tokens);
+        }
+    }
+    if let Some(message) = written(state, nanty, cfg, &input, lang).await {
+        return message;
+    }
+
     let mut lines = Vec::new();
-    if let Some(until) = global_silence(nanty, now.epoch_ms) {
+    if waiting > 0 {
+        lines.push(line("nanty.chat.status_waiting", json!({ "count": waiting })));
+    } else {
+        lines.push(line("nanty.chat.status_nothing_waiting", json!({})));
+    }
+    if done > 0 {
+        lines.push(line("nanty.chat.status_done", json!({ "count": done })));
+    }
+    if planned > 0 {
+        lines.push(line("nanty.chat.status_planned", json!({ "count": planned })));
+    }
+    if let Some(until) = silence {
         lines.push(line("nanty.chat.status_silence", json!({ "until": hhmm(until) })));
     }
-    if turn::model_route(cfg).is_none() {
-        lines.push(line("nanty.chat.status_no_model", json!({})));
-    } else {
-        let view = turn::budget_view(cfg, &snap.spend_on(&now.day_key()));
-        lines.push(match view.mode {
-            turn::BudgetMode::Usd => line(
-                "nanty.chat.status_budget_usd",
-                json!({ "spent": round_cents(view.spent_usd), "budget": round_cents(view.budget_usd) }),
-            ),
-            turn::BudgetMode::Tokens => {
-                line("nanty.chat.status_budget_tokens", json!({ "tokens": view.tokens, "budget": view.budget_tokens }))
-            }
-        });
-    }
-    params.insert("lines".into(), Value::Array(lines));
-    fixed(nanty, "nanty.chat.status", params)
+    let (code, budget) = tools::budget_line(nanty, cfg);
+    lines.push(line(&code, Value::Object(budget)));
+    fixed(nanty, "nanty.chat.status", param("lines", Value::Array(lines)))
 }
 
-/// `resumo`: os fatos do resumo da manhã, agora, sem modelo e sem consumir os avisos guardados.
-async fn summary(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config) -> ConversationMessage {
+/// `resumo`: os fatos do resumo da manhã, agora, sem consumir os avisos guardados. Com modelo, o
+/// texto é dele (spec 139 T06); sem ele, a reserva do dicionário.
+async fn summary(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, lang: Lang) -> ConversationMessage {
     let now = nanty.now();
     let facts = digest::gather(state, nanty, &now).await;
+    let input = digest::summary_input(TurnKind::Summary, &facts, &nanty.snapshot());
+    if let Some(message) = written(state, nanty, cfg, &input, lang).await {
+        return message;
+    }
     let mut short = cfg.nanty.clone();
     short.digest_empty = DigestEmpty::Short;
     match digest::compose(&facts, &short, super::new_id(), now.epoch_ms) {
@@ -338,17 +436,20 @@ async fn summary(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config) -> Conversa
     }
 }
 
-/// Os projetos que o Nanty observa.
-fn observed(cfg: &Config) -> Vec<&Project> {
+/// Os projetos que o Nanty observa (os únicos que a conversa lê).
+pub(super) fn observed(cfg: &Config) -> Vec<&Project> {
     cfg.projects.iter().filter(|p| cfg.nanty.observes(&p.id)).collect()
 }
 
-/// "Escolha um projeto": os nomes, até [`MAX_LISTED_PROJECTS`].
-fn choose(nanty: &Nanty, projects: &[&Project]) -> ConversationMessage {
+/// "Escolha um projeto": os nomes na ordem de [`ranked`] (os prováveis primeiro), até
+/// [`MAX_LISTED_PROJECTS`], sem nunca cortar um projeto que casa com a citação.
+fn choose(nanty: &Nanty, projects: &[&Project], text: &str) -> ConversationMessage {
     if projects.is_empty() {
         return fixed(nanty, "nanty.chat.no_projects", Map::new());
     }
-    let names: Vec<&str> = projects.iter().take(MAX_LISTED_PROJECTS).map(|p| p.name.as_str()).collect();
+    let ranked = ranked(projects, text);
+    let matching = ranked.iter().filter(|(_, score)| *score > 0).count();
+    let names: Vec<&str> = ranked.iter().take(MAX_LISTED_PROJECTS.max(matching)).map(|(p, _)| p.name.as_str()).collect();
     fixed(nanty, "nanty.chat.choose_project", param("projects", names.join(", ")))
 }
 
@@ -361,13 +462,13 @@ async fn pause(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, args: &str, c
         match running.as_slice() {
             [] => return fixed(nanty, "nanty.chat.pause_nothing", Map::new()),
             [one] => *one,
-            many => return choose(nanty, many),
+            many => return choose(nanty, many, args),
         }
     } else {
         match cite(&projects, args) {
             Cited::One(p) => p,
-            Cited::Ambiguous(list) => return choose(nanty, &list),
-            Cited::None | Cited::Unknown => return choose(nanty, &projects),
+            Cited::Ambiguous(list) => return choose(nanty, &list, args),
+            Cited::None | Cited::Unknown => return choose(nanty, &projects, args),
         }
     };
     let name = param("project", target.name.as_str());
@@ -388,8 +489,9 @@ async fn pause(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, args: &str, c
 }
 
 /// `silencio [horas]`: silêncio de todos os avisos por 1 hora (ou pelas horas pedidas, até
-/// [`SILENCE_MAX_HOURS`]); `0` (ou `off`, `desligar`) desliga.
-fn silence(nanty: &Nanty, args: &str) -> ConversationMessage {
+/// [`SILENCE_MAX_HOURS`]); `0` (ou `off`, `desligar`) desliga. Ligado, a resposta cita o cartão com o
+/// botão para desligar (spec 139 T04).
+fn silence(nanty: &Nanty, args: &str, channel: Channel) -> ConversationMessage {
     let arg = args.trim().to_lowercase();
     let hours = match arg.as_str() {
         "" => Some(SILENCE_DEFAULT_HOURS),
@@ -399,20 +501,14 @@ fn silence(nanty: &Nanty, args: &str) -> ConversationMessage {
     let Some(hours) = hours.filter(|h| *h <= SILENCE_MAX_HOURS) else {
         return fixed(nanty, "nanty.chat.silence_usage", param("max", SILENCE_MAX_HOURS));
     };
-    let now_ms = nanty.now().epoch_ms;
-    let until = now_ms.saturating_add(hours.saturating_mul(60 * 60 * 1000));
-    nanty.update(|st| {
-        st.silences.retain(|s| s.project_id.is_some() || s.group.is_some());
-        if hours > 0 {
-            st.silences.push(Silence { project_id: None, group: None, until_ms: until });
-        }
-        true
-    });
     if hours == 0 {
-        fixed(nanty, "nanty.chat.silence_off", Map::new())
-    } else {
-        fixed(nanty, "nanty.chat.silence_on", param("until", hhmm(until)))
+        super::silence::end(nanty, channel);
+        return fixed(nanty, "nanty.chat.silence_off", Map::new());
     }
+    let (until, card) = super::silence::apply(nanty, Request::Hours(hours), channel);
+    let mut message = fixed(nanty, "nanty.chat.silence_on", param("until", hhmm(until)));
+    message.card_ids = vec![card];
+    message
 }
 
 // ---- O projeto citado ----
@@ -429,33 +525,103 @@ pub enum Cited<'a> {
     Ambiguous(Vec<&'a Project>),
 }
 
-/// O texto em palavras minúsculas, cercado de espaços: `" olha o projeto loja "`.
+/// Letra sem acento (a citação "sao joao" casa com o nome "São João").
+fn fold(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        'ñ' => 'n',
+        other => other,
+    }
+}
+
+/// A palavra sem acento (para a detecção do idioma, [`super::language`]).
+pub(super) fn fold_word(word: &str) -> String {
+    word.chars().map(fold).collect()
+}
+
+/// O texto em palavras minúsculas e sem acento, cercado de espaços: `" olha o projeto loja "`.
 fn words(text: &str) -> String {
-    let flat: String = text.chars().map(|c| if c.is_alphanumeric() { c.to_lowercase().next().unwrap_or(c) } else { ' ' }).collect();
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_alphanumeric() { fold(c.to_lowercase().next().unwrap_or(c)) } else { ' ' })
+        .collect();
     format!(" {} ", flat.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-/// Palavras depois de "projeto" que não são nome (`o projeto que falhou`).
-const NOT_A_NAME: [&str; 24] = [
-    "que", "de", "do", "da", "dos", "das", "no", "na", "em", "e", "ou", "esta", "está", "agora", "pra", "para", "that",
-    "is", "the", "of", "in", "on", "and", "now",
+/// Palavras depois de "projeto" que não são nome (`o projeto que falhou`), já sem acento.
+const NOT_A_NAME: [&str; 23] = [
+    "que", "de", "do", "da", "dos", "das", "no", "na", "em", "e", "ou", "esta", "agora", "pra", "para", "that", "is",
+    "the", "of", "in", "on", "and", "now",
 ];
 
-/// O projeto citado: pelo nome (ou pelo id), como palavras inteiras. Um nome contido em outro citado
-/// junto (`Loja` dentro de `Loja Nova`) não conta à parte.
-pub fn cite<'a>(projects: &[&'a Project], text: &str) -> Cited<'a> {
-    let hay = words(text);
-    let mut found: Vec<(&'a Project, String)> = Vec::new();
-    for p in projects {
-        let name = words(&p.name);
-        let id = words(&p.id);
-        let hit = [name.as_str(), id.as_str()].iter().any(|w| w.trim().len() > 1 && hay.contains(*w));
-        if hit && !found.iter().any(|(f, _)| f.id == p.id) {
-            found.push((p, name));
+/// Como o texto cita um projeto: pelo nome inteiro (ou pelo id), por um número do nome ("14" em
+/// "Test 14") ou por uma palavra do nome (esta só ordena a lista de escolha).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Hit {
+    whole: bool,
+    number: bool,
+    word: bool,
+}
+
+impl Hit {
+    fn score(self) -> u8 {
+        if self.whole {
+            3
+        } else if self.number {
+            2
+        } else {
+            u8::from(self.word)
         }
     }
-    let names: Vec<String> = found.iter().map(|(_, n)| n.clone()).collect();
-    found.retain(|(_, name)| !names.iter().any(|other| other != name && other.contains(name.as_str())));
+}
+
+fn hit(hay: &str, project: &Project) -> Hit {
+    let name = words(&project.name);
+    let id = words(&project.id);
+    let whole = [name.as_str(), id.as_str()].iter().any(|w| w.trim().len() > 1 && hay.contains(*w));
+    let number = name
+        .split_whitespace()
+        .filter(|w| w.bytes().all(|b| b.is_ascii_digit()))
+        .any(|n| hay.contains(&format!(" {n} ")));
+    let word = name
+        .split_whitespace()
+        .filter(|w| w.chars().count() >= 3 && !NOT_A_NAME.contains(w) && !matches!(*w, "projeto" | "project"))
+        .any(|w| hay.contains(&format!(" {w} ")));
+    Hit { whole, number, word }
+}
+
+/// Os projetos na ordem da lista de escolha: os que casam com a citação primeiro (nome inteiro,
+/// depois número, depois uma palavra do nome), e o resto na ordem de antes. Com a nota de cada um.
+fn ranked<'a>(projects: &[&'a Project], text: &str) -> Vec<(&'a Project, u8)> {
+    let hay = words(text);
+    let mut out: Vec<(&'a Project, u8)> = projects.iter().map(|p| (*p, hit(&hay, p).score())).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// O projeto citado: pelo nome (ou pelo id), como palavras inteiras e sem diferença de acento; sem
+/// nome inteiro no texto, por um número do nome ("o projeto 14" casa com "Test 14"). Um nome contido
+/// em outro citado junto (`Loja` dentro de `Loja Nova`) não conta à parte.
+pub fn cite<'a>(projects: &[&'a Project], text: &str) -> Cited<'a> {
+    let hay = words(text);
+    let hits: Vec<(&'a Project, Hit)> = projects.iter().map(|p| (*p, hit(&hay, p))).collect();
+    let any_whole = hits.iter().any(|(_, h)| h.whole);
+    let mut found: Vec<(&'a Project, String)> = Vec::new();
+    for (p, h) in &hits {
+        let counts = if any_whole { h.whole } else { h.number };
+        if counts && !found.iter().any(|(f, _)| f.id == p.id) {
+            found.push((*p, words(&p.name)));
+        }
+    }
+    if any_whole {
+        let names: Vec<String> = found.iter().map(|(_, n)| n.clone()).collect();
+        found.retain(|(_, name)| !names.iter().any(|other| other != name && other.contains(name.as_str())));
+    }
     match found.len() {
         0 => {
             let tokens: Vec<&str> = hay.split_whitespace().collect();
@@ -473,119 +639,105 @@ pub fn cite<'a>(projects: &[&'a Project], text: &str) -> Cited<'a> {
 
 // ---- Texto livre ----
 
-/// A entrada do modelo na conversa: a mensagem da pessoa (já redigida), os sinais estruturados, as
-/// contagens, os ids que ele pode propor e, se a pessoa citou um projeto, a leitura dele (com o
-/// conteúdo dos arquivos em `project.untrusted`).
-#[derive(Debug, Serialize)]
-struct ChatInput<'a> {
-    kind: TurnKind,
-    message: &'a str,
-    signals: Vec<SignalFact>,
-    counts: BTreeMap<&'static str, u64>,
-    allowed_actions: Vec<ActionId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<Value>,
-}
-
-/// O texto livre: confere o projeto citado, monta a entrada, chama o modelo pela fila única e
-/// transforma cada id proposto num cartão de confirmação. Sem modelo, sem orçamento ou com resposta
-/// inválida, a resposta é o texto fixo.
+/// O texto livre (spec 139 T03): com modelo, sempre o laço de agente, com o "digitando" para quem
+/// escreveu pelo Telegram; o texto final passa pelo `clean`. Sem modelo, sem orçamento, com a fila
+/// cheia ou com falha, a reserva ([`reserve`]). O que as ferramentas fizeram (T04) vale em qualquer
+/// saída: a mensagem cita os cartões, e a confirmação do silêncio é do servidor.
 async fn converse(
     state: &AppState,
     nanty: &Arc<Nanty>,
     cfg: &Config,
     lang: Lang,
+    person: &ConversationMessage,
     text: &str,
-    channel: Channel,
 ) -> ConversationMessage {
     if turn::model_route(cfg).is_none() {
-        return fixed(nanty, "nanty.chat.no_model", with_commands(lang));
+        return reserve(state, nanty, cfg, lang, text, "nanty.chat.no_model").await;
     }
-    let projects = observed(cfg);
-    let project = match cite(&projects, text) {
-        Cited::None => None,
-        Cited::One(p) => Some(p.clone()),
-        Cited::Unknown => return choose(nanty, &projects),
-        Cited::Ambiguous(list) => return choose(nanty, &list),
-    };
-    let pid = project.as_ref().map(|p| p.id.clone());
-    let snap = nanty.snapshot();
-    let signals: Vec<SignalFact> = snap
-        .alerts
-        .values()
-        .filter(|a| pid.is_none() || a.project_id.is_none() || a.project_id == pid)
-        .filter_map(SignalFact::of_alert)
-        .take(turn::MAX_SIGNALS_IN)
-        .collect();
-    let offers = act::requestable(state, cfg, &snap, pid.as_deref());
-    let mut allowed: Vec<ActionId> = Vec::new();
-    for offer in &offers {
-        if !allowed.contains(&offer.action) {
-            allowed.push(offer.action);
-        }
-    }
-    let now_ms = nanty.now().epoch_ms;
-    let mut counts = BTreeMap::new();
-    counts.insert("projects", projects.len() as u64);
-    counts.insert("running", projects.iter().filter(|p| state.runs().active(&p.id).is_some()).count() as u64);
-    counts.insert("open_cards", snap.cards.iter().filter(|c| c.expires_at_ms > now_ms).count() as u64);
-    let data = match &project {
-        Some(p) => Some(super::read::project_view(state, cfg, p).await),
-        None => None,
-    };
-    let input = ChatInput { kind: TurnKind::Conversation, message: text, signals, counts, allowed_actions: allowed.clone(), project: data };
-    let call = Call {
-        kind: TurnKind::Conversation,
-        system: crate::agents::prompts::nanty_chat_system(lang),
-        user: serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
-        allowed: &allowed,
-        signals: input.signals.len(),
-    };
-    let reply = match turn::run_call(state, nanty, &call).await {
-        TurnOutcome::Reply(reply) => reply,
-        TurnOutcome::Skipped(reason) => {
+    let input = agent::input(state, nanty, cfg, lang, person, text).await;
+    let mut session = Session::new(person.channel, input.untrusted, lang);
+    let system = crate::agents::prompts::nanty_chat_system(lang);
+    // C-09: só a quem escreveu pelo Telegram; a fila de saída o renova sem atropelar os envios.
+    let typing = (person.channel == Channel::Telegram).then(|| nanty.telegram().outbox().typing());
+    let ended = agent::run(state, nanty, cfg, system, input.text, &mut session).await;
+    drop(typing);
+    let secrets = SecretSet::from_config(&*state.config().read().await);
+    let reply = match ended {
+        Ended::Reply { text, .. } => Some(format::clean(&secrets, &text)).filter(|t| !t.is_empty()),
+        Ended::Skipped(reason) => {
             let code = match reason {
                 "budget" => "nanty.chat.budget",
                 "busy" => "nanty.chat.busy",
                 "no_model" => "nanty.chat.no_model",
                 _ => "nanty.chat.failed",
             };
-            return fixed(nanty, code, with_commands(lang));
+            // Sem texto do modelo e sem nada feito pelas ferramentas: a reserva.
+            if session.cards.is_empty() && session.silence.is_none() {
+                return reserve(state, nanty, cfg, lang, text, code).await;
+            }
+            None
         }
     };
-    // Cada id proposto vira um cartão de confirmação: nada é executado aqui.
-    let mut card_ids = Vec::new();
-    let mut actions = Vec::new();
-    for id in &reply.actions {
-        for offer in offers.iter().filter(|o| o.action == *id) {
-            if card_ids.len() >= MAX_REQUESTED_CARDS {
-                break;
-            }
-            if let Ok(card) = act::request_card(state, offer, channel).await {
-                if !card_ids.contains(&card) {
-                    card_ids.push(card);
-                }
-                let name = id.as_str().to_string();
-                if !actions.contains(&name) {
-                    actions.push(name);
-                }
-            }
+    let effect = effect_message(nanty, &session);
+    let mut message = match (effect, reply) {
+        (Some(mut m), reply) => {
+            m.text = reply.map(|r| format::fit(&r, format::MAX_MESSAGE_CHARS - CLOSING_ROOM));
+            m
         }
+        (None, Some(reply)) => {
+            let mut m = fixed(nanty, "nanty.chat.failed", Map::new());
+            m.code = None;
+            m.text = Some(reply);
+            m
+        }
+        (None, None) => return fixed(nanty, "nanty.chat.failed", with_commands(lang)),
+    };
+    // O idioma do texto do modelo (instruído a seguir a pessoa); sem sinal claro, o dela.
+    let written = message.text.as_deref().and_then(super::language::detect).unwrap_or(lang);
+    message.lang = Some(written.tag().to_string());
+    message.card_ids = session.cards.clone();
+    message.actions = session.actions.clone();
+    if let [one] = session.read.as_slice() {
+        message.project_id = Some(one.clone());
     }
-    let secrets = SecretSet::from_config(&*state.config().read().await);
-    let text = Some(format::clean(&secrets, &reply.summary)).filter(|t| !t.is_empty());
-    let mut message = fixed(nanty, "nanty.chat.confirm", Map::new());
-    match (card_ids.is_empty(), &text) {
-        (true, Some(_)) => message.code = None,
-        (true, None) => return fixed(nanty, "nanty.chat.failed", with_commands(lang)),
-        (false, _) => {}
-    }
-    message.text = text;
-    message.lang = Some(lang.tag().to_string());
-    message.project_id = pid;
-    message.card_ids = card_ids;
-    message.actions = actions;
     message
+}
+
+/// A parte do servidor na resposta (T04): a confirmação do silêncio, com a hora calculada aqui, ou o
+/// lembrete de que nada é feito sem o toque no cartão. `None` sem nada feito pelas ferramentas.
+fn effect_message(nanty: &Nanty, session: &Session) -> Option<ConversationMessage> {
+    match session.silence {
+        Some(SilenceEffect::Applied(until)) => Some(fixed(nanty, "nanty.chat.silence_set", param("until", hhmm(until)))),
+        Some(SilenceEffect::Proposed(until)) => Some(fixed(nanty, "nanty.chat.silence_confirm", param("until", hhmm(until)))),
+        Some(SilenceEffect::Ended) => Some(fixed(nanty, "nanty.chat.silence_off", Map::new())),
+        None if !session.cards.is_empty() => Some(fixed(nanty, "nanty.chat.confirm", Map::new())),
+        None => None,
+    }
+}
+
+/// A reserva sem modelo: o projeto citado ([`cite`]) e a fase dele pela fonte única, nas linhas que a
+/// janela também traduz; citação ambígua ou desconhecida, a lista para escolher, com os prováveis
+/// primeiro; sem citação, o texto fixo `code`.
+async fn reserve(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, lang: Lang, text: &str, code: &str) -> ConversationMessage {
+    let projects = observed(cfg);
+    match cite(&projects, text) {
+        Cited::None => fixed(nanty, code, with_commands(lang)),
+        Cited::Ambiguous(_) | Cited::Unknown => choose(nanty, &projects, text),
+        Cited::One(project) => match super::observe::project_facts(state, cfg, &project.id).await {
+            Some(facts) => {
+                let lines: Vec<Value> = tools::status_lines(&facts, false)
+                    .into_iter()
+                    .map(|(code, params)| json!({ "code": code, "params": params }))
+                    .collect();
+                let mut params = param("project", project.name.as_str());
+                params.insert("lines".into(), Value::Array(lines));
+                let mut message = fixed(nanty, "nanty.chat.reserve_status", params);
+                message.project_id = Some(project.id.clone());
+                message
+            }
+            None => fixed(nanty, code, with_commands(lang)),
+        },
+    }
 }
 
 #[cfg(test)]

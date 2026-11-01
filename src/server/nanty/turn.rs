@@ -126,7 +126,9 @@ fn is_hhmm(text: &str) -> bool {
 fn fact_allowed(key: &str, value: &Value) -> bool {
     let text = value.as_str();
     match key {
-        "age_min" | "attempts" | "count" | "free_gb" | "min_gb" => value.is_u64(),
+        // Spec 139 T02: zero tentativas não é fato (um aviso gravado antes ainda pode trazê-lo).
+        "attempts" => value.as_u64().is_some_and(|n| n > 0),
+        "age_min" | "count" | "free_gb" | "min_gb" => value.is_u64(),
         "reason" => text.is_some_and(|v| crate::agents::runner::BLOCK_CODES.contains(&v)),
         "stop" => text.is_some_and(|v| crate::server::attention::PROVIDER_STOP_CODES.contains(&v)),
         "role" => matches!(text, Some("architect" | "developer" | "reviewer")),
@@ -202,6 +204,10 @@ pub enum TurnKind {
     MorningDigest,
     /// A conversa: a pessoa escreveu (T08).
     Conversation,
+    /// O atalho `/status`, escrito pelo modelo (spec 139 T06).
+    Status,
+    /// O atalho `/resumo`, escrito pelo modelo (spec 139 T06).
+    Summary,
 }
 
 /// Toda a entrada do modelo na proatividade: só sinais estruturados.
@@ -220,6 +226,9 @@ pub struct TurnInput {
     pub disk_free_gb: Option<u64>,
     /// Ids do catálogo que o modelo pode sugerir.
     pub allowed_actions: Vec<ActionId>,
+    /// Hora local (`HH:MM`) até quando os avisos estão em silêncio (o `/status`, spec 139 T06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silenced_until: Option<String>,
 }
 
 impl TurnInput {
@@ -232,6 +241,7 @@ impl TurnInput {
             tokens: BTreeMap::new(),
             disk_free_gb: None,
             allowed_actions: Vec::new(),
+            silenced_until: None,
         }
     }
 
@@ -247,7 +257,7 @@ pub fn allowed_for(cards: &[Card]) -> Vec<ActionId> {
     let mut out = Vec::new();
     for card in cards {
         if let Some(id) = card.action.as_deref().and_then(actions::parse) {
-            if id.entry().kind != ActionKind::PersonOnly && !out.contains(&id) {
+            if !matches!(id.entry().kind, ActionKind::PersonOnly | ActionKind::Silence) && !out.contains(&id) {
                 out.push(id);
             }
         }
@@ -264,9 +274,16 @@ pub fn allowed_for(cards: &[Card]) -> Vec<ActionId> {
 pub fn notice_input(cards: &[Card], st: &NantyState, day: &str) -> TurnInput {
     let mut input = TurnInput::new(TurnKind::Notice);
     input.signals = cards.iter().rev().take(MAX_SIGNALS_IN).rev().filter_map(SignalFact::of_card).collect();
-    input.counts.insert("new_notices", cards.len() as u64);
-    input.counts.insert("open_cards", st.cards.len() as u64);
-    input.counts.insert("digest_items", st.digest.len() as u64);
+    // Spec 139 T06: zero não é fato; a contagem zerada fica de fora.
+    for (name, value) in [
+        ("new_notices", cards.len() as u64),
+        ("open_cards", st.cards.iter().filter(|c| c.awaits_person()).count() as u64),
+        ("digest_items", st.digest.len() as u64),
+    ] {
+        if value > 0 {
+            input.counts.insert(name, value);
+        }
+    }
     let spend = st.spend_on(day);
     if spend.usd > 0.0 {
         input.cost_usd.insert("nanty_today", round_cents(spend.usd));
@@ -462,7 +479,7 @@ pub enum TurnOutcome {
 }
 
 /// Volta o avatar ao estado derivado em qualquer saída.
-struct Thinking<'a>(&'a Nanty);
+pub(super) struct Thinking<'a>(pub(super) &'a Nanty);
 
 impl Drop for Thinking<'_> {
     fn drop(&mut self) {
@@ -470,7 +487,7 @@ impl Drop for Thinking<'_> {
     }
 }
 
-fn turn_entry(nanty: &Nanty, code: &str, kind: TurnKind, reason: Option<&str>) -> JournalEntry {
+pub(super) fn turn_entry(nanty: &Nanty, code: &str, kind: TurnKind, reason: Option<&str>) -> JournalEntry {
     let mut entry = JournalEntry::new(nanty.now().epoch_ms, JournalKind::ModelTurn, code);
     entry.params.insert("turn".into(), json!(kind));
     if let Some(reason) = reason {
@@ -479,7 +496,7 @@ fn turn_entry(nanty: &Nanty, code: &str, kind: TurnKind, reason: Option<&str>) -
     entry
 }
 
-fn skipped(nanty: &Nanty, kind: TurnKind, reason: &'static str) -> TurnOutcome {
+pub(super) fn skipped(nanty: &Nanty, kind: TurnKind, reason: &'static str) -> TurnOutcome {
     // Sem modelo escolhido não é novidade: o registro não enche a cada aviso.
     if reason != "no_model" {
         nanty.record(&turn_entry(nanty, "turn.skipped", kind, Some(reason)));
@@ -488,7 +505,7 @@ fn skipped(nanty: &Nanty, kind: TurnKind, reason: &'static str) -> TurnOutcome {
 }
 
 /// Estimativa de tokens quando o provedor não informa o uso (4 caracteres por token).
-fn estimate_tokens(text: &str) -> u32 {
+pub(super) fn estimate_tokens(text: &str) -> u32 {
     u32::try_from(text.len() / 4 + 1).unwrap_or(u32::MAX)
 }
 
@@ -496,7 +513,13 @@ fn estimate_tokens(text: &str) -> u32 {
 /// vez na fila, chama o modelo (o cliente dos papéis, com a conexão do `[nanty]`), soma o gasto do
 /// dia e valida a resposta.
 pub async fn run(state: &AppState, nanty: &Arc<Nanty>, input: &TurnInput) -> TurnOutcome {
-    let lang = nanty_lang(&state.config().read().await.nanty);
+    let lang = nanty_lang(&state.config().read().await.nanty, nanty);
+    run_in(state, nanty, input, lang).await
+}
+
+/// Como [`run`], com o idioma do texto escolhido por quem chama: os atalhos da conversa respondem no
+/// idioma de quem falou (spec 139 T06), e não no do Nanty.
+pub async fn run_in(state: &AppState, nanty: &Arc<Nanty>, input: &TurnInput, lang: crate::i18n::Lang) -> TurnOutcome {
     let call = Call {
         kind: input.kind,
         system: crate::agents::prompts::nanty_system(lang),
@@ -614,13 +637,15 @@ pub fn model_message(nanty: &Nanty, lang: crate::i18n::Lang, reply: &Reply, card
         reply_to: None,
         voice: false,
         audio: None,
+        relayed: None,
     }
 }
 
 /// Turno proativo (depois de cada rodada): os cartões que acabaram de sair (fora os que só vão ao
 /// resumo) viram uma entrada estruturada; com resposta válida, o resumo do modelo entra na conversa
 /// ligado aos cartões. Sem modelo, sem orçamento ou com resposta inválida, nada muda: os cartões já
-/// trazem o texto fixo do observador. Devolve o resultado (`None` sem cartão novo).
+/// trazem o texto fixo do observador. Devolve o resultado (`None` sem cartão novo). Esta mensagem
+/// não tem fala própria (spec 139 T08, C-14): cada aviso tem um áudio só, o do cartão.
 pub async fn proactive(state: &AppState, nanty: &Arc<Nanty>) -> Option<TurnOutcome> {
     // Sem modelo escolhido, nada a fazer (nem a gravar): os cartões já têm o texto fixo.
     if model_route(&*state.config().read().await).is_none() {
@@ -657,7 +682,7 @@ pub async fn proactive(state: &AppState, nanty: &Arc<Nanty>) -> Option<TurnOutco
     let input = notice_input(&fresh, &snapshot, &nanty.now().day_key());
     let outcome = run(state, nanty, &input).await;
     if let TurnOutcome::Reply(reply) = &outcome {
-        let lang = nanty_lang(&state.config().read().await.nanty);
+        let lang = nanty_lang(&state.config().read().await.nanty, nanty);
         let mut message = model_message(nanty, lang, reply, fresh.iter().map(|c| c.id.clone()).collect());
         let first = fresh.first().and_then(|c| c.project_id.clone());
         if fresh.iter().all(|c| c.project_id == first) {

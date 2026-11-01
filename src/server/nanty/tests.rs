@@ -141,6 +141,7 @@ async fn removed_project_state_leaves_with_the_event() {
         reply_to: None,
         voice: false,
         audio: None,
+        relayed: None,
     });
     assert_eq!(nanty.journal_tail(10).len(), 1);
     assert_eq!(nanty.conversation().len(), 1);
@@ -196,6 +197,7 @@ async fn lagged_triggers_a_full_sweep() {
                 reply_to: None,
                 voice: false,
                 audio: None,
+                relayed: None,
             })
             .expect("conversa");
     }
@@ -321,6 +323,7 @@ async fn read_routes_show_config_masked_feed_conversation_and_status() {
         reply_to: None,
         voice: false,
         audio: None,
+        relayed: None,
     });
     let app = crate::server::router(st.clone());
 

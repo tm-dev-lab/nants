@@ -270,6 +270,8 @@ pub(super) const FAST: Tuning = Tuning {
     backoff_max: Duration::from_millis(200),
     send_gap: Duration::from_millis(50),
     send_settle: Duration::ZERO,
+    typing_every: Duration::from_millis(150),
+    speech_deadline: Duration::from_secs(5),
 };
 
 pub(super) struct World {
@@ -347,7 +349,7 @@ impl World {
         self.request(Method::POST, uri, Some(body)).await
     }
 
-    async fn get(&self, uri: &str) -> Value {
+    pub(super) async fn get(&self, uri: &str) -> Value {
         self.request(Method::GET, uri, None).await.1
     }
 

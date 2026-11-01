@@ -218,8 +218,15 @@ impl crate::harness::compose::ComposeRunner for LocalShellCompose {
             return Ok(ComposeOutput { code: Some(0), output: String::new(), timed_out: false });
         };
         let command = call.args.get(at + 1).ok_or("comando ausente")?;
+        // O `-lc` do container é um shell de login: aqui, no host, ele leria o `~/.profile` real da
+        // pessoa (o de 2026-10-31 passou a carregar um script só de bash, e o `sh` saía com 2 antes
+        // do comando). Como no fake do `compose.rs`, o ambiente é limpo e o HOME é a própria
+        // worktree (no container, o HOME também fica dentro de /work): nada do usuário entra.
         let out = Command::new("sh")
             .args(["-lc", command])
+            .env_clear()
+            .env("HOME", &call.cwd)
+            .env("PATH", "/usr/bin:/bin")
             .current_dir(&call.cwd)
             .output()
             .map_err(|e| e.to_string())?;

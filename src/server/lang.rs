@@ -142,7 +142,7 @@ mod tests {
         assert!(!path.exists(), "o mesmo idioma não regrava a configuração");
         crate::server::nanty::remember_lang(&state, Lang::En).await;
         let cfg = crate::config::Config::load_from(&path).expect("lê");
-        assert_eq!(crate::server::nanty::nanty_lang(&cfg.nanty), Lang::En);
+        assert_eq!(crate::server::nanty::language::interface_lang(&cfg.nanty), Lang::En);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

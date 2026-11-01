@@ -5,7 +5,8 @@
  * - **Texto do Nanty:** o texto fixo pelo dicionário (`code` + `params`, com as linhas extras) e o
  *   texto do modelo como veio; os cartões que a mensagem cita levam os mesmos botões do feed.
  * - **Voz (T09):** a nota de voz toca pela rota `GET /api/nanty/audio/:id`, com a transcrição no
- *   texto. A rota aceita `Range` (o Safari, inclusive o do iPhone, só toca assim). Navegador que
+ *   texto. Com a voz ligada, a resposta da janela também tem áudio (spec 139 T08): o tocador aparece
+ *   junto do texto e só toca com o clique. A rota aceita `Range` (o Safari, inclusive o do iPhone, só toca assim). Navegador que
  *   não toca Ogg/Opus (`canPlayType`): a transcrição fica, com um aviso discreto e o baixar.
  * - **Envio:** `POST /api/nanty/conversation`; a resposta chega pelo `nanty_changed` e fica só na
  *   janela (T08). O gravar aparece desligado: a gravação pela janela fica para depois.
@@ -139,8 +140,20 @@ function PersonMessage({ m }: { m: NantyMessage }) {
   );
 }
 
+/** O título do resumo da manhã: a única frase do servidor que vem antes do texto do modelo. */
+const DIGEST_LEAD = "nanty.digest.lead";
+
 function NantyMessageView({ m, cards, decisions }: { m: NantyMessage; cards: readonly NantyCard[]; decisions: NantyDecisions }) {
-  const paragraphs = [...nantyLinesText(m.code, m.params, m.lines), ...(m.text !== null && m.text.trim() !== "" ? [m.text] : [])];
+  // Spec 139 T05: o texto fixo sai no idioma da mensagem (o da conversa), não no da interface.
+  // Spec 139 T06 (C-11): com o texto do modelo, a lista fixa (`lines`) não entra; ficam a frase
+  // curta do servidor e o porquê dos avisos guardados (`why`, sempre) junto do texto dele, como no
+  // Telegram. Spec 139 T12: a fala do modelo vem primeiro e a frase do servidor fecha; só o título
+  // do resumo abre o texto.
+  const modelText = m.text !== null && m.text.trim() !== "" ? m.text : null;
+  const fixedLines = modelText === null ? [...m.lines, ...m.why] : m.why;
+  const fixed = nantyLinesText(m.code, m.params, fixedLines, m.lang ?? undefined);
+  const leads = m.code === DIGEST_LEAD;
+  const paragraphs = modelText === null ? fixed : leads ? [...fixed, modelText] : [modelText, ...fixed];
   const cited = m.card_ids.map((id) => cards.find((c) => c.id === id)).filter((c): c is NantyCard => c !== undefined);
   return (
     <li className="nd-nanty-msg" data-from="nanty" data-nanty-msg={m.id}>

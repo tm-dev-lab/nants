@@ -38,8 +38,8 @@ use super::actions::{self, ActionKind};
 use super::clock::LocalTime;
 use super::store::{Card, Channel, ConversationMessage, DecidedBy, DoneItem, PlannedItem, Spend};
 use super::turn::{budget_view, BudgetView};
-use super::{nanty_lang, Avatar, InstanceStatus};
-use crate::config::{ActionLevel, DigestEmpty, Effort, NantyConfig, NantyRoute, VoiceRoute};
+use super::{Avatar, InstanceStatus};
+use crate::config::{ActionLevel, DigestEmpty, Effort, NantyConfig, NantyRoute, NantyVoice};
 use crate::server::config_api::{mask_api_key, sanitize_for_view, validate_connection_id, validate_text_field};
 use crate::server::error::ApiError;
 use crate::server::events::validate_project_id;
@@ -51,19 +51,15 @@ struct RouteView {
     model: String,
 }
 
-#[derive(Debug, Serialize)]
-struct VoiceRouteView {
-    connection_id: String,
-    model: String,
-    voice: String,
-}
-
+/// A voz (spec 139 T07): uma conexão do Gemini (vazia = a primeira com chave) para falar e
+/// transcrever, com os modelos e a voz efetivos.
 #[derive(Debug, Serialize)]
 struct VoiceView {
     enabled: bool,
-    order: Vec<VoiceRouteView>,
-    /// A conexão da transcrição (T09); vazia = a primeira do Google Gemini.
-    transcribe: RouteView,
+    connection_id: String,
+    speech_model: String,
+    voice: String,
+    transcribe_model: String,
     max_input_secs: u64,
 }
 
@@ -102,8 +98,10 @@ struct ConfigView {
     quiet_end: String,
     digest_time: String,
     digest_empty: DigestEmpty,
-    /// Idioma efetivo das mensagens (`pt-BR` ou `en`).
+    /// Idioma da interface lembrado (`pt-BR` ou `en`): o de "seguir a conversa" sem histórico.
     lang: &'static str,
+    /// Idioma próprio do Nanty (spec 139 T05): `follow`, `pt-BR` ou `en`.
+    language: &'static str,
     excluded_projects: Vec<String>,
     actions: BTreeMap<String, ActionLevel>,
     /// O catálogo com nível, na ordem dele (T11).
@@ -120,7 +118,7 @@ fn catalog_view(cfg: &NantyConfig) -> Vec<CatalogView> {
             let kind = match entry.kind {
                 ActionKind::Executes => "executes",
                 ActionKind::PersonOnly => "person_only",
-                ActionKind::CardOption | ActionKind::Link => return None,
+                ActionKind::CardOption | ActionKind::Link | ActionKind::Silence => return None,
             };
             let level = actions::level(cfg, entry.id)?;
             Some(CatalogView { id: entry.id.as_str(), kind, level, default_level: entry.default_level })
@@ -139,11 +137,14 @@ fn route_view(route: &NantyRoute) -> RouteView {
     }
 }
 
-fn voice_route_view(route: &VoiceRoute) -> VoiceRouteView {
-    VoiceRouteView {
-        connection_id: connection_id_view(&route.connection_id),
-        model: sanitize_for_view(&route.model, |v| validate_text_field("model", v)),
-        voice: sanitize_for_view(&route.voice, |v| validate_text_field("voice", v)),
+fn voice_view(voice: &NantyVoice) -> VoiceView {
+    VoiceView {
+        enabled: voice.enabled,
+        connection_id: connection_id_view(&voice.connection_id),
+        speech_model: text_view("model", &voice.speech_model()),
+        voice: text_view("voice", &voice.voice_name()),
+        transcribe_model: text_view("model", &voice.transcribe_model()),
+        max_input_secs: voice.max_input_secs,
     }
 }
 
@@ -163,7 +164,8 @@ fn config_view(cfg: &NantyConfig, now: LocalTime) -> ConfigView {
         quiet_end: text_view("quiet_end", &cfg.quiet_end),
         digest_time: text_view("digest_time", &cfg.digest_time),
         digest_empty: cfg.digest_empty,
-        lang: nanty_lang(cfg).tag(),
+        lang: super::language::interface_lang(cfg).tag(),
+        language: cfg.language.as_str(),
         excluded_projects: cfg
             .excluded_projects
             .iter()
@@ -172,12 +174,7 @@ fn config_view(cfg: &NantyConfig, now: LocalTime) -> ConfigView {
         actions: cfg.actions.clone(),
         catalog: catalog_view(cfg),
         reserve: cfg.reserve.iter().map(|(role, r)| (text_view("role", role), route_view(r))).collect(),
-        voice: VoiceView {
-            enabled: cfg.voice.enabled,
-            order: cfg.voice.order.iter().map(voice_route_view).collect(),
-            transcribe: route_view(&cfg.voice.transcribe),
-            max_input_secs: cfg.voice.max_input_secs,
-        },
+        voice: voice_view(&cfg.voice),
         telegram: TelegramView {
             bot_token_masked: if cfg.telegram.bot_token.is_empty() {
                 String::new()
@@ -212,10 +209,23 @@ struct Today {
     done: usize,
 }
 
+/// O silêncio de tudo ligado (spec 139 T04): o fim e o cartão com o botão de desligar, que a janela
+/// mostra no cabeçalho do feed, fora de "Esperando você".
+#[derive(Debug, Serialize)]
+struct SilenceView {
+    until_ms: u64,
+    /// `HH:MM` local.
+    until: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    card: Option<Card>,
+}
+
 #[derive(Debug, Serialize)]
 struct FeedView {
-    /// Cartões abertos (ainda válidos), do mais novo para o mais velho.
+    /// Cartões abertos (ainda válidos) que esperam a pessoa, do mais novo para o mais velho.
     waiting: Vec<Card>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    silence: Option<SilenceView>,
     /// O que foi feito, do mais novo para o mais velho.
     done: Vec<DoneItem>,
     planned: Vec<PlannedItem>,
@@ -233,7 +243,13 @@ pub async fn get_feed(State(state): State<AppState>) -> Json<serde_json::Value> 
         .epoch_ms
         .saturating_sub(u64::from(now.minute_of_day()) * 60_000 + now.epoch_ms % 60_000);
     let spend = snapshot.spend_on(&now.day_key());
-    let mut waiting: Vec<Card> = snapshot.cards.into_iter().filter(|c| c.expires_at_ms > now.epoch_ms).collect();
+    let silence = super::silence::global_until(&snapshot, now.epoch_ms).map(|until_ms| SilenceView {
+        until_ms,
+        until: super::silence::hhmm(until_ms),
+        card: snapshot.cards.iter().find(|c| c.expires_at_ms > now.epoch_ms && !c.awaits_person()).cloned(),
+    });
+    let mut waiting: Vec<Card> =
+        snapshot.cards.into_iter().filter(|c| c.expires_at_ms > now.epoch_ms && c.awaits_person()).collect();
     waiting.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
     let mut done = snapshot.done;
     done.reverse();
@@ -244,7 +260,7 @@ pub async fn get_feed(State(state): State<AppState>) -> Json<serde_json::Value> 
         waiting: waiting.len(),
         done: done.iter().filter(|d| d.at_ms >= day_start).count(),
     };
-    let view = FeedView { waiting, done, planned: snapshot.planned, today };
+    let view = FeedView { waiting, silence, done, planned: snapshot.planned, today };
     Json(serde_json::to_value(view).unwrap_or_default())
 }
 
@@ -436,7 +452,8 @@ pub async fn post_conversation(State(state): State<AppState>, body: Bytes) -> Re
         return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "nanty_message_invalid", Map::new()));
     }
     let secrets = state.secret_set().await;
-    let person = super::chat::person_message(&nanty, &secrets, Channel::Web, &input.text)
+    let cfg = state.config().read().await.nanty.clone();
+    let person = super::chat::person_message(&nanty, &cfg, &secrets, Channel::Web, &input.text)
         .ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "nanty_message_invalid", Map::new()))?;
     let id = person.id.clone();
     super::chat::spawn_reply(&state, person);

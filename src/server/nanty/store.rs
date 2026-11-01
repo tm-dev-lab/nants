@@ -72,6 +72,15 @@ pub struct Card {
     pub requested: Option<Channel>,
 }
 
+impl Card {
+    /// O cartão espera uma decisão da pessoa. O botão de desligar o silêncio (spec 139 T04) é um
+    /// controle, não uma decisão pendente: fica fora de "Esperando você", do `/status`, do resumo, do
+    /// selo e do avatar "esperando".
+    pub fn awaits_person(&self) -> bool {
+        self.action.as_deref() != Some("end_silence")
+    }
+}
+
 /// Como um aviso sai, decidido pelo filtro (T02).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -252,6 +261,22 @@ pub struct PlannedItem {
 /// Cartões enviados ao Telegram guardados (os mais recentes).
 pub const MAX_SENT: usize = 200;
 
+/// Como o cartão foi ao Telegram (spec 139 T08, C-14): a mensagem de texto é editada pelo
+/// `editMessageText`, e a nota de voz, pelo `editMessageCaption`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentKind {
+    #[default]
+    Text,
+    Voice,
+}
+
+impl SentKind {
+    fn is_text(&self) -> bool {
+        *self == SentKind::Text
+    }
+}
+
 /// Cartão enviado ao Telegram (T07): o `message_id` para a edição depois da decisão, do resolvido
 /// ou do vencimento. `message_id` vazio = o cartão saiu junto num resumo da fila (sem botões) ou o
 /// Telegram recusou o envio: não há o que editar.
@@ -270,6 +295,9 @@ pub struct SentCard {
     #[serde(default)]
     pub text: String,
     pub at_ms: u64,
+    /// Texto ou nota de voz (spec 139 T08). Quem foi gravado antes dela é texto.
+    #[serde(default, skip_serializing_if = "SentKind::is_text")]
+    pub kind: SentKind,
 }
 
 /// O estado de `state.json`.
@@ -305,6 +333,17 @@ pub struct NantyState {
     pub digest_day: String,
     /// Cartões enviados ao Telegram (T07), até [`MAX_SENT`].
     pub telegram_sent: Vec<SentCard>,
+    /// Último idioma em que a pessoa falou (`pt-BR` ou `en`; spec 139 T05): o que o texto dela
+    /// mostrou ou, sem sinal no texto, o `language_code` do Telegram. Base do "seguir a conversa".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub person_lang: Option<String>,
+    /// O outro idioma visto na última mensagem, com uma pista só (spec 139 T12): a próxima pista
+    /// dele confirma a troca; uma mensagem que não a confirma zera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_lang_pending: Option<String>,
+    /// Último `language_code` do dono no Telegram, já como `pt-BR` ou `en` (spec 139 T05).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_lang: Option<String>,
 }
 
 /// Prefixo do grupo de um projeto (`<id>:`): o grupo nasce do projeto e do tipo.
@@ -312,7 +351,30 @@ pub(super) fn group_of_project(group: &str, project_id: &str) -> bool {
     group.strip_prefix(project_id).is_some_and(|rest| rest.starts_with(':'))
 }
 
+/// Tira `attempts: 0` dos fatos (spec 139 T02: zero tentativas não é fato). `true` se mudou.
+fn drop_zero_attempts(facts: &mut Map<String, Value>) -> bool {
+    let zero = facts.get("attempts").is_some_and(|v| v.as_u64() == Some(0));
+    if zero {
+        facts.remove("attempts");
+    }
+    zero
+}
+
 impl NantyState {
+    /// Os avisos gravados antes da spec 139 T02 levam `attempts: 0` nos fatos e no que foi avisado;
+    /// o observador de agora não emite mais esse fato. Sem normalizar, a primeira varredura depois de
+    /// atualizar veria fatos novos e reenviaria o mesmo aviso como atualização. `true` se mudou.
+    pub fn normalize_legacy_facts(&mut self) -> bool {
+        let mut changed = false;
+        for alert in self.alerts.values_mut() {
+            changed |= drop_zero_attempts(&mut alert.facts);
+            if let Some(notified) = alert.notified.as_mut() {
+                changed |= drop_zero_attempts(notified);
+            }
+        }
+        changed
+    }
+
     /// Tira o que venceu (cartões e silêncios) em `now_ms`. `true` se mudou.
     pub fn prune_expired(&mut self, now_ms: u64) -> bool {
         let before = (self.cards.len(), self.silences.len(), self.undo.len());
@@ -501,10 +563,29 @@ pub struct ConversationMessage {
     /// `GET /api/nanty/audio/:id` enquanto a mensagem estiver na conversa.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRef>,
+    /// A mensagem da pessoa traz texto de terceiro (spec 139 T04, C-07): encaminhada ou com a
+    /// citação de outra pessoa. Vai ao modelo como dado não confiável e contamina o turno.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed: Option<Relayed>,
 }
 
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// Texto de terceiro numa mensagem da pessoa (spec 139 T04, C-07).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Relayed {
+    /// A mensagem inteira foi encaminhada (`forward_origin`): o texto dela é de terceiro.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forwarded: bool,
+    /// A pessoa citou ou respondeu a mensagem de outra pessoa (`quote`, `reply_to_message` de
+    /// terceiro ou `external_reply`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub third_party: bool,
+    /// O trecho citado do terceiro, já redigido, quando o Telegram o manda.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
 }
 
 /// Um áudio da conversa (T09), em `<pasta do Nanty>/audio/<id>.ogg` (Opus em OGG).
@@ -515,6 +596,24 @@ pub struct AudioRef {
     /// Duração em segundos (arredondada para cima).
     pub duration_secs: u32,
     pub bytes: u64,
+}
+
+/// Funde as linhas da conversa com o mesmo id (spec 139 T08): o arquivo só recebe acréscimos, então a
+/// mensagem que ganha o áudio depois volta como uma linha nova. A última linha vence, e a posição
+/// continua a da primeira.
+pub fn merged_lines(lines: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out: Vec<ConversationMessage> = Vec::with_capacity(lines.len());
+    for line in lines {
+        match seen.get(&line.id).and_then(|at| out.get_mut(*at)) {
+            Some(first) => *first = line,
+            None => {
+                seen.insert(line.id.clone(), out.len());
+                out.push(line);
+            }
+        }
+    }
+    out
 }
 
 impl ConversationMessage {
@@ -535,6 +634,7 @@ impl ConversationMessage {
             reply_to: None,
             voice: false,
             audio: None,
+            relayed: None,
         }
     }
 }
@@ -557,11 +657,14 @@ impl Store {
         &self.dir
     }
 
-    /// Lê o estado; ausente ou inválido = vazio.
+    /// Lê o estado; ausente ou inválido = vazio. Normaliza o que versões anteriores gravaram
+    /// ([`NantyState::normalize_legacy_facts`]).
     pub fn load(&self) -> NantyState {
-        read_private(&self.dir.join(STATE_FILE), MAX_STATE_BYTES)
+        let mut state: NantyState = read_private(&self.dir.join(STATE_FILE), MAX_STATE_BYTES)
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.normalize_legacy_facts();
+        state
     }
 
     /// Grava o estado de forma atômica.
@@ -722,6 +825,7 @@ mod tests {
             reply_to: None,
             voice: false,
             audio: None,
+            relayed: None,
         };
         log.append(&msg).expect("append");
         let back: Vec<ConversationMessage> = log.tail(CONVERSATION_TAIL);

@@ -471,6 +471,165 @@ pub fn failure_signature(output: &str, max: usize) -> Vec<String> {
     failing_lines(output, max).iter().map(|l| without_durations(l)).collect()
 }
 
+/// Spec 139 T01: a parte das linhas da assinatura da falha que o gate compara entre dois ciclos.
+/// São as linhas de [`failure_signature`] (os testes que falharam) seguidas das últimas `max` linhas
+/// não vazias da saída (a mensagem, que muda quando o Desenvolvedor avança dentro do mesmo teste).
+/// Em todas, as durações, os horários e datas, os números de porta e o trecho variável dos caminhos
+/// temporários viram marcas fixas: duas rodadas da mesma falha dão as mesmas linhas, em qualquer
+/// stack. O ruído que sobrar só faz a falha parecer outra, o lado seguro (o gate não para cedo).
+pub fn stable_failure_lines(output: &str, max: usize) -> Vec<String> {
+    let mut lines = failure_signature(output, max);
+    let tail: Vec<&str> = output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let from = tail.len().saturating_sub(max);
+    lines.extend(tail[from..].iter().map(|l| without_durations(&l.chars().take(200).collect::<String>())));
+    lines.iter().map(|l| without_volatile(l)).collect()
+}
+
+/// O texto termina na palavra `port` seguida de espaço, `=` ou `: ` (`import ` e `report ` não).
+fn ends_with_port_word(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["port ", "port=", "port: "].iter().any(|suffix| {
+        lower.strip_suffix(suffix).is_some_and(|before| !before.chars().next_back().is_some_and(char::is_alphanumeric))
+    })
+}
+
+/// Começos de caminho temporário (Unix, macOS e Windows) e a pasta temporária deste processo.
+fn temp_prefixes() -> Vec<String> {
+    let mut out: Vec<String> =
+        ["/tmp/", "/var/tmp/", "/var/folders/", "/private/var/folders/", "/private/tmp/", "\\Temp\\"].iter().map(|p| p.to_string()).collect();
+    let own = std::env::temp_dir().to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    if own.len() > 1 {
+        out.push(format!("{own}/"));
+    }
+    out
+}
+
+/// Fim de um trecho de caminho: espaço, aspas, parênteses, colchetes, vírgula ou dois-pontos.
+fn path_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ':' | ';')
+}
+
+/// Troca o caminho até a pasta variável de um temporário (`/tmp/abc123/src/x.js` vira
+/// `<tmp>/src/x.js`; no Windows, `Users\x\AppData\Local\Temp\abc` vira `<tmp>`). O resto do
+/// caminho fica, para a falha continuar distinguível.
+fn without_temp_paths(line: &str) -> String {
+    let mut out = line.to_string();
+    for prefix in temp_prefixes() {
+        let mut from = 0;
+        while let Some(rel) = out[from..].find(&prefix) {
+            let at = from + rel;
+            let start = out[..at].rfind(path_delimiter).map_or(0, |d| d + out[d..].chars().next().map_or(1, char::len_utf8));
+            let after = at + prefix.len();
+            // O começo Unix (`/tmp/`) só vale no início do caminho: `/home/x/tmp/` não é temporário.
+            if prefix.starts_with('/') && start != at {
+                from = after;
+                continue;
+            }
+            let end = out[after..].find(|c: char| path_delimiter(c) || c == '/' || c == '\\').map_or(out.len(), |e| after + e);
+            out.replace_range(start..end, "<tmp>");
+            from = start + "<tmp>".len();
+        }
+    }
+    out
+}
+
+/// O texto antes da posição termina num nome de máquina que leva porta: `localhost`, um IPv4 ou um
+/// endereço entre colchetes (`[::1]`).
+fn ends_with_host(before: &str) -> bool {
+    if before.ends_with("localhost") || before.ends_with(']') {
+        return true;
+    }
+    let token = before.rsplit(|c: char| !(c.is_ascii_digit() || c == '.')).next().unwrap_or("");
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.parse::<u8>().is_ok())
+}
+
+/// Fim da sequência de dígitos que começa em `i`.
+fn digits_end(chars: &[char], i: usize) -> usize {
+    let mut j = i;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    j
+}
+
+/// `hh:mm:ss` (com fração opcional) a partir de `i`: o fim, se houver.
+fn clock_end(chars: &[char], i: usize) -> Option<usize> {
+    let h = digits_end(chars, i);
+    if !(1..=2).contains(&(h - i)) || chars.get(h) != Some(&':') {
+        return None;
+    }
+    let m = digits_end(chars, h + 1);
+    if m - h - 1 != 2 || chars.get(m) != Some(&':') {
+        return None;
+    }
+    let sec = digits_end(chars, m + 1);
+    if sec - m - 1 != 2 {
+        return None;
+    }
+    let mut end = sec;
+    if matches!(chars.get(end), Some('.' | ',')) && chars.get(end + 1).is_some_and(char::is_ascii_digit) {
+        end = digits_end(chars, end + 1);
+    }
+    Some(end)
+}
+
+/// `aaaa-mm-dd` a partir de `i`: o fim, se houver.
+fn date_end(chars: &[char], i: usize) -> Option<usize> {
+    let y = digits_end(chars, i);
+    if y - i != 4 || chars.get(y) != Some(&'-') {
+        return None;
+    }
+    let m = digits_end(chars, y + 1);
+    if m - y - 1 != 2 || chars.get(m) != Some(&'-') {
+        return None;
+    }
+    let d = digits_end(chars, m + 1);
+    (d - m - 1 == 2).then_some(d)
+}
+
+/// Spec 139 T01: troca o que varia entre duas rodadas da mesma falha por marcas fixas: o trecho
+/// variável dos caminhos temporários (`<tmp>`), datas (`<date>`), horários `hh:mm:ss` (`<clock>`)
+/// e números de porta depois de `localhost`, de um IPv4, de `[...]` ou da palavra `port` (`<port>`).
+/// Número de linha e coluna (`x.js:10:5`) fica: ele distingue uma falha da outra.
+fn without_volatile(line: &str) -> String {
+    let chars: Vec<char> = without_temp_paths(line).chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        if c == ':' && ends_with_host(&out) {
+            let j = digits_end(&chars, i + 1);
+            if (1..=5).contains(&(j - i - 1)) {
+                out.push_str(":<port>");
+                i = j;
+                continue;
+            }
+        }
+        if c.is_ascii_digit() && !prev.is_some_and(|p| p.is_ascii_digit() || p == '.' || p == ':') {
+            if let Some(end) = date_end(&chars, i) {
+                out.push_str("<date>");
+                i = end;
+                continue;
+            }
+            if let Some(end) = clock_end(&chars, i) {
+                out.push_str("<clock>");
+                i = end;
+                continue;
+            }
+            if ends_with_port_word(&out) {
+                out.push_str("<port>");
+                i = digits_end(&chars, i);
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Troca cada número seguido de unidade de tempo (`1.23s`, `0,5 s`, `120ms`, `3 min`, `2µs`...) por
 /// `<t>`. O resto da linha fica igual.
 fn without_durations(line: &str) -> String {
@@ -665,5 +824,51 @@ mod tests {
         // Outras durações e números que não são tempo.
         assert_eq!(without_durations("✘ two.spec.ts:10 (1.5 s) [120ms] 3 min v2"), "✘ two.spec.ts:10 (<t>) [<t>] <t> v2");
         assert_eq!(without_durations("1 failed, 3 passed"), "1 failed, 3 passed");
+    }
+
+    /// Spec 139 T01: a assinatura do gate ignora tempos, horários, portas e o trecho variável dos
+    /// caminhos temporários; sem linha de teste que falhou, compara o fim da saída.
+    #[test]
+    fn stable_failure_lines_ignore_times_ports_and_temp_paths() {
+        let run = |dir: &str, port: &str, clock: &str, secs: &str| {
+            format!(
+                "[{clock}] server on http://localhost:{port}\n✘ e2e/cart.spec.ts:12:5 adds item ({secs})\n    at {dir}/src/cart.ts:40:7\nError: connect ECONNREFUSED 127.0.0.1:{port}\n1 failed\n"
+            )
+        };
+        let a = stable_failure_lines(&run("/tmp/nants-abc123", "41234", "10:46:12", "1.2s"), 8);
+        let b = stable_failure_lines(&run("/tmp/nants-zz9", "39001", "10:48:59.120", "3.4s"), 8);
+        assert_eq!(a, b);
+        assert!(a.iter().any(|l| l.contains("e2e/cart.spec.ts:12:5")), "linha e coluna ficam: {a:?}");
+        // A falha que muda continua diferente.
+        let other = stable_failure_lines(&run("/tmp/nants-abc123", "41234", "10:46:12", "1.2s").replace("cart.spec.ts:12:5", "login.spec.ts:3:1"), 8);
+        assert_ne!(a, other);
+        // Sem linha de teste que falhou: o fim da saída, com as mesmas trocas.
+        let none = |at: &str, port: &str| format!("Running on port {port}\n{at} Error: No tests found\n");
+        let x = stable_failure_lines(&none("2026-10-31T10:46:01", "5173"), 8);
+        assert_eq!(x, stable_failure_lines(&none("2026-11-01T09:00:59", "6006"), 8));
+        assert!(!x.is_empty() && x.iter().any(|l| l.contains("No tests found")), "{x:?}");
+        assert_ne!(x, stable_failure_lines("Error: Cannot find module 'x'\n", 8));
+        // Caminho de projeto com `tmp` no meio não é temporário.
+        assert_eq!(without_volatile("FAIL /home/u/tmp/app.test.js"), "FAIL /home/u/tmp/app.test.js");
+        assert_eq!(without_volatile("FAIL /tmp/run-1/app.test.js"), "FAIL <tmp>/app.test.js");
+        // Porta só depois da palavra `port`, não de `import` ou `report`.
+        assert_eq!(without_volatile("port 3000, Port=8080, port: 5173"), "port <port>, Port=<port>, port: <port>");
+        assert_eq!(without_volatile("import 3 and report 4"), "import 3 and report 4");
+    }
+
+    /// Spec 139 T01: o mesmo teste que falha com outra mensagem (o Desenvolvedor corrigiu a primeira
+    /// asserção e caiu na segunda) é outra falha, em qualquer formato de linha marcada.
+    #[test]
+    fn stable_failure_lines_tell_apart_messages_of_the_same_failing_test() {
+        for (head, tail) in [("FAIL tests/cart.test.js", "Tests: 1 failed, 3 passed"), ("✕ adds item (12 ms)", "1 failed"), ("not ok 2 - adds item", "# fail 1")] {
+            let run = |message: &str| format!("{head}\n  {message}\n{tail}\n");
+            let first = stable_failure_lines(&run("expected 2 to equal 3"), 10);
+            let second = stable_failure_lines(&run("expected 'Cart' to equal 'Carrinho'"), 10);
+            assert_ne!(first, second, "{head}");
+            assert_eq!(first, stable_failure_lines(&run("expected 2 to equal 3"), 10), "{head}");
+        }
+        // Mais de dez testes falhando: o corte das linhas marcadas não esconde a mudança no fim.
+        let many = |last: &str| (1..=12).map(|n| format!("FAIL t{n}.test.js\n")).collect::<String>() + last;
+        assert_ne!(stable_failure_lines(&many("FAIL t13.test.js\n"), 10), stable_failure_lines(&many("FAIL t14.test.js\n"), 10));
     }
 }

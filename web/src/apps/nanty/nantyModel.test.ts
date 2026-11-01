@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { Attention, AttentionProject } from "../../desktop/api";
 import { NANTY_EMPTY_FEED, NANTY_STATUS } from "../../desktop/shell-test-utils";
 import { parseNantyConversation, parseNantyFeed, parseNantyStatus, parseNantyUsage, type NantyCard, type NantyDone, type NantyFeed } from "./nantyApi";
-import { cardButtons, coveredByAttention, doneWho, factTexts, feedSections, linkWindow, nantyBadgeCount, nantySummary, nantyTabByKey } from "./nantyModel";
+import { cardButtons, chatCards, coveredByAttention, doneWho, factTexts, feedSections, linkWindow, nantyBadgeCount, nantySummary, nantyTabByKey } from "./nantyModel";
 
 function card(group: string, projectId: string | null): NantyCard {
   return { id: `c-${group}`, project_id: projectId, group, code: `nanty.why.${group.split(":")[1] ?? ""}`, expires_at_ms: 9e12 };
@@ -86,6 +86,12 @@ describe("selo sem duplicar o sino (C-07)", () => {
     expect(nantyBadgeCount(f, bell)).toBe(2);
     expect(nantyBadgeCount(f, null)).toBe(4);
     expect(nantyBadgeCount(null, bell)).toBe(0);
+    // Spec 139 T04: com o silêncio ligado, o botão de desligar não conta no selo, mas a conversa o cita.
+    const off = { ...card("*:end_silence", null), action: "end_silence", token: "tk" };
+    const hushed = { ...feed(), silence: { until: "15:30", card: off } };
+    expect(nantyBadgeCount(hushed, null)).toBe(0);
+    expect(chatCards(hushed)).toEqual([off]);
+    expect(chatCards(null)).toEqual([]);
   });
 });
 
@@ -217,6 +223,13 @@ describe("feed (T10): seções, botões e fatos", () => {
     expect(cardButtons({ ...base, action: "open_nants" }).map((b) => b.choice)).toEqual(["open", "no", "later"]);
     expect(cardButtons({ ...base, project_id: null, action: "open_nants" }).map((b) => b.choice)).toEqual(["no", "later"]);
     expect(cardButtons(card("p1:plan_waiting", "p1"))).toEqual([]);
+    // Spec 139 T04: o silêncio da conversa, sem "lembrar depois".
+    const hush = { ...card("*:end_silence", null), token: "tk" };
+    expect(cardButtons({ ...hush, action: "end_silence" }).map((b) => [b.choice, b.label])).toEqual([["yes", "Desligar o silêncio"]]);
+    expect(cardButtons({ ...hush, group: "*:set_silence", action: "set_silence" }).map((b) => [b.choice, b.label])).toEqual([
+      ["yes", "Silenciar os avisos"],
+      ["no", "Não"],
+    ]);
     expect(linkWindow(base)).toBe("plan");
     expect(linkWindow(card("p1:cost_alert", "p1"))).toBe("costs");
     expect(linkWindow(card("p1:run_blocked", "p1"))).toBe("execution");

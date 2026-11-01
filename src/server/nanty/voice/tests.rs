@@ -1,6 +1,7 @@
-//! Testes da voz (spec 138 T09), só com provedores simulados num servidor local (nunca chave real):
-//! a codificação de um áudio pequeno, a leitura do WAV, a ordem das conexões, a cadeia com cada elo
-//! falhando, o fim do orçamento, a transcrição e a rota dos áudios com a rotação da conversa.
+//! Testes da voz (spec 138 T09 e 139 T07), só com o Gemini simulado num servidor local (nunca chave
+//! real): a codificação de um áudio pequeno, a leitura do WAV, a conexão única do Gemini, a falha
+//! que cai para o texto, o fim do orçamento, a transcrição sem armazenamento, a lista de vozes com
+//! o cache, a migração registrada ao subir e a rota dos áudios com a rotação da conversa.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxPath, State as AxState};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use http_body_util::BodyExt;
@@ -19,7 +20,7 @@ use tower::ServiceExt;
 
 use super::encode::{ogg_opus, pcm_of_gemini, pcm_of_wav, raw_pcm, Pcm};
 use super::*;
-use crate::config::{Config, Connection, ConnectionKind, VoiceRoute, WireApi};
+use crate::config::{Config, Connection, ConnectionKind, WireApi, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE, DEFAULT_TRANSCRIBE_MODEL};
 use crate::server::nanty::store::Speaker;
 use crate::server::nanty::InstanceStatus;
 
@@ -32,7 +33,7 @@ pub(crate) fn gemini_key() -> String {
     format!("{}-{}", "gk", "voz".repeat(8))
 }
 
-pub(crate) fn openai_key() -> String {
+fn openai_key() -> String {
     format!("{}-{}", "ok", "fala".repeat(6))
 }
 
@@ -89,27 +90,44 @@ fn decoded_samples(ogg: &[u8], rate: i32) -> usize {
 #[derive(Clone)]
 pub(crate) enum Reply {
     Status(u16),
+    /// Um erro com este corpo (o 400 do Gemini para a chave recusada, por exemplo).
+    Error(u16, &'static str),
     /// O corpo como vem (o Gemini fora do formato, por exemplo).
     Raw(Vec<u8>),
     /// O texto da transcrição.
     Text(String),
 }
 
-/// Os provedores de voz simulados: fala do Gemini e da OpenAI e a transcrição do Gemini. Sem
-/// roteiro, a fala dá certo (meio segundo) e a transcrição devolve `default_text`.
+/// O Gemini simulado: a fala, a transcrição e a lista de vozes. Sem roteiro, a fala dá certo (meio
+/// segundo), a transcrição devolve `default_text` e a lista tem duas páginas.
 #[derive(Default)]
 pub(crate) struct FakeVoice {
     pub(crate) gemini: Mutex<VecDeque<Reply>>,
-    pub(crate) openai: Mutex<VecDeque<Reply>>,
     pub(crate) transcribe: Mutex<VecDeque<Reply>>,
+    pub(crate) voices: Mutex<VecDeque<Reply>>,
     pub(crate) default_text: Mutex<String>,
-    /// (rota, cabeçalho da chave, corpo).
+    /// Com a fala presa ([`Self::hold_speech`]), cada fala anota a chamada e só responde depois de
+    /// uma liberação ([`Self::release_speech`]): os testes não dependem de quanto ela demora.
+    pub(crate) speech_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// (rota, cabeçalho da chave, corpo; na lista de vozes, a consulta).
     pub(crate) calls: Mutex<Vec<(String, String, Value)>>,
 }
 
 impl FakeVoice {
     pub(crate) fn calls(&self, route: &str) -> Vec<Value> {
         lock(&self.calls).iter().filter(|(r, _, _)| r == route).map(|(_, _, b)| b.clone()).collect()
+    }
+
+    /// As próximas falas esperam a liberação.
+    pub(crate) fn hold_speech(&self) {
+        *lock(&self.speech_gate) = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Solta `count` falas presas, na ordem em que chegaram.
+    pub(crate) fn release_speech(&self, count: usize) {
+        if let Some(gate) = lock(&self.speech_gate).as_ref() {
+            gate.add_permits(count);
+        }
     }
 
     pub(crate) fn keys(&self) -> Vec<String> {
@@ -125,12 +143,23 @@ fn status(code: u16) -> Response {
     (StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(json!({"error": {"code": code}}))).into_response()
 }
 
+fn error_with(code: u16, text: &'static str) -> Response {
+    (StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), text).into_response()
+}
+
 async fn gemini_speak(AxState(fake): AxState<Arc<FakeVoice>>, headers: HeaderMap, body: Bytes) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     lock(&fake.calls).push(("gemini".into(), header_of(&headers, "x-goog-api-key"), body));
+    let gate = lock(&fake.speech_gate).clone();
+    if let Some(gate) = gate {
+        if let Ok(permit) = gate.acquire().await {
+            permit.forget();
+        }
+    }
     let reply = lock(&fake.gemini).pop_front();
     let audio = match reply {
         Some(Reply::Status(code)) => return status(code),
+        Some(Reply::Error(code, text)) => return error_with(code, text),
         Some(Reply::Raw(bytes)) => bytes,
         _ => wav(24_000, 1, &tone(24_000, 5)),
     };
@@ -142,15 +171,48 @@ async fn gemini_speak(AxState(fake): AxState<Arc<FakeVoice>>, headers: HeaderMap
     .into_response()
 }
 
-async fn openai_speak(AxState(fake): AxState<Arc<FakeVoice>>, headers: HeaderMap, body: Bytes) -> Response {
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    lock(&fake.calls).push(("openai".into(), header_of(&headers, "authorization"), body));
-    let reply = lock(&fake.openai).pop_front();
-    match reply {
-        Some(Reply::Status(code)) => status(code),
-        Some(Reply::Raw(bytes)) => bytes.into_response(),
-        _ => small_ogg().into_response(),
+/// A lista de vozes em duas páginas, com os campos ora direto na voz (o exemplo do SDK), ora dentro
+/// de `prompted` (a referência), e uma voz sem id, que fica de fora.
+async fn gemini_voices(
+    AxState(fake): AxState<Arc<FakeVoice>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    lock(&fake.calls).push(("voices".into(), header_of(&headers, "x-goog-api-key"), json!(query)));
+    match lock(&fake.voices).pop_front() {
+        Some(Reply::Status(code)) => return status(code),
+        Some(Reply::Error(code, text)) => return error_with(code, text),
+        _ => {}
     }
+    if query.get("page_token").map(String::as_str) == Some("p2") {
+        return Json(json!({"voices": [
+            {"type": "prompted", "id": "Aoede", "display_name": "Aoede", "prompted": {"language_code": "en-US", "gender": "female", "description": "Breezy"}},
+            {"type": "prebuilt", "id": "fr-fr-assistant-1", "display_name": "Louise", "language_code": "fr-FR"},
+        ]}))
+        .into_response();
+    }
+    Json(json!({
+        "voices": [
+            {"type": "prebuilt", "id": "Kore", "display_name": "Kore", "language_code": "pt-BR", "gender": "female", "description": "Firm"},
+            {"type": "prebuilt", "id": "Puck", "display_name": "Puck", "language_code": "en-US", "gender": "male", "description": "Upbeat"},
+            {"type": "prebuilt", "display_name": "Sem id"},
+        ],
+        "next_page_token": "p2",
+    }))
+    .into_response()
+}
+
+/// A lista de modelos em duas páginas, como a de verdade: de texto, de fala e de outras famílias.
+async fn gemini_models(
+    AxState(fake): AxState<Arc<FakeVoice>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    lock(&fake.calls).push(("models".into(), header_of(&headers, "x-goog-api-key"), json!(query)));
+    if query.get("pageToken").map(String::as_str) == Some("m2") {
+        return Json(json!({"models": [{"name": "models/gemini-3.8-flash-lite-tts"}, {"name": "models/gemini-3.8-flash-image"}]})).into_response();
+    }
+    Json(json!({"models": [{"name": "models/gemini-3.8-flash"}, {"name": "models/gemini-3.8-flash-tts"}], "nextPageToken": "m2"})).into_response()
 }
 
 async fn gemini_generate(
@@ -165,6 +227,7 @@ async fn gemini_generate(
     let reply = lock(&fake.transcribe).pop_front();
     let text = match reply {
         Some(Reply::Status(code)) => return status(code),
+        Some(Reply::Error(code, text)) => return error_with(code, text),
         Some(Reply::Text(text)) => text,
         _ => lock(&fake.default_text).clone(),
     };
@@ -181,7 +244,8 @@ pub(crate) async fn fake_voice() -> (Arc<FakeVoice>, String) {
     *lock(&fake.default_text) = "/status".into();
     let app = Router::new()
         .route("/v1beta/interactions", post(gemini_speak))
-        .route("/v1/audio/speech", post(openai_speak))
+        .route("/v1beta/voices", get(gemini_voices))
+        .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/:call", post(gemini_generate))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("porta");
@@ -200,7 +264,7 @@ pub(crate) fn gemini_conn(base: &str) -> Connection {
     conn
 }
 
-/// Uma conexão por chave no endereço simulado (a fala da OpenAI).
+/// Uma conexão por chave no endereço simulado (a OpenAI, que não tem mais voz).
 pub(crate) fn openai_conn(base: &str) -> Connection {
     Connection {
         id: "oai".into(),
@@ -213,15 +277,12 @@ pub(crate) fn openai_conn(base: &str) -> Connection {
     }
 }
 
-/// Voz ligada, com a ordem Gemini e depois OpenAI nos provedores simulados.
+/// Voz ligada na conexão do Gemini simulado (a OpenAI fica cadastrada, sem voz).
 pub(crate) fn voice_config(cfg: &mut Config, base: &str) {
-    cfg.connections.push(gemini_conn(base));
     cfg.connections.push(openai_conn(base));
+    cfg.connections.push(gemini_conn(base));
     cfg.nanty.voice.enabled = true;
-    cfg.nanty.voice.order = vec![
-        VoiceRoute { connection_id: "gem".into(), ..VoiceRoute::default() },
-        VoiceRoute { connection_id: "oai".into(), ..VoiceRoute::default() },
-    ];
+    cfg.nanty.voice.connection_id = "gem".into();
 }
 
 // ---- Mundo de teste ----
@@ -279,7 +340,6 @@ fn a_small_pcm_becomes_a_voice_note_with_the_exact_length() {
     assert!(ogg.starts_with(b"OggS"), "OGG");
     assert!(ogg.windows(8).any(|w| w == b"OpusHead"), "Opus");
     assert!(ogg.len() < samples.len() * 2 / 4, "comprime: {} bytes", ogg.len());
-    assert_eq!(provider::ogg_duration_secs(&ogg), Some(1), "meio segundo, para cima");
     // Volta inteiro, sem o atraso do começo e sem o enchimento do fim (a 24 kHz, o mesmo número).
     assert_eq!(decoded_samples(&ogg, 24_000), samples.len());
     assert_eq!(Pcm { rate: 24_000, samples }.duration_secs(), 1);
@@ -304,47 +364,54 @@ fn wav_is_read_and_audio_out_of_the_format_is_refused() {
     assert_eq!(ogg_opus(&Pcm { rate: 44_100, samples: mono.clone() }), Err("rate"));
     assert_eq!(ogg_opus(&Pcm { rate: 24_000, samples: Vec::new() }), Err("empty"));
     assert_eq!(pcm_of_wav(b"RIFF....WAVEjunk"), Err("format"));
-    assert_eq!(provider::ogg_duration_secs(b"nada"), None);
 }
 
-// ---- A ordem ----
+// ---- A conexão da voz ----
 
 #[test]
-fn the_order_is_the_list_or_gemini_then_openai_with_the_initial_models() {
+fn the_voice_is_one_gemini_connection_with_the_initial_models() {
     let mut cfg = Config::default();
-    let mut real_openai = openai_conn("https://api.openai.com");
-    real_openai.base_url = "https://api.openai.com/v1".into();
-    let other = Connection { id: "azure".into(), base_url: "https://x.openai.azure.com/v1".into(), ..openai_conn("x") };
     let anthropic = Connection::native("ant", "A", ConnectionKind::Anthropic, gemini_key());
     let no_key = Connection::native("gem2", "G2", ConnectionKind::GoogleGemini, "");
-    cfg.connections = vec![real_openai, other, anthropic, no_key, gemini_conn("http://127.0.0.1:9")];
-    // Automática: o Gemini com chave, depois a OpenAI; o resto fica fora.
-    let (steps, skipped) = chain(&cfg);
-    let got: Vec<(Provider, &str, &str, &str)> =
-        steps.iter().map(|s| (s.provider, s.connection.id.as_str(), s.model.as_str(), s.voice.as_str())).collect();
-    assert_eq!(
-        got,
-        [
-            (Provider::Gemini, "gem", DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE),
-            (Provider::OpenAi, "oai", DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_VOICE),
-        ]
-    );
-    assert!(skipped.is_empty());
-    // A lista vale como está: o modelo e a voz dela, a conexão que sumiu e o tipo sem voz contam.
-    cfg.nanty.voice.order = vec![
-        VoiceRoute { connection_id: "azure".into(), model: "m-fala".into(), voice: "v1".into() },
-        VoiceRoute { connection_id: "sumiu".into(), ..VoiceRoute::default() },
-        VoiceRoute { connection_id: "ant".into(), ..VoiceRoute::default() },
-        VoiceRoute { connection_id: "gem".into(), ..VoiceRoute::default() },
-    ];
-    let (steps, skipped) = chain(&cfg);
-    let got: Vec<(&str, &str, &str)> = steps.iter().map(|s| (s.connection.id.as_str(), s.model.as_str(), s.voice.as_str())).collect();
-    assert_eq!(got, [("azure", "m-fala", "v1"), ("gem", DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE)]);
-    assert_eq!(skipped, ["missing_connection", "unsupported"]);
-    // A transcrição: a primeira conexão do Gemini com chave, ou a escolhida.
+    cfg.connections = vec![openai_conn("https://api.openai.com"), anthropic, no_key, gemini_conn("http://127.0.0.1:9")];
+    // Automática: a primeira conexão do Gemini com chave fala e transcreve, com os iniciais.
+    let step = speaker(&cfg).expect("fala");
+    assert_eq!((step.connection.id.as_str(), step.model.as_str(), step.voice.as_str()), ("gem", DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE));
     assert_eq!(transcriber(&cfg).map(|(c, m)| (c.id, m)), Some(("gem".to_string(), DEFAULT_TRANSCRIBE_MODEL.to_string())));
-    cfg.nanty.voice.transcribe = crate::config::NantyRoute { connection_id: "ant".into(), model: String::new() };
-    assert!(transcriber(&cfg).is_none(), "só o Gemini transcreve");
+    // A escolhida, com o modelo leve só porque a pessoa escolheu (nunca troca sozinho).
+    cfg.nanty.voice.connection_id = "gem".into();
+    cfg.nanty.voice.speech_model = "gemini-3.8-flash-lite-tts".into();
+    cfg.nanty.voice.voice = "Puck".into();
+    cfg.nanty.voice.transcribe_model = "m-ouvir".into();
+    let step = speaker(&cfg).expect("fala");
+    assert_eq!((step.model.as_str(), step.voice.as_str()), ("gemini-3.8-flash-lite-tts", "Puck"));
+    assert_eq!(transcriber(&cfg).map(|(_, m)| m).as_deref(), Some("m-ouvir"));
+    // A OpenAI, a Anthropic e a conexão que sumiu não falam nem transcrevem.
+    for (id, code) in [("oai", "unsupported"), ("ant", "unsupported"), ("sumiu", "missing_connection")] {
+        cfg.nanty.voice.connection_id = id.into();
+        assert_eq!(speaker(&cfg).err(), Some(code), "{id}");
+        assert!(transcriber(&cfg).is_none(), "{id}");
+    }
+    // Sem nenhuma conexão do Gemini com chave.
+    cfg.nanty.voice.connection_id = String::new();
+    cfg.connections.retain(|c| c.id != "gem");
+    assert_eq!(speaker(&cfg).err(), Some("no_connection"));
+    assert!([ConnectionKind::ApiKey, ConnectionKind::Anthropic, ConnectionKind::ChatgptPlan].iter().all(|k| !speaks(*k) && !transcribes(*k)));
+    assert!(speaks(ConnectionKind::GoogleGemini) && transcribes(ConnectionKind::GoogleGemini));
+}
+
+/// O corpo da fala segue o formato atual da Interactions API; o estilo vai como anotação.
+#[test]
+fn the_speech_body_follows_the_current_interactions_format() {
+    let body = provider::speech_body("gemini-3.8-flash-tts", "Kore", "Oi.", None);
+    assert_eq!(body["input"][0]["type"], "user_input");
+    assert_eq!(body["input"][0]["content"][0], json!({"type": "text", "text": "Oi."}));
+    assert_eq!(body["response_format"], json!({"type": "audio", "mime_type": "audio/wav"}));
+    assert_eq!(body["generation_config"]["speech_config"], json!([{"voice": "Kore"}]));
+    assert_eq!(body["store"], false);
+    let styled = provider::speech_body("m", "Kore", "Oi.", Some(" calmo "));
+    assert_eq!(styled["input"][0]["content"][0]["annotations"], json!([{"type": "speech_metadata", "style": "calmo"}]));
+    assert!(provider::speech_body("m", "Kore", "Oi.", Some("  "))["input"][0]["content"][0].get("annotations").is_none());
 }
 
 // ---- A cadeia ----
@@ -356,18 +423,17 @@ fn world_with_voice(tag: &str, base: &str) -> World {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gemini_speaks_first_and_the_spend_is_counted() {
+async fn gemini_speaks_and_the_spend_is_counted() {
     let (fake, base) = fake_voice().await;
     let w = world_with_voice("chain-gemini", &base);
     let spoken = speak(&w.state, &w.nanty(), "Tudo calmo por aqui.").await.expect("fala");
-    assert_eq!(spoken.provider, Provider::Gemini);
     assert!(spoken.ogg.starts_with(b"OggS") && spoken.duration_secs == 1);
     assert_eq!(decoded_samples(&spoken.ogg, 24_000), tone(24_000, 5).len());
-    assert!(fake.calls("openai").is_empty(), "o segundo elo não foi chamado");
     let body = &fake.calls("gemini")[0];
     assert_eq!(body["model"], DEFAULT_GEMINI_TTS_MODEL);
     assert_eq!(body["generation_config"]["speech_config"][0]["voice"], DEFAULT_GEMINI_VOICE);
     assert_eq!(body["input"][0]["content"][0]["text"], "Tudo calmo por aqui.");
+    assert_eq!(body["store"], false);
     assert_eq!(fake.keys(), [gemini_key()], "a chave só no cabeçalho");
     assert!(!body.to_string().contains(&gemini_key()));
     let spend = w.nanty().snapshot().spend_on(&w.nanty().now().day_key());
@@ -376,30 +442,29 @@ async fn gemini_speaks_first_and_the_spend_is_counted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_failing_link_passes_to_the_next_and_finally_to_text() {
+async fn a_failing_gemini_falls_back_to_text() {
     let (fake, base) = fake_voice().await;
     let w = world_with_voice("chain-fail", &base);
-    // O Gemini cai: a OpenAI fala, com o Opus dela, e o modelo e a voz iniciais.
+    // O Gemini cai: sobra o texto, com o motivo, e nenhum outro provedor é chamado.
     lock(&fake.gemini).push_back(Reply::Status(500));
-    let spoken = speak(&w.state, &w.nanty(), "Oi.").await.expect("fala");
-    assert_eq!(spoken.provider, Provider::OpenAi);
-    let body = &fake.calls("openai")[0];
-    assert_eq!((body["model"].as_str(), body["voice"].as_str(), body["response_format"].as_str()), (Some(DEFAULT_OPENAI_TTS_MODEL), Some(DEFAULT_OPENAI_VOICE), Some("opus")));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["provider_error"]));
     assert_eq!(w.journal("voice.failed")[0]["reason"], "provider_error");
-    // O Gemini devolve o que não é áudio e a OpenAI recusa a chave: sobra o texto, com os motivos.
+    // O que não é áudio, e a chave recusada.
     lock(&fake.gemini).push_back(Reply::Raw(Vec::new()));
-    lock(&fake.openai).push_back(Reply::Status(401));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["empty", "auth"]));
-    // A OpenAI manda algo que não é OGG.
-    lock(&fake.gemini).push_back(Reply::Status(429));
-    lock(&fake.openai).push_back(Reply::Raw(b"ID3 mp3".to_vec()));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["rate_limited", "format"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["empty"]));
+    lock(&fake.gemini).push_back(Reply::Status(401));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["auth"]));
     let texts = w.journal("voice.text");
-    assert_eq!(texts.len(), 2);
-    assert_eq!(texts[1]["reasons"], json!(["rate_limited", "format"]));
-    // Nada do texto nem da chave no registro.
+    assert_eq!(texts.len(), 3);
+    assert_eq!(texts[2]["reasons"], json!(["auth"]));
+    assert_eq!(fake.calls("gemini").len(), 3);
+    // A conexão escolhida é a OpenAI (uma configuração feita à mão): texto, sem chamada.
+    w.state.config().write().await.nanty.voice.connection_id = "oai".into();
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["unsupported"]));
+    assert_eq!(fake.calls("gemini").len(), 3);
+    // Nada do texto nem das chaves no registro.
     let journal = serde_json::to_string(&w.nanty().journal_tail(1000)).expect("json");
-    assert!(!journal.contains("Oi.") && !journal.contains(&openai_key()), "{journal}");
+    assert!(!journal.contains("Oi.") && !journal.contains(&openai_key()) && !journal.contains(&gemini_key()), "{journal}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -413,7 +478,7 @@ async fn without_budget_the_voice_is_not_called_and_text_follows() {
         true
     });
     assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["budget"]));
-    assert!(fake.calls("gemini").is_empty() && fake.calls("openai").is_empty());
+    assert!(fake.calls("gemini").is_empty());
     assert_eq!(w.journal("voice.text")[0]["reasons"], json!(["budget"]));
     // Sem conexão de voz nenhuma: texto, com o motivo.
     let w2 = World::new("chain-none", Config::default());
@@ -423,7 +488,7 @@ async fn without_budget_the_voice_is_not_called_and_text_follows() {
 // ---- A transcrição ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transcription_sends_the_note_inline_and_reads_only_the_answer() {
+async fn transcription_sends_the_note_inline_without_storage_and_reads_only_the_answer() {
     let (fake, base) = fake_voice().await;
     lock(&fake.transcribe).push_back(Reply::Text("  olha o projeto Loja  ".into()));
     let ogg = small_ogg();
@@ -431,6 +496,8 @@ async fn transcription_sends_the_note_inline_and_reads_only_the_answer() {
     assert_eq!((heard.text.as_str(), heard.input_tokens, heard.output_tokens), ("olha o projeto Loja", Some(40), Some(6)));
     let body = &fake.calls("transcribe")[0];
     assert_eq!(body["_call"], "m-ouvir:generateContent");
+    // Privacidade (C-17): o pedido sai com o armazenamento desligado.
+    assert_eq!(body["store"], json!(false));
     let parts = &body["contents"][0]["parts"];
     assert_eq!(parts[0]["text"], "transcreva");
     assert_eq!(parts[1]["inline_data"]["mime_type"], "audio/ogg");
@@ -443,6 +510,280 @@ async fn transcription_sends_the_note_inline_and_reads_only_the_answer() {
     assert_eq!(provider::gemini_transcribe(&gemini_conn(&base), "m", "p", &ogg).await.err(), Some("empty"));
     assert_eq!(provider::gemini_transcribe(&gemini_conn(&base), "../x?y", "p", &ogg).await.err(), Some("config"));
     assert_eq!(provider::gemini_transcribe(&openai_conn(&base), "m", "p", &ogg).await.err(), Some("unsupported"));
+}
+
+// ---- As vozes ----
+
+async fn json_of(resp: Response) -> (StatusCode, Value) {
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("corpo").to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_voices_route_lists_every_page_and_keeps_a_short_cache() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("voices", &base);
+    let (status, body) = json_of(w.get("/api/nanty/voices").await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["connection_id"].as_str(), body["voice"].as_str()), (Some("gem"), Some(DEFAULT_GEMINI_VOICE)));
+    let ids: Vec<&str> = body["voices"].as_array().expect("lista").iter().filter_map(|v| v["id"].as_str()).collect();
+    assert_eq!(ids, ["Kore", "Puck", "Aoede"], "as duas páginas, sem a voz sem id nem a de outro idioma");
+    // Spec 139 T12: os modelos de fala, de todas as páginas, que a lista das conexões deixa de fora.
+    assert_eq!(body["speech_models"], json!(["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]));
+    assert_eq!(fake.calls("models").len(), 2);
+    assert_eq!(body["voices"][0], json!({"id": "Kore", "display_name": "Kore", "type": "prebuilt", "language_code": "pt-BR", "gender": "female", "description": "Firm"}));
+    assert_eq!((body["voices"][2]["language_code"].as_str(), body["voices"][2]["description"].as_str()), (Some("en-US"), Some("Breezy")), "lido dentro de `prompted`");
+    let pages = fake.calls("voices");
+    assert_eq!(pages.len(), 2);
+    assert_eq!((pages[0]["page_size"].as_str(), pages[1]["page_token"].as_str()), (Some("1000"), Some("p2")));
+    assert_eq!(fake.keys(), vec![gemini_key(); 4], "a chave só no cabeçalho");
+    assert!(!body.to_string().contains(&gemini_key()));
+    // Dentro do cache: nenhuma chamada nova.
+    let (status, again) = json_of(w.get("/api/nanty/voices?connection_id=gem").await).await;
+    assert_eq!((status, again["voices"].clone()), (StatusCode::OK, body["voices"].clone()));
+    assert_eq!(fake.calls("voices").len(), 2);
+}
+
+/// O erro do Gemini para a chave recusada: 400, com o motivo no corpo.
+const KEY_INVALID_BODY: &str = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#;
+const KEY_MESSAGE_BODY: &str = r#"{"error":{"code":400,"message":"API key not valid."}}"#;
+const PLAIN_400_BODY: &str = r#"{"error":{"code":400,"message":"Invalid value at voice","status":"INVALID_ARGUMENT"}}"#;
+
+/// Spec 139 T09: o Gemini recusa a chave com 400, e os três caminhos dizem `auth`; o corpo só escolhe
+/// o código. Um 400 comum continua `bad_request`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_refused_with_a_400_is_auth_on_every_path_and_the_body_stays_out() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("key-400", &base);
+    // A lista de vozes, pela rota: a tela lê o `reason` e diz "Chave recusada".
+    lock(&fake.voices).push_back(Reply::Error(400, KEY_INVALID_BODY));
+    let (status, body) = json_of(w.get("/api/nanty/voices").await).await;
+    assert_eq!((status, body["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("nanty_voice_list_failed")));
+    assert_eq!((body["params"]["reason"].as_str(), body["params"]["connection_id"].as_str()), (Some("auth"), Some("gem")));
+    assert!(!body.to_string().contains("API key not valid"), "{body}");
+    lock(&fake.voices).push_back(Reply::Error(400, PLAIN_400_BODY));
+    let (_, body) = json_of(w.get("/api/nanty/voices").await).await;
+    assert_eq!(body["params"]["reason"], "bad_request");
+    // A fala: o motivo certo no registro, sem o corpo.
+    lock(&fake.gemini).push_back(Reply::Error(400, KEY_INVALID_BODY));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["auth"]));
+    assert_eq!(w.journal("voice.failed")[0]["reason"], "auth");
+    lock(&fake.gemini).push_back(Reply::Error(400, PLAIN_400_BODY));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["bad_request"]));
+    let record = format!("{:?}{:?}", w.journal("voice.failed"), w.journal("voice.text"));
+    assert!(!record.contains("API key") && !record.contains("Invalid value"), "{record}");
+    // A transcrição, com as duas formas do corpo.
+    let ogg = b"OggS".to_vec();
+    for (body, code) in [(KEY_INVALID_BODY, "auth"), (KEY_MESSAGE_BODY, "auth"), (PLAIN_400_BODY, "bad_request")] {
+        lock(&fake.transcribe).push_back(Reply::Error(400, body));
+        assert_eq!(provider::gemini_transcribe(&gemini_conn(&base), "m", "p", &ogg).await.err(), Some(code), "{body}");
+    }
+    // O corpo só conta num 400: em outro status, o código é o do status.
+    lock(&fake.transcribe).push_back(Reply::Error(500, KEY_INVALID_BODY));
+    assert_eq!(provider::gemini_transcribe(&gemini_conn(&base), "m", "p", &ogg).await.err(), Some("provider_error"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_voices_route_answers_coded_errors() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("voices-errors", &base);
+    let code = |v: &Value| v["code"].as_str().map(str::to_string);
+    // Conexão que não é do Gemini, ou que não existe.
+    for uri in ["/api/nanty/voices?connection_id=oai", "/api/nanty/voices?connection_id=sumiu"] {
+        let (status, body) = json_of(w.get(uri).await).await;
+        assert_eq!((status, code(&body).as_deref()), (StatusCode::CONFLICT, Some("nanty_voice_no_connection")), "{uri}");
+    }
+    // O provedor falhou: 502 com o motivo em código, sem cache do erro.
+    lock(&fake.voices).push_back(Reply::Status(500));
+    let (status, body) = json_of(w.get("/api/nanty/voices").await).await;
+    assert_eq!((status, code(&body).as_deref()), (StatusCode::BAD_GATEWAY, Some("nanty_voice_list_failed")));
+    assert_eq!(body["params"]["reason"], "provider_error");
+    assert_eq!(body["params"]["connection_id"], "gem", "a tela segue com os modelos da conexão");
+    let (status, _) = json_of(w.get("/api/nanty/voices").await).await;
+    assert_eq!(status, StatusCode::OK, "o erro não fica guardado");
+    // Sem chave.
+    let mut cfg = Config::default();
+    cfg.connections.push(Connection::native("gk", "G", ConnectionKind::GoogleGemini, ""));
+    cfg.nanty.voice.connection_id = "gk".into();
+    let w2 = World::new("voices-nokey", cfg);
+    let (status, body) = json_of(w2.get("/api/nanty/voices").await).await;
+    assert_eq!((status, code(&body).as_deref()), (StatusCode::CONFLICT, Some("nanty_voice_no_key")));
+    // Na automática, um Gemini sem chave também é "sem chave": a mesma regra dos Ajustes (T09).
+    let mut cfg = Config::default();
+    cfg.connections.push(Connection::native("gk", "G", ConnectionKind::GoogleGemini, ""));
+    let w4 = World::new("voices-auto-nokey", cfg);
+    let (status, body) = json_of(w4.get("/api/nanty/voices").await).await;
+    assert_eq!((status, code(&body).as_deref()), (StatusCode::CONFLICT, Some("nanty_voice_no_key")));
+    // A gravada sumiu: sem parâmetro, é ela; com o parâmetro vazio, a automática dos Ajustes (T09).
+    let mut cfg = Config::default();
+    voice_config(&mut cfg, &base);
+    cfg.connections.insert(0, Connection::native("sem-chave", "G", ConnectionKind::GoogleGemini, ""));
+    cfg.nanty.voice.connection_id = "sumiu".into();
+    let w5 = World::new("voices-auto-saved-gone", cfg);
+    let (status, body) = json_of(w5.get("/api/nanty/voices").await).await;
+    assert_eq!((status, code(&body).as_deref()), (StatusCode::CONFLICT, Some("nanty_voice_no_connection")));
+    let (status, body) = json_of(w5.get("/api/nanty/voices?connection_id=").await).await;
+    assert_eq!((status, body["connection_id"].as_str()), (StatusCode::OK, Some("gem")), "a primeira com chave: {body}");
+    // Sem conexão do Gemini nenhuma.
+    let w3 = World::new("voices-none", Config::default());
+    let (status, body) = json_of(w3.get("/api/nanty/voices").await).await;
+    assert_eq!((status, code(&body).as_deref()), (StatusCode::CONFLICT, Some("nanty_voice_no_connection")));
+    for lang in crate::i18n::Lang::ALL {
+        for key in ["nanty_voice_no_connection", "nanty_voice_no_key", "nanty_voice_list_failed"] {
+            let text = crate::i18n::tr(lang, &format!("serverError.{key}"), &[]);
+            assert!(!text.is_empty() && !text.contains("serverError"), "{lang:?}: {text}");
+        }
+    }
+}
+
+// ---- A migração ao subir ----
+
+/// Spec 139 T07 (C-16): a voz antiga carregada vira a nova; ao subir, o Nanty registra uma linha
+/// (só números) e o arquivo passa à forma nova, sem a ordem antiga.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_old_voice_is_migrated_and_recorded_when_the_nanty_starts() {
+    let dir = temp("migrate");
+    let path = dir.join("config.toml");
+    let old = r#"
+[[connections]]
+id = "gem"
+name = "Gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "env:NANTS_T07_SEM_CHAVE"
+kind = "google_gemini"
+
+[[connections]]
+id = "oai"
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key = "env:NANTS_T07_SEM_CHAVE"
+
+[nanty.voice]
+enabled = true
+order = [{ connection_id = "gem", voice = "Puck" }, { connection_id = "oai", model = "gpt-4o-mini-tts-2025-12-15" }]
+transcribe = { connection_id = "gem", model = "" }
+"#;
+    std::fs::write(&path, old).expect("grava");
+    let cfg = Config::load_from(&path).expect("carrega");
+    let state = AppState::new(path.clone(), cfg, 3000)
+        .with_data_dir(dir.join("data"))
+        .with_nanty_clock(crate::server::nanty::clock::test_clock());
+    let running = crate::server::nanty::start(&state);
+    let nanty = Arc::clone(state.nanty());
+    let migrated = || {
+        nanty.journal_tail(100).into_iter().filter(|e| e.kind == JournalKind::Voice && e.code == "voice.migrated").map(|e| e.params).collect::<Vec<_>>()
+    };
+    for _ in 0..500 {
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        if !migrated().is_empty() && !written.contains("order =") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let lines = migrated();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["dropped"], 1);
+    assert_eq!((lines[0]["moved"].as_bool(), lines[0]["transcribe_dropped"].as_bool()), (Some(true), Some(false)));
+    let written = std::fs::read_to_string(&path).expect("arquivo");
+    assert!(!written.contains("order =") && !written.contains("gpt-4o"), "{written}");
+    let again = Config::load_from(&path).expect("relê");
+    assert_eq!((again.nanty.voice.connection_id.as_str(), again.nanty.voice.voice_name().as_str()), ("gem", "Puck"));
+    assert_eq!(again.nanty.voice.migrated, None, "nada mais a migrar");
+    assert_eq!(state.config().read().await.nanty.voice.migrated, None, "o recado foi consumido");
+    state.trigger_shutdown();
+    running.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Spec 139 T08: a migração sem conseguir gravar deixa o código no registro, e o resto sobe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migration_that_cannot_be_saved_leaves_the_code_in_the_journal() {
+    let dir = temp("migrate-fail");
+    // O arquivo da configuração fica dentro de um arquivo: a gravação falha.
+    std::fs::write(dir.join("arquivo"), "x").expect("grava");
+    let mut cfg = Config::default();
+    cfg.nanty.voice.migrated = Some(VoiceMigration { moved: true, dropped: 1, transcribe_dropped: false });
+    let state = AppState::new(dir.join("arquivo").join("config.toml"), cfg, 3000)
+        .with_data_dir(dir.join("data"))
+        .with_nanty_clock(crate::server::nanty::clock::test_clock());
+    let running = crate::server::nanty::start(&state);
+    let nanty = Arc::clone(state.nanty());
+    let code = |name: &str| nanty.journal_tail(100).into_iter().filter(|e| e.kind == JournalKind::Voice && e.code == name).map(|e| e.params).collect::<Vec<_>>();
+    for _ in 0..500 {
+        if !code("voice.migration_unsaved").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(code("voice.migrated").len(), 1);
+    assert_eq!(code("voice.migration_unsaved")[0]["reason"], "config_save_failed");
+    state.trigger_shutdown();
+    running.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- A segunda linha da mensagem ----
+
+/// Spec 139 T08: a mensagem que ganha o áudio tem duas linhas no arquivo. A conversa mostra uma só,
+/// o áudio segue servido e guardado, e a remoção do projeto leva as duas.
+#[test]
+fn a_message_with_two_lines_follows_the_audio_rules_and_leaves_whole() {
+    let w = World::new("two-lines", Config::default());
+    let nanty = w.nanty();
+    let audio = save_audio(&nanty, &small_ogg(), 1).expect("áudio");
+    let mut message = message_with(&nanty, None);
+    message.project_id = Some("p1".into());
+    nanty.keep_message(&message);
+    message.audio = Some(audio.clone());
+    nanty.keep_message(&message);
+    assert_eq!(nanty.conversation_all().len(), 2, "o arquivo só recebe acréscimos");
+    assert_eq!(nanty.conversation(), [message.clone()]);
+    assert!(nanty.read_audio(&audio.id).is_some());
+    prune_older(&nanty, Duration::ZERO);
+    assert!(nanty.read_audio(&audio.id).is_some(), "a segunda linha cita o áudio");
+    nanty.forget_project("p1");
+    assert!(nanty.conversation_all().is_empty());
+    assert!(nanty.read_audio(&audio.id).is_none());
+}
+
+// ---- O corte da fala ----
+
+/// Spec 139 T08 (C-14): a fala só termina num fim de frase; sem nenhum, numa palavra inteira.
+#[test]
+fn the_speech_is_cut_at_the_end_of_a_sentence() {
+    assert_eq!(speech_text("  Curto.  ", 100), "Curto.");
+    assert_eq!(speech_text("Primeira frase. Segunda frase. Terceira que passa do limite", 40), "Primeira frase. Segunda frase.");
+    assert_eq!(speech_text("Tudo certo! Valeu? Sobra um pedaço que nao cabe", 25), "Tudo certo! Valeu?");
+    // Um ponto de número não é fim de frase, e uma quebra de linha é.
+    assert_eq!(speech_text("Custou 1.50 dolares hoje e segue sem parar", 25), "Custou 1.50 dolares hoje");
+    assert_eq!(speech_text("Loja\nCustou 1.50 dolares hoje e segue sem parar", 20), "Loja");
+    // Sem espaço nenhum: o limite, sem partir um caractere.
+    assert_eq!(speech_text(&"ç".repeat(30), 10), "ç".repeat(10));
+}
+
+#[tokio::test]
+async fn a_long_text_is_spoken_up_to_the_last_whole_sentence() {
+    let (fake, base) = fake_voice().await;
+    let mut cfg = Config::default();
+    voice_config(&mut cfg, &base);
+    let w = World::new("cut", cfg);
+    let text = "Uma frase inteira sobre o projeto. ".repeat(100);
+    let spoken = speak(&w.state, &w.nanty(), &text).await;
+    assert!(spoken.is_ok());
+    let sent = fake.calls("gemini")[0]["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    assert!(sent.chars().count() <= MAX_SPEECH_CHARS && sent.ends_with("projeto."), "{}", sent.len());
+}
+
+/// Spec 139 T12: a frase do servidor fecha a fala, mesmo quando o texto é cortado.
+#[test]
+fn the_server_line_stays_in_the_speech() {
+    let line = "Confirme no cartão.";
+    let text = format!("{}\n{line}", "Uma frase inteira sobre o projeto. ".repeat(100).trim());
+    let cut = speech_keeping(&text, Some(line), MAX_SPEECH_CHARS);
+    assert!(cut.chars().count() <= MAX_SPEECH_CHARS && cut.ends_with(&format!("projeto.\n{line}")), "{}", cut.len());
+    assert_eq!(speech_keeping("Curto.\nConfirme no cartão.", Some(line), MAX_SPEECH_CHARS), "Curto.\nConfirme no cartão.");
+    assert_eq!(speech_keeping(&text, None, 50), speech_text(&text, 50));
 }
 
 // ---- A rota dos áudios ----
@@ -565,12 +906,12 @@ fn the_person_voice_message_keeps_the_mark_and_the_redacted_transcript() {
     let secret = gemini_key();
     let secrets = SecretSet::new([secret.clone()]);
     let raw = format!("minha chave é {secret}");
-    let m = crate::server::nanty::chat::person_message_with(&nanty, &secrets, Channel::Telegram, Some(&raw), true, None).expect("mensagem");
+    let m = crate::server::nanty::chat::person_message_with(&nanty, &crate::config::NantyConfig::default(), &secrets, Channel::Telegram, Some(&raw), true, None).expect("mensagem");
     assert_eq!((m.from, m.voice, m.text.as_deref()), (Speaker::Person, true, Some("minha chave é ***")));
     // A nota que não virou texto entra sem texto, com a marca.
-    let empty = crate::server::nanty::chat::person_message_with(&nanty, &secrets, Channel::Telegram, None, true, None).expect("nota");
+    let empty = crate::server::nanty::chat::person_message_with(&nanty, &crate::config::NantyConfig::default(), &secrets, Channel::Telegram, None, true, None).expect("nota");
     assert_eq!((empty.voice, empty.text), (true, None));
-    assert!(crate::server::nanty::chat::person_message_with(&nanty, &secrets, Channel::Telegram, None, false, None).is_none());
+    assert!(crate::server::nanty::chat::person_message_with(&nanty, &crate::config::NantyConfig::default(), &secrets, Channel::Telegram, None, false, None).is_none());
     let line = serde_json::to_string(&nanty.conversation()).expect("json");
     assert!(!line.contains(&secret) && line.contains("\"voice\":true"), "{line}");
 }

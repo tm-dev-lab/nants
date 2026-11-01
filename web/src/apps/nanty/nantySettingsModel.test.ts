@@ -1,13 +1,13 @@
 // @vitest-environment node
 /*
  * Modelo puro dos Ajustes do Nanty (spec 138 T11): o pedido só com o que mudou, as faixas dos
- * números, a ordem da voz e a leitura das respostas da API (a configuração e o canal do Telegram,
- * com o link de pareamento só na forma `t.me/<bot>?start=<código>`).
+ * números, o estado da voz e a leitura das respostas da API (a configuração, as vozes e o canal do
+ * Telegram, com o link de pareamento só na forma `t.me/<bot>?start=<código>`).
  */
 import { describe, expect, it } from "vitest";
 import { NANTY_CONFIG } from "../../desktop/shell-test-utils";
-import { parseNantySettings, parseNantyTelegram, type NantySettings } from "./nantyApi";
-import { budgetFraction, draftOf, invalidNumbers, minutesText, moveStep, settingsPatch, speaks, transcribes, voiceWarning } from "./nantySettingsModel";
+import { parseNantySettings, parseNantyTelegram, parseNantyVoices, type NantySettings } from "./nantyApi";
+import { budgetFraction, draftOf, invalidNumbers, keyRefused, minutesText, settingsPatch, voiceCapable, voiceCheckOf, voiceState, voiceWarning } from "./nantySettingsModel";
 
 function saved(): NantySettings {
   const s = parseNantySettings(NANTY_CONFIG);
@@ -26,18 +26,15 @@ describe("pedido dos Ajustes", () => {
     expect(settingsPatch(s, { ...draftOf(s), model: "  " })).toEqual({});
   });
 
-  it("os projetos excluídos, a ordem da voz e a transcrição", () => {
+  it("os projetos excluídos e a voz, na forma nova e sem espaços", () => {
     const s = saved();
-    const d = {
-      ...draftOf(s),
-      excluded: ["p3", "p1"],
-      voice_order: [{ connection_id: "gem", model: " m ", voice: "" }],
-      transcribe: { connection_id: "gem", model: "" },
-    };
+    const d = { ...draftOf(s), excluded: ["p3", "p1"], voice_connection_id: "gem", speech_model: " m ", voice_name: "Puck", transcribe_model: "t" };
     expect(settingsPatch(s, d)).toEqual({
       excluded_projects: ["p1", "p3"],
-      voice: { order: [{ connection_id: "gem", model: "m", voice: "" }], transcribe: { connection_id: "gem", model: "" } },
+      voice: { connection_id: "gem", speech_model: "m", voice: "Puck", transcribe_model: "t" },
     });
+    // Vazio volta ao inicial no servidor: o pedido leva o vazio.
+    expect(settingsPatch(s, { ...draftOf(s), voice_name: " " })).toEqual({ voice: { voice: "" } });
   });
 
   it("número fora da faixa do servidor: nenhum pedido", () => {
@@ -56,29 +53,62 @@ describe("pedido dos Ajustes", () => {
     }
   });
 
-  it("subir, descer e as bordas da lista; a barra e o relógio da validade", () => {
-    expect(moveStep(["a", "b", "c"], 2, -1)).toEqual(["a", "c", "b"]);
-    expect(moveStep(["a", "b", "c"], 0, 1)).toEqual(["b", "a", "c"]);
-    expect(moveStep(["a", "b"], 0, -1)).toEqual(["a", "b"]);
-    expect(moveStep(["a", "b"], 1, 1)).toEqual(["a", "b"]);
+  it("a barra e o relógio da validade", () => {
     expect([budgetFraction(1, 4), budgetFraction(9, 4), budgetFraction(0, 0), budgetFraction(1, 0)]).toEqual([0.25, 1, 0, 1]);
     expect([minutesText(600), minutesText(61), minutesText(-3)]).toEqual(["10:00", "1:01", "0:00"]);
   });
 });
 
 describe("conexões da voz (as regras do servidor)", () => {
-  it("fala: Gemini e por chave; transcrição: só Gemini; o aviso da gravada", () => {
-    expect([speaks("google_gemini"), speaks("api_key"), speaks(undefined), speaks("chatgpt_plan"), speaks("anthropic")]).toEqual([true, true, true, false, false]);
-    expect([transcribes("google_gemini"), transcribes("api_key"), transcribes(undefined), transcribes("anthropic")]).toEqual([true, false, false, false]);
+  it("só o Gemini serve; o aviso da gravada", () => {
+    expect([voiceCapable("google_gemini"), voiceCapable("api_key"), voiceCapable(undefined), voiceCapable("anthropic"), voiceCapable("chatgpt_plan")]).toEqual([true, false, false, false, false]);
     const conns = [
       { id: "g", name: "G", base_url: "", api_key_masked: "", kind: "google_gemini" as const },
       { id: "k", name: "K", base_url: "", api_key_masked: "" },
     ];
-    expect([voiceWarning("", conns, transcribes), voiceWarning("g", conns, transcribes), voiceWarning("k", conns, transcribes), voiceWarning("x", conns, speaks)]).toEqual([null, null, "unusable", "gone"]);
+    expect([voiceWarning("", conns), voiceWarning("g", conns), voiceWarning("k", conns), voiceWarning("x", conns)]).toEqual([null, null, "unusable", "gone"]);
+  });
+
+  it("o estado é o que a rota de vozes responde", () => {
+    const failure = (code: string | undefined, params?: Record<string, string>) => ({ ok: false as const, error: { kind: "http" as const, status: 409, message: "x", code, params } });
+    const ready = voiceCheckOf({ ok: true, data: { connection_id: "g", voices: [], speech_models: [] } });
+    expect([ready.status, voiceState(ready)]).toEqual(["ready", "ready"]);
+    expect(voiceState(voiceCheckOf(failure("nanty_voice_no_key")))).toBe("no_key");
+    expect(voiceState(voiceCheckOf(failure("nanty_voice_no_connection")))).toBe("no_connection");
+    // O provedor falhou: a regra do servidor continua valendo, com a conexão que ele resolveu.
+    const listFailed = voiceCheckOf(failure("nanty_voice_list_failed", { reason: "provider_error", connection_id: "g" }));
+    expect(listFailed).toMatchObject({ status: "failed", connection_id: "g" });
+    expect(voiceState(listFailed)).toBe("ready");
+    expect(keyRefused(listFailed)).toBe(false);
+    // A chave recusada não está pronta: repetir não resolve.
+    const refused = voiceCheckOf(failure("nanty_voice_list_failed", { reason: "auth", connection_id: "g" }));
+    expect(refused).toMatchObject({ status: "failed", connection_id: "g", reason: "auth" });
+    expect([keyRefused(refused), voiceState(refused)]).toEqual([true, "key_refused"]);
+    // O motivo só vale no código da lista.
+    expect(voiceState(voiceCheckOf(failure("outro_codigo", { reason: "auth", connection_id: "g" })))).toBeNull();
+    // Sem resposta do servidor: nada a afirmar.
+    expect(voiceState(voiceCheckOf(failure(undefined)))).toBeNull();
+    expect(voiceState({ status: "loading" })).toBeNull();
   });
 });
 
 describe("leitura da API", () => {
+  it("as vozes: sem id fica de fora, sem repetir, e o rótulo só leva a descrição curta", () => {
+    const voices = parseNantyVoices({
+      connection_id: "g",
+      voices: [
+        { id: "Kore", display_name: "Kore", language_code: "pt-BR", description: "Firm" },
+        { id: "Kore", display_name: "Kore de novo" },
+        { display_name: "Sem id" },
+        { id: "Puck", display_name: "", description: "x".repeat(41) },
+      ],
+      speech_models: ["gemini-3.8-flash-tts", 7, ""],
+    });
+    expect(voices).toEqual({ connection_id: "g", voices: [{ id: "Kore", name: "Kore (pt-BR, Firm)" }, { id: "Puck", name: "Puck" }], speech_models: [{ id: "gemini-3.8-flash-tts" }] });
+    expect(parseNantyVoices({ connection_id: "g", voices: [] })?.speech_models).toEqual([]);
+    expect(parseNantyVoices("x")).toBeNull();
+  });
+
   it("a configuração: hora inválida descarta; a reserva vazia some; sem token na forma da tela", () => {
     expect(parseNantySettings({ ...NANTY_CONFIG, digest_time: "8h" })).toBeNull();
     const s = parseNantySettings({ ...NANTY_CONFIG, now: "25:99x", reserve: { developer: { connection_id: "oai", model: "m" }, reviewer: { connection_id: "", model: "" }, chefe: { connection_id: "x", model: "y" } } });

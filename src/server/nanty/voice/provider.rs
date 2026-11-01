@@ -1,15 +1,27 @@
-//! As chamadas de voz aos provedores (spec 138 T09), com as conexões que a pessoa já tem:
+//! As chamadas de voz ao Gemini (spec 138 T09; só Gemini desde a spec 139 T07, G6), pela conexão
+//! do Google Gemini que a pessoa já tem:
 //!
-//! - **Fala pelo Gemini:** `POST {endpoint}/v1beta/interactions` (o mesmo caminho do adaptador
-//!   nativo) com `response_format` de áudio WAV e a voz em `generation_config.speech_config`, como o
-//!   vídeo do Nants faz. O áudio volta em base64 no passo `model_output` (ou em `output_audio`).
-//! - **Fala pela OpenAI:** `POST {endpoint}/audio/speech` com `response_format: "opus"`: o corpo já
-//!   é a nota de voz (Opus em OGG).
-//! - **Transcrição pelo Gemini:** `POST {endpoint}/v1beta/models/{modelo}:generateContent` com a
-//!   nota de voz em `inline_data` (`audio/ogg`) e o pedido de transcrição.
+//! - **Fala:** `POST {endpoint}/v1beta/interactions` (o mesmo caminho do adaptador nativo), no
+//!   formato atual da documentação: o texto em `input[].content[]` (o estilo, quando há, em
+//!   `annotations` com `speech_metadata.style`), `response_format` de áudio WAV (24 kHz, mono, PCM
+//!   de 16 bits) e a voz em `generation_config.speech_config[].voice`. O áudio volta em base64 num
+//!   item `type: "audio"` de `steps[].content[]` (ou em `output_audio`). `store: false`.
+//! - **Transcrição:** `POST {endpoint}/v1beta/models/{modelo}:generateContent` com a nota de voz em
+//!   `inline_data` (`audio/ogg`), o pedido de transcrição e **`store: false`**: desde 2026-10-26 o
+//!   `generateContent` guarda os pedidos por padrão nos projetos pagos novos, e o campo do pedido
+//!   vale mais que a configuração do projeto. Ficou no `generateContent` (e não na Interactions) por
+//!   ser o formato de entrada de áudio já validado de verdade na rc.22.
+//! - **Vozes:** `GET {endpoint}/v1beta/voices`, página a página (`page_size`, `page_token`), lido de
+//!   forma tolerante (o idioma, o gênero e a descrição direto na voz ou dentro de `prompted`). Só as
+//!   vozes dos idiomas do Nanty ficam: a lista real tem milhares, por idioma e em ordem alfabética, e
+//!   o teto antigo cortava em 2000 antes de chegar ao português (visto com a chave real, spec 139 T12).
+//! - **Modelos de fala:** `GET {endpoint}/v1beta/models`, página a página, só os nomes com a parte
+//!   `tts`. A lista de modelos das conexões é só de texto e os deixa de fora, então o autocomplete da
+//!   fala não teria o que oferecer (visto com a chave real, spec 139 T12).
 //!
 //! **Nada vaza:** a chave vai só no cabeçalho, marcada como sensível; nenhum erro carrega texto do
-//! provedor, do reqwest ou a URL, só um código ([`Fail`]). Sem redirecionamento.
+//! provedor, do reqwest ou a URL, só um código ([`Fail`]). Sem redirecionamento. O corpo de um 400 é
+//! lido só para reconhecer a chave recusada, que o Gemini devolve assim, e nunca é guardado.
 
 use std::time::Duration;
 
@@ -17,16 +29,27 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::config::{Connection, ConnectionKind};
+use crate::server::models_native::key_rejected;
 
 /// Prazo de uma chamada de voz (provisório).
 pub const VOICE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Teto do corpo de uma resposta (o áudio em base64 cabe com folga).
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-/// Caminho da fala e do `generateContent` do Gemini, a partir do endereço da conexão.
+/// Caminho da fala do Gemini, a partir do endereço da conexão.
 pub const GEMINI_INTERACTIONS_PATH: &str = "/v1beta/interactions";
 const GEMINI_MODELS_PATH: &str = "/v1beta/models";
-/// Caminho da fala da OpenAI, a partir do endereço da conexão (que já termina em `/v1`).
-pub const OPENAI_SPEECH_PATH: &str = "/audio/speech";
+/// Caminho da lista de vozes do Gemini.
+pub const GEMINI_VOICES_PATH: &str = "/v1beta/voices";
+/// Vozes por página pedidas ao `/voices` (o máximo da documentação).
+pub const VOICES_PAGE_SIZE: u32 = 1000;
+/// Páginas lidas no máximo (um teto contra uma paginação sem fim).
+pub const MAX_VOICE_PAGES: usize = 10;
+/// Teto do corpo de um 400 lido para achar a chave recusada (o erro do Gemini é curto).
+const MAX_ERROR_BYTES: usize = 16 * 1024;
+/// Modelos pedidos por página à lista do Gemini (o máximo da API).
+const MODELS_PAGE_SIZE: u32 = 1000;
+/// Vozes guardadas no máximo.
+pub const MAX_VOICES: usize = 2000;
 /// Tipo do áudio da nota de voz.
 pub const OGG_MIME: &str = "audio/ogg";
 
@@ -87,6 +110,26 @@ pub fn status_code(status: u16) -> Fail {
     }
 }
 
+/// O código de uma resposta de erro: o Gemini recusa a chave com 400 `API_KEY_INVALID`, não com 401.
+/// O corpo só escolhe o código e fica aqui.
+async fn refusal(mut resp: reqwest::Response, status: u16) -> Fail {
+    if status != 400 {
+        return status_code(status);
+    }
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    if key_rejected(&String::from_utf8_lossy(&body)) {
+        "auth"
+    } else {
+        status_code(status)
+    }
+}
+
 fn transport(e: &reqwest::Error) -> Fail {
     if e.is_timeout() {
         "timeout"
@@ -100,7 +143,7 @@ async fn send(req: reqwest::RequestBuilder) -> Result<Vec<u8>, Fail> {
     let mut resp = req.send().await.map_err(|e| transport(&e))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(status_code(status));
+        return Err(refusal(resp, status).await);
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| transport(&e))? {
@@ -120,8 +163,24 @@ fn tokens(v: &Value) -> Option<u64> {
     v.as_u64()
 }
 
+/// O corpo da fala, no formato atual da Interactions API. O estilo, quando há, vai como anotação
+/// `speech_metadata` do texto.
+pub fn speech_body(model: &str, voice: &str, text: &str, style: Option<&str>) -> Value {
+    let mut part = json!({"type": "text", "text": text});
+    if let Some(style) = style.map(str::trim).filter(|s| !s.is_empty()) {
+        part["annotations"] = json!([{"type": "speech_metadata", "style": style}]);
+    }
+    json!({
+        "model": model,
+        "input": [{"type": "user_input", "content": [part]}],
+        "response_format": {"type": "audio", "mime_type": "audio/wav"},
+        "generation_config": {"speech_config": [{"voice": voice}]},
+        "store": false,
+    })
+}
+
 /// Fala pelo Gemini: o WAV (ou o PCM cru) da Interactions API.
-pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &str) -> Result<Audio, Fail> {
+pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &str, style: Option<&str>) -> Result<Audio, Fail> {
     if conn.kind != ConnectionKind::GoogleGemini {
         return Err("unsupported");
     }
@@ -129,21 +188,13 @@ pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &st
         return Err("config");
     }
     let key = key_of(conn)?;
-    let body = json!({
-        "model": model,
-        "input": [{"type": "user_input", "content": [{"type": "text", "text": text}]}],
-        "response_format": {"type": "audio", "mime_type": "audio/wav"},
-        "generation_config": {"speech_config": [{"voice": voice}]},
-        "store": false,
-    });
+    let body = speech_body(model, voice, text, style);
     let url = format!("{}{GEMINI_INTERACTIONS_PATH}", endpoint(conn));
     let raw = send(client()?.post(url).header("x-goog-api-key", sensitive(&key)?).json(&body)).await?;
     let value: Value = serde_json::from_slice(&raw).map_err(|_| "bad_response")?;
     let mut data: Option<&str> = None;
+    // O áudio é o item `audio` de qualquer passo (o tipo do passo muda entre as versões da API).
     for step in value["steps"].as_array().into_iter().flatten() {
-        if step["type"] != "model_output" {
-            continue;
-        }
         for part in step["content"].as_array().into_iter().flatten() {
             if part["type"] == "audio" {
                 if let Some(d) = part["data"].as_str() {
@@ -165,28 +216,6 @@ pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &st
     Ok(Audio { bytes, input_tokens: tokens(&usage["total_input_tokens"]), output_tokens: output })
 }
 
-/// Fala pela OpenAI: o corpo já é Opus em OGG.
-pub async fn openai_speak(conn: &Connection, model: &str, voice: &str, text: &str) -> Result<Audio, Fail> {
-    if conn.kind != ConnectionKind::ApiKey {
-        return Err("unsupported");
-    }
-    if !valid_name(model) || !valid_name(voice) {
-        return Err("config");
-    }
-    let key = key_of(conn)?;
-    let body = json!({"model": model, "input": text, "voice": voice, "response_format": "opus"});
-    let url = format!("{}{OPENAI_SPEECH_PATH}", endpoint(conn));
-    let bytes = send(client()?.post(url).header(reqwest::header::AUTHORIZATION, sensitive(&format!("Bearer {key}"))?).json(&body))
-        .await?;
-    if bytes.is_empty() {
-        return Err("empty");
-    }
-    if !bytes.starts_with(b"OggS") {
-        return Err("format");
-    }
-    Ok(Audio { bytes, input_tokens: None, output_tokens: None })
-}
-
 /// Transcreve a nota de voz (`audio/ogg`) pelo Gemini.
 pub async fn gemini_transcribe(conn: &Connection, model: &str, prompt: &str, audio: &[u8]) -> Result<Transcript, Fail> {
     if conn.kind != ConnectionKind::GoogleGemini {
@@ -202,6 +231,8 @@ pub async fn gemini_transcribe(conn: &Connection, model: &str, prompt: &str, aud
             {"text": prompt},
             {"inline_data": {"mime_type": OGG_MIME, "data": data}},
         ]}],
+        // Privacidade (spec 139 T07, C-17): o provedor não guarda a nota de voz nem a transcrição.
+        "store": false,
     });
     let url = format!("{}{GEMINI_MODELS_PATH}/{model}:generateContent", endpoint(conn));
     let raw = send(client()?.post(url).header("x-goog-api-key", sensitive(&key)?).json(&body)).await?;
@@ -225,14 +256,115 @@ pub async fn gemini_transcribe(conn: &Connection, model: &str, prompt: &str, aud
     Ok(Transcript { text, input_tokens: tokens(&meta["promptTokenCount"]), output_tokens: output })
 }
 
-/// Duração de um OGG Opus em segundos (arredondada para cima): o grânulo da última página menos
-/// o `pre_skip` do `OpusHead`, a 48 kHz. `None` fora do formato.
-pub fn ogg_duration_secs(bytes: &[u8]) -> Option<u32> {
-    let head = bytes.windows(8).position(|w| w == b"OpusHead")?;
-    let pre_skip = u64::from(u16::from_le_bytes([*bytes.get(head + 10)?, *bytes.get(head + 11)?]));
-    let last = bytes.windows(4).rposition(|w| w == b"OggS")?;
-    let granule = bytes.get(last + 6..last + 14)?;
-    let granule = u64::from_le_bytes(granule.try_into().ok()?);
-    let samples = granule.saturating_sub(pre_skip);
-    u32::try_from(samples.div_ceil(48_000)).ok()
+/// O nome de um modelo de fala: tem a parte `tts`, sem o prefixo `models/`.
+fn speech_model_name(raw: &str) -> Option<&str> {
+    let name = raw.strip_prefix("models/").unwrap_or(raw);
+    (valid_name(name) && name.split('-').any(|part| part == "tts")).then_some(name)
+}
+
+/// Os modelos de fala da conexão do Gemini, em ordem de nome.
+pub async fn gemini_speech_models(conn: &Connection) -> Result<Vec<String>, Fail> {
+    if conn.kind != ConnectionKind::GoogleGemini {
+        return Err("unsupported");
+    }
+    let key = key_of(conn)?;
+    let client = client()?;
+    let url = format!("{}{GEMINI_MODELS_PATH}", endpoint(conn));
+    let mut out: Vec<String> = Vec::new();
+    let mut token = String::new();
+    for _ in 0..MAX_VOICE_PAGES {
+        let mut query = vec![("pageSize", MODELS_PAGE_SIZE.to_string())];
+        if !token.is_empty() {
+            query.push(("pageToken", token.clone()));
+        }
+        let raw = send(client.get(&url).query(&query).header("x-goog-api-key", sensitive(&key)?)).await?;
+        let value: Value = serde_json::from_slice(&raw).map_err(|_| "bad_response")?;
+        out.extend(value["models"].as_array().into_iter().flatten().filter_map(|m| m["name"].as_str()).filter_map(speech_model_name).map(str::to_string));
+        let next = value["nextPageToken"].as_str().unwrap_or_default();
+        if next.is_empty() || next == token {
+            break;
+        }
+        token = next.to_string();
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// A voz fala um idioma do Nanty (pt ou en). Sem idioma informado, fica: não há como saber.
+fn speaks_nanty_language(voice: &VoiceInfo) -> bool {
+    voice.language_code.is_empty() || crate::server::nanty::language::from_language_code(&voice.language_code).is_some()
+}
+
+/// Uma voz da lista do Gemini (`/v1beta/voices`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VoiceInfo {
+    /// O nome usado na fala (nas `prebuilt`, o nome da voz, por exemplo `Kore`).
+    pub id: String,
+    pub display_name: String,
+    /// `prebuilt`, `prompted` ou `replicated`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub language_code: String,
+    pub gender: String,
+    pub description: String,
+}
+
+/// Texto curto de um campo da voz: o direto na voz, ou o de dentro de `prompted` (a referência e o
+/// exemplo do SDK divergem); só texto simples, até 500 caracteres.
+fn voice_field(voice: &Value, name: &str) -> String {
+    let raw = voice[name].as_str().or_else(|| voice["prompted"][name].as_str()).unwrap_or_default();
+    raw.chars().filter(|c| !c.is_control()).take(500).collect::<String>().trim().to_string()
+}
+
+/// Lê uma voz da resposta; sem um id que sirva na fala, fica de fora.
+pub fn voice_of(voice: &Value) -> Option<VoiceInfo> {
+    let id = voice_field(voice, "id");
+    let id = if id.is_empty() { voice_field(voice, "name") } else { id };
+    if !valid_name(&id) {
+        return None;
+    }
+    let display_name = voice_field(voice, "display_name");
+    Some(VoiceInfo {
+        display_name: if display_name.is_empty() { id.clone() } else { display_name },
+        kind: voice_field(voice, "type"),
+        language_code: voice_field(voice, "language_code"),
+        gender: voice_field(voice, "gender"),
+        description: voice_field(voice, "description"),
+        id,
+    })
+}
+
+/// A lista de vozes da conexão do Gemini nos idiomas do Nanty, todas as páginas (até
+/// [`MAX_VOICE_PAGES`]).
+pub async fn gemini_voices(conn: &Connection) -> Result<Vec<VoiceInfo>, Fail> {
+    if conn.kind != ConnectionKind::GoogleGemini {
+        return Err("unsupported");
+    }
+    let key = key_of(conn)?;
+    let client = client()?;
+    let url = format!("{}{GEMINI_VOICES_PATH}", endpoint(conn));
+    let mut out: Vec<VoiceInfo> = Vec::new();
+    let mut token = String::new();
+    for _ in 0..MAX_VOICE_PAGES {
+        let mut query = vec![("page_size", VOICES_PAGE_SIZE.to_string())];
+        if !token.is_empty() {
+            query.push(("page_token", token.clone()));
+        }
+        let raw = send(client.get(&url).query(&query).header("x-goog-api-key", sensitive(&key)?)).await?;
+        let value: Value = serde_json::from_slice(&raw).map_err(|_| "bad_response")?;
+        for voice in value["voices"].as_array().into_iter().flatten() {
+            if let Some(info) = voice_of(voice).filter(speaks_nanty_language) {
+                if out.len() < MAX_VOICES && !out.iter().any(|v| v.id == info.id) {
+                    out.push(info);
+                }
+            }
+        }
+        let next = value["next_page_token"].as_str().or_else(|| value["nextPageToken"].as_str()).unwrap_or_default();
+        if next.is_empty() || next == token || out.len() >= MAX_VOICES {
+            break;
+        }
+        token = next.to_string();
+    }
+    Ok(out)
 }

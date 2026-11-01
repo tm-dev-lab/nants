@@ -324,6 +324,18 @@ describe("busca e grade", () => {
     const focused = rules.filter((r) => r.selectors.includes('.nd-nmenu-tile[data-state="focused"] .nd-nmenu-icon')).map((r) => r.body).join(";");
     expect(focused).toContain("background-color: var(--state-press);");
   });
+
+  it("o marcador tem a mesma medida em todo estado: ponto, nunca traço (spec 139 G8)", () => {
+    setup({ layout: { windows: { conversation: win({ z: 1 }), board: win({ z: 2 }) } } });
+    openMenu();
+    expect(tile("board").querySelector('[data-indicator="focused"]')).not.toBeNull();
+    expect(tile("conversation").querySelector('[data-indicator="open"]')).not.toBeNull();
+    const base = cssRuleBody(desktopCss, ".nd-nmenu-indicator");
+    expect(base).toContain("width: 4px;");
+    expect(base).toContain("height: 4px;");
+    const byState = cssRules(desktopCss).filter((r) => r.selectors.some((s) => s.includes("[data-indicator=")));
+    expect(byState.filter((r) => /(?:^|[;\s])(?:width|height):/.test(r.body))).toEqual([]);
+  });
 });
 
 describe("ativar", () => {
@@ -346,6 +358,7 @@ describe("ativar", () => {
     setup({ layout: { windows: { conversation: win({ z: 2 }), plan: win({ z: 1, mode: "minimized" }) } } });
     const panel = openMenu();
     const chips = panel.querySelector<HTMLElement>("[data-nmenu-open]");
+    for (const chip of chips?.querySelectorAll("button") ?? []) expect(chip.querySelector("svg[data-icon]")?.getAttribute("width")).toBe("14");
     expect([...(chips?.querySelectorAll("button") ?? [])].map((b) => b.getAttribute("aria-label"))).toEqual([
       "Conversa, em foco",
       "Plano, minimizada",

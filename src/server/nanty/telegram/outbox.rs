@@ -23,6 +23,16 @@
 //! - **Aba visível (C-07):** com uma aba do Nants visível (avisada pelo `visibilitychange`, em
 //!   `POST /api/nanty/presence`), o envio espera `visible_hold_secs`; o que for decidido na janela
 //!   nesse meio não sai. Ligado por padrão (`[nanty.telegram] hold_while_visible`).
+//! - **Voz (spec 139 T08, C-14):** com a voz ligada, o aviso sai como nota de voz, com os botões e a
+//!   legenda, e o texto completo à parte quando a legenda corta.
+//!   - **Fora da fila:** a fala é gerada numa tarefa à parte, só depois das esperas acima (o que for
+//!     decidido na janela não custa fala), uma de cada vez e com prazo. Enquanto ela anda, a fila
+//!     segue com o resto, menos o que cita o cartão. Vencido o prazo, sem orçamento ou com falha, o
+//!     aviso sai em texto.
+//!   - **Um áudio por aviso:** o texto do modelo sobre o aviso segue em texto, e o cartão pedido na
+//!     conversa também: a fala é a da resposta que o cita. A rajada continua em texto.
+//!   - **Edição:** a nota de voz é editada pelo `editMessageCaption`, com a linha final dentro de 1024.
+//!   - **Recusa:** o Telegram recusou a nota (4xx), o aviso sai pelo `sendMessage`, com os botões.
 //! - **Erros:** nenhum derruba o Nanty. 429 espera o `retry_after`; rede e 5xx esperam cada vez mais;
 //!   uma recusa do Telegram (4xx) desiste daquele envio e fica no registro.
 
@@ -30,7 +40,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::{watch, Notify};
 
 use super::client::{TelegramClient, TgError};
@@ -44,12 +54,18 @@ use crate::server::nanty::act::Answer;
 use crate::server::nanty::actions::{self, ActionKind};
 use crate::server::nanty::clock;
 use crate::server::nanty::render;
-use crate::server::nanty::store::{Card, Channel, ConversationMessage, DecidedBy, Delivery, NantyState, SentCard, Speaker};
-use crate::server::nanty::{nanty_lang, InstanceStatus, Nanty};
+use crate::server::nanty::store::{Card, Channel, ConversationMessage, DecidedBy, Delivery, NantyState, SentCard, SentKind, Speaker};
+use crate::server::nanty::voice::{self, Spoken};
+use crate::server::nanty::{nanty_lang, new_id, InstanceStatus, Nanty};
 use crate::server::state::AppState;
 
 /// Intervalo mínimo entre duas chamadas ao chat (C-10).
 pub const SEND_GAP: Duration = Duration::from_secs(1);
+/// Renovação do "digitando" (spec 139 T03, C-09): o Telegram o mostra por até 5 segundos.
+pub const TYPING_EVERY: Duration = Duration::from_secs(4);
+/// Prazo da fala (spec 139 T08, C-14; provisório, abaixo do prazo da chamada ao provedor): vencido,
+/// a saída vai em texto.
+pub const SPEECH_DEADLINE: Duration = Duration::from_secs(45);
 /// Acomodação do cartão novo: a rodada que o criou ainda pode pôr a oferta nele (o que troca o id e
 /// o token, T03); o envio espera para não mandar um cartão que já nasce vencido.
 pub const SEND_SETTLE: Duration = Duration::from_secs(2);
@@ -90,6 +106,67 @@ struct Inner {
     tabs: BTreeMap<String, u64>,
     /// Mensagens que só perdem os botões (o botão de um cartão que a fila não conhece mais).
     strips: VecDeque<(i64, i64)>,
+    /// Respostas da conversa em andamento que pediram o "digitando" (spec 139 T03).
+    typing: usize,
+    /// Falas em andamento que pediram o "gravando áudio" (spec 139 T08).
+    recording: usize,
+    /// Quando o último "digitando" ou "gravando áudio" saiu.
+    typing_last: Option<std::time::Instant>,
+    /// A fala dos cartões, por id (spec 139 T08).
+    speech: BTreeMap<String, CardSpeech>,
+}
+
+/// A fala de um cartão, gerada fora da fila (spec 139 T08, C-14).
+#[derive(Debug, Clone)]
+enum Speech {
+    /// A tarefa à parte está gerando.
+    Pending,
+    Ready(Arc<Spoken>),
+    /// Sem fala (prazo, orçamento ou falha): o cartão sai em texto.
+    Text,
+}
+
+/// A fala de uma mensagem de cartão: a renovação (outro `created_at_ms`) é um aviso novo.
+#[derive(Debug, Clone)]
+struct CardSpeech {
+    created_at_ms: u64,
+    state: Speech,
+}
+
+/// O "digitando" pedido por uma resposta da conversa (spec 139 T03, C-09): enquanto existir, a fila
+/// o renova a cada [`TYPING_EVERY`], só quando não há nada a enviar e com o mesmo intervalo entre
+/// chamadas dos outros envios ([`SEND_GAP`]). Solto em qualquer saída.
+#[derive(Debug)]
+pub struct Typing<'a>(&'a Outbox);
+
+impl Drop for Typing<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        inner.typing = inner.typing.saturating_sub(1);
+        inner.action_ended();
+    }
+}
+
+/// O "gravando áudio" pedido por uma fala (spec 139 T08): como o [`Typing`], e vale mais que ele
+/// enquanto existir. Solto em qualquer saída.
+#[derive(Debug)]
+pub struct Recording<'a>(&'a Outbox);
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        inner.recording = inner.recording.saturating_sub(1);
+        inner.action_ended();
+    }
+}
+
+impl Inner {
+    /// Sem nada pedido, o próximo pedido sai na hora.
+    fn action_ended(&mut self) {
+        if self.typing == 0 && self.recording == 0 {
+            self.typing_last = None;
+        }
+    }
 }
 
 /// A fila de saída deste processo (em memória; os cartões enviados ficam no estado).
@@ -128,6 +205,82 @@ impl Outbox {
             }
         }
         self.wake();
+    }
+
+    /// Pede o "digitando" enquanto o guarda existir (só a resposta a quem escreveu pelo Telegram).
+    pub fn typing(&self) -> Typing<'_> {
+        self.lock().typing += 1;
+        self.wake();
+        Typing(self)
+    }
+
+    /// Pede o "gravando áudio" enquanto o guarda existir (só a fala para quem escreveu pelo Telegram).
+    pub fn recording(&self) -> Recording<'_> {
+        self.lock().recording += 1;
+        self.wake();
+        Recording(self)
+    }
+
+    /// Há "digitando" ou "gravando áudio" pedido.
+    fn typing_active(&self) -> bool {
+        let inner = self.lock();
+        inner.typing > 0 || inner.recording > 0
+    }
+
+    /// A ação a mandar (ou renovar) agora, se for a hora: marca o envio.
+    fn action_due(&self, every: Duration) -> Option<&'static str> {
+        let mut inner = self.lock();
+        let action = match (inner.recording > 0, inner.typing > 0) {
+            (true, _) => "record_voice",
+            (false, true) => "typing",
+            (false, false) => return None,
+        };
+        if inner.typing_last.is_some_and(|at| at.elapsed() < every) {
+            return None;
+        }
+        inner.typing_last = Some(std::time::Instant::now());
+        Some(action)
+    }
+
+    /// A tarefa da fala do cartão começou.
+    fn speech_started(&self, card: &Card) {
+        self.lock().speech.insert(card.id.clone(), CardSpeech { created_at_ms: card.created_at_ms, state: Speech::Pending });
+    }
+
+    /// A fala terminou (`None` = fica o texto). Sem efeito se o cartão saiu ou foi renovado no meio.
+    fn speech_done(&self, card_id: &str, created_at_ms: u64, spoken: Option<Spoken>) {
+        {
+            let mut inner = self.lock();
+            let Some(entry) = inner.speech.get_mut(card_id).filter(|e| e.created_at_ms == created_at_ms) else { return };
+            entry.state = spoken.map_or(Speech::Text, |s| Speech::Ready(Arc::new(s)));
+        }
+        self.wake();
+    }
+
+    /// A fala pronta do cartão.
+    fn spoken(&self, card: &Card) -> Option<Arc<Spoken>> {
+        match self.lock().speech.get(&card.id) {
+            Some(CardSpeech { created_at_ms, state: Speech::Ready(spoken) }) if *created_at_ms == card.created_at_ms => Some(Arc::clone(spoken)),
+            _ => None,
+        }
+    }
+
+    /// Esquece a fala do que já saiu.
+    fn forget_speech(&self, card_id: &str) {
+        self.lock().speech.remove(card_id);
+    }
+
+    /// Esquece a fala dos cartões que saíram do estado ou foram renovados (decididos no meio dela).
+    fn keep_speech_of(&self, st: &NantyState) {
+        self.lock().speech.retain(|id, e| st.cards.iter().any(|c| c.id == *id && c.created_at_ms == e.created_at_ms));
+    }
+
+    /// O texto completo do aviso cuja legenda cortou: é a próxima mensagem, sem espera e sem voz.
+    fn push_full_text(&self, text: &str) {
+        let mut message = ConversationMessage::from_nanty(new_id(), 0, Channel::Telegram, "", Map::new());
+        message.code = None;
+        message.text = Some(text.to_string());
+        self.lock().queue.push_front(Queued { message, at_ms: 0, voice_sent: true });
     }
 
     /// Mensagens esperando.
@@ -178,6 +331,7 @@ impl Outbox {
         let mut inner = self.lock();
         inner.queue.clear();
         inner.strips.clear();
+        inner.speech.clear();
     }
 }
 
@@ -207,7 +361,17 @@ fn keyboard(lang: Lang, card: &Card) -> Option<Value> {
     let token = card.token.as_deref()?;
     let mut rows: Vec<Value> = Vec::new();
     let mut last = Vec::new();
-    if let Some(action) = card.action.as_deref().and_then(actions::parse) {
+    let action = card.action.as_deref().and_then(actions::parse);
+    // O silêncio da conversa (spec 139 T04): o botão da ação; a confirmação também tem o "não", e
+    // nenhum dos dois tem "lembrar depois".
+    if let Some(action) = action.filter(|a| a.entry().kind == ActionKind::Silence) {
+        rows.push(json!([button(tr(lang, &action.label_code(), &[]), card, token, Answer::Yes)]));
+        if action == actions::ActionId::SetSilence {
+            rows.push(json!([button(tr(lang, "nanty.telegram.button_no", &[]), card, token, Answer::No)]));
+        }
+        return Some(Value::Array(rows));
+    }
+    if let Some(action) = action {
         if matches!(action.entry().kind, ActionKind::Executes | ActionKind::Link) {
             rows.push(json!([button(tr(lang, &action.label_code(), &[]), card, token, Answer::Yes)]));
         }
@@ -258,6 +422,33 @@ enum Op {
     Clear(SentCard),
     /// Envios novos: um só, ou o resumo da fila.
     Send(Vec<Item>),
+    /// Gerar a fala do cartão, numa tarefa à parte (não é uma chamada ao Telegram).
+    Speak(Card),
+}
+
+/// A fala dos cartões vista pela escolha da próxima chamada (spec 139 T08). `None` em
+/// [`next_op`] = voz desligada.
+type SpeechMap = BTreeMap<String, CardSpeech>;
+
+/// O que falta para o cartão sair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ahead {
+    /// Pode sair: em voz, com a fala pronta, ou em texto.
+    Go,
+    /// A fala ainda não começou.
+    Start,
+    /// A fala está sendo gerada.
+    Pending,
+}
+
+/// O cartão fala: com a voz ligada, menos o pedido na conversa (a fala é a da resposta que o cita).
+fn ahead(speech: Option<&SpeechMap>, card: &Card) -> Ahead {
+    let Some(speech) = speech.filter(|_| card.requested.is_none()) else { return Ahead::Go };
+    match speech.get(&card.id).filter(|e| e.created_at_ms == card.created_at_ms) {
+        None => Ahead::Start,
+        Some(CardSpeech { state: Speech::Pending, .. }) => Ahead::Pending,
+        Some(_) => Ahead::Go,
+    }
 }
 
 /// Pode ir ao Telegram: aberto, não antigo, não só do resumo e não pedido na janela (T08).
@@ -304,7 +495,17 @@ impl Waits {
 
 /// Escolhe a próxima chamada. Registros de outro chat (desparear, trocar o token) ou sem mensagem
 /// cujo cartão já saiu são esquecidos aqui, sem chamada (`forget`).
-fn next_op(st: &NantyState, queue: &[Queued], strip: Option<(i64, i64)>, chat_id: i64, waits: Waits, now_ms: u64, forget: &mut Vec<String>) -> Option<Op> {
+#[allow(clippy::too_many_arguments)]
+fn next_op(
+    st: &NantyState,
+    queue: &[Queued],
+    strip: Option<(i64, i64)>,
+    speech: Option<&SpeechMap>,
+    chat_id: i64,
+    waits: Waits,
+    now_ms: u64,
+    forget: &mut Vec<String>,
+) -> Option<Op> {
     for rec in &st.telegram_sent {
         let card = st.cards.iter().find(|c| c.id == rec.card_id);
         if rec.chat_id != chat_id || (card.is_none() && rec.message_id.is_none()) {
@@ -335,11 +536,27 @@ fn next_op(st: &NantyState, queue: &[Queued], strip: Option<(i64, i64)>, chat_id
         .map(Item::Card)
         .collect();
     items.extend(queue.iter().filter(|q| released(q.at_ms, waits.message(&q.message), now_ms)).cloned().map(Item::Message));
-    match items.len() {
-        0 => None,
-        n if n > MAX_BURST => Some(Op::Send(items)),
-        _ => Some(Op::Send(items.into_iter().take(1).collect())),
+    if items.len() > MAX_BURST {
+        return Some(Op::Send(items));
     }
+    // Uma fala de cada vez. O cartão que espera a dele não segura o resto da fila, só o que o cita.
+    let speaking = speech.is_some_and(|s| s.values().any(|e| matches!(e.state, Speech::Pending)));
+    let mut waiting: Vec<&str> = Vec::new();
+    for item in &items {
+        match item {
+            Item::Card(card) => match ahead(speech, card) {
+                Ahead::Go => return Some(Op::Send(vec![item.clone()])),
+                Ahead::Start if !speaking => return Some(Op::Speak(card.clone())),
+                Ahead::Start | Ahead::Pending => waiting.push(&card.id),
+            },
+            Item::Message(q) => {
+                if !q.message.card_ids.iter().any(|id| waiting.contains(&id.as_str())) {
+                    return Some(Op::Send(vec![item.clone()]));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---- O laço ----
@@ -441,12 +658,14 @@ async fn step(state: &AppState, nanty: &Arc<Nanty>, sender: &mut Option<Sender>,
     let settle_ms = u64::try_from(nanty.telegram().tuning().send_settle.as_millis()).unwrap_or(u64::MAX);
     let waits = Waits { card_ms: hold_ms.max(settle_ms), message_ms: hold_ms, settle_ms };
     let snapshot = nanty.snapshot();
-    let (queue, strip): (Vec<Queued>, Option<(i64, i64)>) = {
+    outbox.keep_speech_of(&snapshot);
+    let (queue, strip, speech): (Vec<Queued>, Option<(i64, i64)>, SpeechMap) = {
         let inner = outbox.lock();
-        (inner.queue.iter().cloned().collect(), inner.strips.front().copied())
+        (inner.queue.iter().cloned().collect(), inner.strips.front().copied(), inner.speech.clone())
     };
+    let speech = cfg.nanty.voice.enabled.then_some(&speech);
     let mut forget = Vec::new();
-    let op = next_op(&snapshot, &queue, strip, chat_id, waits, now_ms, &mut forget);
+    let op = next_op(&snapshot, &queue, strip, speech, chat_id, waits, now_ms, &mut forget);
     if !forget.is_empty() {
         nanty.update_quiet(|st| {
             let before = st.telegram_sent.len();
@@ -455,13 +674,29 @@ async fn step(state: &AppState, nanty: &Arc<Nanty>, sender: &mut Option<Sender>,
         });
     }
     let Some(op) = op else {
+        // Spec 139 T03: sem nada a enviar, o "digitando" de uma resposta em andamento.
+        let every = nanty.telegram().tuning().typing_every;
+        if let Some(action) = outbox.action_due(every) {
+            match client.send_chat_action(chat_id, action).await {
+                Ok(()) => {
+                    *retry = None;
+                    return Step::Sent;
+                }
+                Err(e) => {
+                    if let Some(step) = on_error(nanty, "sendChatAction", &e, retry) {
+                        return step;
+                    }
+                }
+            }
+        }
         // Algo ainda espera a aba: confere de novo no próximo tique.
-        return Step::Idle(IDLE);
+        return Step::Idle(if outbox.typing_active() { IDLE.min(every) } else { IDLE });
     };
-    let lang = nanty_lang(&cfg.nanty);
+    let lang = nanty_lang(&cfg.nanty, nanty);
     let secrets = SecretSet::from_config(&cfg);
-    let quiet = nanty.now().within(cfg.nanty.quiet_window());
-    let ctx = Ctx { nanty, client, cfg: &cfg, secrets: &secrets, lang, quiet, chat_id, now_ms, st: &snapshot };
+    // O silêncio de tudo (spec 139 T04) cala o som das mensagens, como o horário de silêncio.
+    let quiet = nanty.now().within(cfg.nanty.quiet_window()) || crate::server::nanty::silence::global_until(&snapshot, now_ms).is_some();
+    let ctx = Ctx { state, nanty, client, cfg: &cfg, secrets: &secrets, lang, quiet, chat_id, now_ms, st: &snapshot };
     match execute(&ctx, op, retry).await {
         Ok(()) => {
             *retry = None;
@@ -473,6 +708,7 @@ async fn step(state: &AppState, nanty: &Arc<Nanty>, sender: &mut Option<Sender>,
 
 /// O que uma chamada precisa saber.
 struct Ctx<'a> {
+    state: &'a AppState,
     nanty: &'a Nanty,
     client: &'a TelegramClient,
     cfg: &'a Config,
@@ -488,7 +724,7 @@ struct Ctx<'a> {
 /// Faz a chamada. `Err` = falha passageira, com a espera; recusa do Telegram conta como feita
 /// (desiste e segue).
 async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<(), Step> {
-    let Ctx { nanty, client, cfg, secrets, lang, quiet, chat_id, now_ms, st } = *ctx;
+    let Ctx { nanty, client, cfg, secrets, lang, quiet, chat_id, now_ms, st, .. } = *ctx;
     let outbox = nanty.telegram().outbox();
     let fail = |method: &str, e: &TgError, retry: &mut Option<Duration>| on_error(nanty, method, e, retry);
     match op {
@@ -501,10 +737,20 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
             outbox.lock().strips.retain(|s| *s != (chat, message));
         }
         Op::Finish(rec) => {
-            let text = clean(secrets, &format!("{}\n\n{}", rec.text, final_line(lang, st, &rec.card_id)));
+            let line = final_line(lang, st, &rec.card_id);
             if let Some(message_id) = rec.message_id {
-                if let Err(e) = client.edit_text(rec.chat_id, message_id, &text).await {
-                    if let Some(step) = fail("editMessageText", &e, retry) {
+                let (method, edited) = match rec.kind {
+                    SentKind::Text => {
+                        let text = clean(secrets, &format!("{}\n\n{line}", rec.text));
+                        ("editMessageText", client.edit_text(rec.chat_id, message_id, &text).await)
+                    }
+                    SentKind::Voice => {
+                        let caption = closed_caption(&rec.text, &clean(secrets, &line));
+                        ("editMessageCaption", client.edit_caption(rec.chat_id, message_id, &caption).await)
+                    }
+                };
+                if let Err(e) = edited {
+                    if let Some(step) = fail(method, &e, retry) {
                         return Err(step);
                     }
                 }
@@ -537,13 +783,39 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                     let keys = keyboard(lang, &card);
                     let buttons = keys.is_some();
                     let silent = card.delivery == Some(Delivery::Silent);
-                    let message_id = match client.send(chat_id, &text, silent, keys).await {
-                        Ok(id) => id,
-                        Err(e) => match fail("sendMessage", &e, retry) {
-                            Some(step) => return Err(step),
-                            None => None,
+                    let spoken = outbox.spoken(&card).filter(|_| cfg.nanty.voice.enabled);
+                    let mut voiced = None;
+                    if let Some(spoken) = &spoken {
+                        let caption = format::fit(&text, format::MAX_CAPTION_CHARS);
+                        match client.send_voice(chat_id, spoken.ogg.clone(), &caption, spoken.duration_secs, silent, keys.clone()).await {
+                            Ok(id) => voiced = Some(id),
+                            // Recusada, o cartão sai em texto, com os botões: ele nunca se perde.
+                            Err(e) => {
+                                if let Some(step) = fail("sendVoice", &e, retry) {
+                                    return Err(step);
+                                }
+                            }
+                        }
+                    }
+                    let kind = if voiced.is_some() { SentKind::Voice } else { SentKind::Text };
+                    let message_id = match voiced {
+                        Some(id) => id,
+                        None => match client.send(chat_id, &text, silent, keys).await {
+                            Ok(id) => id,
+                            Err(e) => match fail("sendMessage", &e, retry) {
+                                Some(step) => return Err(step),
+                                None => None,
+                            },
                         },
                     };
+                    if let Some(spoken) = &spoken {
+                        // Leitura e gravação curtas de arquivo local, como as do estado aqui.
+                        voice::keep_notice(nanty, &card, lang, spoken);
+                    }
+                    outbox.forget_speech(&card.id);
+                    if kind == SentKind::Voice && format::units(&text) > format::MAX_CAPTION_CHARS {
+                        outbox.push_full_text(&text);
+                    }
                     nanty.update_quiet(|s| {
                         s.put_sent(SentCard {
                             card_id: card.id.clone(),
@@ -553,13 +825,15 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                             buttons: buttons && message_id.is_some(),
                             text,
                             at_ms: now_ms,
+                            kind,
                         });
                         true
                     });
                 }
                 Item::Message(q) => {
                     let text = clean(secrets, &render::message_text(lang, &q.message));
-                    if let Some(sent) = send_voice(ctx, &q, &text, retry).await? {
+                    let tail = render::closing(lang, &q.message).map(|line| clean(secrets, &line));
+                    if let Some(sent) = send_voice(ctx, &q, &text, tail.as_deref(), retry).await? {
                         let mut inner = outbox.lock();
                         if sent {
                             inner.queue.retain(|m| m.message.id != q.message.id);
@@ -609,30 +883,61 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                             buttons: false,
                             text: String::new(),
                             at_ms: now_ms,
+                            kind: SentKind::Text,
                         });
                     }
                 }
                 true
             });
+            for item in &items {
+                if let Item::Card(card) = item {
+                    outbox.forget_speech(&card.id);
+                }
+            }
             journal(nanty, "telegram.batched", param("count", items.len()));
+        }
+        Op::Speak(card) => {
+            start_speech(ctx, &card);
+            // Não foi uma chamada ao Telegram: a fila segue sem o intervalo do chat.
+            return Err(Step::Idle(Duration::ZERO));
         }
     }
     Ok(())
 }
 
+/// Gera a fala do cartão numa tarefa à parte, com o texto que vai na legenda (spec 139 T08, C-14).
+/// O [`voice::speak_on_time`] sempre responde, então nada deixa o cartão esperando para sempre.
+fn start_speech(ctx: &Ctx<'_>, card: &Card) {
+    let outbox = ctx.nanty.telegram().outbox();
+    outbox.speech_started(card);
+    let text = clean(ctx.secrets, &card_text(ctx.lang, ctx.cfg, card));
+    let (id, created_at_ms) = (card.id.clone(), card.created_at_ms);
+    let state = ctx.state.clone();
+    tokio::spawn(async move {
+        let spoken = voice::speak_on_time(&state, state.nanty(), &text).await.ok();
+        state.nanty().telegram().outbox().speech_done(&id, created_at_ms, spoken);
+    });
+}
+
+/// A legenda da nota de voz depois da decisão: o texto, cortado para a linha final caber em 1024.
+fn closed_caption(text: &str, line: &str) -> String {
+    let room = format::MAX_CAPTION_CHARS.saturating_sub(format::units(line) + 2);
+    format!("{}\n\n{line}", format::fit(text, room))
+}
+
 /// A nota de voz de uma mensagem com áudio (T09, C-12): a fala com a legenda curta (o mesmo texto
-/// redigido, cortado em 1024). `None` = não há nota a mandar (sem áudio, já enviada, ou o arquivo
+/// redigido, cortado em 1024, sem perder a frase do servidor que fecha o texto, `tail`). `None` = não há nota a mandar (sem áudio, já enviada, ou o arquivo
 /// saiu): segue o texto. `Some(true)` = a legenda levou o texto inteiro, nada mais a mandar;
 /// `Some(false)` = falta o texto completo, que vai na próxima vez (também quando o Telegram recusa a
 /// nota: o aviso nunca se perde).
-async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, retry: &mut Option<Duration>) -> Result<Option<bool>, Step> {
+async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, tail: Option<&str>, retry: &mut Option<Duration>) -> Result<Option<bool>, Step> {
     let Some(audio) = q.message.audio.as_ref().filter(|_| !q.voice_sent) else { return Ok(None) };
     let nanty = ctx.nanty;
     // Leitura curta de um arquivo local (como as gravações do estado que a fila já faz aqui).
     let Some(ogg) = nanty.read_audio(&audio.id) else { return Ok(None) };
-    let caption = format::fit(text, format::MAX_CAPTION_CHARS);
+    let caption = format::fit_keeping(text, tail, format::MAX_CAPTION_CHARS);
     let whole = caption == text;
-    match ctx.client.send_voice(ctx.chat_id, ogg, &caption, audio.duration_secs, ctx.quiet).await {
+    match ctx.client.send_voice(ctx.chat_id, ogg, &caption, audio.duration_secs, ctx.quiet, None).await {
         Ok(_) => Ok(Some(whole && !text.is_empty())),
         Err(e) => match on_error(nanty, "sendVoice", &e, retry) {
             Some(step) => Err(step),
@@ -658,4 +963,39 @@ fn batch_text(lang: Lang, items: &[Item]) -> String {
         lines.push(tr_plural(lang, "nanty.telegram.batch_more", u64::try_from(rest).unwrap_or(u64::MAX), &[]));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    fn datas(kb: &Value) -> Vec<String> {
+        kb.as_array()
+            .map(|rows| {
+                rows.iter()
+                    .flat_map(|r| r.as_array().cloned().unwrap_or_default())
+                    .filter_map(|b| b["callback_data"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Spec 139 T04: o cartão do silêncio leva o botão da ação (e o "não", na confirmação), sem o
+    /// "lembrar depois"; o texto é o do dicionário, com a hora calculada pelo servidor.
+    #[test]
+    fn the_silence_cards_carry_only_their_buttons_and_the_server_time() {
+        let mut st = NantyState::default();
+        let id = crate::server::nanty::silence::apply_in(&mut st, 0, 3_600_000, Channel::Telegram);
+        let off = st.cards.iter().find(|c| c.id == id).cloned().expect("cartão");
+        let token = off.token.clone().unwrap_or_default();
+        let kb = keyboard(Lang::PtBr, &off).expect("botões");
+        assert_eq!(datas(&kb), [callback_data(&off.id, &token, Answer::Yes)]);
+        assert_eq!(kb[0][0]["text"], tr(Lang::PtBr, "nanty.action.end_silence", &[]));
+        let until = off.params["until"].as_str().unwrap_or_default().to_string();
+        assert_eq!(render::card_text(Lang::En, &off), tr(Lang::En, "nanty.card.end_silence", &[("until", &until)]));
+        let ask = Card { action: Some("set_silence".into()), ..off };
+        let kb = keyboard(Lang::En, &ask).expect("botões");
+        assert_eq!(datas(&kb), [callback_data(&ask.id, &token, Answer::Yes), callback_data(&ask.id, &token, Answer::No)]);
+        assert_eq!(kb[0][0]["text"], tr(Lang::En, "nanty.action.set_silence", &[]));
+    }
 }

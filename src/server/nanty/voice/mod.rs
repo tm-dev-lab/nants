@@ -1,24 +1,33 @@
-//! Voz do Nanty (spec 138 T09, G5): a fala com legenda, a nota de voz transcrita e os áudios da
-//! conversa para a janela.
+//! Voz do Nanty (spec 138 T09, G5; só Gemini desde a spec 139 T07, G6): a fala com legenda, a nota
+//! de voz transcrita, a lista de vozes e os áudios da conversa para a janela.
 //!
-//! - **Medição primeiro (C-14):** o codificador `opus-pure` (Rust puro) foi aprovado pela medição
-//!   registrada na T09. Por isso a ordem é a da decisão do usuário: Gemini (WAV de 24 kHz que vira
-//!   Opus em OGG, [`encode`]), depois OpenAI (que já entrega Opus em OGG), depois só texto.
-//! - **A ordem ([`chain`]):** a lista `[nanty.voice] order`, ou, vazia, as conexões do Google Gemini
-//!   com chave e depois as da OpenAI (`api.openai.com`). O modelo e a voz de cada passo vêm da
-//!   configuração; vazios, os iniciais provisórios de `config::nanty` (nunca aqui).
-//! - **Quando fala:** com a voz ligada, o Nanty responde em voz a quem falou com ele por nota de voz
-//!   no Telegram ([`attach_speech`]). A fala é a do texto da resposta, já redigido; a nota sai com a
-//!   legenda curta (até 1024) e, se a legenda cortou, o texto completo numa mensagem à parte, pela
-//!   mesma fila de saída da T07 ([`super::telegram::outbox`]).
+//! - **Só o Gemini, depois o texto:** uma conexão do Google Gemini (`[nanty.voice] connection_id`,
+//!   ou, vazia, a primeira com chave) fala e transcreve. A fala é o WAV de 24 kHz da Interactions
+//!   API, que vira Opus em OGG ([`encode`]). Se ela falha, a resposta segue em texto. O modelo e a
+//!   voz vêm da configuração (os iniciais provisórios ficam em `config::nanty`, nunca aqui).
+//! - **Quando fala (spec 139 T08):** com a voz ligada, em toda saída do Nanty; desligada, só texto.
+//!   - A resposta, na janela e no Telegram, e o resumo da manhã saem por [`deliver`]: o texto entra
+//!     na conversa assim que fica pronto, e o áudio entra depois na mesma mensagem, fora da fila de
+//!     saída. Na janela, o tocador nunca toca sozinho. No Telegram, a nota espera a fala.
+//!   - O aviso com botões fala na fila de saída ([`super::telegram::outbox`]), depois da espera da
+//!     aba visível, e o áudio entra na conversa quando sai ([`keep_notice`]). O texto do modelo
+//!     sobre esse aviso não tem outro áudio.
+//!   - O que é só controle fica em texto: a resposta ao clique, o cartão pedido na conversa (a fala
+//!     é a da resposta que o cita) e o aviso de teste do Telegram.
+//!   - A fala é a do texto que sai, já redigido, cortada em fim de frase ([`speech_text`]) e com
+//!     prazo ([`speak_on_time`]). A nota sai com a legenda curta (até 1024) e, se a legenda cortou,
+//!     o texto completo numa mensagem à parte.
 //! - **Ouvir ([`hear`]):** só a nota de voz do dono (a escuta já filtra estranhos e grupos, T06).
 //!   A duração e o tamanho são conferidos antes de baixar (até [`MAX_INPUT_BYTES`] e
-//!   `max_input_secs`), e de novo no `getFile` e no download. A transcrição é do Gemini; o texto
-//!   entra na conversa redigido, com a marca `voice`, e segue pela fila única da T08.
+//!   `max_input_secs`), e de novo no `getFile` e no download. A transcrição sai com `store: false`
+//!   (o provedor não guarda); o texto entra na conversa redigido, com a marca `voice`, e segue pela
+//!   fila única da T08.
+//! - **Vozes ([`get_voices`]):** a lista do `/v1beta/voices` da conexão, com um cache curto em
+//!   memória ([`VOICES_TTL`]), para os Ajustes.
 //! - **Orçamento:** cada fala e cada transcrição entram no gasto do dia do Nanty (os tokens
 //!   informados ou estimados e o US$ pelo preço do modelo, quando há) e contam em `voice_calls`.
-//!   Sem orçamento, ou com a falha de um passo, passa ao próximo e por fim ao texto: o aviso nunca
-//!   se perde. O registro guarda só códigos (o provedor, o motivo), nunca o texto nem o áudio.
+//!   Sem orçamento, com o prazo vencido ou com a falha da fala, vai o texto: o aviso nunca se perde.
+//!   O registro guarda só códigos (o provedor, o motivo), nunca o texto nem o áudio.
 //! - **Os áudios ([`get_audio`]):** ficam em `<pasta do Nanty>/audio/<id>.ogg` (0600) e só são
 //!   servidos pelo id de uma mensagem que ainda está na conversa: quando a mensagem sai na rotação,
 //!   o áudio deixa de ser servido e o arquivo é apagado na próxima limpeza ([`prune`]).
@@ -27,25 +36,25 @@ pub mod encode;
 pub mod provider;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use super::journal::{JournalEntry, JournalKind};
 use super::jsonl::{ensure_private_dir, read_private_bytes, write_atomic};
-use super::store::{AudioRef, Channel, ConversationMessage};
+use super::store::{AudioRef, Card, Channel, ConversationMessage};
 use super::telegram::client::{TelegramClient, VoiceNote};
 use super::telegram::format;
 use super::{nanty_lang, render, turn, Avatar, Nanty};
 use crate::agents::llm_client::{Billing, Usage};
-use crate::config::{
-    Config, Connection, ConnectionKind, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE, DEFAULT_OPENAI_TTS_MODEL,
-    DEFAULT_OPENAI_VOICE, DEFAULT_TRANSCRIBE_MODEL,
-};
+use crate::config::{Config, Connection, ConnectionKind, VoiceMigration};
+use crate::i18n::Lang;
 use crate::server::error::ApiError;
 use crate::server::events::SecretSet;
 use crate::server::state::AppState;
@@ -59,112 +68,85 @@ pub const MAX_AUDIO_BYTES: u64 = 20 * 1024 * 1024;
 /// Maior texto mandado à fala (a resposta do modelo tem até 600; os textos fixos são curtos).
 pub const MAX_SPEECH_CHARS: usize = 2000;
 /// Tokens por segundo de áudio, para estimar a saída quando o provedor não informa (a taxa
-/// publicada do áudio do Gemini; provisória para a OpenAI).
+/// publicada do áudio do Gemini).
 pub const AUDIO_TOKENS_PER_SEC: u64 = 25;
+/// Quanto a lista de vozes fica guardada em memória (provisório).
+pub const VOICES_TTL: Duration = Duration::from_secs(10 * 60);
 /// Um arquivo de áudio sem mensagem só é apagado depois disto (a mensagem dele pode estar sendo
 /// gravada agora).
 const PRUNE_GRACE: Duration = Duration::from_secs(10 * 60);
 /// Cache privado: o id do áudio nunca muda de conteúdo.
 const CACHE_CONTROL: &str = "private, max-age=3600";
+/// Quem fala (o registro guarda este código).
+pub const PROVIDER: &str = "gemini";
 
-/// Quem fala.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
-    Gemini,
-    OpenAi,
-}
-
-impl Provider {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Provider::Gemini => "gemini",
-            Provider::OpenAi => "openai",
-        }
-    }
-}
-
-/// Um passo da fala: a conexão, o modelo e a voz já resolvidos.
+/// A fala: a conexão, o modelo e a voz já resolvidos.
 #[derive(Debug, Clone)]
 pub struct Step {
-    pub provider: Provider,
     pub connection: Connection,
     pub model: String,
     pub voice: String,
 }
 
-/// Conexão da OpenAI: por chave, no endereço `api.openai.com` (a escolha automática; na lista
-/// explícita, qualquer conexão por chave serve).
-fn is_openai(conn: &Connection) -> bool {
-    conn.kind == ConnectionKind::ApiKey
-        && reqwest::Url::parse(conn.endpoint().trim()).ok().and_then(|u| u.host_str().map(str::to_string)).as_deref()
-            == Some("api.openai.com")
-}
-
-/// O tipo de conexão serve para a fala? Só o Google Gemini e as conexões por chave (a fala da
-/// OpenAI). A mesma regra vale no [`chain`] e na gravação dos Ajustes (`nanty::settings`, T11).
+/// O tipo de conexão serve para a fala? Só o Google Gemini. A mesma regra vale no [`speaker`] e
+/// na gravação dos Ajustes (`nanty::settings`).
 pub fn speaks(kind: ConnectionKind) -> bool {
-    matches!(kind, ConnectionKind::GoogleGemini | ConnectionKind::ApiKey)
+    kind == ConnectionKind::GoogleGemini
 }
 
 /// O tipo de conexão serve para a transcrição? Só o Google Gemini. A mesma regra vale no
-/// [`transcriber`] e na gravação dos Ajustes (`nanty::settings`, T11).
+/// [`transcriber`] e na gravação dos Ajustes (`nanty::settings`).
 pub fn transcribes(kind: ConnectionKind) -> bool {
     kind == ConnectionKind::GoogleGemini
 }
 
-fn step_of(conn: &Connection, model: &str, voice: &str) -> Result<Step, &'static str> {
-    if !speaks(conn.kind) {
-        return Err("unsupported");
-    }
-    let (provider, default_model, default_voice) = if conn.kind == ConnectionKind::GoogleGemini {
-        (Provider::Gemini, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE)
-    } else {
-        (Provider::OpenAi, DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_VOICE)
-    };
-    let pick = |v: &str, d: &str| if v.trim().is_empty() { d.to_string() } else { v.trim().to_string() };
-    Ok(Step { provider, connection: conn.clone(), model: pick(model, default_model), voice: pick(voice, default_voice) })
+/// A conexão serve para a voz inteira (falar e transcrever).
+pub fn voice_capable(kind: ConnectionKind) -> bool {
+    speaks(kind) && transcribes(kind)
 }
 
-/// A ordem da fala: os passos utilizáveis e os códigos dos que ficaram de fora (conexão que não
-/// existe mais ou tipo sem voz).
-pub fn chain(cfg: &Config) -> (Vec<Step>, Vec<&'static str>) {
+/// A conexão da voz: a escolhida (`missing_connection` se sumiu, `unsupported` se não é do Gemini)
+/// ou, vazia, a primeira do Google Gemini com chave (`no_connection` sem nenhuma).
+pub fn voice_connection<'a>(cfg: &'a Config, id: &str) -> Result<&'a Connection, &'static str> {
+    let id = id.trim();
+    if id.is_empty() {
+        return cfg.connections.iter().find(|c| voice_capable(c.kind) && c.has_usable_key()).ok_or("no_connection");
+    }
+    let conn = cfg.connections.iter().find(|c| c.id == id).ok_or("missing_connection")?;
+    if voice_capable(conn.kind) {
+        Ok(conn)
+    } else {
+        Err("unsupported")
+    }
+}
+
+/// A fala: a conexão da voz, com o modelo e a voz da configuração.
+pub fn speaker(cfg: &Config) -> Result<Step, &'static str> {
     let voice = &cfg.nanty.voice;
-    let mut steps = Vec::new();
-    let mut skipped = Vec::new();
-    if voice.order.is_empty() {
-        let usable = |c: &&Connection| c.has_usable_key();
-        let gemini = cfg.connections.iter().filter(|c| c.kind == ConnectionKind::GoogleGemini).filter(usable);
-        let openai = cfg.connections.iter().filter(|c| is_openai(c)).filter(usable);
-        for conn in gemini.chain(openai) {
-            if let Ok(step) = step_of(conn, "", "") {
-                steps.push(step);
-            }
-        }
-        return (steps, skipped);
-    }
-    for route in &voice.order {
-        match cfg.connections.iter().find(|c| c.id == route.connection_id) {
-            None => skipped.push("missing_connection"),
-            Some(conn) => match step_of(conn, &route.model, &route.voice) {
-                Ok(step) => steps.push(step),
-                Err(code) => skipped.push(code),
-            },
-        }
-    }
-    (steps, skipped)
+    let conn = voice_connection(cfg, &voice.connection_id)?;
+    Ok(Step { connection: conn.clone(), model: voice.speech_model(), voice: voice.voice_name() })
 }
 
-/// A conexão e o modelo da transcrição: o `[nanty.voice] transcribe` ou a primeira conexão do
-/// Google Gemini com chave, com o modelo inicial.
+/// A conexão e o modelo da transcrição: a mesma conexão da fala.
 pub fn transcriber(cfg: &Config) -> Option<(Connection, String)> {
-    let route = &cfg.nanty.voice.transcribe;
-    let conn = if route.connection_id.trim().is_empty() {
-        cfg.connections.iter().find(|c| transcribes(c.kind) && c.has_usable_key())?
-    } else {
-        cfg.connections.iter().find(|c| c.id == route.connection_id && transcribes(c.kind))?
-    };
-    let model = if route.model.trim().is_empty() { DEFAULT_TRANSCRIBE_MODEL.to_string() } else { route.model.trim().to_string() };
-    Some((conn.clone(), model))
+    let conn = voice_connection(cfg, &cfg.nanty.voice.connection_id).ok()?;
+    Some((conn.clone(), cfg.nanty.voice.transcribe_model()))
+}
+
+/// A linha do registro da migração da voz antiga (C-16): quantos passos saíram (os da OpenAI,
+/// entre eles), se o passo do Gemini virou a conexão e se a transcrição antiga era de outra
+/// conexão. Só números e sim ou não.
+pub fn migration_entry(nanty: &Nanty, done: &VoiceMigration) -> JournalEntry {
+    let mut p = param("dropped", done.dropped);
+    p.insert("moved".into(), json!(done.moved));
+    p.insert("transcribe_dropped".into(), json!(done.transcribe_dropped));
+    journal(nanty, "voice.migrated", p)
+}
+
+/// A linha do registro quando o arquivo não passou à forma nova (spec 139 T08): só o código da
+/// falha. A migração roda de novo no próximo início.
+pub fn migration_unsaved(nanty: &Nanty, code: &str) -> JournalEntry {
+    journal(nanty, "voice.migration_unsaved", param("reason", code))
 }
 
 // ---- Registro e gasto ----
@@ -213,111 +195,192 @@ impl Drop for Speaking<'_> {
 
 // ---- A fala ----
 
-/// Uma fala pronta: a nota de voz (Opus em OGG), a duração e quem falou.
+/// Uma fala pronta: a nota de voz (Opus em OGG) e a duração.
 #[derive(Debug, Clone)]
 pub struct Spoken {
     pub ogg: Vec<u8>,
     pub duration_secs: u32,
-    pub provider: Provider,
 }
 
-/// Um passo: chama o provedor, soma o gasto e, no Gemini, codifica o PCM em Opus.
+/// Chama o Gemini, soma o gasto e codifica o PCM em Opus.
 async fn speak_step(cfg: &Config, nanty: &Nanty, step: &Step, text: &str) -> Result<Spoken, &'static str> {
-    let audio = match step.provider {
-        Provider::Gemini => provider::gemini_speak(&step.connection, &step.model, &step.voice, text).await?,
-        Provider::OpenAi => provider::openai_speak(&step.connection, &step.model, &step.voice, text).await?,
-    };
-    let (ogg, duration_secs) = match step.provider {
-        Provider::OpenAi => {
-            let secs = provider::ogg_duration_secs(&audio.bytes).ok_or("format")?;
-            (audio.bytes.clone(), secs)
-        }
-        Provider::Gemini => {
-            let bytes = audio.bytes.clone();
-            let encoded = tokio::task::spawn_blocking(move || {
-                let pcm = encode::pcm_of_gemini(&bytes)?;
-                let secs = pcm.duration_secs();
-                encode::ogg_opus(&pcm).map(|ogg| (ogg, secs))
-            })
-            .await
-            .map_err(|_| "encode")?;
-            // O provedor já cobrou: o gasto entra mesmo se a codificação falhar.
-            let secs = encoded.as_ref().map(|(_, s)| *s).unwrap_or(0);
-            let output = audio.output_tokens.unwrap_or(u64::from(secs) * AUDIO_TOKENS_PER_SEC);
-            charge(cfg, nanty, &step.model, audio.input_tokens.unwrap_or_else(|| estimate_tokens(text)), output);
-            return encoded.map(|(ogg, secs)| Spoken { ogg, duration_secs: secs, provider: step.provider });
-        }
-    };
-    let output = audio.output_tokens.unwrap_or(u64::from(duration_secs) * AUDIO_TOKENS_PER_SEC);
+    let audio = provider::gemini_speak(&step.connection, &step.model, &step.voice, text, None).await?;
+    let bytes = audio.bytes.clone();
+    let encoded = tokio::task::spawn_blocking(move || {
+        let pcm = encode::pcm_of_gemini(&bytes)?;
+        let secs = pcm.duration_secs();
+        encode::ogg_opus(&pcm).map(|ogg| (ogg, secs))
+    })
+    .await
+    .map_err(|_| "encode")?;
+    // O provedor já cobrou: o gasto entra mesmo se a codificação falhar.
+    let secs = encoded.as_ref().map(|(_, s)| *s).unwrap_or(0);
+    let output = audio.output_tokens.unwrap_or(u64::from(secs) * AUDIO_TOKENS_PER_SEC);
     charge(cfg, nanty, &step.model, audio.input_tokens.unwrap_or_else(|| estimate_tokens(text)), output);
+    let (ogg, duration_secs) = encoded?;
     if ogg.len() as u64 > MAX_AUDIO_BYTES {
         return Err("too_big");
     }
-    Ok(Spoken { ogg, duration_secs, provider: step.provider })
+    Ok(Spoken { ogg, duration_secs })
 }
 
-/// A fala do texto pela ordem da voz. `Err` com os motivos (códigos) quando nenhum passo falou: o
-/// texto segue sem áudio.
+/// O texto da fala: inteiro até `max` caracteres; mais longo, cortado no último fim de frase que
+/// cabe (a pontuação seguida de espaço, ou uma quebra de linha) e, sem nenhum, na última palavra
+/// inteira. A fala nunca termina no meio de uma frase por causa do limite.
+pub fn speech_text(text: &str, max: usize) -> String {
+    let Some((limit, _)) = text.char_indices().nth(max) else { return text.trim().to_string() };
+    let ends = |i: usize, c: char| {
+        let after = i + c.len_utf8();
+        let closes = matches!(c, '.' | '!' | '?' | '…') && text[after..].chars().next().is_none_or(char::is_whitespace);
+        (closes || c == '\n').then_some(after)
+    };
+    let head = &text[..limit];
+    let sentence = head.char_indices().filter_map(|(i, c)| ends(i, c)).last().filter(|end| !text[..*end].trim().is_empty());
+    let cut = sentence.or_else(|| head.rfind(char::is_whitespace)).unwrap_or(limit);
+    text[..cut].trim().to_string()
+}
+
+/// Como [`speech_text`], preservando o fecho do texto (a frase do servidor, spec 139 T12): o corte
+/// fica no que vem antes dele.
+pub fn speech_keeping(text: &str, tail: Option<&str>, max: usize) -> String {
+    let head = tail.and_then(|t| Some((text.strip_suffix(t)?.trim_end(), t)));
+    match head {
+        Some((head, tail)) if text.chars().count() > max && tail.chars().count() < max => {
+            format!("{}\n{tail}", speech_text(head, max.saturating_sub(tail.chars().count() + 1)))
+        }
+        _ => speech_text(text, max),
+    }
+}
+
+/// A fala do texto pelo Gemini. `Err` com os motivos (códigos) quando ele não falou: o texto segue
+/// sem áudio.
 pub async fn speak(state: &AppState, nanty: &Nanty, text: &str) -> Result<Spoken, Vec<&'static str>> {
     let cfg = state.config().read().await.clone();
-    let text: String = text.chars().take(MAX_SPEECH_CHARS).collect();
-    let (steps, mut reasons) = chain(&cfg);
-    let mut spoken = None;
-    for step in &steps {
-        if exhausted(&cfg, nanty) {
-            reasons.push("budget");
-            break;
-        }
-        nanty.set_busy(Some(Avatar::Speaking));
-        let speaking = Speaking(nanty);
-        let result = speak_step(&cfg, nanty, step, &text).await;
-        drop(speaking);
-        match result {
-            Ok(done) => {
-                let mut p = param("provider", step.provider.as_str());
-                p.insert("secs".into(), json!(done.duration_secs));
-                nanty.record(&journal(nanty, "voice.ok", p));
-                spoken = Some(done);
-                break;
+    let text = speech_text(text, MAX_SPEECH_CHARS);
+    let result = match speaker(&cfg) {
+        Err(code) => Err(code),
+        Ok(_) if exhausted(&cfg, nanty) => Err("budget"),
+        Ok(step) => {
+            nanty.set_busy(Some(Avatar::Speaking));
+            let speaking = Speaking(nanty);
+            let result = speak_step(&cfg, nanty, &step, &text).await;
+            drop(speaking);
+            match &result {
+                Ok(done) => {
+                    let mut p = param("provider", PROVIDER);
+                    p.insert("secs".into(), json!(done.duration_secs));
+                    nanty.record(&journal(nanty, "voice.ok", p));
+                }
+                Err(code) => {
+                    let mut p = param("provider", PROVIDER);
+                    p.insert("reason".into(), json!(code));
+                    nanty.record(&journal(nanty, "voice.failed", p));
+                }
             }
-            Err(code) => {
-                let mut p = param("provider", step.provider.as_str());
-                p.insert("reason".into(), json!(code));
-                nanty.record(&journal(nanty, "voice.failed", p));
-                reasons.push(code);
-            }
+            result
         }
-    }
-    match spoken {
-        Some(done) => Ok(done),
-        None => {
-            if steps.is_empty() && reasons.is_empty() {
-                reasons.push("no_connection");
-            }
-            nanty.record(&journal(nanty, "voice.text", param("reasons", json!(reasons))));
-            Err(reasons)
-        }
-    }
+    };
+    result.map_err(|code| {
+        let reasons = vec![code];
+        nanty.record(&journal(nanty, "voice.text", param("reasons", json!(reasons))));
+        reasons
+    })
 }
 
-/// Com a voz ligada e a pessoa tendo falado por voz no Telegram, a resposta ganha a fala: o texto
-/// da resposta (como vai ao Telegram, já redigido) vira nota de voz. Sem fala, nada muda: a
-/// resposta sai em texto.
-pub async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, person: &ConversationMessage, message: &mut ConversationMessage) {
+/// Como [`speak`], dentro do prazo da fala (spec 139 T08, C-14). Vencido, o motivo `deadline` fica
+/// no registro e a saída vai em texto na hora. A chamada segue numa tarefa à parte, sem ser abortada:
+/// ela termina sozinha, com o gasto e o registro reais, e a fala tardia é descartada. Assim toda fala
+/// enviada ao provedor entra no orçamento.
+pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str) -> Result<Spoken, Vec<&'static str>> {
+    let deadline = nanty.telegram().tuning().speech_deadline;
+    let (job_state, job_text) = (state.clone(), text.to_string());
+    let mut job = tokio::spawn(async move { speak(&job_state, job_state.nanty(), &job_text).await });
+    let reason = match tokio::time::timeout(deadline, &mut job).await {
+        Ok(Ok(result)) => return result,
+        Ok(Err(_)) => "failed",
+        Err(_) => "deadline",
+    };
+    let reasons = vec![reason];
+    nanty.record(&journal(nanty, "voice.text", param("reasons", json!(reasons))));
+    Err(reasons)
+}
+
+/// Entrega a fala do Nanty (spec 139 T08): a resposta, o resumo e a recusa da nota de voz.
+/// 1. O texto entra na conversa na hora: a janela o mostra, e ele não se perde se a fala falhar.
+/// 2. Com a voz ligada, a fala é gerada (`recording` liga o "gravando áudio" para quem escreveu pelo
+///    Telegram) e o áudio entra na mesma mensagem, numa segunda linha com o mesmo id. Sem fala, nada
+///    muda, e o motivo fica no registro.
+/// 3. A mensagem vai à fila de saída uma vez só: como nota de voz, ou em texto.
+///
+/// As mensagens falam uma de cada vez, na ordem em que entraram: uma fala curta não ultrapassa a
+/// anterior no Telegram.
+pub async fn deliver(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage, recording: bool) {
+    keep(nanty, message).await;
+    let enabled = state.config().read().await.nanty.voice.enabled;
+    let record = (recording && enabled).then(|| nanty.telegram().outbox().recording());
+    let turn = nanty.speech_turn.lock().await;
+    attach_speech(state, nanty, message).await;
+    drop(record);
+    if message.audio.is_some() {
+        keep(nanty, message).await;
+    }
+    let n = Arc::clone(nanty);
+    let done = message.clone();
+    let _ = tokio::task::spawn_blocking(move || n.send_out(&done)).await;
+    drop(turn);
+}
+
+/// Grava a mensagem na conversa, fora do laço assíncrono.
+async fn keep(nanty: &Arc<Nanty>, message: &ConversationMessage) {
+    let n = Arc::clone(nanty);
+    let saved = message.clone();
+    let _ = tokio::task::spawn_blocking(move || n.keep_message(&saved)).await;
+}
+
+/// Com a voz ligada, a mensagem ganha a fala: o texto dela (como vai ao Telegram, já redigido) vira
+/// áudio, que a janela toca e o Telegram recebe como nota de voz.
+async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage) {
     let cfg = state.config().read().await.clone();
-    if !person.voice || person.channel != Channel::Telegram || !cfg.nanty.voice.enabled {
+    if !cfg.nanty.voice.enabled {
         return;
     }
-    let lang = nanty_lang(&cfg.nanty);
+    let lang = nanty_lang(&cfg.nanty, nanty);
     let secrets = SecretSet::from_config(&cfg);
     let text = format::clean(&secrets, &render::message_text(lang, message));
     if text.is_empty() {
         return;
     }
-    let Ok(spoken) = speak(state, nanty, &text).await else { return };
+    let tail = render::closing(lang, message).map(|line| format::clean(&secrets, &line));
+    let text = speech_keeping(&text, tail.as_deref(), MAX_SPEECH_CHARS);
+    let Ok(spoken) = speak_on_time(state, nanty, &text).await else { return };
     let n = Arc::clone(nanty);
     let audio = tokio::task::spawn_blocking(move || save_audio(&n, &spoken.ogg, spoken.duration_secs)).await.ok().flatten();
+    if audio.is_none() {
+        unsaved(nanty);
+    }
     message.audio = audio;
+}
+
+/// O áudio não foi guardado: a mensagem segue em texto, com o motivo no registro.
+fn unsaved(nanty: &Nanty) {
+    nanty.record(&journal(nanty, "voice.text", param("reasons", json!(["save"]))));
+}
+
+/// O áudio de um aviso entra na conversa (spec 139 T08): a mensagem tem o texto fixo do cartão e o
+/// áudio, com a mesma rotação das outras, para a janela tocar. Ela só é gravada: o aviso já foi ao
+/// Telegram.
+pub fn keep_notice(nanty: &Nanty, card: &Card, lang: Lang, spoken: &Spoken) {
+    let Some(audio) = save_audio(nanty, &spoken.ogg, spoken.duration_secs) else {
+        unsaved(nanty);
+        return;
+    };
+    let mut message =
+        ConversationMessage::from_nanty(super::new_id(), nanty.now().epoch_ms, Channel::Telegram, &card.code, card.params.clone());
+    message.project_id = card.project_id.clone();
+    message.card_ids = vec![card.id.clone()];
+    message.lang = Some(lang.tag().to_string());
+    message.audio = Some(audio);
+    nanty.keep_message(&message);
 }
 
 // ---- Os áudios guardados ----
@@ -490,6 +553,95 @@ pub async fn get_audio(
     Ok(resp)
 }
 
+// ---- As vozes ----
+
+/// O que os Ajustes oferecem para a voz: as vozes e os modelos de fala.
+#[derive(Debug, Clone, Default)]
+pub struct VoiceOptions {
+    voices: Vec<provider::VoiceInfo>,
+    speech_models: Vec<String>,
+}
+
+/// A lista de vozes guardada: a conexão (id e endereço), quando foi lida e o que ela oferece.
+#[derive(Debug, Default)]
+pub struct VoicesCache {
+    entry: Mutex<Option<(String, String, Instant, VoiceOptions)>>,
+}
+
+impl VoicesCache {
+    fn get(&self, id: &str, endpoint: &str) -> Option<VoiceOptions> {
+        let guard = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
+        let (cid, cend, at, voices) = guard.as_ref()?;
+        (cid == id && cend == endpoint && at.elapsed() < VOICES_TTL).then(|| voices.clone())
+    }
+
+    fn put(&self, id: &str, endpoint: &str, voices: VoiceOptions) {
+        *self.entry.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((id.to_string(), endpoint.to_string(), Instant::now(), voices));
+    }
+}
+
+/// Consulta de `GET /api/nanty/voices`: sem `connection_id`, a conexão gravada; com ele, a pedida, e
+/// vazio é a automática (a mesma regra de [`voice_connection`]), para o rascunho dos Ajustes.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicesQuery {
+    #[serde(default)]
+    connection_id: Option<String>,
+}
+
+/// A conexão que a tela vai usar para a voz, com a chave: o que decide o estado dela (pronta, sem
+/// chave, sem conexão) nos Ajustes (T09). Na automática, um Gemini cadastrado sem chave é "sem
+/// chave", não "sem conexão": a pessoa precisa saber o que falta.
+fn voice_ready<'a>(cfg: &'a Config, id: &str) -> Result<&'a Connection, ApiError> {
+    let no_key = || ApiError::coded(StatusCode::CONFLICT, "nanty_voice_no_key", Map::new());
+    match voice_connection(cfg, id) {
+        Ok(conn) if conn.has_usable_key() => Ok(conn),
+        Ok(_) => Err(no_key()),
+        Err("no_connection") if cfg.connections.iter().any(|c| voice_capable(c.kind)) => Err(no_key()),
+        Err(_) => Err(ApiError::coded(StatusCode::CONFLICT, "nanty_voice_no_connection", Map::new())),
+    }
+}
+
+/// `GET /api/nanty/voices` (spec 139 T07, para os Ajustes da T09): as vozes do `/v1beta/voices`
+/// da conexão do Gemini (a gravada, ou a do `?connection_id=`, para a pessoa ver antes de gravar; o
+/// valor vazio é a automática) e os modelos de fala dela (spec 139 T12; se só essa lista falhar, ela
+/// vem vazia e as vozes seguem), com cache curto em memória. Sem conexão do Gemini: 409 `nanty_voice_no_connection`; sem chave:
+/// 409 `nanty_voice_no_key`; o provedor falhou: 502 `nanty_voice_list_failed` com o motivo e a
+/// conexão em `params` (a tela continua usável, com a lista de modelos dela). Nunca mostra a chave
+/// nem o texto do provedor.
+pub async fn get_voices(State(state): State<AppState>, query: Option<Query<VoicesQuery>>) -> Result<Json<Value>, ApiError> {
+    let query = query.map(|Query(q)| q).unwrap_or_default();
+    let cfg = state.config().read().await.clone();
+    let wanted = query.connection_id.unwrap_or_else(|| cfg.nanty.voice.connection_id.clone());
+    let conn = voice_ready(&cfg, &wanted)?.clone();
+    let endpoint = conn.endpoint().to_string();
+    let cache = &state.nanty().voices;
+    let options = match cache.get(&conn.id, &endpoint) {
+        Some(options) => options,
+        None => {
+            let voices = provider::gemini_voices(&conn).await.map_err(|code| match code {
+                "no_key" => ApiError::coded(StatusCode::CONFLICT, "nanty_voice_no_key", Map::new()),
+                other => {
+                    let mut params = param("reason", other);
+                    params.insert("connection_id".into(), json!(conn.id));
+                    ApiError::coded(StatusCode::BAD_GATEWAY, "nanty_voice_list_failed", params)
+                }
+            })?;
+            let speech_models = provider::gemini_speech_models(&conn).await.unwrap_or_default();
+            let options = VoiceOptions { voices, speech_models };
+            cache.put(&conn.id, &endpoint, options.clone());
+            options
+        }
+    };
+    Ok(Json(json!({
+        "connection_id": conn.id,
+        "voice": cfg.nanty.voice.voice_name(),
+        "voices": options.voices,
+        "speech_models": options.speech_models,
+    })))
+}
+
 // ---- Ouvir ----
 
 /// Por que a nota de voz não virou texto (o código da resposta fixa).
@@ -530,7 +682,7 @@ async fn listen(state: &AppState, nanty: &Nanty, cfg: &Config, note: &VoiceNote)
     let audio = client.download(&path, MAX_INPUT_BYTES).await.map_err(|e| e.code())?;
     nanty.set_busy(Some(Avatar::Thinking));
     let thinking = Speaking(nanty);
-    let prompt = crate::agents::prompts::nanty_transcribe_prompt(nanty_lang(&cfg.nanty));
+    let prompt = crate::agents::prompts::nanty_transcribe_prompt();
     let heard = provider::gemini_transcribe(&conn, &model, &prompt, &audio).await;
     drop(thinking);
     let heard = heard?;
@@ -543,7 +695,7 @@ async fn listen(state: &AppState, nanty: &Nanty, cfg: &Config, note: &VoiceNote)
 /// A nota de voz do dono (ao vivo, já filtrada pela escuta): baixa, transcreve e segue como texto
 /// pela fila única da T08, com a marca `voice`. Quando não dá, a mensagem da pessoa entra na
 /// conversa sem texto e o Nanty responde no Telegram com o motivo (texto fixo).
-pub async fn hear(state: &AppState, note: &VoiceNote) {
+pub async fn hear(state: &AppState, note: &VoiceNote, relayed: Option<crate::server::nanty::store::Relayed>) {
     let nanty = Arc::clone(state.nanty());
     let cfg = state.config().read().await.clone();
     let secrets = SecretSet::from_config(&cfg);
@@ -561,8 +713,9 @@ pub async fn hear(state: &AppState, note: &VoiceNote) {
         None => None,
     };
     let n = Arc::clone(&nanty);
+    let nanty_cfg = cfg.nanty.clone();
     let person = tokio::task::spawn_blocking(move || {
-        super::chat::person_message_with(&n, &secrets, Channel::Telegram, text.as_deref(), true, audio)
+        super::chat::person_message_from(&n, &nanty_cfg, &secrets, Channel::Telegram, text.as_deref(), true, audio, relayed)
     })
     .await
     .ok()
@@ -583,16 +736,19 @@ pub async fn hear(state: &AppState, note: &VoiceNote) {
             };
             let mut message = ConversationMessage::from_nanty(super::new_id(), nanty.now().epoch_ms, Channel::Telegram, code, params);
             message.reply_to = Some(person.id.clone());
-            let _ = tokio::task::spawn_blocking(move || nanty.push_message(&message)).await;
+            // A nota sem texto não diz o idioma: vale o resolvido para ela (T05).
+            message.lang = person.lang.clone();
+            // Spec 139 T08: a recusa também é fala do Nanty.
+            deliver(state, &nanty, &mut message, true).await;
         }
     }
 }
 
 /// Ouve numa tarefa à parte (a escuta segue enquanto baixa e transcreve).
-pub fn spawn_hear(state: &AppState, note: VoiceNote) {
+pub fn spawn_hear(state: &AppState, note: VoiceNote, relayed: Option<crate::server::nanty::store::Relayed>) {
     let state = state.clone();
     tokio::spawn(async move {
-        hear(&state, &note).await;
+        hear(&state, &note, relayed).await;
     });
 }
 

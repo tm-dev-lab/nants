@@ -8,7 +8,8 @@
  * - Menu: o símbolo, o nome, o slogan logo depois (regra de identidade) e a versão; a busca, que
  *   filtra a grade (setas movem o destaque, Enter abre); a grade dos apps com os estados de cada um
  *   (fechado, aberto com o ponto, minimizado, em foco), os selos e a dica no `aria-describedby`;
- *   a linha das janelas abertas e minimizadas; o rodapé dos atalhos.
+ *   a linha das janelas abertas e minimizadas; o rodapé dos atalhos. Todo app aparece pelo ícone
+ *   de linha do conjunto, inclusive o Nanty (o avatar colorido fica na janela dele).
  * - Modal (`aria-modal`): o Tab fica preso no painel e o próprio menu trata o Esc, o Alt+0 e o
  *   Alt+1…9 (o `Desktop` não age com um modal aberto). Clique fora fecha.
  * - Fechando (`closing`): o painel continua desenhado, inerte e fora da árvore acessível, só
@@ -18,7 +19,6 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboa
 import { localized, tp } from "../i18n";
 import { useT } from "../i18n/react";
 import { BRAND_NAME, BRAND_SLOGAN } from "./brand";
-import { AppGlyph } from "./AppGlyph";
 import { appItemState, BADGE_MAX, type AppBadge } from "./appState";
 import { N_BUTTON_ID } from "./focus";
 import { trapTab } from "./focusTrap";
@@ -313,7 +313,7 @@ export function NMenu({ kinds, layout, subtitles, badges, version, closing, pane
                     onClick={() => onActivate(kind)}
                   >
                     <span className="nd-nmenu-icon" aria-hidden="true">
-                      <AppGlyph kind={kind} size={18} />
+                      <Icon name={meta.icon} size={18} />
                     </span>
                     <span className="nd-nmenu-tile-label" aria-hidden="true">
                       {meta.title}
@@ -352,6 +352,7 @@ export function NMenu({ kinds, layout, subtitles, badges, version, closing, pane
                       onClick={() => onShow(kind)}
                     >
                       <span className="nd-nmenu-indicator" data-indicator={state} aria-hidden="true" />
+                      <Icon name={WINDOW_META[kind].icon} size={14} />
                       {WINDOW_META[kind].title}
                     </button>
                   </li>

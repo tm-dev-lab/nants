@@ -15,8 +15,8 @@ pub use schema::{
     LanViewPortsConfig, valid_override_url,
 };
 pub use nanty::{
-    parse_hhmm, ActionLevel, DigestEmpty, NantyConfig, NantyFilter, NantyRoute, NantyTelegram, NantyVoice, Urgency, VoiceRoute,
-    DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE, DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_VOICE, DEFAULT_TRANSCRIBE_MODEL,
+    parse_hhmm, ActionLevel, DigestEmpty, NantyConfig, NantyChat, NantyFilter, NantyLanguage, NantyRoute, NantyTelegram, NantyVoice, Urgency, VoiceMigration,
+    VoiceRoute, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_VOICE, DEFAULT_TRANSCRIBE_MODEL,
     DEFAULT_VOICE_MAX_INPUT_SECS, GB_BYTES,
 };
 pub use view_ports::{ViewPorts, DEFAULT_VIEW_PORTS, MAX_VIEW_PORTS, MIN_VIEW_PORT, VIEW_PORTS_EXHAUSTED_PREFIX};
@@ -45,10 +45,21 @@ impl Config {
                 let mut cfg: Self = toml::from_str(&content)?;
                 // Spec 116: a conexão pelo plano ChatGPT tem endereço e protocolo fixos.
                 cfg.connections.iter_mut().for_each(Connection::normalize);
+                cfg.migrate_voice();
                 Ok(cfg)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Spec 139 T07 (C-16): a voz antiga (`order` e `transcribe`, até a rc.22) vira a nova, só com
+    /// o Gemini. O resultado fica em `nanty.voice.migrated` até o Nanty registrar a linha.
+    pub fn migrate_voice(&mut self) {
+        let connections = &self.connections;
+        let is_gemini = |id: &str| connections.iter().any(|c| c.id == id && c.kind == ConnectionKind::GoogleGemini);
+        if let Some(done) = self.nanty.voice.migrate(is_gemini) {
+            self.nanty.voice.migrated = Some(done);
         }
     }
 

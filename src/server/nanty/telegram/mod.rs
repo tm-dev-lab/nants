@@ -113,6 +113,11 @@ pub struct Tuning {
     pub send_gap: Duration,
     /// Espera do cartão novo antes do envio (T07, [`outbox::SEND_SETTLE`]).
     pub send_settle: Duration,
+    /// Renovação do "digitando" enquanto o laço da conversa roda (spec 139 T03, C-09,
+    /// [`outbox::TYPING_EVERY`]).
+    pub typing_every: Duration,
+    /// Prazo da fala (spec 139 T08, C-14, [`outbox::SPEECH_DEADLINE`]): vencido, a saída vai em texto.
+    pub speech_deadline: Duration,
 }
 
 impl Default for Tuning {
@@ -123,6 +128,8 @@ impl Default for Tuning {
             backoff_max: BACKOFF_MAX,
             send_gap: outbox::SEND_GAP,
             send_settle: outbox::SEND_SETTLE,
+            typing_every: outbox::TYPING_EVERY,
+            speech_deadline: outbox::SPEECH_DEADLINE,
         }
     }
 }
@@ -466,7 +473,7 @@ pub async fn listen(state: AppState, mut shutdown: watch::Receiver<bool>) {
                 s.ready = true;
                 backoff.reset();
                 health_to(&nanty, Health::Connected);
-                let lang = nanty_lang(&state.config().read().await.nanty);
+                let lang = nanty_lang(&state.config().read().await.nanty, &nanty);
                 publish_commands(&nanty, &s.client, lang).await;
             }
             Ok(Some(updates)) => {
@@ -545,7 +552,12 @@ async fn on_message(state: &AppState, nanty: &Arc<Nanty>, s: &Session, update_id
     }
     let Some(from) = m.from.as_ref().filter(|f| !f.is_bot) else { return };
     let cfg = state.config().read().await.nanty.clone();
-    let lang = nanty_lang(&cfg);
+    // O pareamento responde no idioma do Telegram de quem escreveu, quando é pt ou en (T05).
+    let lang = from
+        .language_code
+        .as_deref()
+        .and_then(crate::server::nanty::language::from_language_code)
+        .unwrap_or_else(|| nanty_lang(&cfg, nanty));
     match (cfg.telegram.owner_id, cfg.telegram.chat_id) {
         (Some(owner), Some(chat)) if from.id == owner && m.chat.id == chat => {
             owner_message(state, nanty, update_id, m, stale).await;
@@ -603,7 +615,15 @@ async fn pair(state: &AppState, nanty: &Arc<Nanty>, s: &Session, chat_id: i64, f
 async fn owner_message(state: &AppState, nanty: &Arc<Nanty>, update_id: i64, m: &Message, stale: bool) {
     let now = nanty.now().epoch_ms;
     let secrets = state.secret_set().await;
-    let person = m.text.as_deref().and_then(|text| super::chat::person_message(nanty, &secrets, Channel::Telegram, text));
+    // Spec 139 T04 (C-07): a encaminhada e a citação de terceiro vão marcadas.
+    let owner = m.from.as_ref().map_or(0, |f| f.id);
+    let relayed = m.relayed(owner);
+    // Spec 139 T05: o `language_code` do dono é a terceira pista do idioma dele.
+    nanty.note_telegram_lang(m.from.as_ref().and_then(|f| f.language_code.as_deref()));
+    let cfg = state.config().read().await.nanty.clone();
+    let person = m.text.as_deref().and_then(|text| {
+        super::chat::person_message_from(nanty, &cfg, &secrets, Channel::Telegram, Some(text), false, None, relayed.clone())
+    });
     if stale {
         let age_min = u64::try_from(m.date).ok().map(|date| (now / 1000).saturating_sub(date) / 60);
         stale_card(nanty, update_id, "message", age_min);
@@ -611,7 +631,7 @@ async fn owner_message(state: &AppState, nanty: &Arc<Nanty>, update_id: i64, m: 
         super::chat::spawn_reply(state, person);
     } else if let Some(note) = m.voice.clone().filter(|_| m.text.is_none()) {
         // T09: a nota de voz do dono é baixada e transcrita numa tarefa à parte e segue como texto.
-        super::voice::spawn_hear(state, note);
+        super::voice::spawn_hear(state, note, relayed);
     }
 }
 
@@ -662,7 +682,7 @@ fn stale_card(nanty: &Arc<Nanty>, update_id: i64, kind: &str, age_min: Option<u6
 
 async fn on_callback(state: &AppState, nanty: &Arc<Nanty>, s: &Session, update_id: i64, q: &CallbackQuery, stale: bool) {
     let cfg = state.config().read().await.nanty.clone();
-    let lang = nanty_lang(&cfg);
+    let lang = nanty_lang(&cfg, nanty);
     let same_chat = q.message.as_ref().is_none_or(|m| Some(m.chat.id) == cfg.telegram.chat_id);
     let owner = cfg.telegram.chat_id.is_some() && cfg.telegram.owner_id == Some(q.from.id) && same_chat;
     if !owner {
@@ -721,3 +741,9 @@ mod t08_tests;
 
 #[cfg(test)]
 mod t09_tests;
+
+#[cfg(test)]
+mod t12_eval_tests;
+
+#[cfg(test)]
+mod voice_tests;

@@ -2,13 +2,15 @@
  * Aba Ajustes do Nanty (spec 138 T11, `reference/Settings.dc.html`): cartões em grade (duas colunas
  * na janela larga, uma na estreita e no celular).
  *
- * - **Modelo e esforço**, pelas conexões que já existem;
+ * - **Modelo e esforço**, pelas conexões que já existem, com o combobox de modelos dos Agentes;
  * - **Orçamento do dia**, com a barra do gasto e o aviso "sem preço, o orçamento conta tokens";
  * - **Telegram** (`NantyTelegramCard`), com a espera com a aba aberta;
- * - **Voz:** ligar, a ordem das conexões e a conexão da transcrição;
+ * - **Voz** (spec 139 T09): ligar, uma conexão do Gemini para falar e transcrever, os modelos e a voz
+ *   à vista e o estado que o servidor diz (pronta, sem chave, sem conexão);
  * - **Horários:** silêncio e resumo da manhã, com a hora do Nants agora (C-15, lida do servidor) e
  *   os horários no formato da tela;
- * - **Idioma:** o do Nanty segue o da interface (C-08); o botão abre a Aparência;
+ * - **Idioma** (spec 139 T05): o seletor do idioma próprio do Nanty para os avisos e o resumo,
+ *   seguir a conversa (o padrão), português ou inglês; a conversa responde no idioma de quem falou;
  * - **Reserva** por papel e **projetos** observados.
  *
  * Um só "Salvar" no fim manda só o que mudou (`PUT /api/nanty/config`); o erro sai com o código
@@ -17,22 +19,32 @@
  */
 import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ConnectionView } from "../../api/types";
-import { useShell } from "../../desktop/shellContext";
 import { Icon } from "../../desktop/Icon";
-import { formatNumber, formatUsd, t as tr } from "../../i18n";
+import { useShell } from "../../desktop/shellContext";
+import { formatNumber, formatUsd, t as tr, type MessageKey } from "../../i18n";
 import { useT } from "../../i18n/react";
 import { apiFailureText } from "../../i18n/serverCodes";
-import { EFFORT_OPTIONS, ROLE_INFO } from "../../settings/rules";
+import { EFFORT_OPTIONS, NATIVE_PROVIDERS, ROLE_INFO } from "../../settings/rules";
 import { useAppStore } from "../../store";
-import { getNantySettings, NANTY_ROLES, putNantySettings, type NantyRole, type NantySettings } from "./nantyApi";
-import { budgetFraction, draftOf, speaks, transcribes, voiceWarning, invalidNumbers, moveStep, NANTY_LIMITS, settingsPatch, type NantyDraft, type NantyNumberField } from "./nantySettingsModel";
+import { ModelCombobox, type ModelOption } from "../shared/ModelCombobox";
+import { modelsHint, useConnectionModels, type ConnectionModels } from "../shared/useConnectionModels";
+import { getNantySettings, NANTY_LANGUAGES, NANTY_ROLES, putNantySettings, type NantyLanguage, type NantyRole, type NantySettings } from "./nantyApi";
+import { budgetFraction, draftOf, invalidNumbers, keyRefused, NANTY_LIMITS, settingsPatch, voiceCapable, voiceState, voiceWarning, type NantyDraft, type NantyNumberField, type VoiceCheck, type VoiceState } from "./nantySettingsModel";
 import { useNanty } from "./nantyStore";
 import { NantyTelegramCard } from "./NantyTelegramCard";
 import { clockText } from "./nantyText";
+import { useNantyVoices } from "./useNantyVoices";
 
 const EMPTY_CONNECTIONS: readonly ConnectionView[] = [];
 
 type Patch = (change: Partial<NantyDraft>) => void;
+
+/** A conexão do Gemini que a voz usa agora: a escolhida ou, na automática, a que o servidor resolveu. */
+function voiceConnection(draft: NantyDraft, connections: readonly ConnectionView[], check: VoiceCheck): ConnectionView | undefined {
+  const resolved = check.status === "ready" || check.status === "failed" ? check.connection_id : null;
+  const id = draft.voice_connection_id !== "" ? draft.voice_connection_id : resolved;
+  return connections.find((c) => c.id === id && voiceCapable(c.kind));
+}
 
 function Card({ id, title, aside, children }: { id: string; title: string; aside?: ReactNode; children: ReactNode }) {
   const headingId = useId();
@@ -57,6 +69,7 @@ function ConnectionSelect({
   onChange,
   label,
   nameOf,
+  labelOf,
 }: {
   id: string;
   value: string;
@@ -66,17 +79,76 @@ function ConnectionSelect({
   label?: string;
   /** Nome da conexão gravada que não está na lista (incompatível); sem ele, o id. */
   nameOf?: (id: string) => string;
+  /** O texto de cada opção; sem ele, o nome. */
+  labelOf?: (connection: ConnectionView) => string;
 }) {
   return (
     <select id={id} className="nd-input" value={value} onChange={(event) => onChange(event.target.value)} aria-label={label}>
       <option value="">{empty}</option>
       {connections.map((c) => (
         <option key={c.id} value={c.id}>
-          {c.name}
+          {labelOf?.(c) ?? c.name}
         </option>
       ))}
       {value !== "" && !connections.some((c) => c.id === value) ? <option value={value}>{nameOf?.(value) ?? value}</option> : null}
     </select>
+  );
+}
+
+/**
+ * O campo do modelo, com a lista da conexão (o mesmo combobox dos Agentes), sem filtro por nome: a
+ * lista completa e o texto livre. Com `title`, leva rótulo e o "Atualizar lista".
+ */
+function ModelField({
+  title,
+  label,
+  value,
+  connection,
+  models,
+  disabled,
+  placeholder,
+  listed,
+  onChange,
+}: {
+  title?: string;
+  label?: string;
+  value: string;
+  connection: ConnectionView | undefined;
+  models: ConnectionModels;
+  disabled: boolean;
+  placeholder?: string;
+  /** A lista própria do campo, quando há; sem ela, os modelos de texto da conexão. */
+  listed?: readonly ModelOption[];
+  onChange: (model: string) => void;
+}) {
+  const { t } = useT();
+  const id = useId();
+  const entry = models.entryOf(connection);
+  const own = listed !== undefined && listed.length > 0 ? listed : null;
+  const hint = own !== null ? null : modelsHint(entry);
+  const options = own ?? (entry?.status === "ready" ? entry.models : []);
+  return (
+    <div className="nd-field">
+      {title !== undefined ? (
+        <div className="nd-field-labelrow">
+          <label htmlFor={id} className="nd-field-label">
+            {title}
+          </label>
+          {connection !== undefined && entry !== undefined ? (
+            <button type="button" className="nd-btn nd-label-action" data-variant="ghost" disabled={entry.status === "loading"} onClick={() => models.load(connection, true)}>
+              <Icon name="refresh" size={14} />
+              <span>{t("settings.agents.refreshList")}</span>
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <ModelCombobox id={id} label={label} value={value} options={options} disabled={disabled} placeholder={placeholder} onChange={onChange} />
+      {hint !== null ? (
+        <p aria-live="polite" className={hint.warn ? "nd-field-warn" : "nd-field-hint"}>
+          {hint.text}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -112,10 +184,9 @@ function NumberField({ field, label, value, min, max, step, invalid, onChange }:
   );
 }
 
-function ModelCard({ draft, connections, patch }: { draft: NantyDraft; connections: readonly ConnectionView[]; patch: Patch }) {
+function ModelCard({ draft, connections, models, patch }: { draft: NantyDraft; connections: readonly ConnectionView[]; models: ConnectionModels; patch: Patch }) {
   const { t } = useT();
   const connId = useId();
-  const modelId = useId();
   const effortName = useId();
   const gone = draft.connection_id !== "" && !connections.some((c) => c.id === draft.connection_id);
   return (
@@ -124,15 +195,27 @@ function ModelCard({ draft, connections, patch }: { draft: NantyDraft; connectio
         <label htmlFor={connId} className="nd-field-label">
           {t("nanty.prefs.model.connection")}
         </label>
-        <ConnectionSelect id={connId} value={draft.connection_id} connections={connections} empty={t("nanty.prefs.model.none")} onChange={(connection_id) => patch({ connection_id })} />
+        <ConnectionSelect
+          id={connId}
+          value={draft.connection_id}
+          connections={connections}
+          empty={t("nanty.prefs.model.none")}
+          onChange={(connection_id) => {
+            patch({ connection_id });
+            const conn = connections.find((c) => c.id === connection_id);
+            if (conn !== undefined) models.retryFailed(conn);
+          }}
+        />
         {gone ? <p className="nd-field-error">{t("nanty.prefs.model.gone", { id: draft.connection_id })}</p> : null}
       </div>
-      <div className="nd-field">
-        <label htmlFor={modelId} className="nd-field-label">
-          {t("nanty.prefs.model.model")}
-        </label>
-        <input id={modelId} type="text" className="nd-input" value={draft.model} disabled={draft.connection_id === ""} onChange={(event) => patch({ model: event.target.value })} autoComplete="off" spellCheck={false} />
-      </div>
+      <ModelField
+        title={t("nanty.prefs.model.model")}
+        value={draft.model}
+        connection={connections.find((c) => c.id === draft.connection_id)}
+        models={models}
+        disabled={draft.connection_id === ""}
+        onChange={(model) => patch({ model })}
+      />
       <div className="nd-field">
         <span className="nd-field-label">{t("nanty.prefs.model.effort")}</span>
         <div role="radiogroup" aria-label={t("nanty.prefs.model.effort")} className="nd-segment nd-chrome">
@@ -242,18 +325,58 @@ function HoldField({ draft, invalid, patch }: { draft: NantyDraft; invalid: bool
   );
 }
 
-function VoiceCard({ draft, connections, invalid, patch }: { draft: NantyDraft; connections: readonly ConnectionView[]; invalid: boolean; patch: Patch }) {
+const VOICE_STATE_LABEL: Readonly<Record<VoiceState, MessageKey>> = {
+  ready: "nanty.prefs.voice.state.ready",
+  no_key: "nanty.prefs.voice.state.noKey",
+  key_refused: "nanty.prefs.voice.state.keyRefused",
+  no_connection: "nanty.prefs.voice.state.noConnection",
+};
+
+/** O estado da voz, o que o servidor respondeu: pronta, sem chave ou sem conexão. */
+function VoiceStateLine({ check, name }: { check: VoiceCheck; name: string | null }) {
   const { t } = useT();
-  const addId = useId();
-  const transcribeId = useId();
+  const state = voiceState(check);
+  if (state === null) {
+    return check.status === "loading" ? <p className="nd-field-hint" data-nanty-voice-state="loading">{t("nanty.prefs.voice.state.checking")}</p> : null;
+  }
+  const label = t(VOICE_STATE_LABEL[state]);
+  return (
+    <p className="nd-nanty-state nd-nanty-voice-state" role="status" data-nanty-voice-state={state}>
+      <span className="nd-dot" data-tone={state === "ready" ? "green" : "amber"} aria-hidden="true" />
+      <span>{state === "ready" && name !== null ? t("nanty.prefs.voice.state.readyVia", { name }) : label}</span>
+    </p>
+  );
+}
+
+function VoiceCard({
+  draft,
+  connections,
+  invalid,
+  patch,
+  check,
+  reloadVoices,
+  models,
+}: {
+  draft: NantyDraft;
+  connections: readonly ConnectionView[];
+  invalid: boolean;
+  patch: Patch;
+  check: VoiceCheck;
+  reloadVoices: () => void;
+  models: ConnectionModels;
+}) {
+  const { t } = useT();
+  const shell = useShell();
+  const connectionId = useId();
+  const voiceId = useId();
   const nameOf = (id: string): string => connections.find((c) => c.id === id)?.name ?? id;
-  // Cada seletor oferece só as conexões que o caminho usa (as regras de `voice::speaks` e
-  // `voice::transcribes` do servidor).
-  const speakers = connections.filter((c) => speaks(c.kind));
-  const transcribers = connections.filter((c) => transcribes(c.kind));
-  const free = speakers.filter((c) => !draft.voice_order.some((r) => r.connection_id === c.id));
-  const transcribeWarn = voiceWarning(draft.transcribe.connection_id, connections, transcribes);
-  const full = draft.voice_order.length >= NANTY_LIMITS.voiceSteps;
+  // Um seletor só, com as conexões do Gemini: a regra de `voice_capable` do servidor.
+  const gemini = connections.filter((c) => voiceCapable(c.kind));
+  const warn = voiceWarning(draft.voice_connection_id, connections);
+  const conn = voiceConnection(draft, connections, check);
+  const noneYet = gemini.length === 0;
+  const voices = check.status === "ready" ? check.voices : [];
+  const speechModels = check.status === "ready" ? check.speech_models : [];
   const toggle = (
     <button
       type="button"
@@ -271,106 +394,86 @@ function VoiceCard({ draft, connections, invalid, patch }: { draft: NantyDraft; 
   return (
     <Card id="voice" title={t("nanty.prefs.voice.title")} aside={toggle}>
       <p className="nd-nanty-pref-text">{t("nanty.prefs.voice.hint")}</p>
-      <span className="nd-field-label">{t("nanty.prefs.voice.order")}</span>
-      {draft.voice_order.length === 0 ? <p className="nd-field-hint" data-nanty-voice-auto="">{t("nanty.prefs.voice.auto")}</p> : null}
-      <ol className="nd-nanty-order" data-nanty-voice-order="">
-        {draft.voice_order.map((step, i) => {
-          const name = nameOf(step.connection_id);
-          const warn = voiceWarning(step.connection_id, connections, speaks);
-          return (
-            <li key={step.connection_id} className="nd-nanty-order-item" data-nanty-voice-step={step.connection_id} data-warn={warn ?? undefined}>
-              <span className="nd-nanty-order-n nd-num" aria-hidden="true">
-                {i + 1}
-              </span>
-              <span className="nd-nanty-order-name">
-                {name}
-                {warn !== null ? (
-                  <span className="nd-field-error" data-nanty-voice-warn={step.connection_id}>
-                    {warn === "gone" ? t("nanty.prefs.model.gone", { id: step.connection_id }) : t("nanty.prefs.voice.stepUnusable", { name })}
-                  </span>
-                ) : null}
-              </span>
-              <span className="nd-nanty-order-tools">
-                <button type="button" className="nd-btn nd-btn-sm" data-variant="ghost" aria-label={t("nanty.prefs.voice.up", { name })} disabled={i === 0} onClick={() => patch({ voice_order: moveStep(draft.voice_order, i, -1) })}>
-                  <Icon name="arrow-up" size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="nd-btn nd-btn-sm"
-                  data-variant="ghost"
-                  aria-label={t("nanty.prefs.voice.down", { name })}
-                  disabled={i === draft.voice_order.length - 1}
-                  onClick={() => patch({ voice_order: moveStep(draft.voice_order, i, 1) })}
-                >
-                  <Icon name="arrow-down" size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="nd-btn nd-btn-sm"
-                  data-variant="ghost"
-                  aria-label={t("nanty.prefs.voice.remove", { name })}
-                  onClick={() => patch({ voice_order: draft.voice_order.filter((_, k) => k !== i) })}
-                >
-                  <Icon name="close" size={14} />
-                </button>
-              </span>
-            </li>
-          );
-        })}
-        {draft.voice_order.length > 0 ? (
-          <li className="nd-nanty-order-item" data-nanty-voice-step="text">
-            <span className="nd-nanty-order-n nd-num" aria-hidden="true">
-              {draft.voice_order.length + 1}
-            </span>
-            <span className="nd-nanty-order-name">{t("nanty.prefs.voice.textOnly")}</span>
-          </li>
-        ) : null}
-      </ol>
-      {free.length > 0 && !full ? (
+      <VoiceStateLine check={check} name={conn?.name ?? null} />
+      {check.status === "no_key" ? (
+        <p className="nd-field-warn" data-nanty-voice-why="no_key">
+          {t("nanty.prefs.voice.noKeyHint")}
+        </p>
+      ) : null}
+      {keyRefused(check) ? (
+        <p className="nd-field-warn" data-nanty-voice-why="key_refused">
+          {t("nanty.prefs.voice.keyRefusedHint")}
+        </p>
+      ) : null}
+      {noneYet ? (
+        <p className="nd-field-warn" data-nanty-voice-why="no_connection">
+          {t("nanty.prefs.voice.noConnections")}
+        </p>
+      ) : null}
+      {!noneYet || draft.voice_connection_id !== "" ? (
         <div className="nd-field">
-          <label htmlFor={addId} className="nd-field-label">
-            {t("nanty.prefs.voice.add")}
+          <label htmlFor={connectionId} className="nd-field-label">
+            {t("nanty.prefs.voice.connection")}
           </label>
-          <select
-            id={addId}
-            className="nd-input"
-            value=""
-            onChange={(event) => {
-              const id = event.target.value;
-              if (id !== "") patch({ voice_order: [...draft.voice_order, { connection_id: id, model: "", voice: "" }] });
+          <ConnectionSelect
+            id={connectionId}
+            value={draft.voice_connection_id}
+            connections={gemini}
+            nameOf={nameOf}
+            labelOf={(c) => t("nanty.prefs.voice.connectionOption", { name: c.name, kind: NATIVE_PROVIDERS.google_gemini.brand })}
+            empty={t("nanty.prefs.voice.connectionAuto")}
+            onChange={(voice_connection_id) => {
+              patch({ voice_connection_id });
+              const next = gemini.find((c) => c.id === voice_connection_id);
+              if (next !== undefined) models.retryFailed(next);
             }}
-          >
-            <option value="">{t("nanty.prefs.voice.addPick")}</option>
-            {free.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
+          />
+          {warn === "gone" ? (
+            <p className="nd-field-error" data-nanty-voice-warn="">
+              {t("nanty.prefs.model.gone", { id: draft.voice_connection_id })}
+            </p>
+          ) : warn === "unusable" ? (
+            <p className="nd-field-error" data-nanty-voice-warn="">
+              {t("nanty.prefs.voice.connectionUnusable", { name: nameOf(draft.voice_connection_id) })}
+            </p>
+          ) : null}
         </div>
       ) : null}
+      <div className="nd-nanty-voice-where">
+        {noneYet ? null : <p className="nd-nanty-pref-note">{t("nanty.prefs.voice.connectionHint")}</p>}
+        <button type="button" className="nd-btn" data-variant={noneYet ? "primary" : undefined} onClick={() => shell.openSettings("connections")} data-nanty-voice-connections="">
+          {noneYet ? null : <Icon name="link" size={14} />}
+          {t(noneYet ? "nanty.prefs.voice.createConnection" : "nanty.prefs.voice.openConnections")}
+        </button>
+      </div>
+      <ModelField title={t("nanty.prefs.voice.speechModel")} value={draft.speech_model} connection={conn} models={models} disabled={false} listed={speechModels} onChange={(speech_model) => patch({ speech_model })} />
       <div className="nd-field">
-        <label htmlFor={transcribeId} className="nd-field-label">
-          {t("nanty.prefs.voice.transcribe")}
-        </label>
-        <ConnectionSelect
-          id={transcribeId}
-          value={draft.transcribe.connection_id}
-          connections={transcribers}
-          nameOf={nameOf}
-          empty={t("nanty.prefs.voice.transcribeAuto")}
-          onChange={(connection_id) => patch({ transcribe: { connection_id, model: "" } })}
-        />
-        {transcribeWarn === "gone" ? (
-          <p className="nd-field-error" data-nanty-voice-warn="transcribe">
-            {t("nanty.prefs.model.gone", { id: draft.transcribe.connection_id })}
-          </p>
-        ) : transcribeWarn === "unusable" ? (
-          <p className="nd-field-error" data-nanty-voice-warn="transcribe">
-            {t("nanty.prefs.voice.transcribeUnusable", { name: nameOf(draft.transcribe.connection_id) })}
+        <div className="nd-field-labelrow">
+          <label htmlFor={voiceId} className="nd-field-label">
+            {t("nanty.prefs.voice.voice")}
+          </label>
+          {check.status === "ready" || check.status === "failed" ? (
+            <button type="button" className="nd-btn nd-label-action" data-variant="ghost" onClick={reloadVoices}>
+              <Icon name="refresh" size={14} />
+              <span>{t("settings.agents.refreshList")}</span>
+            </button>
+          ) : null}
+        </div>
+        <ModelCombobox id={voiceId} value={draft.voice_name} options={voices} disabled={false} listLabel={t("nanty.prefs.voice.voices")} onChange={(voice_name) => patch({ voice_name })} />
+        {check.status === "failed" && !keyRefused(check) ? (
+          <p aria-live="polite" className="nd-field-warn" data-nanty-voices-failed="">
+            {t("nanty.prefs.voice.listFailed", { error: apiFailureText(check.error) })}
           </p>
         ) : null}
       </div>
+      <ModelField
+        title={t("nanty.prefs.voice.transcribeModel")}
+        value={draft.transcribe_model}
+        connection={conn}
+        models={models}
+        disabled={false}
+        onChange={(transcribe_model) => patch({ transcribe_model })}
+      />
       <NumberField
         field="max_input_secs"
         label={t("nanty.prefs.voice.maxInput")}
@@ -446,23 +549,51 @@ function HoursCard({ draft, now, patch, digestRef }: { draft: NantyDraft; now: s
   );
 }
 
-function LanguageCard({ lang }: { lang: NantySettings["lang"] }) {
+/** Rótulo de cada opção do idioma próprio do Nanty. */
+const LANGUAGE_LABEL: Record<NantyLanguage, MessageKey> = {
+  follow: "nanty.prefs.lang.follow",
+  "pt-BR": "nanty.prefs.lang.pt",
+  en: "nanty.prefs.lang.en",
+};
+
+/** Spec 139 T05: o idioma próprio do Nanty (avisos e resumo); a conversa segue quem falou. */
+function LanguageCard({ draft, lang, patch }: { draft: NantyDraft; lang: NantySettings["lang"]; patch: Patch }) {
   const { t } = useT();
-  const shell = useShell();
+  const id = useId();
   return (
     <Card id="lang" title={t("nanty.prefs.lang.title")}>
-      <p className="nd-nanty-pref-text" data-nanty-lang={lang}>
-        {t("nanty.prefs.lang.text", { lang: t(lang === "en" ? "language.name.en" : "language.name.pt-BR") })}
-      </p>
-      <button type="button" className="nd-btn nd-btn-sm nd-self-start" onClick={() => shell.openSettings("appearance")}>
-        <Icon name="globe" size={14} />
-        {t("nanty.prefs.lang.change")}
-      </button>
+      <p className="nd-nanty-pref-text">{t("nanty.prefs.lang.text")}</p>
+      <div className="nd-field">
+        <label htmlFor={id} className="nd-field-label">
+          {t("nanty.prefs.lang.field")}
+        </label>
+        <select
+          id={id}
+          className="nd-input"
+          value={draft.language}
+          onChange={(event) => {
+            const next = NANTY_LANGUAGES.find((l) => l === event.target.value);
+            if (next !== undefined) patch({ language: next });
+          }}
+          data-nanty-language=""
+        >
+          {NANTY_LANGUAGES.map((l) => (
+            <option key={l} value={l}>
+              {t(LANGUAGE_LABEL[l])}
+            </option>
+          ))}
+        </select>
+      </div>
+      {draft.language === "follow" ? (
+        <p className="nd-nanty-pref-note" data-nanty-lang={lang}>
+          {t("nanty.prefs.lang.followHint", { lang: t(lang === "en" ? "nanty.prefs.lang.enLower" : "nanty.prefs.lang.ptLower") })}
+        </p>
+      ) : null}
     </Card>
   );
 }
 
-function ReserveCard({ draft, connections, patch }: { draft: NantyDraft; connections: readonly ConnectionView[]; patch: Patch }) {
+function ReserveCard({ draft, connections, models, patch }: { draft: NantyDraft; connections: readonly ConnectionView[]; models: ConnectionModels; patch: Patch }) {
   const { t } = useT();
   const set = (role: NantyRole, change: Partial<NantyDraft["reserve"][NantyRole]>): void => patch({ reserve: { ...draft.reserve, [role]: { ...draft.reserve[role], ...change } } });
   return (
@@ -480,18 +611,20 @@ function ReserveCard({ draft, connections, patch }: { draft: NantyDraft; connect
                 connections={connections}
                 empty={t("nanty.prefs.reserve.none")}
                 label={t("nanty.prefs.reserve.connection", { role: label })}
-                onChange={(connection_id) => set(role, connection_id === "" ? { connection_id, model: "" } : { connection_id })}
+                onChange={(connection_id) => {
+                  set(role, connection_id === "" ? { connection_id, model: "" } : { connection_id });
+                  const conn = connections.find((c) => c.id === connection_id);
+                  if (conn !== undefined) models.retryFailed(conn);
+                }}
               />
-              <input
-                type="text"
-                className="nd-input"
+              <ModelField
+                label={t("nanty.prefs.reserve.model", { role: label })}
                 value={route.model}
+                connection={connections.find((c) => c.id === route.connection_id)}
+                models={models}
                 disabled={route.connection_id === ""}
-                aria-label={t("nanty.prefs.reserve.model", { role: label })}
                 placeholder={t("nanty.prefs.reserve.modelPlaceholder")}
-                onChange={(event) => set(role, { model: event.target.value })}
-                autoComplete="off"
-                spellCheck={false}
+                onChange={(model) => set(role, { model })}
               />
             </div>
           );
@@ -541,6 +674,17 @@ export function NantySettingsView({ focusDigest, onFocused }: { focusDigest: boo
   const [notice, setNotice] = useState<Notice | null>(null);
   const digestRef = useRef<HTMLInputElement | null>(null);
   const mounted = useRef(true);
+  const geminiSignature = connections
+    .filter((c) => voiceCapable(c.kind))
+    .map((c) => `${c.id}|${c.base_url}|${c.api_key_masked}`)
+    .join("\n");
+  const voices = useNantyVoices(draft !== null, draft?.voice_connection_id ?? "", geminiSignature);
+  const inUse = draft === null ? [] : [draft.connection_id, ...NANTY_ROLES.map((role) => draft.reserve[role].connection_id)];
+  const voiceConn = draft === null ? undefined : voiceConnection(draft, connections, voices.check);
+  const models = useConnectionModels(
+    [...connections.filter((c) => inUse.includes(c.id)), ...(voiceConn === undefined ? [] : [voiceConn])],
+    connections,
+  );
 
   useEffect(() => {
     mounted.current = true;
@@ -613,14 +757,14 @@ export function NantySettingsView({ focusDigest, onFocused }: { focusDigest: boo
   return (
     <div className="nd-nanty-settings" data-nanty-settings="">
       <div className="nd-nanty-prefs">
-        <ModelCard draft={draft} connections={connections} patch={patch} />
+        <ModelCard draft={draft} connections={connections} models={models} patch={patch} />
         <BudgetCard draft={draft} invalid={invalid} patch={patch} />
         <NantyTelegramCard hold={<HoldField draft={draft} invalid={invalid.includes("visible_hold_secs")} patch={patch} />} />
-        <VoiceCard draft={draft} connections={connections} invalid={invalid.includes("max_input_secs")} patch={patch} />
+        <VoiceCard draft={draft} connections={connections} invalid={invalid.includes("max_input_secs")} patch={patch} check={voices.check} reloadVoices={voices.reload} models={models} />
         <HoursCard draft={draft} now={saved.now} patch={patch} digestRef={digestRef} />
-        <ReserveCard draft={draft} connections={connections} patch={patch} />
+        <ReserveCard draft={draft} connections={connections} models={models} patch={patch} />
         <ProjectsCard draft={draft} patch={patch} />
-        <LanguageCard lang={saved.lang} />
+        <LanguageCard draft={draft} lang={saved.lang} patch={patch} />
       </div>
       <div className="nd-nanty-savebar" data-nanty-savebar="">
         {notice !== null ? (

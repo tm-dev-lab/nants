@@ -118,6 +118,18 @@ pub fn units(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
+/// Como [`fit`], preservando o fecho do texto (a frase do servidor, spec 139 T12): o corte fica no
+/// que vem antes dele. Sem o fecho no fim do texto, é o [`fit`].
+pub fn fit_keeping(text: &str, tail: Option<&str>, max: usize) -> String {
+    let head = tail.and_then(|t| Some((text.strip_suffix(t)?.trim_end(), t)));
+    match head {
+        Some((head, tail)) if units(text) > max && units(tail) < max => {
+            format!("{}\n{tail}", fit(head, max.saturating_sub(units(tail) + 1)))
+        }
+        _ => fit(text, max),
+    }
+}
+
 /// Corta `text` em `max` unidades, com `…` no fim: de preferência na última quebra de linha (ou
 /// no último espaço) da segunda metade, para não partir uma palavra.
 pub fn fit(text: &str, max: usize) -> String {
@@ -196,6 +208,16 @@ mod tests {
         // As etapas que só inserem ou cortam não juntam nada.
         let out = clean(&secrets, &format!("https://{head}{tail} @{secret}"));
         assert!(!out.contains(&secret), "{out}");
+    }
+
+    #[test]
+    fn the_tail_survives_the_cut() {
+        let long = format!("{}\nConfirme.", "palavra ".repeat(100).trim());
+        let cut = fit_keeping(&long, Some("Confirme."), 100);
+        assert!(units(&cut) <= 100 && cut.ends_with("…\nConfirme."), "{cut}");
+        assert_eq!(fit_keeping("curto\nConfirme.", Some("Confirme."), 100), "curto\nConfirme.");
+        assert_eq!(fit_keeping(&long, Some("outro fecho"), 100), fit(&long, 100), "sem o fecho no fim, o corte comum");
+        assert_eq!(fit_keeping(&long, None, 100), fit(&long, 100));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! - **intervalo do grupo** (`group_interval`): fatos mudaram, avisa de novo só depois dele;
 //! - **repetição** (`repeat_interval`): sem mudança, repete só depois dele (o resumo não repete);
 //! - **inibição** ([`INHIBITIONS`]): "sem crédito" cala "execução bloqueada" do mesmo projeto;
-//! - **silêncios** com validade (`NantyState::silences`);
-//! - **horário de silêncio:** o urgente vai sem som e o resto vai para o resumo.
+//! - **silêncios** com validade (`NantyState::silences`): o de um projeto ou de um grupo cala o aviso;
+//! - **horário de silêncio:** o urgente vai sem som e o resto vai para o resumo. O silêncio de tudo
+//!   (o pedido na conversa, spec 139 T04, C-08) vale como o horário de silêncio: cala o som, mas o
+//!   urgente continua chegando, e nada se perde (o resto vai ao resumo).
 //!
 //! **Resolvido:** a condição de um tipo coberto pela rodada que não aparece mais fecha o cartão e
 //! vira um "feito" com o resultado `resolved`.
@@ -49,11 +51,13 @@ pub fn delivery_for(urgency: Urgency, quiet: bool) -> Delivery {
     }
 }
 
-/// O silêncio vale para o sinal: do projeto, do grupo ou de tudo, ainda dentro da validade.
+/// Um silêncio do projeto ou do grupo vale para o sinal, ainda dentro da validade. O silêncio de
+/// tudo não cala: ele vale como o horário de silêncio (ver [`apply`]).
 fn silenced(st: &NantyState, signal: &Signal, now_ms: u64) -> bool {
     let group = signal.group();
     st.silences.iter().any(|s| {
         s.until_ms > now_ms
+            && (s.project_id.is_some() || s.group.is_some())
             && s.project_id.as_deref().is_none_or(|p| signal.project_id.as_deref() == Some(p))
             && s.group.as_deref().is_none_or(|g| g == group)
     })
@@ -204,7 +208,8 @@ pub fn apply(
     now: LocalTime,
 ) -> Outcome {
     let now_ms = now.epoch_ms;
-    let quiet = now.within(cfg.quiet_window());
+    // O silêncio de tudo vale como o horário de silêncio: o urgente sai sem som, o resto vai ao resumo.
+    let quiet = now.within(cfg.quiet_window()) || super::silence::global_until(st, now_ms).is_some();
     let filter = &cfg.filter;
     let mut out = Outcome { changed: st.prune_expired(now_ms), journal: Vec::new() };
 

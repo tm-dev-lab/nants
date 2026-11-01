@@ -1021,6 +1021,7 @@
   font: var(--fs-control) var(--font-sans);
   color: var(--ink2);
   cursor: pointer;
+  overflow-wrap: anywhere;
 }
 
 /* --- Primeiros passos --- */

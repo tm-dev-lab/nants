@@ -1,11 +1,15 @@
 //! Gravação dos Ajustes e das Regras do Nanty (spec 138 T11), pela janela:
 //!
 //! - `PUT /api/nanty/config`: só os campos enviados mudam (os ausentes ficam como estão). Os
-//!   campos são os da aba Ajustes: modelo e esforço, orçamento do dia, horários, projetos
-//!   excluídos, reserva por papel, voz e a espera do Telegram com a aba aberta. O token, o chat e o
-//!   dono do Telegram **nunca** passam por aqui (`deny_unknown_fields`): só pelas rotas do canal
-//!   ([`super::telegram::api`]). O idioma também não: ele segue o da interface (C-08,
-//!   `server::lang`);
+//!   campos são os da aba Ajustes: modelo e esforço, orçamento do dia, horários, o idioma próprio do
+//!   Nanty (`language`: `follow`, `pt-BR` ou `en`, spec 139 T05), projetos excluídos, reserva por
+//!   papel, voz e a espera do Telegram com a aba aberta. A voz (spec 139 T07) é só do Gemini: uma
+//!   conexão (`connection_id`) para falar e transcrever, os modelos (`speech_model`,
+//!   `transcribe_model`) e a voz (`voice`); vazio volta ao inicial. A forma antiga (`order`,
+//!   `transcribe`) saiu na T09 e é recusada como campo desconhecido. O token, o chat e o dono do
+//!   Telegram **nunca** passam por aqui (`deny_unknown_fields`): só pelas rotas do canal
+//!   ([`super::telegram::api`]). O idioma da interface lembrado (`lang`) também não: ele segue o da
+//!   interface (C-08, `server::lang`);
 //! - `PUT /api/nanty/actions/:id`: `{level}` com `off`, `ask` ou `auto`, por id do catálogo (C-02).
 //!   Só as ações que o Nanty executa mudam de nível; a faixa "só a pessoa" fica travada.
 //!
@@ -26,7 +30,10 @@ use super::actions::{self, ActionKind};
 use super::voice;
 use super::api::{config_json, parse_json};
 use super::Part;
-use crate::config::{parse_hhmm, ActionLevel, Config, ConnectionKind, DigestEmpty, Effort, NantyConfig, NantyRoute, VoiceRoute};
+use crate::config::{
+    parse_hhmm, ActionLevel, Config, DigestEmpty, Effort, NantyConfig, NantyLanguage, NantyRoute, NantyVoice, DEFAULT_GEMINI_TTS_MODEL,
+    DEFAULT_GEMINI_VOICE, DEFAULT_TRANSCRIBE_MODEL,
+};
 use crate::server::config_api::{persist, spawn_pricing_autofill, validate_text_field};
 use crate::server::error::{params, ApiError};
 use crate::server::events::validate_project_id;
@@ -40,8 +47,6 @@ pub const MAX_BUDGET_TOKENS: u64 = 100_000_000;
 pub const VOICE_INPUT_SECS: std::ops::RangeInclusive<u64> = 5..=1800;
 /// Teto da espera do Telegram com a aba aberta, em segundos.
 pub const MAX_VISIBLE_HOLD_SECS: u64 = 3600;
-/// Passos da voz, no máximo (fora o texto, que é sempre o último).
-pub const MAX_VOICE_STEPS: usize = 5;
 /// Projetos excluídos, no máximo.
 pub const MAX_EXCLUDED: usize = 500;
 /// Papéis com reserva.
@@ -56,20 +61,13 @@ struct RouteInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct VoiceRouteInput {
-    connection_id: String,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    voice: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct VoiceInput {
     enabled: Option<bool>,
-    order: Option<Vec<VoiceRouteInput>>,
-    transcribe: Option<RouteInput>,
+    /// A conexão do Gemini que fala e transcreve; vazia = automática.
+    connection_id: Option<String>,
+    speech_model: Option<String>,
+    voice: Option<String>,
+    transcribe_model: Option<String>,
     max_input_secs: Option<u64>,
 }
 
@@ -93,6 +91,8 @@ struct ConfigInput {
     quiet_end: Option<String>,
     digest_time: Option<String>,
     digest_empty: Option<DigestEmpty>,
+    /// O idioma próprio do Nanty (spec 139 T05): `follow`, `pt-BR` ou `en`.
+    language: Option<String>,
     excluded_projects: Option<Vec<String>>,
     reserve: Option<BTreeMap<String, RouteInput>>,
     voice: Option<VoiceInput>,
@@ -104,21 +104,61 @@ fn invalid(field: &str) -> ApiError {
     ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "nanty_config_invalid", params([("field", json!(field))]))
 }
 
-/// Conexão cadastrada e de um tipo que o caminho usa (a fala ou a transcrição, pelas regras de
-/// [`super::voice`]); outra é recusada com o campo.
-fn voice_connection(cfg: &Config, field: &str, id: &str, usable: fn(ConnectionKind) -> bool) -> Result<String, ApiError> {
-    let id = connection(cfg, field, id, true)?;
-    if id.is_empty() || cfg.connections.iter().any(|c| c.id == id && usable(c.kind)) {
+/// Conexão vazia (automática) ou cadastrada e do Google Gemini, que fala e transcreve (as regras
+/// `speaks` e `transcribes` de [`super::voice`]); outra é recusada com o campo.
+fn voice_connection(cfg: &Config, field: &str, id: &str) -> Result<String, ApiError> {
+    let id = connection(cfg, field, id)?;
+    if id.is_empty() || cfg.connections.iter().any(|c| c.id == id && voice::voice_capable(c.kind)) {
         Ok(id)
     } else {
         Err(invalid(field))
     }
 }
 
+/// Modelo ou voz da fala: vazio volta ao inicial; com valor, o nome que vai na URL e no corpo.
+fn voice_name(field: &str, value: &str, default: &str) -> Result<String, ApiError> {
+    let value = text(field, value)?;
+    if value.is_empty() {
+        return Ok(default.to_string());
+    }
+    if voice::provider::valid_name(&value) {
+        Ok(value)
+    } else {
+        Err(invalid(field))
+    }
+}
+
+/// Aplica a voz do pedido.
+fn apply_voice(cfg: &Config, current: &NantyVoice, input: VoiceInput) -> Result<NantyVoice, ApiError> {
+    let mut v = current.clone();
+    if let Some(enabled) = input.enabled {
+        v.enabled = enabled;
+    }
+    if let Some(id) = input.connection_id {
+        v.connection_id = voice_connection(cfg, "voice.connection_id", &id)?;
+    }
+    if let Some(model) = input.speech_model {
+        v.speech_model = voice_name("voice.speech_model", &model, DEFAULT_GEMINI_TTS_MODEL)?;
+    }
+    if let Some(name) = input.voice {
+        v.voice = voice_name("voice.voice", &name, DEFAULT_GEMINI_VOICE)?;
+    }
+    if let Some(model) = input.transcribe_model {
+        v.transcribe_model = voice_name("voice.transcribe_model", &model, DEFAULT_TRANSCRIBE_MODEL)?;
+    }
+    if let Some(secs) = input.max_input_secs {
+        if !VOICE_INPUT_SECS.contains(&secs) {
+            return Err(invalid("voice.max_input_secs"));
+        }
+        v.max_input_secs = secs;
+    }
+    Ok(v)
+}
+
 /// Conexão vazia (sem) ou cadastrada.
-fn connection(cfg: &Config, field: &str, id: &str, allow_empty: bool) -> Result<String, ApiError> {
+fn connection(cfg: &Config, field: &str, id: &str) -> Result<String, ApiError> {
     let id = id.trim();
-    if id.is_empty() && allow_empty {
+    if id.is_empty() {
         return Ok(String::new());
     }
     if cfg.connections.iter().any(|c| c.id == id) {
@@ -143,7 +183,7 @@ fn clock(field: &str, value: &str) -> Result<String, ApiError> {
 fn apply(cfg: &Config, input: ConfigInput) -> Result<NantyConfig, ApiError> {
     let mut n = cfg.nanty.clone();
     if let Some(id) = input.connection_id {
-        n.connection_id = connection(cfg, "connection_id", &id, true)?;
+        n.connection_id = connection(cfg, "connection_id", &id)?;
     }
     if let Some(model) = input.model {
         n.model = text("model", &model)?;
@@ -175,6 +215,9 @@ fn apply(cfg: &Config, input: ConfigInput) -> Result<NantyConfig, ApiError> {
     if let Some(v) = input.digest_empty {
         n.digest_empty = v;
     }
+    if let Some(v) = input.language {
+        n.language = NantyLanguage::parse(&v).ok_or_else(|| invalid("language"))?;
+    }
     if let Some(list) = input.excluded_projects {
         if list.len() > MAX_EXCLUDED {
             return Err(invalid("excluded_projects"));
@@ -195,7 +238,7 @@ fn apply(cfg: &Config, input: ConfigInput) -> Result<NantyConfig, ApiError> {
                 return Err(invalid("reserve"));
             }
             let field = format!("reserve.{role}");
-            let conn = connection(cfg, &field, &route.connection_id, true)?;
+            let conn = connection(cfg, &field, &route.connection_id)?;
             if conn.is_empty() {
                 continue;
             }
@@ -208,37 +251,7 @@ fn apply(cfg: &Config, input: ConfigInput) -> Result<NantyConfig, ApiError> {
         n.reserve = out;
     }
     if let Some(voice) = input.voice {
-        if let Some(enabled) = voice.enabled {
-            n.voice.enabled = enabled;
-        }
-        if let Some(order) = voice.order {
-            if order.len() > MAX_VOICE_STEPS {
-                return Err(invalid("voice.order"));
-            }
-            let mut out = Vec::new();
-            for step in order {
-                out.push(VoiceRoute {
-                    connection_id: {
-                        let id = connection(cfg, "voice.order", &step.connection_id, false)?;
-                        voice_connection(cfg, "voice.order", &id, voice::speaks)?
-                    },
-                    model: text("model", &step.model)?,
-                    voice: text("voice", &step.voice)?,
-                });
-            }
-            n.voice.order = out;
-        }
-        if let Some(route) = voice.transcribe {
-            let conn = voice_connection(cfg, "voice.transcribe", &route.connection_id, voice::transcribes)?;
-            let model = if conn.is_empty() { String::new() } else { text("model", &route.model)? };
-            n.voice.transcribe = NantyRoute { connection_id: conn, model };
-        }
-        if let Some(secs) = voice.max_input_secs {
-            if !VOICE_INPUT_SECS.contains(&secs) {
-                return Err(invalid("voice.max_input_secs"));
-            }
-            n.voice.max_input_secs = secs;
-        }
+        n.voice = apply_voice(cfg, &n.voice, voice)?;
     }
     if let Some(tg) = input.telegram {
         if let Some(hold) = tg.hold_while_visible {

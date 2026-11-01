@@ -71,8 +71,11 @@ async fn commands_are_published_per_language_when_the_bot_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_reply_goes_where_the_person_wrote() {
-    let reply = r#"{"summary": "Tudo calmo na Loja.", "actions": []}"#;
-    let (w, fake) = world("t08-channel", FakeModel::new(&[reply, reply])).await;
+    let reply = "Tudo calmo na Loja.";
+    // Spec 139 T06: com modelo, o `/status` também é escrito por ele (o turno com a entrada
+    // estruturada e a resposta em JSON).
+    let status = r#"{"summary": "Nada espera você agora, está tudo calmo.", "actions": []}"#;
+    let (w, fake) = world("t08-channel", FakeModel::new(&[status, reply, reply])).await;
     let _out = start_outbox(&w);
     // Uma aba visível segura os avisos, mas não a resposta a quem escreveu no Telegram.
     w.state.nanty().telegram().outbox().presence("aba1", true, crate::server::nanty::clock::now_ms());
@@ -80,7 +83,7 @@ async fn the_reply_goes_where_the_person_wrote() {
     fake.push(owner_text(50, "/status"));
     until("resposta ao comando", || sends(&fake).len() == 1).await;
     let text = sends(&fake)[0]["text"].as_str().unwrap_or_default().to_string();
-    assert!(text.starts_with(&tr(Lang::PtBr, "nanty.chat.status", &[("waiting", "0"), ("done", "0"), ("planned", "1")])), "{text}");
+    assert_eq!(text, "Nada espera você agora, está tudo calmo.");
 
     fake.push(owner_text(51, "como está a Loja?"));
     until("resposta do modelo", || sends(&fake).len() == 2).await;
@@ -88,7 +91,7 @@ async fn the_reply_goes_where_the_person_wrote() {
 
     // A mesma conversa pela janela: a resposta fica nela.
     let secrets = w.state.secret_set().await;
-    let person = conversation::person_message(w.state.nanty(), &secrets, Channel::Web, "e a Loja agora?").expect("mensagem");
+    let person = conversation::person_message(w.state.nanty(), &w.state.config().read().await.nanty.clone(), &secrets, Channel::Web, "e a Loja agora?").expect("mensagem");
     let answer = conversation::reply(&w.state, &person).await.expect("resposta");
     assert_eq!((answer.channel, answer.reply_to.as_deref()), (Channel::Web, Some(person.id.as_str())));
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -109,6 +112,30 @@ async fn the_reply_goes_where_the_person_wrote() {
         ]
     );
     assert_eq!(render::message_text(Lang::PtBr, &conv[5]), "Tudo calmo na Loja.");
+}
+
+/// Spec 139 T05: o `language_code` do dono é lido e, sem sinal no texto nem histórico, decide o
+/// idioma da resposta; o texto enviado é o do idioma gravado na mensagem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owner_language_code_decides_when_the_text_does_not() {
+    let (w, fake) = world("t08-langcode", FakeModel::new(&[])).await;
+    let _out = start_outbox(&w);
+    let mut update = owner_text(70, "/status");
+    update["message"]["from"]["language_code"] = json!("en");
+    fake.push(update);
+    until("resposta", || sends(&fake).len() == 1).await;
+    assert_eq!(w.state.nanty().snapshot().telegram_lang.as_deref(), Some("en"));
+    let conv = w.state.nanty().conversation();
+    let answer = conv.iter().rev().find(|m| m.from == Speaker::Nanty).expect("resposta");
+    assert_eq!(answer.lang.as_deref(), Some("en"));
+    let text = sends(&fake)[0]["text"].as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with(&tr(Lang::En, "nanty.chat.status", &[])), "{text}");
+    // O texto em português vence o `language_code`.
+    let mut update = owner_text(71, "/silencio 0");
+    update["message"]["from"]["language_code"] = json!("en");
+    fake.push(update);
+    until("segunda resposta", || sends(&fake).len() == 2).await;
+    assert_eq!(sends(&fake)[1]["text"], json!(tr(Lang::PtBr, "nanty.chat.silence_off", &[])));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -134,5 +161,43 @@ async fn pause_from_telegram_sends_the_card_and_only_the_click_stops() {
     fake.push(click_on(61, OWNER, OWNER, message_id, &callback_data(&card.id, &token, Answer::Yes)));
     until("parado", || guard.stop_signal().requested()).await;
     until("resposta ao clique", || !fake.calls("answerCallbackQuery").is_empty()).await;
-    assert_eq!(fake.calls("answerCallbackQuery")[0].0["text"], json!(tr(Lang::PtBr, "nanty.outcome.done", &[])));
+    // Spec 139 T05: a pessoa falou em inglês (`/pause`), e o Nanty segue a conversa.
+    assert_eq!(fake.calls("answerCallbackQuery")[0].0["text"], json!(tr(Lang::En, "nanty.outcome.done", &[])));
+}
+
+/// Spec 139 T03 (C-09): enquanto o laço roda, o "digitando" vai a quem escreveu pelo Telegram,
+/// renovado no ritmo da fila e sempre antes da resposta; quem escreveu na janela não dispara nenhum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_is_renewed_while_the_loop_runs_only_for_telegram() {
+    use crate::server::nanty::agent::tests::{call, say, Scripted};
+    let model = Scripted::new(vec![
+        call("system_status", json!({})).after(Duration::from_millis(450)),
+        say("Tudo certo por aqui.").after(Duration::from_millis(450)),
+        say("Na janela também."),
+    ]);
+    let (w, fake) = world("t08-typing", FakeModel::new(&[])).await;
+    w.state.nanty().set_backend(model as std::sync::Arc<dyn ChatBackend>);
+    let _out = start_outbox(&w);
+    fake.push(owner_text(70, "como vai a máquina?"));
+    until("resposta", || sends(&fake).len() == 1).await;
+    assert_eq!(sends(&fake)[0]["text"], "Tudo certo por aqui.");
+    let typing = fake.calls("sendChatAction");
+    assert!(typing.len() >= 3, "renovado enquanto o laço roda: {}", typing.len());
+    for (body, _) in &typing {
+        assert_eq!((body["action"].as_str(), body["chat_id"].as_i64()), (Some("typing"), Some(OWNER)), "{body}");
+    }
+    let gap = w.state.nanty().telegram().tuning().typing_every;
+    for pair in typing.windows(2) {
+        assert!(pair[1].1.duration_since(pair[0].1) + Duration::from_millis(30) >= gap, "no ritmo da renovação");
+    }
+    let reply_at = fake.calls("sendMessage")[0].1;
+    assert!(typing.iter().all(|(_, at)| *at <= reply_at), "o digitando para antes da resposta");
+
+    let before = fake.calls("sendChatAction").len();
+    let secrets = w.state.secret_set().await;
+    let person = conversation::person_message(w.state.nanty(), &w.state.config().read().await.nanty.clone(), &secrets, Channel::Web, "e na janela?").expect("mensagem");
+    let answer = conversation::reply(&w.state, &person).await.expect("resposta");
+    assert_eq!(answer.text.as_deref(), Some("Na janela também."));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fake.calls("sendChatAction").len(), before, "a janela não dispara o digitando");
 }

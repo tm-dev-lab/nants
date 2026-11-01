@@ -49,6 +49,7 @@ use super::plan_consensus::{
     OUTCOME_INTERRUPTED, OUTCOME_OPEN, OUTCOME_SHUTDOWN, OUTCOME_UNAVAILABLE,
 };
 use super::projects::{ensure_local_excludes, format_utc, real_children, scrub_text};
+use super::recovery::missing_program_code;
 use super::report::{exclude_guaranteed, wait_shutdown};
 use super::safe_fs::{self, MAX_READ_BYTES, O_NOFOLLOW};
 use super::spec_result::validate_spec_id;
@@ -61,7 +62,7 @@ use crate::agents::runner::{section_text, ACCEPTANCE};
 use crate::config::Effort;
 use crate::sdd::capabilities;
 use crate::sdd::environment::sha256_hex;
-use crate::sdd::{Spec, SpecStatus};
+use crate::sdd::{Spec, SpecStatus, TaskStatus};
 
 /// Nome do arquivo do resultado, dentro de `.sdd/specs/<id>/`.
 pub const PLAN_REVIEW_FILE: &str = "plan-review.json";
@@ -75,26 +76,35 @@ pub const MAX_ISSUES: usize = 8;
 /// Teto do texto de cada apontamento (bytes, depois da redação).
 pub const MAX_ISSUE_TEXT_BYTES: usize = 300;
 /// Tipos aceitos de apontamento.
-pub const ISSUE_KINDS: [&str; 6] = ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", TOO_LARGE];
+pub const ISSUE_KINDS: [&str; 7] =
+    ["contradiction", "untestable", "scope", "uncovered_criterion", "missing_dependency", INFEASIBLE_TEST_COMMAND, TOO_LARGE];
 /// Tarefa grande demais para uma revisão (spec 124 T06): o modelo aponta as áreas misturadas e o
 /// servidor completa, de forma determinística, as de muitos critérios ([`MANY_CRITERIA`]).
 pub const TOO_LARGE: &str = "too_large";
+/// Etapa da bateria que só fica executável depois da primeira tarefa que roda o comando (spec 139
+/// T11, C-21): julgamento do modelo, sem lista de ferramentas no código. É um apontamento como os
+/// demais: passa pelo Arquiteto no consenso e não trava a aprovação.
+pub const INFEASIBLE_TEST_COMMAND: &str = "infeasible_test_command";
+/// Tarefa bloqueada com a saída 126/127 medida pelo runner numa etapa da bateria do plano revisado
+/// (spec 139 T11, C-21): o único erro de forma objetivo. Ponto só do servidor, fora do vocabulário
+/// do modelo ([`ISSUE_KINDS`]), lido da evidência já gravada, sem rodar nada. Não trava a aprovação.
+pub const COMMAND_NOT_RUNNABLE: &str = "command_not_runnable";
 /// Documento da base mencionado pelo usuário na sessão do plano que o plano não cita (spec 136
 /// T05, C-03): ponto só do servidor, determinístico, fora do vocabulário do modelo
 /// ([`ISSUE_KINDS`]). O Arquiteto aceita (passa a citar) ou recusa com o motivo, como os demais.
 pub const MENTIONED_UNUSED: &str = "mentioned_unused";
-/// Documentos listados no ponto [`MENTIONED_UNUSED`]; o resto vira "+N".
-const MAX_UNUSED_LISTED: usize = 4;
+/// Itens listados nos pontos [`MENTIONED_UNUSED`] e [`COMMAND_NOT_RUNNABLE`]; o resto vira "+N".
+const MAX_POINT_LISTED: usize = 4;
 
-/// Apontamento que o servidor completa e que nunca cede a vaga a outro (`too_large` e
-/// [`MENTIONED_UNUSED`]).
+/// Apontamento que o servidor completa e que nunca cede a vaga a outro (`too_large`,
+/// [`MENTIONED_UNUSED`] e [`COMMAND_NOT_RUNNABLE`]).
 fn server_kind(kind: &str) -> bool {
-    kind == TOO_LARGE || kind == MENTIONED_UNUSED
+    kind == TOO_LARGE || kind == MENTIONED_UNUSED || kind == COMMAND_NOT_RUNNABLE
 }
 
 /// Tipo de apontamento conhecido na leitura: os do modelo e os só do servidor.
 fn known_kind(kind: &str) -> bool {
-    ISSUE_KINDS.contains(&kind) || kind == MENTIONED_UNUSED
+    ISSUE_KINDS.contains(&kind) || kind == MENTIONED_UNUSED || kind == COMMAND_NOT_RUNNABLE
 }
 
 pub const STATUS_OK: &str = "ok";
@@ -114,6 +124,8 @@ pub const DETAIL_TIMEOUT: &str = "tempo esgotado";
 pub const DETAIL_INVALID_JSON: &str = "JSON inválido";
 
 const SPECS_REL: &str = ".sdd/specs";
+/// Título do bloco do plano com as etapas da bateria, citado pelo prompt da revisão.
+const BATTERY_HEADING: &str = "### Comandos de teste da bateria (lidos pelo servidor)";
 /// Limites do plano enviado ao modelo.
 const MAX_SPEC_BYTES: usize = 24 * 1024;
 const MAX_TASK_BYTES: usize = 8 * 1024;
@@ -1080,7 +1092,7 @@ async fn review_once(
 ) -> Result<Reviewed, Stop> {
     let secrets = state.secret_set().await;
     let (plan_root, sid, plan_secrets) = (root.to_path_buf(), spec_id.to_string(), Arc::clone(&secrets));
-    let (signature, plan, sizes, dep_cycle, unused) = tokio::task::spawn_blocking(move || {
+    let (signature, plan, sizes, dep_cycle, unused, not_runnable) = tokio::task::spawn_blocking(move || {
         let plan = build_plan(&plan_root, &sid, &plan_secrets)?;
         // Spec 136 T05 (C-03): mencionados na sessão do plano e não citados no plano.
         let turns = super::chat::read_session_turns(&plan_root);
@@ -1091,6 +1103,7 @@ async fn review_once(
             task_sizes(&plan_root, &sid),
             plan_cycle(&plan_root, &sid),
             unused,
+            measured_not_runnable(&plan_root, &battery_steps(&plan_root, &sid, &plan_secrets)),
         ))
     })
     .await
@@ -1150,7 +1163,10 @@ async fn review_once(
     let lang = state.project_lang(project_id).get();
     let items = match answer {
         Ok(raw) => match parse_review(&raw, &secrets) {
-            Some(found) => Ok(with_cycle_items(with_mention_items(with_size_items(found, &sizes, lang), &unused, lang), &dep_cycle, lang)),
+            Some(found) => {
+                let found = with_mention_items(with_size_items(found, &sizes, lang), &unused, lang);
+                Ok(with_cycle_items(with_not_runnable_items(found, &not_runnable, &cycle.points, lang), &dep_cycle, lang))
+            }
             None => Err(DETAIL_INVALID_JSON.to_string()),
         },
         Err(why) => Err(why),
@@ -1214,17 +1230,98 @@ fn with_mention_items(mut items: Vec<ReviewItem>, unused: &[(String, String)], l
     if unused.is_empty() {
         return items;
     }
-    let mut docs: Vec<String> = unused.iter().take(MAX_UNUSED_LISTED).map(|(id, title)| format!("kb:{id} (\"{title}\")")).collect();
-    if unused.len() > MAX_UNUSED_LISTED {
-        docs.push(format!("+{}", unused.len() - MAX_UNUSED_LISTED));
-    }
-    let text = crate::i18n::tr(lang, "plan_review.mentioned_unused", &[("docs", &docs.join(", "))]);
+    let docs = listed(unused.iter().map(|(id, title)| format!("kb:{id} (\"{title}\")")).collect());
+    let text = crate::i18n::tr(lang, "plan_review.mentioned_unused", &[("docs", &docs)]);
     if items.len() >= MAX_ISSUES {
         // Cede a vaga o último apontamento do modelo (os do servidor ficam).
         let at = items.iter().rposition(|i| !server_kind(&i.issue.kind)).unwrap_or(items.len() - 1);
         items.remove(at);
     }
     items.push(ReviewItem { issue: PlanIssue::new(None, MENTIONED_UNUSED, &text), reference: None, new_argument: false });
+    items
+}
+
+/// Até [`MAX_POINT_LISTED`] itens, separados por vírgula; o resto vira "+N".
+fn listed(mut items: Vec<String>) -> String {
+    let rest = items.len().saturating_sub(MAX_POINT_LISTED);
+    items.truncate(MAX_POINT_LISTED);
+    if rest > 0 {
+        items.push(format!("+{rest}"));
+    }
+    items.join(", ")
+}
+
+/// Uma etapa da bateria do plano, redigida como a evidência: o que aparece no ponto e o que a
+/// identifica na evidência. Com várias etapas, é o trecho entre crases da nota do runner
+/// (`runner.tests.failed_step*`), igual nos dois idiomas; o comando de uma etapa não tem nota, e vale
+/// o texto do comando na saída.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatteryStep {
+    step: String,
+    mark: String,
+}
+
+/// As etapas dos comandos de teste que valem para o plano ([`battery_commands`]).
+fn battery_steps(root: &Path, spec_id: &str, secrets: &SecretSet) -> Vec<BatteryStep> {
+    let settings = safe_fs::read_regular(root, ".sdd/settings.yaml", MAX_READ_BYTES).ok().and_then(|t| crate::sdd::Settings::parse(&t).ok());
+    let spec = safe_fs::read_regular(root, &format!("{SPECS_REL}/{spec_id}/spec.md"), MAX_READ_BYTES).ok().and_then(|t| Spec::parse(&t).ok());
+    let (test, full) = battery_commands(settings.as_ref(), spec.as_ref());
+    let mut out = Vec::new();
+    for command in [test, full].into_iter().flatten() {
+        let steps = super::recovery::command_steps(&command).unwrap_or_else(|| vec![command.clone()]);
+        let several = steps.len() > 1;
+        for step in steps.iter().map(|s| scrub_text(secrets, s)) {
+            let mark = if several { format!("`{step}`") } else { step.clone() };
+            out.push(BatteryStep { step, mark });
+        }
+    }
+    out
+}
+
+/// Spec 139 T11: as tarefas bloqueadas do projeto cuja última rodada saiu com 126/127 numa etapa de
+/// `battery`, como `<spec>/<tarefa> (<código>): <etapa>`. Lê só a medição que o runner já gravou na
+/// evidência ([`missing_program_code`]): nada roda aqui, nenhum outro código conta, e a falha de
+/// outro comando não diz respeito a este plano.
+fn measured_not_runnable(root: &Path, battery: &[BatteryStep]) -> Vec<String> {
+    if safe_fs::check_chain(root, SPECS_REL).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for spec in real_children(&root.join(SPECS_REL), true).iter().filter(|s| !s.starts_with('.') && validate_spec_id(s).is_ok()) {
+        for name in task_names(root, spec) {
+            let Ok(raw) = safe_fs::read_regular(root, &format!("{SPECS_REL}/{spec}/tasks/{name}"), MAX_READ_BYTES) else { continue };
+            let Ok(task) = crate::sdd::Task::parse(&raw) else { continue };
+            let evidence = task.frontmatter.test_evidence.as_deref().unwrap_or_default();
+            let (TaskStatus::Blocked, Some(code)) = (task.frontmatter.status, missing_program_code(evidence)) else { continue };
+            // O cabeçalho é do Nants, não da saída.
+            let output = evidence.split_once('\n').map_or("", |(_, rest)| rest);
+            if let Some(found) = battery.iter().find(|b| output.contains(&b.mark)) {
+                out.push(format!("{spec}/{} ({code}): `{}`", task.frontmatter.id, found.step));
+            }
+        }
+    }
+    out
+}
+
+/// Completa os apontamentos com um [`COMMAND_NOT_RUNNABLE`] do servidor quando há saída 126/127
+/// medida ([`measured_not_runnable`]). Um ponto só, com a lista, como o [`MENTIONED_UNUSED`], e pelo
+/// mesmo motivo. Nunca é cortado: o último apontamento do modelo cede a vaga. Texto no idioma do
+/// projeto. A evidência não muda com o plano, então o ponto aceito em `points` com a mesma lista não
+/// volta: nenhum ajuste o tiraria, e cada rodada a mais seria paga à toa. O recusado volta e fica em
+/// disputa pelo [`Cycle::classify`], sem outra rodada.
+fn with_not_runnable_items(mut items: Vec<ReviewItem>, measured: &[String], points: &[PlanPoint], lang: crate::i18n::Lang) -> Vec<ReviewItem> {
+    if measured.is_empty() {
+        return items;
+    }
+    let text = crate::i18n::tr(lang, "plan_review.command_not_runnable", &[("tasks", &listed(measured.to_vec()))]);
+    if points.iter().any(|p| p.kind == COMMAND_NOT_RUNNABLE && p.text == text && p.decision.as_deref() == Some(DECISION_ACCEPT)) {
+        return items;
+    }
+    if items.len() >= MAX_ISSUES {
+        let at = items.iter().rposition(|i| !server_kind(&i.issue.kind)).unwrap_or(items.len() - 1);
+        items.remove(at);
+    }
+    items.push(ReviewItem { issue: PlanIssue::new(None, COMMAND_NOT_RUNNABLE, &text), reference: None, new_argument: false });
     items
 }
 
@@ -1358,16 +1455,49 @@ fn build_plan(root: &Path, spec_id: &str, secrets: &SecretSet) -> Option<String>
     }
     // Spec 124 T04: o que o ambiente de testes prova (critério que depende de capacidade ausente
     // vira verificação manual ou é apontado).
-    let host = safe_fs::read_regular(root, ".sdd/settings.yaml", MAX_READ_BYTES)
+    let settings = safe_fs::read_regular(root, ".sdd/settings.yaml", MAX_READ_BYTES)
         .ok()
-        .and_then(|t| crate::sdd::Settings::parse(&t).ok())
-        .is_some_and(|s| s.environment.is_host());
+        .and_then(|t| crate::sdd::Settings::parse(&t).ok());
+    let host = settings.as_ref().is_some_and(|s| s.environment.is_host());
+    // Spec 139 T11: as etapas da bateria, para o modelo dizer qual tarefa torna cada uma executável.
+    out.push_str(&battery_section(settings.as_ref(), Spec::parse(&spec).ok().as_ref(), secrets));
     let caps = capabilities::current(root, host, || format_utc(unix_now()));
     let section = capabilities::prompt_section(&caps, capabilities::Audience::Plan);
     if !section.is_empty() {
         out.push_str(&format!("\n{}", scrub_text(secrets, &section)));
     }
     Some(out)
+}
+
+/// Comandos de teste que vão valer quando o plano for aprovado (spec 139 T11), pela regra da
+/// aprovação: o `test_command` da configuração, ou o da spec com a configuração vazia; o
+/// `full_test_command` da spec, ou o da configuração.
+fn battery_commands(settings: Option<&crate::sdd::Settings>, spec: Option<&Spec>) -> (Option<String>, Option<String>) {
+    let test = settings
+        .map(|s| s.test_command.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .or_else(|| spec.and_then(|s| s.frontmatter.valid_test_command()));
+    let full = spec.and_then(|s| s.frontmatter.full_test_command.clone()).or_else(|| settings.and_then(|s| s.full_test_command.clone()));
+    (test, full)
+}
+
+/// Bloco do plano com cada etapa `&&` dos comandos de teste (spec 139 T11), pelo mesmo analisador do
+/// runner; comando que ele não divide é uma etapa só. Vazio sem comando. Texto para o modelo.
+fn battery_section(settings: Option<&crate::sdd::Settings>, spec: Option<&Spec>, secrets: &SecretSet) -> String {
+    let (test, full) = battery_commands(settings, spec);
+    let mut lines = String::new();
+    for (name, when, command) in [("test_command", "a cada entrega de cada tarefa", test), ("full_test_command", "antes da revisão de cada tarefa", full)] {
+        let Some(command) = command else { continue };
+        let steps = super::recovery::command_steps(&command).unwrap_or_else(|| vec![command.clone()]);
+        lines.push_str(&format!("- {name}, roda {when}:\n"));
+        for (k, step) in steps.iter().enumerate() {
+            lines.push_str(&format!("  - etapa {} de {}: `{}`\n", k + 1, steps.len(), scrub_text(secrets, step)));
+        }
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    format!("\n{BATTERY_HEADING}\n{lines}")
 }
 
 /// Tamanho de uma tarefa do plano: critérios de aceitação contados, o peso deles com a densidade

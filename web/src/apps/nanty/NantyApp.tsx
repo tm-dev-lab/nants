@@ -23,7 +23,7 @@ import { NantyAvatar } from "./NantyAvatar";
 import type { NantyCard } from "./nantyApi";
 import { NantyChat } from "./NantyChat";
 import { NantyFeedView } from "./NantyFeed";
-import { linkWindow, NANTY_MOOD_LABELS, NANTY_TAB_LABELS, NANTY_TABS, nantyMood, nantyTabByKey, type NantyTab } from "./nantyModel";
+import { chatCards, linkWindow, NANTY_MOOD_LABELS, NANTY_TAB_LABELS, NANTY_TABS, nantyMood, nantyTabByKey, type NantyTab } from "./nantyModel";
 import { NantyRules } from "./NantyRules";
 import { NantySettingsView } from "./NantySettings";
 import { consumeNantyTabRequest, useNanty, useNantyConversation, useNantyTabRequest } from "./nantyStore";
@@ -82,7 +82,7 @@ function FeedTab({ split, onSettings }: { split: boolean; onSettings: () => void
           />
         </div>
       ) : null}
-      {showChat ? <NantyChat messages={messages} cards={feed?.waiting ?? []} decisions={decisions} readOnly={status?.instance === "other_instance"} /> : null}
+      {showChat ? <NantyChat messages={messages} cards={chatCards(feed)} decisions={decisions} readOnly={status?.instance === "other_instance"} /> : null}
     </div>
   );
 }
