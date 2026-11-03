@@ -92,7 +92,7 @@ impl World {
     async fn tool(&self, lang: Lang, name: &str, args: Value) -> String {
         let cfg = self.state.config().read().await.clone();
         let secrets = self.state.secret_set().await;
-        let mut session = Session::new(Channel::Web, false, lang);
+        let mut session = Session::new(Channel::Web, Default::default(), lang);
         let call = ToolCall { id: "c1".into(), name: name.into(), arguments: args.to_string() };
         tools::call(&self.state, &self.nanty(), &cfg, lang, &secrets, &call, &mut session).await
     }
@@ -310,7 +310,7 @@ fn the_digest_with_model_text_keeps_the_short_sentence_and_the_why_of_held_notic
 #[tokio::test]
 async fn status_and_summary_are_written_by_the_model_from_the_same_facts() {
     let status_reply = r#"{"summary": "Por aqui está calmo: nada espera você, e o Test 14 segue pausado.", "actions": []}"#;
-    let summary_reply = r#"{"summary": "Agora o Test 14 é o único que pede atenção.", "actions": ["open_nants"]}"#;
+    let summary_reply = r#"{"summary": "Agora o Test 14 é o único que pede atenção.", "actions": []}"#;
     let model = FakeModel::new(&[status_reply, summary_reply]);
     let w = World::new("commands", Some(Arc::clone(&model) as Arc<dyn ChatBackend>), |_| {});
     let observed = super::observe::observe_projects(&w.state, &w.state.config().read().await.clone()).await.expect("observou");
@@ -322,7 +322,7 @@ async fn status_and_summary_are_written_by_the_model_from_the_same_facts() {
     assert_eq!(status.lang.as_deref(), Some("pt-BR"));
     let summary = w.say("/resumo").await;
     assert_eq!((summary.code.as_deref(), summary.text.as_deref()), (None, Some("Agora o Test 14 é o único que pede atenção.")));
-    assert_eq!(summary.actions, ["open_nants"]);
+    assert!(summary.actions.is_empty());
 
     let requests = model.requests();
     assert_eq!(requests.len(), 2);

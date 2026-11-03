@@ -881,6 +881,39 @@ export function getChatHistory(projectId: string): Promise<ApiResult<ChatHistory
   });
 }
 
+/**
+ * Rascunho que o Nanty deixou na caixa do Arquiteto (spec 140 T15): o texto que a pessoa revê e envia;
+ * `marked` quando veio de uma conversa que leu conteúdo não confiável (o envio sai sem internet).
+ */
+export interface ArchitectDraft {
+  id: string;
+  text: string;
+  marked: boolean;
+}
+
+const DRAFT_ID = /^[0-9a-f]{16}$/;
+/** Teto do texto lido: o de uma mensagem do Arquiteto. */
+const DRAFT_MAX_CHARS = 8000;
+
+/** GET /api/projects/:id/chat/draft: o rascunho pendente, ou `null`. */
+export function getArchitectDraft(projectId: string): Promise<ApiResult<ArchitectDraft | null>> {
+  return request<unknown>({ method: "GET", path: `/api/projects/${enc(projectId)}/chat/draft` }).then((r) => {
+    const result = asObject<{ draft?: unknown }>(r);
+    if (!result.ok) return result;
+    const raw = result.data.draft;
+    if (raw === null || raw === undefined) return { ok: true, data: null };
+    if (!isRecord(raw) || typeof raw.id !== "string" || !DRAFT_ID.test(raw.id) || typeof raw.text !== "string" || typeof raw.marked !== "boolean") {
+      return fail("invalid_response", 200, INVALID_RESPONSE_KEY);
+    }
+    return { ok: true, data: { id: raw.id, text: raw.text.slice(0, DRAFT_MAX_CHARS), marked: raw.marked } };
+  });
+}
+
+/** POST /api/projects/:id/chat/draft/discard: a pessoa descarta o rascunho. */
+export function discardArchitectDraft(projectId: string, id: string): Promise<ApiResult<unknown>> {
+  return request<unknown>({ method: "POST", path: `/api/projects/${enc(projectId)}/chat/draft/discard`, body: JSON.stringify({ id }) });
+}
+
 /** Identidade de turno aceita: hex minúsculo de 1 a 64 caracteres. Qualquer outra vira ausente. */
 const TURN_ID_PATTERN = /^[0-9a-f]{1,64}$/;
 
@@ -1130,11 +1163,13 @@ function chatHttpError(status: number, body: unknown): ApiFailure | null {
 export function postChat(
   projectId: string,
   message: string,
-  options: { internal?: boolean; signal?: AbortSignal; attachments?: readonly string[] } = {},
+  options: { internal?: boolean; signal?: AbortSignal; attachments?: readonly string[]; nantyDraft?: string } = {},
 ): Promise<ApiResult<ChatReply>> {
-  const body: { message: string; internal?: boolean; attachments?: readonly string[] } =
+  const body: { message: string; internal?: boolean; attachments?: readonly string[]; nanty_draft?: string } =
     options.internal === true ? { message, internal: true } : { message };
   if (options.attachments !== undefined && options.attachments.length > 0) body.attachments = options.attachments;
+  // Spec 140 T15: o rascunho do Nanty que a pessoa enviou; o servidor decide a marca pelo guardado.
+  if (options.nantyDraft !== undefined) body.nanty_draft = options.nantyDraft;
   return request<ChatReply>({
     method: "POST",
     path: `/api/projects/${enc(projectId)}/chat`,

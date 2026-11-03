@@ -45,6 +45,10 @@ export interface NantyDraft {
   max_input_secs: string;
   hold_while_visible: boolean;
   visible_hold_secs: string;
+  /** O endereço do Nants que o celular alcança (spec 140 T03); o servidor o confere ao gravar. */
+  address: string;
+  /** O cenário proativo nos avisos importantes (spec 140 T12). */
+  proactive: boolean;
 }
 
 const EMPTY_ROUTE: NantyRoute = { connection_id: "", model: "" };
@@ -73,6 +77,8 @@ export function draftOf(s: NantySettings): NantyDraft {
     max_input_secs: String(s.voice.max_input_secs),
     hold_while_visible: s.telegram.hold_while_visible,
     visible_hold_secs: String(s.telegram.visible_hold_secs),
+    address: s.address,
+    proactive: s.analysis.proactive,
   };
 }
 
@@ -140,7 +146,39 @@ export function settingsPatch(saved: NantySettings, d: NantyDraft): NantySetting
   const hold = Number(d.visible_hold_secs.trim());
   if (hold !== saved.telegram.visible_hold_secs) telegram.visible_hold_secs = hold;
   if (Object.keys(telegram).length > 0) patch.telegram = telegram;
+  if (d.address.trim() !== base.address) patch.address = d.address.trim();
+  if (d.proactive !== base.proactive) patch.analysis = { proactive: d.proactive };
   return patch;
+}
+
+/**
+ * O provedor que recebe o texto do cenário (spec 140 T12, C-12): a marca das conexões nativas, o
+ * plano ChatGPT ou, na conexão por chave, o endereço dela (o nome do servidor). `null` = o endereço
+ * não se lê: a tela diz "endereço próprio".
+ */
+export function providerOf(c: ConnectionView): { kind: "brand"; name: string } | { kind: "plan" } | { kind: "host"; name: string } | null {
+  if (c.kind === "google_gemini") return { kind: "brand", name: "Google Gemini" };
+  if (c.kind === "anthropic") return { kind: "brand", name: "Anthropic" };
+  if (c.kind === "chatgpt_plan") return { kind: "plan" };
+  try {
+    return { kind: "host", name: new URL(c.base_url).hostname };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A conexão pode estar no plano gratuito da Gemini API, que usa o conteúdo para melhorar os produtos
+ * (C-12). O plano da chave não se lê pela conexão: o aviso vale para toda conexão do Gemini, a nativa
+ * e a compatível com a OpenAI.
+ */
+export function maybeFreeGemini(c: ConnectionView): boolean {
+  if (c.kind === "google_gemini") return true;
+  try {
+    return new URL(c.base_url).hostname === "generativelanguage.googleapis.com";
+  } catch {
+    return false;
+  }
 }
 
 /** A conexão serve para a voz? Só o Google Gemini, que fala e transcreve (`voice_capable` do servidor). */

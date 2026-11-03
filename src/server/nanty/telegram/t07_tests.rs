@@ -240,11 +240,12 @@ async fn plain_text_neutral_links_and_redaction() {
     assert!(!text.contains(&tk) && text.contains("***"), "{text}");
     assert!(!text.contains("rm -rf") && text.ends_with("fim"), "{text}");
     assert!(sends(&fake)[0].get("parse_mode").is_none());
-    // Longo demais: corta no limite.
+    // Longo demais: desde a spec 140 T14 (C-27), divide em partes que cabem, sem cortar nada.
     nanty.push_message(&model(&"palavra ".repeat(900)));
-    until("longo", || sends(&fake).len() == 2).await;
-    let long = sends(&fake)[1]["text"].as_str().unwrap_or_default().to_string();
-    assert!(format::units(&long) <= format::MAX_MESSAGE_CHARS && long.ends_with('…'), "{}", long.len());
+    until("longo", || sends(&fake).len() == 3).await;
+    let parts: Vec<String> = sends(&fake)[1..].iter().map(|b| b["text"].as_str().unwrap_or_default().to_string()).collect();
+    assert!(parts.iter().all(|p| format::units(p) <= format::MAX_MESSAGE_CHARS && !p.ends_with('…')), "{:?}", parts.iter().map(String::len).collect::<Vec<_>>());
+    assert_eq!(parts.iter().map(|p| p.split_whitespace().count()).sum::<usize>(), 900);
     // A fala da pessoa não volta para o Telegram.
     let mut person = model("oi");
     person.from = crate::server::nanty::store::Speaker::Person;

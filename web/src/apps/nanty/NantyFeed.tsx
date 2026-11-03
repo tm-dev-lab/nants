@@ -11,6 +11,8 @@
  * - **Desfazer:** no "feito" que ainda tem o desfazer válido.
  * - **Silêncio (spec 139 T04):** ligado, uma linha discreta no topo diz até quando, com o botão
  *   "Desligar o silêncio"; ele é um controle, não entra em "Esperando você".
+ * - **Memória (spec 140 T07):** o cartão de confirmação mostra, abaixo do porquê, o texto exato de
+ *   cada pedido e a fonte; o botão de apagar do rodapé "guardei isto" fica só na conversa.
  */
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { formatTime } from "../../i18n";
@@ -90,6 +92,8 @@ function SilenceLine({ until, card, decisions }: { until: string; card: NantyCar
 
 function WaitingCard({ card, decisions, primary, projectName }: { card: NantyCard; decisions: NantyDecisions; primary: boolean; projectName: string | null }) {
   const why = nantyCodeText(card.code, card.params ?? {});
+  // Spec 140 T07: o texto exato e a fonte do pedido à memória, uma linha cada.
+  const lines = (card.lines ?? []).map((l) => nantyCodeText(l.code, l.params)).filter((l): l is string => l !== null);
   return (
     <article className="nd-nanty-card" data-nanty-card={card.id} data-variant="waiting">
       <div className="nd-nanty-card-head">
@@ -103,6 +107,11 @@ function WaitingCard({ card, decisions, primary, projectName }: { card: NantyCar
           {why}
         </p>
       ) : null}
+      {lines.map((line, i) => (
+        <p key={i} className="nd-nanty-why" data-nanty-card-line="">
+          {line}
+        </p>
+      ))}
       <CardActions card={card} decisions={decisions} primary={primary} />
     </article>
   );

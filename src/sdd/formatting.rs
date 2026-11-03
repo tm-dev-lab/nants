@@ -91,6 +91,7 @@ pub fn host_dir(wt: &Path, f: &Formatter) -> Result<PathBuf, String> {
 
 fn git_output(wt: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     Command::new("git")
+        .args(crate::harness::git::NEUTRAL_CONFIG)
         .arg("--literal-pathspecs")
         .args(args)
         .current_dir(wt)
@@ -109,9 +110,11 @@ fn git_ok(wt: &Path, args: &[&str]) -> Result<(), String> {
     Err(format!("git {} falhou: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
 }
 
-/// Fixa o estado atual da árvore no índice: ponto de retorno de [`discard`].
-pub fn snapshot(wt: &Path) -> Result<(), String> {
-    git_ok(wt, &["add", "-A"])
+/// Fixa o estado atual da árvore no índice: ponto de retorno de [`discard`]. Passa pelo único
+/// `add` do Nants ([`Git::add_all`], spec 140 T09, F-02), que não desce em repositório aninhado;
+/// devolve as pastas que eram repositório e tiveram o `.git` afastado, para o aviso.
+pub fn snapshot(wt: &Path) -> Result<Vec<String>, String> {
+    Git::new(wt.to_path_buf()).add_all().map_err(|e| e.to_string())
 }
 
 /// Caminhos com mudança (modificada, nova ou removida) desde o último [`snapshot`]; o que já estava

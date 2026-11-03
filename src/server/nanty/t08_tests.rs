@@ -410,8 +410,8 @@ async fn free_text_action_becomes_a_card_by_the_tool_and_only_the_click_runs_it(
     assert!(!request.response_json && !request.web_search);
     assert!(request.messages[0].content.contains("dados não confiáveis"));
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["project_status", "project_details", "system_status", "nanty_activity", "propose_action", "set_silence"]);
-    assert!(names.iter().all(|n| crate::server::nanty::actions::parse(n).is_none_or(|a| a.entry().kind == crate::server::nanty::actions::ActionKind::Silence)), "nenhuma ferramenta executa uma ação");
+    assert_eq!(names, ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]);
+    assert!(names.iter().all(|n| crate::server::nanty::actions::parse(n).is_none_or(|a| matches!(a.entry().kind, crate::server::nanty::actions::ActionKind::Silence | crate::server::nanty::actions::ActionKind::Link))), "nenhuma ferramenta executa uma ação");
     let input = model.input(0);
     assert_eq!(input["message"], "aprove o plano do projeto Loja");
     assert!(input.get("allowed_actions").is_none(), "{input}");
@@ -582,7 +582,8 @@ async fn a_code_shaped_trap_never_reaches_the_model_in_proactivity() {
     let everything = w.model.everything();
     assert!(!everything.is_empty());
     assert!(!everything.contains("ARMADILHA"), "a armadilha chegou ao modelo na proatividade");
-    assert!(everything.contains("002-demo"), "os ids seguem");
+    assert!(everything.contains("\"project_id\":\"p1\""), "o id do projeto segue");
+    assert!(!everything.contains("002-demo"), "spec 140 T04 (C-05): o id da spec, escrito no projeto, não vai");
 }
 
 #[test]
@@ -609,7 +610,6 @@ fn only_the_listed_fact_keys_with_known_values_reach_the_input() {
         ("observer", json!("attention")),
         ("since", json!("08:15")),
         ("count", json!(2)),
-        ("spec_id", json!("002-demo")),
         ("task_id", json!("T01")),
     ] {
         good.insert(k.into(), v);

@@ -2398,6 +2398,41 @@ mod tests {
         assert!(v["services"]["db"].get("build").is_none());
     }
 
+    /// Spec 140 T07 (C-21): a pasta de dados do Nants, onde mora a memória do Nanty, nunca é montada
+    /// num container. O override do Nants só monta a worktree (e partes dela, só leitura), nos dois
+    /// modos; o compose do projeto não monta caminho do host fora do projeto.
+    #[test]
+    fn no_container_mount_reaches_the_nants_data_folder() {
+        let dir = project("ov-data", COMPOSE);
+        fs::create_dir_all(dir.join(".nants/sub")).expect("mkdir");
+        let abs = dir.canonicalize().expect("c");
+        let doc: Value = serde_yaml::from_str(COMPOSE).expect("yaml");
+        let data = crate::config::data_dir_from(None, Some("/home/alguem".into())).expect("data");
+        let memory = data.join("nanty").join("memory");
+        for run in [None, Some("run")] {
+            let text = override_yaml("p1", &dir, &doc, run, None).expect("ov");
+            let v: Value = serde_yaml::from_str(&text).expect("parse");
+            let services = v["services"].as_mapping().expect("services");
+            let mut sources = 0;
+            for (_, svc) in services {
+                for vol in svc.get("volumes").and_then(Value::as_sequence).into_iter().flatten() {
+                    let source = vol.get("source").and_then(Value::as_str).unwrap_or_default();
+                    sources += 1;
+                    assert!(Path::new(source).starts_with(&abs), "só a worktree: {source}");
+                    assert!(!Path::new(source).starts_with(&data) && !memory.starts_with(source), "{source}");
+                }
+            }
+            assert!(sources >= 1, "{text}");
+        }
+        for source in [data.to_string_lossy().to_string(), memory.to_string_lossy().to_string(), "../../..".to_string()] {
+            let line = "      - ${NANTS_WORKTREE}:/work\n";
+            let compose = COMPOSE.replace(line, &format!("{line}      - {source}:/dados\n"));
+            assert_ne!(compose, COMPOSE);
+            assert_eq!(crate::sdd::environment::validate_compose(COMPOSE), Ok(()));
+            assert!(crate::sdd::environment::validate_compose(&compose).is_err(), "{source}");
+        }
+    }
+
     /// Spec 129 T05 (C-14): o padrão `${NANTS_WORKTREE:-..}` vale só para o uso manual; no Nants, o
     /// override monta o caminho absoluto da worktree em /work e o subprocesso recebe a variável.
     #[test]

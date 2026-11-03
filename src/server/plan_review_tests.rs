@@ -1594,7 +1594,7 @@ Como usar.
     let beta = add("Beta.md", "# Beta
 Outro texto.
 ");
-    let turn = |role, text: String, ts, internal| ChatTurn { role, text, ts, turn_id: None, internal, attachments: Vec::new(), notice: None };
+    let turn = |role, text: String, ts, internal| ChatTurn { role, text, ts, turn_id: None, internal, attachments: Vec::new(), notice: None, offline: false };
     assert!(crate::server::chat::append_turns(&root, &[turn(TurnRole::User, format!("plano anterior com kb:{beta}"), 5, false)]));
     assert!(crate::kb::mention::record_plan_closed(&root, 7), "o plano anterior foi aprovado");
     let turns = [

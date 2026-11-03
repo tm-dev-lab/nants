@@ -279,6 +279,12 @@ pub fn digest_input(facts: &DigestFacts, st: &NantyState) -> TurnInput {
     summary_input(TurnKind::MorningDigest, facts, st)
 }
 
+/// Os projetos de um resumo (spec 140 T04, C-16): os da entrada do modelo e os dos avisos guardados,
+/// que saem no texto mesmo além do teto da entrada.
+pub fn linked_projects(facts: &DigestFacts, input: &TurnInput) -> Vec<String> {
+    super::provenance::unique(input.project_ids().into_iter().chain(facts.items.iter().filter_map(|i| i.project_id.clone())))
+}
+
 /// A entrada do resumo de um tipo (o da manhã ou o `/resumo`, spec 139 T06): só fatos
 /// estruturados, sem contagem zerada (zero não é fato).
 pub fn summary_input(kind: TurnKind, facts: &DigestFacts, st: &NantyState) -> TurnInput {
@@ -315,7 +321,6 @@ pub fn summary_input(kind: TurnKind, facts: &DigestFacts, st: &NantyState) -> Tu
         }
     }
     input.disk_free_gb = facts.disk_free_gb;
-    input.allowed_actions = vec![super::actions::ActionId::OpenNants];
     input
 }
 
@@ -352,8 +357,11 @@ pub async fn maybe_send(state: &AppState, nanty: &Arc<Nanty>) -> bool {
     };
     // O resumo segue o idioma do Nanty (spec 139 T05), o texto fixo e o do modelo.
     message.lang = Some(nanty_lang(&cfg, nanty).tag().to_string());
+    let mut input = digest_input(&facts, &snapshot);
+    message.link_projects(&linked_projects(&facts, &input));
     if facts.has_highlights() {
-        let input = digest_input(&facts, &snapshot);
+        let full = state.config().read().await.clone();
+        input.can_do = super::can_do::CanDo::now(state, &full, nanty, super::can_do::notice_channel(&full));
         if let TurnOutcome::Reply(reply) = turn::run(state, nanty, &input).await {
             with_model_text(&mut message, &facts, reply.summary);
             message.actions = reply.actions.iter().map(|a| a.as_str().to_string()).collect();
@@ -361,7 +369,7 @@ pub async fn maybe_send(state: &AppState, nanty: &Arc<Nanty>) -> bool {
     }
     record(nanty, "digest.sent", consumed);
     // Spec 139 T08: o resumo entra na conversa agora; com a voz ligada, a fala vem depois.
-    super::voice::deliver(state, nanty, &mut message, false).await;
+    super::voice::deliver(state, nanty, &mut message, super::voice::Tone::Neutral, false).await;
     true
 }
 

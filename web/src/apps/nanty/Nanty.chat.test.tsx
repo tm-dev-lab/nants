@@ -153,6 +153,28 @@ describe("conversa do Nanty", () => {
     expect(paragraphs("c2")).toEqual(["Confirme no cartão: nada é feito sem o seu toque."]);
   });
 
+  it("spec 140 T12: o cenário abre com a linha fixa de análise automática, no idioma dele, e sem botões", async () => {
+    playsOgg(true);
+    await open([
+      { id: "s1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: {}, text: "A tarefa parou nos testes.", lang: "pt-BR", project_ids: ["p1"] },
+      { id: "s2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: {}, text: "The task stopped at the tests.", lang: "en" },
+    ]);
+    const paragraphs = (id: string) => Array.from(msg(id).querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
+    expect(paragraphs("s1")).toEqual(["Análise automática do Nanty, sem pedido seu. A causa é uma hipótese, e a decisão fica nos botões do aviso.", "A tarefa parou nos testes."]);
+    expect(paragraphs("s2")).toEqual(["Automatic analysis by Nanty, not requested by you. The cause is a hypothesis, and the decision stays with the notice buttons.", "The task stopped at the tests."]);
+    expect(msg("s1").querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("spec 140 T12, revisão 1: o cenário recusado pela guarda vira a linha fixa e a frase do servidor", async () => {
+    playsOgg(true);
+    await open([{ id: "w1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: { lines: [{ code: "nanty.scenario.withheld", params: {} }] }, lang: "pt-BR" }]);
+    const paragraphs = Array.from(msg("w1").querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
+    expect(paragraphs).toEqual([
+      "Análise automática do Nanty, sem pedido seu. A causa é uma hipótese, e a decisão fica nos botões do aviso.",
+      "A análise automática deste aviso não pôde ser mostrada aqui. Se quiser, peça na conversa que eu explico o caso.",
+    ]);
+  });
+
   it("nota de voz tocável pela rota da T09: o áudio com Range é do servidor; aqui, tocar e pausar", async () => {
     playsOgg(true);
     const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(function (this: HTMLMediaElement) {
@@ -258,6 +280,37 @@ describe("conversa do Nanty", () => {
     expect(msg("r1").querySelector("[data-nanty-origin]")?.textContent).toBe("Nanty, na janela · 14:20");
   });
 
+  it("spec 140 T03: a resposta abre a tela uma vez, quando chega, sem link; o botão volta a ela", async () => {
+    const opened = (): boolean => document.querySelector('[data-window="execution"]') !== null;
+    const old = { id: "o1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.chat.open_screen", params: { project: "Loja", open_project: "p1" }, lang: "pt-BR" };
+    const view = await open([old]);
+    expect(opened()).toBe(false);
+    expect(msg("o1").textContent).toContain("Abrindo o projeto Loja no Nants.");
+    expect(msg("o1").querySelector("a")).toBeNull();
+
+    const reply = { id: "o2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.chat.open_screen", params: { project: "Loja", open_project: "p1" }, lang: "pt-BR" };
+    view.server.reply("GET", /^\/api\/nanty\/conversation$/, () => ({ status: 200, body: { messages: [old, reply] } }));
+    await act(async () => {
+      view.stream().emit("nanty_changed", { event_type: "nanty_changed", project_id: null, payload: { part: "conversation" } } as unknown as ApiEvent);
+    });
+    await settle();
+    expect(opened()).toBe(true);
+
+    await act(async () => activateApp("Nanty"));
+    await settle();
+    expect(msg("o2").querySelector("[data-nanty-open]")?.textContent).toBe("Abrir o projeto");
+  });
+
+  it("spec 140 T03: reabrir a conversa não reabre a tela; o botão da mensagem abre", async () => {
+    await open([{ id: "o1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.chat.open_screen", params: { project: "Loja", open_project: "p1" }, lang: "pt-BR" }]);
+    expect(document.querySelector('[data-window="execution"]')).toBeNull();
+    await act(async () => {
+      fireEvent.click(msg("o1").querySelector("[data-nanty-open]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(document.querySelector('[data-window="execution"]')).not.toBeNull();
+  });
+
   it("erro no envio: o texto do código, e o campo guarda a mensagem", async () => {
     const view = await open([]);
     view.server.reply("POST", /^\/api\/nanty\/conversation$/, () => ({ status: 422, body: { error: "x", code: "nanty_message_invalid", params: {} } }));
@@ -297,6 +350,47 @@ describe("conversa do Nanty", () => {
     await settle();
     expect(posted).toEqual([{ token: "tok-p", answer: "no" }]);
     expect(chat().querySelector("[data-nanty-notice]")?.textContent).toBe("Combinado, não faço. Só volto a sugerir se algo mudar.");
+  });
+
+  it("spec 140 T07: a resposta que guardou na memória mostra o rodapé e o botão de apagar uma vez só", async () => {
+    const forget = {
+      id: "ffffffffffffffff",
+      project_id: null,
+      group: "*:memory_forget:0a1b2c3d4e5f6071",
+      code: "nanty.card.memory_forget",
+      params: { note: "Disco", entry_id: "0a1b2c3d4e5f6071" },
+      action: "memory_forget",
+      token: "tok-f",
+      created_at_ms: AT,
+      expires_at_ms: Date.now() + 3600_000,
+    };
+    const saved = {
+      id: "s1",
+      at_ms: AT,
+      from: "nanty",
+      channel: "web",
+      text: "Anotado.",
+      code: "nanty.chat.memory_saved",
+      params: { title: "Disco" },
+      lang: "pt-BR",
+      reply_to: "x",
+      card_ids: ["ffffffffffffffff"],
+    };
+    const view = await open([saved], { ...NANTY_EMPTY_FEED, memory: [forget] });
+    const footer = "Guardei na memória: Disco. Se preferir que não, toque em apagar.";
+    expect(msg("s1").textContent?.split(footer).length).toBe(2);
+    expect(within(msg("s1")).getAllByRole("button").map((b) => b.textContent)).toEqual(["Apagar da memória"]);
+    expect(msg("s1").textContent).not.toContain("Guardei na memória: Disco.Guardei");
+    const posted: unknown[] = [];
+    view.server.reply("POST", /^\/api\/nanty\/cards\/ffffffffffffffff\/decide$/, (body) => {
+      posted.push(body);
+      return { status: 200, body: { outcome: "memory_forgotten", code: "nanty.outcome.memory_forgotten", params: {} } };
+    });
+    await act(async () => {
+      fireEvent.click(within(msg("s1")).getByRole("button", { name: "Apagar da memória" }));
+    });
+    await settle();
+    expect(posted).toEqual([{ token: "tok-f", answer: "yes" }]);
   });
 
   it("em en, sem português", async () => {

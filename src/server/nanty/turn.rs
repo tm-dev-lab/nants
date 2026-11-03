@@ -6,8 +6,11 @@
 //!   e `._:-`, até [`MAX_CODE_LEN`]). Texto de spec, log, saída de agente ou commit nunca chega aqui
 //!   (os observadores só guardam contagens e códigos), e um texto livre que escapasse é descartado.
 //! - **Resposta validada ([`validate`]):** um objeto JSON `{summary, actions}`, sem outros campos; o
-//!   resumo curto, sem caractere de controle; as ações só ids do catálogo que a entrada ofereceu. O
-//!   que vier fora disso é descartado inteiro, e o aviso segue com o texto fixo do observador.
+//!   resumo curto, sem caractere de controle; as ações, se vierem, só ids do catálogo com botão nos
+//!   cartões ([`CanDo::buttons`]). O que vier fora disso é descartado inteiro, e o aviso segue com o
+//!   texto fixo do observador.
+//! - **O que pode oferecer (spec 140 T03, C-30):** a entrada leva o [`CanDo`], calculado pelo servidor
+//!   por canal e turno, e o prompt só permite oferecer o que está nele.
 //! - **Um turno por vez ([`TurnQueue`]):** uma fila única para o Telegram e a janela, com guarda
 //!   que libera a vez em qualquer saída, no padrão do `busy_chats` (`AppState::try_begin_chat`).
 //! - **Orçamento diário ([`budget_view`]):** o gasto do Nanty fica no estado dele, à parte dos
@@ -24,10 +27,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::actions::{self, ActionId, ActionKind};
+use super::actions::{self, ActionId};
+use super::can_do::CanDo;
 use super::journal::{JournalEntry, JournalKind};
 use super::store::{Card, Channel, ConversationMessage, Delivery, NantyState, Spend, Speaker};
-use super::{nanty_lang, Avatar, Nanty};
+use super::{nanty_lang, Nanty};
 use crate::agents::chat::ChatBackend;
 use crate::agents::llm_client::{Billing, ChatMessage, ChatRequest, Role, Usage};
 use crate::config::{Config, Connection, ConnectionKind, Urgency};
@@ -108,10 +112,18 @@ pub fn is_code(text: &str) -> bool {
         && text.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
+/// O id de tarefa na forma do SDD: `T` e até 4 dígitos (spec 140 T04, C-05). O id vem de um arquivo do
+/// projeto: com a forma de código, caberiam até 64 caracteres de instrução. Assim, nenhuma frase cabe.
+pub fn is_task_id(text: &str) -> bool {
+    text.strip_prefix('T').is_some_and(|n| (1..=4).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Chaves aceitas em `facts` (T08, defesa extra sugerida na revisão da T05): as que os observadores,
 /// o filtro e a oferta gravam. Qualquer outra fica de fora, mesmo com forma de código.
-pub const FACT_KEYS: [&str; 12] =
-    ["age_min", "attempts", "count", "free_gb", "min_gb", "observer", "reason", "role", "since", "spec_id", "stop", "task_id"];
+/// Spec 140 T04 (C-05): o `spec_id` saiu. Ele é um texto livre de até 64 caracteres escrito no
+/// projeto, e o modelo não precisa dele para falar com a pessoa.
+pub const FACT_KEYS: [&str; 11] =
+    ["age_min", "attempts", "count", "free_gb", "min_gb", "observer", "reason", "role", "since", "stop", "task_id"];
 
 /// Hora local `HH:MM`.
 fn is_hhmm(text: &str) -> bool {
@@ -121,8 +133,8 @@ fn is_hhmm(text: &str) -> bool {
 
 /// O valor aceito para cada chave de [`FACT_KEYS`]: contagens são números; os códigos vêm das
 /// listas fixas do Nants (o motivo do bloqueio, a parada do provedor, o papel, o observador); os ids
-/// (spec e tarefa) têm forma de código. Um texto com forma de código que veio de um arquivo do
-/// projeto (o `next_action_code` de uma tarefa, por exemplo) só passa se for um código conhecido.
+/// de tarefa têm a forma do SDD ([`is_task_id`]). Um texto com forma de código que veio de um arquivo
+/// do projeto (o `next_action_code` de uma tarefa, por exemplo) só passa se for um código conhecido.
 fn fact_allowed(key: &str, value: &Value) -> bool {
     let text = value.as_str();
     match key {
@@ -134,7 +146,7 @@ fn fact_allowed(key: &str, value: &Value) -> bool {
         "role" => matches!(text, Some("architect" | "developer" | "reviewer")),
         "observer" => text.is_some_and(|v| super::signals::SignalKind::ALL.iter().any(|k| k.observer().as_str() == v)),
         "since" => text.is_some_and(is_hhmm),
-        "spec_id" | "task_id" => text.is_some_and(is_code),
+        "task_id" => text.is_some_and(is_task_id),
         _ => false,
     }
 }
@@ -208,6 +220,10 @@ pub enum TurnKind {
     Status,
     /// O atalho `/resumo`, escrito pelo modelo (spec 139 T06).
     Summary,
+    /// O resumo da conversa, no degrau da janela (spec 140 T06).
+    ConversationSummary,
+    /// A análise, no lugar dela, fora da fila da conversa (spec 140 T11, C-13).
+    Analysis,
 }
 
 /// Toda a entrada do modelo na proatividade: só sinais estruturados.
@@ -224,8 +240,8 @@ pub struct TurnInput {
     /// Menor espaço livre medido nas pastas do Nants, em GB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_gb: Option<u64>,
-    /// Ids do catálogo que o modelo pode sugerir.
-    pub allowed_actions: Vec<ActionId>,
+    /// O que existe de verdade agora (spec 140 T03): o modelo só oferece o que está aqui.
+    pub can_do: CanDo,
     /// Hora local (`HH:MM`) até quando os avisos estão em silêncio (o `/status`, spec 139 T06).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silenced_until: Option<String>,
@@ -240,34 +256,21 @@ impl TurnInput {
             cost_usd: BTreeMap::new(),
             tokens: BTreeMap::new(),
             disk_free_gb: None,
-            allowed_actions: Vec::new(),
+            can_do: CanDo::default(),
             silenced_until: None,
         }
+    }
+
+    /// Os projetos dos sinais, sem repetir: a mensagem escrita a partir desta entrada fica ligada a
+    /// todos (spec 140 T04, C-16).
+    pub fn project_ids(&self) -> Vec<String> {
+        super::provenance::unique(self.signals.iter().filter_map(|s| s.project_id.clone()))
     }
 
     /// O JSON que vai ao modelo.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
-}
-
-/// O que o modelo pode sugerir para estes cartões: a ação do catálogo que o servidor já ofereceu em
-/// cada um (fora a faixa "só a pessoa") e as opções de qualquer cartão.
-pub fn allowed_for(cards: &[Card]) -> Vec<ActionId> {
-    let mut out = Vec::new();
-    for card in cards {
-        if let Some(id) = card.action.as_deref().and_then(actions::parse) {
-            if !matches!(id.entry().kind, ActionKind::PersonOnly | ActionKind::Silence) && !out.contains(&id) {
-                out.push(id);
-            }
-        }
-    }
-    for option in [ActionId::RemindLater, ActionId::OpenNants] {
-        if !cards.is_empty() && !out.contains(&option) {
-            out.push(option);
-        }
-    }
-    out
 }
 
 /// A entrada do turno proativo para os cartões que acabaram de sair.
@@ -288,7 +291,6 @@ pub fn notice_input(cards: &[Card], st: &NantyState, day: &str) -> TurnInput {
     if spend.usd > 0.0 {
         input.cost_usd.insert("nanty_today", round_cents(spend.usd));
     }
-    input.allowed_actions = allowed_for(cards);
     input
 }
 
@@ -336,7 +338,8 @@ impl Invalid {
 
 /// Valida a resposta: o objeto `{summary, actions}` e nada mais; o resumo de 1 a
 /// [`MAX_SUMMARY_CHARS`] caracteres, sem controle (fora a quebra de linha); até
-/// [`MAX_MODEL_ACTIONS`] ids, todos do catálogo e de `allowed`. Qualquer desvio descarta tudo.
+/// [`MAX_MODEL_ACTIONS`] ids, todos do catálogo e de `allowed`. Qualquer desvio descarta tudo. O prompt
+/// não pede `actions` (spec 140 T03): o campo só segue aceito, e conferido, para o modelo que o mandar.
 pub fn validate(raw: &str, allowed: &[ActionId]) -> Result<Reply, Invalid> {
     // Só o objeto: o `serde` também aceitaria a lista com os campos em ordem.
     let value: Value = serde_json::from_str(raw.trim()).map_err(|_| Invalid::Format)?;
@@ -403,14 +406,41 @@ pub fn model_route(cfg: &Config) -> Option<(&Connection, &str)> {
     Some((conn, model))
 }
 
+/// A conexão do Nanty é pelo plano.
+fn nanty_on_plan(cfg: &Config) -> bool {
+    cfg.connections.iter().find(|c| c.id == cfg.nanty.connection_id).is_some_and(|c| c.kind == ConnectionKind::ChatgptPlan)
+}
+
+/// Como o orçamento conta: pelo modelo principal do Nanty. Com preço (e fora do plano), em US$; sem
+/// preço ou pelo plano, em tokens.
+pub fn budget_mode(cfg: &Config) -> BudgetMode {
+    if !nanty_on_plan(cfg) && cfg.pricing.contains_key(cfg.nanty.model.trim()) {
+        BudgetMode::Usd
+    } else {
+        BudgetMode::Tokens
+    }
+}
+
+/// O que uma chamada de outra rota do Nanty (a fala e a transcrição) conta no orçamento em US$ (spec
+/// 140 T17, C-19): o preço do próprio modelo dela; sem ele, no modo US$, a estimativa pelo preço do
+/// modelo principal. Assim a fala conta sempre: antes, a voz sem preço somava só tokens, e no modo US$
+/// saía de graça. A estimativa e não a troca da rota inteira para tokens: o orçamento que a pessoa vê
+/// e escolheu continua na mesma unidade, e a medição da T16 deu a fala (cerca de US$ 0,0013) na mesma
+/// ordem do preço do modelo principal. No modo tokens, os tokens dela já contam.
+pub fn route_cost(cfg: &Config, model: &str, usage: &Usage, billing: Billing) -> Option<f64> {
+    turn_cost(cfg, model, usage, billing).or_else(|| {
+        let main = cfg.nanty.model.trim();
+        (budget_mode(cfg) == BudgetMode::Usd && main != model.trim()).then(|| turn_cost(cfg, main, usage, Billing::Metered)).flatten()
+    })
+}
+
 /// O orçamento do dia `spend.day` pela configuração atual.
 pub fn budget_view(cfg: &Config, spend: &Spend) -> BudgetView {
     let n = &cfg.nanty;
-    let conn = cfg.connections.iter().find(|c| c.id == n.connection_id);
-    let plan = conn.is_some_and(|c| c.kind == ConnectionKind::ChatgptPlan);
+    let plan = nanty_on_plan(cfg);
     let configured = model_route(cfg).is_some();
-    let priced = !plan && cfg.pricing.contains_key(n.model.trim());
-    let mode = if priced { BudgetMode::Usd } else { BudgetMode::Tokens };
+    let mode = budget_mode(cfg);
+    let priced = mode == BudgetMode::Usd;
     let roles = [&cfg.agents.architect, &cfg.agents.developer, &cfg.agents.reviewer];
     let quota_shared = plan && roles.iter().any(|r| r.connection_id == n.connection_id);
     let tokens = spend.input_tokens.saturating_add(spend.output_tokens);
@@ -432,6 +462,11 @@ pub fn budget_view(cfg: &Config, spend: &Spend) -> BudgetView {
         quota_shared,
         exhausted,
     }
+}
+
+/// Um turno do modelo pode sair agora: há modelo escolhido e orçamento no dia.
+pub fn can_run(cfg: &Config, nanty: &Nanty) -> bool {
+    model_route(cfg).is_some() && !budget_view(cfg, &nanty.snapshot().spend_on(&nanty.now().day_key())).exhausted
 }
 
 /// Custo em US$ de um turno pelo preço do modelo (o mesmo `cost_of` do custo dos projetos). `None`
@@ -478,15 +513,6 @@ pub enum TurnOutcome {
     Skipped(&'static str),
 }
 
-/// Volta o avatar ao estado derivado em qualquer saída.
-pub(super) struct Thinking<'a>(pub(super) &'a Nanty);
-
-impl Drop for Thinking<'_> {
-    fn drop(&mut self) {
-        self.0.set_busy(None);
-    }
-}
-
 pub(super) fn turn_entry(nanty: &Nanty, code: &str, kind: TurnKind, reason: Option<&str>) -> JournalEntry {
     let mut entry = JournalEntry::new(nanty.now().epoch_ms, JournalKind::ModelTurn, code);
     entry.params.insert("turn".into(), json!(kind));
@@ -524,7 +550,7 @@ pub async fn run_in(state: &AppState, nanty: &Arc<Nanty>, input: &TurnInput, lan
         kind: input.kind,
         system: crate::agents::prompts::nanty_system(lang),
         user: input.to_json(),
-        allowed: &input.allowed_actions,
+        allowed: &input.can_do.buttons,
         signals: input.signals.len(),
     };
     run_call(state, nanty, &call).await
@@ -577,8 +603,7 @@ pub async fn run_call(state: &AppState, nanty: &Arc<Nanty>, input: &Call<'_>) ->
         web_search_max_uses: None,
         cache_key: None,
     };
-    nanty.set_busy(Some(Avatar::Thinking));
-    let thinking = Thinking(nanty);
+    let thinking = nanty.thinking();
     let response = backend.complete(&request).await;
     drop(thinking);
     let response = match response {
@@ -628,7 +653,8 @@ pub fn model_message(nanty: &Nanty, lang: crate::i18n::Lang, reply: &Reply, card
         from: Speaker::Nanty,
         channel: Channel::Web,
         project_id: None,
-        text: Some(reply.summary.clone()),
+        // Spec 140 T04 (C-09): nem o texto escrito só de sinais estruturados escapa do redator.
+        text: Some(super::redact::patterns(&reply.summary)),
         code: None,
         params: Map::new(),
         lang: Some(lang.tag().to_string()),
@@ -638,6 +664,10 @@ pub fn model_message(nanty: &Nanty, lang: crate::i18n::Lang, reply: &Reply, card
         voice: false,
         audio: None,
         relayed: None,
+        project_ids: Vec::new(),
+        // A entrada destes turnos só tem sinais estruturados: a mensagem nasce limpa.
+        taint: Some(super::provenance::Taint::default()),
+        seq: None,
     }
 }
 
@@ -645,7 +675,9 @@ pub fn model_message(nanty: &Nanty, lang: crate::i18n::Lang, reply: &Reply, card
 /// resumo) viram uma entrada estruturada; com resposta válida, o resumo do modelo entra na conversa
 /// ligado aos cartões. Sem modelo, sem orçamento ou com resposta inválida, nada muda: os cartões já
 /// trazem o texto fixo do observador. Devolve o resultado (`None` sem cartão novo). Esta mensagem
-/// não tem fala própria (spec 139 T08, C-14): cada aviso tem um áudio só, o do cartão.
+/// não tem fala própria (spec 139 T08, C-14): cada aviso tem um áudio só, o do cartão. Com um cartão
+/// só, a fila de saída pode tomar o texto para a fala do cartão (spec 140 T02): ela o tira da fila ao
+/// enviar a nota e grava o áudio nesta mesma mensagem, então nada aqui se repete.
 pub async fn proactive(state: &AppState, nanty: &Arc<Nanty>) -> Option<TurnOutcome> {
     // Sem modelo escolhido, nada a fazer (nem a gravar): os cartões já têm o texto fixo.
     if model_route(&*state.config().read().await).is_none() {
@@ -654,7 +686,10 @@ pub async fn proactive(state: &AppState, nanty: &Arc<Nanty>) -> Option<TurnOutco
     let now = nanty.now().epoch_ms;
     let mut fresh: Vec<Card> = Vec::new();
     let mut snapshot = NantyState::default();
-    // Escolhe e marca na mesma trava: duas chamadas juntas nunca pegam o mesmo cartão.
+    let outbox = nanty.telegram().outbox();
+    let mut _solo = None;
+    // Escolhe e marca na mesma trava: duas chamadas juntas nunca pegam o mesmo cartão. A fila de saída
+    // vê o cartão como pego e a marca do turno de uma vez só (a marca vale até o fim desta função).
     nanty.update(|st| {
         fresh = st
             .cards
@@ -672,22 +707,26 @@ pub async fn proactive(state: &AppState, nanty: &Arc<Nanty>) -> Option<TurnOutco
         if latest <= st.turned_until_ms {
             return false;
         }
+        if let [card] = fresh.as_slice() {
+            _solo = Some(outbox.solo_turn(&card.id));
+        }
         st.turned_until_ms = latest;
         snapshot = st.clone();
         true
     });
+    outbox.nudge();
     if fresh.is_empty() {
         return None;
     }
-    let input = notice_input(&fresh, &snapshot, &nanty.now().day_key());
+    let mut input = notice_input(&fresh, &snapshot, &nanty.now().day_key());
+    let cfg = state.config().read().await.clone();
+    input.can_do = CanDo::of(state, &cfg, nanty, super::can_do::notice_channel(&cfg), &fresh.iter().collect::<Vec<_>>());
     let outcome = run(state, nanty, &input).await;
     if let TurnOutcome::Reply(reply) = &outcome {
         let lang = nanty_lang(&state.config().read().await.nanty, nanty);
         let mut message = model_message(nanty, lang, reply, fresh.iter().map(|c| c.id.clone()).collect());
-        let first = fresh.first().and_then(|c| c.project_id.clone());
-        if fresh.iter().all(|c| c.project_id == first) {
-            message.project_id = first;
-        }
+        // C-16: todos os projetos dos cartões, ou a mensagem escapa da limpeza e da exclusão.
+        message.link_projects(&super::provenance::unique(fresh.iter().filter_map(|c| c.project_id.clone())));
         let n = Arc::clone(nanty);
         let _ = tokio::task::spawn_blocking(move || n.push_message(&message)).await;
     }

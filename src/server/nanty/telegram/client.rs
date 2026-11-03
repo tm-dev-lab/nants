@@ -410,6 +410,12 @@ impl TelegramClient {
         self.call(false, "editMessageCaption", &body).await.map(|_| ())
     }
 
+    /// `editMessageReplyMarkup` com outro teclado (spec 140 T07): a resposta perde só o botão usado.
+    pub async fn set_buttons(&self, chat_id: i64, message_id: i64, rows: Value) -> Result<(), TgError> {
+        let body = json!({ "chat_id": chat_id, "message_id": message_id, "reply_markup": { "inline_keyboard": rows } });
+        self.call(false, "editMessageReplyMarkup", &body).await.map(|_| ())
+    }
+
     /// `editMessageReplyMarkup` sem teclado: tira os botões e mantém o texto.
     pub async fn clear_buttons(&self, chat_id: i64, message_id: i64) -> Result<(), TgError> {
         let body = json!({ "chat_id": chat_id, "message_id": message_id });

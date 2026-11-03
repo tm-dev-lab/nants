@@ -2,7 +2,8 @@
 //! "o projeto 14" chega ao modelo com o Test 14 na lista e a ferramenta diz a fase do sino; a memória
 //! na pergunta encadeada; os limites de rodadas, de chamadas, de tokens, de prazo e de orçamento; a
 //! última rodada sem ferramentas; os `provider_items` reenviados como vieram; o envelope de dado não
-//! confiável; os projetos excluídos, que nunca são lidos; a reserva sem modelo com o número.
+//! confiável; os projetos excluídos, que nunca são lidos; a reserva sem modelo com o número; o tom
+//! da voz (spec 140 T01), com o Gemini simulado: o marcador vira tom e nunca chega à pessoa.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,9 @@ use crate::i18n::tr;
 use crate::server::nanty::chat::tests::{base_config, key, write_project};
 use crate::server::nanty::chat::{self, person_message, reply, Cited};
 use crate::server::nanty::observe::Phase;
-use crate::server::nanty::store::Channel;
+use crate::server::nanty::store::{Channel, Speaker};
 use crate::server::nanty::tools;
+use crate::server::nanty::voice::tests::{fake_voice, style_of, voice_config, FakeVoice};
 use crate::server::nanty::InstanceStatus;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -93,10 +95,59 @@ impl Scripted {
         self.requests().iter().flat_map(|r| r.messages.iter().map(|m| m.content.clone())).collect::<Vec<_>>().join("\n")
     }
 
-    /// A entrada (JSON) da mensagem da pessoa no pedido `n`.
+    /// A entrada (JSON) da mensagem atual da pessoa no pedido `n`: o último parágrafo da última
+    /// mensagem da pessoa (spec 140 T06: o histórico vem antes, e a fala dela sem resposta se junta).
     pub(crate) fn input(&self, n: usize) -> Value {
-        let user = self.requests()[n].messages.iter().find(|m| m.role == Role::User).map(|m| m.content.clone()).unwrap_or_default();
-        serde_json::from_str(&user).expect("JSON")
+        let user = self.requests()[n].messages.iter().rfind(|m| m.role == Role::User).map(|m| m.content.clone()).unwrap_or_default();
+        serde_json::from_str(user.rsplit("\n\n").next().unwrap_or_default()).expect("JSON")
+    }
+
+    /// O histórico do pedido `n`, uma mensagem por item, como era a antiga `memory`: `from`, `at`, o
+    /// texto e os campos de terceiro e dos cartões. Sem o resumo e sem a mensagem atual.
+    pub(crate) fn memory(&self, n: usize) -> Vec<Value> {
+        let request = &self.requests()[n];
+        let mut out = Vec::new();
+        // Até a mensagem atual: depois dela vêm só as rodadas de ferramenta deste turno.
+        let end = request.messages.iter().rposition(|m| m.role == Role::User).map_or(0, |i| i + 1);
+        for m in request.messages[..end].iter().filter(|m| m.role != Role::System) {
+            match m.role {
+                Role::User => {
+                    for paragraph in m.content.split("\n\n") {
+                        let Ok(mut item) = serde_json::from_str::<Value>(paragraph) else { continue };
+                        if item.get("message").is_some() || item.get("conversation_summary").is_some() {
+                            continue;
+                        }
+                        item["from"] = json!("person");
+                        out.push(item);
+                    }
+                }
+                Role::Assistant => {
+                    let mut items: Vec<String> = Vec::new();
+                    for paragraph in m.content.split("\n\n") {
+                        if crate::server::nanty::history::strip_stamp(paragraph) != paragraph || items.is_empty() {
+                            items.push(paragraph.to_string());
+                        } else if let Some(last) = items.last_mut() {
+                            last.push_str("\n\n");
+                            last.push_str(paragraph);
+                        }
+                    }
+                    for raw in items {
+                        let header = raw.strip_prefix('[').and_then(|r| r.split_once(']')).map(|(h, _)| h.to_string()).unwrap_or_default();
+                        let (at, cards) = match header.split_once(" card_ids: ") {
+                            Some((at, cards)) => (at.to_string(), cards.split(", ").map(str::to_string).collect::<Vec<_>>()),
+                            None => (header.clone(), Vec::new()),
+                        };
+                        let mut item = json!({ "from": "nanty", "at": at, "text": crate::server::nanty::history::strip_stamp(&raw) });
+                        if !cards.is_empty() {
+                            item["card_ids"] = json!(cards);
+                        }
+                        out.push(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Os resultados de ferramenta do pedido `n`, `(id, texto)`.
@@ -253,7 +304,7 @@ async fn project_14_reaches_the_model_and_the_tool_says_the_phase_of_the_bell() 
     assert_eq!(requests.len(), 2);
     assert_eq!(
         tool_names(&requests[0]),
-        ["project_status", "project_details", "system_status", "nanty_activity", "propose_action", "set_silence"]
+        ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]
     );
     assert!(!requests[0].response_json && !requests[0].web_search);
     let input = model.input(0);
@@ -299,39 +350,51 @@ async fn project_14_reaches_the_model_and_the_tool_says_the_phase_of_the_bell() 
     assert_eq!(w.turns("turn.ok").len(), 1);
 }
 
+/// Spec 140 T06: a pergunta encadeada pelo histórico de verdade, sem limite de tempo e sem relógio. A
+/// mensagem de 1970 continua, porque só o degrau da janela tira uma mensagem; o resultado da
+/// ferramenta da mensagem anterior nunca volta.
 #[tokio::test]
-async fn the_chained_question_uses_the_memory_without_tool_results() {
+async fn the_chained_question_uses_the_history_without_tool_results() {
     let model = Scripted::new(vec![
         call("project_status", json!({"project_id": "p14"})),
         say("O Test 14 está pausado na T02."),
         say("Ele parou nos testes da T02."),
     ]);
     let w = World::new("memory", Some(Arc::clone(&model)), |_| {});
-    // Uma mensagem velha, fora da janela da memória.
-    let mut old = ConversationMessage::from_nanty(super::super::new_id(), 0, Channel::Web, "nanty.chat.help", serde_json::Map::new());
-    old.at_ms = w.nanty().now().epoch_ms.saturating_sub(5 * 60 * 60 * 1000);
-    old.code = None;
-    old.text = Some("MENSAGEM-VELHA".into());
-    w.nanty().push_message(&old);
+    let secrets = w.state.secret_set().await;
+    let cfg = w.state.config().read().await.nanty.clone();
+    let mut old = chat::person_message(&w.nanty(), &cfg, &secrets, Channel::Web, "MENSAGEM-ANTIGA").expect("mensagem");
+    old.at_ms = 1;
+    w.nanty().keep_message(&old);
 
     w.say("Como está o projeto 14?").await;
     let second = w.say("E por que ele parou?").await;
     assert_eq!(second.text.as_deref(), Some("Ele parou nos testes da T02."));
     let input = model.input(2);
     assert_eq!(input["message"], "E por que ele parou?");
-    let memory = input["memory"].as_array().expect("memória").clone();
+    assert!(input.get("memory").is_none(), "o histórico vai como mensagens, não dentro da entrada");
+    let memory = model.memory(2);
     let pairs: Vec<(String, String)> =
         memory.iter().map(|m| (m["from"].as_str().unwrap_or_default().to_string(), m["text"].as_str().unwrap_or_default().to_string())).collect();
     assert_eq!(
         pairs,
-        [("person".to_string(), "Como está o projeto 14?".to_string()), ("nanty".to_string(), "O Test 14 está pausado na T02.".to_string())]
+        [
+            ("person".to_string(), "MENSAGEM-ANTIGA".to_string()),
+            ("person".to_string(), "Como está o projeto 14?".to_string()),
+            ("nanty".to_string(), "O Test 14 está pausado na T02.".to_string()),
+        ]
     );
-    let at = memory[0]["at"].as_str().unwrap_or_default();
-    assert!(at.len() == 5 && at.as_bytes()[2] == b':', "a hora HH:MM: {at}");
-    // O resultado da ferramenta da mensagem anterior não volta, nem a mensagem fora da janela.
-    let user = &model.requests()[2].messages[1].content;
-    assert!(!user.contains("id p14") && !user.contains("MENSAGEM-VELHA"), "{user}");
-    assert_eq!(model.requests()[2].messages.len(), 2, "a mensagem nova começa um histórico novo");
+    for item in &memory {
+        let at = item["at"].as_str().unwrap_or_default();
+        assert_eq!(crate::server::nanty::history::strip_stamp(&format!("[{at}] x")), "x", "a data e a hora: {at}");
+    }
+    // Os papéis alternam, sem ferramenta nem `provider_items` do turno anterior.
+    let request = &model.requests()[2];
+    let roles: Vec<Role> = request.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::System, Role::User, Role::Assistant, Role::User]);
+    assert!(request.messages.iter().all(|m| m.tool_calls.is_empty() && m.provider_items.is_none()));
+    let status = &model.results(1)[0].1;
+    assert!(request.messages.iter().all(|m| !m.content.contains(status.as_str())), "{status}");
 }
 
 // ---- Limites ----
@@ -352,7 +415,7 @@ async fn the_last_round_goes_without_tools_and_every_call_gets_a_result() {
     assert_eq!(answer.text.as_deref(), Some("Parcial."));
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(tool_names(&requests[0]).len(), 6);
+    assert_eq!(tool_names(&requests[0]).len(), 16);
     assert!(requests[1].tools.is_empty(), "a última rodada vai sem ferramentas");
     // Três chamadas, todas com resultado; a terceira passou do teto por resposta.
     let results = model.results(1);
@@ -567,6 +630,32 @@ fn chat_limits_are_written_only_when_changed() {
     let text = toml::to_string(&cfg).expect("ser");
     assert_eq!(text.split("[nanty.chat]").nth(1).expect("seção").trim(), "max_details_per_turn = 1", "{text}");
     assert_eq!(limits.deadline, Duration::from_secs(120));
+    // Spec 140 T04 (C-02): a quarentena, provisória e também só gravada se mudar.
+    assert_eq!(Config::default().nanty.chat.quarantine(), 6);
+    let mut cfg = Config::default();
+    cfg.nanty.chat.quarantine_messages = 4;
+    let text = toml::to_string(&cfg).expect("ser");
+    assert_eq!(text.split("[nanty.chat]").nth(1).expect("seção").trim(), "quarantine_messages = 4", "{text}");
+    // Spec 140 T06 (C-17): a janela em degraus e o teto de tokens, provisórios e só gravados se mudarem.
+    let chat = &Config::default().nanty.chat;
+    assert_eq!((chat.window(), chat.window_step(), chat.history_tokens()), (60, 20, 12_000));
+    for (edit, line) in [
+        (Box::new(|c: &mut Config| c.nanty.chat.window_messages = 50) as Box<dyn Fn(&mut Config)>, "window_messages = 50"),
+        (Box::new(|c: &mut Config| c.nanty.chat.window_step_messages = 10), "window_step_messages = 10"),
+        (Box::new(|c: &mut Config| c.nanty.chat.history_max_tokens = 8000), "history_max_tokens = 8000"),
+    ] {
+        let mut cfg = Config::default();
+        edit(&mut cfg);
+        let text = toml::to_string(&cfg).expect("ser");
+        assert_eq!(text.split("[nanty.chat]").nth(1).expect("seção").trim(), line, "{text}");
+    }
+    // A faixa segura: o degrau nunca esvazia a janela, e o antigo campo de tempo não volta a valer.
+    let mut odd = Config::default().nanty.chat;
+    odd.window_messages = 1;
+    odd.window_step_messages = 99;
+    assert_eq!((odd.window(), odd.window_step()), (2, 1));
+    let old: Config = toml::from_str("[nanty.chat]\nmemory_messages = 30\nmemory_window_mins = 5\n").expect("config antiga");
+    assert_eq!(old.nanty.chat, Config::default().nanty.chat, "a config da rc.23 segue lida");
 }
 
 // ---- A ajuda (spec 139 T13) ----
@@ -590,4 +679,139 @@ async fn the_help_promises_free_talk_only_with_a_model() {
             assert!(shown.contains(need) && shown.contains(command), "{shown}");
         }
     }
+}
+
+// ---- O tom da voz (spec 140 T01) ----
+
+/// Espera o estado sem contar com quanto ele demora.
+async fn settled(what: &str, ready: impl Fn() -> bool) {
+    for _ in 0..20_000 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("nunca aconteceu: {what}");
+}
+
+/// O mundo com o modelo roteirizado e a voz ligada no Gemini simulado.
+async fn voiced(tag: &str, turns: Vec<Turn>) -> (World, Arc<Scripted>, Arc<FakeVoice>) {
+    let model = Scripted::new(turns);
+    let (fake, base) = fake_voice().await;
+    let w = World::new(tag, Some(Arc::clone(&model)), |cfg| voice_config(cfg, &base));
+    (w, model, fake)
+}
+
+fn nanty_line(w: &World) -> Option<ConversationMessage> {
+    w.nanty().conversation().into_iter().find(|m| m.from == Speaker::Nanty)
+}
+
+fn spoken_text(fake: &FakeVoice, n: usize) -> String {
+    fake.calls("gemini")[n]["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// Nada com a forma do marcador em lugar nenhum: a resposta, a conversa gravada e a fala.
+fn no_marker_anywhere(w: &World, fake: &FakeVoice, reply: &ConversationMessage) {
+    let conversation = serde_json::to_string(&w.nanty().conversation()).expect("json");
+    let told: String = fake.calls("gemini").iter().map(Value::to_string).collect();
+    for seen in [reply.text.clone().unwrap_or_default(), conversation, told] {
+        assert!(!seen.to_lowercase().contains("[tone") && !seen.to_lowercase().contains("[tom"), "{seen}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tone_of_the_model_reaches_the_speech_and_the_marker_reaches_nobody() {
+    let (w, model, fake) = voiced("tone-chat", vec![say("[tone: upbeat]\nA Loja terminou a última tarefa.")]).await;
+    fake.hold_speech();
+    let secrets = w.state.secret_set().await;
+    let cfg = w.state.config().read().await.nanty.clone();
+    let person = person_message(&w.nanty(), &cfg, &secrets, Channel::Web, "como foi a Loja?").expect("mensagem");
+    chat::spawn_reply(&w.state, person);
+    // O texto entra antes da fala, já sem o marcador.
+    settled("texto na conversa", || nanty_line(&w).is_some()).await;
+    assert_eq!(nanty_line(&w).and_then(|m| m.text).as_deref(), Some("A Loja terminou a última tarefa."));
+    settled("a fala começou", || fake.calls("gemini").len() == 1).await;
+    assert_eq!(spoken_text(&fake, 0), "A Loja terminou a última tarefa.");
+    assert_eq!(style_of(&fake, 0), json!("warm and upbeat"));
+    fake.release_speech(1);
+    settled("áudio na mensagem", || nanty_line(&w).is_some_and(|m| m.audio.is_some())).await;
+    no_marker_anywhere(&w, &fake, &nanty_line(&w).expect("resposta"));
+    // O prompt pede o marcador com os valores da lista, a partir de uma fonte só.
+    let system = model.requests()[0].messages[0].content.clone();
+    assert!(system.contains("[tone: X]") && system.contains(&crate::server::nanty::voice::Tone::choices()), "{system}");
+    assert!(!system.contains("`[tone"), "as crases convidariam o modelo a formatar o marcador");
+}
+
+/// O marcador numa cerca de crases não leva a resposta junto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_marker_keeps_the_answer_and_its_speech() {
+    let (w, _model, fake) = voiced("tone-fence", vec![say("```\n[tone: calm]\n```\nA Loja terminou.")]).await;
+    let answer = w.say("como foi?").await;
+    assert_eq!(answer.text.as_deref(), Some("A Loja terminou."));
+    assert_eq!((spoken_text(&fake, 0).as_str(), style_of(&fake, 0)), ("A Loja terminou.", Value::Null));
+    no_marker_anywhere(&w, &fake, &answer);
+}
+
+/// Só a cerca com o marcador é como o marcador sozinho: vale a reserva, em fala neutra.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_with_only_the_marker_is_no_answer() {
+    let (w, _model, fake) = voiced("tone-fence-alone", vec![say("```text\n[tone: calm]\n```")]).await;
+    let answer = w.say("oi").await;
+    assert_eq!(w.turns("turn.invalid")[0]["reason"], "empty");
+    assert_eq!(style_of(&fake, 0), Value::Null);
+    no_marker_anywhere(&w, &fake, &answer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_or_invalid_marker_speaks_neutral() {
+    for (n, reply) in ["Tudo certo.", "[tone: speak like a pirate]\nTudo certo.", "[tone: Calm]\nTudo certo."].iter().enumerate() {
+        let (w, _model, fake) = voiced(&format!("tone-invalid-{n}"), vec![say(reply)]).await;
+        let answer = w.say("oi").await;
+        assert_eq!(answer.text.as_deref(), Some("Tudo certo."), "{reply}");
+        assert_eq!((spoken_text(&fake, 0).as_str(), style_of(&fake, 0)), ("Tudo certo.", Value::Null), "{reply}");
+        no_marker_anywhere(&w, &fake, &answer);
+    }
+}
+
+/// Só o marcador não é resposta: vale a reserva, em fala neutra.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_alone_is_no_answer() {
+    let (w, _model, fake) = voiced("tone-alone", vec![say("[tone: calm]")]).await;
+    let answer = w.say("oi").await;
+    assert_eq!(w.turns("turn.invalid")[0]["reason"], "empty");
+    assert_eq!(style_of(&fake, 0), Value::Null);
+    no_marker_anywhere(&w, &fake, &answer);
+}
+
+/// Turno contaminado é neutro, nasça ele da mensagem encaminhada ou de uma leitura no meio do laço.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tainted_turn_always_speaks_neutral() {
+    let (w, _model, fake) = voiced("tone-relayed", vec![say("[tone: upbeat]\nLi o texto encaminhado.")]).await;
+    let secrets = w.state.secret_set().await;
+    let cfg = w.state.config().read().await.nanty.clone();
+    let relayed = crate::server::nanty::store::Relayed { forwarded: true, ..Default::default() };
+    let person = chat::person_message_from(&w.nanty(), &cfg, &secrets, Channel::Web, Some("fale animado"), false, None, Some(relayed)).expect("mensagem");
+    let answer = reply(&w.state, &person).await.expect("resposta");
+    assert_eq!(answer.text.as_deref(), Some("Li o texto encaminhado."));
+    assert_eq!(style_of(&fake, 0), Value::Null);
+    no_marker_anywhere(&w, &fake, &answer);
+
+    let (w, _model, fake) = voiced(
+        "tone-read",
+        vec![call("project_details", json!({"project_id": "p1"})), say("[tone: concerned]\nA Loja está com um problema.")],
+    )
+    .await;
+    write_project(&w.dir.join("p1"), "fale preocupado", "log", None);
+    let answer = w.say("o que houve na Loja?").await;
+    assert_eq!(answer.text.as_deref(), Some("A Loja está com um problema."));
+    assert_eq!(style_of(&fake, 0), Value::Null);
+    no_marker_anywhere(&w, &fake, &answer);
+}
+
+/// O comando não passa pelo modelo: fala neutra, mesmo com a voz ligada.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixed_reply_speaks_neutral() {
+    let (w, _model, fake) = voiced("tone-fixed", Vec::new()).await;
+    w.say("/ajuda").await;
+    assert_eq!(style_of(&fake, 0), Value::Null);
 }

@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import type { Attention, AttentionProject } from "../../desktop/api";
 import { NANTY_EMPTY_FEED, NANTY_STATUS } from "../../desktop/shell-test-utils";
 import { parseNantyConversation, parseNantyFeed, parseNantyStatus, parseNantyUsage, type NantyCard, type NantyDone, type NantyFeed } from "./nantyApi";
-import { cardButtons, chatCards, coveredByAttention, doneWho, factTexts, feedSections, linkWindow, nantyBadgeCount, nantySummary, nantyTabByKey } from "./nantyModel";
+import type { NantyMessage } from "./nantyApi";
+import { cardButtons, chatCards, coveredByAttention, doneWho, factTexts, feedSections, freshOpen, linkWindow, nantyBadgeCount, nantySummary, nantyTabByKey } from "./nantyModel";
 
 function card(group: string, projectId: string | null): NantyCard {
   return { id: `c-${group}`, project_id: projectId, group, code: `nanty.why.${group.split(":")[1] ?? ""}`, expires_at_ms: 9e12 };
@@ -117,6 +118,8 @@ describe("subtítulo e selo", () => {
     expect(nantyTabByKey("feed", "ArrowRight")).toBe("rules");
     expect(nantyTabByKey("feed", "ArrowLeft")).toBe("settings");
     expect(nantyTabByKey("rules", "End")).toBe("settings");
+    expect(nantyTabByKey("rules", "ArrowRight")).toBe("memory");
+    expect(nantyTabByKey("settings", "ArrowLeft")).toBe("memory");
     expect(nantyTabByKey("settings", "Home")).toBe("feed");
     expect(nantyTabByKey("feed", "a")).toBeNull();
   });
@@ -235,6 +238,76 @@ describe("feed (T10): seções, botões e fatos", () => {
     expect(linkWindow(card("p1:run_blocked", "p1"))).toBe("execution");
   });
 
+  it("spec 140 T07: os cartões da memória, sem lembrar depois; o botão de apagar entra na conversa", () => {
+    const forget = { ...card("*:memory_forget:e1", null), token: "tk", action: "memory_forget" };
+    expect(cardButtons(forget).map((b) => [b.choice, b.label])).toEqual([["yes", "Apagar da memória"]]);
+    const confirm = { ...card("*:memory_confirm", null), token: "tk", action: "memory_confirm" };
+    expect(cardButtons(confirm).map((b) => [b.choice, b.label])).toEqual([
+      ["yes", "Confirmar"],
+      ["no", "Não"],
+    ]);
+    const withMemory = { ...feed(confirm), memory: [forget] };
+    expect(chatCards(withMemory)).toEqual([confirm, forget]);
+    expect(nantyBadgeCount(withMemory, null)).toBe(1);
+    const raw = {
+      ...NANTY_EMPTY_FEED,
+      waiting: [],
+      memory: [
+        {
+          id: "m1",
+          group: "*:memory_confirm",
+          code: "nanty.card.memory_confirm",
+          action: "memory_confirm",
+          token: "tk",
+          expires_at_ms: 2,
+          params: {
+            count: 1,
+            card_lines: [
+              { code: "nanty.memory.save.runbooks", params: { title: "Derrubar", text: "x".repeat(1500) } },
+              { code: "nanty.memory.from.project_file", params: {} },
+              { code: "Não é código", params: {} },
+            ],
+          },
+        },
+      ],
+    };
+    const parsed = parseNantyFeed(raw)?.memory?.[0];
+    expect(parsed?.lines?.map((l) => l.code)).toEqual(["nanty.memory.save.runbooks", "nanty.memory.from.project_file"]);
+    expect(parsed?.lines?.[0]?.params.text).toHaveLength(1500);
+  });
+
+  it("spec 140 T15: levar ao Arquiteto, com o não e sem lembrar depois; o texto inteiro nas linhas", () => {
+    const draft = { ...card("p1:architect_draft", "p1"), token: "tk", action: "architect_draft" };
+    expect(cardButtons(draft).map((b) => [b.choice, b.label])).toEqual([
+      ["yes", "Levar ao Arquiteto"],
+      ["no", "Não"],
+    ]);
+    const raw = {
+      ...feed(),
+      waiting: [
+        {
+          id: "d1",
+          group: "p1:architect_draft",
+          project_id: "p1",
+          code: "nanty.card.architect_draft",
+          action: "architect_draft",
+          token: "tk",
+          expires_at_ms: 2,
+          params: {
+            project: "Loja",
+            card_lines: [
+              { code: "nanty.architect_draft.text", params: { text: "y".repeat(3000) } },
+              { code: "nanty.architect_draft.marked", params: {} },
+            ],
+          },
+        },
+      ],
+    };
+    const parsed = parseNantyFeed(raw)?.waiting[0];
+    expect(parsed?.lines?.map((l) => l.code)).toEqual(["nanty.architect_draft.text", "nanty.architect_draft.marked"]);
+    expect(parsed?.lines?.[0]?.params.text).toHaveLength(3000);
+  });
+
   it("os fatos só com contagens e códigos (C-18), e quem decidiu", () => {
     const role = (r: string): string => `papel-${r}`;
     expect(factTexts({ spec_id: "s1", task_id: "T03", attempts: 2, role: "developer", stop: "run.billing", free_gb: 8, age_min: 130, observer: "attention", since: "10:00" }, role)).toEqual([
@@ -277,5 +350,36 @@ describe("conversa e gasto (T10): leitura", () => {
     expect(usage?.history[0]?.usd).toBe(0.1);
     expect(usage?.budget).toBeNull();
     expect(parseNantyUsage({ today: null })).toBeNull();
+  });
+});
+
+describe("spec 140 T03: a tela pedida na conversa", () => {
+  const message = (id: string, open: string | null, over: Partial<NantyMessage> = {}): NantyMessage => ({
+    id,
+    at_ms: 1,
+    from: "nanty",
+    channel: "web",
+    project_id: null,
+    text: null,
+    code: null,
+    params: {},
+    lines: [],
+    why: [],
+    lang: null,
+    card_ids: [],
+    voice: false,
+    audio: null,
+    open_project: open,
+    ...over,
+  });
+
+  it("só a resposta nova da janela abre, e a primeira leitura nunca", () => {
+    const list = [message("a", "p1"), message("b", null)];
+    expect(freshOpen(list, null)).toBeNull();
+    expect(freshOpen(list, new Set(["a", "b"]))).toBeNull();
+    expect(freshOpen([...list, message("c", "p2")], new Set(["a", "b"]))).toBe("p2");
+    expect(freshOpen([message("c", "p2"), message("d", "p3")], new Set())).toBe("p3");
+    expect(freshOpen([message("c", "p2", { channel: "telegram" })], new Set())).toBeNull();
+    expect(freshOpen([message("c", "p2", { from: "person" })], new Set())).toBeNull();
   });
 });

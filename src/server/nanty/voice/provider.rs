@@ -2,10 +2,11 @@
 //! do Google Gemini que a pessoa já tem:
 //!
 //! - **Fala:** `POST {endpoint}/v1beta/interactions` (o mesmo caminho do adaptador nativo), no
-//!   formato atual da documentação: o texto em `input[].content[]` (o estilo, quando há, em
-//!   `annotations` com `speech_metadata.style`), `response_format` de áudio WAV (24 kHz, mono, PCM
-//!   de 16 bits) e a voz em `generation_config.speech_config[].voice`. O áudio volta em base64 num
-//!   item `type: "audio"` de `steps[].content[]` (ou em `output_audio`). `store: false`.
+//!   formato atual da documentação: o texto em `input[].content[]` (o estilo do [`Tone`], quando
+//!   há, em `annotations` com `speech_metadata.style`; nunca texto livre), `response_format` de áudio
+//!   WAV (24 kHz, mono, PCM de 16 bits) e a voz em `generation_config.speech_config[].voice`. O áudio
+//!   volta em base64 num item `type: "audio"` de `steps[].content[]` (ou em `output_audio`).
+//!   `store: false`.
 //! - **Transcrição:** `POST {endpoint}/v1beta/models/{modelo}:generateContent` com a nota de voz em
 //!   `inline_data` (`audio/ogg`), o pedido de transcrição e **`store: false`**: desde 2026-10-26 o
 //!   `generateContent` guarda os pedidos por padrão nos projetos pagos novos, e o campo do pedido
@@ -28,6 +29,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::{json, Value};
 
+use super::tone::Tone;
 use crate::config::{Connection, ConnectionKind};
 use crate::server::models_native::key_rejected;
 
@@ -163,11 +165,11 @@ fn tokens(v: &Value) -> Option<u64> {
     v.as_u64()
 }
 
-/// O corpo da fala, no formato atual da Interactions API. O estilo, quando há, vai como anotação
-/// `speech_metadata` do texto.
-pub fn speech_body(model: &str, voice: &str, text: &str, style: Option<&str>) -> Value {
+/// O corpo da fala, no formato atual da Interactions API. O estilo do tom, quando há, vai como
+/// anotação `speech_metadata` do texto.
+pub fn speech_body(model: &str, voice: &str, text: &str, tone: Tone) -> Value {
     let mut part = json!({"type": "text", "text": text});
-    if let Some(style) = style.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(style) = tone.style() {
         part["annotations"] = json!([{"type": "speech_metadata", "style": style}]);
     }
     json!({
@@ -180,7 +182,7 @@ pub fn speech_body(model: &str, voice: &str, text: &str, style: Option<&str>) ->
 }
 
 /// Fala pelo Gemini: o WAV (ou o PCM cru) da Interactions API.
-pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &str, style: Option<&str>) -> Result<Audio, Fail> {
+pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &str, tone: Tone) -> Result<Audio, Fail> {
     if conn.kind != ConnectionKind::GoogleGemini {
         return Err("unsupported");
     }
@@ -188,7 +190,7 @@ pub async fn gemini_speak(conn: &Connection, model: &str, voice: &str, text: &st
         return Err("config");
     }
     let key = key_of(conn)?;
-    let body = speech_body(model, voice, text, style);
+    let body = speech_body(model, voice, text, tone);
     let url = format!("{}{GEMINI_INTERACTIONS_PATH}", endpoint(conn));
     let raw = send(client()?.post(url).header("x-goog-api-key", sensitive(&key)?).json(&body)).await?;
     let value: Value = serde_json::from_slice(&raw).map_err(|_| "bad_response")?;

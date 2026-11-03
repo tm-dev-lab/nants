@@ -1098,13 +1098,12 @@ pub async fn request_card(state: &AppState, req: &Requestable, channel: Channel)
     let (s, hash, fresh_card) = if req.action == ActionId::PauseRun {
         let project = req.project_id.clone().ok_or(NoCard::Gone)?;
         let run = state.runs().active(&project).ok_or(NoCard::Gone)?;
-        let mut params = Map::new();
-        params.insert("spec_id".into(), json!(run.spec_id));
+        // Spec 140 T04 (C-05): o id da spec fica em `Card.spec_id`, para a ação. A frase do cartão vai ao
+        // modelo, e esse id é texto escrito no projeto. Cartão antigo com o param segue sendo lido.
         let card = Card {
             project_id: Some(project.clone()),
             group: pause_group(&project),
             code: "nanty.card.pause_run".into(),
-            params,
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(card_ttl(&cfg.nanty, false)),
             urgency: Some(Urgency::Normal),

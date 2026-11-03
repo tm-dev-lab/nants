@@ -11,7 +11,10 @@
  *   os horários no formato da tela;
  * - **Idioma** (spec 139 T05): o seletor do idioma próprio do Nanty para os avisos e o resumo,
  *   seguir a conversa (o padrão), português ou inglês; a conversa responde no idioma de quem falou;
- * - **Reserva** por papel e **projetos** observados.
+ * - **Reserva** por papel e **projetos** observados;
+ * - **Análise automática** (spec 140 T12, C-12): o interruptor do cenário proativo, com o que ele faz,
+ *   para onde o texto vai (o provedor da conexão do Nanty e o Telegram), o aviso do plano gratuito do
+ *   Gemini e os tetos (por dia, por spec e a fatia do orçamento).
  *
  * Um só "Salvar" no fim manda só o que mudou (`PUT /api/nanty/config`); o erro sai com o código
  * traduzido. As ações do Telegram (token, parear, teste, desparear) gravam na hora, pelas rotas do
@@ -29,7 +32,7 @@ import { useAppStore } from "../../store";
 import { ModelCombobox, type ModelOption } from "../shared/ModelCombobox";
 import { modelsHint, useConnectionModels, type ConnectionModels } from "../shared/useConnectionModels";
 import { getNantySettings, NANTY_LANGUAGES, NANTY_ROLES, putNantySettings, type NantyLanguage, type NantyRole, type NantySettings } from "./nantyApi";
-import { budgetFraction, draftOf, invalidNumbers, keyRefused, NANTY_LIMITS, settingsPatch, voiceCapable, voiceState, voiceWarning, type NantyDraft, type NantyNumberField, type VoiceCheck, type VoiceState } from "./nantySettingsModel";
+import { budgetFraction, draftOf, invalidNumbers, keyRefused, maybeFreeGemini, NANTY_LIMITS, providerOf, settingsPatch, voiceCapable, voiceState, voiceWarning, type NantyDraft, type NantyNumberField, type VoiceCheck, type VoiceState } from "./nantySettingsModel";
 import { useNanty } from "./nantyStore";
 import { NantyTelegramCard } from "./NantyTelegramCard";
 import { clockText } from "./nantyText";
@@ -321,6 +324,34 @@ function HoldField({ draft, invalid, patch }: { draft: NantyDraft; invalid: bool
           onChange={(visible_hold_secs) => patch({ visible_hold_secs })}
         />
       ) : null}
+    </div>
+  );
+}
+
+/** O endereço que o celular alcança (spec 140 T03): opcional, conferido pelo servidor ao gravar. */
+function AddressField({ draft, patch }: { draft: NantyDraft; patch: Patch }) {
+  const { t } = useT();
+  const id = useId();
+  const hintId = useId();
+  return (
+    <div className="nd-field nd-nanty-subfield" data-nanty-address="">
+      <label htmlFor={id} className="nd-field-label">
+        {t("nanty.tg.address")}
+      </label>
+      <input
+        id={id}
+        className="nd-input"
+        type="url"
+        inputMode="url"
+        autoComplete="off"
+        spellCheck={false}
+        value={draft.address}
+        aria-describedby={hintId}
+        onChange={(event) => patch({ address: event.target.value })}
+      />
+      <p id={hintId} className="nd-field-hint">
+        {t("nanty.tg.addressHint")}
+      </p>
     </div>
   );
 }
@@ -662,6 +693,53 @@ function ProjectsCard({ draft, patch }: { draft: NantyDraft; patch: Patch }) {
   );
 }
 
+/** Spec 140 T12 (C-12): o cenário proativo, com o que ele lê, para onde vai e quanto pode gastar. */
+function ScenarioCard({ draft, analysis, connections, patch }: { draft: NantyDraft; analysis: NantySettings["analysis"]; connections: readonly ConnectionView[]; patch: Patch }) {
+  const { t } = useT();
+  const conn = connections.find((c) => c.id === draft.connection_id);
+  const noModel = conn === undefined || draft.model.trim() === "";
+  const provider = conn === undefined ? null : providerOf(conn);
+  const providerName =
+    provider === null ? t("nanty.prefs.scenario.customProvider") : provider.kind === "plan" ? t("nanty.prefs.scenario.plan") : provider.name;
+  const toggle = (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={draft.proactive}
+      className="nd-btn nd-toggle"
+      data-variant="ghost"
+      onClick={() => patch({ proactive: !draft.proactive })}
+      data-nanty-scenario-toggle=""
+    >
+      <span className="nd-switch" data-on={draft.proactive ? "true" : undefined} aria-hidden="true" />
+      <span>{t("nanty.prefs.scenario.toggle")}</span>
+    </button>
+  );
+  return (
+    <Card id="scenario" title={t("nanty.prefs.scenario.title")} aside={toggle}>
+      <p className="nd-nanty-pref-text">{t("nanty.prefs.scenario.text")}</p>
+      {conn !== undefined ? (
+        <p className="nd-nanty-pref-text" data-nanty-scenario-where="">
+          {t("nanty.prefs.scenario.where", { name: conn.name, provider: providerName })}
+        </p>
+      ) : null}
+      {noModel ? (
+        <p className="nd-field-warn" data-nanty-scenario-why="no_model">
+          {t("nanty.prefs.scenario.noModel")}
+        </p>
+      ) : null}
+      {conn !== undefined && maybeFreeGemini(conn) ? (
+        <p className="nd-field-warn" data-nanty-scenario-why="free_tier">
+          {t("nanty.prefs.scenario.free")}
+        </p>
+      ) : null}
+      <p className="nd-nanty-pref-note" data-nanty-scenario-limits="">
+        {t("nanty.prefs.scenario.limits", { day: formatNumber(analysis.scenarios_per_day), spec: formatNumber(analysis.scenarios_per_spec), pct: formatNumber(analysis.budget_pct) })}
+      </p>
+    </Card>
+  );
+}
+
 type Notice = { tone: "ok" | "warn"; text: string };
 
 export function NantySettingsView({ focusDigest, onFocused }: { focusDigest: boolean; onFocused: () => void }) {
@@ -759,12 +837,20 @@ export function NantySettingsView({ focusDigest, onFocused }: { focusDigest: boo
       <div className="nd-nanty-prefs">
         <ModelCard draft={draft} connections={connections} models={models} patch={patch} />
         <BudgetCard draft={draft} invalid={invalid} patch={patch} />
-        <NantyTelegramCard hold={<HoldField draft={draft} invalid={invalid.includes("visible_hold_secs")} patch={patch} />} />
+        <NantyTelegramCard
+          hold={
+            <>
+              <HoldField draft={draft} invalid={invalid.includes("visible_hold_secs")} patch={patch} />
+              <AddressField draft={draft} patch={patch} />
+            </>
+          }
+        />
         <VoiceCard draft={draft} connections={connections} invalid={invalid.includes("max_input_secs")} patch={patch} check={voices.check} reloadVoices={voices.reload} models={models} />
         <HoursCard draft={draft} now={saved.now} patch={patch} digestRef={digestRef} />
         <ReserveCard draft={draft} connections={connections} models={models} patch={patch} />
         <ProjectsCard draft={draft} patch={patch} />
         <LanguageCard draft={draft} lang={saved.lang} patch={patch} />
+        <ScenarioCard draft={draft} analysis={saved.analysis} connections={connections} patch={patch} />
       </div>
       <div className="nd-nanty-savebar" data-nanty-savebar="">
         {notice !== null ? (

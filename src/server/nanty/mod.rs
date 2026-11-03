@@ -34,28 +34,56 @@
 //!
 //! **Voz (T09; spec 139 T07 e T08):** a nota de voz do dono é transcrita e segue como texto. Com a
 //! voz ligada, toda saída do Nanty fala, só pelo Gemini e com volta para o texto ([`voice`]). Os
-//! áudios ficam na pasta do Nanty e saem junto com as mensagens antigas da conversa.
+//! áudios ficam na pasta do Nanty e saem junto com as mensagens antigas da conversa, ou antes delas,
+//! pelo teto próprio (spec 140 T05).
+//!
+//! **Guarda em disco (spec 140 T05):** a conversa gira com o teto de `[nanty.storage]` e nunca tira
+//! uma linha que o resumo ([`summary`], em arquivo próprio) ainda não cobriu, salvo com o resumo
+//! desligado, quando entra a linha do servidor ([`store::Conversation`]).
+//!
+//! **Cenário proativo (spec 140 T12):** nos avisos importantes, depois do cartão enviado, uma análise
+//! só de leitura do projeto do aviso, no lugar dela ([`analysis`]), vira uma mensagem à parte
+//! ([`scenario`]).
+//!
+//! **Leitura profunda (spec 140 T09):** o leitor de arquivos próprio ([`files`], `openat2` ou
+//! caminhada por `openat`, sem link, com bloqueio, tetos e redator) e o histórico do Git sem a
+//! configuração do repositório ([`git_log`]) são a base das ferramentas de leitura da T10.
 
 pub mod act;
 pub mod agent;
+pub mod analysis;
 pub mod actions;
 pub mod api;
+pub mod can_do;
 pub mod chat;
 pub mod clock;
+pub mod deep;
 pub mod digest;
+pub mod draft;
+pub mod files;
 pub mod filter;
+pub mod git_log;
+pub mod history;
 pub mod instance;
 pub mod journal;
 pub mod jsonl;
 pub mod language;
+pub mod link;
+pub mod memory;
 pub mod observe;
+pub mod provenance;
 pub mod read;
+pub mod redact;
 pub mod render;
+pub mod scenario;
 pub mod settings;
 pub mod signals;
 pub mod silence;
 pub mod store;
+pub mod summarize;
+pub mod summary;
 pub mod telegram;
+pub mod think;
 pub mod tools;
 pub mod turn;
 pub mod voice;
@@ -74,6 +102,7 @@ use self::clock::{LocalTime, NantyClock};
 use self::instance::{InstanceLock, LockOutcome};
 use self::journal::{Journal, JournalEntry};
 use self::observe::NantyProbe;
+use self::provenance::Scoped;
 use self::signals::{Signal, SignalKind};
 use self::store::{ConversationMessage, NantyState, Store, CONVERSATION_TAIL};
 use super::events::{ApiEvent, EventBus, EventType};
@@ -115,6 +144,44 @@ pub enum Avatar {
     Waiting,
 }
 
+/// Quem está pensando e quem está falando agora (spec 140 T11, C-13).
+#[derive(Debug, Default)]
+struct Busy {
+    thinking: usize,
+    speaking: usize,
+}
+
+impl Busy {
+    fn add(&mut self, speaking: bool, up: bool) {
+        let n = if speaking { &mut self.speaking } else { &mut self.thinking };
+        *n = if up { n.saturating_add(1) } else { n.saturating_sub(1) };
+    }
+
+    /// A fala vence o "pensando"; sem nenhum dos dois, vale o estado derivado.
+    fn avatar(&self) -> Option<Avatar> {
+        if self.speaking > 0 {
+            Some(Avatar::Speaking)
+        } else if self.thinking > 0 {
+            Some(Avatar::Thinking)
+        } else {
+            None
+        }
+    }
+}
+
+/// Um turno pensando ou falando ([`Nanty::thinking`], [`Nanty::speaking`]): solto em qualquer saída.
+pub struct BusyGuard<'a> {
+    nanty: &'a Nanty,
+    speaking: bool,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.nanty.busy).add(self.speaking, false);
+        self.nanty.changed(Part::Avatar);
+    }
+}
+
 /// O que mudou na janela (o `part` do evento `nanty_changed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Part {
@@ -140,13 +207,17 @@ pub struct Nanty {
     /// Arquivos na pasta do Nanty; `None` sem pasta de dados (tudo só em memória, desligado).
     store: Option<Store>,
     journal: Option<Journal>,
+    /// A memória de longo prazo (spec 140 T07), na pasta `memory` do Nanty.
+    memory: Option<memory::store::MemoryStore>,
     clock: NantyClock,
     events: EventBus,
     state: Mutex<NantyState>,
     status: Mutex<InstanceStatus>,
     lock: Mutex<Option<InstanceLock>>,
-    /// Pensando ou falando (turno do modelo e voz, T05/T09); vence o estado derivado.
-    busy: Mutex<Option<Avatar>>,
+    /// Pensando ou falando (turno do modelo e voz, T05/T09); vence o estado derivado. Conta quem está
+    /// em cada estado (spec 140 T11, C-13): a conversa e a análise rodam juntas, e o fim de uma não
+    /// apaga o "pensando" da outra.
+    busy: Mutex<Busy>,
     /// Varreduras completas feitas (a inicial e as do `Lagged`).
     sweeps: AtomicU64,
     /// Sonda do disco e do Docker (T02; os testes trocam).
@@ -157,14 +228,27 @@ pub struct Nanty {
     starter: Mutex<Arc<dyn act::RunStarter>>,
     /// A fila única dos turnos do modelo (T05): Telegram e janela.
     turns: turn::TurnQueue,
+    /// O lugar da análise (spec 140 T11, C-13): uma por vez, fora da fila da conversa.
+    analysis: analysis::Lane,
+    /// O cenário proativo em andamento e as recusas já anotadas (spec 140 T12).
+    scenario: scenario::Runtime,
     /// Modelo simulado (testes); `None` = o cliente da conexão do `[nanty]`.
     backend: Mutex<Option<Arc<dyn crate::agents::chat::ChatBackend>>>,
+    /// Modelo simulado só do resumo (testes); `None` = o mesmo da conversa.
+    summary_backend: Mutex<Option<Arc<dyn crate::agents::chat::ChatBackend>>>,
+    /// O resumo da conversa está rodando (spec 140 T06): uma execução por vez.
+    summarizing: std::sync::atomic::AtomicBool,
+    /// O degrau do resumo parou numa geração ilegível (revisão 1 da T06, F-01).
+    summary_blocked: std::sync::atomic::AtomicBool,
     /// O canal do Telegram (T06): saúde, bot e pareamento, em memória.
     telegram: telegram::Link,
     /// A lista de vozes do Gemini, guardada por pouco tempo (spec 139 T07).
     voices: voice::VoicesCache,
     /// A vez de cada mensagem que fala (spec 139 T08): saem na ordem em que entraram na conversa.
     speech_turn: tokio::sync::Mutex<()>,
+    /// Conexão e modelo que recuaram de um esforço maior do `deep_think` (spec 140 T13), só neste
+    /// processo: o próximo pedido é recusado antes da rodada.
+    effort_rejected: Mutex<std::collections::HashSet<String>>,
 }
 
 impl std::fmt::Debug for Nanty {
@@ -199,22 +283,29 @@ impl Nanty {
         let state = store.as_ref().map(Store::load).unwrap_or_default();
         Self {
             store,
+            memory: dir.as_ref().map(|d| memory::store::MemoryStore::new(d.join(memory::MEMORY_DIR))),
             journal: dir.map(Journal::new),
             clock,
             events,
             state: Mutex::new(state),
             status: Mutex::new(InstanceStatus::NotStarted),
             lock: Mutex::new(None),
-            busy: Mutex::new(None),
+            busy: Mutex::new(Busy::default()),
             sweeps: AtomicU64::new(0),
             probe: Mutex::new(observe::default_probe()),
             scans: AtomicU64::new(0),
             starter: Mutex::new(Arc::new(act::RealStarter)),
             turns: turn::TurnQueue::default(),
+            analysis: analysis::Lane::default(),
+            scenario: scenario::Runtime::default(),
             backend: Mutex::new(None),
+            summary_backend: Mutex::new(None),
+            summarizing: std::sync::atomic::AtomicBool::new(false),
+            summary_blocked: std::sync::atomic::AtomicBool::new(false),
             telegram: telegram::Link::default(),
             voices: voice::VoicesCache::default(),
             speech_turn: tokio::sync::Mutex::new(()),
+            effort_rejected: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -228,12 +319,53 @@ impl Nanty {
         &self.turns
     }
 
+    /// Anota que `key` ([`think::rejection_key`]) recuou de um esforço maior.
+    pub fn note_effort_rejected(&self, key: String) {
+        lock(&self.effort_rejected).insert(key);
+    }
+
+    /// `key` já recuou de um esforço maior neste processo.
+    pub fn effort_rejected(&self, key: &str) -> bool {
+        lock(&self.effort_rejected).contains(key)
+    }
+
+    /// O lugar da análise, à parte da fila da conversa.
+    pub fn analysis(&self) -> &analysis::Lane {
+        &self.analysis
+    }
+
+    /// O cenário proativo deste processo (spec 140 T12).
+    pub fn scenario(&self) -> &scenario::Runtime {
+        &self.scenario
+    }
+
+    /// O cartão `id` segue aberto (nem decidido, nem resolvido, nem vencido).
+    pub fn card_open(&self, id: &str) -> bool {
+        let now = self.now().epoch_ms;
+        lock(&self.state).cards.iter().any(|c| c.id == id && c.expires_at_ms > now)
+    }
+
     /// O modelo simulado, se houver (testes).
     pub fn backend(&self) -> Option<Arc<dyn crate::agents::chat::ChatBackend>> {
         lock(&self.backend).clone()
     }
 
     /// Troca o modelo por um simulado (testes: nunca chave real).
+    /// O modelo do resumo: o simulado só dele, ou o da conversa.
+    pub fn summary_backend(&self) -> Option<Arc<dyn crate::agents::chat::ChatBackend>> {
+        lock(&self.summary_backend).clone().or_else(|| self.backend())
+    }
+
+    /// Troca o modelo só do resumo (testes).
+    pub fn set_summary_backend(&self, backend: Arc<dyn crate::agents::chat::ChatBackend>) {
+        *lock(&self.summary_backend) = Some(backend);
+    }
+
+    /// A vez do resumo, se ninguém o está rodando: solta ao cair a guarda.
+    pub fn summary_turn(&self) -> Option<summarize::Running<'_>> {
+        summarize::Running::take(&self.summarizing)
+    }
+
     pub fn set_backend(&self, backend: Arc<dyn crate::agents::chat::ChatBackend>) {
         *lock(&self.backend) = Some(backend);
     }
@@ -395,48 +527,128 @@ impl Nanty {
         true
     }
 
-    /// Tira tudo o que é do projeto removido: o estado e as linhas do registro e da conversa.
+    /// Guarda o `Host` de um aparelho autorizado (spec 140 T03), só quando muda: esta chamada corre a
+    /// cada requisição do aparelho.
+    pub fn note_device_host(&self, host: &str) {
+        self.update_quiet(|st| {
+            if st.device_host.as_deref() == Some(host) {
+                return false;
+            }
+            st.device_host = Some(host.to_string());
+            true
+        });
+    }
+
+    /// Tira tudo o que é do projeto removido: o estado, as linhas do registro e da conversa (todas
+    /// as gerações) e os itens do resumo, inclusive o que também é de outro projeto (o texto não se
+    /// separa por projeto, C-16). Spec 140 T07: também as entradas da memória e os pedidos do cartão de
+    /// confirmação dela, pelo mesmo [`Scoped`].
     pub fn forget_project(&self, project_id: &str) {
-        self.update(|st| st.forget_project(project_id));
+        self.update(|st| {
+            let state = st.forget_project(project_id);
+            memory::card::retain_in(st, |p| !p.touches(project_id)) || state
+        });
         if !self.owns() {
             return;
         }
-        let failed = self.journal.as_ref().is_some_and(|j| j.forget_project(project_id).is_err())
-            || self.store.as_ref().is_some_and(|s| {
-                s.conversation()
-                    .retain::<ConversationMessage>(|m| m.project_id.as_deref() != Some(project_id))
-                    .is_err()
-            });
-        if failed {
+        self.forget_project_memory(project_id);
+        let journal = self.journal.as_ref().is_some_and(|j| j.forget_project(project_id).is_err());
+        let conversation =
+            self.store.as_ref().is_some_and(|s| s.conversation().retain(|m| !m.touches(project_id)).is_err());
+        let summary = self.store.as_ref().and_then(|s| s.summary().forget_project(project_id).err());
+        if journal || conversation {
             terminal_notice("nanty.log.save_failed");
         }
+        self.summary_failed(summary);
         voice::prune(self);
         self.changed(Part::Conversation);
     }
 
     /// Varredura completa (a inicial e a do `Lagged`). Nesta tarefa, tira os itens vencidos e
-    /// tudo o que é de projetos que não existem mais (estado, registro e conversa): cobre o
+    /// tudo o que é de projetos que não existem mais (estado, registro, conversa e resumo): cobre o
     /// `ProjectRemoved` engolido por um `Lagged` e o projeto removido enquanto este processo não
     /// era o dono. Os observadores entram na T02.
     pub fn full_sweep(&self, known_projects: &[String]) {
         let now = self.now().epoch_ms;
         self.update(|st| {
             let expired = st.prune_expired(now);
-            st.retain_projects(known_projects) || expired
+            let pending = memory::card::retain_in(st, |p| p.within(|id| known_projects.iter().any(|k| k == id)));
+            st.retain_projects(known_projects) || expired || pending
         });
         if self.owns() {
+            // Spec 140 T07: a memória dos projetos que não existem mais.
+            self.retain_known_memory(known_projects);
             let known = |p: &Option<String>| p.as_ref().is_none_or(|id| known_projects.contains(id));
-            let failed = self.journal.as_ref().is_some_and(|j| j.retain_known(&known).is_err())
-                || self.store.as_ref().is_some_and(|s| {
-                    s.conversation().retain::<ConversationMessage>(|m| known(&m.project_id)).is_err()
-                });
-            if failed {
+            let known_id = |id: &str| known_projects.iter().any(|k| k == id);
+            let journal = self.journal.as_ref().is_some_and(|j| j.retain_known(&known).is_err());
+            let conversation = self.store.as_ref().is_some_and(|s| s.conversation().retain(|m| m.within(known_id)).is_err());
+            let summary = self.store.as_ref().and_then(|s| s.summary().retain(|item| item.within(known_id)).err());
+            if journal || conversation {
                 terminal_notice("nanty.log.save_failed");
             }
+            self.summary_failed(summary);
             // T09: os áudios cuja mensagem saiu da conversa.
             voice::prune(self);
         }
         self.sweeps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A limpeza do resumo falhou: o motivo, em código, vai ao registro.
+    fn summary_failed(&self, error: Option<summary::SummaryError>) {
+        if let Some(e) = error {
+            let mut entry =
+                JournalEntry::new(self.now().epoch_ms, journal::JournalKind::Conversation, "conversation.summary_unsaved");
+            entry.params.insert("reason".into(), json!(e.code()));
+            self.record(&entry);
+        }
+    }
+
+    /// Aplica a guarda em disco da configuração (`[nanty.storage]`, spec 140 T05): a rotação da
+    /// conversa e os tetos dos áudios.
+    pub fn apply_storage(&self, cfg: &NantyConfig) {
+        if let Some(store) = &self.store {
+            store.apply_storage(&cfg.storage);
+        }
+    }
+
+    /// Liga ou desliga o resumo da conversa (a T06 decide, pelo modelo e pelo orçamento). Desligado,
+    /// a rotação tira a linha não resumida e deixa a linha do servidor no resumo.
+    pub fn set_summarizer(&self, summarizer: store::Summarizer) {
+        if let Some(store) = &self.store {
+            store.conversation().set_summarizer(summarizer);
+        }
+    }
+
+    /// O resumo da conversa (vazio sem pasta de dados).
+    pub fn summary(&self) -> summary::Summary {
+        self.store.as_ref().map(|s| s.summary().load().summary()).unwrap_or_default()
+    }
+
+    /// Muda o resumo (só o dono grava); `Ok(false)` sem mudança ou sem pasta.
+    pub fn update_summary(&self, f: impl FnOnce(&mut summary::Summary) -> bool) -> Result<bool, summary::SummaryError> {
+        if !self.owns() {
+            return Ok(false);
+        }
+        match &self.store {
+            Some(store) => store.summary().update(f),
+            None => Ok(false),
+        }
+    }
+
+    /// Todas as linhas da conversa, fundidas por id, de todas as gerações: o degrau do resumo lê
+    /// tudo, para nunca pular uma mensagem que ficou além da cauda. Erro se alguma geração existe e
+    /// não dá para ler (spec 140 T06, revisão 1, F-01): o degrau não move a marca por cima dela.
+    pub fn whole_conversation(&self) -> Result<Vec<ConversationMessage>, jsonl::JsonlError> {
+        match &self.store {
+            Some(store) => store.conversation().all_strict().map(store::merged_lines),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Anota se o degrau do resumo está parado por uma geração ilegível; `true` só na mudança (o
+    /// registro ganha uma linha por vez que trava, não uma por degrau).
+    pub fn note_summary_blocked(&self, blocked: bool) -> bool {
+        self.summary_blocked.swap(blocked, Ordering::AcqRel) != blocked
     }
 
     pub fn sweeps(&self) -> u64 {
@@ -481,26 +693,68 @@ impl Nanty {
         if !self.owns() {
             return;
         }
-        if self.store.as_ref().is_some_and(|s| s.conversation().append(message).is_err()) {
-            terminal_notice("nanty.log.save_failed");
+        match self.store.as_ref().map(|s| s.conversation().append(message)) {
+            Some(Ok(notes)) => notes.iter().for_each(|note| self.record_rotation(note)),
+            Some(Err(_)) => terminal_notice("nanty.log.save_failed"),
+            None => {}
         }
         self.changed(Part::Conversation);
     }
 
+    /// O que a rotação da conversa fez fora do comum vai ao registro, só com códigos e números.
+    fn record_rotation(&self, note: &store::RotationNote) {
+        let at = self.now().epoch_ms;
+        let kind = journal::JournalKind::Conversation;
+        let entry = match note {
+            store::RotationNote::Unsummarized { messages, reason } => {
+                let mut e = JournalEntry::new(at, kind, "conversation.unsummarized");
+                e.params.insert("messages".into(), json!(messages));
+                e.params.insert("reason".into(), json!(reason));
+                e
+            }
+            store::RotationNote::Held => JournalEntry::new(at, kind, "conversation.held"),
+            store::RotationNote::Unreadable => JournalEntry::new(at, kind, "conversation.unreadable"),
+            store::RotationNote::SummaryFailed(reason) => {
+                let mut e = JournalEntry::new(at, kind, "conversation.summary_unsaved");
+                e.params.insert("reason".into(), json!(reason));
+                e
+            }
+        };
+        self.record(&entry);
+    }
+
     /// A conversa (as últimas mensagens, da mais velha para a mais nova), com as linhas do mesmo id
     /// fundidas ([`store::merged_lines`]). Cada mensagem tem no máximo duas linhas, então o dobro do
-    /// limite sempre traz as últimas [`CONVERSATION_TAIL`].
+    /// limite sempre traz as últimas [`CONVERSATION_TAIL`]. O áudio que já saiu pelo teto dos
+    /// áudios (spec 140 T05) some da mensagem: o texto continua.
     pub fn conversation(&self) -> Vec<ConversationMessage> {
         let lines = self.store.as_ref().map(|s| s.conversation().tail(CONVERSATION_TAIL * 2)).unwrap_or_default();
         let mut merged = store::merged_lines(lines);
         merged.drain(..merged.len().saturating_sub(CONVERSATION_TAIL));
+        voice::drop_missing_audio(self, &mut merged);
         merged
     }
 
-    /// Pensando ou falando (`None` volta ao estado derivado).
-    pub fn set_busy(&self, avatar: Option<Avatar>) {
-        *lock(&self.busy) = avatar;
+    /// Pensando enquanto a guarda existir. Cada turno tem a sua: o avatar só sai de "pensando" quando
+    /// a última cai (spec 140 T11, C-13).
+    pub fn thinking(&self) -> BusyGuard<'_> {
+        self.busy_as(false)
+    }
+
+    /// Falando enquanto a guarda existir; a fala vence o "pensando", que volta quando ela acaba.
+    pub fn speaking(&self) -> BusyGuard<'_> {
+        self.busy_as(true)
+    }
+
+    fn busy_as(&self, speaking: bool) -> BusyGuard<'_> {
+        lock(&self.busy).add(speaking, true);
         self.changed(Part::Avatar);
+        BusyGuard { nanty: self, speaking }
+    }
+
+    /// Turnos pensando agora (a conversa, a análise, a transcrição).
+    pub fn thinking_turns(&self) -> usize {
+        lock(&self.busy).thinking
     }
 
     /// Estado do avatar: desligado dorme; pensando ou falando vence; no silêncio dorme; com
@@ -509,7 +763,7 @@ impl Nanty {
         if self.status() != InstanceStatus::Active {
             return Avatar::Sleeping;
         }
-        if let Some(busy) = *lock(&self.busy) {
+        if let Some(busy) = lock(&self.busy).avatar() {
             return busy;
         }
         let now = self.now();
@@ -661,6 +915,12 @@ async fn known_projects(state: &AppState) -> Vec<String> {
 /// cobertos: uma fonte que falhou não "resolve" o que estava aberto.
 async fn scan(state: &AppState, nanty: &Arc<Nanty>, round: u64) {
     let cfg: Config = state.config().read().await.clone();
+    // Spec 140 T05: a guarda em disco segue a configuração, e os áudios vencidos saem a cada rodada.
+    nanty.apply_storage(&cfg.nanty);
+    // Spec 140 T06: o resumo liga e desliga com o modelo e o orçamento.
+    summarize::sync(nanty, &cfg);
+    let n = Arc::clone(nanty);
+    let _ = tokio::task::spawn_blocking(move || voice::prune(&n)).await;
     let mut signals = Vec::new();
     let mut covered = Vec::new();
     if let Some(found) = observe::observe_projects(state, &cfg).await {
@@ -691,8 +951,18 @@ async fn scan(state: &AppState, nanty: &Arc<Nanty>, round: u64) {
 fn model_turns(state: &AppState, nanty: &Arc<Nanty>) {
     let (s, n) = (state.clone(), Arc::clone(nanty));
     tokio::spawn(async move {
-        turn::proactive(&s, &n).await;
-        digest::maybe_send(&s, &n).await;
+        let spoke = matches!(turn::proactive(&s, &n).await, Some(turn::TurnOutcome::Reply(_)));
+        let sent = digest::maybe_send(&s, &n).await;
+        // Spec 140 T06: as falas proativas também enchem a janela.
+        if spoke || sent {
+            summarize::after_reply(&s, &n).await;
+        }
+    });
+    // Spec 140 T12: o cenário proativo, reavaliado a cada passagem; a análise roda no lugar dela, e
+    // nada aqui espera por ela.
+    let (s, n) = (state.clone(), Arc::clone(nanty));
+    tokio::spawn(async move {
+        let _ = scenario::tick(&s, &n).await;
     });
 }
 
@@ -703,6 +973,11 @@ async fn run(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let nanty = Arc::clone(state.nanty());
+    {
+        let cfg = state.config().read().await;
+        nanty.apply_storage(&cfg.nanty);
+        summarize::sync(&nanty, &cfg);
+    }
     let sweep = |nanty: Arc<Nanty>, known: Vec<String>| async move {
         let _ = tokio::task::spawn_blocking(move || nanty.full_sweep(&known)).await;
     };
@@ -768,3 +1043,9 @@ mod t05_tests;
 
 #[cfg(test)]
 mod t06_tests;
+
+#[cfg(test)]
+mod provenance_tests;
+
+#[cfg(test)]
+mod rotation_tests;

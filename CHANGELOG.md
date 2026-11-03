@@ -17,8 +17,72 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   as a card to confirm. From the first day it tries again after a passing provider failure, switches a role
   to the reserve you chose when its credit runs out, and cleans leftover containers and networks
   of stopped projects. On Telegram, you create your own bot in BotFather and pair it with a single
-  use code. Its spend has a daily budget and shows apart in Costs. Nanty sleeps while Nants is
+  use code. Its spend has a daily budget and shows apart in Costs: US$ 1.00 by default, or 600,000
+  tokens for a model with no price or a ChatGPT plan connection, sized from measured use for about
+  70 messages with voice a day plus the automatic analyses, also after Gemini prices double on
+  2027-01-01. The voice always counts, and a value you set yourself stays. Nanty sleeps while Nants is
   closed, and what waited comes back as old cards that never decide anything.
+- **Nanty remembers where each message came from.** A hostile text read in one turn cannot act in
+  the next one: replies store their source across restarts, tainted text leaves the context after a
+  few messages, each mode has its own tools, checked when they run, and what looks like a secret is
+  redacted, not only the secrets Nants knows.
+- **Nanty remembers the conversation for longer.** It now keeps the last 40 to 60 messages with no
+  time limit, each with its date and time, and turns the oldest 20 into a short summary at a time,
+  written only from clean text: what a project file or a forwarded text said never goes into it.
+  The summary never makes you wait for a reply and counts in the daily budget; with no model or no
+  budget, a line written by the server takes its place.
+- **Nanty is a partner for ideas.** Talk about where a project should go, an idea, the architecture
+  or the roadmap, and Nanty says what it would do and why, points out the risk and disagrees when it
+  has a reason, without opening with praise, keeping what it saw apart from what it supposes. When
+  a question needs real thought, the model itself asks to think again with more effort, once per
+  message and on the same model, inside the daily budget and the ceiling per message; with no room
+  for it, the reply comes at the normal effort, with no error.
+- **Nanty takes an idea to the Architect as a draft.** When an idea is ready, Nanty offers to take
+  it to the Architect of that project, on a card with the whole text. Your tap only leaves the text
+  as a draft in the Architect conversation of the project, where you edit it, send it or discard it;
+  nothing reaches the Architect without you. If the conversation read untrusted content, the draft
+  comes marked and, while it is pending, your messages to that Architect run without internet;
+  discarding it goes back to normal. A conversation that read
+  another project cannot send anything to this one.
+- **Nanty's long replies arrive whole.** A long reply starts with what matters and is kept whole in
+  the window. On Telegram it comes in up to three messages, split between paragraphs or sentences,
+  with the buttons and the server sentence in the last one, and the rest pointed to the window when
+  it is longer. With voice on, the audio speaks only the start of the first paragraph, the caption
+  shows the same part, and the rest follows as text.
+- **Nanty has a long term memory.** It keeps short notes by topic (how you work together, the way
+  you want it to be, how to run the system, runbooks and decisions) that survive restarts and
+  updates. It saves on its own only in a clean conversation, and the reply says what it saved, with
+  a button to delete it. After reading project content or a forwarded text, nothing is saved
+  without you: a silent card shows the exact text and where it came from. A card too long for one
+  Telegram message is confirmed only in the window, where the whole text shows. Secrets are redacted
+  before saving, and a note is never an action, a permission, a channel or a token.
+- **A Memory tab in the Nanty window.** Read the notes by topic, with who said each one, where and
+  when; fix one (if it changed while you edited, you see the saved version and choose), delete it and
+  restore it within 7 days. Restoring the older version of a replaced note swaps the two. Notes that left the index for lack of use are marked, a runbook shows
+  the exact command with a copy button, and "Download a copy" saves the active notes as a JSON file,
+  redacted again.
+- **Nanty reads what the agents did when you ask.** Ask why a run got stuck, what went wrong or for
+  a report, and Nanty reads the end of the agents' dialog and of their tool trail, the test output
+  and the recovery analyses of a task, the spec and the tasks, the last commits and any file of the
+  project, such as the architecture or the roadmap. It reads only the projects it watches, through a
+  reader that never follows a link or opens secrets, private keys, `.git` or dependency folders, and
+  Git runs with the repository settings that could run programs turned off. All of it arrives as
+  untrusted data, redacted and with a ceiling per message, taints the turn, and a second project in
+  the same message only when both are asked together.
+- **Automatic analysis of important notices.** Turn it on in Nanty > Settings and, after a blocked
+  run, a review loop or the end of a spec, Nanty reads that project on its own and sends a separate
+  message with what happened, the likely cause, always as a hypothesis, and a suggestion. It only
+  reads that project, never acts and has no buttons; the notice never waits for it. The card says
+  where the text goes and warns about the free tier of the Gemini API. It is off by default, stays
+  out of quiet hours, of the summary and of a burst, never repeats a case and has a daily ceiling, a
+  ceiling per spec and a share of the daily budget. A text that copies what it read, has a path
+  or a ready to paste command is not sent: a short line says so, and you can ask in the
+  conversation.
+- **Nanty keeps more of the conversation on disk.** The conversation history grows to about 3 MB
+  with a fixed ceiling, and old messages leave only after they are in a summary kept in its own
+  file. Voice audio has its own limits (32 MB and 14 days by default, in `[nanty.storage]`): the
+  audio of an old message goes when it passes the age or the size limit, or with its message, so
+  the text can stay after its audio is gone.
 - **Talk to Nanty in plain words.** You talk to it as you would to someone on your team, by text or
   voice, with no phrase to learn: it looks up what it needs with read only tools, remembers the last
   messages and works out the project from a number, part of the name or its state ("the one that
@@ -31,6 +95,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Language of the person, and Nanty's own.** Nanty answers in the language you wrote or spoke in,
   whatever the language of the interface. Notices and the morning summary follow the new **Nanty
   language** option in Settings: follow the conversation (the default), Portuguese or English.
+- **Nanty offers only what it can do, and brings you to Nants.** Notices and replies offer only what
+  exists at that moment. When you say "open it", Telegram gets a button to Nants, and the window
+  opens the project screen. The address is the last one an authorized device used, or the new
+  optional **Nants address for your phone** in Settings; with no address, Nanty tells you to open
+  Nants on the computer. If something can't be done, it says why and what you can do instead.
 - **Mute in a sentence.** Ask for quiet in your own words, for some hours or until an exact time, up
   to 24 hours. The server confirms with the end time and a button to turn it off. The urgent still
   arrives, without sound, and the rest goes into the summary.
@@ -39,6 +108,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   window, with a player that never starts on its own. Voice goes both ways only through Google
   Gemini, then text, with storage off at the provider. An older configuration with OpenAI in the
   voice keeps working: the first Gemini step becomes the voice connection.
+- **Nanty's voice has a tone.** The voice speaks neutral, upbeat, serious, concerned or calm: Nants
+  picks the tone of a notice by its kind, and in the conversation the model picks one from the same
+  list. After reading something untrusted, the voice stays neutral.
+- **A spoken notice says what Nanty wrote.** With a model and budget, the voice note of a notice
+  speaks Nanty's own words about it, in a single message, with the reason line still written by
+  Nants. If the text takes more than a few seconds, the note speaks the fixed sentence and the text
+  follows, so the notice is never late.
+- **Git repositories made inside a task are committed as files.** When an agent runs `git init`
+  inside the project, the history of that inner repository is kept out of the tree, its files go
+  into the commit as regular files, and the conversation says so. A setting placed in that
+  repository never runs a program on your computer.
 - **Clearer Nanty settings.** The Voice card has one **Gemini connection for voice** selector and
   shows whether voice is ready, has no key, had its key refused or has no connection. The model
   fields have the same autocomplete as the rest of Nants, the speech field lists only speech models

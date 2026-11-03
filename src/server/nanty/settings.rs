@@ -3,7 +3,9 @@
 //! - `PUT /api/nanty/config`: só os campos enviados mudam (os ausentes ficam como estão). Os
 //!   campos são os da aba Ajustes: modelo e esforço, orçamento do dia, horários, o idioma próprio do
 //!   Nanty (`language`: `follow`, `pt-BR` ou `en`, spec 139 T05), projetos excluídos, reserva por
-//!   papel, voz e a espera do Telegram com a aba aberta. A voz (spec 139 T07) é só do Gemini: uma
+//!   papel, voz, a espera do Telegram com a aba aberta e o endereço do Nants que o celular alcança
+//!   (`address`, spec 140 T03; vazio tira) e o interruptor do cenário proativo (`analysis.proactive`,
+//!   spec 140 T12). A voz (spec 139 T07) é só do Gemini: uma
 //!   conexão (`connection_id`) para falar e transcrever, os modelos (`speech_model`,
 //!   `transcribe_model`) e a voz (`voice`); vazio volta ao inicial. A forma antiga (`order`,
 //!   `transcribe`) saiu na T09 e é recusada como campo desconhecido. O token, o chat e o dono do
@@ -78,6 +80,14 @@ struct TelegramInput {
     visible_hold_secs: Option<u64>,
 }
 
+/// O cenário proativo (spec 140 T12, C-12): só o interruptor passa pela janela; os tetos ficam na
+/// configuração.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalysisInput {
+    proactive: Option<bool>,
+}
+
 /// Corpo de `PUT /api/nanty/config`: todo campo é opcional.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +107,9 @@ struct ConfigInput {
     reserve: Option<BTreeMap<String, RouteInput>>,
     voice: Option<VoiceInput>,
     telegram: Option<TelegramInput>,
+    /// O endereço que o celular alcança (spec 140 T03): vazio tira.
+    address: Option<String>,
+    analysis: Option<AnalysisInput>,
 }
 
 /// Valor fora do aceito: 422 com o nome do campo.
@@ -264,6 +277,17 @@ fn apply(cfg: &Config, input: ConfigInput) -> Result<NantyConfig, ApiError> {
             n.telegram.visible_hold_secs = secs;
         }
     }
+    if let Some(proactive) = input.analysis.and_then(|a| a.proactive) {
+        n.analysis.proactive = proactive;
+    }
+    if let Some(address) = input.address {
+        let address = text("address", &address)?;
+        n.address = if address.is_empty() {
+            address
+        } else {
+            super::link::parse_address(&address).ok_or_else(|| invalid("address"))?
+        };
+    }
     Ok(n)
 }
 
@@ -279,8 +303,13 @@ async fn save(state: &AppState, change: impl FnOnce(&Config) -> Result<NantyConf
     next.nanty = nanty;
     persist(state, &next).await?;
     let saved = next.nanty.clone();
+    let stopped = guard.nanty.analysis.proactive && !saved.analysis.proactive;
     *guard = next;
     drop(guard);
+    // Spec 140 T12 (revisão 1, F-02): desligado o cenário, o que está em andamento para já.
+    if stopped {
+        state.nanty().scenario().stop();
+    }
     if routes_changed {
         // Modelos novos do Nanty entram no `models_in_use`: a estimativa de preço sai em segundo plano.
         spawn_pricing_autofill(state);

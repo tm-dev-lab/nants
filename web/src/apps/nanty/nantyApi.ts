@@ -77,6 +77,8 @@ export interface NantyCard {
   token?: string;
   created_at_ms?: number;
   expires_at_ms: number;
+  /** As linhas abaixo do porquê (spec 140 T07: o texto exato e a fonte do pedido à memória). */
+  lines?: Coded[];
 }
 
 /** Desfazer de um "feito" (T03). */
@@ -122,6 +124,8 @@ export interface NantyFeed {
   /** Os cartões que esperam a pessoa (o botão de desligar o silêncio fica fora: é um controle). */
   waiting: NantyCard[];
   silence?: NantySilence | null;
+  /** Os botões de apagar do rodapé "guardei isto" (spec 140 T07): controles, citados pela conversa. */
+  memory?: NantyCard[];
   done?: NantyDone[];
   planned?: NantyPlanned[];
   today: { spend_usd: number; budget_usd: number };
@@ -159,6 +163,8 @@ export interface NantyMessage {
   /** A pessoa falou por nota de voz: o `text` é a transcrição. */
   voice: boolean;
   audio: NantyAudio | null;
+  /** O projeto cuja tela o Nanty abriu a pedido (spec 140 T03, `params.open_project`). */
+  open_project: string | null;
 }
 
 export interface NantyUsage {
@@ -241,6 +247,7 @@ function parseCard(value: unknown): NantyCard | null {
   const token = str(value.token, 128);
   const created = num(value.created_at_ms);
   const cardParams = parseCodeParams(value.params);
+  const lines = parseCardLines(value.params);
   return {
     id,
     project_id: str(value.project_id, 128),
@@ -251,7 +258,27 @@ function parseCard(value: unknown): NantyCard | null {
     ...(token !== null ? { token } : {}),
     ...(created !== null ? { created_at_ms: created } : {}),
     expires_at_ms: expires,
+    ...(lines.length > 0 ? { lines } : {}),
   };
+}
+
+/** Teto de cada texto das linhas do cartão: o runbook proposto vai inteiro (o servidor corta em 1.500). */
+const CARD_LINE_CHARS = 4000;
+/** Linhas do cartão, no máximo. */
+const MAX_CARD_LINES = 40;
+
+/** As linhas do cartão (`params.card_lines`, cada uma `{code, params}`), com o texto inteiro. */
+function parseCardLines(value: unknown): Coded[] {
+  if (!isRecord(value) || !Array.isArray(value.card_lines)) return [];
+  return value.card_lines.slice(0, MAX_CARD_LINES).flatMap((line: unknown) => {
+    if (!isRecord(line) || !isMessageCode(line.code)) return [];
+    const out: Record<string, string | number> = {};
+    for (const [name, v] of Object.entries(isRecord(line.params) ? line.params : {})) {
+      if (typeof v === "string") out[name] = v.slice(0, CARD_LINE_CHARS);
+      else if (typeof v === "number" && Number.isFinite(v)) out[name] = v;
+    }
+    return [{ code: line.code, params: out }];
+  });
 }
 
 function parseUndo(value: unknown): NantyUndo | null {
@@ -308,9 +335,11 @@ export function parseNantyFeed(value: unknown): NantyFeed | null {
   const today = isRecord(value.today) ? value.today : {};
   const spend = isRecord(today.spend) ? num(today.spend.usd) : null;
   const silence = parseSilence(value.silence);
+  const memory = list(value.memory, parseCard);
   return {
     waiting: list(value.waiting, parseCard),
     ...(silence === null ? {} : { silence }),
+    ...(memory.length > 0 ? { memory } : {}),
     done: list(value.done, parseDone),
     planned: list(value.planned, parsePlanned),
     today: { spend_usd: spend ?? 0, budget_usd: num(today.budget_usd) ?? 0 },
@@ -354,6 +383,7 @@ function parseMessage(value: unknown): NantyMessage | null {
     card_ids: Array.isArray(value.card_ids) ? value.card_ids.filter((c): c is string => str(c, 64) !== null) : [],
     voice: value.voice === true,
     audio: parseAudio(value.audio),
+    open_project: isRecord(value.params) ? str(value.params.open_project, 128) : null,
   };
 }
 
@@ -514,6 +544,18 @@ export interface NantySettings {
   reserve: Partial<Record<NantyRole, NantyRoute>>;
   voice: NantyVoiceSettings;
   telegram: { paired: boolean; hold_while_visible: boolean; visible_hold_secs: number };
+  /** O endereço do Nants que o celular alcança (spec 140 T03); vazio = o último de um aparelho. */
+  address: string;
+  /** O cenário proativo (spec 140 T12): o interruptor e os tetos, que a janela só mostra. */
+  analysis: NantyAnalysisSettings;
+}
+
+/** O cenário proativo (spec 140 T12, C-12): o interruptor e os tetos da configuração. */
+interface NantyAnalysisSettings {
+  proactive: boolean;
+  scenarios_per_day: number;
+  scenarios_per_spec: number;
+  budget_pct: number;
 }
 
 /** O idioma próprio do Nanty: seguir a conversa (o padrão), português ou inglês. */
@@ -541,6 +583,9 @@ export interface NantySettingsPatch {
   reserve?: Partial<Record<NantyRole, NantyRoute>>;
   voice?: Partial<NantyVoiceSettings>;
   telegram?: { hold_while_visible?: boolean; visible_hold_secs?: number };
+  address?: string;
+  /** Só o interruptor do cenário passa pela janela (spec 140 T12). */
+  analysis?: { proactive?: boolean };
 }
 
 /** A janela de pareamento do Telegram: o código e o link só enquanto aberta. */
@@ -618,6 +663,7 @@ export function parseNantySettings(value: unknown): NantySettings | null {
   if (typeof value.effort !== "string" || !EFFORTS.includes(value.effort)) return null;
   const voice = isRecord(value.voice) ? value.voice : {};
   const telegram = isRecord(value.telegram) ? value.telegram : {};
+  const analysis = isRecord(value.analysis) ? value.analysis : {};
   const reserve: Partial<Record<NantyRole, NantyRoute>> = {};
   if (isRecord(value.reserve)) {
     for (const role of NANTY_ROLES) {
@@ -653,6 +699,13 @@ export function parseNantySettings(value: unknown): NantySettings | null {
       paired: telegram.paired === true,
       hold_while_visible: telegram.hold_while_visible !== false,
       visible_hold_secs: count(telegram.visible_hold_secs),
+    },
+    address: plain(value.address),
+    analysis: {
+      proactive: analysis.proactive === true,
+      scenarios_per_day: count(analysis.scenarios_per_day),
+      scenarios_per_spec: count(analysis.scenarios_per_spec),
+      budget_pct: count(analysis.budget_pct),
     },
   };
 }

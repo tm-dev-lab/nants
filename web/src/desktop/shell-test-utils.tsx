@@ -84,6 +84,8 @@ export const NANTY_CONFIG = {
   reserve: {},
   voice: { enabled: false, connection_id: "", speech_model: "gemini-3.8-flash-tts", voice: "Kore", transcribe_model: "gemini-3.8-flash", max_input_secs: 300 },
   telegram: { bot_token_masked: "", paired: false, hold_while_visible: true, visible_hold_secs: 180 },
+  address: "",
+  analysis: { proactive: false, scenarios_per_day: 5, scenarios_per_spec: 2, budget_pct: 30 },
 };
 
 /** `GET /api/nanty/telegram` (T11): sem bot. Só com `nanty.telegram`. */

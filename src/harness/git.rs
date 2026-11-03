@@ -25,6 +25,83 @@ pub const LOCAL_SETTINGS: &str = ".sdd/settings.yaml";
 /// Identidade de reserva dos commits do Nants quando falta `user.name`/`user.email` efetivos.
 pub const FALLBACK_IDENTITY: [(&str, &str); 2] = [("user.name", "Nants"), ("user.email", "nants@localhost")];
 
+/// Configuração forçada em todo `git` sobre a árvore de um projeto (spec 140 T09, C-10).
+///
+/// O `.git` do projeto é só leitura no container (spec 062), mas a pasta de trabalho não: um
+/// comando do agente pode criar um repositório aninhado (`sub/.git`) com a configuração e os
+/// atributos que quiser (`core.fsmonitor`, `filter.<nome>.clean` ou `.process` com qualquer nome).
+/// Depois que ele vira gitlink no índice, o `status`, o `diff` da árvore e o `add -A` de fora rodam
+/// um `git` filho dentro dele, que executaria esses programas no host.
+///
+/// A defesa é não descer no aninhado, em vez de listar chaves (o nome do filtro é livre). Validado
+/// com o Git 2.43 no teste `nested_repo_config_runs_nothing`:
+/// - `diff.ignoreSubmodules=all` impede a descida do `status` e do `diff`, mas **não** a do `add -A`
+///   (por isso o [`Git::add_all`] tira os gitlinks do pathspec e afasta o `.git` das pastas novas);
+/// - `submodule.recurse=false` e `status.submoduleSummary=false` fecham a recursão pedida por
+///   configuração; `core.fsmonitor=false` fica como segunda barreira.
+///
+/// O `-c` vale também para os filhos (vai por `GIT_CONFIG_PARAMETERS`) e vence a configuração de
+/// qualquer arquivo. O resto da configuração do usuário (identidade, assinatura, hooks do
+/// repositório principal) continua valendo. Efeito colateral aceito: mudança dentro de um submódulo
+/// (ou do ponteiro dele) não conta como alteração para o Nants.
+pub const NEUTRAL_CONFIG: [&str; 8] = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.ignoreSubmodules=all",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "status.submoduleSummary=false",
+];
+
+/// Código da falha ao afastar o `.git` de um repositório aninhado (a pasta fica como estava).
+pub const NESTED_DETACH_FAILED: &str = "nested_repo_detach_failed";
+/// Pasta, dentro do diretório Git privado da árvore, que recebe o `.git` dos aninhados afastados.
+const NESTED_STORE: &str = "nants-nested";
+/// Rodadas de busca por aninhado dentro de aninhado.
+const NESTED_ROUNDS: usize = 8;
+/// Arquivo, ao lado de [`NESTED_STORE`], com as pastas já afastadas e ainda não avisadas (spec 140
+/// T17): se uma pasta falha no meio do afastamento, o aviso das anteriores, já movidas, sai no próximo
+/// `add_all` que der certo. Os nomes vão separados por NUL, como no `ls-files -z`.
+const NESTED_NOTICE: &str = "nants-nested-notice";
+
+/// O que o [`Git::stage`] indexa.
+enum StageTarget<'a> {
+    /// Tudo (`add -A -- .`), menos `exclude`; com `detach`, o `.git` das pastas novas é afastado.
+    All { detach: bool, exclude: &'a [&'a str] },
+    /// Só estes caminhos (`add -- <paths>`).
+    Paths(&'a [String]),
+}
+
+fn detach_failed() -> GitError {
+    GitError::Failed { command: "git add".into(), code: None, stderr: NESTED_DETACH_FAILED.into() }
+}
+
+/// Move `<root>/<dir>/.git` para `<store>/<name>`, sem seguir link em nenhum componente de `dir`.
+#[cfg(target_os = "linux")]
+fn detach_one(root: &Path, dir: &str, store: &Path, name: &str) -> Result<(), GitError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let parent = crate::server::nanty::files::open_dir_beneath(root, dir).map_err(|_| detach_failed())?;
+    let target = std::fs::File::open(store).map_err(|_| detach_failed())?;
+    let from = CString::new(".git").map_err(|_| detach_failed())?;
+    let to = CString::new(name).map_err(|_| detach_failed())?;
+    // SAFETY: os dois descritores estão abertos e as cadeias são válidas durante a chamada.
+    let rc = unsafe { libc::renameat(parent.as_raw_fd(), from.as_ptr(), target.as_raw_fd(), to.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(detach_failed())
+    }
+}
+
+/// Fora do Linux não há abertura sem link: recusa, e nada é movido.
+#[cfg(not(target_os = "linux"))]
+fn detach_one(_root: &Path, _dir: &str, _store: &Path, _name: &str) -> Result<(), GitError> {
+    Err(detach_failed())
+}
+
 const SCRUBBED_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -187,13 +264,146 @@ impl Git {
             .collect())
     }
 
-    /// Indexa todas as alterações (`git add -A`): arquivos novos, modificados e removidos.
-    pub fn add_all(&self) -> Result<(), GitError> {
-        self.run(["add", "-A"])?;
-        Ok(())
+    /// Indexa todas as alterações (`git add -A`): arquivos novos, modificados e removidos, sem descer
+    /// em repositório aninhado. Ver [`Git::stage`] e [`StageTarget::All`].
+    ///
+    /// Devolve as pastas cujo `.git` foi afastado, para quem chama avisar. Se não der para afastar,
+    /// falha com [`NESTED_DETACH_FAILED`] sem mexer em nada mais.
+    pub fn add_all(&self) -> Result<Vec<String>, GitError> {
+        self.stage(StageTarget::All { detach: true, exclude: &[] })
     }
 
-    /// Diff `base...branch`: alterações da branch desde o ancestral comum com `base`.
+    /// O único `git add` do Nants (spec 140 T09, C-10, F-01 e F-02). Nenhum outro código de produção
+    /// passa `add` ao `git`: a trava `tests/git_add_lock.rs` confere. Nunca desce em repositório
+    /// aninhado (ver [`NEUTRAL_CONFIG`]):
+    /// - **gitlink no índice** (submódulo, inclusive o que veio vazio da base e o agente preencheu com
+    ///   `git init`): fica fora do pathspec e o ponteiro não muda. O `add` sobre ele rodaria um `git`
+    ///   filho dentro dele, e nenhuma configuração impede isso no Git 2.43;
+    /// - **pasta nova com `.git`** (um gerador que fez `git init`, ou o agente), em `All` com
+    ///   `detach`: o `.git` dela vai para o diretório Git privado da árvore ([`Git::detach_dirs`]) e
+    ///   os arquivos entram como arquivos comuns. Sem isso o Git registraria um gitlink (os arquivos
+    ///   ficariam fora do commit e se perderiam com a worktree) ou falharia, no repositório ainda sem
+    ///   commit. Sem `detach` (o hash da árvore, que só lê), a pasta fica fora do pathspec;
+    /// - **caminhos explícitos** (`Paths`): os que são gitlink saem; nada é afastado (são os arquivos
+    ///   do próprio Nants, também no checkout principal, onde um aninhado é do usuário).
+    fn stage(&self, target: StageTarget<'_>) -> Result<Vec<String>, GitError> {
+        let gitlinks = self.gitlinks()?;
+        let mut skip: Vec<String> = gitlinks.clone();
+        let (detached, mut add) = match target {
+            StageTarget::All { detach, exclude } => {
+                let detached = if detach { self.detach_new_nested()? } else { Vec::new() };
+                if !detach {
+                    skip.extend(self.untracked_nested()?);
+                }
+                let mut add: Vec<String> = ["add", "-A", "--", "."].iter().map(|s| s.to_string()).collect();
+                add.extend(exclude.iter().map(|e| format!(":(exclude){e}")));
+                (detached, add)
+            }
+            StageTarget::Paths(paths) => {
+                let keep: Vec<String> = paths.iter().filter(|p| !gitlinks.contains(p)).cloned().collect();
+                if keep.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut add = vec!["add".to_string(), "--".to_string()];
+                add.extend(keep);
+                (Vec::new(), add)
+            }
+        };
+        add.extend(skip.iter().map(|g| format!(":(exclude,literal){g}")));
+        self.run(&add)?;
+        Ok(detached)
+    }
+
+    /// Caminhos dos gitlinks do índice (modo `160000`). Ler o índice não desce em nenhum deles.
+    fn gitlinks(&self) -> Result<Vec<String>, GitError> {
+        let args: Vec<OsString> = ["ls-files", "--stage", "-z"].iter().map(OsString::from).collect();
+        let out = self.run_bytes(&args)?;
+        Ok(String::from_utf8_lossy(&out)
+            .split('\0')
+            .filter_map(|entry| {
+                let (meta, path) = entry.split_once('\t')?;
+                meta.starts_with("160000 ").then(|| path.to_string())
+            })
+            .collect())
+    }
+
+    /// Pastas novas (não rastreadas, fora do `.gitignore`) que são repositório: o Git as lista como
+    /// `pasta/`, sem descer nelas.
+    fn untracked_nested(&self) -> Result<Vec<String>, GitError> {
+        let args: Vec<OsString> = ["ls-files", "--others", "--exclude-standard", "-z"].iter().map(OsString::from).collect();
+        let out = self.run_bytes(&args)?;
+        Ok(String::from_utf8_lossy(&out)
+            .split('\0')
+            .filter_map(|entry| entry.strip_suffix('/'))
+            .filter(|dir| !dir.is_empty() && self.root.join(dir).join(".git").symlink_metadata().is_ok())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Afasta o `.git` de cada pasta nova que é repositório, também dos aninhados dentro dela. Dando
+    /// certo, devolve também as que uma tentativa anterior afastou antes de falhar ([`NESTED_NOTICE`]).
+    fn detach_new_nested(&self) -> Result<Vec<String>, GitError> {
+        let mut detached = Vec::new();
+        for _ in 0..NESTED_ROUNDS {
+            let nested = self.untracked_nested()?;
+            if nested.is_empty() {
+                return Ok(self.take_notice(detached));
+            }
+            detached.extend(self.detach_dirs(nested)?);
+        }
+        if self.untracked_nested()?.is_empty() {
+            Ok(self.take_notice(detached))
+        } else {
+            Err(detach_failed())
+        }
+    }
+
+    /// Anota uma pasta afastada e ainda não avisada. Sem conseguir anotar, só o aviso de uma falha no
+    /// meio se perde; o afastamento em si já aconteceu.
+    fn note_detached(&self, dir: &str) {
+        let Ok(git_dir) = self.private_git_dir() else { return };
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(git_dir.join(NESTED_NOTICE)) else { return };
+        let _ = std::io::Write::write_all(&mut file, format!("{dir}\0").as_bytes());
+    }
+
+    /// As pastas anotadas por [`Self::note_detached`], na ordem, sem repetir as de `detached`, que
+    /// vêm por último; o arquivo é apagado, porque quem chama avisa.
+    fn take_notice(&self, detached: Vec<String>) -> Vec<String> {
+        let Ok(path) = self.private_git_dir().map(|d| d.join(NESTED_NOTICE)) else { return detached };
+        let Ok(raw) = std::fs::read(&path) else { return detached };
+        let _ = std::fs::remove_file(&path);
+        let mut out: Vec<String> = Vec::new();
+        for dir in String::from_utf8_lossy(&raw).split('\0').filter(|d| !d.is_empty()).map(str::to_string).chain(detached) {
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+        out
+    }
+
+    /// Move o `.git` de cada pasta de `dirs` para `<diretório Git privado>/nants-nested/<n>`.
+    ///
+    /// A pasta-mãe é aberta pelo leitor seguro (`openat2` sem link, ou a caminhada por `openat` com
+    /// `O_NOFOLLOW`) e o `.git` sai por `renameat` a partir desse descritor: se um processo do
+    /// container trocar um componente do caminho por um link entre a listagem e o afastamento, a
+    /// abertura falha e nada de fora da árvore é movido. O próprio `.git` nunca é seguido (o
+    /// `renameat` move a entrada, seja ela pasta, arquivo ou link).
+    pub(crate) fn detach_dirs(&self, dirs: Vec<String>) -> Result<Vec<String>, GitError> {
+        let store = self.private_git_dir()?.join(NESTED_STORE);
+        std::fs::create_dir_all(&store).map_err(|_| detach_failed())?;
+        for dir in &dirs {
+            let mut n = 0u32;
+            let name = loop {
+                if store.join(n.to_string()).symlink_metadata().is_err() {
+                    break n.to_string();
+                }
+                n += 1;
+            };
+            detach_one(&self.root, dir, &store, &name)?;
+            self.note_detached(dir);
+        }
+        Ok(dirs)
+    }
     pub fn diff(&self, base: &str, branch: &str) -> Result<String, GitError> {
         check_arg("base", base)?;
         check_arg("branch", branch)?;
@@ -346,9 +556,8 @@ impl Git {
         let _cleanup = Cleanup(tmp.clone());
         let tmp_text = tmp.to_string_lossy().into_owned();
         let isolated = Git { root: self.root.clone(), env: self.env.clone() }.with_env("GIT_INDEX_FILE", &tmp_text);
-        let mut add: Vec<String> = ["add", "-A", "--", "."].iter().map(|s| s.to_string()).collect();
-        add.extend(exclude.iter().map(|e| format!(":(exclude){e}")));
-        isolated.run(&add)?;
+        // Sem descer em repositório aninhado e sem afastar nada (spec 140 T09): o hash só lê.
+        isolated.stage(StageTarget::All { detach: false, exclude })?;
         let mut rm: Vec<String> = ["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--"].iter().map(|s| s.to_string()).collect();
         rm.extend(exclude.iter().map(|e| e.to_string()));
         if !exclude.is_empty() {
@@ -380,7 +589,7 @@ impl Git {
     /// Indexa um caminho (`git add -- <path>`).
     pub fn add_path(&self, path: &str) -> Result<(), GitError> {
         check_arg("path", path)?;
-        self.run(["add", "--", path])?;
+        self.stage(StageTarget::Paths(&[path.to_string()]))?;
         Ok(())
     }
 
@@ -541,7 +750,7 @@ impl Git {
     /// Indexa e commita somente `path` (add + commit restrito ao caminho). Falha desfaz o índice.
     pub fn commit_path(&self, path: &str, msg: &str) -> Result<(), GitError> {
         check_arg("path", path)?;
-        self.run(["add", "--", path])?;
+        self.stage(StageTarget::Paths(&[path.to_string()]))?;
         let result = self.run(self.with_identity(["commit", "-m", msg, "--", path]));
         if result.is_err() {
             let _ = self.run(["reset", "-q", "--", path]);
@@ -555,9 +764,7 @@ impl Git {
         for p in paths {
             check_arg("path", p)?;
         }
-        let mut add = vec!["add".to_string(), "--".to_string()];
-        add.extend(paths.iter().cloned());
-        self.run(add)?;
+        self.stage(StageTarget::Paths(paths))?;
         if !self.has_staged_changes()? {
             return Ok(false);
         }
@@ -884,7 +1091,7 @@ impl Git {
     /// Monta o `Command` do `git` com `cwd` explícito e variáveis de redirecionamento removidas.
     fn command(&self, args: &[OsString]) -> Command {
         let mut cmd = Command::new("git");
-        cmd.args(args).current_dir(&self.root);
+        cmd.args(NEUTRAL_CONFIG).args(args).current_dir(&self.root);
         for var in SCRUBBED_ENV {
             cmd.env_remove(var);
         }
@@ -1655,5 +1862,218 @@ mod tests {
         assert_eq!(parsed[1].head, "222");
         assert_eq!(parsed[2].branch, None);
         assert_eq!(parsed[2].head, "");
+    }
+
+    /// `git` comum (sem o `NEUTRAL_CONFIG`), fora da configuração de quem roda o teste.
+    fn plain(dir: &Path, args: &[&str]) -> process::Output {
+        process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+    }
+
+    /// Script que cria `marker` e devolve a entrada (serve de filtro `clean`).
+    fn trap_script(base: &Path, marker: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = base.join("armadilha.sh");
+        fs::write(&script, format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_str().unwrap().to_string()
+    }
+
+    /// Spec 140 T09 (C-10, F-01): um repositório aninhado já registrado como gitlink, com
+    /// `core.fsmonitor` e um filtro de nome livre (`clean` ou `process`) no `.gitattributes` dele, não
+    /// roda nada no `status`, no `diff`, no `add -A`, no `commit` nem no `merge --squash` da
+    /// integração. O teste mostra também o que cada opção faz no Git deste ambiente.
+    #[test]
+    fn nested_repo_config_runs_nothing() {
+        let (base, repo) = init_repo("nested-trap");
+        let sub = repo.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        plain(&sub, &["init", "-q", "-b", "main"]);
+        fs::write(sub.join("f.txt"), "x\n").unwrap();
+        fs::write(sub.join(".gitattributes"), "* filter=x\n").unwrap();
+        plain(&sub, &["add", "-A"]);
+        assert!(plain(&sub, &["-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "-m", "aninhado"]).status.success());
+        // Gitlink no índice (vem da base, ou de um `add` antigo), e uma branch para o squash.
+        plain(&repo, &["add", "sub"]);
+        assert!(plain(&repo, &["commit", "-q", "-m", "gitlink"]).status.success());
+        plain(&repo, &["checkout", "-q", "-b", "feat"]);
+        fs::write(repo.join("n.txt"), "n\n").unwrap();
+        plain(&repo, &["add", "n.txt"]);
+        plain(&repo, &["commit", "-q", "-m", "feat"]);
+        plain(&repo, &["checkout", "-q", "main"]);
+        let gitlink = || plain(&repo, &["ls-files", "-s", "sub"]).stdout;
+        let before = gitlink();
+        assert!(String::from_utf8_lossy(&before).starts_with("160000 "));
+
+        let marker = base.join("MARCADOR");
+        let script = trap_script(&base, &marker);
+        let mut stamp = 1_000_000u64;
+        // Muda o `mtime` (mesmo tamanho), para o filho ter de comparar o conteúdo pelo filtro.
+        let mut fires = |run: &mut dyn FnMut()| {
+            stamp += 1000;
+            let f = fs::File::options().write(true).open(sub.join("f.txt")).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(stamp)).unwrap();
+            let _ = fs::remove_file(&marker);
+            run();
+            marker.exists()
+        };
+        let git = Git::new(&repo);
+        for (key, other) in [("filter.x.clean", "filter.x.process"), ("filter.x.process", "filter.x.clean")] {
+            plain(&sub, &["config", "--unset-all", other]);
+            plain(&sub, &["config", key, &script]);
+            plain(&sub, &["config", "core.fsmonitor", &script]);
+            // A armadilha é real no git comum.
+            assert!(fires(&mut || drop(plain(&repo, &["status", "--porcelain"]))), "{key}: status comum");
+            assert!(fires(&mut || drop(plain(&repo, &["diff", "--stat"]))), "{key}: diff comum");
+            assert!(fires(&mut || drop(plain(&repo, &["add", "-A"]))), "{key}: add comum");
+            // O que cada opção faz no Git deste ambiente.
+            let ignore = ["-c", "diff.ignoreSubmodules=all"];
+            assert!(!fires(&mut || drop(plain(&repo, &[ignore[0], ignore[1], "status", "--porcelain"]))), "{key}: status com ignore");
+            assert!(!fires(&mut || drop(plain(&repo, &[ignore[0], ignore[1], "diff", "--stat"]))), "{key}: diff com ignore");
+            assert!(fires(&mut || drop(plain(&repo, &[ignore[0], ignore[1], "add", "-A"]))), "{key}: o add desce mesmo com ignore");
+            assert!(!fires(&mut || drop(plain(&repo, &[ignore[0], ignore[1], "add", "-A", "--", ".", ":(exclude,literal)sub"]))), "{key}: add sem o gitlink");
+            plain(&repo, &["reset", "-q"]);
+            // A integração.
+            assert!(!fires(&mut || assert!(git.is_clean().unwrap())), "{key}: is_clean");
+            assert!(!fires(&mut || drop(git.run(["diff", "--stat"]).unwrap())), "{key}: diff");
+            assert!(!fires(&mut || drop(git.is_clean_ignoring_sdd().unwrap())), "{key}: is_clean_ignoring_sdd");
+            fs::write(repo.join("m.txt"), key).unwrap();
+            assert!(!fires(&mut || assert!(git.add_all().unwrap().is_empty())), "{key}: add_all");
+            assert!(!fires(&mut || git.commit(key).unwrap()), "{key}: commit");
+            assert!(!fires(&mut || git.squash_merge("feat").unwrap()), "{key}: merge --squash");
+            if git.has_staged_changes().unwrap() {
+                assert!(!fires(&mut || git.commit("squash").unwrap()), "{key}: commit do squash");
+            }
+            assert!(!fires(&mut || drop(git.worktree_tree_hash(&[]).unwrap())), "{key}: hash da árvore");
+            // F-02, cenário (a): o `snapshot` da formatação sobre o gitlink armado (o mesmo de uma
+            // pasta que veio vazia da base e o agente preencheu com `git init`).
+            fs::write(repo.join("m.txt"), format!("{key} 2")).unwrap();
+            assert!(!fires(&mut || assert!(crate::sdd::formatting::snapshot(&repo).unwrap().is_empty())), "{key}: snapshot");
+            assert!(!fires(&mut || assert!(crate::sdd::formatting::snapshot(&repo).unwrap().is_empty())), "{key}: snapshot de novo");
+            git.commit(&format!("{key} 2")).unwrap();
+        }
+        // O gitlink não mudou, e a identidade do repositório principal continua valendo.
+        assert_eq!(gitlink(), before);
+        assert_eq!(git.run(["log", "-1", "--format=%an"]).unwrap().trim(), "Nants Test");
+    }
+
+    /// Spec 140 T09 (F-01): uma subpasta com `git init` legítimo (um gerador), com e sem commit, e um
+    /// aninhado dentro dela: o `add_all` afasta o `.git` de cada uma para o diretório Git privado, e
+    /// os arquivos entram no commit como arquivos comuns. Antes, o Git falhava ("does not have a
+    /// commit checked out") ou registrava um gitlink, e os arquivos ficavam fora do commit.
+    #[test]
+    fn nested_repo_from_a_generator_keeps_its_files() {
+        let (base, repo) = init_repo("nested-gen");
+        let marker = base.join("MARCADOR");
+        let script = trap_script(&base, &marker);
+        for (dir, file, commit) in [("app", "a.js", false), ("lib", "b.js", true), ("lib/inner", "c.js", true)] {
+            let path = repo.join(dir);
+            fs::create_dir_all(&path).unwrap();
+            plain(&path, &["init", "-q", "-b", "main"]);
+            fs::write(path.join(file), file).unwrap();
+            if commit {
+                plain(&path, &["add", file]);
+                plain(&path, &["-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "-m", "gerado"]);
+            }
+        }
+        // O `.gitattributes` do gerado aponta um filtro que só o `.git` dele definia.
+        fs::write(repo.join("lib/.gitattributes"), "* filter=x\n").unwrap();
+        plain(&repo.join("lib"), &["config", "filter.x.clean", &script]);
+        let git = Git::new(&repo);
+        let mut detached = git.add_all().unwrap();
+        detached.sort();
+        assert_eq!(detached, ["app", "lib", "lib/inner"]);
+        git.commit("gerados").unwrap();
+        assert!(!marker.exists());
+        let tracked = git.run(["ls-files", "-s"]).unwrap();
+        for file in ["app/a.js", "lib/b.js", "lib/inner/c.js", "lib/.gitattributes"] {
+            assert!(tracked.lines().any(|l| l.starts_with("100644 ") && l.ends_with(file)), "{file}: {tracked}");
+        }
+        assert!(!tracked.contains("160000"), "{tracked}");
+        for dir in ["app", "lib", "lib/inner"] {
+            assert!(!repo.join(dir).join(".git").exists(), "{dir}");
+        }
+        let store = git.private_git_dir().unwrap().join(NESTED_STORE);
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 3);
+        assert!(git.is_clean().unwrap());
+        assert!(git.add_all().unwrap().is_empty());
+    }
+
+    /// Spec 140 T09 (F-02), cenário (b): um formatador cria um repositório aninhado armado. O
+    /// `add -A` comum o registraria como gitlink, e o próximo `add` desceria nele; o `snapshot` da
+    /// formatação afasta o `.git` dele e os seguintes não rodam nada.
+    #[test]
+    fn a_nested_repo_made_by_a_formatter_never_becomes_a_gitlink() {
+        let (base, repo) = init_repo("nested-fmt");
+        let marker = base.join("MARCADOR");
+        let script = trap_script(&base, &marker);
+        let made = repo.join("fmt");
+        fs::create_dir_all(&made).unwrap();
+        plain(&made, &["init", "-q", "-b", "main"]);
+        fs::write(made.join("f.txt"), "x\n").unwrap();
+        fs::write(made.join(".gitattributes"), "* filter=x\n").unwrap();
+        plain(&made, &["add", "-A"]);
+        plain(&made, &["-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "-m", "gerado"]);
+        plain(&made, &["config", "filter.x.clean", &script]);
+        plain(&made, &["config", "core.fsmonitor", &script]);
+        let _ = fs::remove_file(&marker);
+        assert_eq!(crate::sdd::formatting::snapshot(&repo).unwrap(), ["fmt"]);
+        fs::write(made.join("f.txt"), "y\n").unwrap();
+        assert!(crate::sdd::formatting::snapshot(&repo).unwrap().is_empty());
+        assert!(!marker.exists(), "o snapshot rodou um programa do aninhado");
+        let staged = Git::new(&repo).run(["ls-files", "-s"]).unwrap();
+        assert!(staged.lines().any(|l| l.starts_with("100644 ") && l.ends_with("fmt/f.txt")), "{staged}");
+        assert!(!staged.contains("160000"), "{staged}");
+    }
+
+    /// Spec 140 T09 (F-02): entre a listagem e o afastamento, uma pasta do meio do caminho vira link
+    /// absoluto para fora da árvore. Nada de fora é movido, e sai `nested_repo_detach_failed`.
+    #[test]
+    fn detach_refuses_a_middle_folder_swapped_for_a_link() {
+        let (base, repo) = init_repo("nested-race");
+        let outside = base.join("fora");
+        fs::create_dir_all(outside.join("b/gen/.git")).unwrap();
+        fs::write(outside.join("b/gen/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("a")).unwrap();
+        let git = Git::new(&repo);
+        match git.detach_dirs(vec!["a/b/gen".into()]) {
+            Err(GitError::Failed { stderr, .. }) => assert_eq!(stderr, NESTED_DETACH_FAILED),
+            other => panic!("devia recusar: {other:?}"),
+        }
+        assert!(outside.join("b/gen/.git/HEAD").exists());
+        let store = git.private_git_dir().unwrap().join(NESTED_STORE);
+        assert_eq!(fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
+        // O link no fim do caminho também não é seguido.
+        fs::remove_file(repo.join("a")).unwrap();
+        fs::create_dir_all(repo.join("a/b")).unwrap();
+        std::os::unix::fs::symlink(outside.join("b/gen"), repo.join("a/b/gen")).unwrap();
+        assert!(git.detach_dirs(vec!["a/b/gen".into()]).is_err());
+        assert!(outside.join("b/gen/.git/HEAD").exists());
+    }
+
+    /// Spec 140 T17: uma pasta falha no meio do afastamento depois de outra já movida. O aviso da
+    /// movida não se perde: sai no próximo `add_all` que der certo, uma vez só.
+    #[test]
+    fn a_detach_failing_midway_keeps_the_notice_of_the_folders_already_moved() {
+        let (base, repo) = init_repo("nested-midway");
+        let made = repo.join("gerado");
+        fs::create_dir_all(&made).unwrap();
+        plain(&made, &["init", "-q", "-b", "main"]);
+        fs::write(made.join("f.txt"), "x\n").unwrap();
+        let outside = base.join("fora");
+        fs::create_dir_all(outside.join("b/gen/.git")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("a")).unwrap();
+        let git = Git::new(&repo);
+        assert!(git.detach_dirs(vec!["gerado".into(), "a/b/gen".into()]).is_err());
+        assert!(!made.join(".git").exists(), "a primeira saiu antes da falha");
+        fs::remove_file(repo.join("a")).unwrap();
+        assert_eq!(git.add_all().unwrap(), ["gerado"]);
+        git.commit("gerados").unwrap();
+        assert!(git.add_all().unwrap().is_empty(), "o aviso sai uma vez só");
     }
 }

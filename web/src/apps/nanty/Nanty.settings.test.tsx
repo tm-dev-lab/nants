@@ -220,6 +220,73 @@ describe("Ajustes", () => {
     expect((within(card).getByLabelText("Avisos e resumo da manhã") as HTMLSelectElement).value).toBe("en");
   });
 
+  it("spec 140 T03: o endereço do Nants vai só quando muda, e a recusa do servidor aparece", async () => {
+    const { view, win } = await open("Ajustes");
+    const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;
+    const field = within(panel).getByLabelText("Endereço do Nants para o celular") as HTMLInputElement;
+    expect(field.value).toBe("");
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 422, body: { error: "x", code: "nanty_config_invalid", params: { field: "address" } } };
+    });
+    fireEvent.change(field, { target: { value: "http://localhost:3000" } });
+    await act(async () => {
+      fireEvent.click(panel.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ address: "http://localhost:3000" }]);
+    expect(panel.querySelector("[data-nanty-save-notice]")?.textContent).toContain("address");
+  });
+
+  it("spec 140 T12: a análise automática diz para onde o texto vai, avisa do plano gratuito e grava só o interruptor", async () => {
+    // Sem modelo: o cartão avisa que não roda, e não diz provedor nenhum.
+    const first = await open("Ajustes");
+    const empty = first.win.querySelector<HTMLElement>('[data-nanty-pref="scenario"]') as HTMLElement;
+    expect(empty.querySelector('[data-nanty-scenario-why="no_model"]')?.textContent).toBe("Sem modelo escolhido no cartão Modelo, a análise não roda.");
+    expect(empty.querySelector("[data-nanty-scenario-where]")).toBeNull();
+    cleanup();
+
+    const config = { ...NANTY_CONFIG, connection_id: "gem", model: "gemini-3.8-flash" };
+    const { view, win } = await open("Ajustes", { config });
+    const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;
+    const card = panel.querySelector<HTMLElement>('[data-nanty-pref="scenario"]') as HTMLElement;
+    const toggle = within(card).getByRole("switch", { name: "Mandar cenários" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(card.textContent).toContain("execução bloqueada, laço de revisão ou fim de spec");
+    expect(card.querySelector("[data-nanty-scenario-where]")?.textContent).toBe(
+      "O que ele lê do projeto vai ao provedor da conexão do Nanty, Gemini pessoal (Google Gemini). O cenário entra na conversa e, com o Telegram pareado, chega ao seu chat.",
+    );
+    expect(card.querySelector('[data-nanty-scenario-why="free_tier"]')?.textContent).toContain("plano gratuito da Gemini API");
+    expect(card.querySelector('[data-nanty-scenario-why="no_model"]')).toBeNull();
+    expect(card.querySelector("[data-nanty-scenario-limits]")?.textContent).toBe(
+      "No máximo 5 por dia e 2 por spec, com até 30% do orçamento do dia. Fica fora do horário de silêncio e dos avisos que vão para o resumo.",
+    );
+    expect(findForbiddenGlyphs(card)).toEqual([]);
+
+    const sent: unknown[] = [];
+    view.server.reply("PUT", /^\/api\/nanty\/config$/, (body) => {
+      sent.push(body);
+      return { status: 200, body: { ...config, analysis: { ...config.analysis, proactive: true } } };
+    });
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    await act(async () => {
+      fireEvent.click(panel.querySelector("[data-nanty-save]") as HTMLButtonElement);
+    });
+    await settle();
+    expect(sent).toEqual([{ analysis: { proactive: true } }]);
+    expect(within(card).getByRole("switch", { name: "Mandar cenários" }).getAttribute("aria-checked")).toBe("true");
+
+    // Outra conexão: o provedor pelo endereço, sem o aviso do Gemini.
+    await act(async () => {
+      fireEvent.change(within(panel).getByLabelText("Conexão do modelo"), { target: { value: "oai" } });
+    });
+    expect(card.querySelector("[data-nanty-scenario-where]")?.textContent).toContain("OpenAI direto (api.openai.com)");
+    expect(card.querySelector('[data-nanty-scenario-why="free_tier"]')).toBeNull();
+  });
+
   it("número fora da faixa trava o salvar com a dica", async () => {
     const { win } = await open("Ajustes");
     const panel = win.querySelector<HTMLElement>("[data-nanty-settings]") as HTMLElement;

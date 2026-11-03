@@ -2,6 +2,13 @@
 //!
 //! GET simples, sem dados do usuário; cache em disco (TTL 24 h) com fallback para o cache antigo
 //! se a rede falhar. Preço digitado pelo usuário (`manual`) nunca é sobrescrito.
+//!
+//! **Preços do Gemini em 2027 (spec 140 T17, C-19):** a página de preços do Google anuncia que os
+//! preços do Gemini 3.8 Flash e da fala dele (US$ 0,75 de entrada, 0,075 em cache e 3,75 de saída por
+//! milhão de tokens até 2026-12-31) **dobram em 2027-01-01**. O catálogo segue o LiteLLM e passa ao
+//! preço novo quando ele passar; um preço `manual` gravado antes disso fica como a pessoa digitou. O
+//! orçamento padrão do Nanty já foi escolhido pelo preço de 2027
+//! (`DEFAULT_DAILY_BUDGET_USD`, na seção `[nanty]` da configuração).
 
 use std::collections::BTreeMap;
 use std::future::Future;

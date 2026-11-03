@@ -10,7 +10,10 @@
  * - "Plano pronto · N tarefas · revisado · Abrir" no rodapé da última mensagem do Arquiteto: o
  *   plano em si fica na janela Plano;
  * - campo com anexos (colar, arrastar e soltar, botão), "N novas" e a rolagem restaurada;
- * - sem `readiness.chat`, o campo fica desabilitado com o que falta e "Configurar".
+ * - sem `readiness.chat`, o campo fica desabilitado com o que falta e "Configurar";
+ * - rascunho do Nanty (spec 140 T15): o texto que o cartão "levar ao Arquiteto" deixou entra na caixa
+ *   vazia com a faixa que diz de onde veio (e a marca de dado não confiável, quando houver); com texto
+ *   da pessoa na caixa, nada é trocado sem ela pedir. Só o envio dela leva o texto ao Arquiteto.
  *
  * O arrasto de arquivos sobre a janela não chega ao desktop: os eventos de arrastar e soltar param
  * aqui, e o gesto de mover janela (ponteiro na barra de título) não participa do arrasto nativo.
@@ -51,6 +54,7 @@ import { answerAfter, Bubble, sameSource } from "./Bubble";
 import { AttachmentPreview, imageFiles, useChatAttachments } from "./ChatAttachments";
 import { setChatSending, takeChatRequest, useChatRequestCount } from "./chatChannel";
 import { useMentionComposer } from "./useMentionComposer";
+import { useArchitectDraft } from "./architectDraft";
 import { dayKey, dayLabel, hasTime } from "./chatTime";
 import { PausedRunCard } from "./PausedRunCard";
 import { RoleConnectionFooter } from "./RoleConnectionFooter";
@@ -72,6 +76,18 @@ const drafts = new Map<string, string>();
 
 function loadDraft(projectId: string): string {
   return drafts.get(projectId) ?? "";
+}
+
+/**
+ * O id do rascunho do Nanty que está na caixa, por projeto (spec 140 T15, revisão 1): guardado junto
+ * do texto da aba, para a janela reaberta com o texto editado ainda levar o id. E o id de cada mensagem
+ * enviada a partir dele, para o "Reenviar" depois de uma falha levar o mesmo id.
+ */
+const draftIds = new Map<string, string>();
+const sentDraftIds = new Map<string, string>();
+
+function sentKey(projectId: string, messageId: number): string {
+  return `${projectId}:${messageId}`;
 }
 
 function saveDraft(projectId: string, text: string): void {
@@ -179,6 +195,53 @@ export function Conversation({
   const chatLevel = gateLevel(shell.readiness, "chat");
   const chatBlocked = chatLevel !== null && !chatLevel.ok;
   const mention = useMentionComposer({ projectId, draft, setDraft, areaRef, disabled: chatBlocked, persist: persistDraft });
+
+  // Spec 140 T15: o rascunho do Nanty entra na caixa vazia; com texto dela, a faixa pergunta antes.
+  const nantyDraft = useArchitectDraft(projectId);
+  const [appliedDraft, setAppliedState] = useState<string | null>(() => draftIds.get(projectId) ?? null);
+  const setAppliedDraft = useCallback(
+    (id: string | null) => {
+      if (id === null) draftIds.delete(projectId);
+      else draftIds.set(projectId, id);
+      setAppliedState(id);
+    },
+    [projectId],
+  );
+  const draftTextRef = useRef(draft);
+  draftTextRef.current = draft;
+  const pendingDraft = nantyDraft.draft;
+  const draftLoaded = nantyDraft.loaded;
+  useEffect(() => {
+    if (!draftLoaded) return;
+    if (pendingDraft === null) {
+      setAppliedDraft(null);
+      return;
+    }
+    // A janela reaberta já tem o rascunho na caixa (guardado na aba, editado ou não): o mesmo id.
+    if (draftIds.get(projectId) === pendingDraft.id || draftTextRef.current === pendingDraft.text) {
+      setAppliedDraft(pendingDraft.id);
+      return;
+    }
+    if (draftTextRef.current.trim() !== "") return;
+    setDraft(pendingDraft.text);
+    persistDraft(pendingDraft.text);
+    setAppliedDraft(pendingDraft.id);
+  }, [draftLoaded, pendingDraft, projectId, setDraft, persistDraft, setAppliedDraft]);
+  const takeNantyDraft = (): void => {
+    if (pendingDraft === null) return;
+    setDraft(pendingDraft.text);
+    persistDraft(pendingDraft.text);
+    setAppliedDraft(pendingDraft.id);
+    areaRef.current?.focus({ preventScroll: true });
+  };
+  const discardNantyDraft = (): void => {
+    if (pendingDraft !== null && appliedDraft === pendingDraft.id) {
+      setDraft("");
+      persistDraft("");
+    }
+    setAppliedDraft(null);
+    void nantyDraft.discard();
+  };
 
   useEffect(() => {
     const area = areaRef.current;
@@ -288,7 +351,13 @@ export function Conversation({
   })();
 
   /** Envia (ou reenvia, com `resendId`) a mensagem. */
-  async function submit(text: string, resendId: number | null, fromChoices = false, attachments: readonly string[] = []): Promise<void> {
+  async function submit(
+    text: string,
+    resendId: number | null,
+    fromChoices = false,
+    attachments: readonly string[] = [],
+    fromDraft: string | null = null,
+  ): Promise<void> {
     if (sending) return;
     let messageId: number;
     if (resendId === null) {
@@ -308,7 +377,13 @@ export function Conversation({
     setSending(true);
     const current: PendingSend = { controller: new AbortController(), messageId, abandoned: false };
     pendingSendRef.current = current;
-    const result = await postChat(projectId, text, { signal: current.controller.signal, ...(attachments.length > 0 ? { attachments } : {}) });
+    // Spec 140 T15 (revisão 1): o id fica com a mensagem até o servidor responder; o "Reenviar" o leva.
+    if (fromDraft !== null) sentDraftIds.set(sentKey(projectId, messageId), fromDraft);
+    const result = await postChat(projectId, text, {
+      signal: current.controller.signal,
+      ...(attachments.length > 0 ? { attachments } : {}),
+      ...(fromDraft !== null ? { nantyDraft: fromDraft } : {}),
+    });
     if (current.abandoned) return;
     if (pendingSendRef.current === current) pendingSendRef.current = null;
     if (graceTimerRef.current !== null) {
@@ -316,6 +391,11 @@ export function Conversation({
       graceTimerRef.current = null;
     }
     setSending(false);
+    if (result.ok && fromDraft !== null) {
+      // Só o turno concluído consome o rascunho no servidor.
+      sentDraftIds.delete(sentKey(projectId, messageId));
+      nantyDraft.sent();
+    }
     const lost = !result.ok && isConnectionLost(result.error);
     if (!lost) appStore.settleUserMessage(projectId, messageId);
     if (!result.ok && lost) onTrackTurn?.(messageId);
@@ -395,7 +475,10 @@ export function Conversation({
     setDraft("");
     mention.clear();
     images.clear();
-    await submit(text === "" ? translateNow("attachments.imageOnly") : text, null, false, names);
+    const fromDraft = pendingDraft !== null && appliedDraft === pendingDraft.id ? pendingDraft.id : null;
+    // A caixa esvazia; o id segue com a mensagem (`sentDraftIds`) até a resposta do servidor.
+    if (fromDraft !== null) setAppliedDraft(null);
+    await submit(text === "" ? translateNow("attachments.imageOnly") : text, null, false, names, fromDraft);
   }
 
   function onPaste(event: ReactClipboardEvent<HTMLTextAreaElement>): void {
@@ -501,7 +584,7 @@ export function Conversation({
           footer={message.id === lastArchitectId ? planFooter : null}
           activeSpecId={specId}
           onResend={(m) => {
-            if (!chatBlocked) void submit(m.text, m.id, false, m.attachments ?? []);
+            if (!chatBlocked) void submit(m.text, m.id, false, m.attachments ?? [], sentDraftIds.get(sentKey(projectId, m.id)) ?? null);
           }}
           resendDisabled={sending || chatBlocked}
           onRetryTurn={message.id === retryNoticeId ? () => void continueTurn() : undefined}
@@ -597,6 +680,15 @@ export function Conversation({
             void send();
           }}
         >
+          {pendingDraft !== null ? (
+            <NantyDraftStrip
+              marked={pendingDraft.marked}
+              inBox={appliedDraft === pendingDraft.id}
+              boxEmpty={draft.trim() === ""}
+              onUse={takeNantyDraft}
+              onDiscard={discardNantyDraft}
+            />
+          ) : null}
           {mention.mobile ? mention.picker : null}
           <AttachmentPreview items={images.items} onRemove={images.remove} />
           {images.notice !== null ? (
@@ -678,6 +770,45 @@ export function Conversation({
           <span>{chatBlocked ? t("conversation.dropBlocked") : t("conversation.dropHint")}</span>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * A faixa do rascunho do Nanty (spec 140 T15): de onde veio o texto da caixa e, quando o Nanty leu
+ * conteúdo não confiável, que enquanto o rascunho estiver pendente as mensagens ao Arquiteto saem sem
+ * internet (a regra é do servidor, para qualquer mensagem). Com texto da pessoa na caixa, ela escolhe
+ * trocar pelo rascunho ou descartá-lo; com a caixa vazia, pôr o rascunho nela.
+ */
+function NantyDraftStrip({
+  marked,
+  inBox,
+  boxEmpty,
+  onUse,
+  onDiscard,
+}: {
+  marked: boolean;
+  inBox: boolean;
+  boxEmpty: boolean;
+  onUse: () => void;
+  onDiscard: () => void;
+}) {
+  const { t } = useT();
+  const line = inBox ? t("conversation.nantyDraft.hint") : boxEmpty ? t("conversation.nantyDraft.pending") : t("conversation.nantyDraft.busy");
+  return (
+    <div role="status" className="nd-strip" data-tone={marked ? "amber" : "violet"} data-nanty-draft={marked ? "marked" : "clean"}>
+      <Icon name="sparkles" size={14} />
+      <span className="nd-strong">{t("conversation.nantyDraft.title")}</span>
+      <span>{line}</span>
+      {marked ? <span>{t("conversation.nantyDraft.marked")}</span> : null}
+      {inBox ? null : (
+        <button type="button" className="nd-btn nd-btn-sm" onClick={onUse}>
+          {boxEmpty ? t("conversation.nantyDraft.put") : t("conversation.nantyDraft.use")}
+        </button>
+      )}
+      <button type="button" className="nd-btn nd-btn-sm" data-variant="ghost" onClick={onDiscard}>
+        {t("conversation.nantyDraft.discard")}
+      </button>
     </div>
   );
 }

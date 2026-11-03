@@ -302,6 +302,7 @@ fn user_turn(attachments: &[&str]) -> ChatTurn {
         internal: false,
         attachments: attachments.iter().map(|s| s.to_string()).collect(),
         notice: None,
+        offline: false,
     }
 }
 

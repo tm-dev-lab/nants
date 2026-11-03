@@ -228,6 +228,47 @@ describe("feed do Nanty", () => {
     expect(within(win).getByRole("tab", { name: "Ajustes" }).getAttribute("aria-selected")).toBe("true");
   });
 
+  it("spec 140 T07: o cartão da memória mostra o texto exato e a fonte, e o toque confirma", async () => {
+    const confirm = {
+      id: "eeeeeeeeeeeeeeee",
+      project_id: null,
+      group: "*:memory_confirm",
+      code: "nanty.card.memory_confirm",
+      params: {
+        count: 1,
+        card_lines: [
+          { code: "nanty.memory.save.decisions", params: { title: "Revisão", text: "Ela revisa o plano antes de aprovar." } },
+          { code: "nanty.memory.from.project_file", params: {} },
+          { code: "nanty.memory.from_project", params: { projects: "p1" } },
+        ],
+      },
+      action: "memory_confirm",
+      token: "tok-mem",
+      created_at_ms: NOW,
+      expires_at_ms: NOW + 3600_000,
+    };
+    const { view, win } = await open({ ...NANTY_EMPTY_FEED, waiting: [confirm] });
+    const el = win.querySelector<HTMLElement>('[data-nanty-card="eeeeeeeeeeeeeeee"]') as HTMLElement;
+    expect(el.querySelector("h4")?.textContent).toBe("Confirmar a memória");
+    expect(el.querySelector("[data-nanty-why]")?.textContent).toContain("Mudar a memória com este pedido?");
+    expect([...el.querySelectorAll("[data-nanty-card-line]")].map((l) => l.textContent)).toEqual([
+      "Guardar em Decisões: Revisão. Texto exato: Ela revisa o plano antes de aprovar.",
+      "Fonte: a conversa leu arquivos do projeto.",
+      "Projeto: p1.",
+    ]);
+    expect(within(el).getAllByRole("button").map((b) => b.textContent)).toEqual(["Confirmar", "Não"]);
+    view.server.reply("POST", /^\/api\/nanty\/cards\/eeeeeeeeeeeeeeee\/decide$/, () => ({
+      status: 200,
+      body: { outcome: "memory_saved", code: "nanty.outcome.memory_saved", params: {} },
+    }));
+    await act(async () => {
+      fireEvent.click(within(el).getByRole("button", { name: "Confirmar" }));
+    });
+    await settle();
+    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Pronto, a memória foi atualizada.");
+    expect(win.querySelector("[data-nanty-notice]")?.getAttribute("data-tone")).toBe("ok");
+  });
+
   it("em en, sem português", async () => {
     setLanguage("en", { persist: false });
     const { win } = await open();

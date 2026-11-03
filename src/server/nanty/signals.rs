@@ -7,6 +7,7 @@
 
 use serde_json::{Map, Value};
 
+use super::voice::Tone;
 use crate::config::{NantyConfig, Urgency};
 
 /// Grupo dos sinais sem projeto (disco, pasta temporária, Docker). Não é um id de projeto válido
@@ -167,9 +168,27 @@ impl SignalKind {
         matches!(self, SignalKind::CostAlert | SignalKind::DockerOrphans | SignalKind::DockerForeign)
     }
 
+    /// Tabela fixa do tom da fala (spec 140 T01, C-28): o marco é animado, o que pede cuidado logo é
+    /// preocupado, a execução parada é séria, a limpeza opcional é calma, e o pedido de decisão fica
+    /// neutro. Sem curinga: um sinal novo obriga a decidir o tom aqui.
+    pub fn tone(self) -> Tone {
+        match self {
+            SignalKind::PlanWaiting => Tone::Neutral,
+            SignalKind::NoCredit | SignalKind::ProviderStopped | SignalKind::DiskLow | SignalKind::TmpLow => Tone::Concerned,
+            SignalKind::RunBlocked | SignalKind::Budget | SignalKind::ReviewLoop | SignalKind::CostAlert => Tone::Serious,
+            SignalKind::DockerOrphans | SignalKind::DockerForeign => Tone::Calm,
+            SignalKind::TaskDelivered | SignalKind::SpecDone | SignalKind::AppReady => Tone::Upbeat,
+        }
+    }
+
     /// Código do porquê: a chave base no dicionário (`nanty.why.<tipo>`).
     pub fn why_code(self) -> String {
         format!("nanty.why.{}", self.as_str())
+    }
+
+    /// O sinal de um código do porquê ([`Self::why_code`]).
+    pub fn of_why_code(code: &str) -> Option<Self> {
+        code.strip_prefix("nanty.why.").and_then(Self::parse)
     }
 }
 
@@ -261,5 +280,21 @@ mod tests {
         assert_eq!(SignalKind::parse("outro"), None);
         assert_eq!(Signal::new(SignalKind::DiskLow, None).group(), "*:disk_low");
         assert_eq!(Signal::new(SignalKind::Budget, Some("p1")).group(), "p1:budget");
+    }
+
+    /// A tabela do tom é fixa (spec 140 T01), e todo sinal volta do código do porquê: é por ele que o
+    /// cartão acha o tom.
+    #[test]
+    fn the_tone_table_is_fixed_and_every_card_finds_its_signal() {
+        let of = |tone: Tone| -> Vec<&str> { SignalKind::ALL.into_iter().filter(|k| k.tone() == tone).map(SignalKind::as_str).collect() };
+        assert_eq!(of(Tone::Neutral), ["plan_waiting"]);
+        assert_eq!(of(Tone::Concerned), ["no_credit", "provider_stopped", "disk_low", "tmp_low"]);
+        assert_eq!(of(Tone::Serious), ["run_blocked", "budget", "review_loop", "cost_alert"]);
+        assert_eq!(of(Tone::Calm), ["docker_orphans", "docker_foreign"]);
+        assert_eq!(of(Tone::Upbeat), ["task_delivered", "spec_done", "app_ready"]);
+        for kind in SignalKind::ALL {
+            assert_eq!(SignalKind::of_why_code(&kind.why_code()), Some(kind));
+        }
+        assert_eq!(SignalKind::of_why_code("spec_done"), None);
     }
 }

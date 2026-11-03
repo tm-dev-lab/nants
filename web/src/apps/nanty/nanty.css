@@ -1267,3 +1267,194 @@
   color: var(--ink2);
   overflow-wrap: anywhere;
 }
+
+/*
+ * --- Aba Memória (spec 140 T08) ---
+ * Os temas como as seções das Regras; cada nota numa faixa, com o título, o texto, a procedência e
+ * as ações. O runbook mostra o comando em bloco de código com o copiar. Na janela estreita, as ações
+ * descem para baixo do título.
+ */
+.nd-nanty-memory {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-width: 0;
+  max-width: 920px;
+}
+
+.nd-nanty-memory-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-4);
+}
+
+.nd-nanty-memory-note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+}
+
+.nd-nanty-memory-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-3);
+  min-width: 0;
+}
+
+.nd-nanty-memory-title {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink);
+  font-size: var(--fs-control);
+  font-weight: var(--fw-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-memory-actions {
+  flex-shrink: 0;
+  gap: var(--sp-1);
+}
+
+.nd-nanty-memory-text {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--fs-control);
+  line-height: var(--lh-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-memory-text[data-muted="true"] {
+  color: var(--ink2);
+}
+
+.nd-nanty-memory-runbook {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-memory-code {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+}
+
+.nd-nanty-memory-pre {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: var(--sp-1) 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  line-height: var(--lh-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-memory-code-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-1);
+  max-width: 45%;
+}
+
+.nd-nanty-memory-check {
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-memory-stale {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-memory-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--lane);
+  box-shadow: var(--card-edge);
+}
+
+.nd-nanty-memory-input {
+  min-height: 96px;
+}
+
+.nd-nanty-memory-form .nd-field-hint[data-over="true"] {
+  color: var(--pill-amber-ink);
+}
+
+.nd-nanty-memory-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+}
+
+.nd-nanty-memory-conflict-title {
+  color: var(--pill-amber-ink);
+  font-weight: var(--fw-semibold);
+}
+
+.nd-nanty-memory-conflict-text {
+  color: var(--ink2);
+  font-size: var(--fs-control);
+}
+
+.nd-nanty-memory-current {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--lane);
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-memory-head {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-memory-code {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-memory-code-side {
+  align-items: flex-start;
+  max-width: none;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-memory-check {
+  text-align: left;
+}
+
+.nd-nanty-app[data-size="narrow"] .nd-nanty-memory-actions {
+  align-self: flex-start;
+}

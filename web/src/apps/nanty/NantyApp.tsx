@@ -1,14 +1,15 @@
 /*
  * Janela do Nanty (spec 138 T04 e T10, `reference/Main.dc.html`): janela de sistema, disponível em
  * qualquer espaço, inclusive sem projeto. A moldura é a de toda janela (`Window`); as abas Feed,
- * Regras e Ajustes ficam no slot da barra de título, como em Configurações (no celular, a linha
+ * Regras, Memória e Ajustes ficam no slot da barra de título, como em Configurações (no celular, a linha
  * logo abaixo dela). O cabeçalho é o da moldura: o avatar no estado atual e o subtítulo vivo (o
  * estado, os projetos observados, o gasto do dia e a saúde do Telegram, `nantySummary`).
  *
  * Aba Feed (T10): o feed (`NantyFeedView`) e a conversa fixa à direita (`NantyChat`). Em janela
  * média ou estreita (e no celular), um seletor alterna entre os dois, cada um com a altura toda.
  *
- * Regras (`NantyRules`) e Ajustes (`NantySettingsView`), T11. O "Mudar horário" do Previsto abre
+ * Regras (`NantyRules`) e Ajustes (`NantySettingsView`), T11. Memória (`NantyMemory`), spec 140 T08:
+ * as notas de longo prazo, por tema, para ler, editar, apagar, restaurar e baixar a cópia. O "Mudar horário" do Previsto abre
  * os Ajustes com o campo do resumo da manhã em foco; o "Abrir o Nanty" de Configurações > Agentes
  * abre a janela já nos Ajustes (`requestNantyTab`).
  */
@@ -23,7 +24,8 @@ import { NantyAvatar } from "./NantyAvatar";
 import type { NantyCard } from "./nantyApi";
 import { NantyChat } from "./NantyChat";
 import { NantyFeedView } from "./NantyFeed";
-import { chatCards, linkWindow, NANTY_MOOD_LABELS, NANTY_TAB_LABELS, NANTY_TABS, nantyMood, nantyTabByKey, type NantyTab } from "./nantyModel";
+import { NantyMemory } from "./NantyMemory";
+import { chatCards, freshOpen, linkWindow, NANTY_MOOD_LABELS, NANTY_TAB_LABELS, NANTY_TABS, nantyMood, nantyTabByKey, type NantyTab } from "./nantyModel";
 import { NantyRules } from "./NantyRules";
 import { NantySettingsView } from "./NantySettings";
 import { consumeNantyTabRequest, useNanty, useNantyConversation, useNantyTabRequest } from "./nantyStore";
@@ -55,6 +57,15 @@ function FeedTab({ split, onSettings }: { split: boolean; onSettings: () => void
     if (card.project_id !== null) shell.goTo(card.project_id, linkWindow(card));
   }, [shell]);
   const decisions = useNantyDecisions(open);
+  const openProject = useCallback((id: string) => shell.goTo(id, "execution"), [shell]);
+  // Spec 140 T03: a resposta que abre a tela abre uma vez só, quando chega.
+  const seen = useRef<ReadonlySet<string> | null>(null);
+  useEffect(() => {
+    if (messages === null) return;
+    const project = freshOpen(messages, seen.current);
+    seen.current = new Set(messages.map((m) => m.id));
+    if (project !== null) openProject(project);
+  }, [messages, openProject]);
   const mood = nantyMood(status);
   const avatar = <NantyAvatar mood={mood} size={AVATAR_SIZE} label={t("nanty.avatar.label", { mood: NANTY_MOOD_LABELS[mood] })} />;
   const showFeed = split || pane === "feed";
@@ -82,7 +93,7 @@ function FeedTab({ split, onSettings }: { split: boolean; onSettings: () => void
           />
         </div>
       ) : null}
-      {showChat ? <NantyChat messages={messages} cards={chatCards(feed)} decisions={decisions} readOnly={status?.instance === "other_instance"} /> : null}
+      {showChat ? <NantyChat messages={messages} cards={chatCards(feed)} decisions={decisions} readOnly={status?.instance === "other_instance"} onOpenProject={openProject} /> : null}
     </div>
   );
 }
@@ -161,6 +172,8 @@ function NantyContentView({ size }: AppContentProps) {
           />
         ) : tab === "rules" ? (
           <NantyRules />
+        ) : tab === "memory" ? (
+          <NantyMemory />
         ) : (
           <NantySettingsView focusDigest={focusDigest} onFocused={() => setFocusDigest(false)} />
         )}

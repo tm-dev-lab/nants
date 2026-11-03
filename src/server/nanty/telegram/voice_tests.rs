@@ -15,13 +15,13 @@ use crate::config::{Config, DigestEmpty};
 use crate::server::events::SecretSet;
 use crate::server::nanty::store::{ConversationMessage, SentCard, SentKind};
 use crate::server::nanty::voice;
-use crate::server::nanty::voice::tests::{fake_voice, voice_config, FakeVoice, Reply};
+use crate::server::nanty::voice::tests::{fake_voice, style_of, voice_config, FakeVoice, Reply};
 use crate::server::nanty::{chat, clock, digest, new_id, render};
 
 const KEY: &str = "p1:plan_waiting";
 
 /// Mundo pareado com a voz ligada no Gemini simulado.
-async fn world(tag: &str, edit: impl FnOnce(&mut Config)) -> (World, Arc<Fake>, Arc<FakeVoice>) {
+pub(super) async fn world(tag: &str, edit: impl FnOnce(&mut Config)) -> (World, Arc<Fake>, Arc<FakeVoice>) {
     let tk = token(tag);
     let (fake, base) = fake_server(&tk).await;
     let (voice_fake, voice_base) = fake_voice().await;
@@ -33,11 +33,11 @@ async fn world(tag: &str, edit: impl FnOnce(&mut Config)) -> (World, Arc<Fake>, 
     (w, fake, voice_fake)
 }
 
-fn start_outbox(w: &World) -> tokio::task::JoinHandle<()> {
+pub(super) fn start_outbox(w: &World) -> tokio::task::JoinHandle<()> {
     tokio::spawn(outbox::run(w.state.clone(), w.state.shutdown_signal()))
 }
 
-fn card(group: &str, action: Option<&str>) -> Card {
+pub(super) fn card(group: &str, action: Option<&str>) -> Card {
     let now = clock::now_ms();
     let mut params = Map::new();
     params.insert("since".into(), json!("10:00"));
@@ -55,23 +55,23 @@ fn card(group: &str, action: Option<&str>) -> Card {
     }
 }
 
-fn add(w: &World, cards: Vec<Card>) {
+pub(super) fn add(w: &World, cards: Vec<Card>) {
     w.state.nanty().update(|st| {
         st.cards.extend(cards);
         true
     });
 }
 
-fn sent(w: &World, card_id: &str) -> Option<SentCard> {
+pub(super) fn sent(w: &World, card_id: &str) -> Option<SentCard> {
     w.state.nanty().snapshot().telegram_sent.into_iter().find(|r| r.card_id == card_id)
 }
 
-fn bodies(fake: &Fake, method: &str) -> Vec<Value> {
+pub(super) fn bodies(fake: &Fake, method: &str) -> Vec<Value> {
     fake.calls(method).into_iter().map(|(b, _)| b).collect()
 }
 
 /// Os `callback_data` de um `reply_markup`.
-fn datas(markup: &Value) -> Vec<String> {
+pub(super) fn datas(markup: &Value) -> Vec<String> {
     markup["inline_keyboard"]
         .as_array()
         .map(|rows| {
@@ -84,7 +84,7 @@ fn datas(markup: &Value) -> Vec<String> {
 }
 
 /// Os motivos das linhas `voice.text` do registro.
-fn text_reasons(w: &World) -> Vec<Value> {
+pub(super) fn text_reasons(w: &World) -> Vec<Value> {
     w.state
         .nanty()
         .journal_tail(1000)
@@ -415,7 +415,7 @@ fn old_sent_records_are_text() {
 
 // ---- O texto antes da fala (revisão 1) ----
 
-fn nanty_lines(w: &World) -> Vec<ConversationMessage> {
+pub(super) fn nanty_lines(w: &World) -> Vec<ConversationMessage> {
     w.state.nanty().conversation().into_iter().filter(|m| m.from == crate::server::nanty::store::Speaker::Nanty).collect()
 }
 
@@ -431,10 +431,10 @@ fn conversation_events(rx: &mut tokio::sync::broadcast::Receiver<crate::server::
 }
 
 /// Marcador do fim da fila de saída.
-const DRAINED: &str = "fim da fila";
+pub(super) const DRAINED: &str = "fim da fila";
 
 /// Espera a fila de saída chegar ao fim: um texto entra por último e sai depois do que veio antes.
-async fn drained(w: &World, fake: &Fake) {
+pub(super) async fn drained(w: &World, fake: &Fake) {
     let mut last = ConversationMessage::from_nanty(new_id(), clock::now_ms(), Channel::Web, "x", Map::new());
     last.code = None;
     last.text = Some(DRAINED.into());
@@ -493,7 +493,9 @@ async fn a_failed_speech_keeps_the_single_line_and_goes_in_text() {
     let reply = chat::reply(&w.state, &asked).await.expect("resposta");
     until("texto", || fake.calls("sendMessage").len() == 1).await;
     assert!(reply.audio.is_none() && fake.calls("sendVoice").is_empty());
-    assert_eq!(nanty_lines(&w), [reply]);
+    let lines = nanty_lines(&w);
+    assert_eq!(lines, [ConversationMessage { seq: lines[0].seq, ..reply }]);
+    assert!(lines[0].seq.is_some());
     assert_eq!(conversation_events(&mut events), 1, "sem áudio, sem segunda linha");
 }
 
@@ -556,7 +558,7 @@ async fn a_speech_past_the_deadline_still_counts_in_the_budget() {
     let nanty = w.state.nanty();
     let spend = || nanty.snapshot().spend_on(&nanty.now().day_key());
     // A fala só termina na liberação, mais abaixo: voltar aqui prova que o texto não a espera.
-    let late = voice::speak_on_time(&w.state, nanty, "Oi.").await;
+    let late = voice::speak_on_time(&w.state, nanty, "Oi.", voice::Tone::Neutral).await;
     assert_eq!(late.map(|_| ()), Err(vec!["deadline"]));
     assert_eq!(spend().voice_calls, 0);
     assert_eq!(text_reasons(&w), [json!(["deadline"])]);
@@ -566,6 +568,41 @@ async fn a_speech_past_the_deadline_still_counts_in_the_budget() {
     // A linha do registro sai logo depois do gasto: espera, sem lê-la no mesmo instante.
     let ok = || nanty.journal_tail(100).iter().filter(|e| e.kind == JournalKind::Voice && e.code == "voice.ok").count();
     until("o registro real da chamada", || ok() == 1).await;
+}
+
+/// Spec 140 T01: o aviso fala no tom do tipo do sinal, e o pedido de decisão fica sem anotação.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_card_speaks_in_the_tone_of_its_signal() {
+    let (w, fake, voice_fake) = world("v-tone", |_| {}).await;
+    let _out = start_outbox(&w);
+    let mut done = card("p1:spec_done", None);
+    done.code = "nanty.why.spec_done".into();
+    add(&w, vec![done]);
+    until("marco", || fake.calls("sendVoice").len() == 1).await;
+    assert_eq!(style_of(&voice_fake, 0), json!("warm and upbeat"));
+    let mut disk = card("*:disk_low", None);
+    disk.code = "nanty.why.disk_low".into();
+    add(&w, vec![disk]);
+    until("disco", || fake.calls("sendVoice").len() == 2).await;
+    assert_eq!(style_of(&voice_fake, 1), json!("concerned but composed"));
+    add(&w, vec![card(KEY, None)]);
+    until("plano", || fake.calls("sendVoice").len() == 3).await;
+    assert_eq!(style_of(&voice_fake, 2), Value::Null);
+}
+
+/// Spec 140 T01: recusada a anotação, o aviso sai em voz mesmo assim, sem esperar outra rodada.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_card_with_a_refused_style_still_goes_as_voice() {
+    let (w, fake, voice_fake) = world("v-tone-400", |_| {}).await;
+    let _out = start_outbox(&w);
+    lock(&voice_fake.gemini).push_back(Reply::Status(400));
+    let mut blocked = card("p1:run_blocked", None);
+    blocked.code = "nanty.why.run_blocked".into();
+    add(&w, vec![blocked]);
+    until("nota", || fake.calls("sendVoice").len() == 1).await;
+    assert_eq!(voice_fake.calls("gemini").len(), 2);
+    assert_eq!((style_of(&voice_fake, 0), style_of(&voice_fake, 1)), (json!("serious and steady"), Value::Null));
+    assert!(fake.calls("sendMessage").is_empty());
 }
 
 /// A última linha vence, e a posição continua a da primeira.

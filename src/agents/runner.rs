@@ -3530,6 +3530,18 @@ impl TaskRunner {
     }
 
     /// Mensagem do agente `tests` na conversa da tarefa.
+    /// Spec 140 T09 (C-10): as pastas que eram repositório aninhado viraram pastas comuns (o `.git`
+    /// delas foi afastado e os arquivos entram no commit); a pessoa fica sabendo. Nada sem pastas.
+    fn nested_notice(&self, task: &Task, attempt: u32, detached: &[String]) {
+        if detached.is_empty() {
+            return;
+        }
+        let count = u64::try_from(detached.len()).unwrap_or(u64::MAX);
+        let names = self.scrub(&detached.join(", "));
+        let text = i18n::tr_plural(self.lang.get(), "runner.nested_repo.detached", count, &[("names", &names)]);
+        self.tests_message(task, attempt, text);
+    }
+
     fn tests_message(&self, task: &Task, attempt: u32, text: String) {
         self.events.emit(RunnerEvent::AgentMessage {
             agent: "tests".into(),
@@ -3593,9 +3605,12 @@ impl TaskRunner {
     ) -> Result<(), RunnerError> {
         let lang = self.lang.get();
         let failed = |why: String| i18n::tr(lang, "runner.format.failed", &[("why", &why)]);
-        if let Err(why) = formatting::snapshot(wt) {
-            self.tests_message(task, attempt, self.scrub(&failed(why)));
-            return Ok(());
+        match formatting::snapshot(wt) {
+            Ok(detached) => self.nested_notice(task, attempt, &detached),
+            Err(why) => {
+                self.tests_message(task, attempt, self.scrub(&failed(why)));
+                return Ok(());
+            }
         }
         let mut applied: Vec<&str> = Vec::new();
         for f in selected {
@@ -3634,10 +3649,13 @@ impl TaskRunner {
                     if formatting::touches_scope(wt, &task.frontmatter.allowed_scope).unwrap_or(false) {
                         applied.push(&f.name);
                     }
-                    if let Err(why) = formatting::snapshot(wt) {
-                        self.tests_message(task, attempt, self.scrub(&failed(why)));
-                        let _ = formatting::reset_to_head(wt);
-                        return Ok(());
+                    match formatting::snapshot(wt) {
+                        Ok(detached) => self.nested_notice(task, attempt, &detached),
+                        Err(why) => {
+                            self.tests_message(task, attempt, self.scrub(&failed(why)));
+                            let _ = formatting::reset_to_head(wt);
+                            return Ok(());
+                        }
                     }
                 }
                 Some(why) => {
@@ -3932,7 +3950,7 @@ impl TaskRunner {
                 task_id: Some(task.frontmatter.id.clone()),
                 attempt: Some(attempt),
             });
-            commit_pending(
+            let detached = commit_pending(
                 &wt,
                 &self.repo_root,
                 &task.frontmatter.spec_id,
@@ -3940,6 +3958,7 @@ impl TaskRunner {
                 &task.frontmatter.branch,
                 self.lang.get(),
             )?;
+            self.nested_notice(task, attempt, &detached);
             // Formatação automática (spec 078): vira commit próprio, antes do HEAD testado e revisado.
             self.format_delivery(settings, task, &wt, attempt).await?;
             self.record_attempt(settings, task, &history_summary)?;
@@ -6913,6 +6932,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Se a worktree tiver alterações, indexa e commita (mensagem de branch, não de squash).
 /// Antes, confirma que `wt` é a worktree da `branch` da tarefa e não a raiz do repositório.
+/// Devolve as pastas que eram repositório aninhado e tiveram o `.git` afastado ([`Git::add_all`]).
 fn commit_pending(
     wt: &Path,
     root: &Path,
@@ -6920,7 +6940,7 @@ fn commit_pending(
     task_id: &str,
     branch: &str,
     lang: Lang,
-) -> Result<(), RunnerError> {
+) -> Result<Vec<String>, RunnerError> {
     if same_path(wt, root) || !wt.join(".git").exists() {
         return Err(RunnerError::Invalid(format!(
             "{} não é uma worktree do repositório",
@@ -6934,11 +6954,15 @@ fn commit_pending(
             wt.display()
         )));
     }
-    if !wt_git.is_clean()? {
-        wt_git.add_all()?;
+    if wt_git.is_clean()? {
+        return Ok(Vec::new());
+    }
+    let detached = wt_git.add_all()?;
+    // Sem nada indexado (a mudança era só dentro de um submódulo), não há commit.
+    if wt_git.has_staged_changes()? {
         wt_git.commit(&i18n::commit_subject(lang, &format!("chore({spec_id}): {task_id} - "), "commit.developer_changes"))?;
     }
-    Ok(())
+    Ok(detached)
 }
 
 /// Linhas de base de escrita compartilháveis entre o runner e o [`TaskEditor`].
@@ -8087,7 +8111,11 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, test_command: &str) -> Self {
-            let base = env::temp_dir().join(format!("nants-runner-{}-{}", process::id(), tag));
+            // Spec 140 T03: o contador garante uma pasta por fixture; a mesma etiqueta em dois testes
+            // paralelos dividia o repositório, e o Git quebrava.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let base = env::temp_dir().join(format!("nants-runner-{}-{seq}-{tag}", process::id()));
             let _ = fs::remove_dir_all(&base);
             let repo = base.join("repo");
             fs::create_dir_all(&repo).unwrap();
@@ -11215,9 +11243,8 @@ mod tests {
     /// Spec 115 T04 (C-09): em projeto en, a tarefa termina DONE pelo commit `feat(<spec>): Txx - `.
     #[tokio::test]
     async fn done_is_detected_by_the_feat_prefix_in_an_english_project() {
-        let en = formatter_texts_in(crate::i18n::Lang::En, "done-prefix-en").await;
+        let (en, root) = formatter_texts_in(crate::i18n::Lang::En, "done-prefix-en").await;
         assert!(!en.is_empty());
-        let root = env::temp_dir().join(format!("nants-runner-{}-done-prefix-en", process::id())).join("repo");
         let subject = git_in(&root, &["log", "-1", "--format=%s", "main"]);
         assert!(subject.starts_with("feat(s1): T01 - "), "{subject}");
         assert!(is_integrated(&Git::new(root.clone()), "main", SPEC, "T01").unwrap());
@@ -11233,8 +11260,8 @@ mod tests {
     }
 
     /// Formatador que aplica, um que sai 3 e um que estoura o tempo, no idioma pedido; devolve as
-    /// mensagens `tests`.
-    async fn formatter_texts_in(lang: crate::i18n::Lang, name: &str) -> Vec<String> {
+    /// mensagens `tests` e o repositório.
+    async fn formatter_texts_in(lang: crate::i18n::Lang, name: &str) -> (Vec<String>, PathBuf) {
         let fx = Fixture::new(name, "true");
         set_formatters(
             &fx,
@@ -11255,17 +11282,17 @@ mod tests {
         )
         .with_lang(crate::i18n::SharedLang::new(lang));
         assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
-        tests_texts(&rec)
+        (tests_texts(&rec), fx.repo.clone())
     }
 
     #[tokio::test]
     async fn formatter_messages_follow_project_language() {
-        let pt = formatter_texts_in(crate::i18n::Lang::PtBr, "fmt-idioma-pt").await;
+        let (pt, _) = formatter_texts_in(crate::i18n::Lang::PtBr, "fmt-idioma-pt").await;
         assert!(pt.iter().any(|t| t.starts_with("formatação automática (boom) falhou (não bloqueia): saída 3: ") && t.contains("oops-text")), "{pt:?}");
         assert!(pt.contains(&"formatação automática (slow) falhou (não bloqueia): tempo esgotado".to_string()), "{pt:?}");
         assert!(pt.contains(&"formatação automática: 1 arquivo (web)".to_string()), "{pt:?}");
 
-        let en = formatter_texts_in(crate::i18n::Lang::En, "fmt-idioma-en").await;
+        let (en, _) = formatter_texts_in(crate::i18n::Lang::En, "fmt-idioma-en").await;
         assert!(en.iter().any(|t| t.starts_with("automatic formatting (boom) failed (does not block): exit 3: ") && t.contains("oops-text")), "{en:?}");
         assert!(en.contains(&"automatic formatting (slow) failed (does not block): timed out".to_string()), "{en:?}");
         assert!(en.contains(&"automatic formatting: 1 file (web)".to_string()), "{en:?}");
@@ -14458,7 +14485,7 @@ mod tests {
     /// contagem e os marcadores do Revisor em inglês.
     #[tokio::test]
     async fn final_verification_message_follows_project_language() {
-        let fx = Fixture::new("final-msg-en", "true");
+        let fx = Fixture::new("final-verification-en", "true");
         with_globals(&fx);
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let (dev, rec) = (FakeDev::default(), Recorder::default());

@@ -345,6 +345,7 @@ mod sweep_tests {
             internal: false,
             attachments: attachments.iter().map(|s| s.to_string()).collect(),
             notice: None,
+            offline: false,
         }
     }
 

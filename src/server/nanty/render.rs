@@ -74,8 +74,9 @@ fn lines_text(lang: Lang, params: &Map<String, Value>, field: &str) -> Vec<Strin
 /// 138) sai sempre, do dicionário.
 ///
 /// Spec 139 T12: a fala do modelo vem primeiro, e a frase do servidor fecha a mensagem (do contrário,
-/// a conversa parece invertida: a confirmação antes da resposta). Só o título do resumo
-/// ([`super::digest::LEAD`]) abre o texto.
+/// a conversa parece invertida: a confirmação antes da resposta). Só os títulos abrem o texto: o do
+/// resumo ([`super::digest::LEAD`]) e o do cenário proativo ([`super::scenario::LEAD`], spec 140 T12),
+/// que avisa antes de tudo que é uma análise automática.
 pub fn message_text(lang: Lang, message: &ConversationMessage) -> String {
     let text = model_text(message);
     let fixed = fixed_parts(lang, message);
@@ -100,8 +101,11 @@ fn model_text(message: &ConversationMessage) -> Option<&str> {
 
 /// A frase do servidor fecha a mensagem: há texto do modelo antes dela, e ela não é título.
 fn closes(message: &ConversationMessage) -> bool {
-    model_text(message).is_some() && message.code.as_deref().is_some_and(|code| code != super::digest::LEAD)
+    model_text(message).is_some() && message.code.as_deref().is_some_and(|code| !LEADS.contains(&code))
 }
+
+/// As frases do servidor que abrem o texto do modelo, em vez de fechá-lo.
+const LEADS: [&str; 2] = [super::digest::LEAD, super::scenario::LEAD];
 
 /// O texto fixo da mensagem, no idioma gravado nela.
 fn fixed_parts(lang: Lang, message: &ConversationMessage) -> Vec<String> {
@@ -115,6 +119,12 @@ fn fixed_parts(lang: Lang, message: &ConversationMessage) -> Vec<String> {
     parts
 }
 
+/// O texto do modelo abre a mensagem (spec 140 T14): há texto dele, e nenhum título do servidor vem
+/// antes ([`message_text`]).
+pub fn opens_with_model(message: &ConversationMessage) -> bool {
+    model_text(message).is_some() && message.code.as_deref().is_none_or(|code| !LEADS.contains(&code))
+}
+
 /// A frase do servidor que fecha a mensagem, quando há: o corte da legenda e da fala a preserva.
 pub fn closing(lang: Lang, message: &ConversationMessage) -> Option<String> {
     closes(message).then(|| fixed_parts(lang, message).join("\n"))
@@ -122,5 +132,9 @@ pub fn closing(lang: Lang, message: &ConversationMessage) -> Option<String> {
 
 /// Texto do porquê de um cartão para o Telegram (o texto fixo do observador, C-06).
 pub fn card_text(lang: Lang, card: &Card) -> String {
-    code_text(lang, &card.code, &card.params)
+    // Spec 140 T07: as linhas extras do cartão (o texto exato e a fonte do pedido à memória).
+    let mut parts = vec![code_text(lang, &card.code, &card.params)];
+    parts.extend(lines_text(lang, &card.params, super::memory::card::CARD_LINES));
+    // Spec 140 T04 (C-09): o texto de cartão passa pelo redator único, como a resposta final.
+    super::redact::patterns(&parts.join("\n"))
 }

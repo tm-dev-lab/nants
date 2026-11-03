@@ -7,7 +7,8 @@
 import { describe, expect, it } from "vitest";
 import { NANTY_CONFIG } from "../../desktop/shell-test-utils";
 import { parseNantySettings, parseNantyTelegram, parseNantyVoices, type NantySettings } from "./nantyApi";
-import { budgetFraction, draftOf, invalidNumbers, keyRefused, minutesText, settingsPatch, voiceCapable, voiceCheckOf, voiceState, voiceWarning } from "./nantySettingsModel";
+import type { ConnectionView } from "../../api/types";
+import { budgetFraction, draftOf, invalidNumbers, keyRefused, maybeFreeGemini, minutesText, providerOf, settingsPatch, voiceCapable, voiceCheckOf, voiceState, voiceWarning } from "./nantySettingsModel";
 
 function saved(): NantySettings {
   const s = parseNantySettings(NANTY_CONFIG);
@@ -24,6 +25,35 @@ describe("pedido dos Ajustes", () => {
     // Mudar e voltar ao valor salvo não manda nada.
     expect(settingsPatch(s, { ...draftOf(s), daily_budget_usd: "0,50" })).toEqual({});
     expect(settingsPatch(s, { ...draftOf(s), model: "  " })).toEqual({});
+  });
+
+  it("spec 140 T03: o endereço entra só quando muda, sem espaços, e vazio tira", () => {
+    const s = saved();
+    expect(settingsPatch(s, { ...draftOf(s), address: "  " })).toEqual({});
+    expect(settingsPatch(s, { ...draftOf(s), address: " http://192.168.0.10:3000 " })).toEqual({ address: "http://192.168.0.10:3000" });
+    const withAddress = { ...s, address: "http://192.168.0.10:3000" };
+    expect(settingsPatch(withAddress, draftOf(withAddress))).toEqual({});
+    expect(settingsPatch(withAddress, { ...draftOf(withAddress), address: "" })).toEqual({ address: "" });
+  });
+
+  it("spec 140 T12: o interruptor do cenário entra só quando muda; o provedor e o aviso do Gemini", () => {
+    const s = saved();
+    expect(s.analysis).toEqual({ proactive: false, scenarios_per_day: 5, scenarios_per_spec: 2, budget_pct: 30 });
+    expect(settingsPatch(s, { ...draftOf(s), proactive: true })).toEqual({ analysis: { proactive: true } });
+    const on = { ...s, analysis: { ...s.analysis, proactive: true } };
+    expect(settingsPatch(on, draftOf(on))).toEqual({});
+    // Servidor antigo, sem o campo: desligado.
+    const old = parseNantySettings({ ...NANTY_CONFIG, analysis: undefined });
+    expect(old?.analysis.proactive).toBe(false);
+    const conn = (kind: ConnectionView["kind"], base_url: string): ConnectionView => ({ id: "c", name: "c", base_url, api_key_masked: "", kind });
+    expect(providerOf(conn("google_gemini", ""))).toEqual({ kind: "brand", name: "Google Gemini" });
+    expect(providerOf(conn("anthropic", ""))).toEqual({ kind: "brand", name: "Anthropic" });
+    expect(providerOf(conn("chatgpt_plan", ""))).toEqual({ kind: "plan" });
+    expect(providerOf(conn("api_key", "https://api.openai.com/v1"))).toEqual({ kind: "host", name: "api.openai.com" });
+    expect(providerOf(conn("api_key", "nada"))).toBeNull();
+    expect(maybeFreeGemini(conn("google_gemini", ""))).toBe(true);
+    expect(maybeFreeGemini(conn("api_key", "https://generativelanguage.googleapis.com/v1beta/openai/"))).toBe(true);
+    expect(maybeFreeGemini(conn("api_key", "https://api.openai.com/v1"))).toBe(false);
   });
 
   it("os projetos excluídos e a voz, na forma nova e sem espaços", () => {

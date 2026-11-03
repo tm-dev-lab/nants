@@ -272,6 +272,9 @@ pub(super) const FAST: Tuning = Tuning {
     send_settle: Duration::ZERO,
     typing_every: Duration::from_millis(150),
     speech_deadline: Duration::from_secs(5),
+    notice_text_wait: Duration::from_millis(100),
+    notice_text_wait_urgent: Duration::from_millis(100),
+    notice_total: Duration::from_secs(60),
 };
 
 pub(super) struct World {

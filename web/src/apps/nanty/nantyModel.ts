@@ -13,14 +13,15 @@ import type { Attention } from "../../desktop/api";
 import type { AppBadge } from "../../desktop/appState";
 import type { WindowKind } from "../../desktop/windows";
 import type { NantyMood } from "./NantyAvatar";
-import type { NantyAnswer, NantyCard, NantyDone, NantyFeed, NantyHealth, NantyPlanned, NantyStatus } from "./nantyApi";
+import type { NantyAnswer, NantyCard, NantyDone, NantyFeed, NantyHealth, NantyMessage, NantyPlanned, NantyStatus } from "./nantyApi";
 
-export const NANTY_TABS = ["feed", "rules", "settings"] as const;
+export const NANTY_TABS = ["feed", "rules", "memory", "settings"] as const;
 export type NantyTab = (typeof NANTY_TABS)[number];
 
 export const NANTY_TAB_LABELS: Readonly<Record<NantyTab, string>> = localized({
   feed: "nanty.tab.feed",
   rules: "nanty.tab.rules",
+  memory: "nanty.tab.memory",
   settings: "nanty.tab.settings",
 });
 
@@ -63,7 +64,9 @@ export function nantyBadgeCount(feed: NantyFeed | null, attention: Attention | n
 export function chatCards(feed: NantyFeed | null): NantyCard[] {
   if (feed === null) return [];
   const off = feed.silence?.card ?? null;
-  return off === null ? feed.waiting : [...feed.waiting, off];
+  // Spec 140 T07: os botões de apagar do rodapé "guardei isto" também.
+  const memory = feed.memory ?? [];
+  return [...feed.waiting, ...(off === null ? [] : [off]), ...memory];
 }
 
 /** Estado do avatar: o do servidor; sem leitura ainda, atento. */
@@ -208,6 +211,9 @@ const ACTION_KEYS: Readonly<Record<string, MessageKey>> = {
   allow_command_always: "nanty.action.allow_command_always",
   change_channel: "nanty.action.change_channel",
   undo: "nanty.action.undo",
+  memory_confirm: "nanty.action.memory_confirm",
+  memory_forget: "nanty.action.memory_forget",
+  architect_draft: "nanty.action.architect_draft",
 };
 
 /** Nome da ação do catálogo, pelo dicionário (`nanty.action.*`). */
@@ -226,6 +232,11 @@ export function cardButtons(card: NantyCard): CardButton[] {
   if (card.token === undefined) return [];
   const out: CardButton[] = [];
   const action = card.action;
+  // A memória (spec 140 T07): o botão de apagar sozinho; a confirmação com o "não".
+  if (action === "memory_forget") return [{ choice: "yes", label: actionLabel(action) }];
+  if (action === "memory_confirm") return [{ choice: "yes", label: actionLabel(action) }, { choice: "no", label: t("nanty.feed.no") }];
+  // Levar ao Arquiteto (spec 140 T15): o "sim" só deixa o rascunho; sem "lembrar depois".
+  if (action === "architect_draft") return [{ choice: "yes", label: actionLabel(action) }, { choice: "no", label: t("nanty.feed.no") }];
   if (action !== undefined && SILENCE.includes(action)) {
     out.push({ choice: "yes", label: actionLabel(action) });
     if (action === "set_silence") out.push({ choice: "no", label: t("nanty.feed.no") });
@@ -246,6 +257,16 @@ export function linkWindow(card: NantyCard): WindowKind {
   if (kind === "plan_waiting") return "plan";
   if (kind === "cost_alert" || kind === "budget" || card.action === "raise_limit") return "costs";
   return "execution";
+}
+
+/**
+ * O projeto que a janela deve abrir agora (spec 140 T03): o da resposta nova mais recente que pede
+ * isso. Só depois da primeira leitura (`seen` nulo): reabrir a conversa não reabre a tela.
+ */
+export function freshOpen(messages: readonly NantyMessage[], seen: ReadonlySet<string> | null): string | null {
+  if (seen === null) return null;
+  const fresh = messages.filter((m) => !seen.has(m.id) && m.from === "nanty" && m.channel === "web" && m.open_project !== null);
+  return fresh[fresh.length - 1]?.open_project ?? null;
 }
 
 const RESULT_KEYS: Readonly<Record<string, MessageKey>> = {

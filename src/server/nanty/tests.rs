@@ -142,6 +142,9 @@ async fn removed_project_state_leaves_with_the_event() {
         voice: false,
         audio: None,
         relayed: None,
+        project_ids: Vec::new(),
+        taint: None,
+        seq: None,
     });
     assert_eq!(nanty.journal_tail(10).len(), 1);
     assert_eq!(nanty.conversation().len(), 1);
@@ -198,6 +201,9 @@ async fn lagged_triggers_a_full_sweep() {
                 voice: false,
                 audio: None,
                 relayed: None,
+                project_ids: Vec::new(),
+                taint: None,
+                seq: None,
             })
             .expect("conversa");
     }
@@ -249,12 +255,19 @@ fn avatar_follows_status_busy_quiet_and_cards() {
         true
     });
     assert_eq!(noon.avatar(&cfg), Avatar::Waiting);
-    noon.set_busy(Some(Avatar::Thinking));
+    // Spec 140 T11 (C-13): cada turno conta no "pensando"; o fim de um não apaga o do outro, e a fala
+    // vence o "pensando", que volta quando ela acaba.
+    let conversation = noon.thinking();
     assert_eq!(noon.avatar(&cfg), Avatar::Thinking);
-    noon.set_busy(Some(Avatar::Speaking));
+    let analysis = noon.thinking();
+    let speaking = noon.speaking();
     assert_eq!(noon.avatar(&cfg), Avatar::Speaking);
-    noon.set_busy(None);
-    assert_eq!(noon.avatar(&cfg), Avatar::Waiting);
+    drop(speaking);
+    assert_eq!(noon.avatar(&cfg), Avatar::Thinking);
+    drop(conversation);
+    assert_eq!((noon.avatar(&cfg), noon.thinking_turns()), (Avatar::Thinking, 1), "a análise segue pensando");
+    drop(analysis);
+    assert_eq!((noon.avatar(&cfg), noon.thinking_turns()), (Avatar::Waiting, 0));
     // Relógio injetado: às 23:00 locais, dentro do silêncio (22:00 a 07:00), dorme.
     let night = Nanty::new(Some(data.join("b")), EventBus::new(), fixed_clock(at((2026, 10, 30), 23, 0, NOON_MS)));
     night.acquire();
@@ -305,7 +318,7 @@ async fn read_routes_show_config_masked_feed_conversation_and_status() {
             undo: None,
         });
         s.push_done(DoneItem { at_ms: NOON_MS - 86_400_000, ..s.done[0].clone() });
-        s.spend = Spend { day: "2026-10-30".into(), usd: 0.07, input_tokens: 900, output_tokens: 80, unpriced_turns: 0, voice_calls: 0 };
+        s.spend = Spend { day: "2026-10-30".into(), usd: 0.07, input_tokens: 900, output_tokens: 80, unpriced_turns: 0, voice_calls: 0, ..Spend::default() };
         true
     });
     nanty.push_message(&ConversationMessage {
@@ -324,6 +337,9 @@ async fn read_routes_show_config_masked_feed_conversation_and_status() {
         voice: false,
         audio: None,
         relayed: None,
+        project_ids: Vec::new(),
+        taint: None,
+        seq: None,
     });
     let app = crate::server::router(st.clone());
 
@@ -344,7 +360,7 @@ async fn read_routes_show_config_masked_feed_conversation_and_status() {
     assert_eq!(feed["today"]["done"], 1, "só o de hoje conta no resumo");
     assert_eq!(feed["today"]["day"], "2026-10-30");
     assert_eq!(feed["today"]["spend"]["usd"], 0.07);
-    assert_eq!(feed["today"]["budget_usd"], 0.5);
+    assert_eq!(feed["today"]["budget_usd"], 1.0);
 
     let (code, conversation) = get(app.clone(), "/api/nanty/conversation").await;
     assert_eq!(code, StatusCode::OK);
@@ -369,7 +385,7 @@ async fn changes_reach_the_global_stream_as_nanty_changed() {
     let data = dir("sse");
     let st = state_in(&data, Config::default());
     let mut rx = st.events().subscribe();
-    st.nanty().set_busy(Some(Avatar::Thinking));
+    let _thinking = st.nanty().thinking();
     let ev = rx.recv().await.expect("evento");
     assert_eq!(ev.event_type(), "nanty_changed");
     assert_eq!(ev.project_id, None);

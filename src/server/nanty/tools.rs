@@ -17,18 +17,38 @@
 //! - **Silêncio (T04):** `set_silence` liga o silêncio de tudo direto, com a confirmação do servidor
 //!   ([`super::silence`]); num turno contaminado, vira o cartão de confirmação. Nenhuma ferramenta
 //!   muda canal, token ou destinatário.
-//! - **Tudo sai redigido:** o [`SecretSet`] da configuração passa sobre o texto de cada resultado.
+//! - **Abrir o Nants (spec 140 T03, C-30):** `open_nants` guarda o pedido na sessão, e o servidor
+//!   acrescenta o caminho à resposta ([`super::link`]): o link, a tela ou o motivo de não dar. O texto
+//!   do modelo não leva link, e o resultado da ferramenta não leva o endereço.
+//! - **Ferramentas por modo (spec 140 T04, C-06):** [`Mode`] lista o que existe em cada modo, e o
+//!   despachante confere antes de tudo: chamar pelo nome uma ferramenta não oferecida não executa nada.
+//! - **Memória (spec 140 T07):** `remember`, `recall` e `forget` ([`memory::tools`]) só existem na
+//!   conversa; num turno contaminado, gravar e apagar viram o cartão de confirmação.
+//! - **Leitura profunda (spec 140 T10, G5):** `agent_log`, `sdd_docs`, `project_files` e
+//!   `git_history` ([`deep`]) existem na conversa e, desde a T12, na análise. O despachante confere o projeto, os parâmetros e o
+//!   isolamento (C-16: outro projeto só no mesmo pedido do primeiro, antes de o modelo ver conteúdo; a
+//!   regra vale também para `project_details`), e toda leitura contamina o turno com o tipo e o projeto.
+//! - **Análise presa ao projeto do aviso (spec 140 T12, C-11):** o modo análise ganha a leitura
+//!   profunda, e o despachante recusa qualquer `project_id` que não seja o da [`Session::pinned`].
+//! - **Pensar mais (spec 140 T13, C-25):** `deep_think` ([`super::think`]) só existe na conversa e
+//!   só sobe o esforço das rodadas seguintes da mensagem, uma vez, dentro do orçamento.
+//! - **Levar ao Arquiteto (spec 140 T15, C-15):** `propose_to_architect` ([`super::draft`]) só existe
+//!   na conversa e só cria o cartão com o texto congelado; o clique deixa um rascunho na caixa do
+//!   Arquiteto, e quem envia é a pessoa.
+//! - **Tudo sai redigido:** o redator único ([`redact::scrub`]) passa sobre o texto de cada resultado.
 
 use serde_json::{json, Map, Value};
 
 use super::act;
 use super::actions::{self, ActionKind};
 use super::agent::{Session, SilenceEffect};
+use super::link;
 use super::observe::{Phase, ProjectFacts};
+use super::provenance::TaintKind;
 use super::signals::SignalKind;
 use super::silence::{self, Request};
 use super::store::DecidedBy;
-use super::{chat, clock, digest, render, turn, Nanty};
+use super::{chat, clock, deep, digest, files, memory, redact, render, turn, Nanty};
 use crate::agents::llm_client::ToolCall;
 use crate::config::{Config, Project, GB_BYTES};
 use crate::i18n::Lang;
@@ -47,6 +67,18 @@ pub const NANTY_ACTIVITY: &str = "nanty_activity";
 pub const PROPOSE_ACTION: &str = "propose_action";
 /// Silenciar os avisos por algumas horas (T04).
 pub const SET_SILENCE: &str = "set_silence";
+/// Levar a pessoa ao Nants (spec 140 T03): o servidor acrescenta o caminho.
+pub const OPEN_NANTS: &str = "open_nants";
+/// Guardar na memória de longo prazo (spec 140 T07).
+pub const REMEMBER: &str = "remember";
+/// Buscar na memória de longo prazo (spec 140 T07).
+pub const RECALL: &str = "recall";
+/// Apagar da memória de longo prazo (spec 140 T07).
+pub const FORGET: &str = "forget";
+/// Levar uma ideia ao Arquiteto como rascunho (spec 140 T15): só na conversa.
+pub const PROPOSE_TO_ARCHITECT: &str = super::draft::PROPOSE_TO_ARCHITECT;
+/// Pensar de novo com esforço maior (spec 140 T13): só na conversa.
+pub const DEEP_THINK: &str = super::think::DEEP_THINK;
 /// Cartões de ação por mensagem, no máximo.
 pub const MAX_PROPOSED_CARDS: usize = turn::MAX_MODEL_ACTIONS;
 /// Abertura e fecho do envelope de dado não confiável.
@@ -56,6 +88,49 @@ pub const UNTRUSTED_CLOSE: &str = "</untrusted_data>";
 pub const NAME_MAX_BYTES: usize = 100;
 /// Linhas do que foi feito e decidido hoje.
 const MAX_ACTIVITY: usize = 20;
+
+/// O modo do turno (spec 140 T04, C-06): decide quais ferramentas existem nele.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// A pessoa escreveu: todas as ferramentas da conversa.
+    #[default]
+    Conversation,
+    /// Turno de análise, sem pessoa presente: só leitura, do projeto do aviso (spec 140 T12).
+    Analysis,
+}
+
+impl Mode {
+    /// As ferramentas do modo. Quem cria uma ferramenta nova decide aqui em que modo ela existe.
+    pub fn tools(self) -> &'static [&'static str] {
+        match self {
+            Mode::Conversation => &[
+                PROJECT_STATUS,
+                PROJECT_DETAILS,
+                deep::AGENT_LOG,
+                deep::SDD_DOCS,
+                deep::PROJECT_FILES,
+                deep::GIT_HISTORY,
+                SYSTEM_STATUS,
+                NANTY_ACTIVITY,
+                PROPOSE_ACTION,
+                OPEN_NANTS,
+                SET_SILENCE,
+                REMEMBER,
+                RECALL,
+                FORGET,
+                DEEP_THINK,
+                PROPOSE_TO_ARCHITECT,
+            ],
+            // Spec 140 T12: a leitura profunda também, só do projeto do aviso ([`Session::pinned`]).
+            Mode::Analysis => &[PROJECT_STATUS, PROJECT_DETAILS, deep::AGENT_LOG, deep::SDD_DOCS, deep::PROJECT_FILES, deep::GIT_HISTORY],
+        }
+    }
+
+    /// A ferramenta existe neste modo.
+    pub fn allows(self, name: &str) -> bool {
+        self.tools().contains(&name)
+    }
+}
 
 /// Uma linha: o código do dicionário e os parâmetros.
 pub type Line = (String, Map<String, Value>);
@@ -91,7 +166,8 @@ pub fn phase_code(phase: Phase) -> String {
 pub fn status_lines(facts: &ProjectFacts, full: bool) -> Vec<Line> {
     let f = facts.status_facts();
     let mut out = vec![line(&phase_code(facts.phase()), &[])];
-    if let Some(v) = f.get("task_id") {
+    // Spec 140 T04 (C-05): só o id na forma do SDD; o resto é texto escrito no projeto.
+    if let Some(v) = f.get("task_id").filter(|v| v.as_str().is_some_and(turn::is_task_id)) {
         out.push(line("nanty.status.task", &[("task", v.clone())]));
     }
     if let (Some(done), Some(total)) = (f.get("done"), f.get("total")) {
@@ -165,6 +241,18 @@ pub async fn call(
     call: &ToolCall,
     session: &mut Session,
 ) -> String {
+    // Spec 140 T04 (C-06): a lista oferecida não restringe a execução; a do modo, sim.
+    if !session.mode.allows(&call.name) {
+        return redact::scrub(secrets, &unknown_tool(lang, &call.name));
+    }
+    // Spec 140 T12 (C-11): na análise, só o projeto do aviso, em toda ferramenta, antes de qualquer
+    // leitura. Outro id recebe a mesma frase do segundo projeto da conversa.
+    if let Some(pin) = &session.pinned {
+        let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        if args.get("project_id").and_then(Value::as_str).map(str::trim).is_some_and(|id| id != pin) {
+            return crate::i18n::tr(lang, "nanty.tool.other_project", &[]);
+        }
+    }
     let out = match call.name.as_str() {
         PROJECT_STATUS => match project_arg(cfg, lang, &call.arguments) {
             Ok(project) => {
@@ -178,25 +266,65 @@ pub async fn call(
             Ok(_) if session.details >= cfg.nanty.chat.details() => {
                 crate::i18n::tr(lang, "nanty.tool.details_limit", &[("max", &cfg.nanty.chat.details().to_string())])
             }
+            // Spec 140 T10 (C-16): outro projeto, só no mesmo pedido do primeiro.
+            Ok(project) if !session.admit(&project.id) => crate::i18n::tr(lang, "nanty.tool.other_project", &[]),
             Ok(project) => {
                 note_read(session, &project.id);
                 session.details += 1;
                 // Daqui em diante, o turno tem dado não confiável no contexto.
-                session.tainted = true;
+                session.tainted.read(TaintKind::ProjectFile, Some(&project.id));
                 project_details(state, cfg, lang, project).await
             }
             Err(text) => text,
         },
         SYSTEM_STATUS => system_status(nanty, cfg, lang).await,
         NANTY_ACTIVITY => activity(nanty, cfg, lang, secrets),
-        PROPOSE_ACTION => propose_action(state, nanty, cfg, lang, &call.arguments, session).await,
+        PROPOSE_ACTION => propose_action(state, nanty, cfg, lang, secrets, &call.arguments, session).await,
+        OPEN_NANTS => open_nants(state, cfg, lang, secrets, &call.arguments, session),
         SET_SILENCE => set_silence(nanty, cfg, lang, &call.arguments, session),
-        other => {
-            let name = if turn::is_code(other) { other } else { "?" };
-            crate::i18n::tr(lang, "nanty.tool.unknown_tool", &[("name", name)])
-        }
+        // Spec 140 T07: a memória de longo prazo; nada daqui muda ação, canal ou token.
+        REMEMBER => memory::tools::remember(nanty, cfg, lang, secrets, &call.arguments, session),
+        RECALL => memory::tools::recall(nanty, cfg, lang, &call.arguments, session),
+        FORGET => memory::tools::forget(nanty, cfg, lang, &call.arguments, session),
+        // Spec 140 T13 (C-25): só muda o esforço das próximas rodadas desta mensagem.
+        DEEP_THINK => super::think::call(nanty, cfg, lang, session),
+        // Spec 140 T15 (C-15): só o cartão; o clique deixa o rascunho, e a pessoa envia.
+        PROPOSE_TO_ARCHITECT => super::draft::propose(nanty, cfg, lang, secrets, &call.arguments, session),
+        // Spec 140 T10: a leitura profunda, só de leitura.
+        name if deep::TOOLS.contains(&name) => deep_read(state, cfg, lang, secrets, call, session).await,
+        other => unknown_tool(lang, other),
     };
-    secrets.scrub_exact(&out)
+    // Spec 140 T04 (C-09): toda leitura sai pelo redator único, inclusive as de leitura profunda.
+    redact::scrub(secrets, &out)
+}
+
+/// Uma leitura profunda ([`deep`], spec 140 T10): o projeto observado, os parâmetros conferidos e o
+/// isolamento entre projetos (C-16) antes de tocar no disco. Toda leitura admitida contamina o turno
+/// com o tipo e o projeto (revê a C-13 da 138), e o teto de leitura vale para o turno todo.
+async fn deep_read(state: &AppState, cfg: &Config, lang: Lang, secrets: &SecretSet, call: &ToolCall, session: &mut Session) -> String {
+    let project = match project_arg(cfg, lang, &call.arguments) {
+        Ok(project) => project,
+        Err(text) => return text,
+    };
+    let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+    let Some(request) = deep::Request::parse(&call.name, &args) else {
+        return crate::i18n::tr(lang, "nanty.tool.deep_args", &[]);
+    };
+    if !session.admit(&project.id) {
+        return crate::i18n::tr(lang, "nanty.tool.other_project", &[]);
+    }
+    note_read(session, &project.id);
+    session.tainted.read(request.taint(), Some(&project.id));
+    let mut budget = session.read_budget.unwrap_or_else(|| files::Budget::new(&cfg.nanty.read));
+    let out = deep::read(state, cfg, lang, secrets, project, request, &mut budget).await;
+    session.read_budget = Some(budget);
+    out
+}
+
+/// A recusa de uma ferramenta que não existe ou que o modo não oferece: a mesma frase, porque para o
+/// modelo as duas coisas são iguais.
+fn unknown_tool(lang: Lang, name: &str) -> String {
+    crate::i18n::tr(lang, "nanty.tool.unknown_tool", &[("name", shown(name))])
 }
 
 /// O projeto do argumento `project_id`, só entre os observados. `Err` com a frase para o modelo.
@@ -223,10 +351,22 @@ fn shown(raw: &str) -> &str {
 /// `propose_action(action_id, project_id)` (T04): só o que [`act::requestable`] oferece agora para
 /// aquele projeto observado (ou, sem projeto, para a máquina). O servidor cria o cartão; nada executa
 /// sem o clique, nem a ação automática.
-async fn propose_action(state: &AppState, nanty: &Nanty, cfg: &Config, lang: Lang, arguments: &str, session: &mut Session) -> String {
+async fn propose_action(
+    state: &AppState,
+    nanty: &Nanty,
+    cfg: &Config,
+    lang: Lang,
+    secrets: &SecretSet,
+    arguments: &str,
+    session: &mut Session,
+) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let raw = args.get("action_id").and_then(Value::as_str).map(str::trim).unwrap_or_default();
     let tr = |code: &str, params: &[(&str, &str)]| crate::i18n::tr(lang, code, params);
+    // Spec 140 T03: abrir o Nants não é cartão. O pedido certo, pelo caminho errado, ainda vale.
+    if raw == OPEN_NANTS {
+        return open_nants(state, cfg, lang, secrets, arguments, session);
+    }
     // Só as ações que o Nanty executa: opções do cartão, links, silêncio e a faixa "só a pessoa"
     // nunca vêm por aqui.
     let Some(action) = actions::parse(raw).filter(|a| a.entry().kind == ActionKind::Executes) else {
@@ -271,6 +411,26 @@ async fn propose_action(state: &AppState, nanty: &Nanty, cfg: &Config, lang: Lan
     }
 }
 
+/// `open_nants(project_id?)` (spec 140 T03, C-30): guarda o caminho na sessão, e o servidor o acrescenta
+/// à resposta. O resultado diz ao modelo o que a pessoa vai receber, sem o endereço.
+fn open_nants(state: &AppState, cfg: &Config, lang: Lang, secrets: &SecretSet, arguments: &str, session: &mut Session) -> String {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let project = match args.get("project_id").and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => match chat::observed(cfg).into_iter().find(|p| p.id == id) {
+            Some(p) => Some(p),
+            None => return crate::i18n::tr(lang, "nanty.tool.unknown_project", &[("id", shown(id))]),
+        },
+        None => None,
+    };
+    if let Some(p) = project {
+        note_read(session, &p.id);
+    }
+    let open = link::resolve(state, cfg, secrets, session.channel, project);
+    let text = crate::i18n::tr(lang, open.tool_code(), &[]);
+    session.open = Some(open);
+    text
+}
+
 /// `set_silence(hours | until)` (T04, C-08; `until`, spec 139 T12: a próxima ocorrência de uma hora
 /// `HH:MM`, que vale sobre `hours`): de 1 a [`chat::SILENCE_MAX_HOURS`] horas liga o silêncio de
 /// tudo direto, com a confirmação do servidor e o botão para desligar; zero desliga. Num turno
@@ -297,7 +457,7 @@ fn set_silence(nanty: &Nanty, cfg: &Config, lang: Lang, arguments: &str, session
         session.silence = Some(SilenceEffect::Ended);
         return crate::i18n::tr(lang, "nanty.tool.silence_off", &[]);
     }
-    let (until, card, code) = if session.tainted {
+    let (until, card, code) = if session.is_tainted() {
         let (until, card) = silence::propose(nanty, cfg, request, session.channel);
         session.silence = Some(SilenceEffect::Proposed(until));
         (until, card, "nanty.tool.silence_card")

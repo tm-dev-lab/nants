@@ -99,7 +99,7 @@ fn read_bytes(root: &Path, spec_id: &str) -> Option<Vec<u8>> {
 
 /// Linhas válidas, numeradas pela posição no arquivo (a contagem inclui as inválidas, para o
 /// `seq` ser estável entre leituras de um arquivo que só cresce).
-fn parse_items(bytes: &[u8]) -> Vec<TrailItem> {
+pub(crate) fn parse_items(bytes: &[u8]) -> Vec<TrailItem> {
     let text = String::from_utf8_lossy(bytes);
     text.lines()
         .zip(1u64..)

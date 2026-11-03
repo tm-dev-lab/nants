@@ -4,7 +4,8 @@
 //! agentes inteiro e apagaria o Nanty se ele morasse lá.
 //!
 //! **Valores iniciais provisórios** (decisão do Arquiteto na spec 138; ajustáveis aqui ou nos
-//! Ajustes da janela): orçamento diário de US$ 0,50, silêncio das 22:00 às 07:00, resumo às 08:00,
+//! Ajustes da janela): orçamento diário de US$ 1,00 ou 600 mil tokens (medidos na spec 140 T16; ver
+//! [`DEFAULT_DAILY_BUDGET_USD`]), silêncio das 22:00 às 07:00, resumo às 08:00,
 //! voz desligada, Telegram sem bot e nenhum projeto excluído (projeto novo já nasce observado).
 //!
 //! **Compatibilidade:** a seção só é gravada fora do padrão (`skip_serializing_if`). Uma versão
@@ -19,8 +20,18 @@ use serde::{Deserialize, Serialize};
 
 use super::schema::Effort;
 
-/// Orçamento diário inicial do modelo do Nanty, em US$ (provisório).
-pub const DEFAULT_DAILY_BUDGET_USD: f64 = 0.5;
+/// Orçamento diário inicial do modelo e da voz do Nanty, em US$ (spec 140 T17, C-19).
+///
+/// **Pela medição da T16** (Gemini 3.8 Flash, preços de 2026): uma mensagem custa em média US$ 0,005
+/// (7.828 tokens), a fala dela cerca de US$ 0,0013, e um cenário automático US$ 0,0045. Com US$ 1,00,
+/// um dia com os 5 cenários do teto diário deixa cerca de 150 mensagens com voz em 2026. **Os preços
+/// do Gemini dobram em 2027-01-01** (ver [`crate::server::price_catalog`]): o mesmo valor dá então
+/// cerca de 73 mensagens, perto das cerca de 68 do modo tokens ([`DEFAULT_DAILY_BUDGET_TOKENS`]). O
+/// valor foi escolhido pelo preço de 2027, para os dois modos durarem um dia parecido.
+///
+/// Só é gravado na configuração quando a pessoa muda: quem nunca mudou passa a ter o padrão novo, e
+/// quem gravou um valor próprio continua com ele.
+pub const DEFAULT_DAILY_BUDGET_USD: f64 = 1.0;
 /// Início do silêncio inicial (provisório).
 pub const DEFAULT_QUIET_START: &str = "22:00";
 /// Fim do silêncio inicial (provisório).
@@ -28,8 +39,15 @@ pub const DEFAULT_QUIET_END: &str = "07:00";
 /// Hora inicial do resumo da manhã (provisório).
 pub const DEFAULT_DIGEST_TIME: &str = "08:00";
 /// Orçamento diário em tokens quando o modelo do Nanty não tem preço (ou vai pelo plano), somando
-/// entrada e saída (provisório, spec 138 T05).
-pub const DEFAULT_DAILY_BUDGET_TOKENS: u64 = 200_000;
+/// entrada e saída, com a leitura de cache contada inteira (spec 140 T17, C-19).
+///
+/// **Pela medição da T16:** a mensagem usa em média 7.828 tokens (no máximo 21 mil), a fala cerca de
+/// 400 e o resumo, a cada 20 mensagens, cerca de 200 por mensagem: cerca de 8.400 por mensagem. Tirados
+/// os 5 cenários do teto diário (cerca de 4.700 cada), 600 mil dão cerca de 68 mensagens por dia, e 27
+/// no pior caso medido. Os 200 mil de antes davam cerca de 25. A fatia de 30% da análise (180 mil) cobre
+/// 7 cenários no teto de 25 mil tokens de cada um, então quem limita é o teto de 5 por dia. Um
+/// `deep_think` (no máximo um por mensagem) custa mais ou menos outra mensagem.
+pub const DEFAULT_DAILY_BUDGET_TOKENS: u64 = 600_000;
 
 /// Configuração do Nanty (`[nanty]`). Tudo opcional no TOML.
 ///
@@ -84,6 +102,11 @@ pub struct NantyConfig {
     pub voice: NantyVoice,
     #[serde(skip_serializing_if = "NantyTelegram::is_default")]
     pub telegram: NantyTelegram,
+    /// Endereço do Nants que o celular alcança (spec 140 T03, C-30), opcional, como
+    /// `http://192.168.0.10:3000`: vale sobre o último `Host` aceito vindo de um aparelho. Só o
+    /// esquema, o nome ou IP e a porta (`nanty::link::parse_address`); nunca um token.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub address: String,
     /// Urgência por tipo de aviso (spec 138 T02): só o que a pessoa mudou; o resto vem da tabela
     /// fixa do código. O modelo nunca decide a urgência.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -94,6 +117,18 @@ pub struct NantyConfig {
     /// Limites do laço da conversa (spec 139 T03, provisórios).
     #[serde(skip_serializing_if = "NantyChat::is_default")]
     pub chat: NantyChat,
+    /// Guarda da conversa e dos áudios em disco (spec 140 T05, provisórios).
+    #[serde(skip_serializing_if = "NantyStorage::is_default")]
+    pub storage: NantyStorage,
+    /// Tetos da memória de longo prazo (spec 140 T07, C-22; provisórios).
+    #[serde(skip_serializing_if = "NantyMemory::is_default")]
+    pub memory: NantyMemory,
+    /// Tetos do leitor de arquivos e do Git do Nanty (spec 140 T09, C-08 e C-10; provisórios).
+    #[serde(skip_serializing_if = "NantyRead::is_default")]
+    pub read: NantyRead,
+    /// Tetos da análise, no lugar dela (spec 140 T11, C-13; provisórios).
+    #[serde(skip_serializing_if = "NantyAnalysis::is_default")]
+    pub analysis: NantyAnalysis,
 }
 
 impl Default for NantyConfig {
@@ -115,9 +150,14 @@ impl Default for NantyConfig {
             reserve: BTreeMap::new(),
             voice: NantyVoice::default(),
             telegram: NantyTelegram::default(),
+            address: String::new(),
             urgency: BTreeMap::new(),
             filter: NantyFilter::default(),
             chat: NantyChat::default(),
+            storage: NantyStorage::default(),
+            memory: NantyMemory::default(),
+            read: NantyRead::default(),
+            analysis: NantyAnalysis::default(),
         }
     }
 }
@@ -170,6 +210,10 @@ impl std::fmt::Debug for NantyConfig {
             .field("urgency", &self.urgency)
             .field("filter", &self.filter)
             .field("chat", &self.chat)
+            .field("storage", &self.storage)
+            .field("memory", &self.memory)
+            .field("read", &self.read)
+            .field("analysis", &self.analysis)
             .finish()
     }
 }
@@ -408,13 +452,26 @@ pub const DEFAULT_CHAT_MAX_CALLS: u32 = 4;
 /// Tokens (entrada mais saída) de todas as rodadas de uma mensagem; passou disso, a rodada seguinte
 /// é a última, sem ferramentas (provisório).
 pub const DEFAULT_CHAT_MAX_TOKENS: u64 = 60_000;
-/// Mensagens da conversa levadas como memória (provisório).
-pub const DEFAULT_CHAT_MEMORY_MESSAGES: u32 = 12;
-/// Janela da memória, em minutos: mensagem mais velha que isto fica de fora (provisório).
-pub const DEFAULT_CHAT_MEMORY_WINDOW_MINS: u64 = 180;
+/// Teto da janela do histórico da conversa, em mensagens (spec 140 T06, C-17; provisório): ao chegar
+/// a ele, as mais antigas viram resumo de uma vez. Sem limite de tempo.
+pub const DEFAULT_CHAT_WINDOW_MESSAGES: u32 = 60;
+/// Mensagens que viram resumo de cada vez (provisório): a janela anda em degraus, entre
+/// `window_messages - window_step_messages` (40) e `window_messages` (60).
+pub const DEFAULT_CHAT_WINDOW_STEP: u32 = 20;
+/// Teto do histórico em tokens, pela estimativa do projeto (provisório): vale sobre o número de
+/// mensagens.
+pub const DEFAULT_CHAT_HISTORY_TOKENS: u64 = 12_000;
 /// Leituras de `project_details` (dado não confiável) atendidas numa mensagem; as outras recebem o
 /// aviso do limite (spec 139 T04, C-07; provisório).
 pub const DEFAULT_CHAT_MAX_DETAILS: u32 = 2;
+/// Últimas mensagens com o texto contaminado inteiro (spec 140 T04, C-02; provisório); nas mais
+/// antigas, o texto vira a linha do servidor.
+pub const DEFAULT_CHAT_QUARANTINE_MESSAGES: u32 = 6;
+/// Teto do texto que o Nanty leva ao Arquiteto como rascunho, em caracteres (spec 140 T15, C-15;
+/// provisório): o cartão mostra o texto inteiro, e o que passa disso é recusa, nunca corte.
+pub const DEFAULT_CHAT_ARCHITECT_DRAFT_CHARS: u32 = 3000;
+/// O maior teto aceito: o de uma mensagem do Arquiteto (`server::chat::MAX_CHAT_MESSAGE_CHARS`).
+const MAX_ARCHITECT_DRAFT_CHARS: u32 = 8000;
 
 /// Limites do laço de agente da conversa (spec 139 T03, C-02, C-06 e C-10). Valores provisórios;
 /// cada campo só é gravado quando difere do padrão, e os acessores põem o valor numa faixa segura.
@@ -429,12 +486,18 @@ pub struct NantyChat {
     pub max_calls_per_reply: u32,
     #[serde(skip_serializing_if = "is_default_chat_tokens")]
     pub max_tokens_per_message: u64,
-    #[serde(skip_serializing_if = "is_default_chat_memory")]
-    pub memory_messages: u32,
     #[serde(skip_serializing_if = "is_default_chat_window")]
-    pub memory_window_mins: u64,
+    pub window_messages: u32,
+    #[serde(skip_serializing_if = "is_default_chat_step")]
+    pub window_step_messages: u32,
+    #[serde(skip_serializing_if = "is_default_chat_history_tokens")]
+    pub history_max_tokens: u64,
     #[serde(skip_serializing_if = "is_default_chat_details")]
     pub max_details_per_turn: u32,
+    #[serde(skip_serializing_if = "is_default_chat_quarantine")]
+    pub quarantine_messages: u32,
+    #[serde(skip_serializing_if = "is_default_chat_architect_draft")]
+    pub architect_draft_chars: u32,
 }
 
 impl Default for NantyChat {
@@ -444,9 +507,12 @@ impl Default for NantyChat {
             deadline_secs: DEFAULT_CHAT_DEADLINE_SECS,
             max_calls_per_reply: DEFAULT_CHAT_MAX_CALLS,
             max_tokens_per_message: DEFAULT_CHAT_MAX_TOKENS,
-            memory_messages: DEFAULT_CHAT_MEMORY_MESSAGES,
-            memory_window_mins: DEFAULT_CHAT_MEMORY_WINDOW_MINS,
+            window_messages: DEFAULT_CHAT_WINDOW_MESSAGES,
+            window_step_messages: DEFAULT_CHAT_WINDOW_STEP,
+            history_max_tokens: DEFAULT_CHAT_HISTORY_TOKENS,
             max_details_per_turn: DEFAULT_CHAT_MAX_DETAILS,
+            quarantine_messages: DEFAULT_CHAT_QUARANTINE_MESSAGES,
+            architect_draft_chars: DEFAULT_CHAT_ARCHITECT_DRAFT_CHARS,
         }
     }
 }
@@ -467,16 +533,28 @@ fn is_default_chat_tokens(v: &u64) -> bool {
     *v == DEFAULT_CHAT_MAX_TOKENS
 }
 
-fn is_default_chat_memory(v: &u32) -> bool {
-    *v == DEFAULT_CHAT_MEMORY_MESSAGES
+fn is_default_chat_window(v: &u32) -> bool {
+    *v == DEFAULT_CHAT_WINDOW_MESSAGES
 }
 
-fn is_default_chat_window(v: &u64) -> bool {
-    *v == DEFAULT_CHAT_MEMORY_WINDOW_MINS
+fn is_default_chat_step(v: &u32) -> bool {
+    *v == DEFAULT_CHAT_WINDOW_STEP
+}
+
+fn is_default_chat_history_tokens(v: &u64) -> bool {
+    *v == DEFAULT_CHAT_HISTORY_TOKENS
 }
 
 fn is_default_chat_details(v: &u32) -> bool {
     *v == DEFAULT_CHAT_MAX_DETAILS
+}
+
+fn is_default_chat_quarantine(v: &u32) -> bool {
+    *v == DEFAULT_CHAT_QUARANTINE_MESSAGES
+}
+
+fn is_default_chat_architect_draft(v: &u32) -> bool {
+    *v == DEFAULT_CHAT_ARCHITECT_DRAFT_CHARS
 }
 
 impl NantyChat {
@@ -504,19 +582,525 @@ impl NantyChat {
         self.max_tokens_per_message.max(1_000)
     }
 
-    /// Mensagens da memória, até 50.
-    pub fn memory(&self) -> usize {
-        self.memory_messages.min(50) as usize
+    /// Teto da janela do histórico, de 2 a 200 mensagens.
+    pub fn window(&self) -> usize {
+        self.window_messages.clamp(2, 200) as usize
     }
 
-    /// Janela da memória, em ms.
-    pub fn memory_window_ms(&self) -> u64 {
-        self.memory_window_mins.saturating_mul(60_000)
+    /// Mensagens resumidas de cada vez, de 1 até uma a menos que a janela.
+    pub fn window_step(&self) -> usize {
+        (self.window_step_messages as usize).clamp(1, self.window() - 1)
+    }
+
+    /// Teto do histórico em tokens, no mínimo 1.000.
+    pub fn history_tokens(&self) -> u64 {
+        self.history_max_tokens.max(1_000)
     }
 
     /// Leituras de `project_details` por mensagem, de 0 a 8 (0: nenhuma).
     pub fn details(&self) -> usize {
         self.max_details_per_turn.min(8) as usize
+    }
+
+    /// Últimas mensagens com o texto contaminado inteiro, até 50 (0: nenhuma).
+    pub fn quarantine(&self) -> usize {
+        self.quarantine_messages.min(50) as usize
+    }
+
+    /// Teto do rascunho levado ao Arquiteto (spec 140 T15), de 200 até o de uma mensagem dele.
+    pub fn architect_draft_chars(&self) -> usize {
+        self.architect_draft_chars.clamp(200, MAX_ARCHITECT_DRAFT_CHARS) as usize
+    }
+}
+
+/// Tamanho do arquivo atual da conversa antes de girar (spec 140 T05, C-20; provisório): 1 MiB.
+pub const DEFAULT_CONVERSATION_MAX_BYTES: u64 = 1024 * 1024;
+/// Gerações antigas da conversa guardadas além do arquivo atual (provisório).
+pub const DEFAULT_CONVERSATION_GENERATIONS: u32 = 2;
+/// Teto de todas as gerações da conversa juntas (provisório): 4 MiB.
+pub const DEFAULT_CONVERSATION_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+/// Teto da pasta dos áudios (provisório): 32 MiB. Os mais velhos saem antes.
+pub const DEFAULT_AUDIO_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Idade máxima de um áudio guardado, em dias (provisório).
+pub const DEFAULT_AUDIO_MAX_AGE_DAYS: u64 = 14;
+
+/// Guarda da conversa e dos áudios do Nanty em disco (spec 140 T05, C-20). Valores provisórios; cada
+/// campo só é gravado quando difere do padrão, e os acessores põem o valor numa faixa segura.
+///
+/// - A conversa gira em `conversation_max_bytes` e guarda `conversation_generations` gerações
+///   antigas, com o teto `conversation_total_bytes` para todas juntas. A linha ainda não resumida
+///   nunca sai na rotação (ver `server::nanty::store::Conversation`).
+/// - Os áudios têm teto próprio, por bytes e por idade: a fala sai pela idade, pelo tamanho ou junto
+///   com a mensagem, nunca depois do texto dela.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NantyStorage {
+    #[serde(skip_serializing_if = "is_default_conversation_max")]
+    pub conversation_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_conversation_generations")]
+    pub conversation_generations: u32,
+    #[serde(skip_serializing_if = "is_default_conversation_total")]
+    pub conversation_total_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_audio_max")]
+    pub audio_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_audio_age")]
+    pub audio_max_age_days: u64,
+}
+
+impl Default for NantyStorage {
+    fn default() -> Self {
+        Self {
+            conversation_max_bytes: DEFAULT_CONVERSATION_MAX_BYTES,
+            conversation_generations: DEFAULT_CONVERSATION_GENERATIONS,
+            conversation_total_bytes: DEFAULT_CONVERSATION_TOTAL_BYTES,
+            audio_max_bytes: DEFAULT_AUDIO_MAX_BYTES,
+            audio_max_age_days: DEFAULT_AUDIO_MAX_AGE_DAYS,
+        }
+    }
+}
+
+fn is_default_conversation_max(v: &u64) -> bool {
+    *v == DEFAULT_CONVERSATION_MAX_BYTES
+}
+
+fn is_default_conversation_generations(v: &u32) -> bool {
+    *v == DEFAULT_CONVERSATION_GENERATIONS
+}
+
+fn is_default_conversation_total(v: &u64) -> bool {
+    *v == DEFAULT_CONVERSATION_TOTAL_BYTES
+}
+
+fn is_default_audio_max(v: &u64) -> bool {
+    *v == DEFAULT_AUDIO_MAX_BYTES
+}
+
+fn is_default_audio_age(v: &u64) -> bool {
+    *v == DEFAULT_AUDIO_MAX_AGE_DAYS
+}
+
+/// Menor arquivo da conversa aceito antes de girar (os testes usam tamanhos pequenos).
+const MIN_CONVERSATION_BYTES: u64 = 256;
+/// Maior arquivo da conversa aceito antes de girar: 8 MiB (spec 140 T17). Era 64 MiB, mas com as 32
+/// gerações que a rotação pode segurar ([`crate::server::nanty::jsonl::HARD_MAX_GENERATIONS`]), reler
+/// a conversa inteira passaria de 2 GiB. Com 8 MiB, o pior caso fica em cerca de 264 MiB, e o padrão
+/// de 1 MiB já guarda bem mais que a janela de 60 mensagens (cerca de 5 KB cada).
+pub const MAX_CONVERSATION_BYTES: u64 = 8 * 1024 * 1024;
+
+impl NantyStorage {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Tamanho do arquivo atual antes de girar, de 256 bytes a 8 MiB.
+    pub fn conversation_max(&self) -> u64 {
+        self.conversation_max_bytes.clamp(MIN_CONVERSATION_BYTES, MAX_CONVERSATION_BYTES)
+    }
+
+    /// Gerações antigas guardadas, de 1 a 16.
+    pub fn generations(&self) -> usize {
+        self.conversation_generations.clamp(1, 16) as usize
+    }
+
+    /// Teto de todas as gerações juntas, nunca abaixo de duas vezes o arquivo atual.
+    pub fn conversation_total(&self) -> u64 {
+        self.conversation_total_bytes.max(self.conversation_max().saturating_mul(2))
+    }
+
+    /// Teto da pasta dos áudios, em bytes. O áudio mais novo fica sempre, mesmo acima do teto.
+    pub fn audio_max(&self) -> u64 {
+        self.audio_max_bytes
+    }
+
+    /// Idade máxima de um áudio, em ms (no mínimo um dia).
+    pub fn audio_max_age_ms(&self) -> u64 {
+        self.audio_max_age_days.max(1).saturating_mul(86_400_000)
+    }
+}
+
+/// Teto do índice da memória enviado em toda conversa, em bytes (spec 140 T07, C-22; provisório).
+pub const DEFAULT_MEMORY_INDEX_BYTES: u64 = 2048;
+/// Parte do índice reservada à identidade, em bytes (provisório): é o único tema com o texto no
+/// índice, e o teto é menor que o resto.
+pub const DEFAULT_MEMORY_IDENTITY_BYTES: u64 = 512;
+/// Teto do texto de um fato, em caracteres (provisório).
+pub const DEFAULT_MEMORY_FACT_CHARS: u32 = 400;
+/// Teto do texto de um runbook, em caracteres (provisório).
+pub const DEFAULT_MEMORY_RUNBOOK_CHARS: u32 = 1500;
+/// Entradas ativas no máximo, somando os temas (provisório).
+pub const DEFAULT_MEMORY_MAX_ACTIVE: u32 = 150;
+/// Dias sem uso depois dos quais a entrada sai do índice e continua na aba (provisório).
+pub const DEFAULT_MEMORY_STALE_DAYS: u64 = 90;
+/// Dias em que a entrada apagada ainda pode voltar, antes de sair do arquivo (provisório).
+pub const DEFAULT_MEMORY_DELETED_KEEP_DAYS: u64 = 7;
+/// Horas em que o botão de apagar do rodapé "guardei isto" vale (provisório).
+pub const DEFAULT_MEMORY_FORGET_BUTTON_HOURS: u64 = 24;
+/// Horas em que o cartão de confirmação do turno contaminado vale (provisório).
+pub const DEFAULT_MEMORY_CONFIRM_HOURS: u64 = 24;
+
+/// Tetos da memória de longo prazo do Nanty (spec 140 T07, C-21 e C-22). Valores provisórios; cada
+/// campo só é gravado quando difere do padrão, e os acessores põem o valor numa faixa segura.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NantyMemory {
+    #[serde(skip_serializing_if = "is_default_memory_index")]
+    pub index_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_memory_identity")]
+    pub identity_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_memory_fact")]
+    pub fact_max_chars: u32,
+    #[serde(skip_serializing_if = "is_default_memory_runbook")]
+    pub runbook_max_chars: u32,
+    #[serde(skip_serializing_if = "is_default_memory_active")]
+    pub max_active: u32,
+    #[serde(skip_serializing_if = "is_default_memory_stale")]
+    pub stale_days: u64,
+    #[serde(skip_serializing_if = "is_default_memory_deleted")]
+    pub deleted_keep_days: u64,
+    #[serde(skip_serializing_if = "is_default_memory_forget_button")]
+    pub forget_button_hours: u64,
+    #[serde(skip_serializing_if = "is_default_memory_confirm")]
+    pub confirm_hours: u64,
+}
+
+impl Default for NantyMemory {
+    fn default() -> Self {
+        Self {
+            index_max_bytes: DEFAULT_MEMORY_INDEX_BYTES,
+            identity_max_bytes: DEFAULT_MEMORY_IDENTITY_BYTES,
+            fact_max_chars: DEFAULT_MEMORY_FACT_CHARS,
+            runbook_max_chars: DEFAULT_MEMORY_RUNBOOK_CHARS,
+            max_active: DEFAULT_MEMORY_MAX_ACTIVE,
+            stale_days: DEFAULT_MEMORY_STALE_DAYS,
+            deleted_keep_days: DEFAULT_MEMORY_DELETED_KEEP_DAYS,
+            forget_button_hours: DEFAULT_MEMORY_FORGET_BUTTON_HOURS,
+            confirm_hours: DEFAULT_MEMORY_CONFIRM_HOURS,
+        }
+    }
+}
+
+fn is_default_memory_index(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_INDEX_BYTES
+}
+
+fn is_default_memory_identity(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_IDENTITY_BYTES
+}
+
+fn is_default_memory_fact(v: &u32) -> bool {
+    *v == DEFAULT_MEMORY_FACT_CHARS
+}
+
+fn is_default_memory_runbook(v: &u32) -> bool {
+    *v == DEFAULT_MEMORY_RUNBOOK_CHARS
+}
+
+fn is_default_memory_active(v: &u32) -> bool {
+    *v == DEFAULT_MEMORY_MAX_ACTIVE
+}
+
+fn is_default_memory_stale(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_STALE_DAYS
+}
+
+fn is_default_memory_deleted(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_DELETED_KEEP_DAYS
+}
+
+fn is_default_memory_forget_button(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_FORGET_BUTTON_HOURS
+}
+
+fn is_default_memory_confirm(v: &u64) -> bool {
+    *v == DEFAULT_MEMORY_CONFIRM_HOURS
+}
+
+const DAY_MS: u64 = 86_400_000;
+const HOUR_MS: u64 = 3_600_000;
+
+impl NantyMemory {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Teto do índice, de 256 bytes a 16 KiB.
+    pub fn index_bytes(&self) -> usize {
+        self.index_max_bytes.clamp(256, 16 * 1024) as usize
+    }
+
+    /// Parte da identidade no índice, até o teto do índice.
+    pub fn identity_bytes(&self) -> usize {
+        (self.identity_max_bytes as usize).min(self.index_bytes())
+    }
+
+    /// Teto do fato, de 40 a 4.000 caracteres.
+    pub fn fact_chars(&self) -> usize {
+        self.fact_max_chars.clamp(40, 4_000) as usize
+    }
+
+    /// Teto do runbook, de 100 a 8.000 caracteres, nunca abaixo do fato.
+    pub fn runbook_chars(&self) -> usize {
+        (self.runbook_max_chars.clamp(100, 8_000) as usize).max(self.fact_chars())
+    }
+
+    /// Entradas ativas no máximo, de 1 a 1.000.
+    pub fn active(&self) -> usize {
+        self.max_active.clamp(1, 1_000) as usize
+    }
+
+    /// Sem uso por este tempo, a entrada sai do índice (no mínimo um dia).
+    pub fn stale_ms(&self) -> u64 {
+        self.stale_days.max(1).saturating_mul(DAY_MS)
+    }
+
+    /// Tempo em que a entrada apagada pode voltar (no mínimo um dia).
+    pub fn deleted_keep_ms(&self) -> u64 {
+        self.deleted_keep_days.max(1).saturating_mul(DAY_MS)
+    }
+
+    /// Validade do botão de apagar do rodapé, de 1 hora a 30 dias.
+    pub fn forget_button_ms(&self) -> u64 {
+        self.forget_button_hours.clamp(1, 720).saturating_mul(HOUR_MS)
+    }
+
+    /// Validade do cartão de confirmação, de 1 hora a 30 dias.
+    pub fn confirm_ms(&self) -> u64 {
+        self.confirm_hours.clamp(1, 720).saturating_mul(HOUR_MS)
+    }
+}
+
+/// Maior arquivo que o leitor do Nanty abre, em bytes (spec 140 T09, C-08; provisório): 256 KiB.
+pub const DEFAULT_READ_FILE_BYTES: u64 = 256 * 1024;
+/// Texto lido somado num turno, em bytes (provisório): 64 KiB.
+pub const DEFAULT_READ_TURN_BYTES: u64 = 64 * 1024;
+/// Entradas de uma listagem de pasta, no máximo (provisório).
+pub const DEFAULT_READ_LIST_ENTRIES: u32 = 200;
+/// Linhas de uma leitura por faixa, no máximo (provisório).
+pub const DEFAULT_READ_RANGE_LINES: u32 = 400;
+/// Commits de uma leitura do Git, no máximo (spec 140 T09, C-10; provisório).
+pub const DEFAULT_READ_GIT_COMMITS: u32 = 30;
+/// Prazo de uma leitura do Git, em segundos (provisório).
+pub const DEFAULT_READ_GIT_TIMEOUT_SECS: u64 = 10;
+
+/// Tetos do leitor de arquivos e do Git do Nanty (spec 140 T09, C-08 e C-10). Valores provisórios;
+/// cada campo só é gravado quando difere do padrão, e os acessores põem o valor numa faixa segura.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NantyRead {
+    #[serde(skip_serializing_if = "is_default_read_file")]
+    pub file_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_read_turn")]
+    pub turn_max_bytes: u64,
+    #[serde(skip_serializing_if = "is_default_read_list")]
+    pub list_max_entries: u32,
+    #[serde(skip_serializing_if = "is_default_read_range")]
+    pub range_max_lines: u32,
+    #[serde(skip_serializing_if = "is_default_read_git_commits")]
+    pub git_max_commits: u32,
+    #[serde(skip_serializing_if = "is_default_read_git_timeout")]
+    pub git_timeout_secs: u64,
+}
+
+impl Default for NantyRead {
+    fn default() -> Self {
+        Self {
+            file_max_bytes: DEFAULT_READ_FILE_BYTES,
+            turn_max_bytes: DEFAULT_READ_TURN_BYTES,
+            list_max_entries: DEFAULT_READ_LIST_ENTRIES,
+            range_max_lines: DEFAULT_READ_RANGE_LINES,
+            git_max_commits: DEFAULT_READ_GIT_COMMITS,
+            git_timeout_secs: DEFAULT_READ_GIT_TIMEOUT_SECS,
+        }
+    }
+}
+
+fn is_default_read_file(v: &u64) -> bool {
+    *v == DEFAULT_READ_FILE_BYTES
+}
+
+fn is_default_read_turn(v: &u64) -> bool {
+    *v == DEFAULT_READ_TURN_BYTES
+}
+
+fn is_default_read_list(v: &u32) -> bool {
+    *v == DEFAULT_READ_LIST_ENTRIES
+}
+
+fn is_default_read_range(v: &u32) -> bool {
+    *v == DEFAULT_READ_RANGE_LINES
+}
+
+fn is_default_read_git_commits(v: &u32) -> bool {
+    *v == DEFAULT_READ_GIT_COMMITS
+}
+
+fn is_default_read_git_timeout(v: &u64) -> bool {
+    *v == DEFAULT_READ_GIT_TIMEOUT_SECS
+}
+
+impl NantyRead {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Maior arquivo aberto, de 1 KiB a 8 MiB.
+    pub fn file_bytes(&self) -> u64 {
+        self.file_max_bytes.clamp(1024, 8 * 1024 * 1024)
+    }
+
+    /// Texto lido somado num turno, de 1 KiB a 1 MiB.
+    pub fn turn_bytes(&self) -> u64 {
+        self.turn_max_bytes.clamp(1024, 1024 * 1024)
+    }
+
+    /// Entradas de uma listagem, de 1 a 2.000.
+    pub fn list_entries(&self) -> usize {
+        self.list_max_entries.clamp(1, 2_000) as usize
+    }
+
+    /// Linhas de uma leitura por faixa, de 1 a 5.000.
+    pub fn range_lines(&self) -> usize {
+        self.range_max_lines.clamp(1, 5_000) as usize
+    }
+
+    /// Commits de uma leitura do Git, de 1 a 200.
+    pub fn git_commits(&self) -> usize {
+        self.git_max_commits.clamp(1, 200) as usize
+    }
+
+    /// Prazo de uma leitura do Git, de 1 s a 60 s.
+    pub fn git_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.git_timeout_secs.clamp(1, 60))
+    }
+}
+
+/// Prazo de uma análise, em segundos (spec 140 T11, C-13; provisório).
+pub const DEFAULT_ANALYSIS_DEADLINE_SECS: u64 = 90;
+/// Rodadas de uma análise, no máximo (provisório); a última vai sem ferramentas.
+pub const DEFAULT_ANALYSIS_MAX_ROUNDS: u32 = 4;
+/// Tokens de uma análise, entrada e saída somadas (provisório); passado o teto, a rodada seguinte é a
+/// última, sem ferramentas.
+pub const DEFAULT_ANALYSIS_MAX_TOKENS: u64 = 25_000;
+
+/// Cenários proativos por dia, no máximo (spec 140 T12, C-14; provisório).
+pub const DEFAULT_SCENARIOS_PER_DAY: u32 = 5;
+/// Cenários proativos por spec, no máximo (provisório).
+pub const DEFAULT_SCENARIOS_PER_SPEC: u32 = 2;
+/// Fatia do orçamento do dia que os cenários podem gastar, em porcentagem (C-19; provisório).
+pub const DEFAULT_SCENARIO_BUDGET_PCT: u32 = 30;
+/// Teto do texto de um cenário, em caracteres (C-11; provisório).
+pub const DEFAULT_SCENARIO_CHARS: u32 = 900;
+
+/// Tetos da análise (spec 140 T11, C-13). Ela gasta do mesmo orçamento diário do Nanty, com prazo,
+/// rodadas e tokens próprios. Valores provisórios; cada campo só é gravado quando difere do padrão, e
+/// os acessores põem o valor numa faixa segura.
+///
+/// O cenário proativo (spec 140 T12, C-12, C-14 e C-19) é o interruptor `proactive`, desligado por
+/// padrão (a pessoa liga nos Ajustes, onde lê para onde o texto vai), com os tetos por dia e por spec
+/// e a fatia do orçamento do dia.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NantyAnalysis {
+    #[serde(skip_serializing_if = "is_default_analysis_deadline")]
+    pub deadline_secs: u64,
+    #[serde(skip_serializing_if = "is_default_analysis_rounds")]
+    pub max_rounds: u32,
+    #[serde(skip_serializing_if = "is_default_analysis_tokens")]
+    pub max_tokens: u64,
+    /// O cenário proativo nos avisos importantes (spec 140 T12): desligado por padrão.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub proactive: bool,
+    #[serde(skip_serializing_if = "is_default_scenarios_per_day")]
+    pub scenarios_per_day: u32,
+    #[serde(skip_serializing_if = "is_default_scenarios_per_spec")]
+    pub scenarios_per_spec: u32,
+    #[serde(skip_serializing_if = "is_default_scenario_budget_pct")]
+    pub budget_pct: u32,
+    #[serde(skip_serializing_if = "is_default_scenario_chars")]
+    pub scenario_chars: u32,
+}
+
+impl Default for NantyAnalysis {
+    fn default() -> Self {
+        Self {
+            deadline_secs: DEFAULT_ANALYSIS_DEADLINE_SECS,
+            max_rounds: DEFAULT_ANALYSIS_MAX_ROUNDS,
+            max_tokens: DEFAULT_ANALYSIS_MAX_TOKENS,
+            proactive: false,
+            scenarios_per_day: DEFAULT_SCENARIOS_PER_DAY,
+            scenarios_per_spec: DEFAULT_SCENARIOS_PER_SPEC,
+            budget_pct: DEFAULT_SCENARIO_BUDGET_PCT,
+            scenario_chars: DEFAULT_SCENARIO_CHARS,
+        }
+    }
+}
+
+fn is_default_scenario_chars(v: &u32) -> bool {
+    *v == DEFAULT_SCENARIO_CHARS
+}
+
+fn is_default_scenarios_per_day(v: &u32) -> bool {
+    *v == DEFAULT_SCENARIOS_PER_DAY
+}
+
+fn is_default_scenarios_per_spec(v: &u32) -> bool {
+    *v == DEFAULT_SCENARIOS_PER_SPEC
+}
+
+fn is_default_scenario_budget_pct(v: &u32) -> bool {
+    *v == DEFAULT_SCENARIO_BUDGET_PCT
+}
+
+fn is_default_analysis_deadline(v: &u64) -> bool {
+    *v == DEFAULT_ANALYSIS_DEADLINE_SECS
+}
+
+fn is_default_analysis_rounds(v: &u32) -> bool {
+    *v == DEFAULT_ANALYSIS_MAX_ROUNDS
+}
+
+fn is_default_analysis_tokens(v: &u64) -> bool {
+    *v == DEFAULT_ANALYSIS_MAX_TOKENS
+}
+
+impl NantyAnalysis {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Prazo da análise inteira, de 1 s a 10 min.
+    pub fn deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.deadline_secs.clamp(1, 600))
+    }
+
+    /// Rodadas da análise, de 1 a 10.
+    pub fn rounds(&self) -> usize {
+        self.max_rounds.clamp(1, 10) as usize
+    }
+
+    /// Teto de tokens da análise, no mínimo 1.000.
+    pub fn tokens(&self) -> u64 {
+        self.max_tokens.max(1_000)
+    }
+
+    /// Cenários por dia, de 0 a 50.
+    pub fn per_day(&self) -> usize {
+        self.scenarios_per_day.min(50) as usize
+    }
+
+    /// Cenários por spec, de 0 a 20.
+    pub fn per_spec(&self) -> usize {
+        self.scenarios_per_spec.min(20) as usize
+    }
+
+    /// Teto do texto de um cenário, de 200 a 3.000 caracteres.
+    pub fn max_chars(&self) -> usize {
+        self.scenario_chars.clamp(200, 3000) as usize
+    }
+
+    /// A fatia do orçamento do dia que os cenários podem gastar, de 0 a 100 %.
+    pub fn budget_share(&self) -> f64 {
+        f64::from(self.budget_pct.min(100)) / 100.0
     }
 }
 
@@ -550,6 +1134,9 @@ pub const DEFAULT_GEMINI_VOICE: &str = "Kore";
 pub const DEFAULT_TRANSCRIBE_MODEL: &str = "gemini-3.8-flash";
 /// Nota de voz mais longa aceita para transcrição, em segundos (provisório).
 pub const DEFAULT_VOICE_MAX_INPUT_SECS: u64 = 300;
+/// Até quantos caracteres do primeiro parágrafo a resposta longa fala (spec 140 T14, C-27;
+/// provisório): a fala para no último fim de frase antes disso.
+pub const DEFAULT_VOICE_LEAD_CHARS: usize = 450;
 
 /// Um passo da ordem antiga da voz (até a rc.22): só lido, para a migração ([`NantyVoice::migrate`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,6 +1184,9 @@ pub struct NantyVoice {
     pub transcribe_model: String,
     #[serde(skip_serializing_if = "is_default_max_input")]
     pub max_input_secs: u64,
+    /// A fala da resposta longa (spec 140 T14): até quantos caracteres do primeiro parágrafo.
+    #[serde(skip_serializing_if = "is_default_lead_chars")]
+    pub lead_chars: usize,
     /// A ordem antiga (lida, nunca gravada).
     #[serde(skip_serializing)]
     pub order: Vec<VoiceRoute>,
@@ -617,6 +1207,7 @@ impl Default for NantyVoice {
             voice: DEFAULT_GEMINI_VOICE.to_string(),
             transcribe_model: DEFAULT_TRANSCRIBE_MODEL.to_string(),
             max_input_secs: DEFAULT_VOICE_MAX_INPUT_SECS,
+            lead_chars: DEFAULT_VOICE_LEAD_CHARS,
             order: Vec::new(),
             transcribe: NantyRoute::default(),
             migrated: None,
@@ -633,6 +1224,7 @@ impl PartialEq for NantyVoice {
             && self.voice == other.voice
             && self.transcribe_model == other.transcribe_model
             && self.max_input_secs == other.max_input_secs
+            && self.lead_chars == other.lead_chars
             && self.order == other.order
             && self.transcribe == other.transcribe
     }
@@ -652,6 +1244,10 @@ fn is_default_transcribe_model(v: &str) -> bool {
 
 fn is_default_max_input(v: &u64) -> bool {
     *v == DEFAULT_VOICE_MAX_INPUT_SECS
+}
+
+fn is_default_lead_chars(v: &usize) -> bool {
+    *v == DEFAULT_VOICE_LEAD_CHARS
 }
 
 /// O valor escolhido, ou o inicial quando vazio.
@@ -678,6 +1274,13 @@ impl NantyVoice {
     /// O modelo da transcrição (o inicial quando vazio).
     pub fn transcribe_model(&self) -> String {
         or_default(&self.transcribe_model, DEFAULT_TRANSCRIBE_MODEL)
+    }
+
+    /// A fala da resposta longa, em caracteres (spec 140 T14): entre 100 e 900, para o trecho caber na
+    /// legenda de 1024 com a linha de que o resto vem a seguir (revisão 1, F-02). Mesmo assim, o
+    /// `voice::long_lead` confere em unidades do Telegram.
+    pub fn lead_chars(&self) -> usize {
+        self.lead_chars.clamp(100, 900)
     }
 
     /// Migra a forma antiga (`order` e `transcribe`, até a rc.22) para a nova (C-16): o primeiro
@@ -839,6 +1442,23 @@ mod tests {
         assert_eq!(cfg.nanty.digest_minute(), 8 * 60);
         assert!((cfg.nanty.budget_usd() - DEFAULT_DAILY_BUDGET_USD).abs() < f64::EPSILON);
         assert!(cfg.nanty.observes("qualquer"), "projeto novo nasce observado");
+    }
+
+    /// Spec 140 T17 (C-19): o orçamento padrão sai da medição, e só é gravado quando a pessoa muda.
+    /// Quem nunca mudou passa ao padrão novo; quem gravou um valor próprio (mesmo o padrão antigo,
+    /// escrito à mão) continua com ele.
+    #[test]
+    fn the_measured_budget_reaches_who_never_changed_it_and_keeps_a_written_value() {
+        let fresh: Config = toml::from_str("[nanty]\nmodel = \"m\"\n").expect("toml");
+        assert!((fresh.nanty.budget_usd() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(fresh.nanty.daily_budget_tokens, 600_000);
+        let text = toml::to_string(&fresh).expect("toml");
+        assert!(!text.contains("daily_budget"), "o padrão não vai ao arquivo: {text}");
+        let own: Config = toml::from_str("[nanty]\ndaily_budget_usd = 0.5\ndaily_budget_tokens = 200000\n").expect("toml");
+        assert!((own.nanty.budget_usd() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(own.nanty.daily_budget_tokens, 200_000);
+        let text = toml::to_string(&own).expect("toml");
+        assert!(text.contains("daily_budget_usd = 0.5") && text.contains("daily_budget_tokens = 200000"), "{text}");
     }
 
     #[test]

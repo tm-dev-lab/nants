@@ -706,6 +706,12 @@ impl AppState {
         &self.config
     }
 
+    /// A mesma configuração, para quem precisa guardá-la (a condição de cancelamento do cenário
+    /// proativo, spec 140 T12, que a lê sem esperar).
+    pub fn config_shared(&self) -> Arc<RwLock<Config>> {
+        Arc::clone(&self.config)
+    }
+
     pub fn host_policy(&self) -> super::security::HostPolicy {
         self.host_policy
     }

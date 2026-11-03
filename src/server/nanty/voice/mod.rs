@@ -10,13 +10,22 @@
 //!     na conversa assim que fica pronto, e o áudio entra depois na mesma mensagem, fora da fila de
 //!     saída. Na janela, o tocador nunca toca sozinho. No Telegram, a nota espera a fala.
 //!   - O aviso com botões fala na fila de saída ([`super::telegram::outbox`]), depois da espera da
-//!     aba visível, e o áudio entra na conversa quando sai ([`keep_notice`]). O texto do modelo
-//!     sobre esse aviso não tem outro áudio.
+//!     aba visível, e o áudio entra na conversa quando sai ([`keep_notice`]). Quando o texto do turno
+//!     chega a tempo, o áudio fala esse texto, no tom do aviso (spec 140 T02). O texto do modelo que
+//!     não entrou na nota não tem outro áudio.
 //!   - O que é só controle fica em texto: a resposta ao clique, o cartão pedido na conversa (a fala
 //!     é a da resposta que o cita) e o aviso de teste do Telegram.
 //!   - A fala é a do texto que sai, já redigido, cortada em fim de frase ([`speech_text`]) e com
 //!     prazo ([`speak_on_time`]). A nota sai com a legenda curta (até 1024) e, se a legenda cortou,
 //!     o texto completo numa mensagem à parte.
+//!   - **Resposta longa (spec 140 T14, C-27):** a que não cabe na legenda fala só o começo do
+//!     primeiro parágrafo, até `[nanty.voice] lead_chars` (provisório: 450), sem chamada extra de
+//!     resumo ([`long_lead`]). A legenda leva esse trecho e avisa que o resto vem a seguir, e o resto
+//!     segue em texto, em partes, sem repetir o trecho. A janela mostra a resposta inteira, com o
+//!     tocador.
+//! - **Tom (spec 140 T01):** cada fala tem um [`Tone`] da lista fechada. O aviso usa o do tipo do
+//!   sinal; a resposta da conversa, o que o modelo marcou, sempre neutro em turno contaminado; o resto
+//!   é neutro. Um 400 com a anotação refaz uma vez sem ela ([`ask_provider`]).
 //! - **Ouvir ([`hear`]):** só a nota de voz do dono (a escuta já filtra estranhos e grupos, T06).
 //!   A duração e o tamanho são conferidos antes de baixar (até [`MAX_INPUT_BYTES`] e
 //!   `max_input_secs`), e de novo no `getFile` e no download. A transcrição sai com `store: false`
@@ -29,11 +38,15 @@
 //!   Sem orçamento, com o prazo vencido ou com a falha da fala, vai o texto: o aviso nunca se perde.
 //!   O registro guarda só códigos (o provedor, o motivo), nunca o texto nem o áudio.
 //! - **Os áudios ([`get_audio`]):** ficam em `<pasta do Nanty>/audio/<id>.ogg` (0600) e só são
-//!   servidos pelo id de uma mensagem que ainda está na conversa: quando a mensagem sai na rotação,
-//!   o áudio deixa de ser servido e o arquivo é apagado na próxima limpeza ([`prune`]).
+//!   servidos pelo id de uma mensagem que ainda está na conversa, conferido num índice em memória
+//!   que não relê a conversa a cada leitura (spec 140 T05). Quando a mensagem sai na rotação, o
+//!   áudio deixa de ser servido e o arquivo é apagado na próxima limpeza ([`prune`]). Os áudios têm
+//!   teto próprio, por idade e por bytes (`[nanty.storage]`): a fala sai pela idade ou pelo tamanho,
+//!   ou junto com a mensagem, e nunca depois do texto dela, que pode continuar na conversa sem ela.
 
 pub mod encode;
 pub mod provider;
+pub mod tone;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -51,13 +64,15 @@ use super::jsonl::{ensure_private_dir, read_private_bytes, write_atomic};
 use super::store::{AudioRef, Card, Channel, ConversationMessage};
 use super::telegram::client::{TelegramClient, VoiceNote};
 use super::telegram::format;
-use super::{nanty_lang, render, turn, Avatar, Nanty};
+use super::{nanty_lang, render, turn, Nanty};
 use crate::agents::llm_client::{Billing, Usage};
 use crate::config::{Config, Connection, ConnectionKind, VoiceMigration};
 use crate::i18n::Lang;
 use crate::server::error::ApiError;
 use crate::server::events::SecretSet;
 use crate::server::state::AppState;
+
+pub use tone::Tone;
 
 /// Pasta dos áudios dentro da pasta do Nanty.
 pub const AUDIO_DIR: &str = "audio";
@@ -171,10 +186,12 @@ fn estimate_tokens(text: &str) -> u64 {
     (text.len() / 4 + 1) as u64
 }
 
-/// Soma a chamada ao gasto do dia e devolve o custo (para o registro).
+/// Soma a chamada ao gasto do dia e devolve o custo (para o registro). A fala conta sempre (spec 140
+/// T17, C-19): sem preço do modelo da voz, no modo US$, pela estimativa do modelo principal
+/// ([`turn::route_cost`]).
 fn charge(cfg: &Config, nanty: &Nanty, model: &str, input: u64, output: u64) -> Option<f64> {
     let usage = Usage::new(u32::try_from(input).unwrap_or(u32::MAX), u32::try_from(output).unwrap_or(u32::MAX));
-    let usd = turn::turn_cost(cfg, model, &usage, Billing::Metered);
+    let usd = turn::route_cost(cfg, model, &usage, Billing::Metered);
     let day = nanty.now().day_key();
     nanty.update(|st| {
         st.add_voice_spend(&day, input, output, usd);
@@ -184,14 +201,6 @@ fn charge(cfg: &Config, nanty: &Nanty, model: &str, input: u64, output: u64) -> 
     usd
 }
 
-/// O avatar volta ao estado derivado em qualquer saída.
-struct Speaking<'a>(&'a Nanty);
-
-impl Drop for Speaking<'_> {
-    fn drop(&mut self) {
-        self.0.set_busy(None);
-    }
-}
 
 // ---- A fala ----
 
@@ -202,9 +211,27 @@ pub struct Spoken {
     pub duration_secs: u32,
 }
 
+/// Chama o Gemini no tom dado. Se ele recusar o pedido com a anotação (`bad_request`), refaz uma vez
+/// sem ela: a voz sem tom vale mais que o texto sem voz. A segunda chamada conta no orçamento: só sai
+/// com orçamento e, dando certo, entra no gasto como qualquer fala. O prazo de [`speak_on_time`]
+/// cobre as duas.
+async fn ask_provider(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone: Tone) -> Result<provider::Audio, &'static str> {
+    let ask = |tone| provider::gemini_speak(&step.connection, &step.model, &step.voice, text, tone);
+    match ask(tone).await {
+        Err("bad_request") if tone.style().is_some() => {
+            nanty.record(&journal(nanty, "voice.style_refused", param("tone", tone.code())));
+            if exhausted(cfg, nanty) {
+                return Err("budget");
+            }
+            ask(Tone::Neutral).await
+        }
+        answer => answer,
+    }
+}
+
 /// Chama o Gemini, soma o gasto e codifica o PCM em Opus.
-async fn speak_step(cfg: &Config, nanty: &Nanty, step: &Step, text: &str) -> Result<Spoken, &'static str> {
-    let audio = provider::gemini_speak(&step.connection, &step.model, &step.voice, text, None).await?;
+async fn speak_step(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone: Tone) -> Result<Spoken, &'static str> {
+    let audio = ask_provider(cfg, nanty, step, text, tone).await?;
     let bytes = audio.bytes.clone();
     let encoded = tokio::task::spawn_blocking(move || {
         let pcm = encode::pcm_of_gemini(&bytes)?;
@@ -228,7 +255,12 @@ async fn speak_step(cfg: &Config, nanty: &Nanty, step: &Step, text: &str) -> Res
 /// cabe (a pontuação seguida de espaço, ou uma quebra de linha) e, sem nenhum, na última palavra
 /// inteira. A fala nunca termina no meio de uma frase por causa do limite.
 pub fn speech_text(text: &str, max: usize) -> String {
-    let Some((limit, _)) = text.char_indices().nth(max) else { return text.trim().to_string() };
+    text[..speech_end(text, max)].trim().to_string()
+}
+
+/// O fim em bytes da fala de [`speech_text`], antes do `trim`.
+fn speech_end(text: &str, max: usize) -> usize {
+    let Some((limit, _)) = text.char_indices().nth(max) else { return text.len() };
     let ends = |i: usize, c: char| {
         let after = i + c.len_utf8();
         let closes = matches!(c, '.' | '!' | '?' | '…') && text[after..].chars().next().is_none_or(char::is_whitespace);
@@ -236,8 +268,51 @@ pub fn speech_text(text: &str, max: usize) -> String {
     };
     let head = &text[..limit];
     let sentence = head.char_indices().filter_map(|(i, c)| ends(i, c)).last().filter(|end| !text[..*end].trim().is_empty());
-    let cut = sentence.or_else(|| head.rfind(char::is_whitespace)).unwrap_or(limit);
-    text[..cut].trim().to_string()
+    sentence.or_else(|| head.rfind(char::is_whitespace)).unwrap_or(limit)
+}
+
+/// O fim em bytes do começo que a resposta longa fala (spec 140 T14, C-27): o primeiro parágrafo
+/// (até a primeira linha em branco), cortado em `max` caracteres no último fim de frase, como a
+/// [`speech_text`]. `text` já vem limpo e sem espaço no começo: `text[..fim]` é o trecho falado, e o
+/// que vem depois é o resto da resposta.
+pub fn lead_end(text: &str, max: usize) -> usize {
+    let paragraph = text.find("\n\n").map_or(text, |end| &text[..end]);
+    speech_end(paragraph, max)
+}
+
+/// A resposta longa fala só o começo (spec 140 T14, C-27): o texto do modelo abre a mensagem (o
+/// resumo da manhã e o cenário, que abrem pelo título do servidor, seguem a fala de sempre) e não
+/// cabe na legenda. Devolve o fim do trecho falado em `text`, o texto limpo da mensagem como vai ao
+/// Telegram; `None` = a fala de sempre. Sem chamada extra de resumo: o prompt pede que a resposta
+/// longa comece pelo essencial.
+///
+/// Revisão 1 (F-02): o trecho falado sempre cabe inteiro na legenda, com a linha de que o resto vem a
+/// seguir (nos dois idiomas): passou, ele recua para o último fim de frase que cabe. Assim nada do que
+/// o áudio fala fica sem aparecer escrito, entre a legenda e as partes.
+pub fn long_lead(message: &ConversationMessage, text: &str, max_chars: usize) -> Option<usize> {
+    if !render::opens_with_model(message) || format::units(text) <= format::MAX_CAPTION_CHARS {
+        return None;
+    }
+    let mut end = lead_end(text, max_chars);
+    let budget = lead_caption_budget();
+    if format::units(&text[..end]) > budget {
+        // Os caracteres que cabem no orçamento, contados como o Telegram conta.
+        let mut used = 0;
+        let fits = text[..end].chars().take_while(|c| {
+            used += c.len_utf16();
+            used <= budget
+        });
+        let chars = fits.count();
+        end = speech_end(&text[..end], chars);
+    }
+    (!text[..end].trim().is_empty()).then_some(end)
+}
+
+/// Quanto o trecho falado pode ocupar na legenda: o limite dela, menos a linha de que o resto vem a
+/// seguir, a maior dos dois idiomas, e a linha em branco entre os dois.
+pub fn lead_caption_budget() -> usize {
+    let line = [Lang::PtBr, Lang::En].into_iter().map(|l| format::units(&crate::i18n::tr(l, "nanty.telegram.rest_follows", &[]))).max().unwrap_or(0);
+    format::MAX_CAPTION_CHARS.saturating_sub(line + 2)
 }
 
 /// Como [`speech_text`], preservando o fecho do texto (a frase do servidor, spec 139 T12): o corte
@@ -252,23 +327,24 @@ pub fn speech_keeping(text: &str, tail: Option<&str>, max: usize) -> String {
     }
 }
 
-/// A fala do texto pelo Gemini. `Err` com os motivos (códigos) quando ele não falou: o texto segue
-/// sem áudio.
-pub async fn speak(state: &AppState, nanty: &Nanty, text: &str) -> Result<Spoken, Vec<&'static str>> {
+/// A fala do texto pelo Gemini, no tom dado. `Err` com os motivos (códigos) quando ele não falou: o
+/// texto segue sem áudio.
+pub async fn speak(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> Result<Spoken, Vec<&'static str>> {
     let cfg = state.config().read().await.clone();
     let text = speech_text(text, MAX_SPEECH_CHARS);
     let result = match speaker(&cfg) {
         Err(code) => Err(code),
         Ok(_) if exhausted(&cfg, nanty) => Err("budget"),
         Ok(step) => {
-            nanty.set_busy(Some(Avatar::Speaking));
-            let speaking = Speaking(nanty);
-            let result = speak_step(&cfg, nanty, &step, &text).await;
+            let speaking = nanty.speaking();
+            let result = speak_step(&cfg, nanty, &step, &text, tone).await;
             drop(speaking);
             match &result {
                 Ok(done) => {
                     let mut p = param("provider", PROVIDER);
                     p.insert("secs".into(), json!(done.duration_secs));
+                    // O tom pedido; a linha `voice.style_refused` diz quando ele caiu para o neutro.
+                    p.insert("tone".into(), json!(tone.code()));
                     nanty.record(&journal(nanty, "voice.ok", p));
                 }
                 Err(code) => {
@@ -291,10 +367,16 @@ pub async fn speak(state: &AppState, nanty: &Nanty, text: &str) -> Result<Spoken
 /// no registro e a saída vai em texto na hora. A chamada segue numa tarefa à parte, sem ser abortada:
 /// ela termina sozinha, com o gasto e o registro reais, e a fala tardia é descartada. Assim toda fala
 /// enviada ao provedor entra no orçamento.
-pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str) -> Result<Spoken, Vec<&'static str>> {
-    let deadline = nanty.telegram().tuning().speech_deadline;
+pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> Result<Spoken, Vec<&'static str>> {
+    speak_within(state, nanty, text, tone, Duration::MAX).await
+}
+
+/// Como [`speak_on_time`], com o prazo limitado também por `limit`: o que sobrou do limite total do
+/// aviso (spec 140 T02).
+pub async fn speak_within(state: &AppState, nanty: &Nanty, text: &str, tone: Tone, limit: Duration) -> Result<Spoken, Vec<&'static str>> {
+    let deadline = nanty.telegram().tuning().speech_deadline.min(limit);
     let (job_state, job_text) = (state.clone(), text.to_string());
-    let mut job = tokio::spawn(async move { speak(&job_state, job_state.nanty(), &job_text).await });
+    let mut job = tokio::spawn(async move { speak(&job_state, job_state.nanty(), &job_text, tone).await });
     let reason = match tokio::time::timeout(deadline, &mut job).await {
         Ok(Ok(result)) => return result,
         Ok(Err(_)) => "failed",
@@ -307,19 +389,19 @@ pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str) -> Resul
 
 /// Entrega a fala do Nanty (spec 139 T08): a resposta, o resumo e a recusa da nota de voz.
 /// 1. O texto entra na conversa na hora: a janela o mostra, e ele não se perde se a fala falhar.
-/// 2. Com a voz ligada, a fala é gerada (`recording` liga o "gravando áudio" para quem escreveu pelo
-///    Telegram) e o áudio entra na mesma mensagem, numa segunda linha com o mesmo id. Sem fala, nada
-///    muda, e o motivo fica no registro.
+/// 2. Com a voz ligada, a fala é gerada no `tone` (`recording` liga o "gravando áudio" para quem
+///    escreveu pelo Telegram) e o áudio entra na mesma mensagem, numa segunda linha com o mesmo id.
+///    Sem fala, nada muda, e o motivo fica no registro.
 /// 3. A mensagem vai à fila de saída uma vez só: como nota de voz, ou em texto.
 ///
 /// As mensagens falam uma de cada vez, na ordem em que entraram: uma fala curta não ultrapassa a
 /// anterior no Telegram.
-pub async fn deliver(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage, recording: bool) {
+pub async fn deliver(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage, tone: Tone, recording: bool) {
     keep(nanty, message).await;
     let enabled = state.config().read().await.nanty.voice.enabled;
     let record = (recording && enabled).then(|| nanty.telegram().outbox().recording());
     let turn = nanty.speech_turn.lock().await;
-    attach_speech(state, nanty, message).await;
+    attach_speech(state, nanty, message, tone).await;
     drop(record);
     if message.audio.is_some() {
         keep(nanty, message).await;
@@ -339,20 +421,24 @@ async fn keep(nanty: &Arc<Nanty>, message: &ConversationMessage) {
 
 /// Com a voz ligada, a mensagem ganha a fala: o texto dela (como vai ao Telegram, já redigido) vira
 /// áudio, que a janela toca e o Telegram recebe como nota de voz.
-async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage) {
+async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage, tone: Tone) {
     let cfg = state.config().read().await.clone();
     if !cfg.nanty.voice.enabled {
         return;
     }
     let lang = nanty_lang(&cfg.nanty, nanty);
     let secrets = SecretSet::from_config(&cfg);
-    let text = format::clean(&secrets, &render::message_text(lang, message));
+    let text = format::clean_whole(&secrets, &render::message_text(lang, message));
     if text.is_empty() {
         return;
     }
     let tail = render::closing(lang, message).map(|line| format::clean(&secrets, &line));
-    let text = speech_keeping(&text, tail.as_deref(), MAX_SPEECH_CHARS);
-    let Ok(spoken) = speak_on_time(state, nanty, &text).await else { return };
+    // Spec 140 T14 (C-27): a resposta longa fala só o começo do primeiro parágrafo.
+    let text = match long_lead(message, &text, cfg.nanty.voice.lead_chars()) {
+        Some(end) => text[..end].trim_end().to_string(),
+        None => speech_keeping(&text, tail.as_deref(), MAX_SPEECH_CHARS),
+    };
+    let Ok(spoken) = speak_on_time(state, nanty, &text, tone).await else { return };
     let n = Arc::clone(nanty);
     let audio = tokio::task::spawn_blocking(move || save_audio(&n, &spoken.ogg, spoken.duration_secs)).await.ok().flatten();
     if audio.is_none() {
@@ -366,14 +452,32 @@ fn unsaved(nanty: &Nanty) {
     nanty.record(&journal(nanty, "voice.text", param("reasons", json!(["save"]))));
 }
 
-/// O áudio de um aviso entra na conversa (spec 139 T08): a mensagem tem o texto fixo do cartão e o
-/// áudio, com a mesma rotação das outras, para a janela tocar. Ela só é gravada: o aviso já foi ao
-/// Telegram.
-pub fn keep_notice(nanty: &Nanty, card: &Card, lang: Lang, spoken: &Spoken) {
+/// De onde veio a fala de um aviso (spec 140 T02): do texto do modelo (`None`) ou da frase fixa, com
+/// o motivo, e quanto ele esperou. Só códigos e números: é o que calibra os prazos.
+pub fn record_notice(nanty: &Nanty, fixed_because: Option<&str>, waited: Duration) {
+    let mut p = param("source", if fixed_because.is_some() { "fixed" } else { "model" });
+    p.insert("waited_ms".into(), json!(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX)));
+    if let Some(reason) = fixed_because {
+        p.insert("reason".into(), json!(reason));
+    }
+    nanty.record(&journal(nanty, "voice.notice", p));
+}
+
+/// O áudio de um aviso entra na conversa (spec 139 T08), com a mesma rotação das outras mensagens,
+/// para a janela tocar. Ele só é gravado: o aviso já foi ao Telegram. Se o áudio falou o texto do
+/// modelo (`said`, spec 140 T02), ele entra na mensagem desse texto, numa segunda linha com o mesmo
+/// id: uma mensagem só. Se falou a frase fixa, entra numa mensagem com o texto fixo do cartão.
+pub fn keep_notice(nanty: &Nanty, card: &Card, lang: Lang, spoken: &Spoken, said: Option<&ConversationMessage>) {
     let Some(audio) = save_audio(nanty, &spoken.ogg, spoken.duration_secs) else {
         unsaved(nanty);
         return;
     };
+    if let Some(said) = said {
+        let mut message = said.clone();
+        message.audio = Some(audio);
+        nanty.keep_message(&message);
+        return;
+    }
     let mut message =
         ConversationMessage::from_nanty(super::new_id(), nanty.now().epoch_ms, Channel::Telegram, &card.code, card.params.clone());
     message.project_id = card.project_id.clone();
@@ -397,20 +501,32 @@ impl Nanty {
     }
 
     /// Toda a conversa guardada (as gerações que a rotação ainda guarda).
+    #[cfg(test)]
     fn conversation_all(&self) -> Vec<ConversationMessage> {
         self.store.as_ref().map(|s| s.conversation().tail(usize::MAX)).unwrap_or_default()
     }
 
-    /// O áudio de uma mensagem que ainda está na conversa.
+    /// O áudio de uma mensagem que ainda está na conversa. O índice dos áudios citados responde sem
+    /// reler a conversa (spec 140 T05, C-20).
     pub fn read_audio(&self, id: &str) -> Option<Vec<u8>> {
-        if !valid_audio_id(id) {
-            return None;
-        }
-        let referenced = self.conversation_all().iter().any(|m| m.audio.as_ref().is_some_and(|a| a.id == id));
-        if !referenced {
+        if !valid_audio_id(id) || !self.store.as_ref()?.conversation().cites_audio(id) {
             return None;
         }
         read_private_bytes(&self.audio_dir()?.join(format!("{id}.ogg")), MAX_AUDIO_BYTES)
+    }
+}
+
+/// Tira das mensagens o áudio cujo arquivo já saiu pelo teto dos áudios (spec 140 T05): a fala sai
+/// antes do texto, e a janela mostra só o texto.
+pub fn drop_missing_audio(nanty: &Nanty, messages: &mut [ConversationMessage]) {
+    let Some(dir) = nanty.audio_dir() else { return };
+    for m in messages.iter_mut() {
+        let gone = m.audio.as_ref().is_some_and(|a| {
+            !valid_audio_id(&a.id) || !std::fs::symlink_metadata(dir.join(format!("{}.ogg", a.id))).is_ok_and(|meta| meta.is_file())
+        });
+        if gone {
+            m.audio = None;
+        }
     }
 }
 
@@ -427,10 +543,24 @@ pub fn save_audio(nanty: &Nanty, ogg: &[u8], duration_secs: u32) -> Option<Audio
     Some(AudioRef { id, duration_secs, bytes: ogg.len() as u64 })
 }
 
-/// Apaga os áudios que nenhuma mensagem da conversa cita mais (a rotação levou a mensagem, ou o
-/// projeto saiu), passada a espera de [`PRUNE_GRACE`].
+/// A limpeza dos áudios (spec 139 T09; tetos da spec 140 T05, C-20):
+/// - o áudio que nenhuma mensagem da conversa cita mais (a rotação levou a mensagem, ou o projeto
+///   saiu) sai passada a espera de [`PRUNE_GRACE`];
+/// - o áudio mais velho que `[nanty.storage] audio_max_age_days` sai, mesmo citado;
+/// - acima de `audio_max_bytes`, saem os mais velhos, mesmo citados, até caber. O mais novo fica.
+///
+/// A fala sai pela idade, pelo tamanho ou junto com a mensagem, nunca depois do texto dela, que pode
+/// continuar na conversa sem ela ([`drop_missing_audio`]).
 pub fn prune(nanty: &Nanty) {
     prune_older(nanty, PRUNE_GRACE);
+}
+
+/// Um áudio na pasta.
+struct Stored {
+    path: PathBuf,
+    id: String,
+    bytes: u64,
+    age: Duration,
 }
 
 /// Como [`prune`], com a espera dada (os testes usam zero).
@@ -438,23 +568,41 @@ fn prune_older(nanty: &Nanty, grace: Duration) {
     if !nanty.owns() {
         return;
     }
+    let Some(store) = nanty.store.as_ref() else { return };
     let Some(dir) = nanty.audio_dir() else { return };
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
-    let referenced: Vec<String> = nanty.conversation_all().into_iter().filter_map(|m| m.audio.map(|a| a.id)).collect();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".ogg")) else { continue };
-        if !valid_audio_id(id) || referenced.iter().any(|r| r == id) {
-            continue;
+    let storage = store.storage();
+    let max_age = Duration::from_millis(storage.audio_max_age_ms());
+    let mut stored: Vec<Stored> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.file_name().to_str().and_then(|n| n.strip_suffix(".ogg")).filter(|id| valid_audio_id(id))?.to_string();
+            let meta = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            // Sem hora de mudança legível: conta como novo (não sai por idade).
+            let age = meta.modified().ok().and_then(|t| t.elapsed().ok()).unwrap_or(Duration::ZERO);
+            Some(Stored { path: entry.path(), id, bytes: meta.len(), age })
+        })
+        .collect();
+    let referenced = store.conversation().audio_ids();
+    stored.retain(|a| {
+        let unreferenced = !referenced.contains(&a.id) && a.age >= grace;
+        let expired = a.age > max_age;
+        if unreferenced || expired {
+            let _ = std::fs::remove_file(&a.path);
+            return false;
         }
-        let old = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= grace);
-        if old {
-            let _ = std::fs::remove_file(entry.path());
+        true
+    });
+    // Do mais velho ao mais novo; o mais novo nunca sai pelo teto.
+    stored.sort_by(|a, b| b.age.cmp(&a.age));
+    let mut total: u64 = stored.iter().map(|a| a.bytes).sum();
+    let keep_newest = stored.len().saturating_sub(1);
+    for a in stored.iter().take(keep_newest) {
+        if total <= storage.audio_max() {
+            break;
+        }
+        if std::fs::remove_file(&a.path).is_ok() {
+            total = total.saturating_sub(a.bytes);
         }
     }
 }
@@ -680,8 +828,7 @@ async fn listen(state: &AppState, nanty: &Nanty, cfg: &Config, note: &VoiceNote)
     }
     let path = file.file_path.ok_or("bad_response")?;
     let audio = client.download(&path, MAX_INPUT_BYTES).await.map_err(|e| e.code())?;
-    nanty.set_busy(Some(Avatar::Thinking));
-    let thinking = Speaking(nanty);
+    let thinking = nanty.thinking();
     let prompt = crate::agents::prompts::nanty_transcribe_prompt();
     let heard = provider::gemini_transcribe(&conn, &model, &prompt, &audio).await;
     drop(thinking);
@@ -739,7 +886,7 @@ pub async fn hear(state: &AppState, note: &VoiceNote, relayed: Option<crate::ser
             // A nota sem texto não diz o idioma: vale o resolvido para ela (T05).
             message.lang = person.lang.clone();
             // Spec 139 T08: a recusa também é fala do Nanty.
-            deliver(state, &nanty, &mut message, true).await;
+            deliver(state, &nanty, &mut message, Tone::Neutral, true).await;
         }
     }
 }

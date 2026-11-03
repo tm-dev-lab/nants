@@ -874,6 +874,8 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/projects/:id/specs/:spec_id/report", GetEffect::Read),
     ("/api/projects/:id/architecture", GetEffect::Read),
     ("/api/projects/:id/chat", GetEffect::Read),
+    // Spec 140 T15: só lê o rascunho do Nanty guardado no estado.
+    ("/api/projects/:id/chat/draft", GetEffect::Read),
     ("/api/projects/:id/chat/attachments/:name", GetEffect::Read),
     ("/api/projects/:id/kb", GetEffect::Read),
     ("/api/projects/:id/kb/docs/:doc", GetEffect::Read),
@@ -897,6 +899,8 @@ const GET_ROUTES: &[(&str, GetEffect)] = &[
     ("/api/nanty/conversation", GetEffect::Read),
     ("/api/nanty/status", GetEffect::Read),
     ("/api/nanty/usage", GetEffect::Read),
+    // Spec 140 T07: a memória de longo prazo, só leitura.
+    ("/api/nanty/memory", GetEffect::Read),
     // Spec 138 T09: só lê o áudio de uma mensagem da conversa, pelo id validado.
     ("/api/nanty/audio/:id", GetEffect::Read),
     // Spec 139 T07: lê a lista de vozes do Gemini e guarda o cache em memória; não muda nada.
@@ -1036,6 +1040,13 @@ const NANTY_WRITE_ROUTES: &[&str] = &[
     "/api/nanty/presence",
     // T08: a mensagem da janela ao Nanty (grava na conversa e chama o modelo).
     "/api/nanty/conversation",
+    // Spec 140 T07: apagar e devolver uma entrada da memória.
+    "/api/nanty/memory/0123456789abcdef/delete",
+    "/api/nanty/memory/0123456789abcdef/restore",
+    // T08: a exportação da aba (só lê, mas leva a memória inteira para fora).
+    "/api/nanty/memory/export",
+    // Spec 140 T15: descartar o rascunho que o Nanty deixou na caixa do Arquiteto.
+    "/api/projects/p1/chat/draft/discard",
 ];
 
 #[tokio::test]
@@ -1049,7 +1060,7 @@ async fn nanty_decision_routes_require_a_device() {
         assert_eq!(json_body(resp).await["code"], CODE_DEVICE_REQUIRED, "{uri}");
     }
     // T11: os Ajustes e o nível de uma ação (PUT).
-    for uri in ["/api/nanty/config", "/api/nanty/actions/approve_plan"] {
+    for uri in ["/api/nanty/config", "/api/nanty/actions/approve_plan", "/api/nanty/memory/0123456789abcdef"] {
         let resp = send(&state, req(Method::PUT, uri, NAT_PEER, None, Some(json!({"level": "auto"})))).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
         assert_eq!(json_body(resp).await["code"], CODE_DEVICE_REQUIRED, "{uri}");
@@ -1062,6 +1073,60 @@ async fn nanty_decision_routes_require_a_device() {
         assert!(body.contains(&format!("\"/api/nanty/telegram/{path}\", post(")), "{path}");
     }
     assert!(body.contains("\"/api/nanty/conversation\", get(nanty::api::get_conversation).post(nanty::api::post_conversation)"));
+    assert!(body.contains("\"/api/nanty/memory/:id\", put(nanty::memory::api::put_entry)"));
+    for path in ["delete", "restore"] {
+        assert!(body.contains(&format!("\"/api/nanty/memory/:id/{path}\", post(")), "{path}");
+    }
+    // A exportação é POST: um GET de outro site levaria o cookie `Lax` e dispararia o download.
+    assert!(body.contains("\"/api/nanty/memory/export\", post(nanty::memory::api::post_export)"));
+    assert!(!GET_ROUTES.iter().any(|(p, _)| p.contains("export")));
+    // Do próprio computador, a rota estática responde (não cai no `:id` da edição).
+    let resp = send(&state, req(Method::POST, "/api/nanty/memory/export", LOOPBACK_PEER, None, Some(json!({})))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["topics"].is_object());
+}
+
+/// Spec 140 T03 (C-30): o endereço guardado vem só do `Host` de um aparelho autorizado, depois da
+/// guarda de `Host`/`Origin`. Nada vira o link que vai ao Telegram sem passar pelos dois.
+#[tokio::test]
+async fn only_an_authorized_device_teaches_the_address() {
+    let dir = TempDir::new("device-host");
+    let clock = Clock::new();
+    let state = lan_state(&dir, &clock);
+    let store = state.devices();
+    let CodeState::Open { code, .. } = store.open_window().expect("janela") else { panic!("aberta") };
+    let (_, token) = store.pair(&code, "Celular".into()).expect("pareia");
+    let learned = || state.nanty().snapshot().device_host;
+    let with_host = |host: &str, cookie: Option<&str>, origin: Option<&str>| {
+        let mut r = req(Method::GET, "/api/devices", NAT_PEER, cookie, None);
+        r.headers_mut().insert(header::HOST, host.parse().expect("host"));
+        if let Some(origin) = origin {
+            r.headers_mut().insert(header::ORIGIN, origin.parse().expect("origin"));
+        }
+        r
+    };
+    // Sem dispositivo: recusado, e nada fica guardado.
+    let resp = send(&state, with_host("192.168.0.50:3000", None, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // Cabeçalho forjado por uma página: a guarda barra antes, mesmo com o cookie.
+    let resp = send(&state, with_host("evil.example:3000", Some(&token), None)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = send(&state, with_host("192.168.0.51:3000", Some(&token), Some("http://evil.example"))).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = send(&state, with_host("192.168.0.52:3001", Some(&token), None)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "outra porta");
+    assert_eq!(learned(), None);
+    // Loopback não é endereço de aparelho.
+    let resp = send(&state, with_host("127.0.0.1:3000", Some(&token), None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(learned(), None);
+    // O aparelho autorizado ensina o endereço, e o mais recente vale.
+    let resp = send(&state, with_host("192.168.0.68:3000", Some(&token), None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(learned().as_deref(), Some("192.168.0.68:3000"));
+    let resp = send(&state, with_host("192.168.0.69:3000", Some(&token), None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(learned().as_deref(), Some("192.168.0.69:3000"));
 }
 
 #[tokio::test]

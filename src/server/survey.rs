@@ -158,6 +158,7 @@ async fn publish(state: &AppState, project_id: &str, root: &Path, secrets: &Secr
         internal: false,
         attachments: Vec::new(),
         notice: None,
+        offline: false,
     };
     let owned = root.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || append_turns(&owned, &[turn])).await;

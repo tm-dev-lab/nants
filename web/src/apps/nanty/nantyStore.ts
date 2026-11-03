@@ -10,6 +10,7 @@
  * com um GET em voo marca "pendente" e repete no fim.
  */
 import { useEffect, useSyncExternalStore } from "react";
+import { bumpArchitectDraft } from "../conversation/architectDraft";
 import {
   getNantyConversation,
   getNantyFeed,
@@ -115,6 +116,7 @@ export function reloadNantyFeed(): void {
 
 /** `lagged`, reconexão e retomada da aba: relê tudo o que a aba já leu. */
 export function resyncNanty(): void {
+  bumpArchitectDraft();
   if (started) reloadNanty();
   if (conversationStarted) void load("conversation");
   if (usageStarted) void load("usage");
@@ -135,6 +137,9 @@ export function applyNantyEvent(part: string): void {
     if (conversationStarted) void load("conversation");
   } else if (part === "avatar" || part === "status") {
     if (started) void load("status");
+  } else if (part === "architect_draft") {
+    // Spec 140 T15: o rascunho que o Nanty deixou na caixa do Arquiteto.
+    bumpArchitectDraft();
   }
 }
 

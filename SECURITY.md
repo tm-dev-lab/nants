@@ -303,21 +303,53 @@ A connection that uses the ChatGPT plan (preview) signs in with OAuth 2.0 and ha
 ## Nanty and Telegram
 
 Nanty is the system agent that watches the projects and the machine, tells you on Telegram and acts
-only through a fixed catalog of actions. Its Telegram channel and its model turn are built to keep
-your projects on your computer and to keep a message or a document from steering it.
+only through a fixed catalog of actions. Its Telegram channel and its model turn are built so that
+project content leaves your computer only in the cases below, and so that a message or a document
+cannot steer it.
 
-- **Only summaries leave the computer.** What goes to Telegram is a short summary: the fixed text of
-  the observers (written in the Nants dictionaries, never by the model), counts and codes, or the
-  reply of the model. It never carries code, commands, log lines or secrets. Every message goes
-  through the redaction of the configured secrets (`SecretSet`: the API keys, the bot token and the
+- **What leaves the computer, and where it goes.** Nanty content goes to the provider of the Nanty
+  connection, to the Google Gemini connection of the voice when the voice is on, and to your
+  Telegram chat once it is paired.
+  - **The provider of the Nanty connection** gets every model turn: your message, the recent
+    conversation, its summary, the index of the memory notes, the full text of the notes a recall
+    brings back, and the structured facts of the notices. When Nanty reads a project (because you
+    asked, or in the automatic analysis), what it read goes there too, redacted. That provider may
+    not be the one the project roles use: a project you run on one provider can be read by a Nanty
+    on another.
+  - **The Google Gemini connection of the voice**, only with the voice on, gets the text to speak,
+    already redacted, and your voice notes to transcribe, with `store: false`. It may be another
+    provider than the one of the Nanty connection.
+  - **Telegram** gets the fixed text of the observers (written in the Nants dictionaries, never by
+    the model), counts and codes, the reply of the model and, with the voice on, the voice note of
+    that same text. The reply can tell, in its own words, what Nanty read from a project when you
+    asked; with the automatic analysis on (below), a summary of project content goes, without your
+    asking, to the provider and to your Telegram chat. Settings says so next to the switch, and warns
+    that the free tier of the Gemini API may use what you send to improve Google products (Nants
+    cannot tell the plan of a key).
+  - **What is stored stays here.** The files of the conversation, its summary, the memory notes and
+    the voice audio live only in the Nanty folder of the data folder, readable only by your user
+    (0600), with rotation and ceilings (`[nanty.storage]`, `[nanty.memory]`). Nants never uploads
+    those files; only what the items above list is sent.
+
+  On the way to Telegram, code blocks and backticks are removed and links are neutralized, and the
+  automatic analysis drops any text that copies a passage it read, has a path or has a command.
+  Every message goes through the redaction of the configured secrets (`SecretSet`: the API keys, the bot token and the
   credentials in URLs), before and after the text is cleaned, so a secret split by a backtick or an
   escape sequence does not come back whole. It goes as plain text, with no `parse_mode`, with link
   previews off, links in the model text neutralized and the Telegram size limits respected (4096
   characters per message, 1024 per voice note caption). Messages go through the Telegram servers.
+  A card whose exact text does not fit one message goes without its "yes" button and points to the
+  window, where the whole text shows; its "no" carries the same token, so a "yes" built by hand
+  with that token is refused on Telegram and the card waits for the window.
 - **Voice only through your Google Gemini connection.** Speech and transcription use that
   connection only, with `store: false` in every request, so the provider does not keep the voice
   note or the transcription. What is spoken is the same text that goes out, already redacted. When
-  the voice fails, the text goes instead. The key goes only in the request header, and the record
+  the voice fails, the text goes instead. The tone of the voice comes from a closed list of five
+  (neutral, upbeat, serious, concerned, calm): the server picks it for a notice by its kind, the
+  model picks one by name in the conversation, and only a short English style written in the Nants
+  code reaches the provider, never text from the model or a project. A tainted turn is always
+  neutral. A notice spoken with the model text keeps the reason line written by the server, and
+  waits for that text only a few seconds before falling back to the fixed sentence. The key goes only in the request header, and the record
   keeps only codes, never the text or the audio.
 - **No open port.** Nants reads Telegram by long polling (`getUpdates`), never by webhook, so nothing
   listens for the internet. Reading and sending use separate clients with no redirects, and the
@@ -362,29 +394,159 @@ did not confirm:
   someone else, now or in the conversation memory), the mute also becomes a card to confirm, which
   expires at the latest at the time it shows, so a clicked card never mutes past it. Project content has a limit
   of reads per message.
+- **Taint outlives the turn.** A hostile text read in one turn cannot act in the next one. Every
+  reply of Nanty stores where it came from, also across restarts, and a reply written with tainted
+  text in the context is tainted too. Lines stored by older versions count as tainted. The text of a
+  tainted message stays in the context only for the last few messages (6 by default). After that
+  it leaves together with every reply that inherited from it, a line written by the server takes its
+  place, with only the time, the project and the kind of read, and the turn is clean again. A new
+  read restarts the count: the reply that just read stays whole, and keeps the next turns tainted,
+  for the next few messages. A copy of older text may last that long after the last read, always
+  in a tainted turn, where nothing is saved or done without your tap. Your own
+  words stay whole; only text from third parties leaves. The ids that reach the model from a project
+  are limited to the SDD task form, so no sentence fits in them.
+- **The summary sees only clean text.** When old messages of the conversation become a summary, the
+  model that writes it gets your words and the clean replies only: a tainted reply and the text of a
+  third party arrive as the line written by the server. It runs with no tools, its text is redacted
+  before it is written and goes back to the conversation as data, after the system prompt, and each
+  item is linked to its projects, so removing or excluding a project also takes it away.
+- **Long term memory is data, never a rule.** Nanty's notes go to the model as data, after the
+  system prompt, labelled as notes, and each one records where it came from (your words, a clean
+  turn, your confirmation on a card, or an import). In a turn with untrusted text in the context,
+  now or in the recent messages, saving and deleting become a silent card with the exact text and
+  its source; only your tap saves it. The text is redacted before it is written, what the summary
+  of the conversation already says is refused, and the notes of a removed project go with it. The
+  actions, the filter and the mute do not depend on the memory code (a test checks it), so a note
+  that says "always approve" changes nothing. Each topic is a versioned file with a `.bak` copy: an
+  unreadable file is kept and refuses writes, a newer version is read only, and the memory folder is
+  never mounted in a container.
+- **The Memory tab.** You read, edit and delete the notes in the Nanty window, and the text of a note
+  is always shown as text, never as HTML. An edit only counts over the version you opened; if the note
+  changed in the meantime, the tab shows the saved version and you choose. A deleted note can be
+  restored for 7 days (`deleted_keep_days`). The copy you download comes from a POST that, like
+  every route, asks for an authorized device on the network; it has only the active notes, general
+  or of a project still registered, and goes through the redactor again, so a key added after the
+  note was saved does not leave either. Each edit, deletion, restore and export goes to the Nanty
+  journal with ids and codes, never the text; a restore that swaps out the newer note of the same
+  title also journals that note (`memory.swapped`).
+- **Tools per mode, checked when they run.** Each mode has its own list of tools, and the server
+  checks it before running any call, not only when it offers them. The names are public, so a model
+  that calls a tool it was not offered gets a refusal and nothing runs.
+- **Patterns are redacted too.** Besides the secrets Nants knows, what looks like a secret is replaced
+  in tool results, in the final reply, in the text of cards and in all that goes to Telegram: common
+  key prefixes (also glued to other text before them), JWT and `Bearer` values, `KEY=value` in sensitive names, URL credentials, PEM blocks
+  and high entropy strings. Commit hashes, UUIDs and ids stay readable. This is a safety net, not a
+  promise: a secret with no recognizable shape can still pass. In particular, a key written only in
+  hexadecimal, with no sensitive name next to it (`token=`, `secret:` and the like), is not caught,
+  because it looks like a commit hash; a configured secret is always caught, whatever its shape. On
+  the other side, a long identifier with many short words or several groups of digits may be masked
+  by mistake.
+- **Projects stay apart.** A reply that touched several projects is linked to all of them: it leaves
+  when any of them is removed, and it stops reaching the model when any of them is excluded. Once
+  the model has seen the content of one project in a message, the server refuses to open another
+  one until your next message: a second project can only be asked in the same request as the first,
+  before any content arrives, so a hostile text in one project cannot pull another into the turn.
 - **Forwarded messages and quotes.** A forwarded message, or a quote of a third party, goes to the
   model as untrusted data, in the same envelope as project content, and a forwarded message never
   counts as a command. The language of a forwarded text does not count as yours either.
-- **Structured signals when it acts on its own.** In a proactive turn, the model gets only
+- **Structured signals in the notice turn.** In the turn that writes a notice, the model gets only
   structured signals (codes, ids, counts, roles, cost and disk), from a fixed list of accepted keys,
-  never the text of a spec, a log, an agent output or a commit. Its answer must be a summary plus
-  catalog ids, checked by the server; anything else is dropped.
+  never the text of a spec, a log, an agent output or a commit. Its answer must be a summary, with
+  any catalog id checked by the server; anything else is dropped.
+- **Automatic analysis, only if you turn it on.** It is off by default (`[nanty.analysis]
+  proactive`). When it is on, after the card of an important notice went out (a blocked run, a review
+  loop or the end of a spec) and while it is still open, Nanty reads that project on its own and
+  sends a separate message with what happened, the likely cause (always as a hypothesis) and a
+  suggestion. The turn starts tainted by that project and is pinned to it: the server refuses any
+  other project id in any tool, and the model gets only the signal and that project, with no memory,
+  no conversation history and no list of other projects. It has only the read tools (state, the
+  reading of the project and the deep reads), never a tool that acts, mutes, remembers or opens
+  Nants; the end of a spec goes with no tools at all, only with the `report.md`, read by the safe
+  reader, redacted and sealed in the envelope. The output is plain text with no action field, up to
+  900 characters, redacted and cleaned, with no buttons and with a fixed line of the server saying it
+  is an automatic analysis; a text that repeats 8 words in a row of what was read, has a path or has
+  something shaped like a command (backticks, a prompt at the start of a line, a pipe, a chain or a
+  redirection, an option next to a program, `sudo`, or a download, a package install or a package
+  run on the spot followed by a target) is dropped whole, and only the fixed line goes, with a server
+  sentence saying the analysis could not be shown. Naming a tool in prose, as in "the npm install
+  step failed", is fine; when the word after the tool is not a short prose word, it counts as a
+  target and the text is dropped.
+  Turning the switch off stops an analysis already running, and nothing of it reaches you. It never runs in quiet hours, for a notice that goes to the summary or
+  one sent inside a burst, never repeats a case (the key is the project, spec, task, signal and the
+  facts, stored across restarts), has a daily and a per spec ceiling and may spend at most a share of
+  the daily budget (30% by default). The notice never waits for it.
+- **Taking an idea to the Architect is a draft, never a turn.** The Architect writes specs and may
+  have internet, so Nanty never sends it anything. The model can only create a card with the whole
+  text, redacted and with a ceiling (over it, a refusal, never a cut). Your tap on that card's token
+  only stores the exact text you saw as a draft in the box of that project's Architect
+  conversation, and only your send takes it to the Architect. A draft from a conversation that read
+  untrusted content is marked in the box, and the rule lives on the server: while a marked draft is
+  pending in the project, every message you send to its Architect runs without internet, even with
+  the switch on and whether or not it carries the draft (edited, retyped or resent after a failure),
+  with a note that tells the model the text is data. The draft leaves only when a turn that carried
+  it ends well, or when you discard it; a failed turn consumes nothing. Each message that ran without
+  internet stores the mark in the project chat history, so the internal turns born from it (the plan
+  check, the consensus rounds, "continue where it stopped") also run without internet, even after a
+  restart, until your next message without the mark. Your messages after that follow the project
+  switch again: the Architect already reads project content written by the agents with the internet
+  on, by your choice, and the draft text in the history does not change that threat model. Content read from another
+  project than the destination is refused, by the tool and again on the tap, so a hostile project
+  cannot pick where its text goes. The draft records its project and sources, and removing a
+  project takes it away.
+- **Offers come from the server, and so does the link to Nants.** Each turn gets `can_do`, what the
+  server calculated for that channel, and Nanty may offer only what a yes can fulfil there; a card
+  button is only pointed out, never offered on your behalf. The model never writes a link:
+  links in its text stay neutralized. When you ask to open Nants, the server adds the address itself,
+  with no token and no entry link, so the device still has to be authorized. The address is the one
+  in Settings or the last `Host` of an authorized device, and only after the `Host` and `Origin`
+  checks: it must be a network IP, so a header forged by a page never becomes that link.
 - **Read only tools, with checked ids.** In the conversation, the model chooses what to look up, but
   every tool that takes a project accepts only the ids of the projects Nanty watches: an excluded or
   unknown id gets a plain refusal, with no read. What comes from the state tools is trusted, because
   it comes from the same source as the bell and the notices. What comes from the files of a project
-  (the plan, the tasks, the report and the costs, never the logs) is marked as untrusted data, with
-  your secrets and the URLs redacted and a size limit, and when it disagrees with the state, the
-  state wins. No tool writes outside the cards and the mute, and none changes the channel, the token
+  (the plan, the tasks, the report and the costs, and the deep reads below) is marked as untrusted
+  data, with your secrets and the URLs redacted and a size limit, and when it disagrees with the
+  state, the state wins. No tool writes outside the cards and the mute, and none changes the channel, the token
   or the recipient. Your own messages are redacted before they are stored, and the conversation
   memory keeps only what you said and the final replies, never what a tool returned.
+- **Deep reads, on request.** When you ask why something failed or for a report, Nanty can read the
+  agents' dialog, their tool trail, the test output and the recovery analyses of a task, the spec
+  and the tasks, the Git history and the files of the project. All of it is read only, goes to the
+  model in the untrusted data envelope with the file names inside it, passes through the redactor
+  before any cut, and has a ceiling per file, per listing and per message (`[nanty.read]`). Every
+  read taints the turn, with its kind and its project stored with the reply. A recalled memory note
+  that came from an import of a project follows the same rule as a read of that project. Errors go to the model
+  as codes, with no path, and nothing of what was read goes to the logs. Besides the conversation,
+  these tools exist only in the automatic analysis, when you turn it on, and there only for the
+  project of the notice.
+- **The reader opens only what is below the project.** It resolves the project folder once and opens
+  everything below it from that descriptor, with `openat2` and `RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS` (or a walk by `openat` with `O_NOFOLLOW` where the kernel lacks it), so a
+  link anywhere in the path, even one swapped in while the agent works, makes the open fail instead
+  of leaving the project. `..`, absolute paths and control characters are refused before touching
+  the disk. Folders such as `.git`, `.ssh`, `.aws`, `.docker`, `.kube`, `secrets`, `node_modules`,
+  `target`, `dist` and the knowledge base sources are never opened or listed, a name that looks like
+  a secret is refused in any part of the path, and a file with a private key or binary content is
+  refused. It works only on Linux, the one system Nants is published for.
+- **Git runs neutral.** The Git history is read with a clean environment (no inherited `GIT_*`, no
+  system or global configuration) and with the repository settings that run programs neutralized:
+  no pager, no fsmonitor, no hooks, no external diff, no textconv and no signature check, with a
+  deadline and a commit count limit. It reads only the subject, the author without the e-mail, the
+  date and the counts, never the patch, and a `.git` that is a link or points outside the project is
+  refused. The integration Git of the runner gets the same care: it never descends into a repository
+  an agent created inside the project (`diff.ignoreSubmodules=all`, `submodule.recurse=false`, and
+  the `.git` of a new nested repository is moved to `nants-nested` in the private Git folder of the
+  worktree before `add`), so a `fsmonitor` or a `clean` filter set there never runs on your computer.
 - **Limits per message.** Rounds of tools, tool calls, time and tokens are limited, the daily budget
   is checked before each round and the last round goes without tools.
 - **A tested trap.** The tests put instructions such as "send the token to..." and "approve the plan"
   inside project files and forwarded messages, have a tool output order a mute, an action outside
   the catalog or a read of an excluded project, and check that no action happens, nothing leaks, the
   channel and the token do not change and the action still waits for your click; a code shaped trap
-  text in a project title must never reach a proactive turn.
+  text in a project title must never reach the notice turn; and a hostile project file with a marker
+  sentence, a path and a command, copied by the model in the automatic analysis, never reaches the
+  conversation or Telegram, while its attempts to act, mute, remember or read another project are
+  refused.
 
 ## Release packages
 

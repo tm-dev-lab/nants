@@ -1,8 +1,11 @@
 //! Arquivo JSONL com rotação (spec 138 T01): o registro do Nanty e a conversa.
 //!
 //! Uma linha por entrada, acrescentada no fim. Quando o arquivo atual passaria de `max_bytes`, ele
-//! vira `<nome>.1.jsonl` (o `.1` anterior vira `.2`, e assim até `keep`; o mais velho sai). Os
-//! arquivos são 0600, abertos com `O_NOFOLLOW`; linha inválida na leitura é pulada.
+//! vira `<nome>.1.jsonl`, e cada geração antiga sobe um número. Depois, a mais velha sai enquanto
+//! houver mais de `keep` gerações antigas ou todas juntas passarem de `total_bytes` (spec 140 T05).
+//! Quem usa o arquivo pode segurar a geração mais velha ([`JsonlLog::append_with`]): a conversa
+//! segura a linha ainda não resumida, e a geração fica até poder sair. Os arquivos são 0600, abertos
+//! com `O_NOFOLLOW`; linha inválida na leitura é pulada.
 //!
 //! Cada `JsonlLog` (e os clones dele) tem um mutex próprio: acrescentar, girar, filtrar e ler
 //! acontecem um de cada vez, então um `retain` nunca perde a linha de um `append` paralelo e a
@@ -19,17 +22,56 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+/// Gerações antigas guardadas no máximo, mesmo seguradas: acima disso, a mais velha sai sempre, e
+/// quem segura recebe `forced` para registrar o que saiu ([`JsonlLog::append_with`]).
+pub const HARD_MAX_GENERATIONS: usize = 32;
+/// Teto fixo de leitura de uma geração: duas vezes o maior arquivo que a configuração aceita
+/// ([`crate::config::MAX_CONVERSATION_BYTES`]). Ele não segue o limite em vigor, então baixar o
+/// limite nunca deixa ilegível uma geração já gravada (revisão 1 da spec 140 T05, F-01).
+pub const READ_CEILING: u64 = crate::config::MAX_CONVERSATION_BYTES * 2;
+
+/// Uma geração lida.
+enum Generation {
+    Missing,
+    Text(String),
+    /// Existe, mas não deu para ler (grande demais, symlink, erro de leitura).
+    Unreadable,
+}
+
+/// Limites da rotação.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Tamanho do arquivo atual antes de girar.
+    pub max_bytes: u64,
+    /// Gerações antigas guardadas (`.1` a `.keep`).
+    pub keep: usize,
+    /// Teto das gerações antigas juntas.
+    pub total_bytes: u64,
+}
+
+/// A geração mais velha pode sair? A resposta de quem usa o arquivo ([`JsonlLog::append_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// Pode sair.
+    Drop,
+    /// Fica até a próxima rotação.
+    Hold,
+}
+
 /// Arquivo JSONL com rotação.
 #[derive(Debug, Clone)]
 pub struct JsonlLog {
     dir: PathBuf,
     /// Nome sem a extensão (`journal`, `conversation`).
     stem: &'static str,
-    max_bytes: u64,
-    /// Gerações antigas guardadas (`.1` a `.keep`).
-    keep: usize,
-    /// Serializa as operações sobre o arquivo (compartilhado entre os clones).
-    lock: Arc<Mutex<()>>,
+    /// Os limites, sob o mutex que serializa as operações sobre o arquivo (compartilhado entre os
+    /// clones).
+    limits: Arc<Mutex<Limits>>,
+    /// Quantas vezes alguma linha saiu (rotação ou filtro): quem guarda um índice do arquivo sabe que
+    /// precisa refazê-lo.
+    removals: Arc<AtomicU64>,
+    /// Teto de leitura de uma geração ([`READ_CEILING`]; os testes baixam).
+    read_cap: Arc<AtomicU64>,
 }
 
 /// Falha de gravação (sem detalhe: nunca carrega caminho).
@@ -37,12 +79,54 @@ pub struct JsonlLog {
 pub struct JsonlError;
 
 impl JsonlLog {
+    /// Sem teto total: só `keep` gerações antigas.
     pub fn new(dir: PathBuf, stem: &'static str, max_bytes: u64, keep: usize) -> Self {
-        Self { dir, stem, max_bytes, keep, lock: Arc::new(Mutex::new(())) }
+        Self::with_limits(dir, stem, Limits { max_bytes, keep, total_bytes: u64::MAX })
     }
 
-    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    pub fn with_limits(dir: PathBuf, stem: &'static str, limits: Limits) -> Self {
+        Self {
+            dir,
+            stem,
+            limits: Arc::new(Mutex::new(limits)),
+            removals: Arc::new(AtomicU64::new(0)),
+            read_cap: Arc::new(AtomicU64::new(READ_CEILING)),
+        }
+    }
+
+    /// Baixa o teto de leitura (testes: uma geração ilegível sem gravar megabytes).
+    #[cfg(test)]
+    pub fn set_read_cap(&self, cap: u64) {
+        self.read_cap.store(cap, Ordering::Release);
+    }
+
+    fn read_generation(&self, generation: usize) -> Generation {
+        let path = self.path(generation);
+        if fs::symlink_metadata(&path).is_err() {
+            return Generation::Missing;
+        }
+        match read_private(&path, self.read_cap.load(Ordering::Acquire)) {
+            Some(text) => Generation::Text(text),
+            None => Generation::Unreadable,
+        }
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, Limits> {
+        self.limits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Troca os limites (a configuração mudou): valem da próxima rotação em diante.
+    pub fn set_limits(&self, limits: Limits) {
+        *self.guard() = limits;
+    }
+
+    /// Quantas vezes alguma linha saiu do arquivo.
+    pub fn removals(&self) -> u64 {
+        self.removals.load(Ordering::Acquire)
+    }
+
+    fn removed(&self) {
+        self.removals.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Caminho da geração `n` (0 = o atual).
@@ -53,10 +137,28 @@ impl JsonlLog {
         }
     }
 
+    /// A maior geração antiga presente (`.1` a `.n`). Um buraco deixado por uma rotação interrompida
+    /// não esconde as gerações depois dele (revisão 1, F-02).
+    fn generations(&self) -> usize {
+        (1..=HARD_MAX_GENERATIONS + 1).rev().find(|n| fs::symlink_metadata(self.path(*n)).is_ok()).unwrap_or(0)
+    }
+
     /// Acrescenta uma entrada, girando antes se o arquivo atual passaria do limite.
     pub fn append<T: Serialize>(&self, entry: &T) -> Result<(), JsonlError> {
+        self.append_with(entry, |_, _| Release::Drop)
+    }
+
+    /// Como [`Self::append`], perguntando a `release` se a geração mais velha pode sair. Ele recebe o
+    /// texto dela (`None`: ela existe, mas não deu para ler) e `forced`: acima de
+    /// [`HARD_MAX_GENERATIONS`] gerações, ela sai mesmo com [`Release::Hold`], e quem segura
+    /// registra o que saiu antes de responder.
+    pub fn append_with<T: Serialize>(
+        &self,
+        entry: &T,
+        mut release: impl FnMut(Option<&str>, bool) -> Release,
+    ) -> Result<(), JsonlError> {
         let mut line = serde_json::to_string(entry).map_err(|_| JsonlError)?;
-        let _guard = self.guard();
+        let limits = self.guard();
         line.push('\n');
         ensure_private_dir(&self.dir)?;
         let current = self.path(0);
@@ -65,8 +167,11 @@ impl JsonlLog {
             Ok(_) => return Err(JsonlError),
             Err(_) => 0,
         };
-        if size > 0 && size + line.len() as u64 > self.max_bytes {
-            self.rotate()?;
+        if size > 0 && size + line.len() as u64 > limits.max_bytes {
+            self.rotate(&limits, &mut release)?;
+        } else if size > 0 && !ends_with_newline(&current) {
+            // Uma linha cortada por uma queda: a nova começa na linha seguinte, e só a cortada é pulada.
+            line.insert(0, '\n');
         }
         let mut file = OpenOptions::new()
             .append(true)
@@ -78,17 +183,42 @@ impl JsonlLog {
         file.write_all(line.as_bytes()).map_err(|_| JsonlError)
     }
 
-    /// Gira as gerações: o mais velho sai, cada uma sobe um número e o atual vira `.1`.
-    fn rotate(&self) -> Result<(), JsonlError> {
-        if self.keep == 0 {
-            return fs::remove_file(self.path(0)).map_err(|_| JsonlError);
-        }
-        let _ = fs::remove_file(self.path(self.keep));
-        for n in (0..self.keep).rev() {
-            let from = self.path(n);
+    /// Gira as gerações: cada uma sobe um número e o atual vira `.1`. Depois, a mais velha sai
+    /// enquanto houver mais de `keep` gerações antigas ou elas juntas passarem do teto, se `release`
+    /// deixar.
+    ///
+    /// Com um buraco (uma rotação interrompida), cada geração sobe para o número seguinte, que já
+    /// está livre: a ordem é do maior para o menor, então nenhuma é sobrescrita.
+    fn rotate(&self, limits: &Limits, release: &mut impl FnMut(Option<&str>, bool) -> Release) -> Result<(), JsonlError> {
+        let mut n = self.generations();
+        for g in (0..=n).rev() {
+            let from = self.path(g);
             if fs::symlink_metadata(&from).is_ok() {
-                fs::rename(&from, self.path(n + 1)).map_err(|_| JsonlError)?;
+                fs::rename(&from, self.path(g + 1)).map_err(|_| JsonlError)?;
             }
+        }
+        n += 1;
+        while n > 0 {
+            let total: u64 = (1..=n).filter_map(|g| fs::symlink_metadata(self.path(g)).ok()).map(|m| m.len()).sum();
+            let forced = n > HARD_MAX_GENERATIONS;
+            if !forced && n <= limits.keep && total <= limits.total_bytes {
+                break;
+            }
+            let answer = match self.read_generation(n) {
+                // Um buraco: não há o que tirar neste número.
+                Generation::Missing => {
+                    n -= 1;
+                    continue;
+                }
+                Generation::Text(text) => release(Some(&text), forced),
+                Generation::Unreadable => release(None, forced),
+            };
+            if answer == Release::Hold && !forced {
+                break;
+            }
+            fs::remove_file(self.path(n)).map_err(|_| JsonlError)?;
+            self.removed();
+            n -= 1;
         }
         Ok(())
     }
@@ -96,13 +226,13 @@ impl JsonlLog {
     /// As últimas `limit` entradas, da mais velha para a mais nova, lendo das gerações antigas só
     /// o que faltar. Linhas que não são do tipo pedido são puladas.
     pub fn tail<T: DeserializeOwned>(&self, limit: usize) -> Vec<T> {
-        let _guard = self.guard();
+        let _limits = self.guard();
         let mut out: Vec<T> = Vec::new();
-        for generation in 0..=self.keep {
+        for generation in 0..=self.generations() {
             if out.len() >= limit {
                 break;
             }
-            let Some(text) = read_private(&self.path(generation), self.max_bytes.saturating_mul(2)) else {
+            let Generation::Text(text) = self.read_generation(generation) else {
                 continue;
             };
             let mut older: Vec<T> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
@@ -114,14 +244,40 @@ impl JsonlLog {
         out
     }
 
+    /// Todas as entradas de todas as gerações, da mais velha para a mais nova, ou erro se alguma
+    /// geração existe e não dá para ler (spec 140 T06, revisão 1, F-01): quem decide a cobertura do
+    /// resumo ou a sequência das linhas nunca o faz sobre uma leitura parcial.
+    pub fn all_strict<T: DeserializeOwned>(&self) -> Result<Vec<T>, JsonlError> {
+        let _limits = self.guard();
+        let mut out: Vec<T> = Vec::new();
+        for generation in 0..=self.generations() {
+            let text = match self.read_generation(generation) {
+                Generation::Missing => continue,
+                Generation::Unreadable => return Err(JsonlError),
+                Generation::Text(text) => text,
+            };
+            let mut older: Vec<T> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            older.append(&mut out);
+            out = older;
+        }
+        Ok(out)
+    }
+
     /// Reescreve todas as gerações mantendo só as entradas que passam em `keep`, preservando a
-    /// ordem (a limpeza de um projeto removido).
+    /// ordem (a limpeza de um projeto removido). Uma geração que existe e não dá para ler é um erro:
+    /// a limpeza não fica pela metade em silêncio. As outras gerações são limpas mesmo assim.
     pub fn retain<T: Serialize + DeserializeOwned>(&self, keep: impl Fn(&T) -> bool) -> Result<(), JsonlError> {
-        let _guard = self.guard();
-        for generation in 0..=self.keep {
+        let _limits = self.guard();
+        let mut failed = false;
+        for generation in 0..=self.generations() {
             let path = self.path(generation);
-            let Some(text) = read_private(&path, self.max_bytes.saturating_mul(2)) else {
-                continue;
+            let text = match self.read_generation(generation) {
+                Generation::Missing => continue,
+                Generation::Unreadable => {
+                    failed = true;
+                    continue;
+                }
+                Generation::Text(text) => text,
             };
             let entries: Vec<T> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
             let kept: Vec<&T> = entries.iter().filter(|e| keep(e)).collect();
@@ -134,9 +290,63 @@ impl JsonlLog {
                 body.push('\n');
             }
             write_atomic(&path, body.as_bytes())?;
+            self.removed();
+        }
+        if failed {
+            return Err(JsonlError);
         }
         Ok(())
     }
+
+    /// Passa `f` por todas as entradas, da mais velha para a mais nova, e regrava (de forma atômica)
+    /// só as gerações em que `f` mudou alguma (`true`). As linhas que não são do tipo pedido ficam
+    /// como estão. Uma geração ilegível é um erro, depois de passar pelas outras.
+    pub fn map_all<T: Serialize + DeserializeOwned>(&self, mut f: impl FnMut(&mut T) -> bool) -> Result<(), JsonlError> {
+        let _limits = self.guard();
+        let mut failed = false;
+        for generation in (0..=self.generations()).rev() {
+            let text = match self.read_generation(generation) {
+                Generation::Missing => continue,
+                Generation::Unreadable => {
+                    failed = true;
+                    continue;
+                }
+                Generation::Text(text) => text,
+            };
+            let mut changed = false;
+            let mut body = String::with_capacity(text.len());
+            for raw in text.lines() {
+                let mapped = serde_json::from_str::<T>(raw).ok().and_then(|mut entry| f(&mut entry).then_some(entry));
+                match mapped {
+                    Some(entry) => {
+                        changed = true;
+                        body.push_str(&serde_json::to_string(&entry).map_err(|_| JsonlError)?);
+                    }
+                    None => body.push_str(raw),
+                }
+                body.push('\n');
+            }
+            if changed {
+                write_atomic(&self.path(generation), body.as_bytes())?;
+            }
+        }
+        if failed {
+            return Err(JsonlError);
+        }
+        Ok(())
+    }
+}
+
+/// O arquivo termina numa quebra de linha (ou não dá para ler o último byte: conta como sim).
+fn ends_with_newline(path: &Path) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let last = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).and_then(|mut f| {
+        f.seek(SeekFrom::End(-1))?;
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte)?;
+        Ok(byte[0])
+    });
+    last.map_or(true, |b| b == b'\n')
 }
 
 /// Cria a pasta (0700) se faltar; recusa symlink ou algo que não é pasta.
@@ -296,6 +506,32 @@ mod tests {
             (0..4u32).flat_map(|t| (0..60u32).filter(|i| i % 3 != 0).map(move |i| t * 1000 + i)).collect();
         expected.sort_unstable();
         assert_eq!(left, expected);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Spec 140 T05: quem segura a geração mais velha a mantém além do limite, até o fixo
+    /// [`HARD_MAX_GENERATIONS`], quando ela sai com `forced`; cada saída conta em `removals`.
+    #[test]
+    fn a_held_generation_stays_until_the_hard_ceiling() {
+        let d = dir("hold");
+        let log = JsonlLog::new(d.clone(), "c", 20, 1);
+        let mut forced_seen = 0;
+        for n in 0..(HARD_MAX_GENERATIONS as u32 + 4) {
+            log.append_with(&E { n, p: "ab".into() }, |text, forced| {
+                assert!(text.is_some_and(|t| !t.is_empty()));
+                forced_seen += usize::from(forced);
+                Release::Hold
+            })
+            .expect("append");
+        }
+        assert!(log.path(HARD_MAX_GENERATIONS).is_file() && !log.path(HARD_MAX_GENERATIONS + 1).exists());
+        assert!(forced_seen > 0);
+        assert_eq!(log.removals(), forced_seen as u64);
+        let before = log.removals();
+        log.set_limits(Limits { max_bytes: 20, keep: 1, total_bytes: u64::MAX });
+        log.append(&E { n: 999, p: "ab".into() }).expect("append");
+        assert!(!log.path(2).exists(), "liberada, volta ao limite numa rotação");
+        assert!(log.removals() > before);
         let _ = fs::remove_dir_all(&d);
     }
 

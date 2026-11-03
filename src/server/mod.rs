@@ -169,6 +169,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects/:id/architecture/survey", post(survey::post_survey))
         .route("/api/projects/:id/chat", get(chat::get_chat).post(chat::post_chat))
         .route("/api/projects/:id/chat/continue", post(chat::post_chat_continue))
+        // Spec 140 T15: o rascunho que o Nanty deixou na caixa do Arquiteto (ler e descartar).
+        .route("/api/projects/:id/chat/draft", get(nanty::draft::get_draft))
+        .route("/api/projects/:id/chat/draft/discard", post(nanty::draft::post_discard))
         // Limite de corpo próprio (5 MiB) só nesta rota; o global continua em `MAX_BODY_BYTES`.
         .route(
             "/api/projects/:id/chat/attachments",
@@ -237,6 +240,13 @@ pub fn router(state: AppState) -> Router {
         // Nanty (spec 138 T03): decidir um cartão e desfazer, com as proteções das rotas que mudam algo.
         .route("/api/nanty/cards/:id/decide", post(nanty::api::post_decide))
         .route("/api/nanty/undo/:id", post(nanty::api::post_undo))
+        // Spec 140 T07: a memória de longo prazo (a aba Memória é a T08), com as mesmas proteções.
+        .route("/api/nanty/memory", get(nanty::memory::api::get_memory))
+        // T08: a exportação da aba (POST: nenhuma navegação de outro site dispara o download).
+        .route("/api/nanty/memory/export", post(nanty::memory::api::post_export))
+        .route("/api/nanty/memory/:id", put(nanty::memory::api::put_entry))
+        .route("/api/nanty/memory/:id/delete", post(nanty::memory::api::post_delete))
+        .route("/api/nanty/memory/:id/restore", post(nanty::memory::api::post_restore))
         // Nanty (spec 138 T06): o canal do Telegram (saúde, token, pareamento e teste).
         .route("/api/nanty/telegram", get(nanty::telegram::api::get_telegram))
         .route("/api/nanty/telegram/token", post(nanty::telegram::api::post_token))

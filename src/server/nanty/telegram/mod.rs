@@ -45,6 +45,7 @@ use self::client::{CallbackQuery, Message, TelegramClient, TgError, Update};
 use self::pairing::{PairAttempt, PairState, Pairing};
 use super::act::{self, Answer};
 use super::journal::{JournalEntry, JournalKind};
+use super::link;
 use super::store::{Card, Channel, DecidedBy, Delivery};
 use super::{nanty_lang, Nanty, Part};
 use crate::config::NantyTelegram;
@@ -118,6 +119,12 @@ pub struct Tuning {
     pub typing_every: Duration,
     /// Prazo da fala (spec 139 T08, C-14, [`outbox::SPEECH_DEADLINE`]): vencido, a saída vai em texto.
     pub speech_deadline: Duration,
+    /// Espera do aviso em voz pelo texto do turno (spec 140 T02, C-29, [`outbox::NOTICE_TEXT_WAIT`]).
+    pub notice_text_wait: Duration,
+    /// A mesma espera no aviso urgente ([`outbox::NOTICE_TEXT_WAIT_URGENT`]).
+    pub notice_text_wait_urgent: Duration,
+    /// Limite do aviso em voz, com a espera e a fala ([`outbox::NOTICE_TOTAL`]).
+    pub notice_total: Duration,
 }
 
 impl Default for Tuning {
@@ -130,6 +137,9 @@ impl Default for Tuning {
             send_settle: outbox::SEND_SETTLE,
             typing_every: outbox::TYPING_EVERY,
             speech_deadline: outbox::SPEECH_DEADLINE,
+            notice_text_wait: outbox::NOTICE_TEXT_WAIT,
+            notice_text_wait_urgent: outbox::NOTICE_TEXT_WAIT_URGENT,
+            notice_total: outbox::NOTICE_TOTAL,
         }
     }
 }
@@ -698,10 +708,24 @@ async fn on_callback(state: &AppState, nanty: &Arc<Nanty>, s: &Session, update_i
         let _ = s.client.answer_callback(&q.id, None).await;
         return;
     };
-    let text = match act::decide(state, &card_id, &token, answer, DecidedBy::Telegram).await {
+    // Spec 140 T17 (da revisão 2 da T07): o cartão longo demais saiu sem o "sim", e o "não" dele leva
+    // o mesmo token. Um "sim" montado à mão com esse token não decide nada por aqui: só a janela, onde
+    // o texto vai inteiro.
+    if answer == Answer::Yes && nanty.snapshot().window_only(&card_id) {
+        journal(nanty, "telegram.yes_window_only", param("card", card_id.as_str()));
+        let _ = s.client.answer_callback(&q.id, Some(&tr(lang, "nanty.telegram.card_in_window", &[]))).await;
+        return;
+    }
+    // Spec 140 T07 e T15: o de levar ao Arquiteto e os da memória têm decisão própria; os outros, `act`.
+    let text = match super::draft::decide(state, &card_id, &token, answer, DecidedBy::Telegram).await {
         Ok(outcome) => {
             if outcome.outcome == "expired" {
                 strip_clicked(nanty, q);
+            }
+            // Spec 140 T03: o botão que leva ao Nants entrega o caminho, e não só o aviso do clique.
+            if outcome.outcome == "open_nants" {
+                let project = outcome.params.get("project_id").and_then(Value::as_str);
+                link::send_to_telegram(state, nanty, lang, &card_id, project).await;
             }
             act::outcome_text(lang, &outcome)
         }
@@ -746,4 +770,25 @@ mod t09_tests;
 mod t12_eval_tests;
 
 #[cfg(test)]
+mod t16_eval_tests;
+
+#[cfg(test)]
 mod voice_tests;
+
+#[cfg(test)]
+mod notice_tests;
+
+#[cfg(test)]
+mod link_tests;
+
+#[cfg(test)]
+mod memory_tests;
+
+#[cfg(test)]
+mod scenario_tests;
+
+#[cfg(test)]
+mod t14_tests;
+
+#[cfg(test)]
+mod t15_tests;

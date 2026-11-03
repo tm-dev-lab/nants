@@ -2795,6 +2795,12 @@ mod gemini_tests;
 mod limit_client_tests;
 
 #[cfg(test)]
+mod history_tests;
+
+#[cfg(test)]
+mod effort_tests;
+
+#[cfg(test)]
 pub(crate) mod live_tests;
 
 #[cfg(test)]

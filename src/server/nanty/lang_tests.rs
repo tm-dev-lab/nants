@@ -197,7 +197,7 @@ async fn the_quote_is_cut_in_the_message_and_in_the_memory() {
     let input = model.input(0);
     let count = |v: &Value, c: char| v.as_str().unwrap_or_default().chars().filter(|x| *x == c).count();
     assert_eq!(count(&input["quote"], 'z'), MAX_QUOTE_CHARS, "a citação da mensagem vai cortada");
-    let memory = input["memory"].as_array().cloned().unwrap_or_default();
+    let memory = model.memory(0);
     let legacy = memory.iter().find(|m| m["text"] == "olha isso").expect("memória");
     assert_eq!(count(&legacy["quote"], 'q'), 1500, "a citação da memória tem o corte do texto");
 }

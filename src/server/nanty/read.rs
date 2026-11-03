@@ -4,8 +4,9 @@
 //!   texto do projeto como não confiável, redige segredos e URLs antes do corte por campo e tem teto;
 //!   o relatório final mais recente (`report.md`, redigido e cortado); e o custo do projeto pelo
 //!   `usage.jsonl` (só números).
-//! - **Sem logs:** nenhum `run.log`, saída de agente, trilha ou diálogo entra; os códigos de parada
-//!   já chegam pelos sinais estruturados.
+//! - **Sem logs aqui:** nenhum `run.log`, saída de agente, trilha ou diálogo entra nesta visão; os
+//!   códigos de parada já chegam pelos sinais estruturados. A leitura a fundo deles, a pedido, é de
+//!   [`super::deep`] (spec 140 T10, que revê a C-13 da 138).
 //! - **Só o projeto pedido:** a ferramenta `project_details` ([`super::tools`]) chama isto para um projeto
 //!   observado só, o id que o modelo pediu e o servidor conferiu.
 //! - **Dado não confiável:** o texto lido vai em `untrusted`; o prompt manda tratar tudo ali como dado

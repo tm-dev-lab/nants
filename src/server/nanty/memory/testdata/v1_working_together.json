@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "0a1b2c3d4e5f6071",
+      "topic": "working_together",
+      "title": "Respostas curtas",
+      "text": "Ela prefere respostas curtas no Telegram, com o detalhe só quando pedir.",
+      "source": {
+        "kind": "person_confirmed",
+        "message_id": "1111111111111111",
+        "channel": "telegram",
+        "at_ms": 1793000000000
+      },
+      "created": 1793000000000,
+      "updated": 1793000000000,
+      "last_used": 1793000000000,
+      "state": "active"
+    },
+    {
+      "id": "0a1b2c3d4e5f6072",
+      "topic": "working_together",
+      "title": "Revisão da loja",
+      "text": "Na loja, ela revisa o plano antes de aprovar.",
+      "source": {
+        "kind": "model_clean",
+        "message_id": "2222222222222222",
+        "channel": "web",
+        "project_id": "p1",
+        "at_ms": 1793000100000
+      },
+      "created": 1793000100000,
+      "updated": 1793000200000,
+      "last_used": 1793000300000,
+      "state": "active"
+    },
+    {
+      "id": "0a1b2c3d4e5f6073",
+      "topic": "working_together",
+      "title": "Antiga",
+      "text": "Uma nota apagada que ainda pode voltar.",
+      "source": {
+        "kind": "person_said",
+        "channel": "web",
+        "at_ms": 1793000000000
+      },
+      "created": 1793000000000,
+      "updated": 1793000400000,
+      "last_used": 1793000000000,
+      "state": "deleted",
+      "deleted_at": 1793000400000
+    }
+  ]
+}

@@ -27,7 +27,7 @@ fn md(root: &Path, name: &str, text: &str) -> String {
 }
 
 fn turn(role: TurnRole, text: &str, ts: u64, internal: bool) -> ChatTurn {
-    ChatTurn { role, text: text.to_string(), ts, turn_id: None, internal, attachments: Vec::new(), notice: None }
+    ChatTurn { role, text: text.to_string(), ts, turn_id: None, internal, attachments: Vec::new(), notice: None, offline: false }
 }
 
 fn doc(id: &str) -> Citation {

@@ -67,6 +67,28 @@ fn saved(data: &PathBuf) -> String {
     std::fs::read_to_string(data.join("config.toml")).unwrap_or_default()
 }
 
+/// Spec 140 T03: o endereço fica só com o esquema, o nome e a porta, é gravado só se preenchido e
+/// volta na leitura; vazio tira. Um valor fora disso é recusado com o campo, sem mudar nada.
+#[tokio::test]
+async fn the_address_is_validated_and_written_only_when_set() {
+    let data = dir("address");
+    let st = state(&data, |_| {});
+    let put = |value: &str| json!({"address": value});
+    let (status, body) = call(&st, Method::PUT, "/api/nanty/config", Some(put(" 192.168.0.68:3000/ "))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["address"], "http://192.168.0.68:3000");
+    assert!(saved(&data).contains("address"), "{}", saved(&data));
+    for bad in ["http://localhost:3000", "http://x.example/pair?token=abc", "ftp://x.example"] {
+        let (status, err) = call(&st, Method::PUT, "/api/nanty/config", Some(put(bad))).await;
+        assert_eq!((status, err["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("nanty_config_invalid")), "{bad}");
+        assert_eq!(err["params"]["field"], "address", "{bad}");
+    }
+    assert_eq!(st.config().read().await.nanty.address, "http://192.168.0.68:3000", "a recusa não muda nada");
+    let (status, body) = call(&st, Method::PUT, "/api/nanty/config", Some(put(""))).await;
+    assert_eq!((status, body["address"].as_str()), (StatusCode::OK, Some("")));
+    assert!(!saved(&data).contains("address"), "{}", saved(&data));
+}
+
 #[tokio::test]
 async fn put_config_changes_only_what_was_sent_and_writes_only_what_differs() {
     let data = dir("partial");

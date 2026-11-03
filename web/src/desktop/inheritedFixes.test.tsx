@@ -211,7 +211,9 @@ describe("5. 'Reenviar' respeita o bloqueio do chat", () => {
     const resend = within(blocked.container).getByRole("button", { name: "Reenviar" }) as HTMLButtonElement;
     expect(resend.disabled).toBe(true);
     fireEvent.click(resend);
-    expect(post).not.toHaveBeenCalled();
+    // Spec 140 T15: a janela lê o rascunho do Nanty (GET); o que importa aqui é nenhum POST.
+    const posts = (post.mock.calls as unknown[][]).filter((call) => (call[1] as RequestInit | undefined)?.method === "POST");
+    expect(posts).toHaveLength(0);
     blocked.unmount();
     const ready = view(READY);
     expect((within(ready.container).getByRole("button", { name: "Reenviar" }) as HTMLButtonElement).disabled).toBe(false);

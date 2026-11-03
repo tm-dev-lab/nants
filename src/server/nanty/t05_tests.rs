@@ -267,12 +267,12 @@ async fn proactive_input_has_only_structured_signals_and_no_project_text() {
     let user = request.messages.iter().find(|m| m.role == Role::User).expect("entrada");
     let input: Value = serde_json::from_str(&user.content).expect("JSON");
     let top: Vec<&str> = input.as_object().expect("objeto").keys().map(String::as_str).collect();
-    assert_eq!(top, ["allowed_actions", "cost_usd", "counts", "kind", "signals", "tokens"]);
+    assert_eq!(top, ["can_do", "cost_usd", "counts", "kind", "signals", "tokens"]);
     assert_structured(&input, "input");
     assert_eq!(input["kind"], "notice");
     assert_eq!(input["signals"][0]["kind"], "plan_waiting");
-    assert_eq!(input["signals"][0]["facts"]["spec_id"], "001-demo");
-    assert_eq!(input["allowed_actions"], json!(["approve_plan", "remind_later", "open_nants"]));
+    assert_eq!(input["signals"][0]["facts"]["spec_id"], Value::Null, "spec 140 T04 (C-05)");
+    assert_eq!(input["can_do"]["buttons"], json!(["approve_plan", "remind_later"]));
     assert!(request.response_json && request.tools.is_empty() && !request.web_search);
     assert_eq!(request.model, "m-nanty");
 
@@ -296,7 +296,7 @@ fn free_text_in_facts_never_reaches_the_input() {
     facts.insert("long".into(), json!("x".repeat(turn::MAX_CODE_LEN + 1)));
     let kept = turn::structured(&facts);
     // T08: só as chaves da lista fixa (o `ok` tem forma de código, mas não é fato de observador).
-    assert_eq!(kept.keys().map(String::as_str).collect::<Vec<_>>(), ["count", "since", "spec_id"]);
+    assert_eq!(kept.keys().map(String::as_str).collect::<Vec<_>>(), ["count", "since"]);
     let card = Card {
         id: "c".into(),
         project_id: Some("p1".into()),
@@ -344,8 +344,8 @@ fn reply_validation_accepts_only_the_format_and_catalog_ids_offered() {
     let many = r#"{"summary": "x", "actions": ["open_nants", "remind_later", "approve_plan", "open_nants"]}"#;
     assert_eq!(turn::validate(many, &allowed), Err(Invalid::Action));
     // A faixa "só a pessoa" nunca entra no que o modelo pode sugerir.
-    let card = Card { action: Some("change_channel".into()), ..Card::default() };
-    assert_eq!(turn::allowed_for(&[card]), [ActionId::RemindLater, ActionId::OpenNants]);
+    let card = Card { action: Some("change_channel".into()), token: Some("t".into()), ..Card::default() };
+    assert_eq!(super::can_do::card_buttons(&card), [ActionId::RemindLater]);
 }
 
 #[tokio::test]
@@ -398,7 +398,7 @@ async fn one_turn_at_a_time_in_a_single_queue() {
     });
     let w = World::new("queue", Arc::clone(&model), 12, 0, |_| {});
     let mut input = TurnInput::new(TurnKind::Notice);
-    input.allowed_actions = vec![ActionId::ApprovePlan];
+    input.can_do.buttons = vec![ActionId::ApprovePlan];
     let nanty = w.nanty();
     let (a, b, c) =
         tokio::join!(turn::run(&w.state, &nanty, &input), turn::run(&w.state, &nanty, &input), turn::run(&w.state, &nanty, &input));
@@ -451,7 +451,7 @@ async fn unpriced_model_counts_tokens_and_the_status_shows_it_and_the_shared_quo
         c.nanty.daily_budget_tokens = 1000;
     });
     let mut input = TurnInput::new(TurnKind::Notice);
-    input.allowed_actions = vec![ActionId::ApprovePlan];
+    input.can_do.buttons = vec![ActionId::ApprovePlan];
     assert!(matches!(turn::run(&w.state, &w.nanty(), &input).await, TurnOutcome::Reply(_)));
     let spend = w.nanty().snapshot().spend;
     assert_eq!((spend.usd, spend.unpriced_turns, spend.input_tokens), (0.0, 1, 1000));
@@ -482,6 +482,34 @@ async fn unpriced_model_counts_tokens_and_the_status_shows_it_and_the_shared_quo
     *w.state.config().write().await = cfg;
     assert_eq!(turn::run(&w.state, &w.nanty(), &input).await, TurnOutcome::Skipped("no_model"));
     assert!(turn::proactive(&w.state, &w.nanty()).await.is_none());
+}
+
+/// Spec 140 T17 (C-19): a fala conta sempre. Sem preço do modelo da voz, no modo US$, ela é estimada
+/// pelo preço do modelo principal; com preço próprio, vale o dela; no modo tokens, só os tokens.
+#[test]
+fn an_unpriced_voice_route_is_estimated_by_the_main_model_in_usd_mode() {
+    let mut cfg = Config::default();
+    cfg.connections = vec![connection("main", ConnectionKind::ApiKey)];
+    cfg.nanty.connection_id = "main".into();
+    cfg.nanty.model = "m-nanty".into();
+    cfg.pricing.insert("m-nanty".into(), price(1.0, 2.0));
+    let usage = Usage::new(1_000_000, 1_000_000);
+    assert_eq!(turn::budget_mode(&cfg), turn::BudgetMode::Usd);
+    let estimated = turn::route_cost(&cfg, "m-fala", &usage, Billing::Metered).expect("estimada");
+    assert!((estimated - 3.0).abs() < 1e-9, "{estimated}");
+    cfg.pricing.insert("m-fala".into(), price(0.5, 10.0));
+    let own = turn::route_cost(&cfg, "m-fala", &usage, Billing::Metered).expect("própria");
+    assert!((own - 10.5).abs() < 1e-9, "{own}");
+    // Modo tokens (o principal sem preço): a fala sem preço conta só os tokens.
+    cfg.pricing.clear();
+    assert_eq!(turn::budget_mode(&cfg), turn::BudgetMode::Tokens);
+    assert_eq!(turn::route_cost(&cfg, "m-fala", &usage, Billing::Metered), None);
+    // Gravada no gasto, a estimativa entra no US$ do dia, e não como turno sem preço.
+    cfg.pricing.insert("m-nanty".into(), price(1.0, 2.0));
+    let mut st = NantyState::default();
+    st.add_voice_spend("2026-10-30", 100, 50, turn::route_cost(&cfg, "m-fala", &Usage::new(100, 50), Billing::Metered));
+    let view = turn::budget_view(&cfg, &st.spend_on("2026-10-30"));
+    assert!(view.spent_usd > 0.0 && view.unpriced_turns == 0, "{view:?}");
 }
 
 async fn get(app: axum::Router, uri: &str) -> Value {
@@ -608,7 +636,7 @@ fn usage_line(at: &str, model: &str, input: u64, output: u64) -> String {
 #[tokio::test]
 async fn morning_digest_is_built_from_facts_with_the_model_only_when_there_is_something_to_highlight() {
     // 08:30 local (o instante é meio-dia UTC): o dia local começa às 03:30 UTC.
-    let reply = r#"{"summary": "O disco está baixo e um plano espera você.", "actions": ["open_nants"]}"#;
+    let reply = r#"{"summary": "O disco está baixo e um plano espera você.", "actions": []}"#;
     let w = World::new("digest", FakeModel::new(&[reply]), 8, 30, |c| {
         c.pricing.insert("m-proj".into(), price(10.0, 20.0));
     });
@@ -664,7 +692,7 @@ async fn morning_digest_is_built_from_facts_with_the_model_only_when_there_is_so
     let cost = lines.iter().find(|l| l["code"] == "nanty.digest.cost_partial").expect("custo");
     assert_eq!(cost["params"]["cost_usd"], json!(1.2));
     assert_eq!(cost["params"]["tokens"], json!(110_500));
-    assert_eq!((message.lang.as_deref(), message.actions.as_slice()), (Some("pt-BR"), ["open_nants".to_string()].as_slice()));
+    assert_eq!((message.lang.as_deref(), message.actions.as_slice()), (Some("pt-BR"), [].as_slice()));
 
     // A entrada do modelo do resumo também é só estruturada.
     let request = &w.model.requests()[0];

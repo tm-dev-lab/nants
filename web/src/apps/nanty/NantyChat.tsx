@@ -8,6 +8,8 @@
  *   texto. Com a voz ligada, a resposta da janela também tem áudio (spec 139 T08): o tocador aparece
  *   junto do texto e só toca com o clique. A rota aceita `Range` (o Safari, inclusive o do iPhone, só toca assim). Navegador que
  *   não toca Ogg/Opus (`canPlayType`): a transcrição fica, com um aviso discreto e o baixar.
+ * - **Abrir a tela (spec 140 T03):** a resposta com `open_project` abre o projeto quando chega, e
+ *   guarda o botão para voltar a ele; aqui não há link.
  * - **Envio:** `POST /api/nanty/conversation`; a resposta chega pelo `nanty_changed` e fica só na
  *   janela (T08). O gravar aparece desligado: a gravação pela janela fica para depois.
  */
@@ -140,19 +142,31 @@ function PersonMessage({ m }: { m: NantyMessage }) {
   );
 }
 
-/** O título do resumo da manhã: a única frase do servidor que vem antes do texto do modelo. */
-const DIGEST_LEAD = "nanty.digest.lead";
+/**
+ * As frases do servidor que vêm antes do texto do modelo: o título do resumo da manhã e a linha do
+ * cenário proativo (spec 140 T12), que diz antes de tudo que é uma análise automática.
+ */
+const LEADS: readonly string[] = ["nanty.digest.lead", "nanty.scenario.lead"];
 
-function NantyMessageView({ m, cards, decisions }: { m: NantyMessage; cards: readonly NantyCard[]; decisions: NantyDecisions }) {
+interface MessageViewProps {
+  m: NantyMessage;
+  cards: readonly NantyCard[];
+  decisions: NantyDecisions;
+  onOpenProject: (id: string) => void;
+}
+
+function NantyMessageView({ m, cards, decisions, onOpenProject }: MessageViewProps) {
+  const { t } = useT();
+  const openProject = m.open_project;
   // Spec 139 T05: o texto fixo sai no idioma da mensagem (o da conversa), não no da interface.
   // Spec 139 T06 (C-11): com o texto do modelo, a lista fixa (`lines`) não entra; ficam a frase
   // curta do servidor e o porquê dos avisos guardados (`why`, sempre) junto do texto dele, como no
-  // Telegram. Spec 139 T12: a fala do modelo vem primeiro e a frase do servidor fecha; só o título
-  // do resumo abre o texto.
+  // Telegram. Spec 139 T12: a fala do modelo vem primeiro e a frase do servidor fecha; só os títulos
+  // (o do resumo e o do cenário, spec 140 T12) abrem o texto.
   const modelText = m.text !== null && m.text.trim() !== "" ? m.text : null;
   const fixedLines = modelText === null ? [...m.lines, ...m.why] : m.why;
   const fixed = nantyLinesText(m.code, m.params, fixedLines, m.lang ?? undefined);
-  const leads = m.code === DIGEST_LEAD;
+  const leads = m.code !== null && LEADS.includes(m.code);
   const paragraphs = modelText === null ? fixed : leads ? [...fixed, modelText] : [modelText, ...fixed];
   const cited = m.card_ids.map((id) => cards.find((c) => c.id === id)).filter((c): c is NantyCard => c !== undefined);
   return (
@@ -170,6 +184,11 @@ function NantyMessageView({ m, cards, decisions }: { m: NantyMessage; cards: rea
         {cited.map((card) => (
           <CardActions key={card.id} card={card} decisions={decisions} primary={false} origin="chat" />
         ))}
+        {openProject !== null ? (
+          <button type="button" className="nd-btn nd-btn-sm" data-variant="ghost" data-nanty-open="" onClick={() => onOpenProject(openProject)}>
+            {t("nanty.convo.openProject")}
+          </button>
+        ) : null}
         <Meta m={m} />
       </div>
     </li>
@@ -200,9 +219,10 @@ interface ChatProps {
   decisions: NantyDecisions;
   /** O Nanty está ativo noutra instância: a conversa é só leitura aqui. */
   readOnly: boolean;
+  onOpenProject: (id: string) => void;
 }
 
-export function NantyChat({ messages, cards, decisions, readOnly }: ChatProps) {
+export function NantyChat({ messages, cards, decisions, readOnly, onOpenProject }: ChatProps) {
   const { t } = useT();
   const hintId = useId();
   const listRef = useRef<HTMLOListElement | null>(null);
@@ -257,7 +277,7 @@ export function NantyChat({ messages, cards, decisions, readOnly }: ChatProps) {
             <EmptyChat />
           </li>
         ) : (
-          list.map((m) => (m.from === "person" ? <PersonMessage key={m.id} m={m} /> : <NantyMessageView key={m.id} m={m} cards={cards} decisions={decisions} />))
+          list.map((m) => (m.from === "person" ? <PersonMessage key={m.id} m={m} /> : <NantyMessageView key={m.id} m={m} cards={cards} decisions={decisions} onOpenProject={onOpenProject} />))
         )}
       </ol>
       {notice !== null ? (

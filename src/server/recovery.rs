@@ -1702,7 +1702,7 @@ fn reason_line(key: &str) -> String {
 /// Estado git resumido (branch atual, status curto, diff --stat base...branch), limitado.
 fn git_summary(root: &Path, base: Option<&str>, branch: &str) -> String {
     let run = |args: &[&str]| -> String {
-        match Command::new("git").args(args).current_dir(root).output() {
+        match Command::new("git").args(crate::harness::git::NEUTRAL_CONFIG).args(args).current_dir(root).output() {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if text.is_empty() {
@@ -2899,6 +2899,7 @@ fn diff_patch(root: &Path, base: Option<&str>, branch: &str) -> String {
         return UNAVAILABLE.into();
     }
     let out = Command::new("git")
+        .args(crate::harness::git::NEUTRAL_CONFIG)
         .args(["diff", "--no-color", "--no-ext-diff", &format!("{base}...{branch}"), "--"])
         .current_dir(root)
         .output();
@@ -2925,6 +2926,7 @@ fn diff_names(root: &Path, base: Option<&str>, branch: &str) -> String {
         return UNAVAILABLE.into();
     }
     let out = Command::new("git")
+        .args(crate::harness::git::NEUTRAL_CONFIG)
         .args(["diff", "--name-status", &format!("{base}...{branch}"), "--"])
         .current_dir(root)
         .output();

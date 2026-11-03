@@ -864,7 +864,7 @@ async fn voice_checks(rig: &Rig, stage: &mut Stage) -> (Vec<Check>, String) {
             text.push_str("teto atingido: as falas pararam aqui\n");
             break;
         }
-        match voice::speak(&stage.w.state, &nanty, line).await {
+        match voice::speak(&stage.w.state, &nanty, line, voice::Tone::Neutral).await {
             Err(reasons) => {
                 checks.push(check("fala", false, format!("{i}: {reasons:?}")));
                 text.push_str(&format!("fala {i} FALHOU: {reasons:?}\n"));
@@ -902,7 +902,7 @@ async fn voice_checks(rig: &Rig, stage: &mut Stage) -> (Vec<Check>, String) {
     let body = stage.w.get("/api/nanty/voices").await;
     let local = body["voices"].as_array().into_iter().flatten().find(|v| v["language_code"] == "pt-BR").and_then(|v| v["id"].as_str()).map(str::to_string);
     if let Some(id) = local.filter(|_| !lock(&rig.ledger).over()) {
-        let spoken = provider::gemini_speak(&conn, &cfg.nanty.voice.speech_model(), &id, "O Test 14 parou na segunda tarefa.", None).await;
+        let spoken = provider::gemini_speak(&conn, &cfg.nanty.voice.speech_model(), &id, "O Test 14 parou na segunda tarefa.", voice::Tone::Neutral).await;
         checks.push(check("voz da lista serve na fala", spoken.is_ok(), format!("{id}: {:?}", spoken.as_ref().map(|a| a.bytes.len()))));
         if let Ok(audio) = &spoken {
             let tokens = audio.input_tokens.unwrap_or(0) + audio.output_tokens.unwrap_or(0);

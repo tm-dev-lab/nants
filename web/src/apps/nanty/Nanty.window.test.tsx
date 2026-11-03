@@ -46,7 +46,7 @@ async function openNanty(): Promise<HTMLElement> {
 }
 
 describe("janela do Nanty", () => {
-  it("no menu do N com o ícone de linha, e abre com as abas Feed, Regras e Ajustes na barra de título", async () => {
+  it("no menu do N com o ícone de linha, e abre com as abas Feed, Regras, Memória e Ajustes na barra de título", async () => {
     await renderShell({ ...SPACE, nanty: { config: NANTY_CONFIG, telegram: NANTY_TELEGRAM } });
     const tile = openNMenu().querySelector<HTMLElement>('.nd-nmenu-tile[data-kind="nanty"]');
     expect(tile?.getAttribute("aria-label")).toBe("Nanty");
@@ -62,7 +62,7 @@ describe("janela do Nanty", () => {
     expect(within(bar as HTMLElement).getByText("atento")).toBeTruthy();
     const tools = bar?.querySelector<HTMLElement>("[data-window-tools]");
     const tabs = within(tools as HTMLElement).getAllByRole("tab");
-    expect(tabs.map((t) => t.textContent)).toEqual(["Feed", "Regras", "Ajustes"]);
+    expect(tabs.map((t) => t.textContent)).toEqual(["Feed", "Regras", "Memória", "Ajustes"]);
     expect(tabs[0]?.getAttribute("aria-selected")).toBe("true");
 
     const panel = within(win).getByRole("tabpanel");
@@ -75,9 +75,14 @@ describe("janela do Nanty", () => {
     expect(within(win).getByRole("tabpanel").querySelector("[data-nanty-rules]")?.textContent).toContain("O que o Nanty pode fazer");
     fireEvent.keyDown(tabs[1] as HTMLElement, { key: "ArrowRight" });
     await settle();
+    // Spec 140 T08: a Memória fica entre as Regras e os Ajustes.
+    expect(within(win).getByRole("tabpanel").querySelector("[data-nanty-memory]")).not.toBeNull();
+    expect(document.activeElement).toBe(tabs[2]);
+    fireEvent.keyDown(tabs[2] as HTMLElement, { key: "ArrowRight" });
+    await settle();
     const settings = within(win).getByRole("tabpanel");
     expect(settings.querySelector("[data-nanty-settings]")).not.toBeNull();
-    expect(document.activeElement).toBe(tabs[2]);
+    expect(document.activeElement).toBe(tabs[3]);
     // A foto do bot e o passo a passo (o Telegram não aceita foto animada).
     const link = within(settings).getByRole("link", { name: "Baixar a imagem" });
     expect(link.getAttribute("href")).toBe(NANTY_BOT_PHOTO);
@@ -92,7 +97,7 @@ describe("janela do Nanty", () => {
     expect(kinds).toEqual(["nanty", "settings"]);
     fireEvent.keyDown(window, { key: "Escape" });
     const win = await openNanty();
-    expect(within(win).getAllByRole("tab")).toHaveLength(3);
+    expect(within(win).getAllByRole("tab")).toHaveLength(4);
   });
 
   it("no lançador, com o subtítulo vivo", async () => {

@@ -126,8 +126,13 @@ async fn a_long_text_goes_as_a_short_caption_and_the_full_text_apart() {
     w.state.nanty().push_message(&spoken_reply(&w, &long));
     until("texto à parte", || !fake.sent_texts().is_empty()).await;
     let caption = sends(&fake, "sendVoice")[0]["caption"].as_str().unwrap_or_default().to_string();
-    assert!(caption.encode_utf16().count() <= 1024 && caption.ends_with('…'), "{}", caption.len());
-    assert_eq!(fake.sent_texts(), [long.trim().to_string()], "o texto completo, redigido como sempre");
+    // Spec 140 T14 (C-27): a legenda leva só o começo que o áudio fala, até 450 caracteres em fim de
+    // frase, e avisa que o resto vem a seguir; o texto traz o resto, sem repetir o começo.
+    let lead = "Projeto Loja segue bem. ".repeat(18);
+    let follows = crate::i18n::tr(Lang::PtBr, "nanty.telegram.rest_follows", &[]);
+    assert_eq!(caption, format!("{}\n\n{follows}", lead.trim_end()));
+    assert!(caption.encode_utf16().count() <= 1024);
+    assert_eq!(fake.sent_texts(), ["Projeto Loja segue bem. ".repeat(62).trim().to_string()], "o resto, redigido como sempre");
     // As duas saídas respeitam o intervalo da fila (uma chamada por vez).
     let voice_at = fake.calls("sendVoice")[0].1;
     let text_at = fake.calls("sendMessage")[0].1;
@@ -147,8 +152,12 @@ async fn the_server_line_stays_in_a_cut_caption() {
     until("texto à parte", || !fake.sent_texts().is_empty()).await;
     let line = crate::i18n::tr(Lang::PtBr, "nanty.chat.confirm", &[]);
     let caption = sends(&fake, "sendVoice")[0]["caption"].as_str().unwrap_or_default().to_string();
-    assert!(caption.encode_utf16().count() <= 1024 && caption.ends_with(&format!("…\n{line}")), "{caption}");
-    assert!(fake.sent_texts()[0].ends_with(&line), "o texto completo também fecha com ela");
+    // Spec 140 T14 (C-27): a legenda leva o começo falado e o aviso de que o resto vem a seguir; a frase
+    // do servidor fecha a última parte do texto, que é a mensagem que leva o teclado.
+    let follows = crate::i18n::tr(Lang::PtBr, "nanty.telegram.rest_follows", &[]);
+    assert!(caption.encode_utf16().count() <= 1024 && caption.ends_with(&follows) && !caption.contains(&line), "{caption}");
+    assert_eq!(fake.sent_texts().len(), 1);
+    assert!(fake.sent_texts()[0].ends_with(&format!("\n{line}")), "o texto também fecha com ela");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

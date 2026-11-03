@@ -127,6 +127,11 @@ pub struct ChatTurn {
     /// Aviso do sistema (só em [`TurnRole::System`], spec 127 T01). Omitido quando ausente.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<TurnNotice>,
+    /// Mensagem da pessoa que saiu sem internet porque havia um rascunho marcado do Nanty pendente
+    /// (spec 140 T15, C-15). Os turnos internos seguintes herdam a marca enquanto esta for a última
+    /// mensagem da pessoa. Linhas antigas não têm o campo: sem marca.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub offline: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1297,6 +1302,7 @@ mod tests {
             internal: false,
             attachments: Vec::new(),
             notice: None,
+            offline: false,
         }
     }
 

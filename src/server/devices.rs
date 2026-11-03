@@ -981,6 +981,14 @@ pub async fn require_device(State(state): State<AppState>, mut req: Request, nex
         }
     }
     let lan = state.lan_mode();
+    // Spec 140 T03 (C-30): o endereço que o aparelho alcança. Só com o dispositivo conferido, e esta
+    // camada vem depois da guarda de `Host`/`Origin`: um cabeçalho forjado por uma página não chega aqui.
+    if lan && device.is_some() {
+        let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).and_then(super::nanty::link::device_host);
+        if let Some(host) = host {
+            state.nanty().note_device_host(&host);
+        }
+    }
     if lan && !loopback && device.is_none() && !is_open(req.method(), req.uri().path()) && !chatgpt_callback_pending(&state, &req) {
         if is_page(req.method(), req.uri().path()) {
             let denial = Denial {

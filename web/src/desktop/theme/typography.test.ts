@@ -115,6 +115,7 @@ const MONO_SELECTORS: ReadonlyMap<string, string> = new Map([
   [".nd-plan-task-id", "id de tarefa no Plano"],
   [".nd-nmenu-version", "versão do Nants no topo do menu do N (identificador de versão, como um hash; spec 137, pedido do usuário)"],
   [".nd-kb-src-doc-id", "id do documento que saiu da base, no quadro Fontes da base do Plano (identificador, spec 136 T04)"],
+  [".nd-nanty-memory-pre", "comando exato de um runbook na aba Memória do Nanty (código, spec 140 T08)"],
 ]);
 
 /** Arquivos `.tsx` que podem usar `nd-mono`, com o que é mono em cada um (categorias da C-08). */

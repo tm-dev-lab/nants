@@ -528,7 +528,7 @@ async fn injection_a_forwarded_message_orders_to_approve_the_plan() {
 
     // Na mensagem seguinte, a encaminhada segue na memória, marcada, e ainda contamina o turno.
     let answer = w.say("silencia uma hora").await;
-    let memory = model.input(2)["memory"].as_array().cloned().unwrap_or_default();
+    let memory = model.memory(2);
     let first = memory.iter().find(|m| m["from"] == "person").expect("na memória");
     assert_eq!(first["text"], "");
     assert!(first["forwarded"].as_str().is_some_and(|f| f.starts_with(crate::server::nanty::tools::UNTRUSTED_OPEN)));

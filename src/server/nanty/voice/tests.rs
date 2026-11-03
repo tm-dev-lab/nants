@@ -403,15 +403,16 @@ fn the_voice_is_one_gemini_connection_with_the_initial_models() {
 /// O corpo da fala segue o formato atual da Interactions API; o estilo vai como anotação.
 #[test]
 fn the_speech_body_follows_the_current_interactions_format() {
-    let body = provider::speech_body("gemini-3.8-flash-tts", "Kore", "Oi.", None);
+    let body = provider::speech_body("gemini-3.8-flash-tts", "Kore", "Oi.", Tone::Neutral);
     assert_eq!(body["input"][0]["type"], "user_input");
     assert_eq!(body["input"][0]["content"][0], json!({"type": "text", "text": "Oi."}));
     assert_eq!(body["response_format"], json!({"type": "audio", "mime_type": "audio/wav"}));
     assert_eq!(body["generation_config"]["speech_config"], json!([{"voice": "Kore"}]));
     assert_eq!(body["store"], false);
-    let styled = provider::speech_body("m", "Kore", "Oi.", Some(" calmo "));
-    assert_eq!(styled["input"][0]["content"][0]["annotations"], json!([{"type": "speech_metadata", "style": "calmo"}]));
-    assert!(provider::speech_body("m", "Kore", "Oi.", Some("  "))["input"][0]["content"][0].get("annotations").is_none());
+    for tone in Tone::ALL.into_iter().filter(|t| *t != Tone::Neutral) {
+        let styled = provider::speech_body("m", "Kore", "Oi.", tone);
+        assert_eq!(styled["input"][0]["content"][0]["annotations"], json!([{"type": "speech_metadata", "style": tone.style()}]));
+    }
 }
 
 // ---- A cadeia ----
@@ -426,7 +427,7 @@ fn world_with_voice(tag: &str, base: &str) -> World {
 async fn gemini_speaks_and_the_spend_is_counted() {
     let (fake, base) = fake_voice().await;
     let w = world_with_voice("chain-gemini", &base);
-    let spoken = speak(&w.state, &w.nanty(), "Tudo calmo por aqui.").await.expect("fala");
+    let spoken = speak(&w.state, &w.nanty(), "Tudo calmo por aqui.", Tone::Neutral).await.expect("fala");
     assert!(spoken.ogg.starts_with(b"OggS") && spoken.duration_secs == 1);
     assert_eq!(decoded_samples(&spoken.ogg, 24_000), tone(24_000, 5).len());
     let body = &fake.calls("gemini")[0];
@@ -447,20 +448,20 @@ async fn a_failing_gemini_falls_back_to_text() {
     let w = world_with_voice("chain-fail", &base);
     // O Gemini cai: sobra o texto, com o motivo, e nenhum outro provedor é chamado.
     lock(&fake.gemini).push_back(Reply::Status(500));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["provider_error"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["provider_error"]));
     assert_eq!(w.journal("voice.failed")[0]["reason"], "provider_error");
     // O que não é áudio, e a chave recusada.
     lock(&fake.gemini).push_back(Reply::Raw(Vec::new()));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["empty"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["empty"]));
     lock(&fake.gemini).push_back(Reply::Status(401));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["auth"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["auth"]));
     let texts = w.journal("voice.text");
     assert_eq!(texts.len(), 3);
     assert_eq!(texts[2]["reasons"], json!(["auth"]));
     assert_eq!(fake.calls("gemini").len(), 3);
     // A conexão escolhida é a OpenAI (uma configuração feita à mão): texto, sem chamada.
     w.state.config().write().await.nanty.voice.connection_id = "oai".into();
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["unsupported"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["unsupported"]));
     assert_eq!(fake.calls("gemini").len(), 3);
     // Nada do texto nem das chaves no registro.
     let journal = serde_json::to_string(&w.nanty().journal_tail(1000)).expect("json");
@@ -477,12 +478,102 @@ async fn without_budget_the_voice_is_not_called_and_text_follows() {
         st.add_spend(&day, limit, 0, None);
         true
     });
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["budget"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["budget"]));
     assert!(fake.calls("gemini").is_empty());
     assert_eq!(w.journal("voice.text")[0]["reasons"], json!(["budget"]));
     // Sem conexão de voz nenhuma: texto, com o motivo.
     let w2 = World::new("chain-none", Config::default());
-    assert_eq!(speak(&w2.state, &w2.nanty(), "Oi.").await.err(), Some(vec!["no_connection"]));
+    assert_eq!(speak(&w2.state, &w2.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["no_connection"]));
+}
+
+// ---- O tom ----
+
+/// A anotação da fala `n` do Gemini simulado (`Value::Null` sem anotação).
+pub(crate) fn style_of(fake: &FakeVoice, n: usize) -> Value {
+    fake.calls("gemini")[n]["input"][0]["content"][0]["annotations"][0]["style"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_fixed_style_of_the_tone_reaches_the_provider() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("tone-style", &base);
+    for tone in Tone::ALL {
+        speak(&w.state, &w.nanty(), "Oi.", tone).await.expect("fala");
+    }
+    let styles: Vec<Value> = (0..Tone::ALL.len()).map(|n| style_of(&fake, n)).collect();
+    assert_eq!(styles, [Value::Null, json!("warm and upbeat"), json!("serious and steady"), json!("concerned but composed"), json!("calm and unhurried")]);
+    assert!(fake.calls("gemini")[0]["input"][0]["content"][0].get("annotations").is_none(), "o neutro omite a anotação");
+    assert_eq!(w.journal("voice.ok")[1]["tone"], "upbeat");
+}
+
+/// Um 400 com a anotação refaz uma vez sem ela, e a chamada que deu certo entra no gasto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_style_is_retried_once_without_it_and_counts_in_the_budget() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("tone-retry", &base);
+    lock(&fake.gemini).push_back(Reply::Status(400));
+    let spoken = speak(&w.state, &w.nanty(), "Tudo certo.", Tone::Calm).await.expect("fala");
+    assert!(spoken.ogg.starts_with(b"OggS"));
+    assert_eq!(fake.calls("gemini").len(), 2);
+    assert_eq!(style_of(&fake, 0), json!("calm and unhurried"));
+    assert_eq!(style_of(&fake, 1), Value::Null);
+    assert_eq!(fake.calls("gemini")[1]["input"][0]["content"][0]["text"], "Tudo certo.");
+    let spend = w.nanty().snapshot().spend_on(&w.nanty().now().day_key());
+    assert_eq!((spend.voice_calls, spend.input_tokens, spend.output_tokens), (1, 12, 13));
+    assert_eq!(w.journal("voice.style_refused")[0]["tone"], "calm");
+    assert_eq!(w.journal("voice.ok")[0]["tone"], "calm");
+    assert!(w.journal("voice.failed").is_empty());
+}
+
+/// A nova tentativa é uma só: recusada de novo, sobra o texto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_refusal_falls_back_to_text() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("tone-twice", &base);
+    lock(&fake.gemini).extend([Reply::Status(400), Reply::Status(400)]);
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Serious).await.err(), Some(vec!["bad_request"]));
+    assert_eq!(fake.calls("gemini").len(), 2);
+    assert_eq!(w.journal("voice.failed")[0]["reason"], "bad_request");
+    assert_eq!(w.nanty().snapshot().spend_on(&w.nanty().now().day_key()).voice_calls, 0);
+}
+
+/// Só a recusa do pedido com anotação refaz: não a falha do provedor, a chave recusada ou o neutro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn other_failures_and_the_neutral_tone_are_not_retried() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("tone-other", &base);
+    lock(&fake.gemini).push_back(Reply::Status(500));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Calm).await.err(), Some(vec!["provider_error"]));
+    lock(&fake.gemini).push_back(Reply::Error(400, "{\"error\":{\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"reason\":\"API_KEY_INVALID\"}]}}"));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Calm).await.err(), Some(vec!["auth"]));
+    lock(&fake.gemini).push_back(Reply::Status(400));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["bad_request"]));
+    assert_eq!(fake.calls("gemini").len(), 3);
+    assert!(w.journal("voice.style_refused").is_empty());
+}
+
+/// A segunda chamada confere o orçamento: acabou enquanto a primeira estava no provedor, ela não sai.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retry_is_not_sent_without_budget() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("tone-budget", &base);
+    fake.hold_speech();
+    lock(&fake.gemini).push_back(Reply::Status(400));
+    let (state, nanty) = (w.state.clone(), w.nanty());
+    let job = tokio::spawn(async move { speak(&state, &nanty, "Oi.", Tone::Calm).await });
+    while fake.calls("gemini").is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let nanty = w.nanty();
+    let (day, limit) = (nanty.now().day_key(), w.state.config().read().await.nanty.daily_budget_tokens);
+    nanty.update(|st| {
+        st.add_spend(&day, limit, 0, None);
+        true
+    });
+    fake.release_speech(1);
+    assert_eq!(job.await.expect("tarefa").err(), Some(vec!["budget"]));
+    assert_eq!(fake.calls("gemini").len(), 1);
+    assert_eq!(w.journal("voice.text")[0]["reasons"], json!(["budget"]));
 }
 
 // ---- A transcrição ----
@@ -567,10 +658,10 @@ async fn a_key_refused_with_a_400_is_auth_on_every_path_and_the_body_stays_out()
     assert_eq!(body["params"]["reason"], "bad_request");
     // A fala: o motivo certo no registro, sem o corpo.
     lock(&fake.gemini).push_back(Reply::Error(400, KEY_INVALID_BODY));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["auth"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["auth"]));
     assert_eq!(w.journal("voice.failed")[0]["reason"], "auth");
     lock(&fake.gemini).push_back(Reply::Error(400, PLAIN_400_BODY));
-    assert_eq!(speak(&w.state, &w.nanty(), "Oi.").await.err(), Some(vec!["bad_request"]));
+    assert_eq!(speak(&w.state, &w.nanty(), "Oi.", Tone::Neutral).await.err(), Some(vec!["bad_request"]));
     let record = format!("{:?}{:?}", w.journal("voice.failed"), w.journal("voice.text"));
     assert!(!record.contains("API key") && !record.contains("Invalid value"), "{record}");
     // A transcrição, com as duas formas do corpo.
@@ -738,7 +829,9 @@ fn a_message_with_two_lines_follows_the_audio_rules_and_leaves_whole() {
     message.audio = Some(audio.clone());
     nanty.keep_message(&message);
     assert_eq!(nanty.conversation_all().len(), 2, "o arquivo só recebe acréscimos");
-    assert_eq!(nanty.conversation(), [message.clone()]);
+    let all = nanty.conversation_all();
+    assert!(all[0].seq.is_some() && all[0].seq == all[1].seq, "a segunda linha leva o número da primeira");
+    assert_eq!(nanty.conversation(), [ConversationMessage { seq: all[0].seq, ..message.clone() }]);
     assert!(nanty.read_audio(&audio.id).is_some());
     prune_older(&nanty, Duration::ZERO);
     assert!(nanty.read_audio(&audio.id).is_some(), "a segunda linha cita o áudio");
@@ -769,7 +862,7 @@ async fn a_long_text_is_spoken_up_to_the_last_whole_sentence() {
     voice_config(&mut cfg, &base);
     let w = World::new("cut", cfg);
     let text = "Uma frase inteira sobre o projeto. ".repeat(100);
-    let spoken = speak(&w.state, &w.nanty(), &text).await;
+    let spoken = speak(&w.state, &w.nanty(), &text, Tone::Neutral).await;
     assert!(spoken.is_ok());
     let sent = fake.calls("gemini")[0]["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string();
     assert!(sent.chars().count() <= MAX_SPEECH_CHARS && sent.ends_with("projeto."), "{}", sent.len());
@@ -824,7 +917,7 @@ async fn the_route_serves_only_audio_of_the_conversation_and_follows_its_rotatio
     // A mensagem sai da conversa (a rotação, ou o projeto removido): o áudio deixa de ser servido e
     // a limpeza apaga o arquivo.
     let store = nanty.store.as_ref().expect("pasta");
-    store.conversation().retain::<ConversationMessage>(|m| m.audio.is_none()).expect("retain");
+    store.conversation().retain(|m| m.audio.is_none()).expect("retain");
     assert_eq!(w.get(&uri).await.status(), StatusCode::NOT_FOUND);
     prune(&nanty);
     assert!(path.exists(), "o arquivo novo espera a folga: a mensagem dele pode estar a caminho");
@@ -894,7 +987,7 @@ async fn the_route_answers_the_range_that_safari_asks_before_playing() {
     assert_eq!(resp.headers()[header::CONTENT_RANGE], format!("bytes */{len}").as_str());
     // O intervalo não abre o áudio que saiu da conversa.
     let store = nanty.store.as_ref().expect("pasta");
-    store.conversation().retain::<ConversationMessage>(|m| m.audio.is_none()).expect("retain");
+    store.conversation().retain(|m| m.audio.is_none()).expect("retain");
     let resp = crate::server::router(w.state.clone()).oneshot(ranged("bytes=0-1")).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

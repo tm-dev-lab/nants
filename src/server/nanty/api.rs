@@ -12,6 +12,7 @@
 //!   anteriores, para a janela Custos;
 //! - `POST /api/nanty/cards/:id/decide` (T03): `{token, answer}` com `answer` = `yes`, `no` ou
 //!   `later`; responde `{outcome, code, params}` (o que o cartão diz, traduzido pela web);
+//! - `/api/nanty/memory*` (spec 140 T07): a memória de longo prazo, em [`super::memory::api`];
 //! - `POST /api/nanty/undo/:id` (T03): `{token}`; desfaz a troca de conexão (comparar e trocar);
 //! - `/api/nanty/telegram*` (T06): o canal do Telegram, em [`super::telegram::api`];
 //! - `POST /api/nanty/presence` (T07, C-07): `{tab, visible}`; com uma aba visível, o envio ao
@@ -85,6 +86,16 @@ struct CatalogView {
     default_level: ActionLevel,
 }
 
+/// O cenário proativo (spec 140 T12, C-12): o interruptor e os tetos, para a aba Ajustes dizer o que
+/// ele faz e quanto pode gastar.
+#[derive(Debug, Serialize)]
+struct AnalysisView {
+    proactive: bool,
+    scenarios_per_day: usize,
+    scenarios_per_spec: usize,
+    budget_pct: u32,
+}
+
 #[derive(Debug, Serialize)]
 struct ConfigView {
     /// Hora local do Nants agora (`HH:MM`, C-15), a mesma do silêncio e do resumo.
@@ -108,7 +119,10 @@ struct ConfigView {
     catalog: Vec<CatalogView>,
     reserve: BTreeMap<String, RouteView>,
     voice: VoiceView,
+    /// O endereço que o celular alcança, se preenchido (spec 140 T03).
+    address: String,
     telegram: TelegramView,
+    analysis: AnalysisView,
 }
 
 fn catalog_view(cfg: &NantyConfig) -> Vec<CatalogView> {
@@ -175,6 +189,7 @@ fn config_view(cfg: &NantyConfig, now: LocalTime) -> ConfigView {
         catalog: catalog_view(cfg),
         reserve: cfg.reserve.iter().map(|(role, r)| (text_view("role", role), route_view(r))).collect(),
         voice: voice_view(&cfg.voice),
+        address: cfg.address.clone(),
         telegram: TelegramView {
             bot_token_masked: if cfg.telegram.bot_token.is_empty() {
                 String::new()
@@ -184,6 +199,12 @@ fn config_view(cfg: &NantyConfig, now: LocalTime) -> ConfigView {
             paired: cfg.telegram.is_paired(),
             hold_while_visible: cfg.telegram.hold_while_visible,
             visible_hold_secs: cfg.telegram.visible_hold_secs,
+        },
+        analysis: AnalysisView {
+            proactive: cfg.analysis.proactive,
+            scenarios_per_day: cfg.analysis.per_day(),
+            scenarios_per_spec: cfg.analysis.per_spec(),
+            budget_pct: cfg.analysis.budget_pct.min(100),
         },
     }
 }
@@ -226,6 +247,8 @@ struct FeedView {
     waiting: Vec<Card>,
     #[serde(skip_serializing_if = "Option::is_none")]
     silence: Option<SilenceView>,
+    /// Os botões de apagar da memória (spec 140 T07): controles, fora de "Esperando você".
+    memory: Vec<Card>,
     /// O que foi feito, do mais novo para o mais velho.
     done: Vec<DoneItem>,
     planned: Vec<PlannedItem>,
@@ -246,8 +269,15 @@ pub async fn get_feed(State(state): State<AppState>) -> Json<serde_json::Value> 
     let silence = super::silence::global_until(&snapshot, now.epoch_ms).map(|until_ms| SilenceView {
         until_ms,
         until: super::silence::hhmm(until_ms),
-        card: snapshot.cards.iter().find(|c| c.expires_at_ms > now.epoch_ms && !c.awaits_person()).cloned(),
+        card: snapshot.cards.iter().find(|c| c.expires_at_ms > now.epoch_ms && c.action.as_deref() == Some("end_silence")).cloned(),
     });
+    // Spec 140 T07: os botões de apagar do rodapé "guardei isto", que a conversa cita.
+    let memory: Vec<Card> = snapshot
+        .cards
+        .iter()
+        .filter(|c| c.expires_at_ms > now.epoch_ms && c.action.as_deref() == Some(super::memory::card::ACTION_FORGET))
+        .cloned()
+        .collect();
     let mut waiting: Vec<Card> =
         snapshot.cards.into_iter().filter(|c| c.expires_at_ms > now.epoch_ms && c.awaits_person()).collect();
     waiting.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
@@ -260,7 +290,7 @@ pub async fn get_feed(State(state): State<AppState>) -> Json<serde_json::Value> 
         waiting: waiting.len(),
         done: done.iter().filter(|d| d.at_ms >= day_start).count(),
     };
-    let view = FeedView { waiting, silence, done, planned: snapshot.planned, today };
+    let view = FeedView { waiting, silence, memory, done, planned: snapshot.planned, today };
     Json(serde_json::to_value(view).unwrap_or_default())
 }
 
@@ -393,7 +423,8 @@ pub async fn post_decide(
     let input: DecideInput = parse_json(&body)?;
     let answer = Answer::parse(&input.answer)
         .ok_or_else(|| ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "nanty_answer_invalid", Map::new()))?;
-    let outcome = act::decide(&state, &id, &input.token, answer, DecidedBy::Web).await?;
+    // Spec 140 T07 e T15: o de levar ao Arquiteto e os da memória têm decisão própria; os outros, `act`.
+    let outcome = super::draft::decide(&state, &id, &input.token, answer, DecidedBy::Web).await?;
     Ok(outcome_json(&outcome))
 }
 
