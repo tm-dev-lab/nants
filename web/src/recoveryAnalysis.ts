@@ -125,6 +125,52 @@ const FIXED_KEYS: readonly MessageKey[] = [
 ];
 const FIXED: ReadonlyMap<string, MessageKey> = new Map(FIXED_KEYS.flatMap((key) => forms(key).map((text): [string, MessageKey] => [text, key])));
 
+/** Linha fixa inteira (sem o recuo) no idioma ativo, como `(sem saída registrada)`; outro texto volta igual. */
+export function localizeFixedLine(value: string, lang: Lang): string {
+  const key = FIXED.get(value.trim());
+  return key === undefined ? value : translate(lang, key);
+}
+
+/** Valor de `- opções: <valor>` de uma linha fixa (o texto depois do primeiro `: `). */
+function optionsValue(form: string): string {
+  const at = form.indexOf(": ");
+  return at < 0 ? form : form.slice(at + 2);
+}
+
+/** Linhas de opções fixas do servidor (`server/recovery.rs` e `recovery_plan::ASK_OPTIONS_LINE`). */
+const OPTION_KEYS: readonly MessageKey[] = [
+  "recoveryText.options.proposed",
+  "recoveryText.options.environmental",
+  "recoveryText.options.quality",
+  "recoveryText.options.ask",
+];
+const OPTION_VALUES: ReadonlyMap<string, MessageKey> = new Map(
+  OPTION_KEYS.flatMap((key) => forms(key).map((text): [string, MessageKey] => [optionsValue(text), key])),
+);
+
+/**
+ * Spec 142 T07: o valor do campo de opções do cartão de recuperação no idioma ativo. As opções
+ * fixas do servidor viram o dicionário (em qualquer idioma em que foram gravadas); as que o modelo
+ * escreveu ficam como vieram.
+ */
+export function localizeEscalationOptions(value: string, lang: Lang): string {
+  const key = OPTION_VALUES.get(value.trim());
+  return key === undefined ? value : optionsValue(translate(lang, key));
+}
+
+/** Valores fixos do código de saída (`server/recovery.rs`: `EXIT_TIMEOUT` e `EXIT_UNKNOWN`), em todos os idiomas. */
+const EXIT_VALUES: ReadonlyMap<string, MessageKey> = new Map(
+  (["recoveryText.exit.timeout", "recoveryText.exit.unknown"] as const).flatMap((key) =>
+    forms(key).map((text): [string, MessageKey] => [text, key]),
+  ),
+);
+
+/** Código de saída no idioma ativo: "tempo limite" e "não informado" viram o dicionário; um número fica como veio. */
+export function localizeExitCode(value: string, lang: Lang): string {
+  const key = EXIT_VALUES.get(value.trim());
+  return key === undefined ? value : translate(lang, key);
+}
+
 const ROUND = numericForms("recoveryText.autonomousRound");
 /** Forma antiga da rodada autônoma (antes da aprovação automática), ainda lida nos registros já gravados. */
 const LEGACY_ROUND: TemplateForm = { re: /^- Rodada autônoma \(YOLO\) #(\d+) de (\d+)$/, params: ["n", "max"] };
@@ -198,7 +244,11 @@ function line(raw: string, lang: Lang): string {
   for (const [label, key] of LABELS) {
     if (!body.startsWith(label)) continue;
     const value = body.slice(label.length);
-    const shown = CAUSE_LABELS.has(key) ? localizeRecoveryCause(value, lang) : value;
+    const shown = CAUSE_LABELS.has(key)
+      ? localizeRecoveryCause(value, lang)
+      : key === "recoveryText.exitCode"
+        ? localizeExitCode(value, lang)
+        : value;
     return `${indent}- ${translate(lang, key)}: ${shown}`;
   }
   return raw;

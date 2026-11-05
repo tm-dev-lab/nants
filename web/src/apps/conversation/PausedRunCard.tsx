@@ -14,7 +14,7 @@ import { localized } from "../../i18n";
 import { useT } from "../../i18n/react";
 import { useShell } from "../../desktop/shellContext";
 import { parseEscalation, type EscalationContext } from "../../escalation";
-import { isRecoveryAnalysis, localizeAttempted, localizeRecoveryAnalysis, localizeRecoveryCause } from "../../recoveryAnalysis";
+import { isRecoveryAnalysis, localizeRecoveryAnalysis, localizeRecoveryCause } from "../../recoveryAnalysis";
 import { recoveryKey, useAppStore, type ChatMessage } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
@@ -70,7 +70,8 @@ function Block({ title, children }: { title: string; children: ReactNode }) {
 
 function EscalationDetails({ ctx }: { ctx: EscalationContext }) {
   const { t, lang } = useT();
-  // As marcas e as causas fixas do servidor vêm em pt-BR: viram o idioma ativo (spec 115 T04).
+  // As marcas e as causas fixas do servidor vêm em pt-BR: viram o idioma ativo (spec 115 T04); os
+  // valores fixos do bloco "Contexto" já saem traduzidos do `parseEscalation` (spec 142 T07).
   const cause = ctx.rootCause !== null ? localizeRecoveryCause(ctx.rootCause, lang) : localizeRecoveryAnalysis(ctx.summary, lang);
   return (
     <div className="nd-stack-sm nd-muted">
@@ -103,12 +104,12 @@ function EscalationDetails({ ctx }: { ctx: EscalationContext }) {
       ) : null}
       {ctx.attempted !== null ? (
         <Block title={t("escalation.attempted")}>
-          <p className="nd-break">{localizeAttempted(ctx.attempted, lang)}</p>
+          <p className="nd-break">{ctx.attempted}</p>
         </Block>
       ) : null}
       {ctx.whyStopped !== null ? (
         <Block title={t("escalation.whyStopped")}>
-          <p className="nd-prewrap">{localizeRecoveryCause(ctx.whyStopped, lang)}</p>
+          <p className="nd-prewrap">{ctx.whyStopped}</p>
         </Block>
       ) : null}
       {ctx.options.length > 0 ? (
@@ -320,7 +321,7 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
     await resume();
   }
 
-  const parsed = analysis === null ? null : parseEscalation(analysis);
+  const parsed = analysis === null ? null : parseEscalation(analysis, lang);
   const resumeLabel = busy
     ? stalled
       ? t("paused.continuing")

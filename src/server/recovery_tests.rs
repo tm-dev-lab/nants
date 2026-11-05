@@ -2219,3 +2219,139 @@ mod restriction {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// ---- Spec 142 T07: o contexto da escalada não chega à tela como pt solto ----
+
+/// Valores `recoveryText.*` de um dicionário da web (`"chave": "valor"`, o valor na mesma linha
+/// ou na seguinte).
+fn web_recovery_texts(file: &str) -> std::collections::BTreeMap<String, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/i18n").join(file);
+    let source = std::fs::read_to_string(&path).expect("dicionário da web");
+    let mut out = std::collections::BTreeMap::new();
+    let mut rest = source.as_str();
+    while let Some(at) = rest.find("\"recoveryText.") {
+        rest = &rest[at + 1..];
+        let Some(end) = rest.find('"') else { break };
+        let key = rest[..end].to_string();
+        let Some(after) = rest[end + 1..].trim_start().strip_prefix(':') else { continue };
+        let Some(value) = after.trim_start().strip_prefix('"') else { continue };
+        let Some(close) = value.find('"') else { break };
+        out.insert(key, value[..close].to_string());
+    }
+    out
+}
+
+/// `line` segue o molde `template` do dicionário com números no lugar de cada `{param}`.
+fn follows_numeric_template(template: &str, line: &str) -> bool {
+    let mut parts = template.split(['{', '}']).step_by(2);
+    let Some(mut rest) = parts.next().and_then(|first| line.strip_prefix(first)) else {
+        return false;
+    };
+    for part in parts {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        let Some(r) = rest[digits..].strip_prefix(part) else {
+            return false;
+        };
+        rest = r;
+    }
+    rest.is_empty()
+}
+
+fn context_loaded(environmental: bool, exit_code: &str, error_tail: &str) -> Loaded {
+    Loaded {
+        facts: String::new(),
+        allowed_scope: Vec::new(),
+        cycles: 1,
+        environmental,
+        config_suspect: false,
+        yolo: false,
+        rounds: 0,
+        env_fixes: 0,
+        command: "npm run check".into(),
+        exit_code: exit_code.into(),
+        error_tail: error_tail.into(),
+        env_note: String::new(),
+    }
+}
+
+/// Spec 142 T07: o bloco "Contexto" é gravado no formato fixo do servidor (lido pelo modelo e pela
+/// web). Cada linha fixa dele (rótulos, opções, contagem, código de saída, "sem saída") precisa ser
+/// uma marca do dicionário da web (`recoveryText.*` em pt-BR, com a forma em inglês), para a tela a
+/// traduzir; uma linha nova em pt solto, sem a chave, falha aqui.
+#[test]
+fn escalation_context_lines_are_dictionary_markers_never_loose_portuguese() {
+    let pt = web_recovery_texts("ptBR.ts");
+    let en = web_recovery_texts("en.ts");
+    assert!(pt.len() > 30 && en.len() > 30, "dicionários lidos: {} e {}", pt.len(), en.len());
+    let key_of = |text: &str| -> Option<String> {
+        let key = pt.iter().find(|(_, v)| v.as_str() == text).map(|(k, _)| k.clone())?;
+        assert!(en.get(&key).is_some_and(|e| e != text), "{key} sem a forma em inglês");
+        Some(key)
+    };
+    let label = |key: &str| -> String {
+        let form = pt.get(key).cloned().unwrap_or_default();
+        form.trim_start_matches("- ").split(':').next().unwrap_or_default().trim().to_string()
+    };
+    let attempted_template = pt.get("recoveryText.attempted").cloned().unwrap_or_default();
+    // Conteúdo do teste (comando, causa, saída, pergunta): nenhum é texto fixo do servidor.
+    let content = ["npm run check", "boom", "7", "1"];
+    let mut proposed = Decision::escalate("boom");
+    proposed.options = vec![reset_workspace_option(Lang::PtBr)];
+    let mut ask = Decision::escalate("boom");
+    ask.change = Some(Change::Ask("7".into()));
+    let cases = [
+        (context_loaded(false, "1", ""), Decision::escalate("boom")),
+        (context_loaded(true, EXIT_TIMEOUT, ""), Decision::escalate("boom")),
+        (context_loaded(false, EXIT_UNKNOWN, "7"), Decision::escalate("boom")),
+        (context_loaded(false, "1", "7"), proposed),
+        (context_loaded(false, "1", "7"), ask),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (loaded, decision) in &cases {
+        let text = escalation_context(&SecretSet::default(), loaded, decision);
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let body = line.trim();
+            if let Some(key) = key_of(body) {
+                seen.insert(key);
+                continue;
+            }
+            if follows_numeric_template(&attempted_template, body) {
+                seen.insert("recoveryText.attempted".to_string());
+                continue;
+            }
+            if content.contains(&body) {
+                continue;
+            }
+            let (name, value) = body.trim_start_matches("- ").split_once(": ").unwrap_or((body, ""));
+            let field = ["recoveryText.command", "recoveryText.exitCode", "recoveryText.whyNot"]
+                .into_iter()
+                .find(|k| label(k) == name);
+            assert!(field.is_some(), "linha fixa fora do dicionário da web: {line:?}\n{text}");
+            match key_of(value) {
+                Some(key) => {
+                    seen.insert(key);
+                }
+                None => assert!(content.contains(&value), "valor fixo fora do dicionário da web: {line:?}"),
+            }
+        }
+    }
+    for key in [
+        "recoveryText.context",
+        "recoveryText.excerpt",
+        "recoveryText.noOutput",
+        "recoveryText.attempted",
+        "recoveryText.options.proposed",
+        "recoveryText.options.environmental",
+        "recoveryText.options.quality",
+        "recoveryText.options.ask",
+        "recoveryText.exit.timeout",
+        "recoveryText.exit.unknown",
+    ] {
+        assert!(seen.contains(key), "{key} não apareceu: {seen:?}");
+    }
+    // O tempo limite do contexto é o mesmo do cabeçalho do runner.
+    assert!(crate::agents::runner::failure_header(None, true).contains(EXIT_TIMEOUT));
+}

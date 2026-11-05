@@ -18,6 +18,10 @@ import {
   RECOVERY_REASON_MESSAGES,
 } from "../../copy";
 import { appStore } from "../../store";
+import { setLanguage } from "../../i18n";
+import { en } from "../../i18n/en";
+import { looksPortuguese } from "../../i18n/ptLeftovers";
+import { ptBR } from "../../i18n/ptBR";
 import { findForbiddenGlyphs } from "../../desktop/glyphs";
 import { notReady, READY, renderShell, settle } from "../../desktop/shell-test-utils";
 import { makeProject, makeProjectState, makeSpec, makeTask } from "../../test-utils";
@@ -25,6 +29,7 @@ import reviseTaskOption from "./fixtures/reviseTaskOption.json";
 
 afterEach(() => {
   cleanup();
+  setLanguage("pt-BR", { persist: false });
   vi.unstubAllGlobals();
 });
 
@@ -397,6 +402,39 @@ describe("Execução pausada: natureza do bloqueio e recuperação", () => {
     expect(within(article).getAllByText(/Causa raiz: Z\. Proposta: W/).length).toBeGreaterThan(0);
     expect(within(article).queryByText(/outra spec/)).toBeNull();
     expect(within(article).getByRole("button", { name: "Retomar manualmente" })).toBeTruthy();
+  });
+
+  // Spec 142 T07: as linhas fixas do bloco "Contexto" (gravadas em pt-BR pelo servidor) saem no
+  // idioma da tela no cartão, como na análise da Conversa.
+  it("em en, o bloco do contexto da escalada não mostra o texto fixo do servidor em português", async () => {
+    setLanguage("en", { persist: false });
+    await open(stateWith(pausedSpec()));
+    const full = [
+      "Análise de recuperação #3 (ESCALATE)",
+      "- Causa raiz: limite de ciclos de recuperação atingido",
+      "- Decisão: escalar ao humano",
+      "- Contexto:",
+      "  - comando: npm test",
+      "  - código: tempo limite",
+      "  - trecho do erro:",
+      `      ${ptBR["recoveryText.noOutput"]}`,
+      "  - o que foi tentado: 2 de 2 ciclos de recuperação e 0 de 2 rodadas autônomas",
+      "  - por que não resolveu: limite de ciclos de recuperação atingido",
+      `  ${ptBR["recoveryText.options.proposed"]}`,
+      ptBR["recoveryText.notCounted"],
+    ].join("\n");
+    applyEvent("agent_message", { agent: "architect", text: full, task_id: "T01", spec_id: "s1", seq: 1 });
+    applyEvent("recovery_decided", { spec_id: "s1", task_id: "T01", cycle: 1, decision: "ESCALATE" });
+    applyEvent("project_status", { status: "blocked", task_id: "T01", reason: "r", kind: "quality" });
+    const article = card();
+    const options = within(article).getByRole("heading", { name: en["escalation.options"] }).parentElement;
+    const proposed = en["recoveryText.options.proposed"];
+    expect(options?.querySelector("li")?.textContent).toBe(proposed.slice(proposed.indexOf(": ") + 2));
+    const details = options?.parentElement;
+    expect(details?.textContent).toContain("time limit");
+    expect(details?.textContent).toContain(en["recoveryText.noOutput"]);
+    expect(details?.textContent).toContain("2 of 2 recovery cycles");
+    expect(looksPortuguese(details?.textContent ?? "")).toBe(false);
   });
 
   it("escalada completa mostra os blocos estruturados, com o trecho do erro em texto", async () => {

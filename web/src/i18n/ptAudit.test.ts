@@ -53,7 +53,6 @@ const EXCEPTIONS: readonly Exception[] = [
   { file: "copy.ts", text: "provider_plan_needs_login", why: "código fixo da falha do provedor (`ProviderFailure::Plan`, spec 116); a palavra `login` vem do dicionário pt, mas o código não é texto de pessoa (a tela mostra `providerMsg.planNeedsLogin`)" },
 
   { file: "desktop/theme/contrast.ts", text: /^(cor inválida:|o fundo do contraste precisa ser opaco)$/, why: "erro de programação dos tokens de tema (lançado nos testes de contraste), nunca exibido" },
-  { file: "escalation.ts", text: /^(comando|trecho do erro|o que foi tentado|por que nao resolveu|opcoes)$/, why: `campos do bloco "Contexto" da escalada; ${SERVER_FORMAT}` },
   { file: "i18n/providerEvidence.ts", text: "error_param", why: "nome fixo do parâmetro da falha do provedor (`params.error_param`, spec 133 T01); a palavra `param` parece português, mas o nome não é texto de pessoa (a tela mostra `provider.evidence.param`)" },
   { file: "i18n/en.ts", text: "Português (Brasil)", why: "nome do idioma na própria língua, no seletor de idioma (o mesmo nos dois dicionários)" },
   { file: "imageResize.ts", text: /^(canvas indisponível|falha ao converter a imagem)$/, why: "erro interno capturado pelo anexo; a tela mostra `attachments.readFailed`" },

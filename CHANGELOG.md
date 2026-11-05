@@ -187,6 +187,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- **A website you read with your eyes first.** The How to use page now has the path in four
+  steps (Install, Connect, Ask and Follow), a table of contents at the side and, in each section,
+  one sentence and a visual: the roles and providers as cards, the flow of the agents with its two
+  ways back, real screenshots with numbered markers, the knowledge base, the container limits, the
+  costs, Nanty and the data folders. All the previous text is still there, folded in a detail you
+  open with one click, and the links to the sections keep working. The Install page gets the same
+  treatment, with numbered steps, the command in a block you can copy and the first access. Three
+  short silent clips show the Board moving, the recovery choice card and a conversation with
+  Nanty; they play only while on screen and stay still when your system asks for less motion. The
+  screenshots and clips now come from a script that runs an isolated Nants with made-up data and
+  no keys, so they are redone for every version, in both languages.
 - **No more dock.** Its place is the Nants menu, and the windows use the whole screen down to the
   bottom edge. Saved layouts are adjusted once to the new space.
 - **The top bar stays on one line** at any desktop width; only the status text shortens, with the
@@ -201,6 +212,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- **The recovery card speaks the screen language.** The "What you can do" options, the exit code
+  ("time limit"), the empty error excerpt, what was tried and why it stopped no longer show the
+  fixed Portuguese text with the screen in English, also for escalations saved before this fix.
 - **A blank screen when opening a project** whose recovery offered to revise a task. The
   screen now reads that option in both formats, and an error inside one window shows in that window
   only, with **Reload the window**, while the rest of Nants keeps working.

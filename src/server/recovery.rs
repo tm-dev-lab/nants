@@ -116,6 +116,11 @@ pub const RESET_WORKSPACE_ID: &str = "reset_workspace";
 /// Spec 141 T05 (C-05): a primeira falha depois da escolha da pessoa tem a mesma assinatura da falha
 /// da escalada. Escalada sem o modelo, sem reabrir os ciclos, com as opções reais de novo.
 pub const CAUSE_SAME_FAILURE: &str = "a mesma falha voltou depois da sua escolha";
+/// Spec 142 T07: valores fixos do código de saída no contexto da escalada (`  - código: ...`), além
+/// do número. São marcas do formato gravado (lidas pelo modelo e pela web); a web as mostra pelo
+/// dicionário (`recoveryText.exit.timeout` e `recoveryText.exit.unknown`).
+const EXIT_TIMEOUT: &str = "tempo limite";
+const EXIT_UNKNOWN: &str = "não informado";
 
 /// O que o run faz depois da análise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3506,7 +3511,7 @@ pub fn command_did_not_run(evidence: &str) -> bool {
     if !first.starts_with(TEST_FAILURE_MARK) {
         return false;
     }
-    first == format!("{TEST_FAILURE_MARK}: tempo limite]") || missing_program_code(evidence).is_some()
+    first == format!("{TEST_FAILURE_MARK}: {EXIT_TIMEOUT}]") || missing_program_code(evidence).is_some()
 }
 
 /// Spec 139 T11: o código 126 ou 127 (programa não executável ou não encontrado) medido pelo runner,
@@ -3582,7 +3587,7 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
         .strip_prefix(TEST_FAILURE_MARK)
         .map(|rest| rest.trim_start_matches(':').trim().trim_end_matches(']').trim().trim_start_matches("código").trim().to_string())
         .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "não informado".to_string());
+        .unwrap_or_else(|| EXIT_UNKNOWN.to_string());
     let error_tail = scrub_text(secrets, &evidence_tail(evidence.as_str(), ENV_TAIL_BYTES)).trim().to_string();
 
     let mut out = String::new();

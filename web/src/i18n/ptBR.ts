@@ -1127,6 +1127,8 @@ export const ptBR = {
   "recoveryText.context": "- Contexto:",
   "recoveryText.excerpt": "- trecho do erro:",
   "recoveryText.noOutput": "(sem saída registrada)",
+  "recoveryText.exit.timeout": "tempo limite",
+  "recoveryText.exit.unknown": "não informado",
   "recoveryText.attempted": "- o que foi tentado: {cycles} de {maxCycles} ciclos de recuperação e {rounds} de {maxRounds} rodadas autônomas",
   "recoveryText.attemptedValue": "{cycles} de {maxCycles} ciclos de recuperação e {rounds} de {maxRounds} rodadas autônomas",
   "recoveryText.options.proposed": "- opções: escolha uma das opções propostas acima, escreva uma orientação própria ou use Retomar",

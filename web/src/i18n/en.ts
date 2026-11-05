@@ -1081,6 +1081,8 @@ export const en: Record<MessageKey, string> = {
   "recoveryText.context": "- Context:",
   "recoveryText.excerpt": "- error excerpt:",
   "recoveryText.noOutput": "(no output recorded)",
+  "recoveryText.exit.timeout": "time limit",
+  "recoveryText.exit.unknown": "not reported",
   "recoveryText.attempted": "- what was tried: {cycles} of {maxCycles} recovery cycles and {rounds} of {maxRounds} autonomous rounds",
   "recoveryText.attemptedValue": "{cycles} of {maxCycles} recovery cycles and {rounds} of {maxRounds} autonomous rounds",
   "recoveryText.options.proposed": "- options: choose one of the options proposed above, write your own guidance or use Resume",
