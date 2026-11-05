@@ -59,6 +59,7 @@ pub mod chat;
 pub mod clock;
 pub mod deep;
 pub mod digest;
+pub mod docs;
 pub mod draft;
 pub mod files;
 pub mod filter;
@@ -70,6 +71,7 @@ pub mod jsonl;
 pub mod language;
 pub mod link;
 pub mod memory;
+pub mod notice;
 pub mod observe;
 pub mod provenance;
 pub mod read;
@@ -492,6 +494,7 @@ impl Nanty {
     /// Muda o estado com `f` e, se mudou, grava (só o dono) e avisa a janela.
     pub fn update(&self, f: impl FnOnce(&mut NantyState) -> bool) -> bool {
         let mut guard = lock(&self.state);
+        let before = guard.cards.clone();
         if !f(&mut guard) {
             return false;
         }
@@ -502,7 +505,10 @@ impl Nanty {
                 }
             }
         }
+        // Spec 141 T06: o cartão decidido, resolvido ou vencido vira um evento na conversa.
+        let events = notice::events(&before, &guard, self.now().epoch_ms);
         drop(guard);
+        self.keep_events(events);
         self.changed(Part::Feed);
         self.changed(Part::Avatar);
         // T07: a fila de saída do Telegram confere o que mudou (cartão novo, decidido, resolvido).
@@ -514,6 +520,7 @@ impl Nanty {
     /// Telegram (T07) não muda nada que a tela mostre.
     pub fn update_quiet(&self, f: impl FnOnce(&mut NantyState) -> bool) -> bool {
         let mut guard = lock(&self.state);
+        let before = guard.cards.clone();
         if !f(&mut guard) {
             return false;
         }
@@ -524,7 +531,28 @@ impl Nanty {
                 }
             }
         }
+        let events = notice::events(&before, &guard, self.now().epoch_ms);
+        drop(guard);
+        self.keep_events(events);
         true
+    }
+
+    /// Grava os eventos de cartão na conversa (spec 141 T06, C-07), sem ir ao Telegram: lá, a
+    /// mensagem do cartão já ganha a linha final. A decisão entra sempre; a resolução e a expiração,
+    /// só do cartão que a pessoa viu (citado na conversa ou enviado ao Telegram).
+    fn keep_events(&self, events: Vec<notice::Pending>) {
+        if events.is_empty() || !self.owns() {
+            return;
+        }
+        let unseen = events.iter().any(|e| e.needs_seen && !e.sent);
+        let cited: Vec<String> = if unseen {
+            self.conversation().iter().flat_map(|m| m.card_ids.iter().cloned().chain(m.notices.iter().map(|f| f.card_id.clone()))).collect()
+        } else {
+            Vec::new()
+        };
+        for event in events.iter().filter(|e| !e.needs_seen || e.sent || cited.contains(&e.fact.card_id)) {
+            self.keep_message(&notice::event_message(event));
+        }
     }
 
     /// Guarda o `Host` de um aparelho autorizado (spec 140 T03), só quando muda: esta chamada corre a
@@ -693,6 +721,19 @@ impl Nanty {
         if !self.owns() {
             return;
         }
+        // Spec 141 T06 (C-07): a mensagem do Nanty que cita cartões grava os fatos deles agora, enquanto
+        // os cartões estão no estado. A regravação do mesmo id (o áudio, a fala do aviso) pode vir de um
+        // objeto sem eles (revisão 1, F-02): valem os da linha já gravada, e só sem ela os do estado.
+        let filled;
+        let message = if message.from == store::Speaker::Nanty && message.notices.is_empty() && !message.card_ids.is_empty() {
+            let mut m = message.clone();
+            let stored = self.conversation().into_iter().rfind(|s| s.id == m.id).map(|s| s.notices).filter(|n| !n.is_empty());
+            m.notices = stored.unwrap_or_else(|| notice::facts_of(&lock(&self.state), &m.card_ids));
+            filled = m;
+            &filled
+        } else {
+            message
+        };
         match self.store.as_ref().map(|s| s.conversation().append(message)) {
             Some(Ok(notes)) => notes.iter().for_each(|note| self.record_rotation(note)),
             Some(Err(_)) => terminal_notice("nanty.log.save_failed"),
@@ -1043,6 +1084,12 @@ mod t05_tests;
 
 #[cfg(test)]
 mod t06_tests;
+
+#[cfg(test)]
+mod t09_tests;
+
+#[cfg(test)]
+mod t10_tests;
 
 #[cfg(test)]
 mod provenance_tests;

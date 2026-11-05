@@ -73,7 +73,11 @@ export function nantyCodeText(code: string, params: CodeParams = {}, errorParams
   return missing ? null : text;
 }
 
-/** O texto de uma mensagem do Nanty: o texto fixo e as linhas extras, cada um no seu parágrafo. */
+/**
+ * O texto de uma mensagem do Nanty: o texto fixo e as linhas extras, cada um no seu parágrafo. A
+ * linha com o nome do projeto (`project_name`, spec 141 T10) sai com ele na frente, como no
+ * Telegram (`nanty.digest.item`).
+ */
 export function nantyLinesText(code: string | null, params: CodeParams, lines: readonly Coded[], lang: Lang = getLanguage()): string[] {
   if (code === null) return [];
   const out: string[] = [];
@@ -81,7 +85,9 @@ export function nantyLinesText(code: string | null, params: CodeParams, lines: r
   if (main !== null) out.push(main);
   for (const line of lines) {
     const text = nantyCodeText(line.code, line.params, {}, lang);
-    if (text !== null) out.push(text);
+    if (text === null) continue;
+    const project = line.params.project_name;
+    out.push(typeof project === "string" ? (nantyCodeText("nanty.digest.item", { project, text }, {}, lang) ?? text) : text);
   }
   return out;
 }

@@ -136,6 +136,9 @@ pub struct TextQuote {
 /// A mensagem respondida, só com o que conta para saber se é de terceiro.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepliedMessage {
+    /// O id da mensagem respondida (spec 141 T06): a resposta a um aviso liga a pergunta ao cartão.
+    #[serde(default)]
+    pub message_id: i64,
     #[serde(default)]
     pub from: Option<User>,
     #[serde(default)]
@@ -373,6 +376,13 @@ impl TelegramClient {
     /// (`disable_notification`); `keyboard` são as linhas de botões inline. Devolve o `message_id`
     /// (`None` se o Telegram não o mandou).
     pub async fn send(&self, chat_id: i64, text: &str, silent: bool, keyboard: Option<Value>) -> Result<Option<i64>, TgError> {
+        self.send_replying(chat_id, text, silent, keyboard, None).await
+    }
+
+    /// Como [`Self::send`], respondendo à mensagem `reply_to` (spec 141 T08: o texto inteiro que segue
+    /// a nota de voz sem legenda). Se ela não existir mais, o texto sai assim mesmo
+    /// (`allow_sending_without_reply`).
+    pub async fn send_replying(&self, chat_id: i64, text: &str, silent: bool, keyboard: Option<Value>, reply_to: Option<i64>) -> Result<Option<i64>, TgError> {
         let mut body = json!({
             "chat_id": chat_id,
             "text": super::format::fit(text, super::format::MAX_MESSAGE_CHARS),
@@ -383,6 +393,9 @@ impl TelegramClient {
         }
         if let Some(rows) = keyboard {
             body["reply_markup"] = json!({ "inline_keyboard": rows });
+        }
+        if let Some(id) = reply_to {
+            body["reply_parameters"] = json!({ "message_id": id, "allow_sending_without_reply": true });
         }
         let result = self.call(false, "sendMessage", &body).await?;
         Ok(result.get("message_id").and_then(Value::as_i64))
@@ -468,9 +481,9 @@ impl TelegramClient {
     }
 
     /// `sendVoice` (T09, C-12): a nota de voz (Opus em OGG) como arquivo, com a legenda em texto
-    /// puro (sem `parse_mode`), cortada no limite de 1024; `silent` manda sem som; `keyboard` são as
-    /// linhas de botões inline, que no multipart vão como JSON em texto (spec 139 T08, C-14). Devolve
-    /// o `message_id`.
+    /// puro (sem `parse_mode`), cortada no limite de 1024 (vazia, a nota sai sem legenda); `silent`
+    /// manda sem som; `keyboard` são as linhas de botões inline, que no multipart vão como JSON em
+    /// texto (spec 139 T08, C-14). Devolve o `message_id`.
     pub async fn send_voice(
         &self,
         chat_id: i64,
@@ -484,11 +497,12 @@ impl TelegramClient {
             .file_name("nanty.ogg")
             .mime_str("audio/ogg")
             .map_err(|_| TgError::BadResponse)?;
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .text("caption", super::format::fit(caption, super::format::MAX_CAPTION_CHARS))
-            .text("duration", duration_secs.to_string())
-            .part("voice", part);
+        let mut form = reqwest::multipart::Form::new().text("chat_id", chat_id.to_string());
+        // Spec 141 T08: a nota cujo texto não cabe na legenda sai sem ela (o texto inteiro a segue).
+        if !caption.trim().is_empty() {
+            form = form.text("caption", super::format::fit(caption, super::format::MAX_CAPTION_CHARS));
+        }
+        let mut form = form.text("duration", duration_secs.to_string()).part("voice", part);
         if silent {
             form = form.text("disable_notification", "true");
         }

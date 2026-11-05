@@ -222,8 +222,8 @@ async fn set_silence_applies_directly_with_the_server_confirmation_and_the_off_b
     assert_eq!((answer.code.as_deref(), answer.params["until"].as_str()), (Some("nanty.chat.silence_set"), Some(hhmm.as_str())));
     assert_eq!(answer.text.as_deref(), Some("Pode deixar, fico quieto."));
     let shown = crate::server::nanty::render::message_text(Lang::PtBr, &answer);
-    // Spec 139 T12: a fala do modelo primeiro, a frase do servidor fecha.
-    assert_eq!(shown, format!("Pode deixar, fico quieto.\n{}", pt("nanty.chat.silence_set", &[("until", &hhmm)])));
+    // Spec 141 T10 (C-10): o texto do modelo sozinho; a hora fica como dado e no cartão de desligar.
+    assert_eq!(shown, "Pode deixar, fico quieto.");
     // O botão para desligar, na janela (a pessoa escreveu por ela).
     assert_eq!(answer.card_ids.len(), 1);
     let off = w.card(&answer.card_ids[0]).expect("cartão");
@@ -341,9 +341,10 @@ async fn the_silence_card_keeps_the_clock_and_the_click_recalculates_it() {
     assert_eq!(silence::hhmm(w.global_silence().expect("ligado no clique")), ahead);
 }
 
-/// Spec 139 T12: a fala do modelo primeiro e a frase do servidor depois; sem ela, o servidor sozinho.
+/// Spec 141 T10 (C-10): com o texto do modelo, nenhuma frase fixa fecha a resposta (o cartão já
+/// pede o toque); sem ele, a frase do servidor é a reserva, sozinha.
 #[tokio::test]
-async fn the_server_line_closes_the_message_and_stands_alone_when_the_model_fails() {
+async fn no_fixed_line_closes_the_model_text_and_it_stands_alone_when_the_model_fails() {
     let model = Scripted::new(vec![call("propose_action", json!({"action_id": "approve_plan", "project_id": "p1"})), say("Deixei pronto o cartão do plano da Loja.")]);
     let w = World::new("order", Arc::clone(&model), |_| {});
     write_project(&w.dir.join("p1"), "Plano", "nada", None);
@@ -351,18 +352,16 @@ async fn the_server_line_closes_the_message_and_stands_alone_when_the_model_fail
     let answer = w.say("aprova o plano da loja").await;
     let line = pt("nanty.chat.confirm", &[]);
     let render = |m: &ConversationMessage| crate::server::nanty::render::message_text(Lang::PtBr, m);
-    assert_eq!(render(&answer), format!("Deixei pronto o cartão do plano da Loja.\n{line}"));
-    assert_eq!(crate::server::nanty::render::closing(Lang::PtBr, &answer), Some(line.clone()));
+    assert_eq!(render(&answer), "Deixei pronto o cartão do plano da Loja.");
+    assert!(!answer.card_ids.is_empty(), "o cartão segue com o botão");
     let mut alone = answer.clone();
     alone.text = None;
     assert_eq!(render(&alone), line);
-    assert_eq!(crate::server::nanty::render::closing(Lang::PtBr, &alone), None);
-    // O título do resumo continua abrindo o texto.
+    // O título do resumo vira selo, uma linha curta antes do texto.
     let mut digest = answer.clone();
     digest.code = Some(crate::server::nanty::digest::LEAD.to_string());
     digest.text = Some("O dia foi calmo.".into());
-    assert_eq!(render(&digest), format!("{}\nO dia foi calmo.", pt(crate::server::nanty::digest::LEAD, &[])));
-    assert_eq!(crate::server::nanty::render::closing(Lang::PtBr, &digest), None);
+    assert_eq!(render(&digest), "Resumo da manhã\nO dia foi calmo.");
 }
 
 #[tokio::test]

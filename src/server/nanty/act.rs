@@ -238,6 +238,14 @@ fn base_params(s: &Suggestion) -> Map<String, Value> {
     p
 }
 
+/// O projeto está parado agora por um defeito do ambiente do Nants (`nants_environment`, T03), pela
+/// mesma leitura da conversa ([`super::observe::project_facts`]). Sem projeto ou sem leitura, `false`:
+/// a retomada segue e o `runs::start` decide.
+async fn nants_fault_now(state: &AppState, cfg: &Config, project_id: Option<&str>) -> bool {
+    let Some(id) = project_id else { return false };
+    super::observe::project_facts(state, cfg, id).await.is_some_and(|f| f.nants_fault())
+}
+
 /// Executa a ação (fora de qualquer lock do Nanty).
 async fn execute(state: &AppState, nanty: &Arc<Nanty>, job: &Job) -> Done {
     let s = &job.suggestion;
@@ -248,6 +256,14 @@ async fn execute(state: &AppState, nanty: &Arc<Nanty>, job: &Job) -> Done {
         let (project, spec) = (s.project_id.clone().unwrap_or_default(), s.spec_id.clone().unwrap_or_default());
         starter.start(state.clone(), project, spec, mode)
     };
+    // Spec 141 T12 (nota da T09): um cartão antigo que retoma (retomar, tentar de novo, trocar pela
+    // reserva) continua clicável depois de o motivo virar defeito do ambiente do Nants. O motivo é
+    // conferido agora, no disco, e retomar é recusado com código: não resolve e gastaria tokens.
+    if matches!(s.action, ActionId::ResumeRun | ActionId::RetryProvider | ActionId::SwapReserve)
+        && nants_fault_now(state, &cfg, s.project_id.as_deref()).await
+    {
+        return Done::failed(&ApiError::coded(StatusCode::CONFLICT, "nanty_resume_nants_fault", Map::new()), params);
+    }
     match s.action {
         ActionId::ApprovePlan => {
             // C-03: o `ApproveInput` não tem versão; o hash do plano é conferido logo antes do start.

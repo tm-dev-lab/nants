@@ -323,7 +323,8 @@ async fn job(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, card: &Card, ki
     let lang = nanty_lang(&cfg.nanty, nanty);
     let secrets = SecretSet::from_config(cfg);
     let facts = super::observe::project_facts(state, cfg, &project_id).await;
-    let status = facts.as_ref().map(|f| tools::render_lines(lang, &tools::status_lines(f, true))).unwrap_or_default();
+    // Spec 141 T09 (C-09): o estado em dados, com o sinal de falha do Nants quando houver.
+    let status = facts.as_ref().map(|f| Value::Object(tools::status_json(f))).unwrap_or(Value::Null);
     let mut body = json!({
         "signal": kind.as_str(),
         "project": { "id": project_id, "name": tools::project_name(&secrets, project) },

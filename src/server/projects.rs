@@ -529,7 +529,9 @@ pub(super) fn ensure_local_excludes(root: &Path) -> Result<(), ApiError> {
         super::provider_errors::PROVIDER_ERRORS_CHAT_EXCLUDE_LINE,
         CAPTURES_EXCLUDE_LINE,
         OUTPUTS_EXCLUDE_LINE,
-        crate::harness::home::EXCLUDE_LINE,
+        // A pasta pessoal antiga (spec 129 T01); fica enquanto houver legado (spec 141 T01: a nova
+        // mora fora da árvore, e a migração tira a antiga).
+        crate::harness::home::LEGACY_EXCLUDE_LINE,
         BUDGET_EXCLUDE_LINE,
         super::chat_attachments::ATTACHMENTS_EXCLUDE_LINE,
         crate::kb::KB_EXCLUDE_LINE,
@@ -891,7 +893,8 @@ mod reserve_race_tests;
 /// `DELETE /api/projects/:id`: remove o projeto **só do Nants**. O corpo é ignorado.
 ///
 /// O que sai: a entrada em `config.projects` (gravação atômica; em falha nada muda na memória) e
-/// o estado de runtime do projeto (pedidos pendentes negados, escopos `run`). O que fica: a pasta
+/// o estado de runtime do projeto (pedidos pendentes negados, escopos `run`) e as pastas pessoais
+/// dos containers dele, no diretório de dados do Nants (spec 141 T01). O que fica: a pasta
 /// do projeto inteira (código, `.git`, `.sdd`, worktrees, branches `sdd/*`, histórico do chat).
 /// Nenhum arquivo do projeto é lido, alterado ou apagado por esta rota.
 ///
@@ -950,6 +953,16 @@ pub async fn remove_project(
         match tokio::time::timeout(super::envs::CLEANUP_TIMEOUT, torn).await {
             Ok(Ok(errors)) => errors.iter().for_each(|e| eprintln!("aviso: cleanup Docker de {id}: {e}")),
             _ => eprintln!("aviso: cleanup Docker de {id} não concluiu"),
+        }
+    }
+    // Spec 141 T01: as pastas pessoais do projeto (no diretório de dados do Nants, fora da pasta do
+    // projeto) saem com ele. Falha não impede a remoção: a varredura do início leva a sobra.
+    if let Some(homes) = state.compose().homes_dir() {
+        let pid = id.clone();
+        match tokio::task::spawn_blocking(move || crate::harness::home::remove_project(&homes, &pid)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("aviso: pastas pessoais de {id} não removidas: {}", e.kind()),
+            Err(_) => eprintln!("aviso: pastas pessoais de {id} não removidas"),
         }
     }
     // Libera fila de gravação e seqs do diálogo (a thread encerra ao drenar); a pasta fica no disco.
@@ -2248,8 +2261,8 @@ Texto.
         assert_eq!(exclude.lines().filter(|l| *l == CAPTURES_EXCLUDE_LINE).count(), 1, "{exclude}");
         // Spec 122 T02: as íntegras das saídas de ferramenta também.
         assert_eq!(exclude.lines().filter(|l| *l == OUTPUTS_EXCLUDE_LINE).count(), 1, "{exclude}");
-        // Spec 129 T01: a pasta pessoal do workspace fica fora do Git.
-        assert_eq!(exclude.lines().filter(|l| *l == crate::harness::home::EXCLUDE_LINE).count(), 1, "{exclude}");
+        // Spec 129 T01: a pasta pessoal antiga do workspace fica fora do Git (legado, spec 141 T01).
+        assert_eq!(exclude.lines().filter(|l| *l == crate::harness::home::LEGACY_EXCLUDE_LINE).count(), 1, "{exclude}");
         assert_eq!(fs::read_to_string(proj.join(".gitignore")).expect("gi"), "target/\n");
     }
 

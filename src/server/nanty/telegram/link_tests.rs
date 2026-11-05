@@ -114,7 +114,8 @@ async fn the_rc23_finding_the_notice_offers_abre_entao_and_the_link_arrives() {
     assert_eq!(url_button(&body).as_deref(), Some(&*format!("{BASE}/?space=p1")));
     assert_eq!(body["reply_markup"]["inline_keyboard"][0][0]["text"], tr(Lang::PtBr, "nanty.telegram.open_button", &[]));
     let text = text_of(&body);
-    assert!(text.starts_with("Pronto, é só tocar.") && text.ends_with(&tr(Lang::PtBr, "nanty.chat.open_link", &[])), "{text}");
+    // Spec 141 T10 (C-10): o texto do modelo, sem frase fixa depois; o botão leva o acesso.
+    assert!(text.starts_with("Pronto, é só tocar.") && !text.contains(&tr(Lang::PtBr, "nanty.chat.open_link", &[])), "{text}");
     let url = url_button(&body).unwrap_or_default();
     assert!(!url.contains("token") && !url.contains(ENTRY_PATH), "sem token e sem link de entrada: {url}");
 
@@ -149,10 +150,18 @@ async fn on_localhost_it_says_to_open_on_the_computer() {
     let body = &sends(&fake)[0];
     assert_eq!(url_button(body), None);
     assert!(body.get("reply_markup").is_none(), "{body}");
-    assert!(text_of(body).ends_with(&tr(Lang::PtBr, "nanty.chat.open_computer", &[])), "{body}");
+    // Spec 141 T10, revisão 1 (F-01): sem link, o que fazer chega à pessoa: a linha curta do servidor
+    // fecha o texto do modelo (a rede de segurança), e o resultado da ferramenta dá ao modelo o mesmo
+    // caminho, sem dizer que o servidor avisa outra coisa.
+    let line = tr(Lang::PtBr, "nanty.chat.open_computer", &[]);
+    assert_eq!(text_of(body), format!("Daqui não dá.\n{line}"));
+    assert!(line.contains("computador") && line.contains("Ajustes do Nanty") && line.contains("aparelho autorizado"), "{line}");
     let input = model.input(0);
     assert!(!input["can_do"]["conversation"].to_string().contains("open_nants"), "não é oferta: {input}");
     assert_eq!(model.results(1)[0].1, tr(Lang::PtBr, "nanty.tool.open_computer", &[]));
+    let tool = &model.results(1)[0].1;
+    // Revisão 2: a linha mantida é a fonte única dos passos; o resultado só diz que não deu.
+    assert!(!tool.contains("Ajustes") && !tool.contains("aparelho autorizado") && tool.contains("sem repetir os passos"), "{tool}");
 }
 
 /// O Telegram recusou o botão (localhost ou IP privado podem ser recusados): a mensagem sai de novo,
@@ -170,7 +179,7 @@ async fn a_refused_button_goes_again_with_the_address_as_text() {
         let url = format!("{address}/?space=p1");
         assert_eq!(url_button(first).as_deref(), Some(url.as_str()));
         assert!(second.get("reply_markup").is_none(), "{second}");
-        let want = format!("Segue.\n{}\n{}", tr(Lang::PtBr, "nanty.chat.open_link", &[]), tr(Lang::PtBr, "nanty.telegram.open_address", &[("url", &url)]));
+        let want = format!("Segue.\n{}", tr(Lang::PtBr, "nanty.telegram.open_address", &[("url", &url)]));
         assert_eq!(text_of(second), want);
         assert_eq!(w.journal("telegram.link_refused")[0]["error"], "api_error");
         assert_eq!(w.state.nanty().telegram().outbox().queued(), 0, "a mensagem não fica presa");
@@ -190,7 +199,8 @@ async fn a_passing_failure_keeps_the_button() {
     assert!(w.journal("telegram.link_refused").is_empty());
 }
 
-/// A nota de voz leva o texto inteiro; o botão sai com a frase do servidor, e a fala não lê o endereço.
+/// A nota de voz leva o texto inteiro; o botão sai numa linha curta só dele (spec 141 T10), e a fala
+/// não lê o endereço.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_voice_the_note_goes_first_and_the_button_follows() {
     let (w, fake, voice_fake) = super::voice_tests::world("link-voice", |c| {
@@ -206,11 +216,11 @@ async fn with_voice_the_note_goes_first_and_the_button_follows() {
     let person = conversation::person_message(w.state.nanty(), &cfg.nanty, &SecretSet::from_config(&cfg), Channel::Telegram, "abre o nants").expect("mensagem");
     conversation::reply(&w.state, &person).await.expect("resposta");
     until("o botão", || sends(&fake).len() == 1).await;
-    let closing = tr(Lang::PtBr, "nanty.chat.open_link", &[]);
-    assert_eq!(bodies(&fake, "sendVoice")[0]["caption"], format!("Segue.\n{closing}"));
+    let carrier = tr(Lang::PtBr, "nanty.chat.open_link", &[]);
+    assert_eq!(bodies(&fake, "sendVoice")[0]["caption"], "Segue.");
     let body = &sends(&fake)[0];
     assert_eq!(url_button(body).as_deref(), Some(&*format!("{BASE}/")));
-    assert_eq!(text_of(body), closing, "o texto não sai duas vezes");
+    assert_eq!(text_of(body), carrier, "o texto não sai duas vezes");
     assert!(!voice_fake.calls("gemini").iter().any(|c| c.to_string().contains("192.168")), "a fala não lê o endereço");
 }
 
@@ -302,8 +312,13 @@ async fn the_way_in_joins_another_effect_of_the_same_message() {
     until("resposta", || sends(&fake).iter().any(|b| url_button(b).is_some())).await;
     let body = sends(&fake).into_iter().find(|b| url_button(b).is_some()).expect("link");
     assert_eq!(url_button(&body).as_deref(), Some(&*format!("{BASE}/")));
-    assert!(text_of(&body).ends_with(&tr(Lang::PtBr, "nanty.chat.open_link", &[])), "{body}");
-    assert!(text_of(&body).contains("silêncio"), "{body}");
+    // Spec 141 T10 (C-10): o texto do modelo sai sozinho; os dois efeitos ficam como dado na
+    // mensagem (a hora do silêncio e o caminho), e o caminho também no botão.
+    assert_eq!(text_of(&body), "Certo.", "{body}");
+    let saved = w.state.nanty().conversation().into_iter().rev().find(|m| m.from == Speaker::Nanty).expect("resposta");
+    assert_eq!(saved.code.as_deref(), Some("nanty.chat.silence_set"));
+    let why = saved.params["why"].as_array().cloned().unwrap_or_default();
+    assert!(why.iter().any(|l| l["code"] == "nanty.chat.open_link"), "{:?}", saved.params);
 }
 
 /// O modelo caiu depois da ferramenta: o caminho sai assim mesmo, sem a reserva.

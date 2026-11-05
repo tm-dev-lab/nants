@@ -195,6 +195,18 @@ describe("conjunto único de botões", () => {
     expect(painters).toEqual([]);
   });
 
+  it("141/T11 (C-12): a variante .nd-btn-wrap quebra a linha; o .nd-btn comum segue numa linha só", () => {
+    const desktop = read("desktop/theme/desktop.css");
+    expect(cssRuleBody(desktop, ".nd-btn")).toMatch(/height: 32px;[\s\S]*white-space: nowrap;/);
+    const wrap = cssRuleBody(desktop, ".nd-btn-wrap");
+    expect(wrap).toContain("height: auto;");
+    expect(wrap).toContain("max-width: 100%;");
+    expect(wrap).toContain("white-space: normal;");
+    expect(wrap).toContain("overflow-wrap: anywhere;");
+    // A variante vem depois do `.nd-btn` no mesmo arquivo: com a mesma especificidade, a ordem decide.
+    expect(desktop.indexOf(".nd-btn-wrap {")).toBeGreaterThan(desktop.indexOf(".nd-btn {"));
+  });
+
   it("Aprovação automática, Internet e Layout: botões neutros; ligado, o tom só no pino do interruptor", () => {
     const shell = read("desktop/theme/shell.css");
     const toggles = read("desktop/topbar/ProjectToggles.tsx");

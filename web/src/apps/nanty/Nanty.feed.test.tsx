@@ -143,7 +143,7 @@ describe("feed do Nanty", () => {
     const { view, win } = await open({ ...NANTY_EMPTY_FEED, waiting: [], silence: { until_ms: NOW + 3600_000, until: "15:30", card: off } });
     expect(win.querySelector('[data-nanty-section="waiting"]')).toBeNull();
     const line = win.querySelector<HTMLElement>("[data-nanty-silence]") as HTMLElement;
-    expect(line.textContent).toContain("Avisos em silêncio até 15:30. O urgente continua chegando, sem som.");
+    expect(line.textContent).toContain("Avisos em silêncio até 15:30. O urgente chega sem som.");
     expect(within(line).getAllByRole("button").map((b) => b.textContent)).toEqual(["Desligar o silêncio"]);
     const posted: unknown[] = [];
     view.server.reply("POST", /^\/api\/nanty\/cards\/dddddddddddddddd\/decide$/, (body) => {
@@ -166,7 +166,7 @@ describe("feed do Nanty", () => {
       fireEvent.click(within(win).getAllByRole("button", { name: "Não" })[0] as HTMLElement);
     });
     await settle();
-    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Este cartão expirou: a situação mudou desde o aviso.");
+    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Cartão expirado: a situação mudou.");
     expect(win.querySelector("[data-nanty-notice]")?.getAttribute("data-tone")).toBe("warn");
 
     view.server.reply("POST", /\/decide$/, () => ({ status: 404, body: { error: "não encontrado", code: "not_found", params: {} } }));
@@ -265,7 +265,7 @@ describe("feed do Nanty", () => {
       fireEvent.click(within(el).getByRole("button", { name: "Confirmar" }));
     });
     await settle();
-    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Pronto, a memória foi atualizada.");
+    expect(win.querySelector("[data-nanty-notice]")?.textContent).toBe("Memória atualizada.");
     expect(win.querySelector("[data-nanty-notice]")?.getAttribute("data-tone")).toBe("ok");
   });
 

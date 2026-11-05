@@ -304,15 +304,15 @@ async fn project_14_reaches_the_model_and_the_tool_says_the_phase_of_the_bell() 
     assert_eq!(requests.len(), 2);
     assert_eq!(
         tool_names(&requests[0]),
-        ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]
+        ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nants_docs", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]
     );
     assert!(!requests[0].response_json && !requests[0].web_search);
     let input = model.input(0);
     assert_eq!(input["message"], "Como está o projeto 14?");
     let lines: Vec<&str> = input["projects"].as_array().expect("lista").iter().filter_map(Value::as_str).collect();
     assert_eq!(lines.len(), PROJECTS.len(), "a lista não corta em dez: {lines:?}");
-    let paused = tr(Lang::PtBr, "nanty.phase.paused", &[]);
-    assert!(lines.contains(&format!("p14 | Test 14 | {paused}").as_str()), "{lines:?}");
+    // Spec 141 T09 (C-10): a fase vai em código; a frase é da reserva.
+    assert!(lines.contains(&"p14 | Test 14 | paused"), "{lines:?}");
 
     // A ferramenta diz a fase da fonte única, a mesma do sino.
     let bell = crate::server::attention::build_attention(&w.state).await;
@@ -325,19 +325,13 @@ async fn project_14_reaches_the_model_and_the_tool_says_the_phase_of_the_bell() 
     let results = model.results(1);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "c0-project_status", "toda chamada recebe o resultado com o id dela");
-    let status = &results[0].1;
-    for expected in [
-        tr(Lang::PtBr, "nanty.status.project", &[("name", "Test 14"), ("id", "p14")]),
-        paused,
-        tr(Lang::PtBr, "nanty.status.task", &[("task", "T02")]),
-        crate::i18n::tr_plural(Lang::PtBr, "nanty.status.progress", 1, &[("total", "2")]),
-        // Spec 139 T06: o motivo e as tentativas em frases, nunca o código cru.
-        tr(Lang::PtBr, "nanty.reason.tests_failed", &[]),
-        crate::i18n::tr_plural(Lang::PtBr, "nanty.status.attempts_of", 2, &[("max", "3")]),
-    ] {
-        assert!(status.contains(&expected), "{expected:?} fora de:\n{status}");
-    }
-    assert!(!status.contains("cost") && !status.contains("0 ") && !status.contains("tests_failed"), "zeros e códigos crus ficam de fora:\n{status}");
+    // Spec 141 T09 (C-09): em dados, com os códigos das listas fixas; zeros e o id da spec ficam de fora.
+    let status: Value = serde_json::from_str(&results[0].1).expect("JSON");
+    assert_eq!(status["project"], json!({"id": "p14", "name": "Test 14"}));
+    let s = &status["status"];
+    assert_eq!((s["phase"].as_str(), s["task_id"].as_str(), s["reason"].as_str()), (Some("paused"), Some("T02"), Some("tests_failed")), "{status}");
+    assert_eq!((s["done"].as_u64(), s["total"].as_u64(), s["attempts"].as_u64(), s["max_attempts"].as_u64()), (Some(1), Some(2), Some(2), Some(3)), "{status}");
+    assert!(s.get("cost_usd").is_none() && s.get("spec_id").is_none() && s.get("nants_fault").is_none(), "{status}");
 
     // A resposta: o texto puro do modelo, ligada ao projeto consultado.
     assert_eq!(answer.text.as_deref(), Some("O Test 14 está pausado na T02."));
@@ -415,13 +409,13 @@ async fn the_last_round_goes_without_tools_and_every_call_gets_a_result() {
     assert_eq!(answer.text.as_deref(), Some("Parcial."));
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(tool_names(&requests[0]).len(), 16);
+    assert_eq!(tool_names(&requests[0]).len(), 17);
     assert!(requests[1].tools.is_empty(), "a última rodada vai sem ferramentas");
     // Três chamadas, todas com resultado; a terceira passou do teto por resposta.
     let results = model.results(1);
     let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["c0-system_status", "c1-nanty_activity", "c2-project_status"]);
-    assert!(results[0].1.contains(&tr(Lang::PtBr, "nanty.system.unmeasured", &[])), "{}", results[0].1);
+    assert!(results[0].1.contains("\"disk_unmeasured\":true"), "{}", results[0].1);
     assert!(results[1].1.contains(&tr(Lang::PtBr, "nanty.activity.none", &[])), "{}", results[1].1);
     assert_eq!(results[2].1, tr(Lang::PtBr, "nanty.tool.skipped", &[]));
     assert_eq!(answer.project_id, None, "a chamada que passou do teto não leu nada");
@@ -579,7 +573,8 @@ async fn the_reserve_without_a_model_finds_the_project_by_number() {
         assert_eq!(answer.code.as_deref(), Some("nanty.chat.reserve_status"), "{text}");
         assert_eq!((answer.params["project"].as_str(), answer.project_id.as_deref()), (Some("Test 14"), Some("p14")));
         let codes: Vec<&str> = answer.params["lines"].as_array().expect("linhas").iter().filter_map(|l| l["code"].as_str()).collect();
-        assert_eq!(codes, ["nanty.phase.paused", "nanty.status.task", "nanty.status.progress"], "{text}");
+        // Spec 141 T09: o motivo da parada também, na frase do dicionário.
+        assert_eq!(codes, ["nanty.phase.paused", "nanty.status.task", "nanty.status.progress", "nanty.reason.tests_failed"], "{text}");
         let shown = render::message_text(Lang::PtBr, &answer);
         assert!(shown.contains(&tr(Lang::PtBr, "nanty.phase.paused", &[])) && shown.contains("T02"), "{shown}");
     }

@@ -1572,6 +1572,7 @@ mod tests {
             project_id: PROJECT_ID.into(),
             text: body.into(),
             taint: if marked { vec![TaintSource { kind: TaintKind::ProjectFile, project_id: Some(PROJECT_ID.into()) }] } else { Vec::new() },
+            fresh: Vec::new(),
             channel: crate::server::nanty::store::Channel::Web,
             at_ms: 1,
         };

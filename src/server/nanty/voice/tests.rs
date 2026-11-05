@@ -840,43 +840,156 @@ fn a_message_with_two_lines_follows_the_audio_rules_and_leaves_whole() {
     assert!(nanty.read_audio(&audio.id).is_none());
 }
 
-// ---- O corte da fala ----
+// ---- Os trechos da fala (spec 141 T08, C-08) ----
 
-/// Spec 139 T08 (C-14): a fala só termina num fim de frase; sem nenhum, numa palavra inteira.
+/// Os trechos terminam num fim de frase; sem nenhum, numa palavra inteira; e juntos somam o texto.
 #[test]
-fn the_speech_is_cut_at_the_end_of_a_sentence() {
-    assert_eq!(speech_text("  Curto.  ", 100), "Curto.");
-    assert_eq!(speech_text("Primeira frase. Segunda frase. Terceira que passa do limite", 40), "Primeira frase. Segunda frase.");
-    assert_eq!(speech_text("Tudo certo! Valeu? Sobra um pedaço que nao cabe", 25), "Tudo certo! Valeu?");
+fn the_speech_is_cut_into_chunks_at_the_end_of_a_sentence() {
+    assert_eq!(speech_chunks("  Curto.  ", 100), ["Curto."]);
+    assert_eq!(
+        speech_chunks("Primeira frase. Segunda frase. Terceira que passa do limite", 40),
+        ["Primeira frase. Segunda frase.", "Terceira que passa do limite"]
+    );
+    assert_eq!(speech_chunks("Tudo certo! Valeu? Sobra um pedaço que nao cabe", 25), ["Tudo certo! Valeu?", "Sobra um pedaço que nao", "cabe"]);
     // Um ponto de número não é fim de frase, e uma quebra de linha é.
-    assert_eq!(speech_text("Custou 1.50 dolares hoje e segue sem parar", 25), "Custou 1.50 dolares hoje");
-    assert_eq!(speech_text("Loja\nCustou 1.50 dolares hoje e segue sem parar", 20), "Loja");
-    // Sem espaço nenhum: o limite, sem partir um caractere.
-    assert_eq!(speech_text(&"ç".repeat(30), 10), "ç".repeat(10));
-}
-
-#[tokio::test]
-async fn a_long_text_is_spoken_up_to_the_last_whole_sentence() {
-    let (fake, base) = fake_voice().await;
-    let mut cfg = Config::default();
-    voice_config(&mut cfg, &base);
-    let w = World::new("cut", cfg);
+    assert_eq!(speech_chunks("Custou 1.50 dolares hoje e segue sem parar", 25)[0], "Custou 1.50 dolares hoje");
+    assert_eq!(speech_chunks("Loja\nCustou 1.50 dolares hoje e segue sem parar", 20)[0], "Loja");
+    // Sem espaço nenhum: o limite, sem partir um caractere, e nada se perde.
+    assert_eq!(speech_chunks(&"ç".repeat(30), 10), ["ç".repeat(10), "ç".repeat(10), "ç".repeat(10)]);
+    assert!(speech_chunks("   ", 10).is_empty());
     let text = "Uma frase inteira sobre o projeto. ".repeat(100);
-    let spoken = speak(&w.state, &w.nanty(), &text, Tone::Neutral).await;
-    assert!(spoken.is_ok());
-    let sent = fake.calls("gemini")[0]["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string();
-    assert!(sent.chars().count() <= MAX_SPEECH_CHARS && sent.ends_with("projeto."), "{}", sent.len());
+    let chunks = speech_chunks(&text, CHUNK_CHARS);
+    assert!(chunks.len() > 1 && chunks.iter().all(|c| c.chars().count() <= CHUNK_CHARS && c.ends_with("projeto.")));
+    let words = |t: &str| t.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+    assert_eq!(words(&chunks.join(" ")), words(&text));
 }
 
-/// Spec 139 T12: a frase do servidor fecha a fala, mesmo quando o texto é cortado.
+/// Uma resposta de 3.000 caracteres sai numa fala só: os trechos em sequência, com a mesma voz e o
+/// mesmo tom, que somam o texto inteiro; o áudio é um só, com a duração somada; o gasto conta por
+/// trecho.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_3000_char_reply_is_one_note_from_all_its_chunks() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("chunks", &base);
+    let text = "Uma frase inteira sobre o projeto, com o detalhe que importa. ".repeat(49);
+    let text = text.trim();
+    assert!(text.chars().count() >= 3000, "{}", text.chars().count());
+    let n = speech_chunks(text, CHUNK_CHARS).len();
+    assert!(n >= 3, "{n}");
+    let spoken = speak(&w.state, &w.nanty(), text, Tone::Calm).await.expect("fala");
+    let calls = fake.calls("gemini");
+    assert_eq!(calls.len(), n, "um pedido por trecho de até {CHUNK_CHARS}");
+    let said: Vec<String> = calls.iter().map(|c| c["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string()).collect();
+    assert_eq!(said.join(" "), text, "os trechos somam o texto inteiro");
+    for (n, call) in calls.iter().enumerate() {
+        assert_eq!(call["generation_config"]["speech_config"][0]["voice"], DEFAULT_GEMINI_VOICE, "a mesma voz");
+        assert_eq!(style_of(&fake, n), json!("calm and unhurried"), "o mesmo tom");
+    }
+    // Um áudio só: os trechos de meio segundo e as pausas entre eles.
+    let gap = 24_000 / 1000 * 300;
+    let samples = n * tone(24_000, 5).len() + (n - 1) * gap;
+    assert_eq!(decoded_samples(&spoken.ogg, 24_000), samples);
+    assert_eq!(spoken.duration_secs, u32::try_from(samples.div_ceil(24_000)).unwrap_or(0));
+    let spend = w.nanty().snapshot().spend_on(&w.nanty().now().day_key());
+    let calls = n as u64;
+    assert_eq!((spend.voice_calls, spend.input_tokens, spend.output_tokens), (calls, 12 * calls, 13 * calls), "o gasto conta por trecho");
+    let ok = w.journal("voice.ok");
+    assert_eq!((ok.len(), ok[0]["chunks"].clone()), (1, json!(n)));
+}
+
+/// Um trecho que falha (ou o tom recusado num trecho do meio) não deixa áudio parcial: a fala inteira
+/// falha, com o motivo e o trecho no registro, e o que o provedor já cobrou fica no gasto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_chunk_leaves_no_partial_audio() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("chunk-fail", &base);
+    let text = "Uma frase inteira sobre o projeto, com o detalhe que importa. ".repeat(48);
+    let n = speech_chunks(&text, CHUNK_CHARS).len();
+    lock(&fake.gemini).push_back(Reply::Raw(wav(24_000, 1, &tone(24_000, 5))));
+    lock(&fake.gemini).push_back(Reply::Status(500));
+    assert_eq!(speak(&w.state, &w.nanty(), &text, Tone::Neutral).await.err(), Some(vec!["provider_error"]));
+    assert_eq!(fake.calls("gemini").len(), 2, "para no trecho que falhou");
+    let failed = w.journal("voice.failed");
+    assert_eq!((failed[0]["reason"].clone(), failed[0]["chunk"].clone(), failed[0]["chunks"].clone()), (json!("provider_error"), json!(1), json!(n)));
+    assert_eq!(w.journal("voice.text")[0]["reasons"], json!(["provider_error"]));
+    assert!(w.journal("voice.ok").is_empty());
+    let spend = w.nanty().snapshot().spend_on(&w.nanty().now().day_key());
+    assert_eq!(spend.voice_calls, 1, "o trecho falado conta");
+    // O tom recusado no primeiro trecho: os outros já vão no neutro, e a nota tem um tom só.
+    lock(&fake.calls).clear();
+    lock(&fake.gemini).push_back(Reply::Status(400));
+    speak(&w.state, &w.nanty(), &text, Tone::Calm).await.expect("fala");
+    assert_eq!(fake.calls("gemini").len(), n + 1, "o primeiro trecho refeito uma vez");
+    assert_eq!(style_of(&fake, 0), json!("calm and unhurried"));
+    assert!((1..=n).all(|i| style_of(&fake, i) == Value::Null));
+    assert_eq!(w.journal("voice.ok")[0]["spoken_tone"], "neutral");
+}
+
+/// Mais trechos que o teto: nenhuma chamada, e o texto segue inteiro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_chunks_is_text_without_a_call() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("chunk-many", &base);
+    let text = "Uma frase inteira sobre o projeto. ".repeat(30 * (MAX_CHUNKS + 1));
+    assert!(speech_chunks(&text, CHUNK_CHARS).len() > MAX_CHUNKS);
+    assert_eq!(speak(&w.state, &w.nanty(), &text, Tone::Neutral).await.err(), Some(vec!["too_long"]));
+    assert!(fake.calls("gemini").is_empty());
+}
+
+/// Revisão 1 (F-01): o texto que passa do que as três mensagens do Telegram mostram não fala, sem
+/// chamada; o que cabe, fala. A duração máxima cabe com folga no que se guarda e numa nota (50 MB).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_past_what_telegram_shows_is_not_spoken() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("chunk-units", &base);
+    assert_eq!(MAX_SPOKEN_UNITS, 3 * 4096 - 512);
+    let sentence = "Uma frase inteira sobre o projeto, com o detalhe. ";
+    let over = sentence.repeat(MAX_SPOKEN_UNITS / sentence.len() + 2);
+    assert!(format::units(over.trim()) > MAX_SPOKEN_UNITS && speech_chunks(&over, CHUNK_CHARS).len() <= MAX_CHUNKS);
+    assert_eq!(speak(&w.state, &w.nanty(), &over, Tone::Neutral).await.err(), Some(vec!["too_long"]));
+    assert!(fake.calls("gemini").is_empty(), "nenhuma chamada");
+    let fits = sentence.repeat(MAX_SPOKEN_UNITS / sentence.len() - 1);
+    assert!(format::units(fits.trim()) <= MAX_SPOKEN_UNITS && speech_chunks(&fits, CHUNK_CHARS).len() <= MAX_CHUNKS);
+    let bytes = u64::from(MAX_SPEECH_SECS) * u64::try_from(encode::OPUS_BITRATE).unwrap_or(0) / 8;
+    assert!(bytes < MAX_AUDIO_BYTES && bytes < 50 * 1024 * 1024, "{bytes}");
+}
+
+/// Revisão 1: o teto total é o prazo de um trecho por trecho, com o teto de trechos, nunca além do
+/// limite do aviso.
 #[test]
-fn the_server_line_stays_in_the_speech() {
-    let line = "Confirme no cartão.";
-    let text = format!("{}\n{line}", "Uma frase inteira sobre o projeto. ".repeat(100).trim());
-    let cut = speech_keeping(&text, Some(line), MAX_SPEECH_CHARS);
-    assert!(cut.chars().count() <= MAX_SPEECH_CHARS && cut.ends_with(&format!("projeto.\n{line}")), "{}", cut.len());
-    assert_eq!(speech_keeping("Curto.\nConfirme no cartão.", Some(line), MAX_SPEECH_CHARS), "Curto.\nConfirme no cartão.");
-    assert_eq!(speech_keeping(&text, None, 50), speech_text(&text, 50));
+fn the_total_deadline_is_per_chunk_and_never_past_the_limit() {
+    let per = Duration::from_secs(45);
+    assert_eq!(total_deadline(per, 0, Duration::MAX), per);
+    assert_eq!(total_deadline(per, 3, Duration::MAX), per * 3);
+    assert_eq!(total_deadline(per, 3, Duration::from_secs(60)), Duration::from_secs(60));
+    assert_eq!(total_deadline(per, MAX_CHUNKS + 5, Duration::MAX), per * u32::try_from(MAX_CHUNKS).unwrap_or(1));
+}
+
+/// Revisão 1: o prazo vale por trecho. O trecho que passa dele encerra a fala na hora, os seguintes
+/// nem são pedidos, e o trecho encerrado entra no gasto pela estimativa.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chunk_past_its_deadline_ends_the_speech_without_the_rest() {
+    let (fake, base) = fake_voice().await;
+    let w = world_with_voice("chunk-late", &base);
+    let tuning = w.nanty().telegram().tuning();
+    w.nanty().telegram().set_tuning(crate::server::nanty::telegram::Tuning { speech_deadline: Duration::from_millis(300), ..tuning });
+    let text = "Uma frase inteira sobre o projeto, com o detalhe que importa. ".repeat(48);
+    assert!(speech_chunks(&text, CHUNK_CHARS).len() >= 3);
+    // O primeiro trecho responde; o segundo fica preso no provedor.
+    fake.hold_speech();
+    fake.release_speech(1);
+    let started = std::time::Instant::now();
+    assert_eq!(speak(&w.state, &w.nanty(), &text, Tone::Neutral).await.err(), Some(vec!["deadline"]));
+    assert!(started.elapsed() < Duration::from_secs(3), "o texto sai na hora: {:?}", started.elapsed());
+    let failed = w.journal("voice.failed");
+    assert_eq!((failed[0]["reason"].clone(), failed[0]["chunk"].clone()), (json!("deadline"), json!(1)));
+    // Soltas as falas presas, nenhum trecho a mais é pedido nem cobrado.
+    fake.release_speech(MAX_CHUNKS);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fake.calls("gemini").len(), 2, "os trechos que faltavam não saem");
+    let spend = w.nanty().snapshot().spend_on(&w.nanty().now().day_key());
+    assert_eq!(spend.voice_calls, 2, "o trecho falado e o encerrado, pela estimativa");
+    assert!(w.journal("voice.ok").is_empty());
 }
 
 // ---- A rota dos áudios ----

@@ -227,30 +227,24 @@ fn old_line(id: &str, text: &str) -> String {
     json!({ "id": id, "at_ms": 0, "from": "nanty", "channel": "telegram", "text": text, "project_id": "p1" }).to_string()
 }
 
-/// `conversation.jsonl` antigo continua lido: a linha sem o campo conta como contaminada até sair da
-/// janela, e nada é migrado nem apagado no arquivo.
+/// `conversation.jsonl` antigo continua lido, mas a linha do Nanty sem o campo (de antes da 140) sai
+/// da janela (spec 141 T06, C-07; antes, contava como contaminada até sair): não chega ao modelo, nem
+/// como a linha do servidor, e não contamina o turno. Nada é migrado nem apagado no arquivo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_old_line_counts_as_tainted_until_it_leaves_the_window() {
-    let script = vec![mute(), say("Vale o cartão."), say("b"), mute(), say("Silenciei.")];
+async fn an_old_line_without_provenance_leaves_the_window() {
+    let script = vec![mute(), say("Silenciei.")];
     let w = World::new("legacy", Scripted::new(script), |c| c.nanty.chat.quarantine_messages = 2);
     let at = w.nanty().now().epoch_ms;
     let path = w.dir.join("data").join(NANTY_DIR).join("conversation.jsonl");
     std::fs::create_dir_all(path.parent().expect("pasta")).expect("pasta");
     std::fs::write(&path, format!("{}\n", old_line("antiga", CANARY).replace("\"at_ms\":0", &format!("\"at_ms\":{at}")))).expect("arquivo");
 
-    let held = w.say("silencia").await;
-    assert_eq!(w.muted(), None, "a linha antiga contamina");
-    assert_eq!(held.card_ids.len(), 1);
-    assert!(memory_of(&w.model, 0).iter().any(|i| i["text"] == CANARY), "ainda inteira na janela");
-    assert_eq!(sources(&held), [TaintSource { kind: TaintKind::Unknown, project_id: Some("p1".into()) }]);
-
-    w.say("mais uma").await;
-    w.say("silencia de novo").await;
-    let last = w.model.requests().len() - 1;
-    let memory = memory_of(&w.model, last);
-    assert!(!memory.iter().any(|i| i["text"].as_str().is_some_and(|t| t.contains(CANARY))), "{memory:?}");
-    assert!(memory.iter().any(|i| i["text"].as_str().is_some_and(|t| t.contains(&tr(Lang::PtBr, "nanty.taint.unknown", &[])))), "{memory:?}");
-    assert!(w.muted().is_some(), "fora da janela, o turno é limpo");
+    let answer = w.say("silencia").await;
+    assert!(w.muted().is_some(), "a linha antiga não contamina");
+    assert!(sources(&answer).is_empty(), "{answer:?}");
+    let unknown = tr(Lang::PtBr, "nanty.taint.unknown", &[]);
+    let everything = w.model.everything();
+    assert!(!everything.contains(CANARY) && !everything.contains(&unknown), "{everything}");
     let kept = std::fs::read_to_string(&path).expect("arquivo");
     assert!(kept.lines().next().is_some_and(|l| l.contains(CANARY) && !l.contains("taint")), "sem migração destrutiva");
 }

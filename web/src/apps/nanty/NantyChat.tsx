@@ -8,20 +8,24 @@
  *   texto. Com a voz ligada, a resposta da janela também tem áudio (spec 139 T08): o tocador aparece
  *   junto do texto e só toca com o clique. A rota aceita `Range` (o Safari, inclusive o do iPhone, só toca assim). Navegador que
  *   não toca Ogg/Opus (`canPlayType`): a transcrição fica, com um aviso discreto e o baixar.
+ * - **Selo e dados (spec 141 T10, C-10):** com o texto do modelo, o balão é só ele; o título do resumo e
+ *   o do cenário viram selo, e os avisos guardados do resumo, um cabeçalho de dados que abre.
+ * - **Eventos de cartão (spec 141 T06):** a decisão, a resolução e o vencimento de um aviso chegam
+ *   como mensagens do servidor (`nanty.event.*`) e aparecem como selo, sem balão nem avatar.
  * - **Abrir a tela (spec 140 T03):** a resposta com `open_project` abre o projeto quando chega, e
  *   guarda o botão para voltar a ele; aqui não há link.
  * - **Envio:** `POST /api/nanty/conversation`; a resposta chega pelo `nanty_changed` e fica só na
  *   janela (T08). O gravar aparece desligado: a gravação pela janela fica para depois.
  */
 import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import { formatTime, type MessageKey } from "../../i18n";
+import { formatTime, type Lang, type MessageKey } from "../../i18n";
 import { apiFailureText } from "../../i18n/serverCodes";
 import { useT } from "../../i18n/react";
 import { Icon } from "../../desktop/Icon";
 import { NantyAvatar } from "./NantyAvatar";
-import { nantyAudioUrl, sendNantyMessage, type NantyAudio, type NantyCard, type NantyMessage } from "./nantyApi";
+import { nantyAudioUrl, sendNantyMessage, type NantyAudio, type NantyCard, type NantyHeldGroup, type NantyMessage } from "./nantyApi";
 import { CardActions } from "./NantyFeed";
-import { nantyLinesText } from "./nantyText";
+import { clockText, nantyCodeText, nantyLinesText, nantyTitle } from "./nantyText";
 import { reloadNantyConversation } from "./nantyStore";
 import type { NantyDecisions } from "./useNantyDecisions";
 
@@ -143,10 +147,97 @@ function PersonMessage({ m }: { m: NantyMessage }) {
 }
 
 /**
- * As frases do servidor que vêm antes do texto do modelo: o título do resumo da manhã e a linha do
- * cenário proativo (spec 140 T12), que diz antes de tudo que é uma análise automática.
+ * Os títulos que viram selo (spec 141 T10, C-10): o do resumo da manhã e o do cenário proativo (spec
+ * 140 T12), numa linha curta de dado antes do balão.
  */
-const LEADS: readonly string[] = ["nanty.digest.lead", "nanty.scenario.lead"];
+const SEALS: readonly string[] = ["nanty.digest.lead", "nanty.scenario.lead"];
+
+/**
+ * A rede de segurança (spec 141 T10, revisão 1, F-01): a linha curta do servidor que fica mesmo com
+ * o texto do modelo, porque o efeito não tem cartão nem botão que diga o que fazer. Igual ao Telegram
+ * (`render::KEPT`).
+ */
+const KEPT: readonly string[] = ["nanty.chat.open_computer"];
+
+/** As linhas mantidas da mensagem: o código dela ou as linhas extras do porquê. */
+function keptLines(m: NantyMessage, lang: Lang | undefined): string[] {
+  const own = m.code !== null && KEPT.includes(m.code) ? nantyLinesText(m.code, m.params, [], lang) : [];
+  const extra = m.why.filter((l) => KEPT.includes(l.code)).flatMap((l) => nantyLinesText(l.code, l.params, [], lang));
+  return [...own, ...extra];
+}
+
+/** O selo do título, no idioma da mensagem. */
+function Seal({ code, lang }: { code: string; lang: Lang | undefined }) {
+  const text = nantyCodeText(code, {}, {}, lang);
+  if (text === null) return null;
+  return (
+    <span className="nd-nanty-seal" data-nanty-seal={code}>
+      {text}
+    </span>
+  );
+}
+
+/**
+ * Os avisos guardados do resumo como cabeçalho de dados (spec 141 T10): a contagem, e por projeto
+ * (com o defeito do Nants marcado) o tipo e a hora de cada um, na ordem do servidor. Fechado por
+ * padrão: o texto do modelo já conta o que importa.
+ */
+function HeldData({ groups, lang }: { groups: readonly NantyHeldGroup[]; lang: Lang | undefined }) {
+  const total = groups.reduce((n, g) => n + g.notices.length, 0);
+  const label = (key: string): string => nantyCodeText(key, {}, {}, lang) ?? "";
+  return (
+    <details className="nd-nanty-held" data-nanty-held="">
+      <summary className="nd-nanty-held-head">
+        <Icon name="chevron-right" size={14} className="nd-details-chevron" />
+        <span>{nantyCodeText("nanty.convo.held", { count: total }, {}, lang)}</span>
+      </summary>
+      {groups.map((g, i) => (
+        <section key={g.project_id ?? `machine-${String(i)}`} className="nd-nanty-held-group" data-nanty-held-project={g.project_id ?? ""}>
+          <p className="nd-nanty-held-project">
+            <span>{g.name ?? g.project_id ?? label("nanty.convo.held.machine")}</span>
+            {g.nants_fault ? <span className="nd-nanty-held-fault">{label("nanty.convo.held.nantsFault")}</span> : null}
+          </p>
+          {g.notices.length > 0 ? (
+            <ul className="nd-nanty-held-list">
+              {g.notices.map((n, j) => (
+                <li key={j} className="nd-nanty-held-row">
+                  <span className="nd-nanty-held-time nd-num">{clockText(n.at, lang)}</span>
+                  <span>{nantyTitle(`nanty.why.${n.kind}`, lang)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ))}
+    </details>
+  );
+}
+
+/** Prefixo dos eventos de cartão (spec 141 T06). */
+const EVENT_PREFIX = "nanty.event.";
+
+/** A resposta da decisão, no idioma da interface. */
+const ANSWER_KEYS: Readonly<Record<string, MessageKey>> = {
+  yes: "nanty.event.answer.yes",
+  no: "nanty.event.answer.no",
+  later: "nanty.event.answer.later",
+  undo: "nanty.event.answer.undo",
+};
+
+/** O evento de um cartão (spec 141 T06): o selo com quem decidiu, a resposta e a hora. */
+function EventSeal({ m, code }: { m: NantyMessage; code: string }) {
+  const { t } = useT();
+  const answer = typeof m.params.answer === "string" && Object.hasOwn(ANSWER_KEYS, m.params.answer) ? ANSWER_KEYS[m.params.answer] : undefined;
+  const time = typeof m.params.time === "string" ? clockText(m.params.time) : undefined;
+  const params = { ...m.params, ...(answer === undefined ? {} : { answer: t(answer) }), ...(time === undefined ? {} : { time }) };
+  const text = nantyCodeText(code, params, {}, m.lang ?? undefined);
+  if (text === null) return null;
+  return (
+    <li className="nd-nanty-event" data-nanty-event={code} data-nanty-msg={m.id}>
+      <span className="nd-nanty-event-seal">{text}</span>
+    </li>
+  );
+}
 
 interface MessageViewProps {
   m: NantyMessage;
@@ -159,20 +250,21 @@ function NantyMessageView({ m, cards, decisions, onOpenProject }: MessageViewPro
   const { t } = useT();
   const openProject = m.open_project;
   // Spec 139 T05: o texto fixo sai no idioma da mensagem (o da conversa), não no da interface.
-  // Spec 139 T06 (C-11): com o texto do modelo, a lista fixa (`lines`) não entra; ficam a frase
-  // curta do servidor e o porquê dos avisos guardados (`why`, sempre) junto do texto dele, como no
-  // Telegram. Spec 139 T12: a fala do modelo vem primeiro e a frase do servidor fecha; só os títulos
-  // (o do resumo e o do cenário, spec 140 T12) abrem o texto.
+  // Spec 141 T10 (C-10): com o texto do modelo, o balão é só ele, como no Telegram: nenhuma frase fixa
+  // fecha a resposta. O título vira selo, e os avisos guardados do resumo, um cabeçalho de dados.
+  // Sem o texto do modelo, a reserva: o texto fixo e as linhas extras.
+  const lang = m.lang ?? undefined;
   const modelText = m.text !== null && m.text.trim() !== "" ? m.text : null;
-  const fixedLines = modelText === null ? [...m.lines, ...m.why] : m.why;
-  const fixed = nantyLinesText(m.code, m.params, fixedLines, m.lang ?? undefined);
-  const leads = m.code !== null && LEADS.includes(m.code);
-  const paragraphs = modelText === null ? fixed : leads ? [...fixed, modelText] : [modelText, ...fixed];
+  const seal = m.code !== null && SEALS.includes(m.code) ? m.code : null;
+  const fixed = nantyLinesText(m.code, m.params, [...m.lines, ...m.why], lang);
+  // O título fica no selo, fora do balão.
+  const paragraphs = modelText !== null ? [modelText, ...keptLines(m, lang)] : seal !== null ? fixed.slice(1) : fixed;
   const cited = m.card_ids.map((id) => cards.find((c) => c.id === id)).filter((c): c is NantyCard => c !== undefined);
   return (
     <li className="nd-nanty-msg" data-from="nanty" data-nanty-msg={m.id}>
       <NantyAvatar mood="attentive" size={26} still />
       <div className="nd-nanty-msg-body">
+        {seal !== null ? <Seal code={seal} lang={lang} /> : null}
         {m.audio !== null ? <VoiceNote audio={m.audio} /> : null}
         {paragraphs.length > 0 ? (
           <div className="nd-nanty-bubble">
@@ -181,6 +273,7 @@ function NantyMessageView({ m, cards, decisions, onOpenProject }: MessageViewPro
             ))}
           </div>
         ) : null}
+        {modelText !== null && m.held.length > 0 ? <HeldData groups={m.held} lang={lang} /> : null}
         {cited.map((card) => (
           <CardActions key={card.id} card={card} decisions={decisions} primary={false} origin="chat" />
         ))}
@@ -277,7 +370,11 @@ export function NantyChat({ messages, cards, decisions, readOnly, onOpenProject 
             <EmptyChat />
           </li>
         ) : (
-          list.map((m) => (m.from === "person" ? <PersonMessage key={m.id} m={m} /> : <NantyMessageView key={m.id} m={m} cards={cards} decisions={decisions} onOpenProject={onOpenProject} />))
+          list.map((m) => {
+            if (m.from === "person") return <PersonMessage key={m.id} m={m} />;
+            if (m.code !== null && m.code.startsWith(EVENT_PREFIX) && m.text === null) return <EventSeal key={m.id} m={m} code={m.code} />;
+            return <NantyMessageView key={m.id} m={m} cards={cards} decisions={decisions} onOpenProject={onOpenProject} />;
+          })
         )}
       </ol>
       {notice !== null ? (

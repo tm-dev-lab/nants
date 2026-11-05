@@ -114,54 +114,77 @@ describe("conversa do Nanty", () => {
     expect(msg("e3").querySelector(".nd-nanty-bubble")?.textContent).toBe("Estou acompanhando os projetos por aqui.1 aviso espera a sua decisão.");
   });
 
-  it("spec 139 T06: com o texto do modelo, a lista fixa não entra; ficam a frase curta e o porquê dos avisos guardados", async () => {
+  it("spec 141 T10: com o texto do modelo, o balão é só ele; o título vira selo e os avisos guardados, dados", async () => {
     playsOgg(true);
     const lines = [{ code: "nanty.digest.running", params: { count: 1 } }];
+    const held = [
+      { project_id: "p2", name: "Mini Street Fighter", nants_fault: true, needs_attention: true, notices: [{ kind: "run_blocked", at: "20:15" }] },
+      { project_id: "p1", name: "Loja", notices: [{ kind: "task_delivered", at: "22:01" }, { kind: "task_delivered", at: "22:06" }] },
+    ];
     await open([
-      {
-        id: "d1",
-        at_ms: AT,
-        from: "nanty",
-        channel: "web",
-        code: "nanty.digest.lead",
-        params: { lines, why: [{ code: "nanty.digest.held", params: { count: 1 } }, { code: "nanty.why.task_delivered", params: { since: "02:00" } }] },
-        text: "O Test 14 parou de madrugada.",
-        lang: "pt-BR",
-      },
-      {
-        id: "d3",
-        at_ms: AT + 2000,
-        from: "nanty",
-        channel: "web",
-        code: "nanty.digest.lead",
-        params: { why: [{ code: "nanty.digest.held", params: { count: 1 } }, { code: "nanty.why.task_delivered", params: { since: "02:00" } }] },
-        text: "Test 14 stopped overnight.",
-        lang: "en",
-      },
+      { id: "d1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.digest.lead", params: { held }, text: "O Mini Street Fighter parou por um defeito do Nants.", lang: "pt-BR" },
+      { id: "d3", at_ms: AT + 2000, from: "nanty", channel: "web", code: "nanty.digest.lead", params: { held }, text: "Mini Street Fighter stopped on a Nants defect.", lang: "en" },
       { id: "d2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.digest.morning", params: { lines }, lang: "pt-BR" },
       { id: "c1", at_ms: AT + 3000, from: "nanty", channel: "web", code: "nanty.chat.confirm", params: {}, text: "Deixei o cartão pronto.", lang: "pt-BR" },
       { id: "c2", at_ms: AT + 4000, from: "nanty", channel: "web", code: "nanty.chat.confirm", params: {}, lang: "pt-BR" },
+      { id: "k1", at_ms: AT + 5000, from: "nanty", channel: "telegram", code: "nanty.chat.open_computer", params: {}, text: "Daqui não dá.", lang: "pt-BR" },
     ]);
     const paragraphs = (id: string) => Array.from(msg(id).querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
-    // O porquê dos avisos guardados sai sempre, do dicionário (C-06 da 138).
-    expect(paragraphs("d1")).toEqual(["Resumo da manhã.", "Guardei 1 aviso para este resumo:", "Uma tarefa foi entregue às 02:00.", "O Test 14 parou de madrugada."]);
-    expect(paragraphs("d3")).toEqual(["Morning summary.", "I saved 1 notice for this summary:", "A task was delivered at 02:00 AM.", "Test 14 stopped overnight."]);
-    // Sem o texto do modelo, a reserva: uma frase por fato.
+    // Revisão 1 (F-01): sem link, a linha curta do que fazer fica depois do texto do modelo.
+    expect(paragraphs("k1")).toEqual([
+      "Daqui não dá.",
+      "Sem um endereço que o seu aparelho alcance: abra o Nants no computador. Para receber o link aqui, entre uma vez por um aparelho autorizado ou preencha o endereço nos Ajustes do Nanty.",
+    ]);
+    const seal = (id: string) => msg(id).querySelector("[data-nanty-seal]")?.textContent;
+    // O texto do modelo sozinho no balão; o título no selo, no idioma da mensagem.
+    expect(paragraphs("d1")).toEqual(["O Mini Street Fighter parou por um defeito do Nants."]);
+    expect(seal("d1")).toBe("Resumo da manhã");
+    expect(paragraphs("d3")).toEqual(["Mini Street Fighter stopped on a Nants defect."]);
+    expect(seal("d3")).toBe("Morning summary");
+    // Os dados: a contagem, por projeto, com o defeito do Nants marcado, o tipo e a hora.
+    const data = msg("d1").querySelector("[data-nanty-held]");
+    expect(data?.querySelector("summary")?.textContent).toBe("3 avisos guardados");
+    const groups = Array.from(data?.querySelectorAll("[data-nanty-held-project]") ?? []);
+    expect(groups.map((g) => g.querySelector(".nd-nanty-held-project")?.textContent)).toEqual(["Mini Street FighterDefeito do Nants", "Loja"]);
+    expect(Array.from(groups[1]?.querySelectorAll("li") ?? []).map((li) => li.textContent)).toEqual(["22:01Tarefa entregue", "22:06Tarefa entregue"]);
+    expect(msg("d3").querySelector("[data-nanty-held] summary")?.textContent).toBe("3 saved notices");
+    expect(msg("d3").querySelector(".nd-nanty-held-fault")?.textContent).toBe("Nants defect");
+    // Sem o texto do modelo, a reserva: uma frase por fato, sem selo nem dados.
     expect(paragraphs("d2")).toEqual(["Bom dia. Aqui vai como estão os projetos.", "1 projeto está rodando."]);
-    // Spec 139 T12: a fala do modelo primeiro, e a frase do servidor fecha; sem ela, o servidor sozinho.
-    expect(paragraphs("c1")).toEqual(["Deixei o cartão pronto.", "Confirme no cartão: nada é feito sem o seu toque."]);
+    expect(msg("d2").querySelector("[data-nanty-seal], [data-nanty-held]")).toBeNull();
+    // Com o texto do modelo, nenhuma frase fixa fecha; sem ele, o servidor sozinho.
+    expect(paragraphs("c1")).toEqual(["Deixei o cartão pronto."]);
     expect(paragraphs("c2")).toEqual(["Confirme no cartão: nada é feito sem o seu toque."]);
   });
 
-  it("spec 140 T12: o cenário abre com a linha fixa de análise automática, no idioma dele, e sem botões", async () => {
+  it("spec 141 T10: a reserva do resumo leva o projeto na frente de cada aviso guardado", async () => {
+    playsOgg(true);
+    const why = [
+      { code: "nanty.digest.held", params: { count: 2 } },
+      { code: "nanty.why.task_delivered", params: { since: "02:00", project_name: "Loja" } },
+      { code: "nanty.why.disk_low", params: { since: "03:00", min_gb: 10 } },
+    ];
+    await open([{ id: "r1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.digest.morning", params: { why }, lang: "pt-BR" }]);
+    const paragraphs = Array.from(msg("r1").querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
+    expect(paragraphs).toEqual([
+      "Bom dia. Aqui vai como estão os projetos.",
+      "Guardei 2 avisos para este resumo:",
+      "Loja: Uma tarefa foi entregue às 02:00.",
+      "O espaço livre em disco ficou abaixo de 10 GB às 03:00.",
+    ]);
+  });
+
+  it("spec 140 T12; spec 141 T10: o cenário abre com o selo curto da análise automática, no idioma dele, e sem botões", async () => {
     playsOgg(true);
     await open([
       { id: "s1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: {}, text: "A tarefa parou nos testes.", lang: "pt-BR", project_ids: ["p1"] },
       { id: "s2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: {}, text: "The task stopped at the tests.", lang: "en" },
     ]);
     const paragraphs = (id: string) => Array.from(msg(id).querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
-    expect(paragraphs("s1")).toEqual(["Análise automática do Nanty, sem pedido seu. A causa é uma hipótese, e a decisão fica nos botões do aviso.", "A tarefa parou nos testes."]);
-    expect(paragraphs("s2")).toEqual(["Automatic analysis by Nanty, not requested by you. The cause is a hypothesis, and the decision stays with the notice buttons.", "The task stopped at the tests."]);
+    expect(paragraphs("s1")).toEqual(["A tarefa parou nos testes."]);
+    expect(msg("s1").querySelector("[data-nanty-seal]")?.textContent).toBe("Análise automática do Nanty");
+    expect(paragraphs("s2")).toEqual(["The task stopped at the tests."]);
+    expect(msg("s2").querySelector("[data-nanty-seal]")?.textContent).toBe("Automatic analysis by Nanty");
     expect(msg("s1").querySelectorAll("button")).toHaveLength(0);
   });
 
@@ -169,10 +192,28 @@ describe("conversa do Nanty", () => {
     playsOgg(true);
     await open([{ id: "w1", at_ms: AT, from: "nanty", channel: "web", code: "nanty.scenario.lead", params: { lines: [{ code: "nanty.scenario.withheld", params: {} }] }, lang: "pt-BR" }]);
     const paragraphs = Array.from(msg("w1").querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent);
-    expect(paragraphs).toEqual([
-      "Análise automática do Nanty, sem pedido seu. A causa é uma hipótese, e a decisão fica nos botões do aviso.",
-      "A análise automática deste aviso não pôde ser mostrada aqui. Se quiser, peça na conversa que eu explico o caso.",
-    ]);
+    expect(msg("w1").querySelector("[data-nanty-seal]")?.textContent).toBe("Análise automática do Nanty");
+    expect(paragraphs).toEqual(["A análise automática deste aviso não pôde ser mostrada aqui. Se quiser, peça na conversa que eu explico o caso."]);
+  });
+
+  it("spec 141 T06: a decisão, a resolução e o vencimento de um aviso aparecem como selo, sem balão, nos dois idiomas", async () => {
+    playsOgg(true);
+    const events = [
+      { id: "e1", at_ms: AT, from: "nanty", channel: "telegram", code: "nanty.event.decided.telegram", params: { time: "20:13", answer: "yes" }, project_id: "p1", notices: [{ card_id: "aaaaaaaaaaaaaaaa", project_id: "p1", signal: "plan_waiting", since: "20:11" }] },
+      { id: "e2", at_ms: AT + 1000, from: "nanty", channel: "web", code: "nanty.event.resolved", params: { time: "20:30" } },
+      { id: "e3", at_ms: AT + 2000, from: "nanty", channel: "web", code: "nanty.event.expired", params: { time: "21:00" } },
+    ];
+    await open(events);
+    const seal = (id: string) => chat().querySelector(`[data-nanty-event][data-nanty-msg="${id}"]`);
+    expect(seal("e1")?.textContent).toBe("Você decidiu pelo Telegram, às 20:13: sim.");
+    expect(seal("e2")?.textContent).toBe("Aviso resolvido às 20:30: a situação não aparece mais.");
+    expect(seal("e3")?.textContent).toBe("Aviso expirado às 21:00.");
+    expect(chat().querySelectorAll(".nd-nanty-bubble")).toHaveLength(0);
+    cleanup();
+    setLanguage("en", { persist: false });
+    await open(events);
+    expect(seal("e1")?.textContent).toBe("You decided on Telegram, at 08:13 PM: yes.");
+    expect(portugueseLeftovers(chat())).toEqual([]);
   });
 
   it("nota de voz tocável pela rota da T09: o áudio com Range é do servidor; aqui, tocar e pausar", async () => {
@@ -349,10 +390,10 @@ describe("conversa do Nanty", () => {
     });
     await settle();
     expect(posted).toEqual([{ token: "tok-p", answer: "no" }]);
-    expect(chat().querySelector("[data-nanty-notice]")?.textContent).toBe("Combinado, não faço. Só volto a sugerir se algo mudar.");
+    expect(chat().querySelector("[data-nanty-notice]")?.textContent).toBe("Combinado, não faço.");
   });
 
-  it("spec 140 T07: a resposta que guardou na memória mostra o rodapé e o botão de apagar uma vez só", async () => {
+  it("spec 140 T07; spec 141 T10: a resposta que guardou na memória é o texto do modelo, sem o rodapé fixo, e o botão de apagar uma vez só", async () => {
     const forget = {
       id: "ffffffffffffffff",
       project_id: null,
@@ -378,9 +419,9 @@ describe("conversa do Nanty", () => {
     };
     const view = await open([saved], { ...NANTY_EMPTY_FEED, memory: [forget] });
     const footer = "Guardei na memória: Disco. Se preferir que não, toque em apagar.";
-    expect(msg("s1").textContent?.split(footer).length).toBe(2);
+    expect(msg("s1").textContent).not.toContain(footer);
+    expect(Array.from(msg("s1").querySelectorAll(".nd-nanty-bubble p")).map((p) => p.textContent)).toEqual(["Anotado."]);
     expect(within(msg("s1")).getAllByRole("button").map((b) => b.textContent)).toEqual(["Apagar da memória"]);
-    expect(msg("s1").textContent).not.toContain("Guardei na memória: Disco.Guardei");
     const posted: unknown[] = [];
     view.server.reply("POST", /^\/api\/nanty\/cards\/ffffffffffffffff\/decide$/, (body) => {
       posted.push(body);

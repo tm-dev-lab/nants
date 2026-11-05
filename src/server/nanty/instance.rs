@@ -79,7 +79,19 @@ mod tests {
         // `flock` vale por arquivo aberto: uma segunda abertura (como outro processo) fica de fora.
         assert!(matches!(try_lock(&d), LockOutcome::Busy));
         drop(first);
-        assert!(matches!(try_lock(&d), LockOutcome::Acquired(_)), "a trava sai com o dono");
+        // A espera curta e limitada existe porque o `flock` vale por descrição de arquivo aberto: se
+        // outro teste, em paralelo, cria um processo filho, o `fork` copia o descritor por um instante
+        // (antes do `exec` fechá-lo, mesmo com `O_CLOEXEC`), e a trava só sai quando todas as cópias
+        // fecham. Sem a espera, a asserção corria contra esse instante e o teste falhava às vezes.
+        let mut again = try_lock(&d);
+        for _ in 0..100 {
+            if matches!(again, LockOutcome::Acquired(_)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            again = try_lock(&d);
+        }
+        assert!(matches!(again, LockOutcome::Acquired(_)), "a trava sai com o dono: {again:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

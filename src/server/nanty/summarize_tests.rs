@@ -417,7 +417,7 @@ async fn the_token_ceiling_cuts_the_oldest_messages_first() {
         person_message(&w.nanty(), &cfg.nanty, &secrets, Channel::Web, &format!("MSG{n}X{}", "y".repeat(2000))).expect("mensagem");
     }
     let person = person_message(&w.nanty(), &cfg.nanty, &secrets, Channel::Web, "agora").expect("mensagem");
-    let context = crate::server::nanty::history::context(&w.nanty(), &cfg, Lang::PtBr, &person, "{}".into());
+    let context = crate::server::nanty::history::context(&w.nanty(), &cfg, Lang::PtBr, &person, serde_json::json!({}));
     let text: String = context.messages.iter().map(|m| m.content.clone()).collect();
     assert!(text.contains("MSG9X") && text.contains("MSG8X") && !text.contains("MSG7X"), "só as duas mais novas cabem em 1.000 tokens");
 }

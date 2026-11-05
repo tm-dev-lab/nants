@@ -495,6 +495,26 @@
 }
 
 /*
+ * Variante que quebra a linha (141/T11, C-12): botão cujo texto vem de fora do dicionário ou pode
+ * ser longo (opção de recuperação, página do provedor). A altura vira mínima e o texto quebra dentro
+ * do cartão, sem vazar da borda no celular. O `.nd-btn` comum continua numa linha só.
+ */
+.nd-btn-wrap {
+  height: auto;
+  min-height: 32px;
+  max-width: 100%;
+  padding-top: var(--sp-1);
+  padding-bottom: var(--sp-1);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+.nd-btn-sm.nd-btn-wrap {
+  min-height: 26px;
+}
+
+/*
  * Ação discreta na linha do rótulo de um campo (ex.: "Atualizar lista" do Modelo, 113/T05): fantasma,
  * com a altura da linha do rótulo (`.nd-field-labelrow`), para não empurrar o campo para baixo.
  */

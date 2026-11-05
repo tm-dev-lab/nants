@@ -214,6 +214,23 @@ pub fn person_message_from(
     audio: Option<AudioRef>,
     relayed: Option<Relayed>,
 ) -> Option<ConversationMessage> {
+    person_message_about(nanty, cfg, secrets, channel, raw, voice, audio, relayed, Vec::new())
+}
+
+/// Como [`person_message_from`], com os fatos do aviso a que ela respondeu no Telegram (spec 141 T06,
+/// C-07): a resposta liga a pergunta ao cartão.
+#[allow(clippy::too_many_arguments)]
+pub fn person_message_about(
+    nanty: &Nanty,
+    cfg: &NantyConfig,
+    secrets: &SecretSet,
+    channel: Channel,
+    raw: Option<&str>,
+    voice: bool,
+    audio: Option<AudioRef>,
+    relayed: Option<Relayed>,
+    notices: Vec<super::notice::NoticeFact>,
+) -> Option<ConversationMessage> {
     let relayed = relayed.map(|r| Relayed { quote: r.quote.as_deref().and_then(|q| redact_to(secrets, q, MAX_QUOTE_CHARS)), ..r });
     let text = raw.and_then(|r| redact(secrets, r));
     if text.is_none() && !voice {
@@ -242,6 +259,7 @@ pub fn person_message_from(
         // A procedência da pessoa é o `relayed`.
         taint: None,
         seq: None,
+        notices,
     };
     nanty.push_message(&message);
     Some(message)
@@ -705,7 +723,7 @@ async fn answer(
     context: Vec<crate::agents::llm_client::ChatMessage>,
     session: &mut Session,
 ) -> (ConversationMessage, Tone) {
-    let system = crate::agents::prompts::nanty_chat_system(lang);
+    let system = crate::agents::prompts::nanty_chat_system(lang, cfg.nanty.voice.enabled);
     // C-09: só a quem escreveu pelo Telegram; a fila de saída o renova sem atropelar os envios.
     let typing = (person.channel == Channel::Telegram).then(|| nanty.telegram().outbox().typing());
     let ended = agent::run(state, nanty, cfg, system, context, session).await;
@@ -721,7 +739,7 @@ async fn answer(
     let reply = match ended {
         Ended::Reply { text, tone: chosen, .. } => {
             // Spec 140 T14 (C-27): a limpeza sem o corte. A conversa grava a resposta inteira; quem
-            // divide é o Telegram, em partes, e a frase do servidor continua fechando a última.
+            // divide é o Telegram, em partes (spec 141 T10: sem frase fixa depois do texto).
             let clean = Some(format::clean_whole(&secrets, &text)).filter(|t| !t.is_empty());
             if clean.is_some() {
                 tone = chosen;
@@ -813,7 +831,7 @@ async fn reserve(state: &AppState, nanty: &Arc<Nanty>, cfg: &Config, lang: Lang,
         Cited::Ambiguous(_) | Cited::Unknown => choose(nanty, &projects, text),
         Cited::One(project) => match super::observe::project_facts(state, cfg, &project.id).await {
             Some(facts) => {
-                let lines: Vec<Value> = tools::status_lines(&facts, false)
+                let lines: Vec<Value> = tools::status_lines(&facts)
                     .into_iter()
                     .map(|(code, params)| json!({ "code": code, "params": params }))
                     .collect();

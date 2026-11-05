@@ -157,6 +157,11 @@ export interface NantyMessage {
    * o texto do modelo (C-06 da 138).
    */
   why: Coded[];
+  /**
+   * Os avisos guardados do resumo como dados (`params.held`, spec 141 T10): com o texto do modelo, a
+   * janela os mostra como cabeçalho de dados, agrupados por projeto, sem frase fixa.
+   */
+  held: NantyHeldGroup[];
   /** Idioma da mensagem (spec 139 T05): o texto fixo é montado nele; `null` nas gravadas antes. */
   lang: Lang | null;
   card_ids: string[];
@@ -165,6 +170,22 @@ export interface NantyMessage {
   audio: NantyAudio | null;
   /** O projeto cuja tela o Nanty abriu a pedido (spec 140 T03, `params.open_project`). */
   open_project: string | null;
+}
+
+/** Um aviso guardado como dado: o tipo (`plan_waiting`...) e a hora local `HH:MM` do fato. */
+interface NantyHeldNotice {
+  kind: string;
+  at: string;
+}
+
+/** Os avisos guardados de um projeto (ou da máquina, sem projeto), na ordem do servidor. */
+export interface NantyHeldGroup {
+  project_id: string | null;
+  /** O nome redigido do projeto observado. */
+  name: string | null;
+  /** O projeto parou por um defeito do ambiente do Nants (spec 141 T09). */
+  nants_fault: boolean;
+  notices: NantyHeldNotice[];
 }
 
 export interface NantyUsage {
@@ -353,6 +374,29 @@ function parseLines(value: unknown, field: "lines" | "why" = "lines"): Coded[] {
   return list.flatMap((line: unknown) => (isRecord(line) && isMessageCode(line.code) ? [{ code: line.code, params: params(line.params) }] : []));
 }
 
+/** Tipo de aviso: `[a-z_]`, como o servidor grava. */
+const KIND_RE = /^[a-z][a-z_]{0,63}$/;
+/** Hora local `HH:MM`. */
+const HHMM_RE = /^\d{2}:\d{2}$/;
+
+function parseHeldNotice(value: unknown): NantyHeldNotice | null {
+  if (!isRecord(value) || typeof value.kind !== "string" || !KIND_RE.test(value.kind)) return null;
+  if (typeof value.at !== "string" || !HHMM_RE.test(value.at)) return null;
+  return { kind: value.kind, at: value.at };
+}
+
+function parseHeldGroup(value: unknown): NantyHeldGroup | null {
+  if (!isRecord(value)) return null;
+  const notices = list(value.notices, parseHeldNotice);
+  const nantsFault = value.nants_fault === true;
+  if (notices.length === 0 && !nantsFault) return null;
+  return { project_id: str(value.project_id, 128), name: str(value.name, 256), nants_fault: nantsFault, notices };
+}
+
+function parseHeld(value: unknown): NantyHeldGroup[] {
+  return isRecord(value) ? list(value.held, parseHeldGroup) : [];
+}
+
 function parseAudio(value: unknown): NantyAudio | null {
   if (!isRecord(value)) return null;
   const id = str(value.id, 16);
@@ -379,6 +423,7 @@ function parseMessage(value: unknown): NantyMessage | null {
     params: params(value.params),
     lines: parseLines(value.params),
     why: parseLines(value.params, "why"),
+    held: parseHeld(value.params),
     lang: isLang(value.lang) ? value.lang : null,
     card_ids: Array.isArray(value.card_ids) ? value.card_ids.filter((c): c is string => str(c, 64) !== null) : [],
     voice: value.voice === true,

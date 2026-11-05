@@ -733,7 +733,7 @@ export type RecoveryDecision =
   | "ASK"
   | "ESCALATE";
 
-type RecoveryOptionKind = "config" | "environment" | "guidance" | "revise_task";
+type RecoveryOptionKind = "config" | "environment" | "guidance" | "revise_task" | "reset_workspace";
 
 /** Checagem proposta numa opção `config` (espelha `sdd::schema::Check`). */
 interface RecoveryCheck {
@@ -762,6 +762,25 @@ export interface RecoveryOption {
   diff?: string;
   /** Environment: arquivos do ambiente docker propostos (o servidor também preenche `diff`). */
   files?: EnvironmentFileView[];
+  /** Config (spec 141 T04): a bateria completa proposta, já com a etapa trocada. */
+  full_test_command?: string;
+  /** Config (spec 141 T04): a etapa restringida, com a evidência das rodadas do servidor. */
+  restriction?: RecoveryRestriction;
+}
+
+/** Spec 141 T04 (C-03): espelha `recovery::Restriction` do servidor. */
+export interface RecoveryRestriction {
+  original: string;
+  restricted: string;
+  appended: string[];
+  tree: string;
+  original_output: string;
+  restricted_output: string;
+  /** Testes que a saída da etapa nova informa (vem da saída do projeto). */
+  tests?: number;
+  /** Testes que a saída da etapa atual informa, e quantos falharam nela. */
+  original_tests?: number;
+  original_failed?: number;
 }
 
 /** Corpo do POST recovery-choice: uma opção (com o número da análise) ou texto livre. */

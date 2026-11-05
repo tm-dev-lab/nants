@@ -7,15 +7,20 @@
 //!   andamento e pausados, o que espera a pessoa (cartões abertos e os avisos guardados para o
 //!   resumo, como os da noite), o custo dos projetos no dia anterior e o menor espaço livre em disco.
 //! - **O modelo** entra só se houver o que destacar e houver orçamento; o texto dele vai como veio e
-//!   com o idioma marcado. Com ele, a lista fixa sai e fica só a frase curta do servidor junto
-//!   (spec 139 T06, C-11, [`with_model_text`]); sem ele, a mensagem fixa (`code` + `params`) é a
-//!   reserva, com uma frase por fato e sem zeros.
+//!   com o idioma marcado. Spec 141 T10 (C-10): com ele, o texto é todo dele, escrito a partir dos
+//!   avisos guardados como dados ([`HeldGroup`]: projeto, tipo e hora), agrupados por projeto e com o
+//!   que pede atenção primeiro; a mensagem leva só o selo ([`LEAD`]) e os mesmos dados, que a janela
+//!   mostra como cabeçalho ([`with_model_text`]). Sem ele, a mensagem fixa (`code` + `params`) é a
+//!   reserva, com uma frase por fato, sem zeros, e a lista completa dos avisos guardados, em ordem e
+//!   com o projeto em cada linha.
 //! - **Dia vazio:** `[nanty] digest_empty` decide entre a mensagem curta e nenhuma.
 //! - **Voz (spec 139 T08):** com a voz ligada, o resumo sai como nota de voz com legenda.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::clock::LocalTime;
@@ -28,8 +33,8 @@ use crate::server::state::AppState;
 
 /// Atraso máximo do resumo depois da hora marcada, em minutos (provisório).
 pub const DIGEST_LATE_MINUTES: u16 = 180;
-/// Avisos guardados listados no resumo (os mais recentes).
-pub const MAX_DIGEST_LINES: usize = 10;
+/// Avisos guardados levados ao modelo (os mais recentes); a reserva e a janela levam todos.
+pub const MAX_HELD_IN: usize = 60;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Código da mensagem do resumo com fatos.
@@ -79,6 +84,20 @@ pub struct DigestFacts {
     pub disk_free_gb: Option<u64>,
     /// Um aviso de disco está aberto.
     pub disk_low: bool,
+    /// Spec 141 T09 (C-09): os projetos parados por um defeito do ambiente do Nants (o motivo
+    /// `nants_environment`), na ordem das condições. A reserva diz que o defeito é do Nants.
+    pub nants_faults: Vec<NantsFault>,
+    /// Spec 141 T10: o nome (redigido) de cada projeto observado, pelo id, para a linha da reserva e
+    /// os dados do modelo dizerem de qual projeto é cada aviso.
+    pub names: BTreeMap<String, String>,
+}
+
+/// Um projeto parado por defeito do ambiente do Nants: o id e o nome (redigido) para a reserva.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NantsFault {
+    pub project_id: String,
+    /// Vazio até o [`gather`] conferir que o projeto é observado.
+    pub name: String,
 }
 
 impl DigestFacts {
@@ -97,12 +116,16 @@ const PAUSED_KINDS: [SignalKind; 5] =
 /// guardados e o disco.
 pub fn state_facts(st: &NantyState, now_ms: u64) -> DigestFacts {
     let mut paused: Vec<&str> = Vec::new();
+    let mut nants_faults: Vec<NantsFault> = Vec::new();
     for alert in st.alerts.values() {
         let Some(kind) = SignalKind::parse(&alert.kind) else { continue };
         if PAUSED_KINDS.contains(&kind) {
             if let Some(p) = alert.project_id.as_deref() {
                 if !paused.contains(&p) {
                     paused.push(p);
+                }
+                if turn::is_nants_fault(&alert.facts) && !nants_faults.iter().any(|f| f.project_id == p) {
+                    nants_faults.push(NantsFault { project_id: p.to_string(), name: String::new() });
                 }
             }
         }
@@ -118,6 +141,7 @@ pub fn state_facts(st: &NantyState, now_ms: u64) -> DigestFacts {
             .count() as u64,
         items: st.digest.clone(),
         disk_low,
+        nants_faults,
         ..DigestFacts::default()
     }
 }
@@ -156,6 +180,21 @@ pub async fn gather(state: &AppState, nanty: &Arc<Nanty>, now: &LocalTime) -> Di
         .map(|p| (p.id.clone(), PathBuf::from(&p.path)))
         .collect();
     facts.projects = observed.len() as u64;
+    // Spec 141 T09: só projeto observado, com o nome redigido; o resto sai da reserva.
+    let secrets = crate::server::events::SecretSet::from_config(&cfg);
+    facts.names = cfg
+        .projects
+        .iter()
+        .filter(|p| cfg.nanty.observes(&p.id))
+        .map(|p| (p.id.clone(), super::tools::project_name(&secrets, p)))
+        .collect();
+    facts.nants_faults = std::mem::take(&mut facts.nants_faults)
+        .into_iter()
+        .filter_map(|f| {
+            let project = cfg.projects.iter().find(|p| p.id == f.project_id && cfg.nanty.observes(&p.id))?;
+            Some(NantsFault { name: super::tools::project_name(&secrets, project), ..f })
+        })
+        .collect();
     facts.running = observed.iter().filter(|(id, _)| state.project_busy_strict(id)).count() as u64;
     let today = day_start_ms(now);
     let roots: Vec<PathBuf> = observed.into_iter().map(|(_, root)| root).collect();
@@ -218,6 +257,11 @@ pub fn compose(facts: &DigestFacts, cfg: &NantyConfig, id: String, at_ms: u64) -
         };
         lines.push(line(code, tokens));
     }
+    // Spec 141 T09 (C-09): sem modelo, a reserva diz que a parada é defeito do Nants, e não do
+    // projeto, para ninguém retomar à toa.
+    for fault in facts.nants_faults.iter().filter(|f| !f.name.is_empty()) {
+        lines.push(line("nanty.digest.nants_fault", json!({ "project": fault.name })));
+    }
     if let Some(gb) = facts.disk_free_gb {
         lines.push(line("nanty.digest.disk", json!({ "free_gb": gb })));
     }
@@ -234,40 +278,168 @@ pub fn compose(facts: &DigestFacts, cfg: &NantyConfig, id: String, at_ms: u64) -
 }
 
 /// Campo de `params` com o porquê dos avisos guardados (spec 139 T06, C-06 da 138): o cabeçalho
-/// `nanty.digest.held` e um `nanty.why.*` por aviso, cada um `{code, params}`. Fica à parte de
-/// `lines` porque sai sempre, com ou sem o texto do modelo: os avisos guardados não viram cartão,
-/// então o porquê deles só existe aqui.
+/// `nanty.digest.held` e um `nanty.why.*` por aviso, cada um `{code, params}`. Spec 141 T10: só na
+/// reserva, sem o modelo, com todos os avisos, em ordem, e o nome do projeto em cada linha
+/// ([`PROJECT_NAME`]). Com o modelo, os avisos vão como dados ([`HELD`]).
 pub const WHY: &str = "why";
 
-/// O porquê dos avisos guardados (os mais recentes, até [`MAX_DIGEST_LINES`]), do dicionário.
+/// Parâmetro da linha do porquê com o nome do projeto (spec 141 T10): a linha sai como
+/// `nanty.digest.item`, com o projeto antes do porquê.
+pub const PROJECT_NAME: &str = "project_name";
+
+/// Campo de `params` com os avisos guardados como dados (spec 141 T10): os [`HeldGroup`], que a
+/// janela mostra como cabeçalho de dados junto do texto do modelo. O Telegram não os lista.
+pub const HELD: &str = "held";
+
+/// Minutos de um dia.
+const DAY_MINUTES: u64 = 24 * 60;
+
+/// O instante do fato de um aviso guardado: o `since` (`HH:MM`) antes da hora em que ele foi
+/// guardado, dentro das 24 horas; sem `since`, a hora em que foi guardado. É a ordem da lista.
+fn event_ms(item: &DigestItem) -> u64 {
+    let since = item.params.get("since").and_then(Value::as_str).and_then(|t| {
+        let (h, m) = t.split_once(':')?;
+        Some(h.parse::<u64>().ok()? * 60 + m.parse::<u64>().ok()?)
+    });
+    match (since, super::clock::local_time_at(item.at_ms)) {
+        (Some(since), Some(at)) => {
+            let at_min = u64::from(at.minute_of_day());
+            let back = (at_min + DAY_MINUTES - since % DAY_MINUTES) % DAY_MINUTES;
+            item.at_ms.saturating_sub(back * 60_000)
+        }
+        _ => item.at_ms,
+    }
+}
+
+/// Os avisos guardados em ordem: do fato mais antigo ao mais novo (a ordem de chegada desempata).
+fn ordered(facts: &DigestFacts) -> Vec<&DigestItem> {
+    let mut items: Vec<&DigestItem> = facts.items.iter().collect();
+    items.sort_by_key(|item| event_ms(item));
+    items
+}
+
+/// O nome do projeto de um aviso guardado, se observado.
+fn name_of<'a>(facts: &'a DigestFacts, item: &DigestItem) -> Option<&'a str> {
+    item.project_id.as_deref().and_then(|id| facts.names.get(id)).map(String::as_str).filter(|n| !n.is_empty())
+}
+
+/// O porquê de todos os avisos guardados, do dicionário, em ordem, com o nome do projeto em cada
+/// linha (spec 141 T10): a contagem do cabeçalho é o número de linhas.
 fn held_why(facts: &DigestFacts) -> Vec<Value> {
-    let held: Vec<&DigestItem> = facts.items.iter().rev().take(MAX_DIGEST_LINES).rev().collect();
+    let held = ordered(facts);
     if held.is_empty() {
         return Vec::new();
     }
-    let mut out = vec![line("nanty.digest.held", json!({ "count": facts.items.len() }))];
+    let mut out = vec![line("nanty.digest.held", json!({ "count": held.len() }))];
     for item in held {
         let mut p = item.params.clone();
         if let Some(project) = &item.project_id {
             p.insert("project_id".into(), json!(project));
+        }
+        if let Some(name) = name_of(facts, item) {
+            p.insert(PROJECT_NAME.into(), json!(name));
         }
         out.push(line(&item.code, Value::Object(p)));
     }
     out
 }
 
-/// Código da frase curta que vai junto do texto do modelo no resumo da manhã (spec 139 T06, C-11):
-/// diz por que a mensagem chegou.
+/// Um aviso guardado como dado (spec 141 T10): o tipo, a hora local do fato e os fatos estruturados.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeldNotice {
+    pub kind: String,
+    /// `HH:MM` local.
+    pub at: String,
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub facts: Map<String, Value>,
+}
+
+/// Os avisos guardados de um projeto (ou da máquina, sem projeto), como dados (spec 141 T10).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeldGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// O nome redigido do projeto observado: só para a janela ([`with_model_text`]). Não vai ao
+    /// modelo, que recebe só códigos e ids (C-01 da 138).
+    #[serde(skip)]
+    pub name: Option<String>,
+    /// O projeto parou por um defeito do ambiente do Nants (spec 141 T09): é problema do Nants, e
+    /// retomar não resolve.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub nants_fault: bool,
+    /// Algum aviso do grupo pede a pessoa (não é só progresso), ou o defeito do Nants.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub needs_attention: bool,
+    pub notices: Vec<HeldNotice>,
+}
+
+/// Os avisos guardados agrupados por projeto (spec 141 T10, função pura): os `limit` mais recentes,
+/// em ordem dentro de cada grupo; os grupos com o defeito do Nants primeiro, depois os que pedem
+/// atenção, e então pela ordem do primeiro aviso. O projeto parado por defeito do Nants entra mesmo
+/// sem aviso guardado.
+pub fn held_groups(facts: &DigestFacts, limit: usize) -> Vec<HeldGroup> {
+    let items = ordered(facts);
+    let skip = items.len().saturating_sub(limit);
+    let mut groups: Vec<HeldGroup> = Vec::new();
+    for item in items.into_iter().skip(skip) {
+        let Some(kind) = SignalKind::of_why_code(&item.code) else { continue };
+        let project_id = item.project_id.clone().filter(|p| turn::is_code(p));
+        let mut notice_facts = turn::structured(&item.params);
+        let at = notice_facts.remove("since").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| super::tools::hhmm(item.at_ms));
+        let index = match groups.iter().position(|g| g.project_id == project_id) {
+            Some(i) => i,
+            None => {
+                let name = project_id.as_ref().and_then(|_| name_of(facts, item)).map(str::to_string);
+                groups.push(HeldGroup { project_id, name, nants_fault: false, needs_attention: false, notices: Vec::new() });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[index];
+        group.nants_fault |= turn::is_nants_fault(&item.params);
+        group.needs_attention |= kind.observer() != super::signals::Observer::Progress;
+        group.notices.push(HeldNotice { kind: kind.as_str().to_string(), at, facts: notice_facts });
+    }
+    for fault in facts.nants_faults.iter().filter(|f| turn::is_code(&f.project_id)) {
+        match groups.iter_mut().find(|g| g.project_id.as_deref() == Some(fault.project_id.as_str())) {
+            Some(group) => group.nants_fault = true,
+            None => groups.push(HeldGroup {
+                project_id: Some(fault.project_id.clone()),
+                name: Some(fault.name.clone()).filter(|n| !n.is_empty()),
+                nants_fault: true,
+                needs_attention: true,
+                notices: Vec::new(),
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.needs_attention |= group.nants_fault;
+    }
+    // A ordenação é estável: dentro da mesma prioridade, fica a ordem do primeiro aviso.
+    groups.sort_by_key(|g| (!g.nants_fault, !g.needs_attention));
+    groups
+}
+
+/// Código do selo do resumo da manhã com o texto do modelo (spec 139 T06; spec 141 T10, C-10): uma
+/// linha curta de dado, não uma frase de conversa.
 pub const LEAD: &str = "nanty.digest.lead";
 
-/// O resumo com o texto do modelo (spec 139 T06, C-11): as linhas de contagem, custo e disco saem;
-/// ficam a frase curta do servidor ([`LEAD`]), o porquê de cada aviso guardado ([`WHY`], do
-/// dicionário) e o texto do modelo.
+/// O resumo com o texto do modelo (spec 141 T10, C-10): o texto é todo dele. A mensagem leva o selo
+/// ([`LEAD`]) e os avisos guardados como dados ([`HELD`]), que só a janela mostra; a lista fixa de
+/// `nanty.why.*`, as contagens, o custo e o disco saem.
 pub fn with_model_text(message: &mut ConversationMessage, facts: &DigestFacts, text: String) {
     let mut params = Map::new();
-    let why = held_why(facts);
-    if !why.is_empty() {
-        params.insert(WHY.into(), Value::Array(why));
+    let held: Vec<Value> = held_groups(facts, facts.items.len())
+        .into_iter()
+        .filter_map(|group| {
+            let mut value = serde_json::to_value(&group).ok()?;
+            if let (Some(name), Some(map)) = (group.name, value.as_object_mut()) {
+                map.insert("name".into(), json!(name));
+            }
+            Some(value)
+        })
+        .collect();
+    if !held.is_empty() {
+        params.insert(HELD.into(), Value::Array(held));
     }
     message.code = Some(LEAD.to_string());
     message.params = params;
@@ -290,19 +462,9 @@ pub fn linked_projects(facts: &DigestFacts, input: &TurnInput) -> Vec<String> {
 pub fn summary_input(kind: TurnKind, facts: &DigestFacts, st: &NantyState) -> TurnInput {
     let mut input = TurnInput::new(kind);
     input.signals = st.alerts.values().filter_map(SignalFact::of_alert).take(turn::MAX_SIGNALS_IN).collect();
-    input.signals.extend(
-        facts.items.iter().rev().take(turn::MAX_SIGNALS_IN).filter_map(|item| {
-            let kind = item.code.strip_prefix("nanty.why.")?;
-            SignalKind::parse(kind)?;
-            Some(SignalFact {
-                kind: kind.to_string(),
-                project_id: item.project_id.clone().filter(|p| turn::is_code(p)),
-                urgency: Some(Urgency::Digest),
-                delivery: None,
-                facts: turn::structured(&item.params),
-            })
-        }),
-    );
+    // Spec 141 T10: os avisos guardados vão como dados agrupados por projeto, com o que pede atenção
+    // primeiro, e não como sinais soltos.
+    input.held = held_groups(facts, MAX_HELD_IN);
     for (name, value) in [
         ("projects", facts.projects),
         ("running", facts.running),

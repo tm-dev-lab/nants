@@ -92,16 +92,15 @@ fn a_long_reply_keeps_its_head_and_tail_with_the_server_mark() {
         let mut m = nanty_line("nanty.chat.confirm", tag);
         m.text = Some(text.clone());
         let mark = tr(lang, "nanty.history.trimmed", &[]);
-        let closing = tr(lang, "nanty.chat.confirm", &[]);
         let e = entry(lang, &m, true);
         assert!(e.content.contains(&mark), "{}", e.content);
         let kept = trim_reply(lang, &render::message_text(lang, &m));
         assert!(kept.starts_with("Começo essencial. w0 w1"), "{kept}");
-        // O fim fica, com a conclusão e a frase do servidor que fecha a mensagem.
-        assert!(kept.ends_with(&closing) && kept.contains("Fim com a conclusão."), "{kept}");
+        // O fim fica, com a conclusão (spec 141 T10: nenhuma frase do servidor depois dela).
+        assert!(kept.ends_with("Fim com a conclusão."), "{kept}");
         assert!(kept.chars().count() <= TRIM_HEAD_CHARS + TRIM_TAIL_CHARS + mark.chars().count() + 2);
         // Nenhuma palavra partida nos cortes: tudo o que ficou existe inteiro no texto.
-        let whole = format!("{text} {closing} {mark}");
+        let whole = format!("{text} {mark}");
         let known: Vec<&str> = whole.split_whitespace().collect();
         for word in kept.split_whitespace() {
             assert!(known.contains(&word), "{word}");

@@ -42,13 +42,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   as a draft in the Architect conversation of the project, where you edit it, send it or discard it;
   nothing reaches the Architect without you. If the conversation read untrusted content, the draft
   comes marked and, while it is pending, your messages to that Architect run without internet;
-  discarding it goes back to normal. A conversation that read
-  another project cannot send anything to this one.
+  discarding it goes back to normal. A message that reads another project in the same turn cannot
+  propose anything to this one; a read of another project from earlier in the conversation only
+  marks the draft.
 - **Nanty's long replies arrive whole.** A long reply starts with what matters and is kept whole in
   the window. On Telegram it comes in up to three messages, split between paragraphs or sentences,
-  with the buttons and the server sentence in the last one, and the rest pointed to the window when
-  it is longer. With voice on, the audio speaks only the start of the first paragraph, the caption
-  shows the same part, and the rest follows as text.
+  with the buttons in the last one; when it is longer, the last one ends with `…` and the whole
+  reply stays in the window.
+- **Nanty's voice is all or nothing.** With voice on, a reply is spoken whole in a single voice
+  note, with the whole text: in the caption when it fits, or in messages that answer the note. If
+  any part of the speech fails, no audio goes and the whole text does. With voice off, text only.
+  The tone marker the model sometimes writes as `[neutral]` no longer shows up in the text.
 - **Nanty has a long term memory.** It keeps short notes by topic (how you work together, the way
   you want it to be, how to run the system, runbooks and decisions) that survive restarts and
   updates. It saves on its own only in a clean conversation, and the reply says what it saved, with
@@ -88,10 +92,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   messages and works out the project from a number, part of the name or its state ("the one that
   got stuck"), and it asks when in doubt. On Telegram, you see "typing" while it works. Commands
   became optional shortcuts. Replies, notices and the morning summary are written by the model when
-  there is one, in natural sentences, with the reason of each notice still written by Nants. In the
-  conversation, Nanty's words come first and a sentence from the server closes the message; in a
-  summary with model text, the title and the reasons open it. With no model or no budget, the fixed replies were rewritten
-  to sound natural too.
+  there is one, in natural sentences, with the reason of each notice still written by Nants on its
+  card. With model text, a message is Nanty's words alone, with no fixed sentence closing it: the
+  card, the buttons and a short label carry the rest. The morning summary with a model is written
+  from the kept notices as data, grouped by project and with what needs attention first, and the
+  window keeps them under it by project, type and time. With no model or no budget, the fixed
+  replies were rewritten to sound natural too, and the summary lists every kept notice in order,
+  with its project.
 - **Language of the person, and Nanty's own.** Nanty answers in the language you wrote or spoke in,
   whatever the language of the interface. Notices and the morning summary follow the new **Nanty
   language** option in Settings: follow the conversation (the default), Portuguese or English.
@@ -101,7 +108,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   optional **Nants address for your phone** in Settings; with no address, Nanty tells you to open
   Nants on the computer. If something can't be done, it says why and what you can do instead.
 - **Mute in a sentence.** Ask for quiet in your own words, for some hours or until an exact time, up
-  to 24 hours. The server confirms with the end time and a button to turn it off. The urgent still
+  to 24 hours. A card shows the end time and a button to turn it off. The urgent still
   arrives, without sound, and the rest goes into the summary.
 - **Voice, whenever it is on.** With the voice on, everything Nanty says goes as audio with the text:
   replies, notices with their buttons and the morning summary on Telegram, and replies in the
@@ -113,8 +120,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   list. After reading something untrusted, the voice stays neutral.
 - **A spoken notice says what Nanty wrote.** With a model and budget, the voice note of a notice
   speaks Nanty's own words about it, in a single message, with the reason line still written by
-  Nants. If the text takes more than a few seconds, the note speaks the fixed sentence and the text
-  follows, so the notice is never late.
+  Nants. If the text takes more than a few seconds, or is too long to show whole with the card, the
+  note speaks the fixed sentence and the text follows, so the notice is never late.
 - **Git repositories made inside a task are committed as files.** When an agent runs `git init`
   inside the project, the history of that inner repository is kept out of the tree, its files go
   into the commit as regular files, and the conversation says so. A setting placed in that
@@ -126,6 +133,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Defense against steered conversations.** A forwarded message or a quote of someone else is
   treated as untrusted data, and after any untrusted content in the turn, even a mute needs your
   click.
+- **A defect of Nants costs no tokens.** When the tests fail citing a path that belongs to Nants
+  itself, the task pauses and tells you it is a defect in the Nants environment, with no call to the
+  Developer or the Architect. The card offers **Clean the workspace and test again**, which Nants
+  runs itself: it empties the task's home folder (the download cache stays) and installs again,
+  with the code untouched. The recovery of the Architect now also sees how the environment is set
+  up, and the options that only guide the Developer are apart from the ones Nants runs.
+- **A narrower test command, with your approval.** When one step of the test command picks up tests
+  it should not, the recovery can propose the same step with a path added at the end. Nants runs
+  both steps on the same code, offers the change only when the current one fails as in the task and
+  the new one passes, and shows both runs with their test counts. It never applies on its own, not
+  even with automatic approval; options that could drop tests are refused, and the change also
+  reaches the `full_test_command` and the checks, which the recovery can now fix too.
+- **The same failure after your choice comes back to you.** Nants keeps the signature of the failure
+  that blocked a task. If the same failure returns after your choice, the task comes back to you
+  without reopening the recovery cycles or calling the Architect again, and a choice that needs no
+  code change runs the official suite first, before the Developer.
+- **Nanty knows Nants.** It searches the Nants docs built into the executable and reads the state of
+  the whole system (the version, each role with its connection kind and model and, per watched
+  project, the environment, automatic approval, the recovery waiting for you and whether the stop
+  is a defect of Nants), with no secrets, paths or addresses. It tells a defect of Nants from one of
+  the project, never suggests resuming such a project, and the morning summary and the notices know
+  it too.
+- **Nanty follows the notice you are talking about.** Each notice in the conversation keeps the
+  facts you saw on its card (the project, what happened and since when), your decisions on the
+  cards enter the conversation, and on Telegram replying to a notice links your question to it, so
+  a question right after a notice is about that project.
 - **No more cycles with no progress.** When the same failure repeats in two cycles in a row, the task
   goes to recovery right away instead of spending the 5 cycles, and the step of the test command
   that failed goes to the Developer and to recovery.
@@ -177,6 +210,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   line spills out of its columns or of the window.
 - **Evidence checks** no longer read an image reference (such as `mcr.microsoft.com/openjdk/jdk:21`),
   a host or a package name as a file path, so valid evidence is not marked as not verified.
+- **Test runners that scan the whole project no longer trip over the containers' home folder.**
+  It used to live inside the task folder (`.nants-home/`), where the browser left a broken link
+  that made `node --test` fail before running any test. The home folder is now mounted at
+  `/nants/home` from Nants' data folder, one per task and one for the project root, and goes away
+  with the task folder or the project. Existing projects move only the download cache on the next
+  run and install again. The browser test container also mounts `.git` and `.nants` read-only,
+  like the other containers.
+- **Test runs at the project root no longer run the tests of the tasks.** The task folders in
+  `.sdd/worktrees` are hidden from the container in the rounds at the project root, so a runner that
+  scans the whole tree only sees the project.
+- **A blank screen when picking an option** other than the recommended one in the Architect's
+  questions, in the desktop browser.
+- **On the phone,** the button of a recovery choice says only **Choose** and long buttons wrap
+  inside the card, and with the keyboard open the bars and the tabs hide so the conversation and
+  the text box use the screen.
+- **An old Nanty card that resumes a run** is refused, with the reason, when the run stopped
+  because of a defect of Nants after the card was sent.
 
 ## [0.1.0] - 2026-10-22
 

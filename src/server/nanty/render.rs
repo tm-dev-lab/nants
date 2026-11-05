@@ -37,6 +37,10 @@ pub fn code_text(lang: Lang, code: &str, params: &Map<String, Value>) -> String 
             if k == "commands" {
                 return Some((k.clone(), super::chat::command_names(lang)));
             }
+            // Spec 141 T06: a resposta do evento de cartão é um código; sai a palavra do idioma.
+            if k == "answer" && code.starts_with(super::notice::EVENT_PREFIX) {
+                return v.as_str().map(|a| (k.clone(), tr(lang, &format!("nanty.event.answer.{a}"), &[])));
+            }
             param_text(lang, v).map(|text| (k.clone(), text))
         })
         .collect();
@@ -51,7 +55,8 @@ pub fn code_text(lang: Lang, code: &str, params: &Map<String, Value>) -> String 
     }
 }
 
-/// As linhas extras de uma mensagem (`params.<field>`: cada uma `{code, params}`), no idioma.
+/// As linhas extras de uma mensagem (`params.<field>`: cada uma `{code, params}`), no idioma. A
+/// linha com o nome do projeto ([`super::digest::PROJECT_NAME`], spec 141 T10) sai com ele na frente.
 fn lines_text(lang: Lang, params: &Map<String, Value>, field: &str) -> Vec<String> {
     let Some(lines) = params.get(field).and_then(Value::as_array) else { return Vec::new() };
     lines
@@ -59,75 +64,79 @@ fn lines_text(lang: Lang, params: &Map<String, Value>, field: &str) -> Vec<Strin
         .filter_map(|line| {
             let code = line.get("code").and_then(Value::as_str)?;
             let params = line.get("params").and_then(Value::as_object).cloned().unwrap_or_default();
-            Some(code_text(lang, code, &params))
+            let text = code_text(lang, code, &params);
+            Some(match params.get(super::digest::PROJECT_NAME).and_then(Value::as_str) {
+                Some(project) => tr(lang, "nanty.digest.item", &[("project", project), ("text", &text)]),
+                None => text,
+            })
         })
         .collect()
 }
 
-/// Texto de uma mensagem do Nanty para o Telegram: o texto fixo do dicionário, as linhas extras e o
-/// texto do modelo, como veio. O idioma é o gravado na mensagem (`message.lang`, spec 139 T05);
-/// `lang` só vale para a mensagem sem idioma (as gravadas antes).
+/// Texto de uma mensagem do Nanty para o Telegram, no idioma gravado nela (`message.lang`, spec 139
+/// T05); `lang` só vale para a mensagem sem idioma (as gravadas antes).
 ///
-/// Spec 139 T06 (C-11): com o texto do modelo, as linhas extras (a lista fixa) não entram: o modelo
-/// já as contou. O texto fixo fica como a frase curta do servidor junto do texto do modelo (o porquê
-/// do resumo, a confirmação do silêncio), e o porquê dos avisos guardados (`params.why`, C-06 da
-/// 138) sai sempre, do dicionário.
-///
-/// Spec 139 T12: a fala do modelo vem primeiro, e a frase do servidor fecha a mensagem (do contrário,
-/// a conversa parece invertida: a confirmação antes da resposta). Só os títulos abrem o texto: o do
-/// resumo ([`super::digest::LEAD`]) e o do cenário proativo ([`super::scenario::LEAD`], spec 140 T12),
-/// que avisa antes de tudo que é uma análise automática.
+/// Spec 141 T10 (C-10): com o texto do modelo, a mensagem é o texto dele, como veio, e nenhuma frase
+/// fixa a fecha (a confirmação, a memória, o caminho até o Nants e o porquê dos avisos guardados ficam
+/// nos cartões, nos botões e nos dados da janela). Só o selo dos títulos abre o texto, numa linha
+/// curta de dado ([`seal`]): o do resumo ([`super::digest::LEAD`]) e o do cenário proativo
+/// ([`super::scenario::LEAD`], spec 140 T12). A exceção é a rede de segurança ([`KEPT`]): a linha
+/// curta que diz o que fazer quando não há outro meio (sem link, o caminho para abrir o Nants) fecha o
+/// texto do modelo. Sem o texto do modelo, a reserva: o texto fixo do dicionário e as linhas extras.
 pub fn message_text(lang: Lang, message: &ConversationMessage) -> String {
-    let text = model_text(message);
-    let fixed = fixed_parts(lang, message);
-    let mut parts: Vec<String> = Vec::new();
-    match text {
-        Some(text) if closes(message) => {
-            parts.push(text.to_string());
-            parts.extend(fixed);
-        }
+    let lang = super::language::tagged(message.lang.as_deref()).unwrap_or(lang);
+    match model_text(message) {
         Some(text) => {
-            parts.extend(fixed);
+            let mut parts: Vec<String> = seal(lang, message).into_iter().collect();
             parts.push(text.to_string());
+            parts.extend(kept(lang, message));
+            parts.join("\n")
         }
-        None => parts.extend(fixed),
+        None => fixed_parts(lang, message).join("\n"),
     }
-    parts.join("\n")
+}
+
+/// As linhas do servidor que ficam mesmo com o texto do modelo (spec 141 T10, revisão 1, F-01): o
+/// efeito que não tem cartão nem botão para levar o que a pessoa pode fazer. Sem endereço que o
+/// aparelho alcance, a linha é a única saída dela.
+pub const KEPT: [&str; 1] = ["nanty.chat.open_computer"];
+
+/// As linhas mantidas ([`KEPT`]) da mensagem: o código dela ou as linhas extras do porquê.
+fn kept(lang: Lang, message: &ConversationMessage) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(code) = message.code.as_deref().filter(|c| KEPT.contains(c)) {
+        out.push(code_text(lang, code, &message.params));
+    }
+    let lines = message.params.get(super::digest::WHY).and_then(Value::as_array).cloned().unwrap_or_default();
+    let kept: Vec<Value> = lines.into_iter().filter(|l| l.get("code").and_then(Value::as_str).is_some_and(|c| KEPT.contains(&c))).collect();
+    if !kept.is_empty() {
+        let mut only = Map::new();
+        only.insert("kept".into(), Value::Array(kept));
+        out.extend(lines_text(lang, &only, "kept"));
+    }
+    out
 }
 
 fn model_text(message: &ConversationMessage) -> Option<&str> {
     message.text.as_deref().filter(|t| !t.trim().is_empty())
 }
 
-/// A frase do servidor fecha a mensagem: há texto do modelo antes dela, e ela não é título.
-fn closes(message: &ConversationMessage) -> bool {
-    model_text(message).is_some() && message.code.as_deref().is_some_and(|code| !LEADS.contains(&code))
+/// Os títulos que viram selo: uma linha curta de dado antes do texto (spec 141 T10).
+const SEALS: [&str; 2] = [super::digest::LEAD, super::scenario::LEAD];
+
+/// O selo da mensagem, quando o código é um título ([`SEALS`]).
+fn seal(lang: Lang, message: &ConversationMessage) -> Option<String> {
+    let code = message.code.as_deref().filter(|code| SEALS.contains(code))?;
+    Some(code_text(lang, code, &Map::new()))
 }
 
-/// As frases do servidor que abrem o texto do modelo, em vez de fechá-lo.
-const LEADS: [&str; 2] = [super::digest::LEAD, super::scenario::LEAD];
-
-/// O texto fixo da mensagem, no idioma gravado nela.
+/// O texto fixo da reserva: a frase do código, as linhas extras e o porquê dos avisos guardados.
 fn fixed_parts(lang: Lang, message: &ConversationMessage) -> Vec<String> {
-    let lang = super::language::tagged(message.lang.as_deref()).unwrap_or(lang);
     let Some(code) = &message.code else { return Vec::new() };
     let mut parts = vec![code_text(lang, code, &message.params)];
-    if model_text(message).is_none() {
-        parts.extend(lines_text(lang, &message.params, "lines"));
-    }
+    parts.extend(lines_text(lang, &message.params, "lines"));
     parts.extend(lines_text(lang, &message.params, super::digest::WHY));
     parts
-}
-
-/// O texto do modelo abre a mensagem (spec 140 T14): há texto dele, e nenhum título do servidor vem
-/// antes ([`message_text`]).
-pub fn opens_with_model(message: &ConversationMessage) -> bool {
-    model_text(message).is_some() && message.code.as_deref().is_none_or(|code| !LEADS.contains(&code))
-}
-
-/// A frase do servidor que fecha a mensagem, quando há: o corte da legenda e da fala a preserva.
-pub fn closing(lang: Lang, message: &ConversationMessage) -> Option<String> {
-    closes(message).then(|| fixed_parts(lang, message).join("\n"))
 }
 
 /// Texto do porquê de um cartão para o Telegram (o texto fixo do observador, C-06).

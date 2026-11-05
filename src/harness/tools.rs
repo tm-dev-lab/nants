@@ -1707,7 +1707,8 @@ impl ToolHost {
                 continue;
             }
             // Spec 129 T01: a pasta pessoal do workspace fica fora da listagem, como as do Nants.
-            if dir_rel.as_os_str().is_empty() && entry.file_name() == home::HOME_DIR {
+            // Spec 141 T01: só a antiga, enquanto houver legado (a nova fica fora da árvore).
+            if dir_rel.as_os_str().is_empty() && entry.file_name() == home::LEGACY_HOME_DIR {
                 continue;
             }
             if entry.file_type()?.is_dir() {
@@ -2744,8 +2745,9 @@ fn check_scope_key(scope: WriteScope, allowed: &[String], key: &str) -> Result<(
     // `.nants/**` (ambiente aprovado) nunca é escrito pelo escopo da tarefa; mudança de ambiente
     // passa só pelo fluxo de permissão (spec 030, T04).
     let env_dir = scope == WriteScope::Allowed && key.split('/').next() == Some(environment::ENV_DIR);
-    // Spec 129 T01: a pasta pessoal do workspace nunca é escrita pelas tarefas.
-    let home_dir = scope == WriteScope::Allowed && home::is_home_path(key);
+    // Spec 129 T01: a pasta pessoal do workspace nunca é escrita pelas tarefas (spec 141 T01: a
+    // antiga, que fica enquanto houver legado; a nova está fora da árvore).
+    let home_dir = scope == WriteScope::Allowed && home::is_legacy_home_path(key);
     let excluded = env_dir || home_dir || key == FIXED_EXCLUDED_FILE || key.split('/').any(|c| c == ".git");
     if in_scope && !excluded {
         Ok(())
@@ -3831,8 +3833,9 @@ fn walk(
         if file_type.is_dir() {
             let name = entry.file_name();
             // As íntegras guardadas (spec 122 T02) repetiriam saídas antigas na busca.
-            // Spec 129 T01: nem a pasta pessoal do workspace (instalações e caches).
-            let outputs = rel == Path::new(spill::OUTPUTS_DIR) || rel == Path::new(home::HOME_DIR);
+            // Spec 129 T01: nem a pasta pessoal do workspace (instalações e caches); spec 141 T01:
+            // a antiga, enquanto houver legado.
+            let outputs = rel == Path::new(spill::OUTPUTS_DIR) || rel == Path::new(home::LEGACY_HOME_DIR);
             if name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)) || outputs || !filter(rel, true) {
                 continue;
             }
@@ -5349,13 +5352,13 @@ mod tests {
     }
 
     /// Spec 129 T01: a pasta pessoal do workspace fica fora da listagem, da busca e da escrita das
-    /// tarefas, mesmo com escopo largo.
+    /// tarefas, mesmo com escopo largo. Spec 141 T01: vale para a antiga, enquanto houver legado.
     #[tokio::test]
     async fn personal_folder_is_out_of_listing_search_and_writes() {
         let root = tmp_dir("home-dir");
         fs::create_dir_all(root.join("src")).expect("src");
         fs::write(root.join("src/a.rs"), "needle\n").expect("a");
-        let h = home::ensure(&root).expect("home");
+        let h = root.join(home::LEGACY_HOME_DIR);
         fs::create_dir_all(h.join(".local/lib")).expect("mk");
         fs::write(h.join(".local/lib/pkg.py"), "needle\n").expect("pkg");
         let dev = host(Role::Developer, &root, &["**"], &[], &[], ApprovalDecision::Deny);

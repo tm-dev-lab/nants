@@ -170,6 +170,7 @@ pub fn new_task(spec_id: &str, id: &str, depends_on: Vec<String>, covers: Vec<St
             tested_signature: None,
             tested_at: None,
             test_evidence: None,
+            failure_signature: None,
             test_run: None,
             next_action: None,
             next_action_code: None,

@@ -961,7 +961,9 @@
   align-self: flex-start;
 }
 
+/* `position: relative` (141/T11): o rádio escondido (`.nd-sr-only`) fica preso ao item; ver `.nd-option`. */
 .nd-segment-item {
+  position: relative;
   min-height: 24px;
   min-width: 0;
   display: inline-flex;

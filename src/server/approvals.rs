@@ -808,10 +808,34 @@ impl ProjectApprover {
         diff: &str,
         commands: &[String],
     ) -> ApprovalDecision {
+        self.config_change(task_id, reason, diff, commands, false).await
+    }
+
+    /// Spec 141 T04 (C-03, R2): o mesmo pedido de [`Self::approve_config_change`] para a RESTRIÇÃO de
+    /// uma etapa do comando de testes. Nunca é aprovado sozinho, nem com a aprovação automática: a
+    /// pessoa vê a troca e as duas rodadas do servidor no `diff` e decide.
+    pub async fn approve_config_restriction(
+        &self,
+        task_id: Option<&str>,
+        reason: &str,
+        diff: &str,
+        commands: &[String],
+    ) -> ApprovalDecision {
+        self.config_change(task_id, reason, diff, commands, true).await
+    }
+
+    async fn config_change(
+        &self,
+        task_id: Option<&str>,
+        reason: &str,
+        diff: &str,
+        commands: &[String],
+        human_only: bool,
+    ) -> ApprovalDecision {
         // YOLO só auto-aprova se CADA segmento (`&&`) de cada comando passa na exclusão do YOLO.
         // Em projeto docker os comandos rodam no container: vale a regra do container (spec 062).
         let in_container = self.yolo_settings().await.is_some_and(|s| s.environment == Environment::Docker);
-        let auto_allowed = commands.iter().flat_map(|c| c.split("&&")).all(|seg| {
+        let auto_allowed = !human_only && commands.iter().flat_map(|c| c.split("&&")).all(|seg| {
             let seg = seg.trim();
             if in_container {
                 yolo_container_excluded_reason(seg).is_none()
@@ -2716,6 +2740,20 @@ mod tests {
             drain_agent_messages(&mut rx)[0]["text"],
             "aprovada automaticamente: Alterar o comando de testes do projeto (test_command/checks). Motivo: r"
         );
+    }
+
+    /// Spec 141 T04 (C-03, R2): a restrição do comando de testes nunca é aprovada sozinha, nem com a
+    /// aprovação automática ligada: vira pedido à pessoa (sem ela, o tempo esgota e nega).
+    #[tokio::test]
+    async fn config_restriction_is_never_auto_approved() {
+        let h = harness("yolo-restriction");
+        set_yolo(&h, true, &[]);
+        let approver = h.approver(Some(Duration::from_millis(80)));
+        let mut rx = h.state.events().subscribe();
+        let cmds = ["node --test test/".to_string()];
+        assert_eq!(approver.approve_config_restriction(None, "r", "d", &cmds).await, ApprovalDecision::Deny);
+        assert_eq!(drain_requests_and_messages(&mut rx), (1, 0), "pedido à pessoa, sem aprovação automática");
+        assert_eq!(approver.approve_config_change(None, "r", "d", &cmds).await, ApprovalDecision::Once, "a correção comum segue automática");
     }
 
     #[tokio::test]

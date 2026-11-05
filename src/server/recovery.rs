@@ -34,11 +34,13 @@ use crate::agents::recovery_plan::{self as plan, CriteriaAdjustment, SplitTask, 
 use crate::agents::runner::{
     add_human_guidance, apply_revision, diagnosis_notes, latest_options_block, recovery_cycles, recovery_notes,
     section_text, task_worktree_path, TaskRevision, ACCEPTANCE, FINDINGS, MAX_REVISION_BYTES, OBJECTIVE, OPTIONS_CLOSE,
-    OPTIONS_OPEN, SCOPE_ADDED_LINE, TEST_FAILURE_MARK,
+    OPTIONS_OPEN, SCOPE_ADDED_LINE, TEST_FAILURE_MARK, BLOCK_NANTS_ENVIRONMENT, BLOCK_SAME_FAILURE,
+    escalation_options_block, mark_test_first,
 };
 use super::approvals::{replace_atomic, PERSIST_LOCK};
 use crate::harness::allowlist::{self, Policy};
 use crate::harness::tools::ApprovalDecision;
+use super::config_restriction::{self, StepChange};
 use crate::sdd::docker_command;
 use crate::sdd::{ArbitrationDecision, Check, Environment, Settings, Task, TaskStatus};
 
@@ -106,6 +108,14 @@ pub const CAUSE_ENV_ROUNDS: &str = "ambiente: limite de rodadas autônomas ating
 /// Cauda da saída de testes mostrada na análise de ambiente e no contexto da escalada.
 const ENV_TAIL_BYTES: usize = 2 * 1024;
 pub const CAUSE_LIMIT: &str = "limite de ciclos de recuperação atingido";
+/// Spec 141 T03 (C-04): a saída dos testes cita um caminho do Nants ([`crate::agents::nants_fault`]).
+/// Escalada sem o modelo, com a opção [`OptionKind::ResetWorkspace`].
+pub const CAUSE_NANTS_ENVIRONMENT: &str = "um defeito do ambiente do Nants travou os testes, não o código";
+/// Id da opção `reset_workspace` oferecida pelo servidor na falha do ambiente do Nants.
+pub const RESET_WORKSPACE_ID: &str = "reset_workspace";
+/// Spec 141 T05 (C-05): a primeira falha depois da escolha da pessoa tem a mesma assinatura da falha
+/// da escalada. Escalada sem o modelo, sem reabrir os ciclos, com as opções reais de novo.
+pub const CAUSE_SAME_FAILURE: &str = "a mesma falha voltou depois da sua escolha";
 
 /// O que o run faz depois da análise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +198,10 @@ pub enum OptionKind {
     Environment,
     Guidance,
     ReviseTask,
+    /// Spec 141 T03 (C-06): o SERVIDOR limpa a pasta pessoal da worktree (menos o cache de
+    /// download) e esquece a instalação ([`reset_workspace`]). Ao contrário de `guidance`, que só
+    /// orienta o Desenvolvedor, esta opção executa algo.
+    ResetWorkspace,
 }
 
 impl OptionKind {
@@ -197,6 +211,7 @@ impl OptionKind {
             Self::Environment => "environment",
             Self::Guidance => "guidance",
             Self::ReviseTask => "revise_task",
+            Self::ResetWorkspace => "reset_workspace",
         }
     }
 }
@@ -212,6 +227,9 @@ pub struct RecoveryOption {
     pub kind: OptionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_command: Option<String>,
+    /// Spec 141 T04 (C-03, R4): a bateria completa proposta numa opção `config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_test_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<Check>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +246,40 @@ pub struct RecoveryOption {
     /// persistidos; a validação do conteúdo e a aplicação ficam para a T02.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<EnvFile>>,
+    /// Spec 141 T04 (C-03, R2): a opção `config` restringe uma etapa do comando de testes. Só o
+    /// SERVIDOR a preenche, com a evidência das próprias rodadas; a que vem do modelo é ignorada.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<Restriction>,
+}
+
+/// Spec 141 T04 (C-03, R2): a troca de uma etapa do comando de testes por ela mesma com caminhos
+/// acrescentados, com a evidência das rodadas do servidor (saídas resumidas e redigidas). É o que
+/// o cartão da recuperação mostra antes de a pessoa aprovar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Restriction {
+    /// A etapa oficial, como está no comando.
+    pub original: String,
+    /// A etapa restrita (a oficial com os caminhos acrescentados).
+    pub restricted: String,
+    /// Os caminhos acrescentados no fim.
+    pub appended: Vec<String>,
+    /// Hash da árvore da worktree em que as duas rodadas do servidor aconteceram.
+    pub tree: String,
+    /// Saída resumida da rodada do servidor com a etapa oficial (falhou).
+    pub original_output: String,
+    /// Saída resumida da rodada do servidor com a etapa restrita (passou).
+    pub restricted_output: String,
+    /// Testes que a saída da rodada restrita informa (ausente se o executor não informa). A
+    /// contagem vem da saída do projeto, não de uma conta do servidor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<u64>,
+    /// Testes que a saída da rodada oficial informa (ausente se o executor não informa).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tests: Option<u64>,
+    /// Testes que falharam na rodada oficial, pela saída (ausente se o executor não informa).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_failed: Option<u64>,
 }
 
 /// Arquivo de ambiente proposto numa opção `environment`.
@@ -251,6 +303,8 @@ const MAX_OPTION_FILE_PATH_BYTES: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigProposal {
     pub test_command: Option<String>,
+    /// Spec 141 T04 (C-03, R4): a bateria completa também pode ser corrigida.
+    pub full_test_command: Option<String>,
     pub checks: Option<Vec<Check>>,
 }
 
@@ -354,6 +408,7 @@ pub async fn recover(
     scope
         .events
         .publish(cycle_event(scope, EventType::RecoveryStarted, task_id, cycle, None, &[], None));
+    let probe = Probe { runner, task_id };
 
     let autonomous = loaded.yolo
         && loaded.cycles >= MAX_CYCLES
@@ -366,7 +421,7 @@ pub async fn recover(
         forced = true;
         env_fix_decision(&scrub_text(scope.secrets, reason))
     } else if loaded.cycles >= MAX_CYCLES && !autonomous {
-        match limit_escalation(scope, &loaded, task_id, shutdown, CAUSE_LIMIT).await {
+        match limit_escalation(scope, &loaded, probe, shutdown, CAUSE_LIMIT).await {
             Ok(decision) => decision,
             Err(Stop::Shutdown) => return Next::Shutdown,
             Err(Stop::Unavailable) => Decision::escalate(CAUSE_LIMIT),
@@ -381,10 +436,12 @@ pub async fn recover(
                 asked_facts = Some(asked);
                 // Opções do ESCALATE: validadas pelo servidor; em YOLO uma opção `config` válida é
                 // aplicada sozinha (spec 073), dentro do limite de rodadas.
-                let decision = prepare_options(scope, &loaded, decision).await;
+                let decision = prepare_options(scope, &loaded, decision, probe, shutdown).await;
                 // ESCALATE final em YOLO (modelo): segue a estratégia sugerida como rodada autônoma,
-                // enquanto houver rodadas (C-02).
-                if yolo_mode && loaded.rounds < MAX_AUTONOMOUS_ROUNDS && is_escalate(&decision) {
+                // enquanto houver rodadas (C-02). Spec 141 T04 (R2): com uma restrição comprovada pelo
+                // servidor entre as opções, a escalada fica: só a pessoa pode aprová-la.
+                let restriction = decision.options.iter().any(|o| o.restriction.is_some());
+                if yolo_mode && loaded.rounds < MAX_AUTONOMOUS_ROUNDS && is_escalate(&decision) && !restriction {
                     forced = true;
                     premise_retry(scope.state.project_lang(scope.project_id).get(), decision)
                 } else {
@@ -404,7 +461,7 @@ pub async fn recover(
         && decision.config.is_some()
         && loaded.rounds >= MAX_AUTONOMOUS_ROUNDS
     {
-        match limit_escalation(scope, &loaded, task_id, shutdown, CAUSE_ENV_ROUNDS).await {
+        match limit_escalation(scope, &loaded, probe, shutdown, CAUSE_ENV_ROUNDS).await {
             Ok(decision) => decision,
             Err(Stop::Shutdown) => return Next::Shutdown,
             Err(Stop::Unavailable) => Decision::escalate(CAUSE_ENV_ROUNDS),
@@ -418,7 +475,7 @@ pub async fn recover(
         model_facts(&format!("{}{}", loaded.facts, loaded.env_note), loaded.yolo && !loaded.environmental, autonomous, false)
     });
     let decision = if decision.config.is_some() {
-        match config_with_feedback(scope, &loaded, task_id, decision, shutdown, &followup_facts).await {
+        match config_with_feedback(scope, &loaded, probe, decision, shutdown, &followup_facts).await {
             Ok(decision) => decision,
             Err(Stop::Shutdown) => return Next::Shutdown,
             Err(Stop::Unavailable) => Decision::escalate(CAUSE_UNAVAILABLE),
@@ -849,15 +906,29 @@ fn premise_retry(lang: crate::i18n::Lang, escalate: Decision) -> Decision {
 /// Valida as opções de um ESCALATE do modelo. Em YOLO, com rodadas sobrando, a primeira opção
 /// `config` válida vira uma decisão REVISE_CONFIG (validada de novo e aplicada por
 /// [`apply_config_decision`]); sem ela, o ESCALATE segue com as opções válidas.
-async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision) -> Decision {
+///
+/// Spec 141 T04 (C-03, R2): a opção `config` que restringe uma etapa nunca é aplicada sozinha: ela
+/// fica para a pessoa, no cartão da recuperação.
+async fn prepare_options(
+    scope: &Scope<'_>,
+    loaded: &Loaded,
+    decision: Decision,
+    probe: Probe<'_>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Decision {
     if !is_escalate(&decision) || (decision.options.is_empty() && decision.discarded.is_empty()) {
         return decision;
     }
-    let decision = validate_decision_options(scope, loaded, decision).await;
+    let decision = validate_decision_options(scope, loaded, decision, probe, shutdown).await;
     let lang = scope.state.project_lang(scope.project_id).get();
     if loaded.yolo && loaded.rounds < MAX_AUTONOMOUS_ROUNDS {
-        let config = decision.options.iter().find(|o| o.kind == OptionKind::Config).map(|o| {
-            (o.label.clone(), ConfigProposal { test_command: o.test_command.clone(), checks: o.checks.clone() })
+        let config = decision.options.iter().find(|o| o.kind == OptionKind::Config && o.restriction.is_none()).map(|o| {
+            let proposal = ConfigProposal {
+                test_command: o.test_command.clone(),
+                full_test_command: o.full_test_command.clone(),
+                checks: o.checks.clone(),
+            };
+            (o.label.clone(), proposal)
         });
         if let Some((label, proposal)) = config {
             return Decision {
@@ -895,19 +966,124 @@ async fn prepare_options(scope: &Scope<'_>, loaded: &Loaded, decision: Decision)
     decision
 }
 
-/// Valida as opções da decisão (sem aplicar nenhuma): as inválidas viram `discarded`.
-async fn validate_decision_options(scope: &Scope<'_>, loaded: &Loaded, mut decision: Decision) -> Decision {
+/// O que a validação de uma opção ou proposta de restrição precisa para conseguir a evidência do
+/// servidor (spec 141 T04): o runner da execução (que roda as etapas e guarda o registro de
+/// rodadas) e a tarefa.
+#[derive(Clone, Copy)]
+struct Probe<'a> {
+    runner: &'a Arc<dyn SpecRunner>,
+    task_id: &'a str,
+}
+
+/// Valida as opções da decisão (sem aplicar nenhuma): as inválidas viram `discarded`. Spec 141 T04:
+/// a opção `config` que restringe uma etapa só fica com a evidência do servidor
+/// ([`restriction_evidence`]); sem ela, é descartada com o motivo.
+async fn validate_decision_options(
+    scope: &Scope<'_>,
+    loaded: &Loaded,
+    mut decision: Decision,
+    probe: Probe<'_>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Decision {
     let (root, secrets) = (scope.root.to_path_buf(), Arc::clone(scope.secrets));
     let (options, environmental) = (std::mem::take(&mut decision.options), loaded.environmental);
     let prereqs = scope.state.prereqs().clone();
+    let worktree = task_worktree_path(scope.root, scope.spec_id, probe.task_id);
     let validated = tokio::task::spawn_blocking(move || {
-        validate_options(&root, &secrets, options, environmental, &|| prereqs.docker_available())
+        let ctx = OptionCtx { worktree: Some(&worktree), stored: false };
+        validate_options_in(&root, &secrets, options, environmental, &|| prereqs.docker_available(), ctx)
     })
     .await
     .unwrap_or_default();
-    decision.options = validated.0;
     decision.discarded.extend(validated.1);
+    // Spec 141 T04: só a primeira restrição de cada decisão é provada (até duas rodadas longas); as
+    // outras são descartadas com o motivo, para o Arquiteto.
+    let mut proved = false;
+    for mut option in validated.0 {
+        let Some(pending) = option.restriction.take() else {
+            decision.options.push(option);
+            continue;
+        };
+        if std::mem::replace(&mut proved, true) {
+            decision.discarded.push(format!(
+                "opção {}: {CAUSE_CONFIG_WEAKENS}: só a primeira restrição de cada decisão é provada pelo servidor",
+                option.id
+            ));
+            continue;
+        }
+        match restriction_evidence(scope, probe, &pending, shutdown).await {
+            Ok(evidence) => {
+                option.restriction = Some(evidence);
+                decision.options.push(option);
+            }
+            Err(why) => decision.discarded.push(format!("opção {}: {CAUSE_CONFIG_WEAKENS}: {why}", option.id)),
+        }
+    }
     decision
+}
+
+/// Spec 141 T04 (C-03, R2): a evidência do servidor para a restrição `pending` (a etapa oficial e a
+/// restrita): o runner roda as duas na worktree da tarefa e o registro de rodadas devolve o par; a
+/// oficial precisa falhar com a mesma assinatura da falha gravada na tarefa e a restrita precisa
+/// passar, tendo rodado ao menos um teste quando o executor informa ([`config_restriction::judge`]).
+/// Devolve a restrição com as duas saídas resumidas e redigidas, ou o motivo (texto para o modelo).
+async fn restriction_evidence(
+    scope: &Scope<'_>,
+    probe: Probe<'_>,
+    pending: &Restriction,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Restriction, String> {
+    let (root, spec_id, task_id) = (scope.root.to_path_buf(), scope.spec_id.to_string(), probe.task_id.to_string());
+    let blocked = tokio::task::spawn_blocking(move || {
+        let rel = format!(".sdd/specs/{spec_id}/tasks/{task_id}.md");
+        let raw = safe_fs::read_regular(&root, &rel, MAX_READ_BYTES).ok()?;
+        Task::parse(&raw).ok()?.frontmatter.test_evidence
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let runs = tokio::select! {
+        biased;
+        _ = wait_shutdown(shutdown) => return Err("execução interrompida antes das rodadas do servidor".to_string()),
+        runs = probe.runner.probe_restriction(scope.spec_id, probe.task_id, &pending.original, &pending.restricted) => runs,
+    };
+    let runs = runs.ok_or_else(|| {
+        "o servidor não conseguiu a rodada da etapa oficial falhando e a da restrita passando, na mesma árvore e no mesmo ambiente"
+            .to_string()
+    })?;
+    let counts = config_restriction::judge(
+        &blocked,
+        runs.original.passed,
+        &runs.original.output,
+        runs.restricted.passed,
+        &runs.restricted.output,
+    )?;
+    Ok(Restriction {
+        tree: runs.tree,
+        original_output: scrub_text(scope.secrets, &config_restriction::summarize(&runs.original.output)),
+        restricted_output: scrub_text(scope.secrets, &config_restriction::summarize(&runs.restricted.output)),
+        tests: counts.tests,
+        original_tests: counts.original_tests,
+        original_failed: counts.original_failed,
+        ..pending.clone()
+    })
+}
+
+/// Spec 141 T04: o texto da restrição para a pessoa (no pedido de aprovação), no idioma do projeto:
+/// a troca, os caminhos acrescentados e as duas rodadas do servidor.
+fn restriction_text(lang: crate::i18n::Lang, restriction: &Restriction) -> String {
+    crate::i18n::tr(
+        lang,
+        "recovery.restriction.approval",
+        &[
+            ("original", &restriction.original),
+            ("restricted", &restriction.restricted),
+            ("appended", &restriction.appended.join(" ")),
+            ("original_output", &restriction.original_output),
+            ("restricted_output", &restriction.restricted_output),
+        ],
+    )
 }
 
 /// Escalada por limite (CAUSE_LIMIT / CAUSE_ENV_ROUNDS): UMA chamada ao modelo só para gerar opções
@@ -917,10 +1093,11 @@ async fn validate_decision_options(scope: &Scope<'_>, loaded: &Loaded, mut decis
 async fn limit_escalation(
     scope: &Scope<'_>,
     loaded: &Loaded,
-    task_id: &str,
+    probe: Probe<'_>,
     shutdown: &mut watch::Receiver<bool>,
     cause: &str,
 ) -> Result<Decision, Stop> {
+    let task_id = probe.task_id;
     let facts = format!("{}{}{LIMIT_NOTE}", loaded.facts, loaded.env_note);
     let answer = match ask_model(scope, &facts, task_id, shutdown).await {
         Ok(answer) => answer,
@@ -933,7 +1110,7 @@ async fn limit_escalation(
     let mut proposed = Decision::escalate(cause);
     proposed.options = answer.options;
     proposed.discarded = answer.discarded;
-    let validated = validate_decision_options(scope, loaded, proposed).await;
+    let validated = validate_decision_options(scope, loaded, proposed, probe, shutdown).await;
     if validated.options.is_empty() {
         return Ok(Decision::escalate(cause));
     }
@@ -993,17 +1170,25 @@ enum Applied {
 /// Valida a proposta REVISE_CONFIG, pede aprovação (HITL; YOLO aprova sozinho) e grava a correção
 /// em `settings.yaml` (só o servidor grava). Qualquer problema vira ESCALATE com causa fixa; a
 /// recusa da validação volta como [`Applied::Refused`], para o Arquiteto corrigir uma vez.
+///
+/// Spec 141 T04 (C-03, R2): a proposta que restringe uma etapa precisa da evidência do servidor
+/// ([`restriction_evidence`]; sem ela, é recusada) e vai SEMPRE à pessoa, mesmo com a aprovação
+/// automática ([`ProjectApprover::approve_config_restriction`]), com a troca e as duas rodadas no
+/// pedido. A decisão devolvida traz a configuração gravada (com a etapa trocada também no
+/// `full_test_command` e nas checagens, R4).
 async fn apply_config_decision(
     scope: &Scope<'_>,
-    task_id: &str,
+    probe: Probe<'_>,
     decision: Decision,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Applied, Stop> {
+    let task_id = probe.task_id;
     let Some(proposal) = decision.config.clone() else {
         return Ok(Applied::Done(decision));
     };
     let (root, secrets) = (scope.root.to_path_buf(), Arc::clone(scope.secrets));
-    let checked = tokio::task::spawn_blocking(move || validate_config(&root, &proposal, &secrets))
+    let worktree = task_worktree_path(scope.root, scope.spec_id, task_id);
+    let checked = tokio::task::spawn_blocking(move || validate_config_in(&root, &proposal, &secrets, Some(&worktree)))
         .await
         .map_err(|_| Stop::Unavailable)?;
     let change = match checked {
@@ -1026,19 +1211,38 @@ async fn apply_config_decision(
     )
     .with_dialog(scope.dialog.clone())
     .with_lang(scope.state.project_lang(scope.project_id));
-    let reason = crate::i18n::tr(
-        scope.state.project_lang(scope.project_id).get(),
-        "approvals.recovery.config_reason",
-        &[("task", task_id), ("cause", &decision.root_cause)],
-    );
+    let lang = scope.state.project_lang(scope.project_id).get();
+    let reason = crate::i18n::tr(lang, "approvals.recovery.config_reason", &[("task", task_id), ("cause", &decision.root_cause)]);
+    let mut diff = change.diff.clone();
+    if let Some(step) = &change.restriction {
+        match restriction_evidence(scope, probe, &pending_restriction(step), shutdown).await {
+            Ok(evidence) => diff = format!("{diff}\n\n{}", restriction_text(lang, &evidence)),
+            Err(_) if *shutdown.borrow() => return Err(Stop::Shutdown),
+            Err(why) => {
+                let reason = format!("{CAUSE_CONFIG_WEAKENS}: {why}");
+                return Ok(Applied::Refused { escalation: Decision::escalate(&reason), reason });
+            }
+        }
+    }
     let approval = tokio::select! {
         biased;
         _ = wait_shutdown(shutdown) => return Err(Stop::Shutdown),
-        approval = approver.approve_config_change(Some(task_id), &reason, &change.diff, &change.commands) => approval,
+        approval = async {
+            if change.restriction.is_some() {
+                approver.approve_config_restriction(Some(task_id), &reason, &diff, &change.commands).await
+            } else {
+                approver.approve_config_change(Some(task_id), &reason, &diff, &change.commands).await
+            }
+        } => approval,
     };
     if approval == ApprovalDecision::Deny {
         return Ok(Applied::Done(Decision::escalate(CAUSE_CONFIG_DENIED)));
     }
+    let applied_config = ConfigProposal {
+        test_command: change.test_command.clone(),
+        full_test_command: change.full_test_command.clone(),
+        checks: change.checks.clone(),
+    };
     let (root, secrets) = (scope.root.to_path_buf(), Arc::clone(scope.secrets));
     let applied = tokio::task::spawn_blocking(move || write_config(&root, &change, &secrets))
         .await
@@ -1046,7 +1250,23 @@ async fn apply_config_decision(
     if applied.is_err() {
         return Ok(Applied::Done(Decision::escalate(CAUSE_CONFIG_SAVE)));
     }
-    Ok(Applied::Done(decision))
+    Ok(Applied::Done(Decision { config: Some(applied_config), ..decision }))
+}
+
+/// A restrição ainda sem evidência (a etapa oficial, a restrita e os caminhos acrescentados): o que
+/// a validação sabe antes das rodadas do servidor.
+fn pending_restriction(step: &StepChange) -> Restriction {
+    Restriction {
+        original: step.original.clone(),
+        restricted: step.restricted(),
+        appended: step.appended.clone(),
+        tree: String::new(),
+        original_output: String::new(),
+        restricted_output: String::new(),
+        tests: None,
+        original_tests: None,
+        original_failed: None,
+    }
 }
 
 /// Spec 133 T13 (D2): aplica a proposta REVISE_CONFIG e, se a validação do servidor a recusar
@@ -1059,13 +1279,14 @@ async fn apply_config_decision(
 async fn config_with_feedback(
     scope: &Scope<'_>,
     loaded: &Loaded,
-    task_id: &str,
+    probe: Probe<'_>,
     decision: Decision,
     shutdown: &mut watch::Receiver<bool>,
     facts: &str,
 ) -> Result<Decision, Stop> {
+    let task_id = probe.task_id;
     let previous = refused_reply(&decision);
-    let (reason, escalation) = match apply_config_decision(scope, task_id, decision, shutdown).await? {
+    let (reason, escalation) = match apply_config_decision(scope, probe, decision, shutdown).await? {
         Applied::Done(decision) => return Ok(decision),
         Applied::Refused { reason, escalation } => (reason, escalation),
     };
@@ -1080,7 +1301,7 @@ async fn config_with_feedback(
         Err(Stop::Shutdown) => return Err(Stop::Shutdown),
         Err(Stop::Unavailable) => return Ok(escalation),
     };
-    let second = restrict_environmental(loaded.environmental, prepare_options(scope, loaded, second).await);
+    let second = restrict_environmental(loaded.environmental, prepare_options(scope, loaded, second, probe, shutdown).await);
     if second.config.is_none() {
         if is_escalate(&second) {
             // O Arquiteto escalou: fica a causa da recusa, com as opções válidas que ele trouxe.
@@ -1091,7 +1312,7 @@ async fn config_with_feedback(
     if loaded.environmental && loaded.yolo && loaded.rounds >= MAX_AUTONOMOUS_ROUNDS {
         return Ok(escalation);
     }
-    match apply_config_decision(scope, task_id, second, shutdown).await? {
+    match apply_config_decision(scope, probe, second, shutdown).await? {
         Applied::Done(decision) => Ok(decision),
         Applied::Refused { escalation, .. } => Ok(escalation),
     }
@@ -1104,6 +1325,9 @@ fn refused_reply(decision: &Decision) -> String {
     if let (Some(config), Some(map)) = (&decision.config, reply.as_object_mut()) {
         if let Some(test) = &config.test_command {
             map.insert("test_command".into(), Value::from(test.as_str()));
+        }
+        if let Some(full) = &config.full_test_command {
+            map.insert("full_test_command".into(), Value::from(full.as_str()));
         }
         if let Some(checks) = &config.checks {
             map.insert("checks".into(), serde_json::to_value(checks).unwrap_or(Value::Null));
@@ -1137,7 +1361,7 @@ const CONTROL_WORDS: [&str; 6] = ["exit", "return", "false", ":", "break", "cont
 /// aspas e com espaços normalizados. `None` se houver qualquer outra construção de shell fora de
 /// aspas (`;`, `||`, `|`, `&`, quebra de linha, subshell, agrupamento, redirecionamento, crase,
 /// barra invertida), aspas abertas ou etapa vazia.
-fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
+pub(crate) fn parse_steps(command: &str) -> Option<Vec<Vec<String>>> {
     Some(scan_steps(command)?.into_iter().map(|(words, _)| words).collect())
 }
 
@@ -1236,7 +1460,17 @@ fn contains_command(new: &str, original: &str) -> bool {
 /// internas a scripts do projeto (ex.: reescrever o script `test` do package.json para tirar o
 /// Playwright) não são detectáveis aqui; ficam cobertas pelo prompt da recuperação e pela regra do
 /// REVISE_TASK, que proíbem explicitamente rebaixar a verificação.
-fn check_not_weakened(current: &Settings, new_test: &str, new_checks: &[Check]) -> Result<(), String> {
+///
+/// Spec 141 T04 (C-03): a guarda vale também para o `full_test_command` (sem ele, a bateria completa
+/// é o `test_command`), e cada campo pode, em vez de conter a etapa original inteira (R1), conter a
+/// etapa com caminhos acrescentados no fim (R2, [`config_restriction`]). Devolve essa restrição, a
+/// conferir depois (caminhos, evidência e aprovação da pessoa); só uma etapa restringida por proposta.
+fn check_not_weakened(
+    current: &Settings,
+    new_test: &str,
+    new_full: Option<&str>,
+    new_checks: &[Check],
+) -> Result<Option<StepChange>, String> {
     let docker = current.environment == Environment::Docker;
     // `None`: nada objetivo a preservar (comando vazio ou invólucro docker não desembrulhável).
     let orig = |c: &str| -> Option<String> {
@@ -1246,22 +1480,63 @@ fn check_not_weakened(current: &Settings, new_test: &str, new_checks: &[Check]) 
         }
         (!c.is_empty()).then(|| c.to_string())
     };
+    let mut changes: Vec<StepChange> = Vec::new();
     if let Some(original_test) = orig(&current.test_command) {
-        if !contains_command(new_test, &original_test) {
-            return Err(format!("{CAUSE_CONFIG_WEAKENS}: o novo test_command não executa mais `{original_test}`"));
-        }
+        let found = field_guard(new_test, &original_test)
+            .map_err(|()| format!("{CAUSE_CONFIG_WEAKENS}: o novo test_command não executa mais `{original_test}`"))?;
+        changes.extend(found);
+    }
+    // R4: a bateria completa (sem ela, o `test_command` faz esse papel).
+    // Igual à atual, a bateria completa não muda e não há o que conferir nela (spec 141 T04, F-02).
+    let original_full = current.full_test_command.as_deref().unwrap_or(current.test_command.as_str());
+    let full_changed = new_full.is_some_and(|f| Some(f) != current.full_test_command.as_deref());
+    if let (true, Some(full), Some(original_full)) = (full_changed, new_full, orig(original_full)) {
+        let found = field_guard(full, &original_full)
+            .map_err(|()| format!("{CAUSE_CONFIG_WEAKENS}: o novo full_test_command não executa mais `{original_full}`"))?;
+        changes.extend(found);
     }
     for check in current.checks.iter().filter(|c| c.blocking) {
         let Some(original) = orig(&check.command) else {
             continue;
         };
-        let kept = contains_command(new_test, &original)
-            || new_checks.iter().any(|n| n.blocking && contains_command(&n.command, &original));
-        if !kept {
+        let candidates = std::iter::once(new_test).chain(new_checks.iter().filter(|n| n.blocking).map(|n| n.command.as_str()));
+        let kept: Vec<Vec<StepChange>> = candidates.filter_map(|c| field_guard(c, &original).ok()).collect();
+        if kept.is_empty() {
             return Err(format!("{CAUSE_CONFIG_WEAKENS}: o check bloqueante `{}` deixaria de ser executado", check.name));
         }
+        // Inteiro em algum lugar vence a restrição.
+        if !kept.iter().any(Vec::is_empty) {
+            changes.extend(kept.into_iter().next().unwrap_or_default());
+        }
     }
-    Ok(())
+    let mut changes = changes.into_iter();
+    let first = changes.next();
+    if let Some(first) = &first {
+        if changes.any(|c| c != *first) {
+            return Err(format!("{CAUSE_CONFIG_WEAKENS}: a proposta restringe mais de uma etapa; só uma restrição por vez"));
+        }
+    }
+    Ok(first)
+}
+
+/// Spec 141 T04: a guarda de um campo. Vazio: o novo contém a etapa original inteira (R1). Com
+/// itens: as etapas que ele restringe (R2). `Err`: tira etapa, troca palavra, usa `||`, `;`,
+/// redirecionamento ou palavra de controle (R3).
+fn field_guard(new: &str, original: &str) -> Result<Vec<StepChange>, ()> {
+    if contains_command(new, original) {
+        return Ok(Vec::new());
+    }
+    let (Some(have), Some(wanted), Some(texts)) = (parse_steps(new), parse_steps(original), command_steps(original)) else {
+        return Err(());
+    };
+    if have.iter().any(|step| step.first().is_some_and(|w| CONTROL_WORDS.contains(&w.as_str()))) {
+        return Err(());
+    }
+    let original: Vec<(Vec<String>, String)> = wanted.into_iter().zip(texts).collect();
+    match config_restriction::match_steps(&have, &original) {
+        Some(changes) if !changes.is_empty() => Ok(changes),
+        _ => Err(()),
+    }
 }
 
 /// Texto "Contexto" anexado a toda escalada: o que a UI e o humano precisam para decidir.
@@ -1409,7 +1684,12 @@ fn check_not_repeated(current: &Settings, new_test: &str) -> Result<(), String> 
 /// Mudança já validada: configuração resultante e diff antes/depois (redigido).
 struct ConfigChange {
     test_command: Option<String>,
+    /// Spec 141 T04 (R4): a bateria completa resultante, quando muda.
+    full_test_command: Option<String>,
     checks: Option<Vec<Check>>,
+    /// Spec 141 T04 (R2): a etapa restringida, que só vale com a evidência do servidor e a aprovação
+    /// da pessoa (nunca automática).
+    restriction: Option<StepChange>,
     diff: String,
     /// Todos os comandos resultantes (para a regra de auto-aprovação YOLO).
     commands: Vec<String>,
@@ -1427,8 +1707,22 @@ fn render_checks(checks: &[Check]) -> String {
 }
 
 /// Mesmas regras do plano (forma, nomes, sem docker em modo docker, sem segredo) + política de
-/// comandos (denylist recusa). Proposta sem efeito (igual ao atual) também é recusada.
+/// comandos (denylist recusa). Proposta sem efeito (igual ao atual) também é recusada. Sem a
+/// worktree da tarefa, uma restrição é recusada (não há onde conferir o caminho acrescentado).
+#[cfg(test)]
 fn validate_config(root: &Path, proposal: &ConfigProposal, secrets: &SecretSet) -> Result<ConfigChange, String> {
+    validate_config_in(root, proposal, secrets, None)
+}
+
+/// [`validate_config`] com a worktree da tarefa (`worktree`), onde os caminhos acrescentados por uma
+/// restrição precisam existir (spec 141 T04, R3). Com a restrição aceita, a etapa é trocada também
+/// no `full_test_command` e nas checagens em que aparece (R4).
+fn validate_config_in(
+    root: &Path,
+    proposal: &ConfigProposal,
+    secrets: &SecretSet,
+    worktree: Option<&Path>,
+) -> Result<ConfigChange, String> {
     let text = safe_fs::read_regular(root, SETTINGS_REL, MAX_READ_BYTES).map_err(|_| "settings ilegível".to_string())?;
     let current = Settings::parse(&text).map_err(|_| "settings inválido".to_string())?;
     let docker = current.environment == Environment::Docker;
@@ -1444,6 +1738,7 @@ fn validate_config(root: &Path, proposal: &ConfigProposal, secrets: &SecretSet) 
         }
     };
     let test_command = proposal.test_command.as_deref().map(norm).transpose()?;
+    let full_test_command = proposal.full_test_command.as_deref().map(norm).transpose()?;
     let checks = match &proposal.checks {
         Some(list) => {
             let mut normalized = Vec::with_capacity(list.len());
@@ -1455,33 +1750,79 @@ fn validate_config(root: &Path, proposal: &ConfigProposal, secrets: &SecretSet) 
         None => None,
     };
     let policy = Policy::from_settings(&current);
-    let all = test_command.iter().cloned().chain(checks.iter().flatten().map(|c| c.command.clone()));
-    for command in all {
-        if let allowlist::Decision::Deny(why) = allowlist::evaluate(&command, &policy) {
-            return Err(format!("comando recusado pela política: {why}"));
+    let allowed = |command: &str| -> Result<(), String> {
+        match allowlist::evaluate(command, &policy) {
+            allowlist::Decision::Deny(why) => Err(format!("comando recusado pela política: {why}")),
+            _ => Ok(()),
+        }
+    };
+    let proposed = test_command.iter().chain(full_test_command.iter()).chain(checks.iter().flatten().map(|c| &c.command));
+    for command in proposed {
+        allowed(command)?;
+    }
+    let mut new_test = test_command.clone().unwrap_or_else(|| current.test_command.clone());
+    let mut new_full = full_test_command.clone().or_else(|| current.full_test_command.clone());
+    let mut new_checks = checks.clone().unwrap_or_else(|| current.checks.clone());
+    let restriction = check_not_weakened(&current, &new_test, new_full.as_deref(), &new_checks)?;
+    if let Some(change) = &restriction {
+        let base = config_restriction::Base { repo: root, branch: &current.base_branch };
+        config_restriction::check_appended(&change.appended, worktree, Some(base))
+            .map_err(|why| format!("{CAUSE_CONFIG_WEAKENS}: {why}"))?;
+        // R4: onde a etapa original aparece inteira, ela é trocada pela restrita; o que mudou assim
+        // passa pela mesma forma e pela mesma política.
+        let derive = |command: &mut String| -> Result<(), String> {
+            // Um comando que não dá para analisar e cita a etapa ficaria sem a troca (spec 141 T04,
+            // F-02): recusa com o motivo, em vez de gravar a configuração pela metade.
+            if parse_steps(command).is_none() && command.contains(change.original.as_str()) {
+                return Err(format!(
+                    "{CAUSE_CONFIG_WEAKENS}: `{command}` cita a etapa `{}` mas não é um encadeamento simples de `&&`; \
+                     a troca não teria como valer nele. Proponha esse comando junto, já com a etapa trocada, em etapas ligadas por `&&`",
+                    change.original
+                ));
+            }
+            if let Some(rewritten) = config_restriction::rewrite(command, change) {
+                crate::sdd::check_test_command_shape(&rewritten)
+                    .map_err(|_| "comando inválido (uma linha, até 200 caracteres)".to_string())?;
+                allowed(&rewritten)?;
+                *command = rewritten;
+            }
+            Ok(())
+        };
+        derive(&mut new_test)?;
+        if let Some(full) = new_full.as_mut() {
+            derive(full)?;
+        }
+        for check in &mut new_checks {
+            derive(&mut check.command)?;
         }
     }
-    let new_test = test_command.clone().unwrap_or_else(|| current.test_command.clone());
-    let new_checks = checks.clone().unwrap_or_else(|| current.checks.clone());
-    check_not_weakened(&current, &new_test, &new_checks)?;
-    if let Some(proposed) = &test_command {
-        check_not_repeated(&current, proposed)?;
+    if test_command.is_some() || new_test != current.test_command {
+        check_not_repeated(&current, &new_test)?;
     }
-    if new_test == current.test_command && new_checks == current.checks {
+    if new_test == current.test_command && new_full == current.full_test_command && new_checks == current.checks {
         return Err("a proposta não muda a configuração atual".to_string());
     }
+    let full_line = |full: &Option<String>| full.as_deref().map(|f| format!("full_test_command: {f}\n")).unwrap_or_default();
     let diff = scrub_text(
         secrets,
         &format!(
-            "Antes:\ntest_command: {}\n{}\n\nDepois:\ntest_command: {}\n{}",
+            "Antes:\ntest_command: {}\n{}{}\n\nDepois:\ntest_command: {}\n{}{}",
             current.test_command,
+            full_line(&current.full_test_command),
             render_checks(&current.checks),
             new_test,
+            full_line(&new_full),
             render_checks(&new_checks)
         ),
     );
-    let commands = std::iter::once(new_test).chain(new_checks.iter().map(|c| c.command.clone())).collect();
-    Ok(ConfigChange { test_command, checks, diff, commands })
+    let commands = std::iter::once(new_test.clone())
+        .chain(new_full.clone())
+        .chain(new_checks.iter().map(|c| c.command.clone()))
+        .collect();
+    let test_out = (test_command.is_some() || new_test != current.test_command).then_some(new_test);
+    let full_out = (full_test_command.is_some() || new_full != current.full_test_command).then_some(new_full).flatten();
+    let checks_out = (checks.is_some() || new_checks != current.checks).then_some(new_checks);
+    Ok(ConfigChange { test_command: test_out, full_test_command: full_out, checks: checks_out, diff, commands, restriction })
 }
 
 /// Spec 129 T05: avisos (pelo dicionário, no idioma do projeto) dos campos que a proposta
@@ -1502,6 +1843,7 @@ fn repeated_install_warnings(root: &Path, config: &ConfigProposal, lang: crate::
         .into_iter()
         .filter(|(field, _)| match field.as_str() {
             "test_command" => config.test_command.is_some(),
+            "full_test_command" => config.full_test_command.is_some(),
             f => f.starts_with("checks[") && config.checks.is_some(),
         })
         .map(|(field, command)| {
@@ -1518,6 +1860,9 @@ fn write_config(root: &Path, change: &ConfigChange, _secrets: &SecretSet) -> Res
     let mut settings = Settings::parse(&text).map_err(|_| ())?;
     if let Some(t) = &change.test_command {
         settings.test_command = t.clone();
+    }
+    if let Some(full) = &change.full_test_command {
+        settings.full_test_command = Some(full.clone());
     }
     if let Some(c) = &change.checks {
         settings.checks = c.clone();
@@ -1777,6 +2122,8 @@ fn load_diagnosis(root: &Path, spec_id: &str, task_id: &str, reason: &str, secre
 ",
         scrub_text(secrets, &evidence_tail(&evidence, MAX_TEST_TAIL_BYTES))
     ));
+    // Spec 141 T03: os mesmos fatos do ambiente do Nants da recuperação.
+    out.push_str(&env_facts(root, spec_id, task_id, secrets));
     Some(DiagFacts {
         facts: scrub_text(secrets, &truncate_bytes(&out, MAX_FACTS_BYTES)),
         already,
@@ -1846,6 +2193,368 @@ pub async fn diagnose(
         ),
     );
     Next::Stay
+}
+
+/// Spec 141 T03 (C-04): a tarefa está BLOQUEADA por defeito do ambiente do Nants (código
+/// [`BLOCK_NANTS_ENVIRONMENT`], gravado pelo runner quando a saída dos testes cita um caminho do
+/// Nants). Ilegível: `false`.
+pub fn nants_fault_blocked(root: &Path, spec_id: &str, task_id: &str) -> bool {
+    let rel = format!(".sdd/specs/{spec_id}/tasks/{task_id}.md");
+    safe_fs::read_regular(root, &rel, MAX_READ_BYTES)
+        .ok()
+        .and_then(|raw| Task::parse(&raw).ok())
+        .is_some_and(|t| t.frontmatter.status == TaskStatus::Blocked && t.frontmatter.next_action_code.as_deref() == Some(BLOCK_NANTS_ENVIRONMENT))
+}
+
+/// Spec 141 T03 (C-04, C-06): falha do ambiente do Nants. A tarefa vai à pessoa SEM o modelo: o
+/// servidor grava uma escalada determinística (não conta como ciclo) com a causa
+/// [`CAUSE_NANTS_ENVIRONMENT`], o caminho citado na proposta, o contexto da falha e a opção
+/// `reset_workspace`, que o próprio servidor executa se a pessoa a escolher. Nunca falha para o
+/// chamador: sem tarefa legível ou sem registro, fica BLOCKED como está.
+pub async fn nants_fault(scope: &Scope<'_>, runner: &Arc<dyn SpecRunner>, task_id: &str) -> Next {
+    let (root, spec_id, tid) = (scope.root.to_path_buf(), scope.spec_id.to_string(), task_id.to_string());
+    let secrets = Arc::clone(scope.secrets);
+    let loaded = tokio::task::spawn_blocking(move || {
+        let loaded = load(&root, &spec_id, &tid, &secrets)?;
+        let evidence = safe_fs::read_regular(&root, &format!(".sdd/specs/{spec_id}/tasks/{tid}.md"), MAX_READ_BYTES)
+            .ok()
+            .and_then(|raw| Task::parse(&raw).ok())
+            .and_then(|t| t.frontmatter.test_evidence)
+            .unwrap_or_default();
+        Some((loaded, crate::agents::nants_fault::cited(&evidence)))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((loaded, cited)) = loaded else {
+        return Next::Stay;
+    };
+    let lang = scope.state.project_lang(scope.project_id).get();
+    let path = cited.unwrap_or_else(|| crate::harness::home::CONTAINER_HOME.to_string());
+    let mut decision = Decision::escalate(CAUSE_NANTS_ENVIRONMENT);
+    decision.proposal = Some(crate::i18n::tr(lang, "recovery.nants_fault.proposal", &[("path", &path)]));
+    decision.options = vec![reset_workspace_option(lang)];
+    escalate_without_model(scope, runner, task_id, &loaded, &decision).await
+}
+
+/// A opção `reset_workspace` oferecida pelo servidor (spec 141 T03), no idioma do projeto.
+fn reset_workspace_option(lang: crate::i18n::Lang) -> RecoveryOption {
+    RecoveryOption {
+        id: RESET_WORKSPACE_ID.to_string(),
+        label: crate::i18n::text(lang, "recovery.option.reset_workspace"),
+        kind: OptionKind::ResetWorkspace,
+        test_command: None,
+        full_test_command: None,
+        checks: None,
+        text: Some(crate::i18n::text(lang, "recovery.option.reset_workspace_text")),
+        objective: None,
+        acceptance: None,
+        allowed_scope: None,
+        diff: None,
+        files: None,
+        restriction: None,
+    }
+}
+
+/// Grava a escalada `decision`, feita sem o modelo, como análise que não conta como ciclo (com o
+/// contexto da falha), publica a decisão com as opções e mostra o cartão na conversa. A tarefa fica
+/// BLOQUEADA, esperando a pessoa. Sem registro, fica como está.
+async fn escalate_without_model(scope: &Scope<'_>, runner: &Arc<dyn SpecRunner>, task_id: &str, loaded: &Loaded, decision: &Decision) -> Next {
+    let cycle = loaded.cycles + 1;
+    scope
+        .events
+        .publish(cycle_event(scope, EventType::RecoveryStarted, task_id, cycle, None, &[], None));
+    let mut text = section_body(scope.secrets, decision);
+    text.push_str(&escalation_context(scope.secrets, loaded, decision));
+    text.push('\n');
+    text.push_str(crate::agents::runner::NOT_COUNTED_LINE);
+    let (spec_id, tid, body) = (scope.spec_id.to_string(), task_id.to_string(), text.clone());
+    let runner_job = Arc::clone(runner);
+    let job_decision = decision.clone();
+    let job_secrets = Arc::clone(scope.secrets);
+    let written = tokio::task::spawn_blocking(move || record(&*runner_job, &spec_id, &tid, &job_decision, &body, &job_secrets))
+        .await
+        .ok()
+        .flatten();
+    let Some(written) = written else {
+        return Next::Stay;
+    };
+    scope.events.publish(cycle_event(
+        scope,
+        EventType::RecoveryDecided,
+        task_id,
+        cycle,
+        Some("ESCALATE"),
+        &decision.options,
+        Some(written.cycle),
+    ));
+    let message = format!("Análise de recuperação #{cycle} (ESCALATE)\n{}", written.text);
+    let params = json!({"cycle": cycle, "decision": "ESCALATE", "autonomous": 0});
+    deliver(
+        scope.events,
+        Some(scope.dialog),
+        ApiEvent::new(
+            EventType::AgentMessage,
+            Some(scope.project_id.to_string()),
+            analysis_payload(scope.secrets, task_id, &message, CODE_ANALYSIS, params),
+        ),
+    );
+    Next::Stay
+}
+
+/// Spec 141 T05 (C-05): a tarefa está BLOQUEADA porque a primeira falha depois da escolha da pessoa
+/// tem a mesma assinatura da escalada (código [`BLOCK_SAME_FAILURE`], gravado pelo runner).
+/// Ilegível: `false`.
+pub fn same_failure_blocked(root: &Path, spec_id: &str, task_id: &str) -> bool {
+    let rel = format!(".sdd/specs/{spec_id}/tasks/{task_id}.md");
+    safe_fs::read_regular(root, &rel, MAX_READ_BYTES)
+        .ok()
+        .and_then(|raw| Task::parse(&raw).ok())
+        .is_some_and(|t| t.frontmatter.status == TaskStatus::Blocked && t.frontmatter.next_action_code.as_deref() == Some(BLOCK_SAME_FAILURE))
+}
+
+/// Spec 141 T05 (C-05): a mesma falha voltou depois da escolha da pessoa. A tarefa volta a ela SEM o
+/// modelo e sem reabrir os ciclos: o servidor grava uma escalada determinística (não conta como
+/// ciclo) com a causa [`CAUSE_SAME_FAILURE`] e oferece de novo as opções reais: as da última
+/// escalada, validadas outra vez (a troca do comando só com a evidência nova das rodadas do
+/// servidor, spec 141 T04), e `reset_workspace` (T03). A orientação livre fica no cartão, como
+/// sempre. Nunca falha para o chamador: sem tarefa legível ou sem registro, fica BLOCKED como está.
+pub async fn same_failure(
+    scope: &Scope<'_>,
+    runner: &Arc<dyn SpecRunner>,
+    task_id: &str,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Next {
+    if *shutdown.borrow() {
+        return Next::Shutdown;
+    }
+    let (root, spec_id, tid) = (scope.root.to_path_buf(), scope.spec_id.to_string(), task_id.to_string());
+    let secrets = Arc::clone(scope.secrets);
+    let loaded = tokio::task::spawn_blocking(move || {
+        let loaded = load(&root, &spec_id, &tid, &secrets)?;
+        let body = safe_fs::read_regular(&root, &format!(".sdd/specs/{spec_id}/tasks/{tid}.md"), MAX_READ_BYTES)
+            .ok()
+            .and_then(|raw| Task::parse(&raw).ok())
+            .map(|t| t.body)
+            .unwrap_or_default();
+        let previous = escalation_options_block(&body)
+            .and_then(|(_, json)| serde_json::from_str::<Vec<RecoveryOption>>(&json).ok())
+            .unwrap_or_default();
+        Some((loaded, previous))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((loaded, previous)) = loaded else {
+        return Next::Stay;
+    };
+    let lang = scope.state.project_lang(scope.project_id).get();
+    let mut decision = Decision::escalate(CAUSE_SAME_FAILURE);
+    decision.proposal = Some(crate::i18n::text(lang, "recovery.same_failure.proposal"));
+    // A evidência guardada de uma restrição vale só para a árvore de antes: a opção volta pendente e
+    // as rodadas do servidor a provam de novo (sem o modelo).
+    decision.options = previous.into_iter().map(|o| RecoveryOption { restriction: None, ..o }).collect();
+    if !decision.options.iter().any(|o| o.kind == OptionKind::ResetWorkspace) {
+        let mut reset = reset_workspace_option(lang);
+        if decision.options.iter().any(|o| o.id == reset.id) {
+            reset.id = format!("{RESET_WORKSPACE_ID}_2");
+        }
+        decision.options.push(reset);
+    }
+    let probe = Probe { runner, task_id };
+    let decision = validate_decision_options(scope, &loaded, decision, probe, shutdown).await;
+    if *shutdown.borrow() {
+        return Next::Shutdown;
+    }
+    escalate_without_model(scope, runner, task_id, &loaded, &decision).await
+}
+
+/// Rótulo das linhas de fatos para o modelo quando um dado não existe.
+const ABSENT: &str = "(ausente)";
+/// Valor no lugar de todo valor do compose que não é estrutural, mostrado ao modelo.
+const REDACTED_VALUE: &str = "[redigido]";
+/// Chaves estruturais do compose cujos valores escalares (direto nelas ou nas listas delas) vão ao
+/// modelo. Todo o resto (`command`, `entrypoint`, `healthcheck.test`, `labels`, blocos `x-*`,
+/// chaves desconhecidas) tem os valores redigidos; os nomes das chaves ficam.
+const COMPOSE_ALLOWED_KEYS: [&str; 34] = [
+    "image",
+    "build",
+    "context",
+    "dockerfile",
+    "target",
+    "ports",
+    "expose",
+    "published",
+    "protocol",
+    "mode",
+    "volumes",
+    "type",
+    "source",
+    "read_only",
+    "depends_on",
+    "condition",
+    "working_dir",
+    "user",
+    "restart",
+    "networks",
+    "network_mode",
+    "driver",
+    "mem_limit",
+    "memswap_limit",
+    "pids_limit",
+    "cpus",
+    "memory",
+    "shm_size",
+    "platform",
+    "init",
+    "tty",
+    "interval",
+    "timeout",
+    "retries",
+];
+/// Chaves cujos nomes de variável ficam e os valores saem (mapa ou lista `NOME=valor`).
+const COMPOSE_NAMED_KEYS: [&str; 3] = ["environment", "args", "labels"];
+
+/// Valor permitido que mesmo assim tem cara de credencial: endereço com usuário e senha
+/// (`esquema://usuario:senha@host`).
+fn credential_shaped(text: &str) -> bool {
+    text.split("://").skip(1).any(|rest| rest.split('/').next().is_some_and(|authority| authority.contains('@')))
+}
+
+/// Spec 141 T03 (revisão 1, F-01): o compose para o modelo, por lista de permissão. Os valores
+/// escalares só ficam nas chaves estruturais ([`COMPOSE_ALLOWED_KEYS`]) e, mesmo nelas, saem se
+/// tiverem cara de credencial; em `environment`, `args` e `labels` ficam os nomes; todo o resto vira
+/// [`REDACTED_VALUE`], inclusive dentro de listas e de blocos `x-*`. Ficam a estrutura e os nomes
+/// das chaves. Compose ilegível não é mostrado (o texto cru poderia ter segredo).
+fn redacted_compose(text: &str, secrets: &SecretSet) -> String {
+    use serde_yaml::Value;
+    fn redacted() -> Value {
+        Value::String(REDACTED_VALUE.into())
+    }
+    /// Escalar de uma chave permitida: fica, menos o que tem cara de credencial.
+    fn keep_scalar(value: &mut Value) {
+        if let Value::String(s) = value {
+            if credential_shaped(s) {
+                *value = redacted();
+            }
+        }
+    }
+    /// Valores de `environment`, `args` e `labels`: os nomes ficam.
+    fn names_only(value: &mut Value) {
+        match value {
+            Value::Mapping(map) => map.iter_mut().for_each(|(_, v)| *v = if v.is_null() { Value::Null } else { redacted() }),
+            Value::Sequence(items) => {
+                for item in items.iter_mut() {
+                    *item = match item.as_str() {
+                        Some(entry) => Value::String(format!("{}={REDACTED_VALUE}", entry.split('=').next().unwrap_or_default())),
+                        None => redacted(),
+                    };
+                }
+            }
+            Value::Null => {}
+            other => *other = redacted(),
+        }
+    }
+    /// `allowed`: o valor está direto numa chave permitida (ou numa lista dela).
+    fn walk(value: &mut Value, allowed: bool) {
+        match value {
+            Value::Mapping(map) => {
+                for (k, v) in map.iter_mut() {
+                    let name = k.as_str().unwrap_or_default().to_lowercase();
+                    if COMPOSE_NAMED_KEYS.contains(&name.as_str()) {
+                        names_only(v);
+                    } else {
+                        walk(v, COMPOSE_ALLOWED_KEYS.contains(&name.as_str()));
+                    }
+                }
+            }
+            Value::Sequence(items) => items.iter_mut().for_each(|item| walk(item, allowed)),
+            Value::Tagged(tagged) => walk(&mut tagged.value, allowed),
+            Value::Null | Value::Bool(_) => {}
+            scalar if allowed => keep_scalar(scalar),
+            scalar => *scalar = redacted(),
+        }
+    }
+    let Ok(mut value) = serde_yaml::from_str::<Value>(text) else {
+        return "(compose ilegível: não mostrado)".to_string();
+    };
+    walk(&mut value, false);
+    match serde_yaml::to_string(&value) {
+        Ok(out) => truncate_bytes(&scrub_text(secrets, out.trim()), MAX_SECTION_BYTES),
+        Err(_) => "(compose ilegível: não mostrado)".to_string(),
+    }
+}
+
+/// Spec 141 T03: a worktree da tarefa (relativa ao projeto), se existe, quando foi criada e se a
+/// última rodada de testes registrada rodou nela. Do estado real: o arquivo `.git` da worktree,
+/// gravado na criação, e o registro de rodadas do projeto.
+fn worktree_fact(root: &Path, spec_id: &str, task_id: &str) -> String {
+    let rel = format!(".sdd/worktrees/{spec_id}/{task_id}");
+    let worktree = read_root(root, spec_id, task_id);
+    if worktree == root {
+        return format!(
+            "- Worktree da tarefa: `{rel}` {ABSENT}. O Nants cria uma nova na próxima rodada.\n"
+        );
+    }
+    let created = std::fs::symlink_metadata(worktree.join(".git"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let last_run = crate::sdd::capabilities::read(root).runs.last().map(|r| r.at.clone());
+    let mut line = format!("- Worktree da tarefa: `{rel}`");
+    if let Some(secs) = created {
+        line.push_str(&format!(", criada em {}", crate::server::projects::format_utc(secs)));
+    }
+    line.push('.');
+    match (created, last_run.as_deref().and_then(|at| super::usage::parse_utc(at).map(|secs| (at, secs)))) {
+        (Some(created), Some((at, secs))) if secs >= created => {
+            line.push_str(&format!(" A última rodada de testes registrada ({at}) rodou nesta MESMA worktree."));
+        }
+        (Some(_), Some((at, _))) => {
+            line.push_str(&format!(" Ela é NOVA: foi criada depois da última rodada de testes registrada ({at})."));
+        }
+        _ => {}
+    }
+    line.push_str(
+        " É a mesma em todas as rodadas desta tarefa até ser removida: o Nants só cria outra quando ela não existe, e um commit novo não cria worktree nova.\n",
+    );
+    line
+}
+
+/// Spec 141 T03 (C-04): fatos do ambiente do Nants para o Arquiteto (recuperação e diagnóstico),
+/// de constantes do código e do estado real, sem segredo e sem caminho do usuário: onde fica cada
+/// configuração, a montagem da área de trabalho e da pasta pessoal, a worktree e o compose redigido.
+fn env_facts(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> String {
+    use crate::agents::spill::OUTPUTS_DIR;
+    use crate::harness::compose::WORKDIR;
+    use crate::harness::home::{CONTAINER_HOME, KEEP_ON_RESET, LEGACY_HOME_DIR, TASK_WORKTREES};
+    use crate::sdd::environment::{COMPOSE_REL, ENV_DIR};
+    let mut out = String::from("\n## Ambiente do Nants (fatos do servidor)\n");
+    out.push_str(&format!(
+        "- Onde fica cada configuração: `{SETTINGS_REL}` guarda test_command, full_test_command, install_command e checks \
+         (REVISE_CONFIG corrige test_command e checks). `{COMPOSE_REL}` e `{ENV_DIR}/Dockerfile*` descrevem o ambiente \
+         (opção `environment` com `files`). Nada disso fica no front matter do spec.md nem da tarefa.\n"
+    ));
+    out.push_str(&format!(
+        "- Área de trabalho no container: a worktree da tarefa em `{WORKDIR}`, com `{WORKDIR}/.git` e `{WORKDIR}/{ENV_DIR}` só \
+         leitura. `{ENV_DIR}`, `{OUTPUTS_DIR}`, `{TASK_WORKTREES}` e `{LEGACY_HOME_DIR}` (legado) são do Nants, não do projeto: \
+         erro que cita um deles é defeito do ambiente do Nants, não do código.\n"
+    ));
+    out.push_str(&format!(
+        "- Pasta pessoal (HOME): `{CONTAINER_HOME}`, fora de `{WORKDIR}`, uma por worktree no diretório de dados do Nants; \
+         persiste entre as rodadas. Só o servidor a limpa: a opção `reset_workspace` apaga tudo nela menos `{KEEP_ON_RESET}` \
+         e faz a instalação rodar de novo.\n"
+    ));
+    out.push_str(&worktree_fact(root, spec_id, task_id));
+    let dir = read_root(root, spec_id, task_id);
+    let compose = safe_fs::read_regular(&dir, COMPOSE_REL, MAX_READ_BYTES)
+        .map(|text| redacted_compose(&text, secrets))
+        .unwrap_or_else(|_| ABSENT.to_string());
+    out.push_str(&format!(
+        "\n## Compose do projeto (`{COMPOSE_REL}`, valores sensíveis redigidos; o Nants acrescenta as montagens acima)\n{compose}\n"
+    ));
+    out
 }
 
 /// Código (spec 133 T11) da análise de recuperação na conversa: `params.cycle`, `params.decision`
@@ -1959,9 +2668,12 @@ fn resolve_option(
         return Err(ChoiceError::Stale);
     }
     let stored = stored.into_iter().find(|o| o.id == id).ok_or(ChoiceError::Stale)?;
-    // Mesma validação da geração (tamanho, privilégio, scrub, guarda, regra ambiental, docker).
+    // Mesma validação da geração (tamanho, privilégio, scrub, guarda, regra ambiental, docker). Spec
+    // 141 T04: a restrição vale com a evidência gravada pelo servidor, na mesma árvore.
     let environmental = command_did_not_run(task.frontmatter.test_evidence.as_deref().unwrap_or_default());
-    validate_option(root, secrets, stored, environmental, &[], docker).map_err(|_| ChoiceError::Stale)
+    let worktree = task_worktree_path(root, &task.frontmatter.spec_id, &task.frontmatter.id);
+    let ctx = OptionCtx { worktree: Some(&worktree), stored: true };
+    validate_option_in(root, secrets, stored, environmental, &[], docker, ctx).map_err(|_| ChoiceError::Stale)
 }
 
 /// Se a escolha é uma opção `environment` com `files`, devolve a opção revalidada: ela exige
@@ -1982,13 +2694,51 @@ pub fn env_files_option(
     Ok((option.kind == OptionKind::Environment && option.files.is_some()).then_some(option))
 }
 
+/// Spec 141 T03 (C-06): `true` se a escolha é a opção `reset_workspace` vigente (revalidada): o
+/// servidor a executa ([`reset_workspace`]) ANTES de [`apply_choice`].
+pub fn is_reset_choice(
+    root: &Path,
+    spec_id: &str,
+    task_id: &str,
+    choice: &Choice,
+    secrets: &SecretSet,
+    docker: DockerProbe<'_>,
+) -> Result<bool, ChoiceError> {
+    let Choice::Option(id, analysis) = choice else {
+        return Ok(false);
+    };
+    let (_, task) = load_blocked(root, spec_id, task_id)?;
+    let option = resolve_option(root, &task, id, *analysis, secrets, docker)?;
+    Ok(option.kind == OptionKind::ResetWorkspace)
+}
+
+/// Spec 141 T03 (C-06): executa a opção `reset_workspace` na worktree da tarefa: esquece a
+/// instalação (a próxima rodada instala de novo) e, com o Compose do projeto, apaga a pasta pessoal
+/// dela (menos o cache de download, [`crate::harness::home::reset`]). O código e os commits não
+/// mudam. Sem worktree, não há o que limpar nela: só o estado da instalação é esquecido.
+pub fn reset_workspace(
+    compose: Option<&crate::harness::compose::ComposeEnv>,
+    root: &Path,
+    spec_id: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    let worktree = task_worktree_path(root, spec_id, task_id);
+    crate::sdd::test_levels::forget_install_state(&worktree);
+    match compose {
+        Some(compose) => compose.reset_home(&worktree),
+        None => Ok(()),
+    }
+}
+
 /// Aplica a escolha à tarefa BLOCKED e devolve o tipo aplicado (`config`, `environment`, `guidance`,
-/// `revise_task` ou `guidance` para texto livre). Efeitos:
+/// `revise_task`, `reset_workspace` ou `guidance` para texto livre). Efeitos:
 /// - `config`: valida de novo (guarda + política) e grava `test_command`/`checks` em settings;
 /// - `guidance`/`environment`/texto livre: registra a entrada em "## Orientação do humano";
 /// - `environment` com `files`: o servidor JÁ adotou o ambiente (`adopted`, ver [`adjust_environment`]);
 ///   sem isso a escolha é recusada (Io). O registro diz que o ambiente foi migrado;
-/// - `revise_task`: reescreve objetivo/critérios/escopo.
+/// - `revise_task`: reescreve objetivo/critérios/escopo;
+/// - `reset_workspace`: o servidor JÁ limpou a área de trabalho (`adopted`, ver [`reset_workspace`]);
+///   sem isso a escolha é recusada (Io). O registro conta ao Desenvolvedor o que foi feito.
 ///
 /// Não muda o status nem grava a marca de retomada: quem retoma (`reset_plan`) faz as duas coisas.
 ///
@@ -2017,15 +2767,23 @@ pub fn apply_choice(
             let option = resolve_option(root, &task, id, *analysis, secrets, docker)?;
             match option.kind {
                 OptionKind::Config => {
-                    let proposal =
-                        ConfigProposal { test_command: option.test_command.clone(), checks: option.checks.clone() };
-                    let change = validate_config(root, &proposal, secrets).map_err(|_| ChoiceError::Stale)?;
+                    // Spec 141 T04: a escolha da pessoa no cartão é a aprovação da restrição, cuja
+                    // evidência `resolve_option` já conferiu.
+                    let proposal = ConfigProposal {
+                        test_command: option.test_command.clone(),
+                        full_test_command: option.full_test_command.clone(),
+                        checks: option.checks.clone(),
+                    };
+                    let worktree = task_worktree_path(root, spec_id, task_id);
+                    let change = validate_config_in(root, &proposal, secrets, Some(&worktree)).map_err(|_| ChoiceError::Stale)?;
                     write_config(root, &change, secrets).map_err(|_| ChoiceError::Io)?;
                     let entry = tr(
                         "recovery.choice.config",
                         &[("label", &option.label), ("commands", &change.commands.join(" | "))],
                     );
                     task.body = add_human_guidance(&task.body, &scrub_text(secrets, &entry));
+                    // Spec 141 T05: a troca do comando não pede mudança de código: testa primeiro.
+                    task.body = mark_test_first(&task.body);
                 }
                 OptionKind::Guidance => {
                     let entry =
@@ -2046,6 +2804,19 @@ pub fn apply_choice(
                         None => tr("recovery.choice.environment_note", &[("label", &option.label), ("text", text)]),
                     };
                     task.body = add_human_guidance(&task.body, &scrub_text(secrets, &entry));
+                }
+                OptionKind::ResetWorkspace => {
+                    // O servidor já limpou a área de trabalho ([`reset_workspace`]); sem isso, recusa.
+                    if !adopted {
+                        return Err(ChoiceError::Io);
+                    }
+                    let entry = tr(
+                        "recovery.choice.reset_workspace",
+                        &[("label", &option.label), ("home", crate::harness::home::CONTAINER_HOME)],
+                    );
+                    task.body = add_human_guidance(&task.body, &scrub_text(secrets, &entry));
+                    // Spec 141 T05: limpar a área de trabalho não pede mudança de código: testa primeiro.
+                    task.body = mark_test_first(&task.body);
                 }
                 OptionKind::ReviseTask => {
                     let revision = TaskRevision {
@@ -2078,7 +2849,8 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 pub fn parse_decision(raw: &str) -> Option<Decision> {
     let value: Value = serde_json::from_str(raw.trim()).ok()?;
     let map = value.as_object()?;
-    const KEYS: [&str; 14] = [
+    const KEYS: [&str; 15] = [
+        "full_test_command",
         "new_tasks",
         "findings",
         "question",
@@ -2120,7 +2892,8 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
     let has_revision_fields = objective.is_some() || acceptance.is_some() || scope_value.is_some();
     let config_value = map.get("test_command").filter(|v| !v.is_null());
     let checks_value = map.get("checks").filter(|v| !v.is_null());
-    if decision != "REVISE_CONFIG" && (config_value.is_some() || checks_value.is_some()) {
+    let full_value = map.get("full_test_command").filter(|v| !v.is_null());
+    if decision != "REVISE_CONFIG" && (config_value.is_some() || checks_value.is_some() || full_value.is_some()) {
         return None;
     }
     // Campos da spec 124 T03: cada um só na sua decisão.
@@ -2212,11 +2985,15 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
             })
         }
         "REVISE_CONFIG" if !has_revision_fields => {
-            let test_command = match config_value {
-                None => None,
-                Some(Value::String(c)) if !c.trim().is_empty() => Some(c.trim().to_string()),
-                Some(_) => return None,
+            let command = |value: Option<&Value>| -> Option<Option<String>> {
+                match value {
+                    None => Some(None),
+                    Some(Value::String(c)) if !c.trim().is_empty() => Some(Some(c.trim().to_string())),
+                    Some(_) => None,
+                }
             };
+            let test_command = command(config_value)?;
+            let full_test_command = command(full_value)?;
             let checks = match checks_value {
                 None => None,
                 Some(Value::Array(items)) => {
@@ -2236,7 +3013,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
                 }
                 Some(_) => return None,
             };
-            if test_command.is_none() && checks.is_none() {
+            if test_command.is_none() && checks.is_none() && full_test_command.is_none() {
                 return None;
             }
             Some(Decision {
@@ -2245,7 +3022,7 @@ pub fn parse_decision(raw: &str) -> Option<Decision> {
                 root_cause,
                 strategy,
                 proposal,
-                config: Some(ConfigProposal { test_command, checks }),
+                config: Some(ConfigProposal { test_command, full_test_command, checks }),
                 options: Vec::new(),
                 discarded: Vec::new(),
                 migrate: None,
@@ -2414,6 +3191,30 @@ fn validate_option(
     taken: &[RecoveryOption],
     docker: DockerProbe<'_>,
 ) -> Result<RecoveryOption, String> {
+    validate_option_in(root, secrets, option, environmental, taken, docker, OptionCtx::default())
+}
+
+/// Onde e como uma opção é validada (spec 141 T04).
+#[derive(Clone, Copy, Default)]
+struct OptionCtx<'a> {
+    /// Worktree da tarefa: os caminhos acrescentados por uma restrição precisam existir nela.
+    worktree: Option<&'a Path>,
+    /// A opção vem do corpo da tarefa, gravada pelo servidor: a evidência guardada da restrição vale
+    /// se a árvore da worktree ainda é a das rodadas. Fora disso (opção do modelo), a evidência que
+    /// vier junto é ignorada e a restrição fica pendente, à espera das rodadas do servidor.
+    stored: bool,
+}
+
+/// [`validate_option`] com o contexto da tarefa (spec 141 T04).
+fn validate_option_in(
+    root: &Path,
+    secrets: &SecretSet,
+    option: RecoveryOption,
+    environmental: bool,
+    taken: &[RecoveryOption],
+    docker: DockerProbe<'_>,
+    ctx: OptionCtx<'_>,
+) -> Result<RecoveryOption, String> {
     let id = option.id.trim().to_string();
     if id.is_empty() || id.len() > MAX_OPTION_ID || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("id inválido".to_string());
@@ -2430,6 +3231,7 @@ fn validate_option(
         label,
         kind: option.kind,
         test_command: None,
+        full_test_command: None,
         checks: None,
         text: None,
         objective: None,
@@ -2437,11 +3239,15 @@ fn validate_option(
         allowed_scope: None,
         diff: None,
         files: None,
+        restriction: None,
     };
     let has_text = option.text.is_some();
     let has_revision = option.objective.is_some() || option.acceptance.is_some() || option.allowed_scope.is_some();
-    let has_config = option.test_command.is_some() || option.checks.is_some();
+    let has_config = option.test_command.is_some() || option.checks.is_some() || option.full_test_command.is_some();
     if option.files.is_some() && option.kind != OptionKind::Environment {
+        return Err("campos de outro tipo de opção".to_string());
+    }
+    if option.restriction.is_some() && option.kind != OptionKind::Config {
         return Err("campos de outro tipo de opção".to_string());
     }
     match option.kind {
@@ -2452,11 +3258,24 @@ fn validate_option(
             if !has_config {
                 return Err("config sem test_command nem checks".to_string());
             }
-            let proposal = ConfigProposal { test_command: option.test_command, checks: option.checks };
-            let change = validate_config(root, &proposal, secrets)?;
+            let given = option.restriction;
+            let proposal = ConfigProposal {
+                test_command: option.test_command,
+                full_test_command: option.full_test_command,
+                checks: option.checks,
+            };
+            let change = validate_config_in(root, &proposal, secrets, ctx.worktree)?;
             out.test_command = change.test_command;
+            out.full_test_command = change.full_test_command;
             out.checks = change.checks;
             out.diff = Some(change.diff);
+            if let Some(step) = &change.restriction {
+                out.restriction = Some(if ctx.stored {
+                    stored_restriction(given, step, ctx.worktree)?
+                } else {
+                    pending_restriction(step)
+                });
+            }
         }
         OptionKind::Environment | OptionKind::Guidance => {
             if has_config || has_revision {
@@ -2497,6 +3316,14 @@ fn validate_option(
                 out.files = Some(files);
             }
         }
+        OptionKind::ResetWorkspace => {
+            if has_config || has_revision {
+                return Err("campos de outro tipo de opção".to_string());
+            }
+            if has_text {
+                out.text = Some(option_text(secrets, option.text.as_ref(), "texto", MAX_OPTION_TEXT_BYTES)?);
+            }
+        }
         OptionKind::ReviseTask => {
             if has_config || has_text {
                 return Err("campos de outro tipo de opção".to_string());
@@ -2520,6 +3347,7 @@ fn validate_option(
 
 /// Valida as opções do modelo, uma a uma: as inválidas são descartadas com o motivo. Devolve as
 /// válidas (ordem original) e os motivos.
+#[cfg(test)]
 fn validate_options(
     root: &Path,
     secrets: &SecretSet,
@@ -2527,10 +3355,36 @@ fn validate_options(
     environmental: bool,
     docker: DockerProbe<'_>,
 ) -> (Vec<RecoveryOption>, Vec<String>) {
+    validate_options_in(root, secrets, options, environmental, docker, OptionCtx::default())
+}
+
+/// Spec 141 T04 (C-03, R2): a evidência gravada de uma restrição, de volta do corpo da tarefa. Vale
+/// se é a mesma troca (`step`) e se a árvore da worktree ainda é a das rodadas do servidor.
+fn stored_restriction(given: Option<Restriction>, step: &StepChange, worktree: Option<&Path>) -> Result<Restriction, String> {
+    let given = given.ok_or_else(|| "restrição sem a evidência do servidor".to_string())?;
+    if given.original != step.original || given.appended != step.appended || given.restricted != step.restricted() || given.tree.is_empty() {
+        return Err("a evidência gravada não corresponde à restrição".to_string());
+    }
+    let tree = worktree.and_then(crate::sdd::test_levels::tree_hash);
+    if tree.as_deref() != Some(given.tree.as_str()) {
+        return Err("a worktree mudou depois das rodadas do servidor; a evidência não vale mais".to_string());
+    }
+    Ok(given)
+}
+
+/// [`validate_options`] com o contexto da tarefa (spec 141 T04).
+fn validate_options_in(
+    root: &Path,
+    secrets: &SecretSet,
+    options: Vec<RecoveryOption>,
+    environmental: bool,
+    docker: DockerProbe<'_>,
+    ctx: OptionCtx<'_>,
+) -> (Vec<RecoveryOption>, Vec<String>) {
     let mut valid: Vec<RecoveryOption> = Vec::new();
     let mut discarded = Vec::new();
     for (i, option) in options.into_iter().enumerate() {
-        match validate_option(root, secrets, option, environmental, &valid, docker) {
+        match validate_option_in(root, secrets, option, environmental, &valid, docker, ctx) {
             Ok(option) => valid.push(option),
             Err(reason) => discarded.push(format!("opção {}: {}", i + 1, reason)),
         }
@@ -2573,6 +3427,9 @@ fn section_body(secrets: &SecretSet, decision: &Decision) -> String {
         }
         if let Some(t) = &config.test_command {
             lines.push(format!("- Novo test_command: {}", clean(secrets, t)));
+        }
+        if let Some(t) = &config.full_test_command {
+            lines.push(format!("- Novo full_test_command: {}", clean(secrets, t)));
         }
         if let Some(checks) = &config.checks {
             lines.push(format!("- Novos checks: {}", clean(secrets, &render_checks(checks).replace('\n', "; "))));
@@ -2708,9 +3565,10 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
     let yolo = parsed.as_ref().is_some_and(|s| s.yolo);
     let config_facts = parsed.as_ref().map(|s| {
         format!(
-            "ambiente: {}\ntest_command: {}\n{}{}",
+            "ambiente: {}\ntest_command: {}\n{}{}{}",
             "docker (test_command e checks rodam DENTRO do serviço workspace)",
             s.test_command,
+            s.full_test_command.as_deref().map(|f| format!("full_test_command: {f}\n")).unwrap_or_default(),
             render_checks(&s.checks),
             install_rule(s.install_command.as_deref())
         )
@@ -2775,6 +3633,8 @@ fn load(root: &Path, spec_id: &str, task_id: &str, secrets: &SecretSet) -> Optio
         out.push_str(&format!("\n## Rodadas instáveis desta tarefa (falharam e passaram ao repetir sem mudança)\n{}\n", cap(flaky, MAX_SECTION_BYTES)));
     }
     out.push_str(&mode_facts());
+    // Spec 141 T03: fatos do ambiente do Nants (configurações, montagens, worktree e compose).
+    out.push_str(&env_facts(root, spec_id, task_id, secrets));
     if let Some(config) = config_facts {
         out.push_str(&format!("\n## Configuração de testes atual (REVISE_CONFIG pode corrigi-la)\n{}\n", cap(config, MAX_SECTION_BYTES)));
     }

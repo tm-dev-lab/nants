@@ -15,12 +15,19 @@
 //! - **O clique grava o rascunho** ([`ArchitectDraft`]) no estado do Nanty, um por projeto, de forma
 //!   atômica (a gravação do `state.json`). Nada vai ao Arquiteto: a janela do projeto lê o rascunho
 //!   (`GET /api/projects/:id/chat/draft`) e o põe na caixa para a pessoa editar, enviar ou descartar.
-//! - **Procedência:** com contaminação na sessão ou na janela, o rascunho vai marcado como dado.
+//! - **Procedência:** com contaminação na sessão ou na janela, de qualquer projeto, o rascunho vai
+//!   marcado como dado.
 //!   Enquanto ele estiver pendente, toda mensagem da pessoa ao Arquiteto do projeto sai sem internet,
 //!   com uma nota ao modelo ([`for_turn`]); ele só sai do estado quando um turno que o carregou termina
 //!   com sucesso ([`consume`]) ou quando a pessoa o descarta. A mensagem que saiu sem internet grava a
-//!   marca no `.chat.jsonl`, e os turnos internos seguintes a herdam, também depois de um reinício. Contaminação vinda de outro projeto que não o destino é recusada, na ferramenta e
-//!   de novo no clique (`nanty_draft_other_project`).
+//!   marca no `.chat.jsonl`, e os turnos internos seguintes a herdam, também depois de um reinício.
+//! - **Recusa só pela leitura do próprio turno (spec 141 T07, C-11):** a recusa
+//!   (`nanty_draft_other_project`, na ferramenta e de novo no clique) vale só quando o turno que propõe
+//!   leu, ele mesmo, outro projeto que não o destino ([`Session::fresh`], gravado no pedido como
+//!   [`ArchitectDraft::fresh`]). A contaminação herdada da janela, de qualquer projeto, vira rascunho
+//!   marcado: a janela conta mensagens, não tempo, e uma leitura antiga de outro projeto recusava a
+//!   oferta que o próprio Nanty tinha acabado de fazer. **Risco aceito:** texto de outro projeto pode
+//!   chegar ao Arquiteto deste, só depois da revisão da pessoa na caixa e sem internet.
 //! - **Escopo:** o rascunho e o pedido no cartão levam o projeto e a procedência ([`Scoped`]); a
 //!   limpeza de projeto e a varredura os alcançam.
 
@@ -72,6 +79,9 @@ pub struct ArchitectDraft {
     /// As fontes não confiáveis do turno que propôs. Com alguma, o rascunho é marcado.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taint: Vec<TaintSource>,
+    /// Dessas, as que o próprio turno leu (spec 141 T07, C-11): só elas, de outro projeto, recusam.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh: Vec<TaintSource>,
     pub channel: Channel,
     pub at_ms: u64,
 }
@@ -79,14 +89,14 @@ pub struct ArchitectDraft {
 impl ArchitectDraft {
     /// Veio de uma conversa que leu dado não confiável: vai marcado, e o turno sai sem internet.
     pub fn marked(&self) -> bool {
-        !self.taint.is_empty()
+        !self.taint.is_empty() || !self.fresh.is_empty()
     }
 }
 
 impl Scoped for ArchitectDraft {
     fn projects(&self) -> Vec<&str> {
         let mut out: Vec<&str> = vec![self.project_id.as_str()];
-        for id in self.taint.iter().filter_map(|t| t.project_id.as_deref()) {
+        for id in self.taint.iter().chain(&self.fresh).filter_map(|t| t.project_id.as_deref()) {
             if !out.contains(&id) {
                 out.push(id);
             }
@@ -104,7 +114,8 @@ fn group_of(project_id: &str) -> String {
     format!("{project_id}:{GROUP_KIND}")
 }
 
-/// Os projetos de onde veio a contaminação que não são o destino (C-15): com algum, recusa.
+/// Os projetos de onde veio a contaminação que não são o destino (C-15). Chamado só com as leituras do
+/// próprio turno (spec 141 T07, C-11): com algum, recusa.
 fn foreign<'a>(taint: &'a [TaintSource], destination: &str) -> Vec<&'a str> {
     let mut out: Vec<&str> = Vec::new();
     for id in taint.iter().filter_map(|t| t.project_id.as_deref()).filter(|id| *id != destination) {
@@ -165,8 +176,9 @@ pub fn propose(nanty: &Nanty, cfg: &Config, lang: Lang, secrets: &SecretSet, arg
     if text.chars().count() > max {
         return tr(lang, "nanty.tool.draft_too_long", &[("max", &max.to_string())]);
     }
-    // C-15: a contaminação que veio de outro projeto não atravessa para este.
-    if !foreign(&session.tainted.sources, &project.id).is_empty() {
+    // C-15 e spec 141 T07 (C-11): o que este turno acabou de ler de outro projeto não atravessa para
+    // este. A contaminação herdada da janela só marca o rascunho.
+    if !foreign(&session.fresh, &project.id).is_empty() {
         journal(nanty, "architect_draft.refused", Some(&project.id), &[("reason", json!("other_project"))]);
         return tr(lang, "nanty.tool.draft_other_project", &[]);
     }
@@ -183,6 +195,7 @@ pub fn propose(nanty: &Nanty, cfg: &Config, lang: Lang, secrets: &SecretSet, arg
         project_id: project.id.clone(),
         text,
         taint: session.tainted.sources.clone(),
+        fresh: session.fresh.clone(),
         channel: session.channel,
         at_ms: now,
     };
@@ -283,8 +296,9 @@ pub async fn decide(state: &AppState, card_id: &str, token: &str, answer: Answer
     let Some(project) = chat::observed(&cfg).into_iter().find(|p| p.id == draft.project_id) else {
         return Err(ApiError::coded(StatusCode::NOT_FOUND, "nanty_draft_project_gone", Map::new()));
     };
-    // C-15, de novo no clique: nada que veio de outro projeto vira rascunho deste.
-    if !foreign(&draft.taint, &draft.project_id).is_empty() {
+    // C-15, de novo no clique: nada que o turno que propôs leu de outro projeto vira rascunho deste
+    // (spec 141 T07, C-11: a herança só marca).
+    if !foreign(&draft.fresh, &draft.project_id).is_empty() {
         journal(&nanty, "architect_draft.refused", Some(&draft.project_id), &[("reason", json!("other_project"))]);
         return Err(ApiError::coded(StatusCode::UNPROCESSABLE_ENTITY, "nanty_draft_other_project", Map::new()));
     }

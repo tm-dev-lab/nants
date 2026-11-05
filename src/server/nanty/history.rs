@@ -18,6 +18,10 @@
 //!   ([`strip_stamp`]).
 //! - **Resposta longa (spec 140 T14, C-27):** a conversa guarda a resposta inteira, e o histórico
 //!   leva dela o começo e o fim, com a marca do servidor no lugar do meio ([`trim_reply`]).
+//! - **O que a pessoa viu (spec 141 T06, C-07, [`notice`]):** a mensagem do Nanty sobre um aviso abre
+//!   com o cabeçalho de fatos do servidor, que fica mesmo com o texto em quarentena; a decisão, a
+//!   resolução e a expiração entram como eventos, do lado da pessoa e como dado; a linha do Nanty sem
+//!   procedência (de antes da 140) sai da janela; e o `focus` vai no fim, em `last`.
 //! - **Normalização (C-18, [`normalize`]):** uma função pura que tira as mensagens só de controle,
 //!   reduz o aviso fixo a uma linha, junta as falas seguidas do mesmo papel e garante que a lista
 //!   começa pela pessoa. O resultado alterna os papéis e não tem `provider_items` nem chamadas de
@@ -29,7 +33,7 @@ use serde_json::{json, Value};
 use super::provenance::{self, Scoped, Taint};
 use super::store::{ConversationMessage, Speaker};
 use super::summary::{self, Summary, SummarySource};
-use super::{agent, chat, language, render, tools, turn, Nanty};
+use super::{agent, chat, language, notice, render, tools, turn, Nanty};
 use crate::agents::llm_client::{ChatMessage, Role};
 use crate::config::Config;
 use crate::i18n::Lang;
@@ -60,9 +64,14 @@ pub fn stamp(at_ms: u64) -> String {
         .unwrap_or_default()
 }
 
-/// O começo `[AAAA-MM-DD HH:MM ...]` que o modelo copiou do histórico, fora da resposta.
+/// O começo `[AAAA-MM-DD HH:MM ...]` que o modelo copiou do histórico, fora da resposta, e as
+/// primeiras linhas que imitam o dado do servidor (`{"server_facts"` ou `{"server_event"`, spec 141
+/// T06, revisão 1, F-01), com ou sem o carimbo: só o servidor escreve esse dado.
 pub fn strip_stamp(text: &str) -> String {
     let trimmed = text.trim_start();
+    if starts_server_data(trimmed) {
+        return strip_server_lines(trimmed);
+    }
     let Some(rest) = trimmed.strip_prefix('[') else { return text.to_string() };
     let Some(end) = rest.find(']') else { return text.to_string() };
     let head = rest[..end].as_bytes();
@@ -76,11 +85,35 @@ pub fn strip_stamp(text: &str) -> String {
         && (11..13).all(digit)
         && head.get(13) == Some(&b':')
         && (14..16).all(digit);
-    if shaped {
-        rest[end + 1..].trim_start().to_string()
-    } else {
-        text.to_string()
+    if !shaped {
+        return text.to_string();
     }
+    // Spec 141 T06: o cabeçalho de fatos copiado também sai; ele é do servidor.
+    strip_server_lines(rest[end + 1..].trim_start())
+}
+
+/// As chaves que só o servidor escreve ([`notice::header`] e [`notice::event_entry`]).
+const SERVER_KEYS: [&str; 2] = ["\"server_facts\"", "\"server_event\""];
+
+/// O texto abre com o dado do servidor: `{` e uma das [`SERVER_KEYS`], com ou sem espaço entre eles.
+fn starts_server_data(text: &str) -> bool {
+    text.strip_prefix('{').is_some_and(|rest| SERVER_KEYS.iter().any(|k| rest.trim_start().starts_with(k)))
+}
+
+/// Tira as primeiras linhas que imitam o dado do servidor.
+fn strip_server_lines(text: &str) -> String {
+    let mut rest = text.trim_start();
+    while starts_server_data(rest) {
+        rest = rest.find('\n').map_or("", |nl| rest[nl + 1..].trim_start());
+    }
+    rest.to_string()
+}
+
+/// O texto do modelo no histórico não carrega as chaves do servidor (spec 141 T06, revisão 1, F-01):
+/// uma imitação, copiada de um arquivo lido ou escrita pelo modelo, nunca se passa pelo cabeçalho de
+/// fatos nem por um evento. O nome da chave vira outro, que não é dado.
+pub fn neutralize_server_keys(text: &str) -> String {
+    text.replace("server_facts", "model_facts_text").replace("server_event", "model_event_text")
 }
 
 /// Uma mensagem do histórico antes da normalização.
@@ -90,13 +123,16 @@ pub struct Entry {
     pub content: String,
     /// Só de controle (um comando, a ajuda, uma recusa, a nota sem texto): sai.
     pub control: bool,
-    /// Aviso fixo do servidor: fica só a primeira linha.
+    /// Aviso fixo do servidor: fica só a primeira linha do texto.
     pub fixed: bool,
+    /// Bytes do começo do `content` que são do servidor (a data, os cartões e o cabeçalho de fatos,
+    /// spec 141 T06): ficam inteiros mesmo no aviso fixo.
+    pub head_len: usize,
 }
 
 impl Entry {
     pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: content.into(), control: false, fixed: false }
+        Self { role, content: content.into(), control: false, fixed: false, head_len: 0 }
     }
 }
 
@@ -124,7 +160,13 @@ pub fn normalize(lead: Vec<String>, entries: Vec<Entry>, last: String) -> Vec<Ch
         push(Role::User, data);
     }
     for entry in entries.into_iter().filter(|e| !e.control) {
-        let content = if entry.fixed { entry.content.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string() } else { entry.content };
+        let content = if entry.fixed {
+            let at = if entry.content.is_char_boundary(entry.head_len) { entry.head_len } else { 0 };
+            let (head, body) = entry.content.split_at(at);
+            format!("{head}{}", body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default())
+        } else {
+            entry.content
+        };
         push(entry.role, content);
     }
     push(Role::User, last);
@@ -194,12 +236,24 @@ fn is_fixed_notice(m: &ConversationMessage) -> bool {
     m.from == Speaker::Nanty && model_text(m).is_none() && m.reply_to.is_none()
 }
 
-/// A mensagem como entra no histórico. `keeps`: o texto fica inteiro ([`provenance::keeps_text`]);
-/// sem ele, a linha do servidor. Da pessoa, um JSON com `at`, o texto e o de terceiro no envelope;
-/// do Nanty, a data e a hora entre colchetes (com os cartões citados) e o texto no idioma dela.
+/// A mensagem como entra no histórico, sem os nomes dos projetos ([`entry_with`]).
 pub fn entry(lang: Lang, m: &ConversationMessage, keeps: bool) -> Entry {
+    entry_with(lang, m, keeps, &notice::Names::new())
+}
+
+/// A mensagem como entra no histórico. `keeps`: o texto fica inteiro ([`provenance::keeps_text`]);
+/// sem ele, a linha do servidor. Da pessoa, um JSON com `at`, o texto, o de terceiro no envelope e,
+/// se ela respondeu a um aviso no Telegram, os fatos dele (`replied_to`); do Nanty, a data e a hora
+/// entre colchetes (com os cartões citados), o cabeçalho de fatos do servidor ([`notice::header`],
+/// spec 141 T06, que fica mesmo com o texto em quarentena) e o texto no idioma dela. O evento de
+/// cartão é dado do servidor, do lado da pessoa ([`notice::event_entry`]).
+pub fn entry_with(lang: Lang, m: &ConversationMessage, keeps: bool, names: &notice::Names) -> Entry {
     let at = stamp(m.at_ms);
     let own = own_lang(lang, m);
+    if notice::is_event(m) {
+        return Entry::new(Role::User, notice::event_entry(&at, m, names));
+    }
+    let mut head_len = 0;
     let content = match m.from {
         Speaker::Person => {
             let text = cut(m.text.as_deref().unwrap_or_default());
@@ -209,20 +263,25 @@ pub fn entry(lang: Lang, m: &ConversationMessage, keeps: bool) -> Entry {
             } else {
                 agent::quarantine_relayed(&mut item, own, &at, m.relayed.as_ref());
             }
+            if !m.notices.is_empty() {
+                item["replied_to"] = notice::facts_value(names, &m.notices);
+            }
             serde_json::to_string(&item).unwrap_or_default()
         }
         Speaker::Nanty => {
-            let text = if keeps { trim_reply(own, &render::message_text(own, m)) } else { provenance::server_line(own, &at, m) };
+            let text = if keeps { neutralize_server_keys(&trim_reply(own, &render::message_text(own, m))) } else { provenance::server_line(own, &at, m) };
             let cards: Vec<&str> = m.card_ids.iter().map(String::as_str).filter(|id| turn::is_code(id)).collect();
-            if cards.is_empty() {
-                format!("[{at}] {text}")
-            } else {
-                format!("[{at} card_ids: {}] {text}", cards.join(", "))
-            }
+            let stamp = if cards.is_empty() { format!("[{at}]") } else { format!("[{at} card_ids: {}]", cards.join(", ")) };
+            let head = match notice::header(names, &m.notices) {
+                Some(facts) => format!("{stamp} {facts}\n"),
+                None => format!("{stamp} "),
+            };
+            head_len = head.len();
+            format!("{head}{text}")
         }
     };
     let role = if m.from == Speaker::Person { Role::User } else { Role::Assistant };
-    Entry { role, content, control: is_control(m), fixed: is_fixed_notice(m) }
+    Entry { role, content, control: is_control(m), fixed: is_fixed_notice(m), head_len }
 }
 
 /// As mensagens ainda fora do resumo, antes da mensagem atual, sem as dos projetos que o Nanty não
@@ -271,20 +330,33 @@ pub struct Context {
     pub taint: Taint,
 }
 
+/// A linha do Nanty de antes da procedência (spec 140): sai da janela (spec 141 T06, C-07). O evento
+/// e a mensagem de agora sempre gravam a procedência.
+fn without_provenance(m: &ConversationMessage) -> bool {
+    m.from == Speaker::Nanty && m.taint.is_none()
+}
+
 /// Monta o contexto da conversa depois do sistema: o índice da memória, o resumo, o histórico da
-/// janela e, por último, `last` (a mensagem com `now`, os projetos, os avisos e o texto da pessoa).
+/// janela e, por último, `last` (a mensagem com `now`, os projetos, os avisos e o texto da pessoa),
+/// com o `focus` (spec 141 T06): o projeto do assunto corrente, só como fato ([`notice::focus`]).
 /// A procedência devolvida é a das mensagens que ficam inteiras no histórico.
-pub fn context(nanty: &Nanty, cfg: &Config, lang: Lang, person: &ConversationMessage, last: String) -> Context {
+pub fn context(nanty: &Nanty, cfg: &Config, lang: Lang, person: &ConversationMessage, mut last: Value) -> Context {
     let chat = &cfg.nanty.chat;
     let summary = nanty.summary();
-    let mut lines: Vec<ConversationMessage> = pending(nanty, cfg, person, &summary).into_iter().filter(|m| !is_control(m)).collect();
+    let names = notice::names(cfg);
+    let mut lines: Vec<ConversationMessage> =
+        pending(nanty, cfg, person, &summary).into_iter().filter(|m| !is_control(m) && !without_provenance(m)).collect();
     lines.drain(..lines.len().saturating_sub(chat.window()));
+    if let (Some(focus), Some(body)) = (notice::focus(&lines, person, &names), last.as_object_mut()) {
+        body.insert("focus".into(), focus);
+    }
+    let last = serde_json::to_string(&last).unwrap_or_else(|_| "{}".to_string());
     let recent: Vec<String> = lines.iter().rev().take(chat.quarantine()).rev().map(|m| m.id.clone()).collect();
     let mut rendered: Vec<(Entry, bool, &ConversationMessage)> = lines
         .iter()
         .map(|m| {
             let keeps = provenance::keeps_text(m, &recent);
-            (entry(lang, m, keeps), keeps, m)
+            (entry_with(lang, m, keeps, &names), keeps, m)
         })
         .collect();
     // O teto de tokens vale sobre o número: as mais antigas saem primeiro.

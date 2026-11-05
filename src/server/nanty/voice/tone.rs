@@ -8,6 +8,10 @@
 //!   lido por [`take_marker`] antes do `format::clean`. Ausente ou inválido, vale o neutro. O marcador
 //!   nunca chega à pessoa: no começo da primeira linha sai até o inválido; fora dali, só o que é
 //!   claramente ele, porque a resposta pode citar prompts e templates de um projeto.
+//! - **A forma curta (spec 141 T08, item 10):** o modelo às vezes escreve só `[neutral]`, sem o
+//!   `tone: `. No começo da primeira linha, um colchete só com um código da lista ([`Tone::code`]),
+//!   em qualquer caixa e com o enfeite, também sai e vale como tom. Fora do começo, a forma curta
+//!   fica: `[calm]` no meio do texto pode ser texto legítimo.
 //! - **Turno contaminado:** o modelo não escolhe; o laço de agente fica no neutro.
 
 use super::super::signals::SignalKind;
@@ -64,6 +68,13 @@ impl Tone {
         Self::ALL.into_iter().find(|t| t.code() == raw)
     }
 
+    /// O tom da forma curta do marcador (`[neutral]`, spec 141 T08): o código da lista em qualquer
+    /// caixa, com os espaços de dentro ignorados.
+    fn of_short(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        Self::ALL.into_iter().find(|t| t.code().eq_ignore_ascii_case(raw))
+    }
+
     /// O tom de um aviso: o do tipo do sinal. O que não veio de um sinal (a confirmação pedida na
     /// conversa, por exemplo) é neutro.
     pub fn of_card(card: &Card) -> Self {
@@ -114,11 +125,28 @@ fn nothing_to_read(text: &str) -> bool {
 /// conta na linha do marcador: uma cerca de crases em linha própria não é enfeite dele, e tirá-la
 /// sozinha deixaria o fechamento como abertura, e o `clean` apagaria o resto da resposta.
 fn head_marker(reply: &str) -> Option<usize> {
+    let (start, after_open) = head_open(reply)?;
+    if let Some(found) = shape(after_open) {
+        return Some(start + 1 + found.len);
+    }
+    short_marker(after_open).map(|(len, _)| start + 1 + len)
+}
+
+/// O começo da primeira linha, depois do que não se vê e do enfeite, quando ali abre um `[`: onde
+/// ele está, em bytes, e o que vem depois dele.
+fn head_open(reply: &str) -> Option<(usize, &str)> {
     let line = reply.trim_start_matches(invisible);
     let body = line.trim_start_matches(|c| c != '\n' && (invisible(c) || DECOR.contains(&c)));
     let start = reply.len() - body.len();
-    let found = shape(reply[start..].strip_prefix('[')?)?;
-    Some(start + 1 + found.len)
+    Some((start, reply[start..].strip_prefix('[')?))
+}
+
+/// A forma curta logo depois de um `[` (spec 141 T08): um código da lista e o `]` na mesma linha.
+/// Os bytes depois do `[`, com o fecho, e o tom.
+fn short_marker(after_open: &str) -> Option<(usize, Tone)> {
+    let line = after_open.split('\n').next().unwrap_or_default();
+    let close = line.find(']')?;
+    Tone::of_short(&line[..close]).map(|tone| (close + 1, tone))
 }
 
 /// O próximo trecho que é claramente o marcador, fora do começo: fechado na mesma linha, com o
@@ -134,17 +162,20 @@ fn next_marker(text: &str) -> Option<(usize, usize)> {
 }
 
 /// Lê o tom da resposta do modelo e devolve o texto sem o marcador. Só conta o marcador exato no
-/// começo da primeira linha, com um valor da lista; o resto vira neutro. Saem do texto o que tem a
+/// começo da primeira linha, com um valor da lista, ou a forma curta ali ([`short_marker`]); o resto
+/// vira neutro. Saem do texto o que tem a
 /// forma do marcador nesse começo e, adiante, só o que é claramente ele ([`next_marker`]), com o
 /// enfeite colado. Sem nada para ler além disso, o texto volta vazio ([`nothing_to_read`]).
 pub fn take_marker(reply: &str) -> (Tone, String) {
-    let tone = reply
+    let full = reply
         .trim_start_matches(invisible)
         .strip_prefix(MARKER_OPEN)
         .and_then(|rest| rest.split('\n').next())
         .and_then(|line| line.split_once(']'))
-        .and_then(|(value, _)| Tone::of_code(value))
-        .unwrap_or_default();
+        .and_then(|(value, _)| Tone::of_code(value));
+    // A forma curta vale como tom em qualquer caixa e com o enfeite (spec 141 T08).
+    let short = || head_open(reply).filter(|(_, after)| shape(after).is_none()).and_then(|(_, after)| short_marker(after)).map(|(_, t)| t);
+    let tone = full.or_else(short).unwrap_or_default();
     let mut text = String::with_capacity(reply.len());
     let mut rest = head_marker(reply).map_or(reply, |end| reply[end..].trim_start_matches(DECOR));
     while let Some((start, end)) = next_marker(rest) {
@@ -301,6 +332,36 @@ mod tests {
             assert_eq!(read(reply), (Tone::Calm, "Oi.".to_string()), "{reply:?}");
         }
         assert_eq!(take_marker("**Atenção**\n[tone: calm]\nOi.").1, "**Atenção**\n\nOi.");
+    }
+
+    /// Spec 141 T08 (item 10): a forma curta no começo sai e vale como tom, em qualquer caixa e com o
+    /// enfeite; fora do começo, ou com o que não é da lista, ela fica.
+    #[test]
+    fn the_short_marker_at_the_start_leaves_and_gives_the_tone() {
+        let real = "[neutral]\nEssa ideia de jogo de viagem no tempo parece um projeto novo, não uma proposta para o Mini Street Fighter.";
+        let said = "Essa ideia de jogo de viagem no tempo parece um projeto novo, não uma proposta para o Mini Street Fighter.";
+        assert_eq!(read(real), (Tone::Neutral, said.to_string()));
+        for tone in Tone::ALL {
+            let code = tone.code();
+            for marker in [
+                format!("[{code}]"),
+                format!("[{}]", code.to_uppercase()),
+                format!("[ {code} ]"),
+                format!("**[{code}]**"),
+                format!("`[{code}]`"),
+                format!("\u{FEFF}  _[{code}]_"),
+            ] {
+                assert_eq!(read(&format!("{marker}\nOi.")), (tone, "Oi.".to_string()), "{marker}");
+            }
+            assert_eq!(read(&format!("[{code}] Na mesma linha.")), (tone, "Na mesma linha.".to_string()));
+            assert_eq!(take_marker(&format!("[{code}]")).1, "", "só o marcador: sem texto");
+        }
+        // Fora do começo, ou fora da lista, a forma curta é texto de pessoa.
+        for text in ["Oi.\n[calm]", "Fica [neutral] aqui.", "[nota]\nOi.", "[calmo]\nOi.", "[calm down]\nOi.", "[calm\nOi."] {
+            assert_eq!(take_marker(text), (Tone::Neutral, text.to_string()), "{text}");
+        }
+        // A forma completa continua mandando no tom.
+        assert_eq!(take_marker("[tone: calm]\n[serious]\nOi."), (Tone::Calm, "[serious]\nOi.".to_string()));
     }
 
     #[test]

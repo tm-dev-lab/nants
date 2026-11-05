@@ -18,6 +18,7 @@ import { isRecoveryAnalysis, localizeAttempted, localizeRecoveryAnalysis, locali
 import { recoveryKey, useAppStore, type ChatMessage } from "../../store";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
+import { hasRestrictionEvidence, RestrictionDetails } from "../shared/RestrictionDetails";
 import { approveProblem, recoveryProblem, type RunProblem } from "../shared/runProblems";
 import { ChatCard, ChatCardHead } from "./ChatCard";
 import { runStopMessage } from "../board/boardModel";
@@ -38,6 +39,7 @@ export const ESCALATION_KIND_LABELS: Readonly<Record<string, string>> = localize
   environment: "recovery.kind.environment",
   guidance: "recovery.kind.guidance",
   revise_task: "recovery.kind.revise_task",
+  reset_workspace: "recovery.kind.reset_workspace",
 });
 
 function blockedTasks(spec: SpecView): TaskView[] {
@@ -168,6 +170,7 @@ function OptionBody({ option }: { option: RecoveryOption }) {
   return (
     <div className="nd-stack-xs nd-muted">
       {option.kind === "environment" && option.files !== undefined ? <EnvironmentFiles option={option} /> : null}
+      {option.kind === "config" && hasRestrictionEvidence(option.restriction) ? <RestrictionDetails restriction={option.restriction} /> : null}
       {option.kind === "config" && option.diff !== undefined ? <pre className="nd-md-pre">{option.diff}</pre> : null}
       {option.kind === "revise_task" ? (
         <div className="nd-stack-xs">
@@ -183,7 +186,7 @@ function OptionBody({ option }: { option: RecoveryOption }) {
           ) : null}
         </div>
       ) : null}
-      {(option.kind === "guidance" || option.kind === "environment") && option.text !== undefined ? <p className="nd-prewrap">{option.text}</p> : null}
+      {(option.kind === "guidance" || option.kind === "environment" || option.kind === "reset_workspace") && option.text !== undefined ? <p className="nd-prewrap">{option.text}</p> : null}
     </div>
   );
 }
@@ -480,14 +483,13 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
                           <div className="nd-actions">
                             <button
                               type="button"
-                              className="nd-btn"
-                             
+                              className="nd-btn nd-btn-wrap"
                               autoFocus
                               disabled={locked}
                               aria-busy={busy}
                               onClick={() => void choose({ option_id: o.id, analysis: confirming.analysis })}
                             >
-                              {busy ? t("paused.applying") : t("recovery.confirm")}
+                              {busy ? t("paused.applying") : hasRestrictionEvidence(o.restriction) ? t("recovery.restriction.confirm") : t("recovery.confirm")}
                             </button>
                             <button type="button" className="nd-btn" disabled={busy} onClick={() => setConfirming(null)}>
                               {t("common.cancel")}
@@ -497,8 +499,8 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
                       ) : (
                         <button
                           type="button"
-                          className="nd-btn"
-                         
+                          className="nd-btn nd-btn-wrap"
+                          aria-label={hasRestrictionEvidence(o.restriction) ? undefined : t("paused.choose", { label: o.label })}
                           disabled={locked}
                           onClick={() => {
                             if (optionsAnalysis === undefined) return;
@@ -506,7 +508,7 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
                             setConfirming({ id: o.id, analysis: optionsAnalysis, taskId: actionTask.id });
                           }}
                         >
-                          {t("paused.choose", { label: o.label })}
+                          {hasRestrictionEvidence(o.restriction) ? t("recovery.restriction.approve") : t("paused.chooseShort")}
                         </button>
                       )}
                     </li>
@@ -515,7 +517,7 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
               </section>
             ) : null}
             {hasOptions && !otherOpen ? (
-              <button type="button" className="nd-btn" aria-expanded={false} disabled={busy} onClick={() => setOtherOpen(true)}>
+              <button type="button" className="nd-btn nd-btn-wrap" aria-expanded={false} disabled={busy} onClick={() => setOtherOpen(true)}>
                 {t("recovery.otherPath")}
               </button>
             ) : null}
@@ -590,7 +592,7 @@ export function PausedRunCard({ projectId, spec, onResumed }: Props) {
             </button>
           ) : null}
           {page !== null ? (
-            <a className="nd-btn" href={page.url} target="_blank" rel="noopener noreferrer" data-provider-page="">
+            <a className="nd-btn nd-btn-wrap" href={page.url} target="_blank" rel="noopener noreferrer" data-provider-page="">
               <Icon name="external" size={14} />
               {page.label}
             </a>

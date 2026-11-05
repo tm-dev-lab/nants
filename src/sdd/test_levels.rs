@@ -8,7 +8,8 @@
 //!   arquivos de trava, `.nants/` com o ambiente), com conteúdo, nome e modo (executável ou link);
 //! - ficam fora os caminhos ignorados pelo `.gitignore` do projeto (dependências instaladas e
 //!   artefatos de build), o `.sdd/` (estado do fluxo), o `.nants-outputs/` (saídas longas das
-//!   ferramentas) e o `.nants-home/` (pasta pessoal do workspace, spec 129 T01).
+//!   ferramentas) e o `.nants-home/` (pasta pessoal antiga do workspace, spec 129 T01: desde a
+//!   spec 141 T01 ela fica fora da área de trabalho; a exclusão fica enquanto houver legado).
 //!
 //! # Quando a rodada do Desenvolvedor dispensa a do runner
 //!
@@ -38,8 +39,9 @@ use super::{Environment, Settings};
 use crate::harness::git::Git;
 use crate::harness::home;
 
-/// Caminhos fora do hash da árvore, além dos ignorados pelo `.gitignore`.
-pub const TREE_EXCLUDES: &[&str] = &[".sdd", ".nants-outputs", home::HOME_DIR];
+/// Caminhos fora do hash da árvore, além dos ignorados pelo `.gitignore`. A pasta pessoal antiga
+/// fica enquanto houver legado (spec 141 T01: a migração a tira das áreas de trabalho).
+pub const TREE_EXCLUDES: &[&str] = &[".sdd", ".nants-outputs", home::LEGACY_HOME_DIR];
 
 /// Rodadas guardadas no registro (as mais antigas saem).
 const LEDGER_MAX_RUNS: usize = 32;
@@ -85,11 +87,29 @@ pub struct SuiteRun {
     pub output: String,
 }
 
+/// Quem rodou o comando: a ferramenta do Desenvolvedor ou o próprio servidor (spec 141 T04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Developer,
+    Server,
+}
+
 /// Rodada guardada, com a chave do ambiente de quando rodou.
 #[derive(Debug, Clone)]
 struct Recorded {
     run: SuiteRun,
     environment: String,
+    source: Source,
+}
+
+/// Spec 141 T04 (C-03, R2): o par de rodadas do servidor que sustenta uma restrição do comando de
+/// testes. O comando oficial (a etapa original) falhou e o restrito passou, sobre a mesma árvore
+/// (`tree`, antes e depois iguais) e no mesmo ambiente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictionProbe {
+    pub tree: String,
+    pub original: SuiteRun,
+    pub restricted: SuiteRun,
 }
 
 #[derive(Debug, Default)]
@@ -144,10 +164,69 @@ impl SuiteLedger {
             return;
         }
         let environment = state.environment.clone();
-        state.runs.push_back(Recorded { run, environment });
+        state.runs.push_back(Recorded { run, environment, source: Source::Developer });
         while state.runs.len() > LEDGER_MAX_RUNS {
             state.runs.pop_front();
         }
+    }
+
+    /// Spec 141 T04: registra uma rodada que o PRÓPRIO servidor fez (qualquer comando, no ambiente
+    /// `environment`). Ela não vale como rodada do Desenvolvedor ([`Self::reusable`] e
+    /// [`Self::same_failure`] a ignoram); só sustenta a restrição ([`Self::restriction_probe`]).
+    pub fn record_server(&self, mut run: SuiteRun, environment: &str) {
+        run.command = run.command.trim().to_string();
+        let mut state = self.state();
+        state.runs.push_back(Recorded { run, environment: environment.to_string(), source: Source::Server });
+        while state.runs.len() > LEDGER_MAX_RUNS {
+            state.runs.pop_front();
+        }
+    }
+
+    /// Spec 141 T04 (C-03, R2): a rodada do servidor de `command` sobre a árvore `tree` (antes e
+    /// depois iguais), no ambiente `environment` e no mesmo lugar, se houver. Com várias, conta como
+    /// passou só se todas passaram (na dúvida, falhou) e devolve a mais recente com esse resultado.
+    /// Rodadas do Desenvolvedor não contam: a evidência é do servidor, não do relato do agente.
+    pub fn server_run(&self, command: &str, tree: &str, environment: &str, in_container: bool) -> Option<SuiteRun> {
+        let command = command.trim();
+        if tree.is_empty() || command.is_empty() {
+            return None;
+        }
+        let state = self.state();
+        let runs: Vec<&SuiteRun> = state
+            .runs
+            .iter()
+            .filter(|r| {
+                r.source == Source::Server
+                    && r.run.command == command
+                    && r.run.tree_before.as_deref() == Some(tree)
+                    && r.run.tree_after.as_deref() == Some(tree)
+                    && r.environment == environment
+                    && r.run.in_container == in_container
+            })
+            .map(|r| &r.run)
+            .collect();
+        let passed = !runs.is_empty() && runs.iter().all(|r| r.passed);
+        runs.into_iter().rev().find(|r| r.passed == passed).cloned()
+    }
+
+    /// Spec 141 T04 (C-03, R2): o par de rodadas do servidor de `original` e `restricted` sobre a
+    /// árvore `tree`, no mesmo ambiente e lugar ([`Self::server_run`]), como ficou: passando ou
+    /// falhando. O par recusado também volta, para não rodar de novo na mesma árvore; quem julga a
+    /// evidência é o chamador (a oficial precisa ter falhado e a restrita, passado).
+    pub fn restriction_probe(
+        &self,
+        original: &str,
+        restricted: &str,
+        tree: &str,
+        environment: &str,
+        in_container: bool,
+    ) -> Option<RestrictionProbe> {
+        if original.trim() == restricted.trim() {
+            return None;
+        }
+        let official = self.server_run(original, tree, environment, in_container)?;
+        let narrowed = self.server_run(restricted, tree, environment, in_container)?;
+        Some(RestrictionProbe { tree: tree.to_string(), original: official, restricted: narrowed })
     }
 
     /// Rodada do Desenvolvedor que vale pela do runner (ver o módulo): mesmo comando, mesma árvore
@@ -173,7 +252,8 @@ impl SuiteLedger {
             .runs
             .iter()
             .filter(|r| {
-                r.run.command == command
+                r.source == Source::Developer
+                    && r.run.command == command
                     && r.run.tree_before.as_deref() == Some(tree)
                     && r.run.tree_after.as_deref() == Some(tree)
             })
@@ -209,7 +289,8 @@ impl SuiteLedger {
             .runs
             .iter()
             .filter(|r| {
-                r.run.command == command
+                r.source == Source::Developer
+                    && r.run.command == command
                     && r.run.tree_before.as_deref() == Some(tree)
                     && r.run.tree_after.as_deref() == Some(tree)
                     && r.environment == environment
@@ -289,15 +370,12 @@ pub fn remember_install(dir: &Path, key: &str, at: &str) {
     }
 }
 
-/// Esquece a instalação da pasta: a próxima rodada instala de novo (melhor esforço). Spec 129 T01:
-/// a pasta pessoal persistente segue o estado da instalação e é apagada junto, menos o cache de
-/// download (na worktree e na base).
-pub fn forget_install(dir: &Path) {
+/// Esquece a instalação da pasta: a próxima rodada instala de novo (melhor esforço). Spec 141 T01:
+/// só o estado; a pasta pessoal (fora da área de trabalho, no diretório de dados do Nants) segue o
+/// estado pelo runner, que conhece o projeto (`ComposeEnv::reset_home`).
+pub fn forget_install_state(dir: &Path) {
     if let Some(path) = install_state_path(dir) {
         let _ = std::fs::remove_file(path);
-    }
-    if let Err(e) = home::reset(dir) {
-        eprintln!("nants: pasta pessoal sem limpeza ({}): {}", home::HOME_DIR, e.kind());
     }
 }
 
@@ -449,6 +527,36 @@ mod tests {
         assert!(ledger.reusable("make test", "", "Docker|h1", true, None).is_none());
     }
 
+    /// Spec 141 T04: a restrição só tem evidência com as rodadas do SERVIDOR (o oficial falhando e
+    /// o restrito passando sobre a mesma árvore e ambiente); as do Desenvolvedor não contam, e as do
+    /// servidor não valem como rodada do Desenvolvedor.
+    #[test]
+    fn restriction_probe_needs_server_runs_on_the_same_tree_and_environment() {
+        let ledger = SuiteLedger::default();
+        ledger.watch(vec!["node --test".into()], "Docker|h1".into());
+        // O Desenvolvedor rodou os dois: não é evidência do servidor.
+        ledger.record(run("node --test", "t1", false));
+        ledger.record(run("node --test test/", "t1", true));
+        assert!(ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h1", true).is_none());
+        ledger.record_server(run("node --test", "t1", false), "Docker|h1");
+        assert!(ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h1", true).is_none(), "falta o restrito");
+        assert!(ledger.server_run("node --test", "t1", "Docker|h1", true).is_some_and(|r| !r.passed), "a oficial fica para reaproveitar");
+        ledger.record_server(run("node --test test/", "t1", true), "Docker|h1");
+        let probe = ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h1", true).expect("evidência");
+        assert!(!probe.original.passed && probe.restricted.passed && probe.tree == "t1");
+        // Outra árvore, outro ambiente ou outro lugar: sem evidência.
+        assert!(ledger.restriction_probe("node --test", "node --test test/", "t2", "Docker|h1", true).is_none());
+        assert!(ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h2", true).is_none());
+        assert!(ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h1", false).is_none());
+        // A rodada do servidor não vale como a do Desenvolvedor.
+        ledger.record_server(run("node --test", "t3", true), "Docker|h1");
+        assert!(ledger.reusable("node --test", "t3", "Docker|h1", true, None).is_none());
+        // Uma falha do restrito na mesma árvore: o par volta como recusado (sem rodar de novo).
+        ledger.record_server(run("node --test test/", "t1", false), "Docker|h1");
+        let refused = ledger.restriction_probe("node --test", "node --test test/", "t1", "Docker|h1", true).expect("par recusado");
+        assert!(!refused.restricted.passed);
+    }
+
     #[test]
     fn install_runs_only_when_the_lockfile_changes_in_that_folder_and_environment() {
         let dir = repo("install");
@@ -471,7 +579,7 @@ mod tests {
         assert!(install_needed(&other, "make deps", &dir));
         assert!(install_needed(&s, "make deps2", &dir));
         // Esquecida (ex.: dependência sumiu), instala de novo.
-        forget_install(&dir);
+        forget_install_state(&dir);
         assert!(install_needed(&s, "make deps", &dir));
         // Sem arquivos de trava, roda sempre.
         let no_locks = settings("test_command: \"make test\"\ninstall_command: \"make deps\"\n");
@@ -480,20 +588,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Spec 129 T01: esquecer a instalação (rodada limpa, falha) apaga a pasta pessoal, menos o
-    /// cache de download; a próxima instalação começa do zero.
+    /// Spec 141 T01: a pasta pessoal antiga (legado, até a migração) não entra no hash da árvore.
     #[test]
-    fn forget_install_resets_the_personal_folder_but_keeps_the_download_cache() {
+    fn legacy_personal_folder_stays_out_of_the_tree_hash() {
         let dir = repo("home");
-        let h = home::ensure(&dir).expect("home");
-        fs::create_dir_all(h.join(".local/lib")).expect("mk");
-        fs::write(h.join(".local/lib/pkg"), "instalado").expect("w");
+        let h = dir.join(home::LEGACY_HOME_DIR);
         fs::create_dir_all(h.join(".cache")).expect("mk");
-        fs::write(h.join(".cache/pkg.tar"), "baixado").expect("w");
-        forget_install(&dir);
-        assert!(!h.join(".local").exists());
-        assert!(h.join(".cache/pkg.tar").exists());
-        // A pasta não entra no hash da árvore.
         let t0 = tree_hash(&dir);
         fs::write(h.join("novo"), "x").expect("w");
         assert_eq!(tree_hash(&dir), t0);

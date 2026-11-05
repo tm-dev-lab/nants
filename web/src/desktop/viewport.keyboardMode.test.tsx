@@ -1,6 +1,7 @@
 /*
- * Modo celular (spec 093, T10; spec 083): com o teclado
- * aberto, a barra compacta e as abas se escondem (`.nd-keyboard-hide`) e o campo fica visível.
+ * Modo celular (spec 093, T10; spec 083; 141/T11): com o teclado aberto, a barra compacta, as abas
+ * (`.nd-keyboard-hide`) e o cabeçalho da janela se escondem, e o campo fica visível. Num aparelho de
+ * toque, o foco na caixa já liga o modo.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -25,9 +26,11 @@ class FakeVisualViewport extends EventTarget {
 
 let vv: FakeVisualViewport;
 
-function setMobile(mobile: boolean): void {
+const TOUCH = "(hover: none) and (pointer: coarse)";
+
+function setMobile(mobile: boolean, touch = false): void {
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
-    matches: query === MOBILE_QUERY ? mobile : false,
+    matches: query === MOBILE_QUERY ? mobile : query === TOUCH ? touch : false,
     media: query,
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
@@ -149,6 +152,64 @@ describe("modo teclado aberto (spec 083)", () => {
     expect(docRemove.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(["focusin", "focusout"]));
   });
 
+  it("aparelho de toque: o foco na caixa liga sem esperar a viewport encolher (Chrome do iPhone, 141/T11)", () => {
+    setMobile(true, true);
+    render(<Screen />);
+    const field = screen.getByRole("textbox", { name: "Mensagem para o Arquiteto" });
+
+    fireEvent.focusIn(field);
+    expect(mark()).toBe("open");
+    // A largura muda junto com o teclado: a referência recomeça, e o modo continua ligado.
+    resize(420, 389);
+    expect(mark()).toBe("open");
+    fireEvent.focusOut(field, { relatedTarget: null });
+    expect(mark()).toBeUndefined();
+  });
+
+  it("aparelho de toque: o teclado fecha com o foco no campo e desliga; encolher ou focar de novo religa", () => {
+    setMobile(true, true);
+    render(<Screen />);
+    const field = screen.getByRole("textbox", { name: "Mensagem para o Arquiteto" });
+
+    fireEvent.focusIn(field);
+    resize(470);
+    expect(mark()).toBe("open");
+    resize(780);
+    expect(mark()).toBeUndefined();
+    // Entre as duas frações, continua desligado (histerese).
+    resize(700);
+    expect(mark()).toBeUndefined();
+    resize(460);
+    expect(mark()).toBe("open");
+    resize(790);
+    expect(mark()).toBeUndefined();
+    fireEvent.focusIn(field);
+    expect(mark()).toBe("open");
+  });
+
+  it("aparelho de toque: foco fora da área, ou no desktop, não liga", () => {
+    setMobile(true, true);
+    render(<Screen />);
+    fireEvent.focusIn(screen.getByRole("textbox", { name: "Busca" }));
+    expect(mark()).toBeUndefined();
+    cleanup();
+    setMobile(false, true);
+    render(<Screen />);
+    fireEvent.focusIn(screen.getByRole("textbox", { name: "Mensagem para o Arquiteto" }));
+    expect(mark()).toBeUndefined();
+  });
+
+  it("aparelho de toque sem visualViewport: o foco liga e a saída desliga", () => {
+    Reflect.deleteProperty(window, "visualViewport");
+    setMobile(true, true);
+    render(<Screen />);
+    const field = screen.getByRole("textbox", { name: "Mensagem para o Arquiteto" });
+    fireEvent.focusIn(field);
+    expect(mark()).toBe("open");
+    fireEvent.focusOut(field, { relatedTarget: null });
+    expect(mark()).toBeUndefined();
+  });
+
   it("sem visualViewport não lança e não marca", () => {
     Reflect.deleteProperty(window, "visualViewport");
     expect(() => installKeyboardMode()()).not.toThrow();
@@ -161,6 +222,11 @@ describe("CSS do modo teclado aberto", () => {
 
   it("esconde .nd-keyboard-hide só no modo celular e só com a marca", () => {
     const rule = /:root\[data-keyboard="open"\] \.nd-root\[data-mobile="true"\] \.nd-keyboard-hide \{\s*display: none !important;\s*\}/;
+    expect(css).toMatch(rule);
+  });
+
+  it("esconde o cabeçalho e as ferramentas da janela com o foco, só no celular e com a marca (141/T11)", () => {
+    const rule = /:root\[data-keyboard="open"\] \.nd-root\[data-mobile="true"\] \.nd-window:focus-within > :where\(\.nd-titlebar, \.nd-window-tools\) \{\s*display: none !important;\s*\}/;
     expect(css).toMatch(rule);
   });
 

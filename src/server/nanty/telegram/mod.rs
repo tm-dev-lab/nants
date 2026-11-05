@@ -117,7 +117,8 @@ pub struct Tuning {
     /// Renovação do "digitando" enquanto o laço da conversa roda (spec 139 T03, C-09,
     /// [`outbox::TYPING_EVERY`]).
     pub typing_every: Duration,
-    /// Prazo da fala (spec 139 T08, C-14, [`outbox::SPEECH_DEADLINE`]): vencido, a saída vai em texto.
+    /// Prazo de cada trecho da fala (spec 139 T08, C-14; por trecho desde a spec 141 T08,
+    /// [`outbox::SPEECH_DEADLINE`]): vencido, a fala para e a saída vai em texto.
     pub speech_deadline: Duration,
     /// Espera do aviso em voz pelo texto do turno (spec 140 T02, C-29, [`outbox::NOTICE_TEXT_WAIT`]).
     pub notice_text_wait: Duration,
@@ -631,8 +632,15 @@ async fn owner_message(state: &AppState, nanty: &Arc<Nanty>, update_id: i64, m: 
     // Spec 139 T05: o `language_code` do dono é a terceira pista do idioma dele.
     nanty.note_telegram_lang(m.from.as_ref().and_then(|f| f.language_code.as_deref()));
     let cfg = state.config().read().await.nanty.clone();
+    // Spec 141 T06 (C-07): a resposta a um aviso do Nanty liga a pergunta ao cartão dele.
+    let about = m
+        .reply_to_message
+        .as_ref()
+        .filter(|r| r.message_id > 0)
+        .map(|r| crate::server::nanty::notice::replied(&nanty.snapshot(), m.chat.id, r.message_id, |id| cfg.observes(id)))
+        .unwrap_or_default();
     let person = m.text.as_deref().and_then(|text| {
-        super::chat::person_message_from(nanty, &cfg, &secrets, Channel::Telegram, Some(text), false, None, relayed.clone())
+        super::chat::person_message_about(nanty, &cfg, &secrets, Channel::Telegram, Some(text), false, None, relayed.clone(), about)
     });
     if stale {
         let age_min = u64::try_from(m.date).ok().map(|date| (now / 1000).saturating_sub(date) / 60);

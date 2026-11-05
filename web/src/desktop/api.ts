@@ -35,7 +35,7 @@ interface AttentionPermission {
 
 interface EscalationOptionRef {
   id: string;
-  kind: "guidance" | "config" | "environment" | "revise_task";
+  kind: "guidance" | "config" | "environment" | "revise_task" | "reset_workspace";
 }
 
 export type PausedOrStalled =
@@ -58,7 +58,7 @@ export interface Attention {
 
 const AGENTS: readonly string[] = ["developer", "reviewer", "architect"];
 const PERMISSION_KINDS: readonly string[] = ["command", "environment", "final_fix"];
-const ESCALATION_KINDS: readonly string[] = ["guidance", "config", "environment", "revise_task"];
+const ESCALATION_KINDS: readonly string[] = ["guidance", "config", "environment", "revise_task", "reset_workspace"];
 
 function parsePermission(value: unknown): AttentionPermission | null {
   if (!isRecord(value)) return null;

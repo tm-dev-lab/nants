@@ -1,8 +1,15 @@
 //! Ferramentas da conversa do Nanty (spec 139 T03, C-04; as ações e o silêncio, T04, G3, C-07 e
 //! C-08).
 //!
-//! - **Saída em frases curtas do dicionário,** no idioma do Nanty, mais os ids. Zeros e valores
-//!   padrão ficam de fora (`ProjectFacts::status_facts`).
+//! - **Dados com códigos (spec 141 T09, C-09 e C-10):** `project_status` e `system_status` devolvem
+//!   JSON com campos enumerados do servidor e códigos das listas fixas, e o modelo conta com as
+//!   palavras dele. As frases `nanty.phase.*`, `nanty.status.*` e `nanty.reason.*` ficam só para a
+//!   reserva sem modelo ([`status_lines`]). Zeros e valores padrão ficam de fora.
+//! - **Visão do Nants (spec 141 T09, G7):** `nants_docs` busca na documentação embutida
+//!   ([`super::docs`]), fonte confiável que não contamina; `system_status` traz a versão, os papéis
+//!   (o tipo de conexão e o modelo) e, por projeto observado, o ambiente, a aprovação automática (`yolo`), a recuperação aberta
+//!   e o sinal de falha do Nants. Nunca entram segredo, caminho, IP, URL, token nem projeto não
+//!   observado.
 //! - **Ids validados:** `project_status`, `project_details` e `propose_action` só aceitam projeto
 //!   observado ([`super::chat::observed`]); um id excluído ou desconhecido recebe a frase de projeto
 //!   desconhecido, sem nenhuma leitura.
@@ -59,8 +66,10 @@ use crate::server::state::AppState;
 pub const PROJECT_STATUS: &str = "project_status";
 /// O que foi lido dos arquivos de um projeto (não confiável).
 pub const PROJECT_DETAILS: &str = "project_details";
-/// A máquina e o Nanty.
+/// O Nants, a máquina e o Nanty (spec 141 T09: a versão, os papéis e os projetos observados).
 pub const SYSTEM_STATUS: &str = "system_status";
+/// A documentação do Nants, por busca (spec 141 T09): fonte confiável.
+pub const NANTS_DOCS: &str = super::docs::NANTS_DOCS;
 /// O que o Nanty fez e decidiu hoje.
 pub const NANTY_ACTIVITY: &str = "nanty_activity";
 /// Propor uma ação do catálogo: o servidor cria o cartão (T04).
@@ -88,6 +97,10 @@ pub const UNTRUSTED_CLOSE: &str = "</untrusted_data>";
 pub const NAME_MAX_BYTES: usize = 100;
 /// Linhas do que foi feito e decidido hoje.
 const MAX_ACTIVITY: usize = 20;
+/// Projetos no `system_status`, no máximo.
+const MAX_SYSTEM_PROJECTS: usize = 30;
+/// Teto do nome de modelo no `system_status`, em bytes.
+const MODEL_MAX_BYTES: usize = 100;
 
 /// O modo do turno (spec 140 T04, C-06): decide quais ferramentas existem nele.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,6 +124,7 @@ impl Mode {
                 deep::PROJECT_FILES,
                 deep::GIT_HISTORY,
                 SYSTEM_STATUS,
+                NANTS_DOCS,
                 NANTY_ACTIVITY,
                 PROPOSE_ACTION,
                 OPEN_NANTS,
@@ -159,11 +173,12 @@ pub fn phase_code(phase: Phase) -> String {
     format!("nanty.phase.{}", phase.as_str())
 }
 
-/// As linhas do estado de um projeto. `full`: com os códigos internos e o custo (a ferramenta, para o
-/// modelo); sem ele, só as linhas que a janela também traduz (a reserva sem modelo). Spec 139 T12: o
-/// id da spec fica de fora nos dois: na rodada real, o modelo o repetia na resposta, e ele não diz
-/// nada a quem lê. A frase dele continua nos dicionários para as mensagens já gravadas.
-pub fn status_lines(facts: &ProjectFacts, full: bool) -> Vec<Line> {
+/// As linhas do estado de um projeto, para a reserva sem modelo (a janela e o Telegram traduzem): a
+/// fase, a tarefa, o andamento, desde quando e o motivo da parada. Spec 139 T12: o id da spec fica de
+/// fora (a frase dele continua nos dicionários para as mensagens já gravadas). Spec 141 T09: o modelo
+/// recebe os mesmos fatos em dados ([`status_json`]); o motivo entra aqui para a reserva dizer, por
+/// exemplo, que a parada é defeito do ambiente do Nants.
+pub fn status_lines(facts: &ProjectFacts) -> Vec<Line> {
     let f = facts.status_facts();
     let mut out = vec![line(&phase_code(facts.phase()), &[])];
     // Spec 140 T04 (C-05): só o id na forma do SDD; o resto é texto escrito no projeto.
@@ -176,38 +191,43 @@ pub fn status_lines(facts: &ProjectFacts, full: bool) -> Vec<Line> {
     if let Some(since) = f.get("since") {
         out.push(line("nanty.status.since", &[("since", since.clone())]));
     }
-    if !full {
-        return out;
-    }
-    // Spec 139 T06: os códigos internos viram frases do dicionário; um código fora das listas fixas
-    // (o de uma tarefa escrita à mão, por exemplo) fica de fora, nunca vai cru.
+    // Spec 139 T06: um código fora das listas fixas (o de uma tarefa escrita à mão) fica de fora.
     if let Some(v) = f.get("reason").and_then(Value::as_str).filter(|v| crate::agents::runner::BLOCK_CODES.contains(v)) {
         out.push(line(&format!("nanty.reason.{v}"), &[]));
     }
-    if let Some(v) = f.get("attempts").filter(|v| v.as_u64().is_some_and(|n| n > 0)) {
-        match f.get("max_attempts") {
-            Some(max) => out.push(line("nanty.status.attempts_of", &[("count", v.clone()), ("max", max.clone())])),
-            None => out.push(line("nanty.status.attempts", &[("count", v.clone())])),
+    out
+}
+
+/// O estado de um projeto em dados, para o modelo (spec 141 T09, C-09): os fatos da fase só com os
+/// códigos das listas fixas (o motivo, a parada do provedor, o papel, o que espera a pessoa), o id de
+/// tarefa na forma do SDD, o ambiente, a aprovação automática (`yolo`), as opções de escalada abertas e o sinal de falha do
+/// Nants. Sem o id da spec (texto livre escrito no projeto, spec 140 T04).
+pub fn status_json(facts: &ProjectFacts) -> Map<String, Value> {
+    let f = facts.status_facts();
+    let mut out = Map::new();
+    out.insert("phase".into(), json!(facts.phase().as_str()));
+    let keep = |key: &str, value: &Value| match key {
+        "task_id" => value.as_str().is_some_and(turn::is_task_id),
+        "reason" => value.as_str().is_some_and(|v| crate::agents::runner::BLOCK_CODES.contains(&v)),
+        "stop" => value.as_str().is_some_and(|v| crate::server::attention::PROVIDER_STOP_CODES.contains(&v)),
+        "role" => matches!(value.as_str(), Some("architect" | "developer" | "reviewer")),
+        "since" | "done" | "total" | "attempts" | "max_attempts" | "waiting" | "permissions" | "cost_usd" | "cost_alerts" => true,
+        _ => false,
+    };
+    for (key, value) in &f {
+        if keep(key, value) {
+            out.insert(key.clone(), value.clone());
         }
     }
-    let stop = f.get("stop").and_then(Value::as_str).filter(|v| crate::server::attention::PROVIDER_STOP_CODES.contains(v));
-    if let Some(v) = stop.and_then(|v| v.strip_prefix("run.")) {
-        out.push(line(&format!("nanty.stop.{v}"), &[]));
-        if let Some(role) = f.get("role").and_then(Value::as_str).filter(|r| matches!(*r, "architect" | "developer" | "reviewer")) {
-            out.push(line(&format!("nanty.status.stop_role.{role}"), &[]));
-        }
+    if !facts.escalations.is_empty() {
+        out.insert("escalation_options".into(), json!(facts.escalations));
     }
-    let waiting: Vec<&str> = f.get("waiting").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    for item in waiting {
-        let code = format!("nanty.status.waiting.{item}");
-        let permissions = f.get("permissions").cloned().unwrap_or(json!(0));
-        out.push(line(&code, &[("count", permissions)]));
+    if facts.nants_fault() {
+        out.insert("nants_fault".into(), json!(true));
     }
-    if let Some(v) = f.get("cost_usd") {
-        out.push(line("nanty.status.cost", &[("usd", v.clone())]));
-    }
-    if let Some(v) = f.get("cost_alerts") {
-        out.push(line("nanty.status.cost_alerts", &[("count", v.clone())]));
+    if let Some(mode) = facts.environment {
+        out.insert("environment".into(), json!(mode));
+        out.insert("yolo".into(), json!(facts.yolo));
     }
     out
 }
@@ -257,7 +277,7 @@ pub async fn call(
         PROJECT_STATUS => match project_arg(cfg, lang, &call.arguments) {
             Ok(project) => {
                 note_read(session, &project.id);
-                project_status(state, cfg, lang, secrets, project).await
+                project_status(state, cfg, secrets, project).await
             }
             Err(text) => text,
         },
@@ -272,12 +292,17 @@ pub async fn call(
                 note_read(session, &project.id);
                 session.details += 1;
                 // Daqui em diante, o turno tem dado não confiável no contexto.
-                session.tainted.read(TaintKind::ProjectFile, Some(&project.id));
+                session.read_taint(TaintKind::ProjectFile, Some(&project.id));
                 project_details(state, cfg, lang, project).await
             }
             Err(text) => text,
         },
-        SYSTEM_STATUS => system_status(nanty, cfg, lang).await,
+        SYSTEM_STATUS => system_status(state, nanty, cfg, secrets).await,
+        // Spec 141 T09 (G7): a documentação do próprio Nants, embutida; não contamina o turno.
+        NANTS_DOCS => {
+            let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+            super::docs::search(args.get("query").and_then(Value::as_str).unwrap_or_default()).to_string()
+        }
         NANTY_ACTIVITY => activity(nanty, cfg, lang, secrets),
         PROPOSE_ACTION => propose_action(state, nanty, cfg, lang, secrets, &call.arguments, session).await,
         OPEN_NANTS => open_nants(state, cfg, lang, secrets, &call.arguments, session),
@@ -314,7 +339,7 @@ async fn deep_read(state: &AppState, cfg: &Config, lang: Lang, secrets: &SecretS
         return crate::i18n::tr(lang, "nanty.tool.other_project", &[]);
     }
     note_read(session, &project.id);
-    session.tainted.read(request.taint(), Some(&project.id));
+    session.read_taint(request.taint(), Some(&project.id));
     let mut budget = session.read_budget.unwrap_or_else(|| files::Budget::new(&cfg.nanty.read));
     let out = deep::read(state, cfg, lang, secrets, project, request, &mut budget).await;
     session.read_budget = Some(budget);
@@ -473,15 +498,28 @@ fn set_silence(nanty: &Nanty, cfg: &Config, lang: Lang, arguments: &str, session
     crate::i18n::tr(lang, code, &[("until", &hhmm(until))])
 }
 
-/// `project_status`: a fonte única da T02, em frases.
-async fn project_status(state: &AppState, cfg: &Config, lang: Lang, secrets: &SecretSet, project: &Project) -> String {
-    let head = line("nanty.status.project", &[("name", json!(project_name(secrets, project))), ("id", json!(project.id))]);
-    let mut lines = vec![head];
+/// O projeto como vai ao modelo: o id e o nome redigido.
+fn project_head(secrets: &SecretSet, project: &Project) -> Map<String, Value> {
+    let mut out = Map::new();
+    out.insert("id".into(), json!(project.id));
+    out.insert("name".into(), json!(project_name(secrets, project)));
+    out
+}
+
+/// `project_status`: a fonte única da T02, em dados (spec 141 T09). A leitura que falhou vira o
+/// código `unread`, sem nada dado por resolvido.
+async fn project_status(state: &AppState, cfg: &Config, secrets: &SecretSet, project: &Project) -> String {
+    let mut out = Map::new();
+    out.insert("project".into(), Value::Object(project_head(secrets, project)));
     match super::observe::project_facts(state, cfg, &project.id).await {
-        Some(facts) => lines.extend(status_lines(&facts, true)),
-        None => lines.push(line("nanty.status.unread", &[])),
+        Some(facts) => {
+            out.insert("status".into(), Value::Object(status_json(&facts)));
+        }
+        None => {
+            out.insert("error".into(), json!("unread"));
+        }
     }
-    render_lines(lang, &lines)
+    Value::Object(out).to_string()
 }
 
 /// Tira do corpo (JSON) qualquer `<` e `>`, trocados pelos escapes `\u003c` e `\u003e` do próprio
@@ -533,9 +571,40 @@ pub fn budget_line(nanty: &Nanty, cfg: &Config) -> Line {
     }
 }
 
-/// `system_status`: o espaço livre (pela sonda), os órfãos do Docker (pelo que o observador viu), o
-/// orçamento e o silêncio.
-async fn system_status(nanty: &Nanty, cfg: &Config, lang: Lang) -> String {
+/// O nome do modelo como vai ao modelo: só com a forma de um id de modelo (letras, dígitos e
+/// `._:-/@`, sem `//`), até [`MODEL_MAX_BYTES`]. Outra coisa (um endereço colado, um texto) fica de fora.
+fn model_code(raw: &str) -> Option<&str> {
+    let model = raw.trim();
+    let shaped = model.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-' | b'/' | b'@'));
+    (!model.is_empty() && model.len() <= MODEL_MAX_BYTES && shaped && !model.contains("//")).then_some(model)
+}
+
+/// Um papel: o tipo da conexão e o modelo. Nunca o id da conexão, a chave, o nome dado a ela nem o
+/// endereço. Sem conexão cadastrada, `connection` vai nulo.
+fn role_json(cfg: &Config, connection_id: &str, model: &str) -> Value {
+    let kind = cfg.connections.iter().find(|c| c.id == connection_id).map(|c| c.kind.as_str());
+    json!({ "connection": kind, "model": model_code(model) })
+}
+
+/// O orçamento do dia do Nanty, em dados.
+fn budget_json(nanty: &Nanty, cfg: &Config) -> Value {
+    if turn::model_route(cfg).is_none() {
+        return json!({ "model": false });
+    }
+    let round = |v: f64| (v * 100.0).round() / 100.0;
+    let view = turn::budget_view(cfg, &nanty.snapshot().spend_on(&nanty.now().day_key()));
+    match view.mode {
+        turn::BudgetMode::Usd => json!({ "mode": "usd", "spent_usd": round(view.spent_usd), "budget_usd": round(view.budget_usd) }),
+        turn::BudgetMode::Tokens => json!({ "mode": "tokens", "tokens": view.tokens, "budget_tokens": view.budget_tokens }),
+    }
+}
+
+/// `system_status` (spec 141 T09, C-09), em dados com campos enumerados: a versão do Nants; os papéis,
+/// com o tipo de conexão e o modelo; a máquina (o espaço livre pela sonda e os recursos do Docker que
+/// o observador viu); o Nanty (o orçamento, o silêncio e o horário quieto); e, por projeto observado,
+/// o estado pela fonte única ([`status_json`]). Nada de caminho, endereço, id de conexão ou projeto
+/// não observado.
+async fn system_status(state: &AppState, nanty: &Nanty, cfg: &Config, secrets: &SecretSet) -> String {
     let probe = nanty.probe();
     let paths = crate::server::doctor::disk_paths(cfg);
     let measured = tokio::task::spawn_blocking(move || {
@@ -546,46 +615,65 @@ async fn system_status(nanty: &Nanty, cfg: &Config, lang: Lang) -> String {
     .await
     .unwrap_or((None, None));
     let filter = &cfg.nanty.filter;
-    let mut lines = Vec::new();
-    for (bytes, code, min_gb) in
-        [(measured.0, "nanty.system.disk", filter.disk_min_free_gb), (measured.1, "nanty.system.tmp", filter.tmp_min_free_gb)]
-    {
+    let mut machine = Map::new();
+    for (bytes, name, min_gb) in [(measured.0, "disk", filter.disk_min_free_gb), (measured.1, "tmp", filter.tmp_min_free_gb)] {
         if let Some(bytes) = bytes {
-            lines.push(line(code, &[("gb", json!(bytes / GB_BYTES))]));
+            machine.insert(format!("{name}_free_gb"), json!(bytes / GB_BYTES));
+            machine.insert(format!("{name}_min_gb"), json!(min_gb));
             if bytes < min_gb.saturating_mul(GB_BYTES) {
-                lines.push(line("nanty.system.below_min", &[("min", json!(min_gb))]));
+                machine.insert(format!("{name}_low"), json!(true));
             }
         }
     }
     if measured == (None, None) {
-        lines.push(line("nanty.system.unmeasured", &[]));
+        machine.insert("disk_unmeasured".into(), json!(true));
     }
     let snap = nanty.snapshot();
-    for (kind, code) in [(SignalKind::DockerOrphans, "nanty.system.orphans"), (SignalKind::DockerForeign, "nanty.system.foreign")] {
-        let count: u64 = snap
-            .alerts
-            .values()
-            .filter(|a| a.kind == kind.as_str())
-            .filter_map(|a| a.facts.get("count").and_then(Value::as_u64))
-            .sum();
+    for (kind, name) in [(SignalKind::DockerOrphans, "docker_orphans"), (SignalKind::DockerForeign, "docker_foreign")] {
+        let count: u64 =
+            snap.alerts.values().filter(|a| a.kind == kind.as_str()).filter_map(|a| a.facts.get("count").and_then(Value::as_u64)).sum();
         if count > 0 {
-            lines.push(line(code, &[("count", json!(count))]));
+            machine.insert(name.into(), json!(count));
         }
     }
-    lines.push(budget_line(nanty, cfg));
+    let mut me = Map::new();
+    me.insert("budget".into(), budget_json(nanty, cfg));
     let now = nanty.now();
     if let Some(until) = global_silence(nanty, now.epoch_ms) {
-        lines.push(line("nanty.chat.status_silence", &[("until", json!(hhmm(until)))]));
+        me.insert("silenced_until".into(), json!(hhmm(until)));
     }
     let n = &cfg.nanty;
     let (start, end) = n.quiet_window();
     if start != end {
-        lines.push(line("nanty.system.quiet", &[("start", json!(n.quiet_start)), ("end", json!(n.quiet_end))]));
-        if now.within((start, end)) {
-            lines.push(line("nanty.system.quiet_now", &[]));
-        }
+        me.insert("quiet".into(), json!({ "start": n.quiet_start, "end": n.quiet_end, "now": now.within((start, end)) }));
     }
-    render_lines(lang, &lines)
+    let a = &cfg.agents;
+    let roles = json!({
+        "architect": role_json(cfg, &a.architect.connection_id, &a.architect.model),
+        "developer": role_json(cfg, &a.developer.connection_id, &a.developer.model),
+        "reviewer": role_json(cfg, &a.reviewer.connection_id, &a.reviewer.model),
+        "nanty": role_json(cfg, &n.connection_id, &n.model),
+    });
+    // Só os observados (a mesma lista da conversa), pela fonte única.
+    let mut projects = Vec::new();
+    for (project, facts) in super::observe::observed_facts(state, cfg, MAX_SYSTEM_PROJECTS).await {
+        let mut entry = project_head(secrets, &project);
+        match facts {
+            Some(facts) => entry.extend(status_json(&facts)),
+            None => {
+                entry.insert("error".into(), json!("unread"));
+            }
+        }
+        projects.push(Value::Object(entry));
+    }
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "roles": roles,
+        "machine": machine,
+        "nanty": me,
+        "projects": projects,
+    })
+    .to_string()
 }
 
 /// O nome (redigido) de um projeto observado; `None` para excluído ou desconhecido.

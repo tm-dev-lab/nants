@@ -117,6 +117,14 @@ pub struct ProjectFacts {
     pub since: Option<String>,
     /// Custo em US$ da spec da fase (só o que tem preço); `None` sem preço ou sem spec.
     pub cost_usd: Option<f64>,
+    /// Spec 141 T09 (C-09): os tipos fixos das opções de escalada que esperam a escolha da pessoa
+    /// (`config`, `guidance`, `reset_workspace`...), nunca o rótulo, que é texto do modelo.
+    pub escalations: Vec<&'static str>,
+    /// Spec 141 T09: o modo do ambiente do projeto (`host` ou `docker`), pelo `settings.yaml`; `None`
+    /// sem SDD ou com o arquivo ilegível. Só na leitura completa.
+    pub environment: Option<&'static str>,
+    /// Spec 141 T09: a aprovação automática (`yolo`) do `settings.yaml`. Só na leitura completa.
+    pub yolo: bool,
 }
 
 /// O que espera a pessoa num projeto, pela visão de atenção do sino.
@@ -253,6 +261,12 @@ impl ProjectFacts {
             Phase::Running => self.phase_progress().and_then(|p| p.current_task.as_deref()),
             _ => None,
         }
+    }
+
+    /// Spec 141 T09 (C-09): a tarefa parou por um defeito do ambiente do próprio Nants (o código
+    /// `nants_environment` da T03): retomar não resolve, e o Nanty nunca o recomenda.
+    pub fn nants_fault(&self) -> bool {
+        self.blocked.as_ref().and_then(|t| t.code.as_deref()) == Some(crate::agents::runner::BLOCK_NANTS_ENVIRONMENT)
     }
 
     /// Os fatos da fase, limpos: zero, falso, vazio e valor padrão ficam de fora (`attempts: 0` não
@@ -484,6 +498,12 @@ async fn facts_with(
                 plan: item.plan_awaiting_approval,
                 recovery: item.paused_or_stalled.as_ref().is_some_and(|r| r.escalation_options.is_some()),
             };
+            facts.escalations = item
+                .paused_or_stalled
+                .as_ref()
+                .and_then(|r| r.escalation_options.as_ref())
+                .map(|options| options.iter().map(|o| o.kind).collect())
+                .unwrap_or_default();
             if let Some(run) = &item.paused_or_stalled {
                 (facts.stop_code, facts.role) = (run.stop_code.clone(), run.role);
                 facts.run_spec_id = Some(run.spec_id.clone());
@@ -498,6 +518,9 @@ async fn facts_with(
             }
         }
         facts.cost_alerts = crate::server::cost_alert::open_alert_count(&root);
+        if reading == Reading::Full {
+            (facts.environment, facts.yolo) = environment_of(&root);
+        }
         if let (Some(pricing), Some(spec)) = (pricing, facts.phase_spec_id()) {
             let records = crate::server::usage::load_records(&root, Some(spec));
             facts.cost_usd = crate::server::usage::aggregate(&records, &pricing).total.cost_usd;
@@ -510,6 +533,39 @@ async fn facts_with(
         facts.since = state.nanty().snapshot().alerts.get(&group).map(|a| a.since.clone());
     }
     Some(facts)
+}
+
+/// O modo do ambiente e a aprovação automática (`yolo`) do `settings.yaml` (leitura segura, sem seguir link); sem o arquivo ou
+/// ilegível, `(None, false)`.
+fn environment_of(root: &Path) -> (Option<&'static str>, bool) {
+    const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
+    let settings = crate::server::safe_fs::read_regular(root, ".sdd/settings.yaml", MAX_SETTINGS_BYTES)
+        .ok()
+        .and_then(|text| crate::sdd::Settings::parse(&text).ok());
+    match settings {
+        Some(s) => {
+            let mode = match s.environment {
+                crate::sdd::Environment::Host => "host",
+                crate::sdd::Environment::Docker => "docker",
+            };
+            (Some(mode), s.yolo)
+        }
+        None => (None, false),
+    }
+}
+
+/// Os fatos completos de cada projeto observado (spec 141 T09: o `system_status`), pela mesma leitura
+/// de [`project_facts`], com o contexto da atenção montado uma vez. A leitura que falhou fica `None`.
+/// `limit`: no máximo tantos projetos, cortados ANTES da leitura (spec 141 T12: os fatos completos
+/// custam disco por projeto, e o que passa do teto nunca é lido).
+pub async fn observed_facts(state: &AppState, cfg: &Config, limit: usize) -> Vec<(crate::config::Project, Option<ProjectFacts>)> {
+    let ctx = crate::server::attention::attention_context(state).await;
+    let mut out = Vec::new();
+    for project in cfg.projects.iter().filter(|p| cfg.nanty.observes(&p.id)).take(limit) {
+        let facts = facts_with(state, cfg, &ctx, project, Reading::Full).await;
+        out.push((project.clone(), facts));
+    }
+    out
 }
 
 /// Os projetos observados, cada um pela mesma leitura de [`project_facts`], só com o que os sinais

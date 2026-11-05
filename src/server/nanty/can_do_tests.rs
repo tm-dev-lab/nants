@@ -173,16 +173,30 @@ fn the_notice_channel_is_the_telegram_only_when_paired() {
     assert_eq!(notice_channel(&cfg), Channel::Telegram);
 }
 
+/// Spec 141 T08 (C-08): com a voz ligada, o prompt pede a resposta escrita para ser ouvida; desligada,
+/// não. O primeiro parágrafo como único trecho ouvido (140/T14) saiu nos dois.
+#[test]
+fn with_voice_the_prompt_asks_to_write_for_the_ear() {
+    for lang in [Lang::PtBr, Lang::En] {
+        let (voiced, plain) = (nanty_chat_system(lang, true), nanty_chat_system(lang, false));
+        assert!(voiced.contains(crate::agents::prompts::NANTY_SPOKEN_RULE.trim()) && voiced.contains("para ser ouvida"));
+        assert!(!plain.contains("para ser ouvida"));
+        for prompt in [&voiced, &plain] {
+            assert!(!prompt.contains("primeiro parágrafo") && !prompt.contains("único trecho"), "{lang:?}");
+        }
+    }
+}
+
 /// A lista antiga saiu do prompt, e os dois mandam ficar no `can_do`, sem frase de exemplo.
 #[test]
 fn the_prompts_only_allow_what_is_in_can_do() {
     for lang in [Lang::PtBr, Lang::En] {
-        for prompt in [nanty_system(lang), nanty_chat_system(lang)] {
+        for prompt in [nanty_system(lang), nanty_chat_system(lang, true)] {
             assert!(prompt.contains("can_do") && !prompt.contains("allowed_actions"));
             assert!(!prompt.contains("Posso abrir"), "sem frase pronta de exemplo");
         }
         assert!(!nanty_system(lang).contains("\"actions\""));
-        assert!(nanty_chat_system(lang).contains("open_nants"));
+        assert!(nanty_chat_system(lang, true).contains("open_nants"));
     }
 }
 
@@ -192,7 +206,7 @@ fn the_prompts_only_allow_what_is_in_can_do() {
 fn a_yes_can_only_answer_what_works_in_the_reply() {
     assert!(NANTY_OFFER_RULE.contains("`actions` ou `conversation`") && NANTY_OFFER_RULE.contains("`buttons` só se cumprem"));
     for lang in [Lang::PtBr, Lang::En] {
-        for prompt in [nanty_system(lang), nanty_chat_system(lang)] {
+        for prompt in [nanty_system(lang), nanty_chat_system(lang, true)] {
             assert!(prompt.contains(NANTY_OFFER_RULE), "{lang:?}");
             assert!(!prompt.contains("ofereça apenas"), "{lang:?}: a regra antiga não separava os grupos");
         }

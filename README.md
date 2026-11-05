@@ -67,10 +67,15 @@ and you decide at every step.
   Activity as "reading the spec section".
 - **Docker for every project.** Tests, checks and the running app live in containers, with
   nothing installed on your system and no `sudo`. Each command runs in a fresh container, and the
-  home folder lives inside the task folder (`.nants-home/`, with `~/.local/bin` on the `PATH`), so
-  whatever a tool installs there is still there for the next command, in any language. It stays
-  out of Git, of the formatters and of the task's files, starts empty in the final clean run
-  (only the download cache is kept) and goes away with the task folder. Before the first task of
+  home folder is mounted at `/nants/home`, outside the project folder (one folder per task and one
+  for the project root, kept in Nants' data folder, with `~/.local/bin` on the `PATH`), so
+  whatever a tool installs there is still there for the next command, in any language. Test
+  runners that scan the project never see it, and it never reaches Git. In the rounds at the project
+  root, the task folders in `.sdd/worktrees` are hidden from the container too, so a runner that
+  scans the whole tree never runs the tests of a task in progress. It starts empty in the
+  final clean run (only the download cache is kept) and goes away with the task folder or the
+  project. A project from an older version moves its old `.nants-home/` folder on the next run:
+  the download cache comes along, the rest is removed, and the install runs again. Before the first task of
   a spec, Nants runs the install command once and lists what it wrote outside the project folder;
   if that goes past a small limit, the conversation, the spec and every Developer briefing get a
   warning with the main paths, since those files are lost between commands. An install that
@@ -97,7 +102,27 @@ and you decide at every step.
   and for each criterion it marks as met it names the evidence (a test, or a file and line).
 - **Recovery with more options.** When a task gets stuck, the Architect can retry with a new
   strategy, split the task into smaller ones (keeping the work already on the branch), adjust the
-  criteria to what the environment proves, or ask you a question in the Conversation.
+  criteria to what the environment proves, or ask you a question in the Conversation. It also sees
+  how the environment is set up (the redacted `compose.yaml` and where each setting lives).
+- **A defect of Nants is not the project's problem.** When the tests fail citing a path that
+  belongs to Nants itself (its home folder, its outputs, the read only `.nants` folder or the task
+  folders), the task pauses right away and tells you it is a defect in the Nants environment, with
+  no call to the Developer or to the Architect and no tokens spent. The card offers **Clean the
+  workspace and test again**, which Nants itself runs: it empties the task's home folder (the
+  download cache stays) and installs again, with the code and the commits untouched. The options
+  that only guide the Developer are apart from the ones Nants runs.
+- **A narrower test command, only with you.** When one step of the test command picks up tests it
+  should not (for example, `node --test` that scans the whole tree), the recovery may propose the
+  same step with a path added at the end (`node --test test/`). Nants runs both steps itself on the
+  same code and offers the change only when the current one fails as it did in the task and the new
+  one passes. The card shows what runs today, what will run and how many tests each one reported;
+  it never applies on its own, not even with automatic approval. Options such as `--grep` or `-k`
+  are refused, the path must exist in the task and in the base branch, and the change applies to
+  the `test_command`, the `full_test_command` and the checks where that step appears.
+- **The same failure does not loop.** Nants keeps the signature of the failure that blocked a task
+  (the error, the commands and the environment). If the same failure comes back after your choice,
+  the task comes back to you, without reopening the recovery cycles or calling the Architect again.
+  When your choice needs no code change, the official suite runs first, before the Developer.
 - **A plan the agents agree on.** Before the plan reaches you, the Reviewer checks it and the
   Architect answers each finding: it adjusts the plan, or keeps it with a reason (for example, a
   check the sandbox cannot run, or one that only adds criteria). The Reviewer remembers those
@@ -478,7 +503,11 @@ window.
   the credit ran out) stays quiet behind it. Every notice says why, in one line written by Nants
   (the observer, the facts and the time), never by the model, and a proactive card only carries
   counts and codes, never the text of the project. With a model, Nanty words the notice and the
-  morning summary itself, from those same facts, and the line with the reason stays.
+  morning summary itself, from those same facts, and the line with the reason stays on the card.
+  The morning summary with a model is Nanty's text alone, written from the notices it kept, grouped
+  by project and with what needs attention first; in the window, the kept notices stay as data
+  under it, by project, type and time. With no model, the summary lists every kept notice, in order,
+  with the project on each line.
 - **The window.** The feed has **Waiting for you**, **Done on its own** (with **Undo** where it
   makes sense), **Planned** (including the morning summary) and **Today**, with the conversation on
   the right. Its animated ant shows what Nanty is doing: watching, thinking, talking, sleeping or
@@ -545,7 +574,12 @@ window.
   tools: the state of a project (the same source as the bell and the notices), a summary read from
   its files (the plan, the tasks, the report and the costs, as untrusted data and with your secrets
   redacted), the machine (disk, temporary folder, leftovers, budget and mute) and what Nanty did
-  today. It works out which project you mean: a number ("the 14"), part of the name,
+  today. It also knows Nants itself: it searches this README, `ARCHITECTURE.md` and `SECURITY.md`,
+  built into Nants, and reads the state of the whole system (the version, each role with its
+  connection kind and model and, per watched project, the environment mode, automatic approval,
+  the recovery waiting for you and whether the stop is a defect of Nants), with no secrets, paths,
+  addresses or projects it does not watch. So it can tell you when a stuck project is a defect of
+  Nants and not of the project, and it never suggests resuming one. It works out which project you mean: a number ("the 14"), part of the name,
   no accents, or its state ("the one that got stuck"). When in doubt, it asks. On Telegram, you see
   "typing" while it works.
 - **It reads deeply when you ask.** Ask why a run got stuck, what went wrong or for a report, and
@@ -594,7 +628,11 @@ window.
   long for one message comes without the button and points to the Nanty window. The ceiling of the
   text is provisional, in `[nanty.chat] architect_draft_chars` (3,000 characters).
 - **It remembers.** The last 40 to 60 messages, with no time limit, each with its date and time, so
-  a follow up question just works, even days later, plus the open notices. Every 20 messages, the
+  a follow up question just works, even days later, plus the open notices. Each notice Nanty sent
+  keeps the facts you saw on its card (the project, what happened and since when), and your
+  decisions on the cards enter the conversation, so "what did you think of the proposal?" right
+  after a notice is about that project. On Telegram, replying to a notice links your question to
+  it. Every 20 messages, the
   oldest ones become a short summary written by the model from clean text only (what a project file
   or a forwarded text said never goes into it). It keeps only what you said and its final replies,
   never what the tools returned. The numbers are provisional and live in `[nanty.chat]`.
@@ -656,13 +694,14 @@ window.
   `/quiet 0` or `/quiet off` turns it off) and `/help`. The Portuguese ones (`/resumo`, `/pausar`,
   `/silencio`, `/ajuda`) work too. With a model and budget, `/status` and `/summary` are written by
   the model from the same facts.
-- **The order of a message.** Nanty's own words come first, and a sentence written by the server
-  (the confirmation of a mute, for example) closes the message. Only in a summary with model text
-  do the title and the reasons of the notices it kept come first.
+- **No canned sentences.** With model text, a message is Nanty's own words alone: no fixed sentence
+  closes it. The card, the buttons and a short label carry the rest (the end time of a mute, the
+  way into Nants, what was saved to memory). The morning summary and the automatic analysis open
+  with a short label of their own. The fixed sentences stay only as the reply with no model.
 - **Long replies.** A long reply starts with what matters, and the window keeps it whole. On
   Telegram it comes in up to three messages, split between paragraphs or sentences; if it is longer
-  than that, the last one says the rest is in the Nanty window. The buttons and the sentence written
-  by the server go in the last message.
+  than that, the last one ends with `…` and the whole reply stays in the Nanty window. The buttons go
+  in the last message.
 - **Without a model,** with the budget used up or after a failure, Nanty answers with short fixed
   text in your language. It still finds a project by its name or number and says how it stands, and
   the commands keep working.
@@ -679,11 +718,12 @@ window.
 ### Voice
 
 Voice is off until you turn it on in Settings. With it on, everything Nanty says on Telegram goes as
-a voice note with the text in the caption: replies, notices with their buttons and the morning
-summary (and the whole text in a message of its own when the caption cut it). A long reply speaks
-only the start of its first paragraph: the caption shows that same part and says the rest follows,
-and the rest comes as text, with the buttons in the last message. In the window, replies
-have audio too, with a player that never starts on its own. With it off, text only.
+a voice note: replies, notices with their buttons and the morning summary. The note speaks the
+whole text, never just a part, and the text comes whole too: in the caption when it fits, or, for a
+longer reply, in messages that answer the note, with the buttons in the last one. If the voice
+fails for any part, no audio goes and you get the whole text. With voice on, Nanty also writes to
+be heard. In the window, replies have audio too, with the whole text and a player that never
+starts on its own. With it off, text only.
 
 - **A tone that fits.** The voice speaks in one of five tones: neutral, upbeat, serious, concerned or
   calm. For a notice, Nants picks it from the kind of notice (a blocked run sounds serious, low disk
@@ -692,9 +732,9 @@ have audio too, with a player that never starts on its own. With it off, text on
   Gemini refuses the tone, the same text is spoken again without it.
 - **A notice speaks Nanty's words.** With a model and budget, the voice note of a notice speaks what
   Nanty wrote about it, in a single message, with that text and the reason line in the caption. Nants
-  waits for the text only a few seconds (15, or 8 for an urgent notice); after that, the note speaks
-  the fixed sentence of the notice and Nanty's text follows as a message, so the notice is never late
-  and never lost.
+  waits for the text only a few seconds (15, or 8 for an urgent notice); after that, or when the
+  text and the card together would not show whole on Telegram, the note speaks the fixed sentence of
+  the notice and Nanty's text follows as a message, so the notice is never late and never lost.
 
 - **Only Google Gemini, then text.** One Google Gemini connection speaks and transcribes; by
   default, the first one with a key. When Gemini fails, the reply goes in text.

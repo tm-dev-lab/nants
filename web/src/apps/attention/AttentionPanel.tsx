@@ -24,6 +24,7 @@ import { environmentReviewHint } from "../shared/permissions";
 import { PermissionDecisions } from "../shared/PermissionDecisions";
 import { gateBlocked } from "../shared/readiness";
 import { ProblemNotice, ReadinessNotice } from "../shared/ReadinessNotice";
+import { hasRestrictionEvidence, RestrictionDetails } from "../shared/RestrictionDetails";
 import { approveProblem, recoveryProblem, type RunProblem } from "../shared/runProblems";
 import { ESCALATION_KIND_LABELS } from "../conversation/PausedRunCard";
 import { permissionTitle } from "../conversation/PermissionMessage";
@@ -316,6 +317,7 @@ function RunItem({ projectId, item, onOpen }: { projectId: string; item: Extract
             <li key={o.id} className="nd-stack-xs">
               <span className="nd-strong">{o.label}</span>
               <span className="nd-muted">{ESCALATION_KIND_LABELS[o.kind] ?? o.kind}</span>
+              {hasRestrictionEvidence(o.restriction) ? <RestrictionDetails restriction={o.restriction} /> : null}
               {confirming === o.id ? (
                 <div className="nd-actions">
                   <button
@@ -325,15 +327,21 @@ function RunItem({ projectId, item, onOpen }: { projectId: string; item: Extract
                     disabled={busy || blocked}
                     onClick={() => void run(() => chooseRecovery(projectId, item.specId, task.id, { option_id: o.id, analysis }), recoveryProblem)}
                   >
-                    {t("recovery.confirm")}
+                    {hasRestrictionEvidence(o.restriction) ? t("recovery.restriction.confirm") : t("recovery.confirm")}
                   </button>
                   <button type="button" className="nd-btn nd-btn-sm" disabled={busy} onClick={() => setConfirming(null)}>
                     {t("common.cancel")}
                   </button>
                 </div>
               ) : (
-                <button type="button" className="nd-btn nd-btn-sm" disabled={busy || blocked} onClick={() => setConfirming(o.id)}>
-                  {t("attention.run.choose", { label: o.label })}
+                <button
+                  type="button"
+                  className="nd-btn nd-btn-sm nd-btn-wrap"
+                  aria-label={hasRestrictionEvidence(o.restriction) ? undefined : t("attention.run.choose", { label: o.label })}
+                  disabled={busy || blocked}
+                  onClick={() => setConfirming(o.id)}
+                >
+                  {hasRestrictionEvidence(o.restriction) ? t("recovery.restriction.approve") : t("attention.run.chooseShort")}
                 </button>
               )}
             </li>

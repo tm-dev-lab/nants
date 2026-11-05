@@ -365,6 +365,7 @@ describe("spec 140 T03: a tela pedida na conversa", () => {
     params: {},
     lines: [],
     why: [],
+    held: [],
     lang: null,
     card_ids: [],
     voice: false,

@@ -53,6 +53,7 @@ use std::time::{Duration, Instant};
 
 use crate::agents::finding_reply::{self, FindingResponse, ARBITRATION_LOG, RESPONSES, SPEC_DECISIONS};
 use crate::agents::markers;
+use crate::agents::nants_fault;
 use crate::agents::finding_track::{self, REGISTRY};
 use crate::agents::llm_client::ProviderFailure;
 use crate::agents::usage::BudgetGuard;
@@ -130,11 +131,32 @@ const LEGACY_LIMIT_CAUSE: &str = "- Causa raiz: limite de ciclos de recuperaçã
 pub const REVISED_NEXT_ACTION: &str = "definição revisada; retomar";
 /// Código do motivo de uma tarefa BLOQUEADA com a definição revisada pelo Arquiteto no chat.
 pub const BLOCK_REVISED: &str = "revised";
+/// Spec 141 T03 (C-04): código do motivo de uma tarefa BLOQUEADA por defeito do ambiente do Nants
+/// (a saída dos testes cita um caminho do Nants, [`crate::agents::nants_fault`]). Vai direto à
+/// pessoa, sem o modelo.
+pub const BLOCK_NANTS_ENVIRONMENT: &str = "nants_environment";
+/// Spec 141 T05 (C-05): código do motivo de uma tarefa BLOQUEADA porque a primeira falha depois da
+/// escolha da pessoa tem a mesma assinatura da falha que ela viu na escalada. Vai de volta à pessoa,
+/// sem o modelo e sem reabrir os ciclos de recuperação.
+pub const BLOCK_SAME_FAILURE: &str = "same_failure";
+/// Spec 141 T05 (C-05): linha estrutural, na seção da escalada e na marca de retomada pelo humano,
+/// com a assinatura da falha ([`persisted_signature`]). Lida pelo runner; igual nos dois idiomas.
+pub const FAILURE_SIGNATURE_LINE: &str = "- Assinatura da falha: ";
+/// Spec 141 T05: linha acrescentada à marca de retomada quando a primeira rodada de testes depois
+/// dela já foi conferida contra a assinatura (só a primeira falha volta direto à pessoa).
+pub const SIGNATURE_CHECKED_LINE: &str = "- Assinatura conferida na primeira rodada depois da retomada";
+/// Spec 141 T05: seção gravada pelo servidor quando a escolha da pessoa é uma opção que ele executa
+/// e que não pede mudança de código (`reset_workspace` ou a troca do comando de testes). A marca de
+/// retomada a consome e leva a linha [`TEST_FIRST_LINE`].
+pub const TEST_FIRST_SECTION: &str = "Escolha sem mudança de código";
+/// Spec 141 T05: linha da marca de retomada: a primeira rodada depois dela é a bateria oficial, sem
+/// sessão do Desenvolvedor antes. Estrutural, igual nos dois idiomas.
+pub const TEST_FIRST_LINE: &str = "- Testes antes do Desenvolvedor: a escolha não pede mudança de código";
 
 /// Códigos estáveis dos motivos de bloqueio gravados em `next_action_code` (spec 114 T02). Cada um
 /// tem o texto `runner.block.<código>` nos dois dicionários, menos o orçamento (`runner.budget.*`,
 /// montado pelo [`BudgetGuard`]).
-pub const BLOCK_CODES: [&str; 24] = [
+pub const BLOCK_CODES: [&str; 26] = [
     "budget",
     "docker",
     "external_edit",
@@ -159,6 +181,8 @@ pub const BLOCK_CODES: [&str; 24] = [
     "blocked",
     "recurring",
     "kept_recurring",
+    BLOCK_NANTS_ENVIRONMENT,
+    BLOCK_SAME_FAILURE,
 ];
 
 /// Motivo de bloqueio (spec 114 T02): o código estável, lido pelas máquinas, e o texto para a
@@ -296,6 +320,31 @@ fn test_signature(settings: &Settings) -> String {
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{h:016x}")
+}
+
+/// FNV-1a 64 de `text`, em hexadecimal.
+fn fnv_hex(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Spec 141 T05 (C-05): a assinatura gravada de uma falha dos testes: a da própria falha (código de
+/// saída, tempo limite, etapa e linhas estáveis, [`FailureSignature`]) e a do que foi rodado
+/// ([`test_signature`]: `test_command`, `full_test_command`, checagens bloqueantes e o hash do
+/// ambiente). Mudar qualquer um deles dá outra assinatura, isto é, uma falha nova.
+fn persisted_signature(failure: &FailureSignature, settings: &Settings) -> String {
+    let canon = format!(
+        "{:?}\n{}\n{:?}\n{}",
+        failure.exit_code,
+        failure.timed_out,
+        failure.step,
+        failure.lines.join("\n")
+    );
+    format!("{}-{}", fnv_hex(&canon), test_signature(settings))
 }
 
 /// Seção "Testes do projeto" do briefing do Desenvolvedor (spec 124 T05): os comandos que o Nants
@@ -486,6 +535,10 @@ pub const INSTALL_FOOTPRINT_SECTION: &str = "Persistência da instalação";
 /// - Node (`npm install` de dois pacotes pequenos, imagem do Test 5): com `HOME=/work/.nants-home`,
 ///   0; com `HOME=/tmp`, 34 (o cache do npm).
 ///
+/// Spec 141 T01: o `HOME` saiu de `/work` para a montagem [`crate::harness::home::CONTAINER_HOME`]
+/// (bind de uma pasta do diretório de dados do Nants, uma por área de trabalho). Ela persiste como
+/// `/work` e, por ser montagem, fica fora do `docker diff` (a conta não muda: o caso normal segue 0).
+///
 /// O caso normal dá 0; uma instalação de um único pacote pequeno fora de `/work` já passa de 10.
 pub const INSTALL_FOOTPRINT_LIMIT: usize = 10;
 /// Profundidade (componentes do caminho) dos grupos de caminhos principais do aviso.
@@ -509,9 +562,9 @@ pub fn install_footprint_prompt(spec_md: &str) -> String {
         return String::new();
     };
     format!(
-        "## Persistência da instalação (cada comando roda num container novo: só o que fica em /work persiste, inclusive a pasta pessoal $HOME={}; o que um comando grava fora de /work se perde no comando seguinte. Faça a instalação gravar dentro de /work, por configuração do projeto, sem regra por ferramenta)\n{}",
-        crate::harness::home::CONTAINER_HOME,
-        section.trim()
+        "## Persistência da instalação (cada comando roda num container novo: só persiste o que fica em /work e na pasta pessoal $HOME={home}, que o Nants monta fora de /work, uma por área de trabalho; o que um comando grava em outro lugar se perde no comando seguinte. Faça a instalação gravar dentro de /work ou de {home}, por configuração do projeto, sem regra por ferramenta)\n{}",
+        section.trim(),
+        home = crate::harness::home::CONTAINER_HOME,
     )
 }
 
@@ -3157,6 +3210,19 @@ pub struct TaskRunner {
 /// Resultado do container mantido da instalação que também confere a persistência (spec 131 T05).
 type KeptSlot = Arc<Mutex<Option<KeptRun>>>;
 
+/// A etapa de uma rodada com eventos ao vivo: o tipo, o rótulo de reserva e o código traduzido pela
+/// interface (`activity.stage.<code>`), com os parâmetros dele.
+struct RunStage {
+    kind: CommandKind,
+    label: String,
+    code: &'static str,
+    params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Spec 141 T04: códigos da etapa das rodadas da prova de uma restrição (a etapa atual e a nova).
+const STAGE_RESTRICTION_OFFICIAL: &str = "restriction_official";
+const STAGE_RESTRICTION_NEW: &str = "restriction_new";
+
 /// Como uma rodada roda no Docker: o container efêmero de sempre, o mantido até o `docker diff`
 /// (spec 131 T05, com o resultado em `KeptSlot`) ou a rodada offline (spec 137 T09).
 enum Round {
@@ -3482,6 +3548,27 @@ impl TaskRunner {
         if matches!(round, Round::Offline) {
             stage_params.insert("offline".into(), serde_json::Value::from(true));
         }
+        let label = format!("{what}{place} · tentativa {attempt}");
+        let stage = RunStage { kind, label, code: stage_code, params: stage_params };
+        self.run_with_events(settings, dir, command, fresh, stage, task_id, attempt, round).await
+    }
+
+    /// A rodada de `command` com os eventos ao vivo (`RunnerEvent::CommandRun` no início e no fim e
+    /// o sinal de vida enquanto corre), com a etapa `stage` (spec 141 T04: também as rodadas da
+    /// prova de uma restrição do comando de testes).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_with_events(
+        &self,
+        settings: &Settings,
+        dir: &Path,
+        command: &str,
+        fresh: bool,
+        stage: RunStage,
+        task_id: &str,
+        attempt: u32,
+        round: Round,
+    ) -> Result<TestResult, RunnerError> {
+        let RunStage { kind, label, code: stage_code, params: stage_params } = stage;
         let run_id = format!(
             "{}-{}-{}",
             task_id,
@@ -3494,7 +3581,7 @@ impl TaskRunner {
             run_id: run_id.clone(),
             started,
             kind,
-            label: format!("{what}{place} · tentativa {attempt}"),
+            label: label.clone(),
             stage_code,
             stage_params: stage_params.clone(),
             command: self.scrub(command),
@@ -3901,6 +3988,8 @@ impl TaskRunner {
         task.frontmatter.tested_sha = None;
         task.frontmatter.tested_signature = None;
         task.frontmatter.tested_at = None;
+        // Spec 141 T05: a assinatura do bloqueio anterior já foi para a escalada; esta tentativa grava a sua.
+        task.frontmatter.failure_signature = None;
         let wt = self.ensure_worktree(settings, task)?;
         let attempt = task.frontmatter.attempts + 1;
         let mut test_output: Option<String> = None;
@@ -3921,6 +4010,7 @@ impl TaskRunner {
         // Spec 124 T02: as respostas aos apontamentos são desta tentativa (as sessões se somam).
         task.body = replace_section(&task.body, RESPONSES, None);
         self.warn_repeated_install(settings, task, attempt);
+        let mut test_first = test_first_armed(&task.body);
         loop {
             self.check_cancel()?;
             if let Some(step) = self.budget_stop(task)? {
@@ -3933,54 +4023,75 @@ impl TaskRunner {
             }
             // Spec 124 T05: as rodadas destes comandos pelo Desenvolvedor ficam registradas.
             self.suite_ledger.watch(test_levels::watched_commands(settings), test_levels::environment_key(settings));
-            let mut brief = self.brief(task, &wt, test_output.clone(), settings)?;
-            brief.previous_progress = std::mem::take(&mut previous_progress);
-            brief.resumed = resume_cause.take();
-            let report = self.developer.implement(&brief).await?;
-            let exhausted = report.exhausted;
-            self.sync_advice(task);
-            self.record_responses(task, &report.summary)?;
-            let dev_criteria = extract_dev_criteria(&report.summary);
-            // Spec 133 T07: os avisos explícitos do Desenvolvedor viram pendências na aprovação.
-            let dev_pending = extract_dev_pending(&report.summary);
-            let history_summary = report.summary.clone();
-            self.events.emit(RunnerEvent::AgentMessage {
-                agent: "developer".into(),
-                text: report.summary,
-                task_id: Some(task.frontmatter.id.clone()),
-                attempt: Some(attempt),
-            });
-            let detached = commit_pending(
-                &wt,
-                &self.repo_root,
-                &task.frontmatter.spec_id,
-                &task.frontmatter.id,
-                &task.frontmatter.branch,
-                self.lang.get(),
-            )?;
-            self.nested_notice(task, attempt, &detached);
-            // Formatação automática (spec 078): vira commit próprio, antes do HEAD testado e revisado.
-            self.format_delivery(settings, task, &wt, attempt).await?;
-            self.record_attempt(settings, task, &history_summary)?;
-            if exhausted.is_some() {
-                previous_progress = self.progress_note(settings, task, &history_summary);
-            }
-            // Spec 133 T05: parada mecânica (repetição ou passos, nunca negações) volta ao topo do
-            // laço numa sessão nova com o progresso e a causa, sem testes, revisão nem tentativa
-            // nova. Uma vez por tentativa; o topo do laço confere o orçamento antes da sessão. Se a
-            // retomada também parar, segue o fluxo de sempre (testes e revisão). Custo: com `Steps`,
-            // o pior caso de uma tentativa dobra (o teto de passos da sessão parada mais o da
-            // retomada).
-            if let Some(stop) = exhausted.filter(|s| s.resumable() && !resume_used) {
-                if let Some(step) = self.budget_stop(task)? {
-                    return Ok(step);
+            // Spec 141 T05: a escolha da pessoa foi executada pelo servidor e não pede mudança de
+            // código (`reset_workspace` ou a troca do comando de testes): a primeira coisa é a bateria
+            // oficial na mesma worktree, sem sessão do Desenvolvedor. Passou, segue para a revisão; a
+            // mesma falha volta à pessoa; uma falha nova volta ao Desenvolvedor, como contexto.
+            let (dev_criteria, dev_pending) = if std::mem::take(&mut test_first) {
+                self.tests_message(task, attempt, i18n::text(self.lang.get(), "runner.tests.test_first"));
+                // Revisão 1, F-02: o que sobrou sem commit na worktree entra no HEAD antes da rodada,
+                // como no ramo do Desenvolvedor: a árvore testada é a commitada (a revisada e a integrada).
+                let detached = commit_pending(
+                    &wt,
+                    &self.repo_root,
+                    &task.frontmatter.spec_id,
+                    &task.frontmatter.id,
+                    &task.frontmatter.branch,
+                    self.lang.get(),
+                )?;
+                self.nested_notice(task, attempt, &detached);
+                (String::new(), String::new())
+            } else {
+                let mut brief = self.brief(task, &wt, test_output.clone(), settings)?;
+                brief.previous_progress = std::mem::take(&mut previous_progress);
+                brief.resumed = resume_cause.take();
+                let report = self.developer.implement(&brief).await?;
+                let exhausted = report.exhausted;
+                self.sync_advice(task);
+                self.record_responses(task, &report.summary)?;
+                let dev_criteria = extract_dev_criteria(&report.summary);
+                // Spec 133 T07: os avisos explícitos do Desenvolvedor viram pendências na aprovação.
+                let dev_pending = extract_dev_pending(&report.summary);
+                let history_summary = report.summary.clone();
+                self.events.emit(RunnerEvent::AgentMessage {
+                    agent: "developer".into(),
+                    text: report.summary,
+                    task_id: Some(task.frontmatter.id.clone()),
+                    attempt: Some(attempt),
+                });
+                let detached = commit_pending(
+                    &wt,
+                    &self.repo_root,
+                    &task.frontmatter.spec_id,
+                    &task.frontmatter.id,
+                    &task.frontmatter.branch,
+                    self.lang.get(),
+                )?;
+                self.nested_notice(task, attempt, &detached);
+                // Formatação automática (spec 078): vira commit próprio, antes do HEAD testado e revisado.
+                self.format_delivery(settings, task, &wt, attempt).await?;
+                self.record_attempt(settings, task, &history_summary)?;
+                if exhausted.is_some() {
+                    previous_progress = self.progress_note(settings, task, &history_summary);
                 }
-                resume_used = true;
-                resume_cause = Some(stop);
-                let id = task.frontmatter.id.clone();
-                self.notice(&id, &format!("task.dev_resumed_{}", stop.code()), &[("task", &id), ("attempt", &attempt.to_string())]);
-                continue;
-            }
+                // Spec 133 T05: parada mecânica (repetição ou passos, nunca negações) volta ao topo do
+                // laço numa sessão nova com o progresso e a causa, sem testes, revisão nem tentativa
+                // nova. Uma vez por tentativa; o topo do laço confere o orçamento antes da sessão. Se a
+                // retomada também parar, segue o fluxo de sempre (testes e revisão). Custo: com `Steps`,
+                // o pior caso de uma tentativa dobra (o teto de passos da sessão parada mais o da
+                // retomada).
+                if let Some(stop) = exhausted.filter(|s| s.resumable() && !resume_used) {
+                    if let Some(step) = self.budget_stop(task)? {
+                        return Ok(step);
+                    }
+                    resume_used = true;
+                    resume_cause = Some(stop);
+                    let id = task.frontmatter.id.clone();
+                    self.notice(&id, &format!("task.dev_resumed_{}", stop.code()), &[("task", &id), ("attempt", &attempt.to_string())]);
+                    continue;
+                }
+                (dev_criteria, dev_pending)
+            };
 
             // Início da execução: artefatos de falha (spec 079) e capturas de tela (spec 082 T03) mais
             // antigos que isto são ignorados.
@@ -4141,6 +4252,8 @@ impl TaskRunner {
                 }
             }
             if test.passed {
+                // Spec 141 T05: a primeira rodada depois da retomada passou; a assinatura fica conferida.
+                task.body = disarm_signature(&task.body);
                 let crit = if dev_criteria.is_empty() { String::new() } else { format!("{DEV_CRITERIA_MARK}{dev_criteria}") };
                 let pend = if dev_pending.is_empty() { String::new() } else { format!("{DEV_PENDING_MARK}{dev_pending}") };
                 let silent = if silent_suite {
@@ -4163,6 +4276,9 @@ impl TaskRunner {
             }
             // Spec 139 T01: a etapa do `&&` que falhou vira fato na saída (Desenvolvedor, recuperação
             // e evidência) e na conversa; com ela, a assinatura da falha, antes dos artefatos.
+            // Spec 141 T03: a saída do próprio comando (sem as notas do Nants), para a detecção da
+            // falha do ambiente do Nants.
+            let own_output = self.scrub(&test.output);
             let step_note = self.failed_step_note(&failed_command, test.failed_step);
             if let Some(note) = &step_note {
                 test.output = format!("{}\n\n{note}\n", test.output.trim_end());
@@ -4170,6 +4286,30 @@ impl TaskRunner {
             let signature = FailureSignature::of(&test, &self.scrub(&test.output));
             let repeated = last_failure.as_ref().filter(|(previous, _)| *previous == signature);
             let same_tree = repeated.is_some_and(|(_, previous_tree)| previous_tree.is_some() && *previous_tree == tree);
+            // Spec 141 T05 (C-05): a primeira falha depois da escolha da pessoa com a mesma assinatura da
+            // falha que ela viu na escalada volta direto a ela: sem outra sessão do Desenvolvedor, sem
+            // recuperação e sem reabrir os ciclos. Falha nova (outra assinatura, outro comando, outras
+            // checagens ou outro ambiente) segue o caminho de sempre. Vem antes da detecção da falha
+            // do Nants: a repetição dela também é "a mesma falha voltou".
+            let persisted = persisted_signature(&signature, settings);
+            let armed = armed_signature(&task.body);
+            // A mesma falha deixa a marca armada (revisão 1, F-01): até o servidor gravar a escalada
+            // nova, um reinício seguido de "Retomar" ainda leva a assinatura. Só a falha nova desarma.
+            if armed.as_deref() == Some(persisted.as_str()) {
+                return self.same_failure_block(task, attempt, &test, &persisted);
+            }
+            if armed.is_some() || test_first_armed(&task.body) {
+                task.body = disarm_signature(&task.body);
+                self.persist(task)?;
+            }
+            // Spec 141 T03 (C-04): a falha que cita um caminho do Nants é defeito do ambiente do
+            // Nants. Vai direto à pessoa, sem outra sessão do Desenvolvedor nem recuperação. Tempo
+            // limite e programa ausente (126/127) seguem o caminho de ambiente de sempre.
+            let did_run = !test.timed_out && !matches!(test.exit_code, Some(126 | 127));
+            if let Some(path) = did_run.then(|| nants_fault::detect(&own_output, &failed_command, repeated.is_some())).flatten() {
+                task.frontmatter.failure_signature = Some(persisted);
+                return self.nants_fault_block(task, attempt, &test, &path);
+            }
             // Spec 139 T01: a mesma assinatura em dois ciclos seguidos é falta de progresso: vai à
             // recuperação já, com o mesmo bloqueio do limite de ciclos (tipo, contagem real e
             // evidência). A árvore sem mudança entra como fato a mais. Falha que muda segue até o limite.
@@ -4211,6 +4351,8 @@ impl TaskRunner {
                 }
                 // A última falha fica registrada: é o fato que o Arquiteto analisa na recuperação.
                 task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(test.exit_code, test.timed_out), test.output));
+                // Spec 141 T05 (C-05): a assinatura vai para a escalada, se a recuperação escalar.
+                task.frontmatter.failure_signature = Some(persisted);
                 return self.block(
                     task,
                     self.block_reason_counted("tests_failed", u64::from(failed_runs)),
@@ -4475,6 +4617,38 @@ impl TaskRunner {
 
     /// Spec 139 T01: o registro da parada por falta de progresso, com a árvore sem mudança como fato
     /// a mais quando for o caso.
+    /// Spec 141 T03 (C-04): bloqueia a tarefa por defeito do ambiente do Nants (`path`, o caminho
+    /// do Nants que a saída cita): grava a evidência da falha, avisa na conversa e devolve o bloqueio
+    /// de ambiente com o código [`BLOCK_NANTS_ENVIRONMENT`], que o servidor leva à pessoa sem modelo.
+    fn nants_fault_block(&self, task: &mut Task, attempt: u32, test: &TestResult, path: &str) -> Result<Step, RunnerError> {
+        task.frontmatter.tested_sha = None;
+        task.frontmatter.tested_signature = None;
+        task.frontmatter.tested_at = None;
+        // O caminho detectado vai marcado logo depois do cabeçalho: a cauda pode já não citá-lo.
+        task.frontmatter.test_evidence = Some(format!(
+            "{}{}{}",
+            failure_header(test.exit_code, test.timed_out),
+            nants_fault::path_mark(path),
+            test.output
+        ));
+        self.tests_message(task, attempt, i18n::tr(self.lang.get(), "runner.tests.nants_fault", &[("path", path)]));
+        self.block(task, self.block_reason(BLOCK_NANTS_ENVIRONMENT, &[("path", path)]), BlockKind::Environmental)
+    }
+
+    /// Spec 141 T05 (C-05): bloqueia a tarefa porque a primeira falha depois da escolha da pessoa tem a
+    /// mesma assinatura (`signature`) da falha da escalada: grava a evidência e a assinatura, avisa na
+    /// conversa e devolve o bloqueio com o código [`BLOCK_SAME_FAILURE`], que o servidor leva de volta
+    /// à pessoa sem o modelo.
+    fn same_failure_block(&self, task: &mut Task, attempt: u32, test: &TestResult, signature: &str) -> Result<Step, RunnerError> {
+        task.frontmatter.tested_sha = None;
+        task.frontmatter.tested_signature = None;
+        task.frontmatter.tested_at = None;
+        task.frontmatter.test_evidence = Some(format!("{}{}", failure_header(test.exit_code, test.timed_out), test.output));
+        task.frontmatter.failure_signature = Some(signature.to_string());
+        self.tests_message(task, attempt, i18n::text(self.lang.get(), "runner.tests.same_failure"));
+        self.block(task, self.block_reason(BLOCK_SAME_FAILURE, &[]), BlockKind::Quality)
+    }
+
     fn no_progress_note(&self, max_cycles: u32, same_tree: bool) -> String {
         let lang = self.lang.get();
         let note = i18n::tr(lang, "runner.tests.no_progress", &[("max", &max_cycles.to_string())]);
@@ -4495,7 +4669,7 @@ impl TaskRunner {
         }
         let Some(code) = result.exit_code.filter(|c| matches!(c, 126 | 127)) else { return };
         if settings.install_command.is_some() {
-            test_levels::forget_install(dir);
+            self.forget_install(dir);
         }
         let install = settings.install_command.as_deref().map(|c| self.scrub(c)).unwrap_or_default();
         let key = if install.is_empty() { "runner.tests.missing_program" } else { "runner.tests.missing_program_install" };
@@ -4559,10 +4733,14 @@ impl TaskRunner {
         attempt: u32,
         clean: bool,
     ) -> Result<Install, RunnerError> {
+        // Spec 141 T01: a pasta pessoal pronta antes de olhar o estado da instalação. Uma área de
+        // trabalho com a pasta antiga é migrada aqui, e o estado esquecido faz a instalação rodar
+        // já nesta rodada (no `HOME` novo), sem gastar um ciclo com dependência ausente.
+        self.settle_home(dir);
         // Spec 129 T01: a rodada limpa começa sem a pasta pessoal (menos o cache de download),
         // com ou sem `install_command`.
         if clean {
-            test_levels::forget_install(dir);
+            self.forget_install(dir);
         }
         let Some(command) = settings.install_command.as_deref().filter(|c| !c.trim().is_empty()) else {
             return Ok(Install::Absent);
@@ -4590,7 +4768,7 @@ impl TaskRunner {
             test_levels::remember_install(dir, &test_levels::install_key(settings, command, dir), &at);
             return Ok(Install::Ran { clean });
         }
-        test_levels::forget_install(dir);
+        self.forget_install(dir);
         self.after_failed_round(settings, dir, &mut out);
         let output = format!("{INSTALL_FAILED_MARK} (`{}`):\n{}", self.scrub(command), out.output);
         Ok(Install::Failed(TestResult { output, ..out }, started.elapsed()))
@@ -4616,6 +4794,60 @@ impl TaskRunner {
             )
     }
 
+    /// Spec 141 T04 (C-03, R2): a evidência de uma restrição do comando de testes, do registro de
+    /// rodadas. O próprio servidor roda, na worktree da tarefa e no ambiente do projeto (no
+    /// container, com os limites do Nants, quando ele é Docker), a etapa oficial (`original`) e a
+    /// restrita (`restricted`), cada uma com o estado recriado como na rodada do `test_command`, e
+    /// registra as duas ([`test_levels::SuiteLedger::record_server`]). Não confia no relato do
+    /// Desenvolvedor: as rodadas dele não contam. A rodada já registrada de um dos dois comandos sobre
+    /// a mesma árvore (passando ou falhando) não roda de novo, e o par volta como ficou: quem julga a
+    /// evidência é a recuperação. As rodadas emitem os eventos ao vivo, com a etapa própria. `None`
+    /// sem worktree, sem hash da árvore, com erro de execução ou sem as duas rodadas na mesma árvore.
+    pub async fn probe_restriction(
+        &self,
+        spec_id: &str,
+        task_id: &str,
+        original: &str,
+        restricted: &str,
+    ) -> Option<test_levels::RestrictionProbe> {
+        let settings = read_settings(&sdd_dir(&self.repo_root).join("settings.yaml")).ok()?;
+        let wt = task_worktree_path(&self.repo_root, spec_id, task_id);
+        if !wt.is_dir() {
+            return None;
+        }
+        let environment = test_levels::environment_key(&settings);
+        let in_container = settings.environment == Environment::Docker;
+        let tree = test_levels::tree_hash(&wt)?;
+        for (command, code, label) in [
+            (original, STAGE_RESTRICTION_OFFICIAL, "Rodada do servidor com a etapa atual"),
+            (restricted, STAGE_RESTRICTION_NEW, "Rodada do servidor com a etapa nova"),
+        ] {
+            // Uma rodada do servidor deste comando nesta árvore e neste ambiente já vale (passando ou
+            // falhando): não roda de novo. Assim a etapa oficial roda uma vez por árvore.
+            if self.suite_ledger.server_run(command, &tree, &environment, in_container).is_some() {
+                continue;
+            }
+            let started = std::time::SystemTime::now();
+            let clock = Instant::now();
+            let tree_before = test_levels::tree_hash(&wt);
+            let stage = RunStage { kind: CommandKind::Tests, label: label.to_string(), code, params: serde_json::Map::new() };
+            let out = self.run_with_events(&settings, &wt, command, true, stage, task_id, 0, Round::Plain).await.ok()?;
+            let tree_after = test_levels::tree_hash(&wt);
+            let run = test_levels::SuiteRun {
+                command: command.to_string(),
+                tree_before,
+                tree_after,
+                in_container,
+                passed: out.passed && !out.timed_out,
+                elapsed: clock.elapsed(),
+                started,
+                output: self.scrub(&out.output),
+            };
+            self.suite_ledger.record_server(run, &environment);
+        }
+        self.suite_ledger.restriction_probe(original, restricted, &tree, &environment, in_container)
+    }
+
     /// Spec 124 T05: a rodada do Desenvolvedor de `command` que vale pela do runner sobre a árvore
     /// `tree` (as condições estão em [`test_levels`]). Com `install_command`, só se a instalação da
     /// pasta estiver em dia (a trava pode ter mudado sem instalar). `None` = o runner roda.
@@ -4625,6 +4857,8 @@ impl TaskRunner {
             return None;
         }
         if let Some(install) = settings.install_command.as_deref() {
+            // Spec 141 T01: com a pasta antiga, a migração esquece a instalação antes da conta.
+            self.settle_home(wt);
             if test_levels::install_needed(settings, install, wt) {
                 return None;
             }
@@ -5715,6 +5949,29 @@ impl TaskRunner {
         Ok(Step::Finish(Outcome::Done))
     }
 
+    /// Spec 141 T01: a pasta pessoal de `dir` pronta (criada e, com a pasta antiga na área de
+    /// trabalho, migrada com o estado da instalação esquecido). Só no modo docker; melhor esforço:
+    /// o próximo comando do Compose tenta de novo.
+    fn settle_home(&self, dir: &Path) {
+        if let Some(c) = &self.compose {
+            if let Err(e) = c.ready_home(dir) {
+                eprintln!("nants: pasta pessoal: {e}");
+            }
+        }
+    }
+
+    /// Esquece a instalação de `dir` (a próxima rodada instala de novo): o estado e, no modo docker,
+    /// a pasta pessoal da área de trabalho, menos o cache de download (spec 129 T01; desde a spec
+    /// 141 T01 ela fica no diretório de dados do Nants, achada pelo Compose do projeto).
+    fn forget_install(&self, dir: &Path) {
+        test_levels::forget_install_state(dir);
+        if let Some(c) = &self.compose {
+            if let Err(e) = c.reset_home(dir) {
+                eprintln!("nants: pasta pessoal: {e}");
+            }
+        }
+    }
+
     /// Devolve ao uid do host arquivos de outro dono em `dir` (só no modo docker, sem sudo).
     fn repair_dir(&self, dir: &Path) -> Result<usize, String> {
         match &self.compose {
@@ -5748,6 +6005,13 @@ impl TaskRunner {
                 root.worktree_remove(&wt)?;
             } else {
                 self.remove_orphan_dir(&wt)?;
+            }
+        }
+        // Spec 141 T01: a pasta pessoal sai com a worktree (fica no diretório de dados do Nants).
+        // Falha aqui não desfaz a conclusão: a varredura do início do servidor leva a sobra.
+        if let Some(c) = &self.compose {
+            if let Err(e) = c.remove_home(&wt) {
+                eprintln!("nants: pasta pessoal: {e}");
             }
         }
         let branch = task.frontmatter.branch.clone();
@@ -6295,6 +6559,7 @@ impl TaskRunner {
                 tested_signature: None,
                 tested_at: None,
                 test_evidence: None,
+                failure_signature: None,
                 test_run: None,
                 next_action: Some("aguardando developer".into()),
                 next_action_code: None,
@@ -6526,6 +6791,10 @@ impl TaskRunner {
             // registro mostra só o que entrou (spec 094 T07).
             let ext = apply_scope_added(&mut task.frontmatter.allowed_scope, text);
             recorded = record_scope_extension(text, &ext);
+        } else if let Some(signature) = task.frontmatter.failure_signature.as_deref() {
+            // Spec 141 T05 (C-05): a escalada guarda a assinatura da falha que a pessoa vai ver; a
+            // marca de retomada a copia ([`mark_human_resumed`]).
+            recorded = format!("{}\n{FAILURE_SIGNATURE_LINE}{signature}", recorded.trim_end());
         }
         task.body = replace_section(&task.body, &format!("{RECOVERY_PREFIX}{n}"), Some(recorded));
         if retry {
@@ -7222,7 +7491,8 @@ pub fn validate_scope(scope: &[String]) -> Result<(), String> {
             || first == "**"
             || first.eq_ignore_ascii_case(".sdd")
             || first.eq_ignore_ascii_case(".git")
-            || first.eq_ignore_ascii_case(crate::harness::home::HOME_DIR)
+            // A pasta pessoal antiga: fica recusada enquanto houver legado (spec 141 T01).
+            || first.eq_ignore_ascii_case(crate::harness::home::LEGACY_HOME_DIR)
         {
             return Err(format!("glob de escopo inválido: {glob}"));
         }
@@ -7465,18 +7735,154 @@ pub fn mark_revised(body: &str) -> String {
 
 /// Acrescenta ao fim do corpo o marcador de retomada pelo humano (idempotente se o corpo já termina
 /// nele): zera o orçamento de ciclos sem apagar o histórico.
+///
+/// Spec 141 T05 (C-05): a marca leva a assinatura da falha da última escalada (ou a da marca
+/// anterior ainda não conferida), na linha [`FAILURE_SIGNATURE_LINE`]: se a primeira falha depois da
+/// retomada tiver a mesma assinatura, a tarefa volta à pessoa sem reabrir os ciclos.
 pub fn mark_human_resumed(body: &str) -> String {
     let mark = format!("## {HUMAN_RESUME_MARK}");
     if body.lines().rev().find(|l| l.starts_with("## ")).is_some_and(|l| l.trim_end() == mark) {
         return body.to_string();
     }
+    let carried = signature_to_carry(body);
+    // Spec 141 T05: a escolha sem mudança de código vira linha da marca (a seção some).
+    let test_first = section_text(body, TEST_FIRST_SECTION).is_some();
+    let body = if test_first { replace_section(body, TEST_FIRST_SECTION, None) } else { body.to_string() };
     let mut out = body.trim_end().to_string();
     if !out.is_empty() {
         out.push_str("\n\n");
     }
     out.push_str(&mark);
     out.push_str("\n- Retomada manualmente pelo humano; ciclos de recuperação anteriores não contam mais.\n");
+    if let Some(signature) = carried {
+        out.push_str(&format!("{FAILURE_SIGNATURE_LINE}{signature}\n"));
+    }
+    if test_first {
+        out.push_str(TEST_FIRST_LINE);
+        out.push('\n');
+    }
     out
+}
+
+/// Spec 141 T05 (revisão 1, F-01): a marca de retomada de uma tarefa BLOQUEADA com o motivo `code`.
+/// Bloqueada por [`BLOCK_SAME_FAILURE`] sem escalada nova gravada (o servidor reiniciou antes), a
+/// marca nova é armada com `signature` (a `failure_signature` do frontmatter) e repete o pedido de
+/// testar antes do Desenvolvedor da marca anterior. Nos demais casos, [`mark_human_resumed`].
+pub fn mark_human_resumed_after(body: &str, code: Option<&str>, signature: Option<&str>) -> String {
+    let resumed = mark_human_resumed(body);
+    let Some(signature) = signature.filter(|_| code == Some(BLOCK_SAME_FAILURE)) else {
+        return resumed;
+    };
+    if armed_signature(&resumed).as_deref() == Some(signature) || signature_of_line(&format!("{FAILURE_SIGNATURE_LINE}{signature}")).is_none() {
+        return resumed;
+    }
+    // A última análise ou marca não leva a assinatura: marca nova, armada com a do bloqueio.
+    let test_first = last_recovery_or_resume(body)
+        .is_some_and(|(header, lines)| header == format!("## {HUMAN_RESUME_MARK}") && lines.iter().any(|l| l.trim_end() == TEST_FIRST_LINE));
+    let mut out = body.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!("## {HUMAN_RESUME_MARK}"));
+    out.push_str("\n- Retomada manualmente pelo humano; ciclos de recuperação anteriores não contam mais.\n");
+    out.push_str(&format!("{FAILURE_SIGNATURE_LINE}{signature}\n"));
+    if test_first {
+        out.push_str(TEST_FIRST_LINE);
+        out.push('\n');
+    }
+    out
+}
+
+/// Spec 141 T05: registra que a escolha da pessoa não pede mudança de código (o servidor já a
+/// executou): a retomada seguinte testa antes de chamar o Desenvolvedor ([`TEST_FIRST_LINE`]).
+pub fn mark_test_first(body: &str) -> String {
+    replace_section(body, TEST_FIRST_SECTION, Some(format!("{TEST_FIRST_LINE}\n")))
+}
+
+/// Spec 141 T05: a última retomada pede a bateria oficial antes do Desenvolvedor e a primeira rodada
+/// depois dela ainda não aconteceu ([`SIGNATURE_CHECKED_LINE`]).
+pub fn test_first_armed(body: &str) -> bool {
+    let Some((header, lines)) = last_recovery_or_resume(body) else { return false };
+    header == format!("## {HUMAN_RESUME_MARK}")
+        && lines.iter().any(|l| l.trim_end() == TEST_FIRST_LINE)
+        && !lines.iter().any(|l| l.trim_end() == SIGNATURE_CHECKED_LINE)
+}
+
+/// Spec 141 T05: a assinatura de uma linha [`FAILURE_SIGNATURE_LINE`], só no início da linha (o texto
+/// do modelo nas seções vem recuado) e só na forma gravada pelo runner (hexadecimal e hífen).
+fn signature_of_line(line: &str) -> Option<&str> {
+    let value = line.trim_end().strip_prefix(FAILURE_SIGNATURE_LINE)?.trim();
+    (!value.is_empty() && value.len() <= 64 && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(value)
+}
+
+/// A última seção do corpo que é uma análise de recuperação ou a marca de retomada pelo humano, com
+/// as próprias linhas (até o cabeçalho seguinte). A marca de definição revisada não interrompe: a
+/// assinatura atravessa a revisão (a falha que volta depois dela é a mesma falha).
+fn last_recovery_or_resume(body: &str) -> Option<(String, Vec<&str>)> {
+    let analysis = format!("## {RECOVERY_PREFIX}");
+    let resume = format!("## {HUMAN_RESUME_MARK}");
+    let mut found: Option<(String, Vec<&str>)> = None;
+    let mut inside = false;
+    for line in body.lines() {
+        if line.starts_with("## ") {
+            inside = line.starts_with(&analysis) || line.trim_end() == resume;
+            if inside {
+                found = Some((line.trim_end().to_string(), Vec::new()));
+            }
+            continue;
+        }
+        if let (true, Some((_, lines))) = (inside, found.as_mut()) {
+            lines.push(line);
+        }
+    }
+    found
+}
+
+/// A assinatura que a próxima marca de retomada leva: a da última escalada (a seção de análise mais
+/// recente) ou, se a última é uma marca ainda não conferida, a dela.
+fn signature_to_carry(body: &str) -> Option<String> {
+    let (header, lines) = last_recovery_or_resume(body)?;
+    if header == format!("## {HUMAN_RESUME_MARK}") {
+        return armed_signature(body);
+    }
+    lines.iter().rev().find_map(|l| signature_of_line(l)).map(str::to_string)
+}
+
+/// Spec 141 T05 (C-05): a assinatura armada pela retomada: a da marca de retomada pelo humano quando
+/// ela é a seção de recuperação mais recente e a primeira rodada de testes depois dela ainda não foi
+/// conferida ([`SIGNATURE_CHECKED_LINE`]). `None`: nada a conferir.
+pub fn armed_signature(body: &str) -> Option<String> {
+    let (header, lines) = last_recovery_or_resume(body)?;
+    if header != format!("## {HUMAN_RESUME_MARK}") || lines.iter().any(|l| l.trim_end() == SIGNATURE_CHECKED_LINE) {
+        return None;
+    }
+    lines.iter().rev().find_map(|l| signature_of_line(l)).map(str::to_string)
+}
+
+/// Spec 141 T05: marca a última retomada como conferida (a linha [`SIGNATURE_CHECKED_LINE`] no fim da
+/// própria seção): só a primeira rodada de testes depois da escolha volta direto à pessoa.
+/// Sem marca armada, o corpo fica como está.
+pub fn disarm_signature(body: &str) -> String {
+    if armed_signature(body).is_none() && !test_first_armed(body) {
+        return body.to_string();
+    }
+    let resume = format!("## {HUMAN_RESUME_MARK}");
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(start) = lines.iter().rposition(|l| l.trim_end() == resume) else {
+        return body.to_string();
+    };
+    let end = lines[start + 1..].iter().position(|l| l.starts_with("## ")).map_or(lines.len(), |i| start + 1 + i);
+    // A linha entra depois da última linha não vazia da seção da marca.
+    let at = (start + 1..end).rev().find(|i| !lines[*i].trim().is_empty()).map_or(start + 1, |i| i + 1);
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
+    out.extend_from_slice(&lines[..at]);
+    out.push(SIGNATURE_CHECKED_LINE);
+    out.extend_from_slice(&lines[at..]);
+    let mut text = out.join("\n");
+    if body.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 /// Texto (cabeçalhos incluídos) das seções de análise de recuperação, em ordem.
@@ -7511,8 +7917,19 @@ pub fn recovery_notes(body: &str) -> String {
 /// `None` se a última análise não tem opções ou se, depois dela, o humano retomou ou a definição foi
 /// revisada (opções vencidas).
 pub fn latest_options_block(body: &str) -> Option<(usize, String)> {
+    options_block(body, true)
+}
+
+/// Spec 141 T05: como [`latest_options_block`], sem vencer as opções pela retomada nem pela revisão:
+/// as opções que a pessoa viu na última escalada, para oferecê-las de novo quando a mesma falha
+/// volta depois da escolha dela (o servidor as valida outra vez).
+pub fn escalation_options_block(body: &str) -> Option<(usize, String)> {
+    options_block(body, false)
+}
+
+fn options_block(body: &str, expire: bool) -> Option<(usize, String)> {
     let header = format!("## {RECOVERY_PREFIX}");
-    let stale = [format!("## {REVISED_MARK}"), format!("## {HUMAN_RESUME_MARK}")];
+    let stale: Vec<String> = if expire { vec![format!("## {REVISED_MARK}"), format!("## {HUMAN_RESUME_MARK}")] } else { Vec::new() };
     let mut number: Option<usize> = None;
     let mut json: Option<String> = None;
     let mut state = 0u8; // 0 fora, 1 abriu, 2 leu o JSON
@@ -7852,6 +8269,7 @@ mod tests {
                 tested_signature: None,
                 tested_at: None,
                 test_evidence: None,
+                failure_signature: None,
                 test_run: None,
                 next_action: None,
                 next_action_code: None,
@@ -15744,6 +16162,58 @@ mod tests {
         (at, last)
     }
 
+    /// Spec 141 T04 (C-03, R2): o próprio servidor roda a etapa oficial e a restrita na worktree da
+    /// tarefa, com os eventos ao vivo da etapa própria, e o par sai do registro de rodadas. Na mesma
+    /// árvore, nada roda de novo (nem o par recusado, nem a oficial para outra restrição).
+    #[tokio::test]
+    async fn probe_restriction_runs_both_steps_once_per_tree_with_events() {
+        let fx = Fixture::new("probe-restriction", "sh run.sh");
+        let rec = Recorder::default();
+        let runner = TaskRunner::new(
+            fx.repo.clone(),
+            Box::new(FakeDev::default()),
+            Box::new(FakeReviewer::new(|_, _| approved(vec![]))),
+            Box::new(ShellTestExecutor::with_timeout(Duration::from_secs(20))),
+            Box::new(rec.clone()),
+        );
+        assert!(runner.probe_restriction(SPEC, "T01", "sh run.sh", "sh run.sh test/").await.is_none(), "sem worktree");
+        let wt = task_worktree_path(&fx.repo, SPEC, "T01");
+        fs::create_dir_all(wt.join("test")).unwrap();
+        git_in(&wt, &["init", "-b", "main"]);
+        fs::write(wt.join("test/a.test.js"), "x\n").unwrap();
+        // Cada rodada deixa uma linha num arquivo fora da worktree: conta as execuções.
+        let count = fx.repo.parent().unwrap_or(&fx.repo).join("rodadas.log");
+        let script = format!(
+            "echo \"$1\" >> '{}'\nif [ -z \"$1\" ]; then echo 'not ok 1 - e2e/game.spec.js'; exit 1; fi\nif [ \"$1\" = other/ ]; then echo 'not ok 1 - x'; exit 1; fi\necho '# tests 2'\necho '# pass 2'\n",
+            count.display()
+        );
+        fs::write(wt.join("run.sh"), script).unwrap();
+        fs::create_dir_all(wt.join("other")).unwrap();
+        let runs = || fs::read_to_string(&count).unwrap_or_default().lines().count();
+        let probe = runner.probe_restriction(SPEC, "T01", "sh run.sh", "sh run.sh test/").await.expect("evidência");
+        assert!(!probe.original.passed && probe.original.output.contains("not ok 1 - e2e/game.spec.js"), "{probe:?}");
+        assert!(probe.restricted.passed && probe.restricted.output.contains("# tests 2"), "{probe:?}");
+        assert_eq!(Some(probe.tree.clone()), test_levels::tree_hash(&wt));
+        assert_eq!(runs(), 2);
+        let stages: Vec<&'static str> = rec
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RunnerEvent::CommandRun { started: true, stage_code, .. } => Some(stage_code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, vec![STAGE_RESTRICTION_OFFICIAL, STAGE_RESTRICTION_NEW]);
+        // O par recusado volta como ficou e não roda de novo; a oficial é reaproveitada.
+        let refused = runner.probe_restriction(SPEC, "T01", "sh run.sh", "sh run.sh other/").await.expect("par");
+        assert!(!refused.restricted.passed);
+        assert_eq!(runs(), 3, "só a etapa nova rodou");
+        let again = runner.probe_restriction(SPEC, "T01", "sh run.sh", "sh run.sh other/").await.expect("par");
+        assert!(!again.restricted.passed);
+        assert_eq!(runs(), 3, "nada rodou de novo");
+        let _ = fs::remove_dir_all(fx.repo.parent().unwrap_or(&fx.repo));
+    }
+
     /// Spec 123 T01, critério 1 e 2 (medição): a rodada de testes do runner, com um comando de
     /// verdade que dura ~12 intervalos, emite o sinal de vida no ritmo até o fim, com os bytes da
     /// saída e a última linha. Antes da correção, só saíam o início e o fim (0 sinais no meio).
@@ -16055,6 +16525,375 @@ mod tests {
             assert!(texts.contains(&format!("test_command falhou (2/{MAX_TEST_CYCLES})\n{step}")), "{texts:?}");
             assert!(texts.iter().any(|t| t.starts_with("Sem progresso:") && t.contains(&format!("limite de {MAX_TEST_CYCLES} ciclos"))), "{texts:?}");
         }
+    }
+
+    /// Spec 141 T03 (C-04), o caso da T07 do Mini Street Fighter num projeto sintético, com o modelo
+    /// simulado contando as chamadas: o comando de testes falha citando a pasta pessoal antiga do
+    /// Nants. Depois da falha, nenhuma chamada a mais: nem outra sessão do Desenvolvedor, nem revisão.
+    /// A tarefa fica BLOQUEADA por ambiente com o código `nants_environment` (o servidor a leva à
+    /// pessoa sem a recuperação), a evidência guarda a falha e a conversa diz o que aconteceu.
+    #[tokio::test]
+    async fn nants_path_in_the_failure_goes_to_the_person_without_more_calls() {
+        // O caminho é montado na hora: o comando em si não cita a pasta do Nants.
+        let command = "sh -c 'p=nants; echo \"Could not find /work/.${p}-home/.config/pulse/x-runtime\"; exit 1'";
+        let fx = Fixture::new("defeito-do-nants", command);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap();
+        let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("bloqueada") };
+        assert_eq!(kind, BlockKind::Environmental);
+        assert_eq!(reason, "defeito do ambiente do Nants: os testes tropeçaram em /work/.nants-home, que é do Nants");
+        assert_eq!(dev.briefs().len(), 1, "só a sessão que implementou; nenhuma depois da falha");
+        assert!(rev.inputs().is_empty(), "sem revisão");
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.status, TaskStatus::Blocked);
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some(BLOCK_NANTS_ENVIRONMENT));
+        let evidence = t.frontmatter.test_evidence.unwrap_or_default();
+        assert!(evidence.starts_with(&failure_header(Some(1), false)) && evidence.contains("/work/.nants-home/.config/pulse"), "{evidence}");
+        assert!(evidence.contains(&nants_fault::path_mark("/work/.nants-home")), "o caminho detectado fica marcado: {evidence}");
+        let texts = tests_texts(&rec);
+        assert!(texts.iter().any(|t| t.starts_with("Os testes tropeçaram em /work/.nants-home")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("Sem progresso:")), "{texts:?}");
+    }
+
+    /// Spec 141 T03: falha comum de código não muda: segue para o Desenvolvedor até o limite.
+    #[tokio::test]
+    async fn ordinary_failure_still_goes_back_to_the_developer() {
+        let fx = Fixture::new("falha-comum", "sh -c 'echo \"AssertionError: 1 != 2 at /work/src/a.test.js\"; exit 1'");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let outcome = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap();
+        let Outcome::Blocked { kind, .. } = outcome else { panic!("bloqueada") };
+        assert_eq!(kind, BlockKind::Quality);
+        assert_eq!(fx.read_task("T01").frontmatter.next_action_code.as_deref(), Some("tests_failed"));
+        assert!(dev.briefs().len() >= 2, "voltou ao Desenvolvedor");
+    }
+
+    // ---- Spec 141 T05 (C-05): assinatura persistida e escolha humana sem laço ----
+
+    /// Retomada como a do servidor (`reset_plan` em `server::runs`) depois da escolha da pessoa: a
+    /// orientação dela, a marca de retomada e a tarefa reaberta.
+    fn human_choice(fx: &Fixture, guidance: &str) {
+        let mut t = fx.read_task("T01");
+        t.body = add_human_guidance(&t.body, guidance);
+        t.body = mark_human_resumed_after(&t.body, t.frontmatter.next_action_code.as_deref(), t.frontmatter.failure_signature.as_deref());
+        t.frontmatter.status = TaskStatus::Todo;
+        t.frontmatter.attempts = 0;
+        t.frontmatter.next_action = None;
+        t.frontmatter.next_action_code = None;
+        fx.put_task(&t);
+    }
+
+    /// Escalada como a do servidor (análise sem o modelo, que não conta como ciclo).
+    const ESCALATION: &str = "- Causa raiz: o test_command varre a pasta pessoal\n- Decisão: escalar ao humano";
+
+    #[test]
+    fn signature_goes_from_the_escalation_to_the_resume_mark_and_is_checked_once() {
+        let escalated = format!("## Objetivo\nx\n\n## {RECOVERY_PREFIX}1\n{ESCALATION}\n{FAILURE_SIGNATURE_LINE}abc-123\n");
+        assert_eq!(armed_signature(&escalated), None, "sem retomada, nada armado");
+        let resumed = mark_human_resumed(&escalated);
+        assert!(resumed.ends_with(&format!("{FAILURE_SIGNATURE_LINE}abc-123\n")), "{resumed}");
+        assert_eq!(armed_signature(&resumed).as_deref(), Some("abc-123"));
+        assert_eq!(mark_human_resumed(&resumed), resumed, "idempotente");
+        assert_eq!(recovery_cycles(&resumed), 0, "a retomada zera os ciclos, como antes");
+        // Uma seção depois da marca (a orientação, por exemplo) não desarma.
+        let with_section = format!("{resumed}\n## {GUIDANCE_SECTION}\n- nova worktree\n");
+        assert_eq!(armed_signature(&with_section).as_deref(), Some("abc-123"));
+        let checked = disarm_signature(&with_section);
+        assert_eq!(armed_signature(&checked), None);
+        assert!(checked.contains(&format!("{FAILURE_SIGNATURE_LINE}abc-123\n{SIGNATURE_CHECKED_LINE}\n\n## {GUIDANCE_SECTION}")), "{checked}");
+        assert_eq!(disarm_signature(&checked), checked, "conferida uma vez só");
+        // A retomada seguinte, sem escalada nova, não arma a assinatura já conferida.
+        let again = mark_human_resumed(&format!("{checked}\n## Outra\n- y\n"));
+        assert_eq!(armed_signature(&again), None, "{again}");
+        // A marca não conferida passa para a retomada seguinte; a revisão da definição não corta.
+        let revised = mark_human_resumed(&mark_revised(&format!("{with_section}\n## Outra\n- y\n")));
+        assert_eq!(armed_signature(&revised).as_deref(), Some("abc-123"), "{revised}");
+        // Escalada sem a linha (bloqueio que não foi falha de testes): nada armado.
+        let plain = mark_human_resumed(&format!("## {RECOVERY_PREFIX}1\n{ESCALATION}\n"));
+        assert_eq!(armed_signature(&plain), None);
+        // Texto do modelo vem recuado: não forja a assinatura.
+        let forged = mark_human_resumed(&format!("## {RECOVERY_PREFIX}1\n{ESCALATION}\n  {FAILURE_SIGNATURE_LINE}abc-123\n"));
+        assert_eq!(armed_signature(&forged), None);
+        // Análise depois da marca (a recuperação já rodou de novo): desarmada.
+        let later = format!("{resumed}\n## {RECOVERY_PREFIX}2\n- Causa raiz: y\n");
+        assert_eq!(armed_signature(&later), None);
+        // As opções da escalada continuam legíveis depois da retomada (para oferecê-las de novo).
+        let options = format!("## {RECOVERY_PREFIX}1\n{ESCALATION}\n{OPTIONS_OPEN}\n[{{\"id\":\"a\"}}]\n{OPTIONS_CLOSE}\n");
+        let resumed = mark_human_resumed(&options);
+        assert_eq!(latest_options_block(&resumed), None, "vencidas para a escolha");
+        assert_eq!(escalation_options_block(&resumed), Some((1, "[{\"id\":\"a\"}]".to_string())));
+    }
+
+    /// Critério 3: mudar o `test_command`, o `full_test_command`, as checagens bloqueantes ou o hash
+    /// do ambiente dá outra assinatura (falha nova); a mesma falha sobre o mesmo que foi rodado dá a
+    /// mesma.
+    #[test]
+    fn persisted_signature_changes_with_the_commands_checks_and_environment() {
+        let fx = Fixture::new("assinatura-gravada", "node --test");
+        let settings = crate::sdd::read_settings(&fx.settings_path()).unwrap();
+        let test = TestResult { passed: false, output: "Error: ENOENT\n".into(), exit_code: Some(1), timed_out: false, failed_step: None };
+        let failure = FailureSignature::of(&test, &test.output);
+        let base = persisted_signature(&failure, &settings);
+        assert_eq!(persisted_signature(&FailureSignature::of(&test, &test.output), &settings), base);
+        let variants: Vec<Settings> = vec![
+            Settings { test_command: "node --test test/".into(), ..settings.clone() },
+            Settings { full_test_command: Some("node --test test/ && npx playwright test".into()), ..settings.clone() },
+            Settings { checks: vec![crate::sdd::Check { name: "lint".into(), command: "npm run lint".into(), blocking: true }], ..settings.clone() },
+            Settings { environment_hash: Some("outro".into()), ..settings.clone() },
+        ];
+        for changed in &variants {
+            assert_ne!(persisted_signature(&failure, changed), base, "{changed:?}");
+        }
+        let other = TestResult { output: "AssertionError: 1 != 2\n".into(), ..test.clone() };
+        assert_ne!(persisted_signature(&FailureSignature::of(&other, &other.output), &settings), base, "outra falha");
+    }
+
+    /// Critério 1: a escalada grava a assinatura da falha que bloqueou a tarefa; o RETRY não.
+    #[tokio::test]
+    async fn escalation_section_records_the_failure_signature() {
+        let fx = Fixture::new("assinatura-escalada", "sh -c 'echo \"Error: ENOENT, stat pulse/native\"; exit 1'");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+        assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+        let signature = fx.read_task("T01").frontmatter.failure_signature.expect("assinatura no bloqueio");
+        runner.record_recovery(SPEC, "T01", false, ESCALATION).unwrap();
+        let body = fx.read_task("T01").body;
+        assert!(body.contains(&format!("{ESCALATION}\n{FAILURE_SIGNATURE_LINE}{signature}")), "{body}");
+        let resumed = mark_human_resumed(&body);
+        assert_eq!(armed_signature(&resumed), Some(signature.clone()), "a marca de retomada leva a assinatura");
+        // Persistida no disco: outra instância do runner (reinício do servidor) lê a mesma.
+        human_choice(&fx, "nova worktree");
+        assert_eq!(armed_signature(&fx.read_task("T01").body), Some(signature));
+    }
+
+    /// Critérios 2 e 4, o laço da T07 do Mini Street Fighter num projeto sintético, com o modelo
+    /// simulado contando as chamadas: os testes falham sempre do mesmo jeito (o comando varre uma
+    /// pasta que o Desenvolvedor não controla). Escalada, a pessoa escolhe ("nova worktree" e depois
+    /// uma orientação), e a mesma falha volta: a tarefa para na primeira repetição, sem reabrir os
+    /// ciclos (nenhuma rodada contada, nenhuma sessão a mais do Desenvolvedor depois da falha, nenhuma
+    /// revisão), com o código `same_failure` que o servidor leva à pessoa sem o modelo.
+    #[tokio::test]
+    async fn same_failure_after_the_human_choice_stops_at_the_first_repetition() {
+        let fx = Fixture::new("laco-t07", "sh -c 'echo \"Error: ENOENT: no such file or directory, stat pulse/native\"; exit 1'");
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+        assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { kind: BlockKind::Quality, .. }));
+        let first = dev.briefs().len();
+        assert_eq!(fx.read_task("T01").frontmatter.next_action_code.as_deref(), Some("tests_failed"));
+        runner.record_recovery(SPEC, "T01", false, ESCALATION).unwrap();
+        for (round, guidance) in ["nova worktree", "tente outra abordagem nos testes"].iter().enumerate() {
+            human_choice(&fx, guidance);
+            let before_texts = tests_texts(&rec).len();
+            let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+            let Outcome::Blocked { kind, reason, .. } = outcome else { panic!("bloqueada") };
+            assert_eq!(kind, BlockKind::Quality);
+            assert!(reason.starts_with("a mesma falha voltou depois da sua escolha"), "{reason}");
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.status, TaskStatus::Blocked);
+            assert_eq!(t.frontmatter.next_action_code.as_deref(), Some(BLOCK_SAME_FAILURE));
+            assert_eq!(dev.briefs().len(), first + round + 1, "só a sessão da escolha; nenhuma depois da falha");
+            assert!(rev.inputs().is_empty(), "sem revisão");
+            assert_eq!(recovery_cycles(&t.body), 0, "os ciclos não reabrem");
+            assert_eq!(armed_signature(&t.body), t.frontmatter.failure_signature, "a mesma falha deixa a marca armada: {}", t.body);
+            let texts = tests_texts(&rec)[before_texts..].to_vec();
+            assert!(texts.iter().any(|t| t.starts_with("A mesma falha voltou depois da sua escolha")), "{texts:?}");
+            assert!(!texts.iter().any(|t| t.starts_with("test_command falhou (")), "nenhum ciclo contado: {texts:?}");
+            // O servidor grava a escalada sem o modelo (com a assinatura), e a pessoa escolhe de novo.
+            runner.record_recovery(SPEC, "T01", false, &format!("- Causa raiz: x\n- Decisão: escalar ao humano\n{NOT_COUNTED_LINE}")).unwrap();
+        }
+    }
+
+    /// Critério 3: depois da escolha, uma falha nova segue o caminho de sempre (volta ao
+    /// Desenvolvedor e conta os ciclos): outra saída, ou o mesmo erro com outro comando de testes ou
+    /// outras checagens bloqueantes.
+    #[tokio::test]
+    async fn a_new_failure_after_the_human_choice_reopens_the_cycles() {
+        let failing = "sh -c 'echo \"Error: ENOENT: no such file or directory, stat pulse/native\"; exit 1'";
+        for change in ["command", "checks", "output"] {
+            let fx = Fixture::new(&format!("falha-nova-{change}"), failing);
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+            assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+            runner.record_recovery(SPEC, "T01", false, ESCALATION).unwrap();
+            human_choice(&fx, "nova worktree");
+            let mut settings = crate::sdd::read_settings(&fx.settings_path()).unwrap();
+            match change {
+                "command" => settings.test_command = format!("{failing} # outro"),
+                "checks" => settings.checks = vec![crate::sdd::Check { name: "lint".into(), command: "true".into(), blocking: true }],
+                _ => settings.test_command = "sh -c 'echo \"AssertionError: 1 != 2\"; exit 1'".into(),
+            }
+            crate::sdd::write_settings(&fx.settings_path(), &settings).unwrap();
+            fx.commit_all("chore: settings");
+            let before = dev.briefs().len();
+            let outcome = runner.run_task(SPEC, "T01").await.unwrap();
+            assert!(matches!(outcome, Outcome::Blocked { kind: BlockKind::Quality, .. }), "{change}");
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("tests_failed"), "{change}");
+            assert!(dev.briefs().len() >= before + 2, "{change}: voltou ao Desenvolvedor");
+            assert!(t.body.contains(SIGNATURE_CHECKED_LINE), "{change}: a assinatura foi conferida uma vez");
+        }
+    }
+
+    /// Spec 141 T03 com a T05: a falha do ambiente do Nants que volta depois de `reset_workspace` é a
+    /// mesma falha (vai à pessoa com o código `same_failure`, sem modelo), e não reabre a detecção em
+    /// laço: uma sessão do Desenvolvedor por escolha.
+    #[tokio::test]
+    async fn nants_fault_that_comes_back_after_the_choice_is_the_same_failure() {
+        let command = "sh -c 'p=nants; echo \"Could not find /work/.${p}-home/.config/pulse/x-runtime\"; exit 1'";
+        let fx = Fixture::new("nants-volta", command);
+        fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+        assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { kind: BlockKind::Environmental, .. }));
+        assert_eq!(fx.read_task("T01").frontmatter.next_action_code.as_deref(), Some(BLOCK_NANTS_ENVIRONMENT));
+        assert!(fx.read_task("T01").frontmatter.failure_signature.is_some());
+        runner.record_recovery(SPEC, "T01", false, &format!("{ESCALATION}\n{NOT_COUNTED_LINE}")).unwrap();
+        human_choice(&fx, "limpei a área de trabalho");
+        assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+        let t = fx.read_task("T01");
+        assert_eq!(t.frontmatter.next_action_code.as_deref(), Some(BLOCK_SAME_FAILURE));
+        assert_eq!(dev.briefs().len(), 2);
+        assert_eq!(recovery_cycles(&t.body), 0);
+    }
+
+    /// Escolha executada pelo servidor que não pede mudança de código (`reset_workspace` ou a troca do
+    /// comando), como `apply_choice` e `reset_plan` a deixam.
+    fn server_choice(fx: &Fixture) {
+        let mut t = fx.read_task("T01");
+        t.body = add_human_guidance(&t.body, "Escolhi limpar a área de trabalho");
+        t.body = mark_test_first(&t.body);
+        fx.put_task(&t);
+        human_choice(fx, "e testar de novo");
+    }
+
+    /// Spec 141 T05 (ajuste do G3): depois de `reset_workspace`, a bateria oficial roda primeiro, na
+    /// mesma worktree, sem sessão do Desenvolvedor. Verde: segue para a revisão. A mesma falha: volta à
+    /// pessoa com zero chamadas. Falha nova: o Desenvolvedor entra uma vez, com ela como contexto.
+    /// O resultado depende de arquivos fora do repositório (o "ambiente"), que o teste cria.
+    #[tokio::test]
+    async fn a_choice_without_code_change_runs_the_suite_before_the_developer() {
+        // A worktree fica em `<base>/repo/.sdd/worktrees/s1/T01`: `../../../../..` é `<base>`.
+        let command = "sh -c 'if [ -f ../../../../../env-ok ]; then echo ok; elif [ -f ../../../../../env-new ]; then echo \"AssertionError: 1 != 2\"; exit 1; else echo \"Error: ENOENT: no such file or directory, stat pulse/native\"; exit 1; fi'";
+        for outcome in ["green", "same", "new"] {
+            let fx = Fixture::new(&format!("testa-primeiro-{outcome}"), command);
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+            assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+            runner.record_recovery(SPEC, "T01", false, ESCALATION).unwrap();
+            server_choice(&fx);
+            assert!(test_first_armed(&fx.read_task("T01").body), "{}", fx.read_task("T01").body);
+            let base = fx.repo.parent().unwrap().to_path_buf();
+            match outcome {
+                "green" => fs::write(base.join("env-ok"), "").unwrap(),
+                "new" => fs::write(base.join("env-new"), "").unwrap(),
+                _ => {}
+            }
+            // Revisão 1, F-02: uma sobra sem commit na worktree entra no HEAD testado.
+            fs::write(fx.worktree("T01").join("sobra.txt"), "relatorio\n").unwrap();
+            let before = dev.briefs().len();
+            let result = runner.run_task(SPEC, "T01").await.unwrap();
+            let texts = tests_texts(&rec);
+            assert!(texts.iter().any(|t| t.starts_with("A sua escolha não pede mudança no código")), "{texts:?}");
+            let t = fx.read_task("T01");
+            match outcome {
+                "green" => {
+                    assert_eq!(result, Outcome::Done);
+                    assert_eq!(dev.briefs().len(), before, "nenhuma sessão do Desenvolvedor");
+                    assert_eq!(rev.inputs().len(), 1, "foi à revisão");
+                    assert_eq!(git_in(&fx.repo, &["show", "main:sobra.txt"]).trim(), "relatorio", "a árvore testada é a integrada");
+                }
+                "same" => {
+                    assert!(matches!(result, Outcome::Blocked { .. }));
+                    assert_eq!(t.frontmatter.next_action_code.as_deref(), Some(BLOCK_SAME_FAILURE));
+                    assert_eq!(dev.briefs().len(), before, "zero chamadas ao modelo");
+                    assert!(rev.inputs().is_empty());
+                }
+                _ => {
+                    assert!(matches!(result, Outcome::Blocked { .. }));
+                    assert_eq!(t.frontmatter.next_action_code.as_deref(), Some("tests_failed"));
+                    assert_eq!(dev.briefs().len(), before + 1, "o Desenvolvedor entra uma vez");
+                    let context = dev.briefs()[before].test_output.clone().unwrap_or_default();
+                    assert!(context.contains("AssertionError: 1 != 2"), "a falha nova é o contexto: {context}");
+                }
+            }
+            // A mesma falha deixa a marca armada até a escalada nova (revisão 1, F-01); as outras a conferem.
+            assert_eq!(test_first_armed(&t.body), outcome == "same", "{}", t.body);
+        }
+    }
+
+    /// Revisão 1, F-01: o servidor reinicia depois do bloqueio `same_failure` e antes de gravar a
+    /// escalada nova; a pessoa clica em "Retomar". A mesma falha volta como `same_failure`, sem sessão
+    /// do Desenvolvedor e sem ciclos. Vale também com a marca já conferida (estado gravado antes da
+    /// correção): a retomada arma a marca nova com a `failure_signature` do frontmatter.
+    #[tokio::test]
+    async fn restart_before_the_same_failure_escalation_keeps_the_signature() {
+        let command = "sh -c 'echo \"Error: ENOENT: no such file or directory, stat pulse/native\"; exit 1'";
+        for checked in [false, true] {
+            let fx = Fixture::new(&format!("reinicio-mesma-falha-{checked}"), command);
+            fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+            let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+            let runner = fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec);
+            assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+            runner.record_recovery(SPEC, "T01", false, ESCALATION).unwrap();
+            server_choice(&fx);
+            assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+            assert_eq!(fx.read_task("T01").frontmatter.next_action_code.as_deref(), Some(BLOCK_SAME_FAILURE));
+            if checked {
+                let mut t = fx.read_task("T01");
+                t.body = disarm_signature(&t.body);
+                assert_eq!(armed_signature(&t.body), None);
+                fx.put_task(&t);
+            }
+            // Sem escalada nova (reinício): só "Retomar".
+            let before = dev.briefs().len();
+            let mut t = fx.read_task("T01");
+            t.body = mark_human_resumed_after(&t.body, t.frontmatter.next_action_code.as_deref(), t.frontmatter.failure_signature.as_deref());
+            t.frontmatter.status = TaskStatus::Todo;
+            t.frontmatter.next_action = None;
+            t.frontmatter.next_action_code = None;
+            fx.put_task(&t);
+            assert!(matches!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Blocked { .. }));
+            let t = fx.read_task("T01");
+            assert_eq!(t.frontmatter.next_action_code.as_deref(), Some(BLOCK_SAME_FAILURE), "{checked}");
+            assert_eq!(dev.briefs().len(), before, "{checked}: sem sessão do Desenvolvedor");
+            assert!(rev.inputs().is_empty());
+            assert_eq!(recovery_cycles(&t.body), 0);
+        }
+    }
+
+    /// A orientação livre continua como antes: a sessão do Desenvolvedor vem primeiro.
+    #[test]
+    fn test_first_is_only_for_choices_without_code_change() {
+        let escalated = format!("## {RECOVERY_PREFIX}1\n{ESCALATION}\n{FAILURE_SIGNATURE_LINE}abc-123\n");
+        assert!(!test_first_armed(&mark_human_resumed(&add_human_guidance(&escalated, "tente outra coisa"))));
+        let resumed = mark_human_resumed(&mark_test_first(&escalated));
+        assert!(test_first_armed(&resumed), "{resumed}");
+        assert!(!resumed.contains(&format!("## {TEST_FIRST_SECTION}")), "a seção vira linha da marca: {resumed}");
+        assert!(!test_first_armed(&disarm_signature(&resumed)));
+        // Sem assinatura (escalada que não veio de falha de testes), a marca ainda testa primeiro e é conferida.
+        let plain = mark_human_resumed(&mark_test_first(&format!("## {RECOVERY_PREFIX}1\n{ESCALATION}\n")));
+        assert!(test_first_armed(&plain));
+        assert!(!test_first_armed(&disarm_signature(&plain)));
+    }
+
+    /// A primeira rodada verde depois da retomada confere a assinatura: uma falha igual mais tarde
+    /// (outra tentativa) segue o caminho de sempre.
+    #[tokio::test]
+    async fn a_green_round_after_the_choice_checks_the_signature() {
+        let fx = Fixture::new("verde-confere", "true");
+        let mut t = task("T01", TaskStatus::Todo, &[]);
+        t.body = mark_human_resumed(&format!("{}\n## {RECOVERY_PREFIX}1\n{ESCALATION}\n{FAILURE_SIGNATURE_LINE}abc-123\n", t.body));
+        fx.add_task(&t);
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        assert_eq!(fx.runner(&dev, &rev, ShellTestExecutor::new(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let t = fx.read_task("T01");
+        assert!(t.body.contains(SIGNATURE_CHECKED_LINE), "{}", t.body);
+        assert_eq!(armed_signature(&t.body), None);
     }
 
     /// Spec 139 T01: a falha que muda a cada ciclo (outra saída, de verdade) segue até o limite de
@@ -16396,7 +17235,7 @@ mod tests {
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
         let _ = runner.run_task(SPEC, "T01").await.unwrap();
         let brief = &dev.briefs()[0].install_footprint;
-        assert!(brief.contains("só o que fica em /work persiste") && brief.contains("/tmp/.local/lib ("), "{brief}");
+        assert!(brief.contains("só persiste o que fica em /work e na pasta pessoal $HOME=/nants/home") && brief.contains("/tmp/.local/lib ("), "{brief}");
     }
 
     /// Spec 131 T05: a instalação que sai com código 1 (no Test 9, a base ainda sem a trava) é
@@ -17034,7 +17873,7 @@ mod tests {
         let rev = FakeReviewer::new(|n, _| if n == 0 { rejected(vec![finding("F-01")]) } else { approved(vec![]) });
         let (dev, rec) = (FakeDev::default(), Recorder::default());
         assert_eq!(fx.runner(&dev, &rev, ReadonlyFormatter, &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
-        let diagnosis = "o formatador prettier tentou alterar `.nants/`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`, `.nants-home/`)";
+        let diagnosis = "o formatador prettier tentou alterar `.nants/`, que é só leitura; configure-o para ignorar as pastas do Nants (`.nants/`, `.nants-outputs/`, `.sdd/`)";
         let texts = tests_texts(&rec);
         let failed: Vec<&String> = texts.iter().filter(|t| t.starts_with("formatação automática (prettier) falhou (não bloqueia): ")).collect();
         assert_eq!(failed.len(), 1, "{texts:?}");
@@ -17123,33 +17962,51 @@ mod tests {
         }
     }
 
-    /// Executor que anota, a cada comando, o que existe na pasta pessoal da pasta em que roda.
-    #[derive(Clone, Default)]
+    /// Compose falso que anota, a cada `run` do workspace, o comando, a pasta de trabalho e o que
+    /// existe na pasta pessoal montada (a origem do bind de `HOME` no override).
+    #[derive(Default)]
     struct HomeProbe {
-        seen: Arc<Mutex<Vec<(String, bool, bool)>>>,
+        seen: Mutex<Vec<(String, PathBuf, bool, bool)>>,
     }
 
-    impl TestExecutor for HomeProbe {
-        fn run<'a>(&'a self, dir: &'a Path, command: &'a str) -> Fut<'a, Result<TestResult, RunnerError>> {
-            Box::pin(async move {
-                let home = dir.join(crate::harness::home::HOME_DIR);
-                let installed = home.join(".local/bin/tool").exists();
-                let cached = home.join(".cache/pkg").exists();
-                self.seen.lock().unwrap().push((command.to_string(), installed, cached));
-                Ok(TestResult { passed: true, output: "ok".into(), exit_code: Some(0), timed_out: false, failed_step: None })
-            })
+    impl crate::harness::compose::ComposeRunner for HomeProbe {
+        fn run(&self, call: &crate::harness::compose::ComposeCall) -> Result<crate::harness::compose::ComposeOutput, String> {
+            let ok = crate::harness::compose::ComposeOutput { code: Some(0), output: "ok".into(), timed_out: false };
+            if crate::harness::compose::fake::sub_of(&call.args) != "run" {
+                return Ok(ok);
+            }
+            let ov: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&call.args[6]).expect("override")).expect("yaml");
+            let ws = &ov["services"]["workspace"];
+            let target = ws["environment"]["HOME"].as_str().expect("HOME").to_string();
+            let source = ws["volumes"]
+                .as_sequence()
+                .expect("volumes")
+                .iter()
+                .find(|v| v["target"].as_str() == Some(target.as_str()))
+                .and_then(|v| v["source"].as_str())
+                .expect("bind do HOME")
+                .to_string();
+            let home = PathBuf::from(source);
+            let command = call.args.last().cloned().unwrap_or_default();
+            self.seen.lock().unwrap().push((command, call.cwd.clone(), home.join(".local/bin/tool").exists(), home.join(".cache/pkg").exists()));
+            Ok(ok)
         }
     }
 
     /// Spec 129 T01: a rodada limpa final começa sem a pasta pessoal (o que o Desenvolvedor instalou
-    /// nela some), menos o cache de download; vale também sem `install_command`.
+    /// nela some), menos o cache de download; vale também sem `install_command`. Spec 141 T01: a
+    /// pasta fica fora da área de trabalho (no diretório de dados do Nants) e sai com a worktree.
     #[tokio::test]
     async fn clean_round_starts_without_the_personal_folder_but_keeps_the_cache() {
         let fx = Fixture::new("home-clean", "make test");
+        enable_docker(&fx);
         fx.add_task(&task("T01", TaskStatus::Todo, &[]));
+        let probe = Arc::new(HomeProbe::default());
+        let env = Arc::new(crate::harness::compose::fake::test_env("rhome", probe.clone()));
+        let in_dev = env.clone();
         let dev = FakeDev {
-            summary: Some(Arc::new(|n, brief: &DevBrief| {
-                let home = crate::harness::home::ensure(&brief.worktree).unwrap();
+            summary: Some(Arc::new(move |n, brief: &DevBrief| {
+                let home = in_dev.ready_home(&brief.worktree).unwrap();
                 fs::create_dir_all(home.join(".local/bin")).unwrap();
                 fs::write(home.join(".local/bin/tool"), "#!/bin/sh\n").unwrap();
                 fs::create_dir_all(home.join(".cache")).unwrap();
@@ -17158,16 +18015,50 @@ mod tests {
             })),
             ..FakeDev::default()
         };
-        let probe = HomeProbe::default();
         let (rev, rec) = (FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
-        assert_eq!(fx.runner(&dev, &rev, probe.clone(), &rec).run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
+        let wt_home = env.host_home(&fx.worktree("T01")).expect("home");
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_compose(env.clone());
+        assert_eq!(runner.run_task(SPEC, "T01").await.unwrap(), Outcome::Done);
         let seen = probe.seen.lock().unwrap().clone();
-        let first = seen.first().expect("rodada");
-        assert_eq!(first, &("make test".to_string(), false, true), "{seen:?}");
-        // A pasta é da área de trabalho: nunca vai para a base pelo commit da tarefa, e a remoção da
-        // worktree a leva junto.
-        assert!(!fx.repo.join(crate::harness::home::HOME_DIR).exists());
-        assert!(!fx.worktree("T01").join(crate::harness::home::HOME_DIR).exists());
+        let first = seen.iter().find(|(c, ..)| c == "make test").expect("rodada");
+        assert!(first.1.ends_with("T01") && !first.2 && first.3, "{seen:?}");
+        // A pasta nunca fica na área de trabalho, então nunca vai para a base pelo commit da tarefa;
+        // a remoção da worktree a leva junto. A da raiz fica (a raiz continua).
+        assert!(!fx.repo.join(crate::harness::home::LEGACY_HOME_DIR).exists());
+        assert!(!fx.worktree("T01").exists());
+        assert!(!wt_home.exists(), "a pasta pessoal saiu com a worktree");
+    }
+
+    /// Spec 141 T01: a worktree antiga, com a pasta pessoal dentro da árvore e a instalação
+    /// lembrada, é migrada antes da conta da instalação: a pasta antiga sai e a instalação roda de
+    /// novo já na primeira rodada, no `HOME` novo.
+    #[tokio::test]
+    async fn legacy_personal_folder_is_migrated_before_the_install_check() {
+        let fx = Fixture::new("home-legacy", "make test");
+        enable_docker(&fx);
+        let mut settings = read_settings(&fx.settings_path()).unwrap();
+        settings.install_command = Some("make deps".into());
+        settings.lockfiles = vec!["deps.lock".into()];
+        crate::sdd::write_settings(&fx.settings_path(), &settings).unwrap();
+        fs::write(fx.repo.join("deps.lock"), "a=1\n").unwrap();
+        fx.commit_all("chore: instalação");
+        let settings = read_settings(&fx.settings_path()).unwrap();
+        let legacy = fx.repo.join(crate::harness::home::LEGACY_HOME_DIR);
+        fs::create_dir_all(legacy.join(".cache")).unwrap();
+        fs::write(legacy.join(".cache/pkg"), "bytes").unwrap();
+        fs::create_dir_all(legacy.join(".local/bin")).unwrap();
+        test_levels::remember_install(&fx.repo, &test_levels::install_key(&settings, "make deps", &fx.repo), "2026-10-26T10:00:00Z");
+        assert!(!test_levels::install_needed(&settings, "make deps", &fx.repo));
+        let probe = Arc::new(HomeProbe::default());
+        let env = Arc::new(crate::harness::compose::fake::test_env("rlegacy", probe.clone()));
+        let (dev, rev, rec) = (FakeDev::default(), FakeReviewer::new(|_, _| approved(vec![])), Recorder::default());
+        let runner = fx.runner(&dev, &rev, ScriptedTests::default(), &rec).with_compose(env.clone());
+        let installed = runner.ensure_installed(&settings, &fx.repo, "base", "T01", 1, false).await.unwrap();
+        assert!(matches!(installed, Install::Ran { clean: false }), "a instalação roda de novo no HOME novo");
+        assert!(!legacy.exists());
+        let seen = probe.seen.lock().unwrap().clone();
+        let install = seen.iter().find(|(c, ..)| c == "make deps").expect("instalação");
+        assert!(install.3, "o cache de download veio para a pasta nova: {seen:?}");
     }
 }
 

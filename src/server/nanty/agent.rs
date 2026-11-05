@@ -41,7 +41,7 @@ use tokio::time::Instant;
 
 use super::can_do::CanDo;
 use super::link::Open;
-use super::provenance::{self, Taint, TaintKind};
+use super::provenance::{self, Taint, TaintKind, TaintSource};
 use super::store::{Channel, ConversationMessage, Relayed};
 use super::turn::{self, TurnKind};
 use super::voice::{tone, Tone};
@@ -142,6 +142,9 @@ pub struct Session {
     pub think: super::think::Think,
     /// O cartão de levar ao Arquiteto já saiu nesta mensagem (spec 140 T15): um por mensagem.
     pub drafted: bool,
+    /// As fontes lidas pelo próprio turno (spec 141 T07, C-11), fora as herdadas da janela: só a leitura
+    /// de outro projeto aqui recusa o rascunho ao Arquiteto ([`super::draft`]).
+    pub fresh: Vec<TaintSource>,
 }
 
 impl Session {
@@ -167,6 +170,7 @@ impl Session {
             seen: Vec::new(),
             think: super::think::Think::default(),
             drafted: false,
+            fresh: Vec::new(),
         }
     }
 
@@ -194,6 +198,16 @@ impl Session {
     /// O turno de análise: só as ferramentas de [`tools::Mode::Analysis`], com a procedência de nascença.
     pub fn analysis(channel: Channel, tainted: Taint, lang: Lang) -> Self {
         Self { mode: tools::Mode::Analysis, ..Self::new(channel, tainted, lang) }
+    }
+
+    /// Uma leitura de dado não confiável feita pelo próprio turno ([`Taint::read`]), guardada também à
+    /// parte da herança (spec 141 T07, C-11).
+    pub fn read_taint(&mut self, kind: TaintKind, project_id: Option<&str>) {
+        self.tainted.read(kind, project_id);
+        let source = TaintSource { kind, project_id: project_id.map(str::to_string) };
+        if !self.fresh.contains(&source) {
+            self.fresh.push(source);
+        }
     }
 
     /// O turno tem dado não confiável: nada se grava nem se silencia sozinho.
@@ -259,10 +273,8 @@ pub async fn input(state: &AppState, nanty: &Nanty, cfg: &Config, lang: Lang, pe
         .iter()
         .take(MAX_LISTED)
         .map(|(p, phase)| {
-            let phase = match phase {
-                Some(phase) => crate::i18n::tr(lang, &tools::phase_code(*phase), &[]),
-                None => crate::i18n::tr(lang, "nanty.status.unread", &[]),
-            };
+            // Spec 141 T09 (C-10): o código da fase, e não a frase; as frases ficam para a reserva.
+            let phase = phase.map_or("unread", |phase| phase.as_str());
             format!("{} | {} | {}", p.id, tools::project_name(&secrets, p), phase)
         })
         .collect();
@@ -299,8 +311,7 @@ pub async fn input(state: &AppState, nanty: &Nanty, cfg: &Config, lang: Lang, pe
         "message": text,
     });
     let relayed = relay_fields(&mut body, "message", person.relayed.as_ref(), text, super::chat::MAX_QUOTE_CHARS);
-    let last = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
-    let history::Context { mut messages, mut taint } = history::context(nanty, cfg, lang, person, last);
+    let history::Context { mut messages, mut taint } = history::context(nanty, cfg, lang, person, body);
     if relayed {
         taint.add(TaintKind::Relayed, None);
         taint.origin.get_or_insert_with(|| person.id.clone());

@@ -48,11 +48,13 @@
 //!   neutralizaria o link, e só o servidor o escreve.
 //! - **Resposta longa (spec 140 T14, C-27):** a conversa grava o texto inteiro, e a fila o divide em
 //!   até três mensagens ([`format::split`]), que saem uma por chamada, na ordem, antes de qualquer
-//!   outro envio e nunca no resumo da fila. Acima de três, a última termina com a linha que aponta a
-//!   janela. O teclado (o link do Nants e os botões de apagar) vai na última parte, que é a anotada
-//!   para a edição de depois, e a frase do servidor fecha essa parte. Com a voz ligada, a nota sai
-//!   primeiro: o áudio fala o começo do primeiro parágrafo ([`voice::long_lead`]), a legenda leva o
-//!   mesmo trecho e avisa que o resto vem a seguir, e as partes trazem só o resto, sem repetir o trecho.
+//!   outro envio e nunca no resumo da fila. Acima de três, a última termina com a marca do corte
+//!   (spec 141 T10, C-10: sem frase fixa). O teclado (o link do Nants e os botões de apagar) vai na
+//!   última parte, que é a anotada para a edição de depois.
+//! - **Voz tudo ou nada (spec 141 T08, C-08):** a nota de uma mensagem fala o texto inteiro
+//!   ([`voice::speak`]). A transcrição vai completa: na legenda, com o teclado, quando o texto cabe
+//!   nela; senão a nota sai sem legenda e sem teclado, e o texto inteiro segue em mensagens que
+//!   respondem a ela (`reply_parameters`), em partes, com o teclado na última.
 //! - **Erros:** nenhum derruba o Nanty. 429 espera o `retry_after`; rede e 5xx esperam cada vez mais;
 //!   uma recusa do Telegram (4xx) desiste daquele envio e fica no registro.
 
@@ -86,8 +88,9 @@ use crate::server::state::AppState;
 pub const SEND_GAP: Duration = Duration::from_secs(1);
 /// Renovação do "digitando" (spec 139 T03, C-09): o Telegram o mostra por até 5 segundos.
 pub const TYPING_EVERY: Duration = Duration::from_secs(4);
-/// Prazo da fala (spec 139 T08, C-14; provisório, abaixo do prazo da chamada ao provedor): vencido,
-/// a saída vai em texto.
+/// Prazo de cada trecho da fala (spec 139 T08, C-14; por trecho desde a spec 141 T08; provisório,
+/// abaixo do prazo da chamada ao provedor): vencido, a fala para, sem pedir os trechos restantes, e a
+/// saída vai em texto.
 pub const SPEECH_DEADLINE: Duration = Duration::from_secs(45);
 /// Espera pelo texto do turno antes de falar o aviso (spec 140 T02, C-29; provisório): vencida, ele
 /// fala a frase fixa.
@@ -133,6 +136,8 @@ struct Queued {
     buttons_sent: bool,
     /// As partes que faltam da resposta longa (spec 140 T14), na ordem. A última leva o teclado.
     parts: Vec<String>,
+    /// A nota de voz sem legenda a que o texto responde (spec 141 T08): o `message_id` dela.
+    reply_to: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -278,7 +283,7 @@ impl Outbox {
         }
         {
             let mut inner = self.lock();
-            inner.queue.push_back(Queued { message: message.clone(), at_ms: now_ms, voice_sent: false, link_only: false, buttons_sent: false, parts: Vec::new() });
+            inner.queue.push_back(Queued { message: message.clone(), at_ms: now_ms, voice_sent: false, link_only: false, buttons_sent: false, parts: Vec::new(), reply_to: None });
             while inner.queue.len() > MAX_QUEUED {
                 inner.queue.pop_front();
             }
@@ -407,7 +412,7 @@ impl Outbox {
         let mut message = ConversationMessage::from_nanty(new_id(), 0, Channel::Telegram, "", Map::new());
         message.code = None;
         message.text = Some(text.to_string());
-        self.lock().queue.push_front(Queued { message, at_ms: 0, voice_sent: true, link_only: false, buttons_sent: true, parts: Vec::new() });
+        self.lock().queue.push_front(Queued { message, at_ms: 0, voice_sent: true, link_only: false, buttons_sent: true, parts: Vec::new(), reply_to: None });
     }
 
     /// Mensagens esperando.
@@ -1097,32 +1102,18 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                     }
                     // Spec 140 T14 (C-27): a limpeza sem o corte; quem divide é o [`format::split`].
                     let text = format::clean_whole(secrets, &render::message_text(lang, &q.message));
-                    let tail = render::closing(lang, &q.message).map(|line| clean(secrets, &line));
-                    // A resposta longa com áudio: a nota fala e mostra o começo, e o resto segue em partes.
-                    if let Some(end) = voice::long_lead(&q.message, &text, cfg.nanty.voice.lead_chars()).filter(|_| !q.voice_sent) {
-                        if let Some(sent) = send_lead(ctx, &q, own, text[..end].trim_end(), retry).await? {
-                            let rest = text[end..].trim_start();
-                            let parts = format::split(rest, tail.as_deref(), &tr(own, "nanty.telegram.rest_in_window", &[]), format::MAX_MESSAGE_CHARS, keyboard_room(url, &rows), format::MAX_PARTS);
-                            if let Some(m) = outbox.lock().queue.iter_mut().find(|m| m.message.id == q.message.id) {
-                                m.voice_sent = true;
-                                // Recusada a nota, o texto inteiro vai na próxima vez, como antes.
-                                if sent {
-                                    m.parts = parts;
-                                }
-                            }
-                            return Ok(());
-                        }
-                    }
-                    match send_voice(ctx, &q, &text, tail.as_deref(), &rows, retry).await? {
-                        Voiced::Sent { whole, keyed } => {
-                            record_buttons(ctx, &held, keyed, SentKind::Voice, &text, tail.as_deref(), None);
+                    match send_voice(ctx, &q, &text, &rows, retry).await? {
+                        Voiced::Sent { whole, keyed, note, buttons_sent } => {
+                            record_buttons(ctx, &held, keyed, SentKind::Voice, &text, None, None);
                             let mut inner = outbox.lock();
                             if whole && url.is_none() {
                                 inner.queue.retain(|m| m.message.id != q.message.id);
                             } else if let Some(m) = inner.queue.iter_mut().find(|m| m.message.id == q.message.id) {
                                 m.voice_sent = true;
                                 m.link_only = whole;
-                                m.buttons_sent = true;
+                                m.buttons_sent = buttons_sent;
+                                // Spec 141 T08: o texto inteiro que segue a nota sem legenda responde a ela.
+                                m.reply_to = note.filter(|_| !whole);
                             }
                             return Ok(());
                         }
@@ -1134,10 +1125,12 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                         }
                         Voiced::NoVoice => {}
                     }
-                    // A legenda já levou o texto: o botão vai com a frase do servidor.
-                    let body = if q.link_only && url.is_some() { tail.as_deref().unwrap_or(&text) } else { &text };
+                    // A legenda já levou o texto: o botão do link vai numa linha curta de dado (spec
+                    // 141 T10, C-10: a frase que fechava o texto do modelo saiu).
+                    let carrier = tr(own, "nanty.chat.open_link", &[]);
+                    let body = if q.link_only && url.is_some() { carrier.as_str() } else { text.as_str() };
                     // Spec 140 T14 (C-27): o texto longo vira partes, que saem uma por vez, na ordem.
-                    let parts = format::split(body, tail.as_deref(), &tr(own, "nanty.telegram.rest_in_window", &[]), format::MAX_MESSAGE_CHARS, keyboard_room(url, &rows), format::MAX_PARTS);
+                    let parts = format::split(body, format::MAX_MESSAGE_CHARS, keyboard_room(url, &rows), format::MAX_PARTS);
                     if parts.len() > 1 {
                         if let Some(m) = outbox.lock().queue.iter_mut().find(|m| m.message.id == q.message.id) {
                             m.parts = parts;
@@ -1146,9 +1139,9 @@ async fn execute(ctx: &Ctx<'_>, op: Op, retry: &mut Option<Duration>) -> Result<
                         return Err(Step::Idle(Duration::ZERO));
                     }
                     let keyed = if let Some(url) = url {
-                        send_link(ctx, &q.message, body, url, &rows, retry).await?
+                        send_link(ctx, &q.message, body, url, &rows, q.reply_to, retry).await?
                     } else if !text.is_empty() {
-                        send_keyed(ctx, own, &text, &rows, retry).await?
+                        send_keyed(ctx, own, &text, &rows, q.reply_to, retry).await?
                     } else {
                         None
                     };
@@ -1267,6 +1260,7 @@ fn start_speech(ctx: &Ctx<'_>, card: &Card) {
     let outbox = ctx.nanty.telegram().outbox();
     outbox.speech_started(card);
     let fixed = clean(ctx.secrets, &card_text(ctx.lang, ctx.cfg, card));
+    let card_whole = format::clean_whole(ctx.secrets, &card_text(ctx.lang, ctx.cfg, card));
     let can_wait = turn::can_run(ctx.cfg, ctx.nanty);
     let tuning = ctx.nanty.telegram().tuning();
     let (card, state, secrets, lang) = (card.clone(), ctx.state.clone(), ctx.secrets.clone(), ctx.lang);
@@ -1279,10 +1273,16 @@ fn start_speech(ctx: &Ctx<'_>, card: &Card) {
             // Spec 140 T14 (revisão 1): sem o corte de 4096; o texto completo à parte passa pela divisão.
             let text = format::clean_whole(&secrets, &render::message_text(lang, &message));
             if text.is_empty() {
-                Err("no_text")
-            } else {
-                Ok(Said { message, text })
+                return Err("no_text");
             }
+            // Spec 141 T08 (revisão 2, F-02): a nota fala o texto do modelo só se o texto completo
+            // à parte (ele e o do cartão) aparece inteiro; senão, fala a frase fixa, e o texto do
+            // modelo segue como mensagem.
+            let note = format!("{text}\n{card_whole}");
+            if !voice::speakable(&note) {
+                return Err("too_long");
+            }
+            Ok(Said { message, text })
         });
         // O que for decidido na janela durante a espera não custa fala.
         if matches!(said, Err(GONE)) || !outbox.speech_speaking(&card) {
@@ -1314,27 +1314,30 @@ enum Voiced {
     /// Não há nota a mandar (sem áudio, já enviada, ou o arquivo saiu): segue o texto.
     NoVoice,
     /// A nota saiu. `whole`: a legenda levou o texto inteiro, nada mais a mandar. `keyed`: o
-    /// `message_id` da nota que levou os botões.
-    Sent { whole: bool, keyed: Option<i64> },
+    /// `message_id` da nota que levou os botões. `note`: o `message_id` da nota, a que o texto
+    /// inteiro responde quando não coube na legenda. `buttons_sent`: os botões já foram com ela (ou
+    /// foram recusados nela); senão, vão com o texto.
+    Sent { whole: bool, keyed: Option<i64>, note: Option<i64>, buttons_sent: bool },
     /// O Telegram recusou a nota: o texto completo vai na próxima vez (o aviso nunca se perde).
     Refused,
 }
 
-/// A nota de voz de uma mensagem com áudio (T09, C-12): a fala com a legenda curta (o mesmo texto
-/// redigido, cortado em 1024, sem perder a frase do servidor que fecha o texto, `tail`), com os botões
-/// de apagar da memória (spec 140 T07). Recusado o teclado, a nota sai de novo sem ele, com a linha
-/// que aponta a janela.
-async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, tail: Option<&str>, rows: &[Value], retry: &mut Option<Duration>) -> Result<Voiced, Step> {
+/// A nota de voz de uma mensagem com áudio (T09, C-12; tudo ou nada desde a spec 141 T08, C-08): a
+/// fala do texto inteiro. Quando o texto (redigido) cabe na legenda, ele vai
+/// nela, com os botões de apagar da memória (spec 140 T07); recusado o teclado, a nota sai de novo
+/// sem ele, com a linha que aponta a janela. Quando não cabe, a nota sai sem legenda e sem teclado, e
+/// o texto inteiro segue em mensagens que respondem a ela, com os botões na última.
+async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, rows: &[Value], retry: &mut Option<Duration>) -> Result<Voiced, Step> {
     let Some(audio) = q.message.audio.as_ref().filter(|_| !q.voice_sent) else { return Ok(Voiced::NoVoice) };
     let nanty = ctx.nanty;
     // Leitura curta de um arquivo local (como as gravações do estado que a fila já faz aqui).
     let Some(ogg) = nanty.read_audio(&audio.id) else { return Ok(Voiced::NoVoice) };
-    let caption = format::fit_keeping(text, tail, format::MAX_CAPTION_CHARS);
-    let whole = caption == text && !text.is_empty();
-    let keys = (!rows.is_empty()).then(|| Value::Array(rows.to_vec()));
+    let whole = !text.is_empty() && format::units(text) <= format::MAX_CAPTION_CHARS;
+    let caption = if whole { text } else { "" };
+    let keys = (whole && !rows.is_empty()).then(|| Value::Array(rows.to_vec()));
     let keyed = keys.is_some();
-    let e = match ctx.client.send_voice(ctx.chat_id, ogg.clone(), &caption, audio.duration_secs, ctx.quiet, keys).await {
-        Ok(id) => return Ok(Voiced::Sent { whole, keyed: id.filter(|_| keyed) }),
+    let e = match ctx.client.send_voice(ctx.chat_id, ogg.clone(), caption, audio.duration_secs, ctx.quiet, keys).await {
+        Ok(id) => return Ok(Voiced::Sent { whole, keyed: id.filter(|_| keyed), note: id, buttons_sent: whole }),
         Err(e) => e,
     };
     if let Some(step) = on_error(nanty, "sendVoice", &e, retry) {
@@ -1346,10 +1349,10 @@ async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, tail: Option<&str>, r
     journal(nanty, "telegram.buttons_refused", param("error", e.code()));
     let line = forget_line(ctx, &q.message);
     let room = format::MAX_CAPTION_CHARS.saturating_sub(format::units(&line) + 1);
-    let head = format::fit_keeping(text, tail, room);
+    let head = format::fit(text, room);
     let plain = format!("{head}\n{line}");
     match ctx.client.send_voice(ctx.chat_id, ogg, plain.trim_start(), audio.duration_secs, ctx.quiet, None).await {
-        Ok(_) => Ok(Voiced::Sent { whole: head == text && !text.is_empty(), keyed: None }),
+        Ok(id) => Ok(Voiced::Sent { whole: head == text && !text.is_empty(), keyed: None, note: id, buttons_sent: true }),
         Err(e) => match on_error(nanty, "sendVoice", &e, retry) {
             Some(step) => Err(step),
             None => Ok(Voiced::Refused),
@@ -1358,31 +1361,13 @@ async fn send_voice(ctx: &Ctx<'_>, q: &Queued, text: &str, tail: Option<&str>, r
 }
 
 /// A folga da última mensagem (spec 140 T14, revisão 1, F-01): com teclado (o link ou os botões de
-/// apagar), a recusa dele acrescenta linhas, e a mensagem tem de caber inteira com elas, sem perder a
-/// frase do servidor. Sem teclado, nada é acrescentado.
+/// apagar), a recusa dele acrescenta linhas, e a mensagem tem de caber inteira com elas, sem perder o
+/// fim do texto. Sem teclado, nada é acrescentado.
 fn keyboard_room(url: Option<&str>, rows: &[Value]) -> usize {
     if url.is_some() || !rows.is_empty() {
         format::LAST_PART_ROOM
     } else {
         0
-    }
-}
-
-/// A nota de voz da resposta longa (spec 140 T14, C-27): o áudio fala o começo (`lead`), e a legenda
-/// leva esse mesmo trecho e a linha de que o resto vem a seguir, sem teclado: os botões vão na última
-/// parte do texto. `None` = não há nota a mandar; `Some(false)` = o Telegram a recusou.
-async fn send_lead(ctx: &Ctx<'_>, q: &Queued, lang: Lang, lead: &str, retry: &mut Option<Duration>) -> Result<Option<bool>, Step> {
-    let Some(audio) = q.message.audio.as_ref() else { return Ok(None) };
-    // Leitura curta de um arquivo local (como as gravações do estado que a fila já faz aqui).
-    let Some(ogg) = ctx.nanty.read_audio(&audio.id) else { return Ok(None) };
-    let line = tr(lang, "nanty.telegram.rest_follows", &[]);
-    let caption = format::fit_keeping(&format!("{lead}\n\n{line}"), Some(&line), format::MAX_CAPTION_CHARS);
-    match ctx.client.send_voice(ctx.chat_id, ogg, &caption, audio.duration_secs, ctx.quiet, None).await {
-        Ok(_) => Ok(Some(true)),
-        Err(e) => match on_error(ctx.nanty, "sendVoice", &e, retry) {
-            Some(step) => Err(step),
-            None => Ok(Some(false)),
-        },
     }
 }
 
@@ -1394,7 +1379,7 @@ async fn send_part(ctx: &Ctx<'_>, q: &Queued, lang: Lang, url: Option<&str>, hel
     let outbox = ctx.nanty.telegram().outbox();
     let Some(part) = q.parts.first() else { return Ok(()) };
     if q.parts.len() > 1 {
-        if let Err(e) = ctx.client.send(ctx.chat_id, part, ctx.quiet, None).await {
+        if let Err(e) = ctx.client.send_replying(ctx.chat_id, part, ctx.quiet, None, q.reply_to).await {
             if let Some(step) = on_error(ctx.nanty, "sendMessage", &e, retry) {
                 return Err(step);
             }
@@ -1405,8 +1390,8 @@ async fn send_part(ctx: &Ctx<'_>, q: &Queued, lang: Lang, url: Option<&str>, hel
         return Ok(());
     }
     let keyed = match url {
-        Some(url) => send_link(ctx, &q.message, part, url, rows, retry).await?,
-        None => send_keyed(ctx, lang, part, rows, retry).await?,
+        Some(url) => send_link(ctx, &q.message, part, url, rows, q.reply_to, retry).await?,
+        None => send_keyed(ctx, lang, part, rows, q.reply_to, retry).await?,
     };
     record_buttons(ctx, held, keyed, SentKind::Text, part, None, url);
     outbox.lock().queue.retain(|m| m.message.id != q.message.id);
@@ -1421,12 +1406,13 @@ fn forget_line(ctx: &Ctx<'_>, message: &ConversationMessage) -> String {
 
 /// O texto com os botões de apagar da memória (spec 140 T07). Sem botão, o envio de sempre. Recusado o
 /// teclado, a mensagem sai de novo sem ele, com a linha que aponta a aba Memória; o motivo fica no
-/// registro. Devolve o `message_id` da mensagem que levou os botões.
-async fn send_keyed(ctx: &Ctx<'_>, lang: Lang, text: &str, rows: &[Value], retry: &mut Option<Duration>) -> Result<Option<i64>, Step> {
+/// registro. Devolve o `message_id` da mensagem que levou os botões. `reply_to`: a nota de voz a que
+/// o texto responde (spec 141 T08).
+async fn send_keyed(ctx: &Ctx<'_>, lang: Lang, text: &str, rows: &[Value], reply_to: Option<i64>, retry: &mut Option<Duration>) -> Result<Option<i64>, Step> {
     let Ctx { nanty, client, chat_id, quiet, .. } = *ctx;
     let keys = (!rows.is_empty()).then(|| Value::Array(rows.to_vec()));
     let keyed = keys.is_some();
-    let e = match client.send(chat_id, text, quiet, keys).await {
+    let e = match client.send_replying(chat_id, text, quiet, keys, reply_to).await {
         Ok(id) => return Ok(id.filter(|_| keyed)),
         Err(e) => e,
     };
@@ -1440,7 +1426,7 @@ async fn send_keyed(ctx: &Ctx<'_>, lang: Lang, text: &str, rows: &[Value], retry
     let line = tr(lang, "nanty.telegram.forget_in_window", &[]);
     let room = format::MAX_MESSAGE_CHARS.saturating_sub(format::units(&line) + 1);
     let plain = format!("{}\n{line}", format::fit(text, room));
-    if let Err(e) = client.send(chat_id, plain.trim_start(), quiet, None).await {
+    if let Err(e) = client.send_replying(chat_id, plain.trim_start(), quiet, None, reply_to).await {
         if let Some(step) = on_error(nanty, "sendMessage", &e, retry) {
             return Err(step);
         }
@@ -1451,12 +1437,14 @@ async fn send_keyed(ctx: &Ctx<'_>, lang: Lang, text: &str, rows: &[Value], retry
 /// O texto com o botão do link e, abaixo, os de apagar da memória (spec 140 T07). Recusado o teclado,
 /// a mensagem sai de novo sem ele, com o endereço como texto (e a linha da aba Memória, se havia
 /// botão dela); o motivo fica no registro, porque só um bot real diz o que o Telegram aceita.
-async fn send_link(ctx: &Ctx<'_>, message: &ConversationMessage, text: &str, url: &str, rows: &[Value], retry: &mut Option<Duration>) -> Result<Option<i64>, Step> {
+/// `reply_to`: a nota de voz a que o texto responde (spec 141 T08).
+#[allow(clippy::too_many_arguments)]
+async fn send_link(ctx: &Ctx<'_>, message: &ConversationMessage, text: &str, url: &str, rows: &[Value], reply_to: Option<i64>, retry: &mut Option<Duration>) -> Result<Option<i64>, Step> {
     let Ctx { nanty, client, chat_id, quiet, lang, .. } = *ctx;
     let lang = crate::server::nanty::language::tagged(message.lang.as_deref()).unwrap_or(lang);
     let mut keys = vec![link_row(lang, url)];
     keys.extend(rows.iter().cloned());
-    let e = match client.send(chat_id, text, quiet, Some(Value::Array(keys))).await {
+    let e = match client.send_replying(chat_id, text, quiet, Some(Value::Array(keys)), reply_to).await {
         Ok(id) => return Ok(id.filter(|_| !rows.is_empty())),
         Err(e) => e,
     };
@@ -1470,7 +1458,7 @@ async fn send_link(ctx: &Ctx<'_>, message: &ConversationMessage, text: &str, url
     }
     let room = format::MAX_MESSAGE_CHARS.saturating_sub(format::units(&line) + 1);
     let plain = format!("{}\n{line}", format::fit(text, room));
-    if let Err(e) = client.send(chat_id, plain.trim_start(), quiet, None).await {
+    if let Err(e) = client.send_replying(chat_id, plain.trim_start(), quiet, None, reply_to).await {
         if let Some(step) = on_error(nanty, "sendMessage", &e, retry) {
             return Err(step);
         }

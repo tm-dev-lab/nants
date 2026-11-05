@@ -410,7 +410,7 @@ async fn free_text_action_becomes_a_card_by_the_tool_and_only_the_click_runs_it(
     assert!(!request.response_json && !request.web_search);
     assert!(request.messages[0].content.contains("dados não confiáveis"));
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]);
+    assert_eq!(names, ["project_status", "project_details", "agent_log", "sdd_docs", "project_files", "git_history", "system_status", "nants_docs", "nanty_activity", "propose_action", "open_nants", "set_silence", "remember", "recall", "forget", "deep_think", "propose_to_architect"]);
     assert!(names.iter().all(|n| crate::server::nanty::actions::parse(n).is_none_or(|a| matches!(a.entry().kind, crate::server::nanty::actions::ActionKind::Silence | crate::server::nanty::actions::ActionKind::Link))), "nenhuma ferramenta executa uma ação");
     let input = model.input(0);
     assert_eq!(input["message"], "aprove o plano do projeto Loja");
@@ -418,7 +418,8 @@ async fn free_text_action_becomes_a_card_by_the_tool_and_only_the_click_runs_it(
     // A ação pedida como ferramenta não existe: recebe o resultado e nada acontece.
     let results = model.results(1);
     assert_eq!(results[0].1, tr(Lang::PtBr, "nanty.tool.unknown_tool", &[("name", "approve_plan")]));
-    assert!(results[1].1.contains(&tr(Lang::PtBr, "nanty.phase.plan_waiting", &[])), "{}", results[1].1);
+    // Spec 141 T09: o estado vai em dados, com o código da fase.
+    assert!(results[1].1.contains("\"phase\":\"plan_waiting\""), "{}", results[1].1);
     // A proposta pela ferramenta vira o cartão, e o resultado diz ao modelo que só o clique executa.
     assert_eq!(answer.card_ids.len(), 1);
     let card = w.card(&answer.card_ids[0]).expect("cartão");

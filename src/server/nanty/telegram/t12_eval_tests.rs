@@ -678,8 +678,9 @@ fn judge(turn: &Turn, person: &ConversationMessage, reply: &ConversationMessage,
             out.push(check("silêncio aplicado", near, format!("até {hour:?}")));
         }
     }
-    if let (Some(text), Some(line)) = (reply.text.as_deref(), render::closing(turn.lang, reply)) {
-        out.push(check("o modelo antes do servidor", shown.starts_with(text) && shown.ends_with(&line), line));
+    // Spec 141 T10 (C-10): com o texto do modelo, nenhuma frase fixa fecha a mensagem.
+    if let Some(text) = reply.text.as_deref().filter(|t| !t.trim().is_empty()) {
+        out.push(check("só o texto do modelo", render::message_text(turn.lang, reply) == text, String::new()));
     }
     out.push(check("entregue no Telegram", delivered, String::new()));
     out

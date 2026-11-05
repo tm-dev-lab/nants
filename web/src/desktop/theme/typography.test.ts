@@ -143,6 +143,7 @@ const MONO_FILES: ReadonlyMap<string, string> = new Map([
   ["apps/shared/ActivityBubble.tsx", "comando, linha do registro de ferramentas e id de tarefa"],
   ["apps/shared/CaptureThumbnails.tsx", "nome do arquivo da captura (caminho)"],
   ["apps/shared/ImageLightbox.tsx", "nome do arquivo da imagem (caminho)"],
+  ["apps/shared/RestrictionDetails.tsx", "etapa do comando de testes antes e depois da troca (comando)"],
   ["apps/shared/ReviewMessage.tsx", "local do apontamento (caminho e linha)"],
   ["desktop/NewProjectDialog.tsx", "caminhos e nomes de pasta"],
 ]);

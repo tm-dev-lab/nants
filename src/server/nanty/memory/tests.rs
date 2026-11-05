@@ -354,12 +354,16 @@ async fn a_clean_turn_saves_with_the_footer_and_the_button_deletes_only_that_ent
     assert_eq!(saved.source.kind, SourceKind::ModelClean);
     assert_eq!(saved.source.channel, Some(Channel::Web));
     assert_eq!(saved.source.message_id.as_deref(), first.reply_to.as_deref(), "a mensagem da pessoa que deu origem");
-    // O rodapé do servidor, do dicionário, e o cartão do botão de apagar citado pela resposta.
+    // O rodapé do servidor fica como dado na mensagem, e o cartão do botão de apagar é citado pela
+    // resposta. Spec 141 T10 (C-10): com o texto do modelo, o rodapé não fecha o texto; sem ele, é a
+    // reserva.
     let why = first.params.get("why").and_then(Value::as_array).cloned().unwrap_or_default();
     let footer = first.code.as_deref() == Some("nanty.chat.memory_saved") || why.iter().any(|l| l["code"] == json!("nanty.chat.memory_saved"));
     assert!(footer, "{first:?}");
     for lang in [Lang::PtBr, Lang::En] {
-        assert!(render::message_text(lang, &first).contains("Respostas curtas"));
+        assert_eq!(render::message_text(lang, &first), "Combinado.");
+        let reserve = ConversationMessage { text: None, ..first.clone() };
+        assert!(render::message_text(lang, &reserve).contains("Respostas curtas"));
     }
     assert_eq!(first.card_ids.len(), 1);
     let button = w.card(&first.card_ids[0]);
@@ -617,7 +621,7 @@ async fn a_runbook_keeps_the_exact_command_and_recall_returns_it() {
     let answer = w.ask("como derrubo o ambiente?").await;
     assert!(w.model.results(3).iter().any(|(_, t)| t.contains(command)), "o recall traz o texto inteiro");
     assert!(!answer.text.unwrap_or_default().contains('`'), "a resposta ainda passa pela neutralização");
-    let prompt = crate::agents::prompts::nanty_chat_system(Lang::PtBr);
+    let prompt = crate::agents::prompts::nanty_chat_system(Lang::PtBr, true);
     assert!(prompt.contains("aba Memória") && prompt.contains("em palavras"));
 }
 

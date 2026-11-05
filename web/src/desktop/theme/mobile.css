@@ -7,7 +7,7 @@
  * - uma janela por vez em tela cheia, sem cantos nem sombra; o Alternador é uma lista vertical
  *   sobre uma superfície sólida (texto nunca direto sobre o papel de parede);
  * - alvos de toque com ≥ 44 px (botões da barra de título inclusive);
- * - com o teclado aberto (`<html data-keyboard="open">`), a barra e as abas somem;
+ * - com o teclado aberto (`<html data-keyboard="open">`), a barra, as abas e o cabeçalho da janela somem;
  * - janela estreita (`data-size="narrow"`, 390 px): nada rola na horizontal.
  */
 
@@ -360,6 +360,14 @@
 
 /* --- Teclado virtual aberto: a barra e as abas somem; o campo fica visível --- */
 :root[data-keyboard="open"] .nd-root[data-mobile="true"] .nd-keyboard-hide {
+  display: none !important;
+}
+
+/*
+ * 141/T11: o cabeçalho e as ferramentas da janela onde se digita também somem; o campo e a conversa
+ * ficam com a altura que o teclado deixa. A janela é a que tem o foco (no celular, uma por vez).
+ */
+:root[data-keyboard="open"] .nd-root[data-mobile="true"] .nd-window:focus-within > :where(.nd-titlebar, .nd-window-tools) {
   display: none !important;
 }
 

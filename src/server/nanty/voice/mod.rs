@@ -15,14 +15,18 @@
 //!     não entrou na nota não tem outro áudio.
 //!   - O que é só controle fica em texto: a resposta ao clique, o cartão pedido na conversa (a fala
 //!     é a da resposta que o cita) e o aviso de teste do Telegram.
-//!   - A fala é a do texto que sai, já redigido, cortada em fim de frase ([`speech_text`]) e com
-//!     prazo ([`speak_on_time`]). A nota sai com a legenda curta (até 1024) e, se a legenda cortou,
-//!     o texto completo numa mensagem à parte.
-//!   - **Resposta longa (spec 140 T14, C-27):** a que não cabe na legenda fala só o começo do
-//!     primeiro parágrafo, até `[nanty.voice] lead_chars` (provisório: 450), sem chamada extra de
-//!     resumo ([`long_lead`]). A legenda leva esse trecho e avisa que o resto vem a seguir, e o resto
-//!     segue em texto, em partes, sem repetir o trecho. A janela mostra a resposta inteira, com o
-//!     tocador.
+//!   - **Tudo ou nada (spec 141 T08, C-08):** a fala é a do texto inteiro que sai, já redigido, numa
+//!     nota só: os trechos cortados em fim de frase ([`speech_chunks`], até [`CHUNK_CHARS`]) saem em
+//!     sequência, com a mesma voz e o mesmo tom, e o PCM é juntado antes de virar Opus. Só fala o
+//!     texto que o Telegram mostra inteiro ([`speakable`], o mesmo critério do [`format::split`]),
+//!     com os tetos de segurança de tamanho ([`MAX_SPOKEN_UNITS`]), de trechos ([`MAX_CHUNKS`])
+//!     e de duração ([`MAX_SPEECH_SECS`]). O prazo vale por trecho ([`speak_within`]), com teto total
+//!     ([`total_deadline`]): o trecho que passa de qualquer um encerra a fala, sem pedir nem cobrar
+//!     os seguintes. Falha, prazo ou excesso em qualquer trecho:
+//!     nenhum áudio parcial, sai o texto inteiro na hora, e o motivo fica no registro.
+//!   - **A transcrição vai completa:** na legenda se couber (até 1024); se não, a nota sai sem legenda
+//!     e o texto inteiro vai em mensagens que respondem a ela ([`format::split`], até 4096 cada). A
+//!     janela mostra o texto inteiro da mesma mensagem, com o tocador.
 //! - **Tom (spec 140 T01):** cada fala tem um [`Tone`] da lista fechada. O aviso usa o do tipo do
 //!   sinal; a resposta da conversa, o que o modelo marcou, sempre neutro em turno contaminado; o resto
 //!   é neutro. Um 400 com a anotação refaz uma vez sem ela ([`ask_provider`]).
@@ -33,7 +37,7 @@
 //!   fila única da T08.
 //! - **Vozes ([`get_voices`]):** a lista do `/v1beta/voices` da conexão, com um cache curto em
 //!   memória ([`VOICES_TTL`]), para os Ajustes.
-//! - **Orçamento:** cada fala e cada transcrição entram no gasto do dia do Nanty (os tokens
+//! - **Orçamento:** cada trecho da fala e cada transcrição entram no gasto do dia do Nanty (os tokens
 //!   informados ou estimados e o US$ pelo preço do modelo, quando há) e contam em `voice_calls`.
 //!   Sem orçamento, com o prazo vencido ou com a falha da fala, vai o texto: o aviso nunca se perde.
 //!   O registro guarda só códigos (o provedor, o motivo), nunca o texto nem o áudio.
@@ -80,8 +84,6 @@ pub const AUDIO_DIR: &str = "audio";
 pub const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
 /// Maior áudio guardado ou servido.
 pub const MAX_AUDIO_BYTES: u64 = 20 * 1024 * 1024;
-/// Maior texto mandado à fala (a resposta do modelo tem até 600; os textos fixos são curtos).
-pub const MAX_SPEECH_CHARS: usize = 2000;
 /// Tokens por segundo de áudio, para estimar a saída quando o provedor não informa (a taxa
 /// publicada do áudio do Gemini).
 pub const AUDIO_TOKENS_PER_SEC: u64 = 25;
@@ -211,11 +213,12 @@ pub struct Spoken {
     pub duration_secs: u32,
 }
 
-/// Chama o Gemini no tom dado. Se ele recusar o pedido com a anotação (`bad_request`), refaz uma vez
-/// sem ela: a voz sem tom vale mais que o texto sem voz. A segunda chamada conta no orçamento: só sai
-/// com orçamento e, dando certo, entra no gasto como qualquer fala. O prazo de [`speak_on_time`]
-/// cobre as duas.
-async fn ask_provider(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone: Tone) -> Result<provider::Audio, &'static str> {
+/// Chama o Gemini no tom dado e devolve o áudio com o tom que valeu. Se ele recusar o pedido com a
+/// anotação (`bad_request`), refaz uma vez sem ela: a voz sem tom vale mais que o texto sem voz, e os
+/// trechos seguintes já vão no neutro, para a nota ter um tom só. A segunda chamada conta no
+/// orçamento: só sai com orçamento e, dando certo, entra no gasto como qualquer fala. O prazo de
+/// [`speak_within`] cobre as duas.
+async fn ask_provider(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone: Tone) -> Result<(provider::Audio, Tone), &'static str> {
     let ask = |tone| provider::gemini_speak(&step.connection, &step.model, &step.voice, text, tone);
     match ask(tone).await {
         Err("bad_request") if tone.style().is_some() => {
@@ -223,42 +226,54 @@ async fn ask_provider(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone
             if exhausted(cfg, nanty) {
                 return Err("budget");
             }
-            ask(Tone::Neutral).await
+            ask(Tone::Neutral).await.map(|audio| (audio, Tone::Neutral))
         }
-        answer => answer,
+        answer => answer.map(|audio| (audio, tone)),
     }
 }
 
-/// Chama o Gemini, soma o gasto e codifica o PCM em Opus.
-async fn speak_step(cfg: &Config, nanty: &Nanty, step: &Step, text: &str, tone: Tone) -> Result<Spoken, &'static str> {
-    let audio = ask_provider(cfg, nanty, step, text, tone).await?;
-    let bytes = audio.bytes.clone();
-    let encoded = tokio::task::spawn_blocking(move || {
-        let pcm = encode::pcm_of_gemini(&bytes)?;
-        let secs = pcm.duration_secs();
-        encode::ogg_opus(&pcm).map(|ogg| (ogg, secs))
-    })
-    .await
-    .map_err(|_| "encode")?;
-    // O provedor já cobrou: o gasto entra mesmo se a codificação falhar.
-    let secs = encoded.as_ref().map(|(_, s)| *s).unwrap_or(0);
-    let output = audio.output_tokens.unwrap_or(u64::from(secs) * AUDIO_TOKENS_PER_SEC);
-    charge(cfg, nanty, &step.model, audio.input_tokens.unwrap_or_else(|| estimate_tokens(text)), output);
-    let (ogg, duration_secs) = encoded?;
-    if ogg.len() as u64 > MAX_AUDIO_BYTES {
-        return Err("too_big");
+/// O tamanho de um trecho da fala, em caracteres (spec 141 T08, C-08; provisório). A fala de um texto
+/// longo de uma vez só perde a qualidade e passa do prazo de uma chamada; cerca de mil caracteres
+/// são pouco mais de um minuto de áudio.
+pub const CHUNK_CHARS: usize = 1000;
+/// O maior texto falado, em unidades do Telegram (revisão 1, F-01): as [`format::MAX_PARTS`]
+/// mensagens cheias, com a folga do teclado na última. É só o teto de segurança, conferido em
+/// [`speak_within`]: o critério de verdade é o da divisão real ([`speakable`], revisão 2, F-02), que
+/// pode precisar de mais partes por causa das quebras de parágrafo. Acima disso, `too_long`.
+pub const MAX_SPOKEN_UNITS: usize = format::MAX_PARTS * format::MAX_MESSAGE_CHARS - format::LAST_PART_ROOM;
+/// O teto de trechos de uma fala, só de segurança (provisório): o limite de verdade é
+/// [`speakable`], abaixo de [`MAX_SPOKEN_UNITS`], que com trechos de até [`CHUNK_CHARS`], cortados em fim de frase, cabe com
+/// folga em 16. Acima disso, a fala falha e vai o texto inteiro.
+pub const MAX_CHUNKS: usize = 16;
+/// O teto da duração de uma nota, em segundos (provisório): 15 minutos cobrem o texto de
+/// [`MAX_SPOKEN_UNITS`] na velocidade da fala. A 32 kbit/s são cerca de 3,6 MB, longe do limite
+/// guardado ([`MAX_AUDIO_BYTES`]) e dos 50 MB de uma nota do Telegram. Passou, a fala falha.
+pub const MAX_SPEECH_SECS: u32 = 15 * 60;
+/// A pausa entre dois trechos juntados, em milissegundos: a respiração entre duas frases.
+const CHUNK_GAP_MS: u32 = 300;
+/// Caracteres falados por segundo, para estimar o áudio de um trecho encerrado pelo prazo, que o
+/// provedor pode ter cobrado sem responder (provisório).
+const SPOKEN_CHARS_PER_SEC: u64 = 15;
+
+/// Os trechos da fala (spec 141 T08, C-08): o texto inteiro, cortado em fim de frase a cada até
+/// `max` caracteres (a pontuação seguida de espaço, ou uma quebra de linha) e, sem nenhum, na última
+/// palavra inteira. Nada do texto se perde: só os espaços entre dois trechos saem.
+pub fn speech_chunks(text: &str, max: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let end = speech_end(rest, max.max(1));
+        let end = if end == 0 { rest.len() } else { end };
+        let chunk = rest[..end].trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        rest = rest[end..].trim_start();
     }
-    Ok(Spoken { ogg, duration_secs })
+    chunks
 }
 
-/// O texto da fala: inteiro até `max` caracteres; mais longo, cortado no último fim de frase que
-/// cabe (a pontuação seguida de espaço, ou uma quebra de linha) e, sem nenhum, na última palavra
-/// inteira. A fala nunca termina no meio de uma frase por causa do limite.
-pub fn speech_text(text: &str, max: usize) -> String {
-    text[..speech_end(text, max)].trim().to_string()
-}
-
-/// O fim em bytes da fala de [`speech_text`], antes do `trim`.
+/// O fim em bytes do primeiro trecho de [`speech_chunks`], antes do `trim`.
 fn speech_end(text: &str, max: usize) -> usize {
     let Some((limit, _)) = text.char_indices().nth(max) else { return text.len() };
     let ends = |i: usize, c: char| {
@@ -268,92 +283,144 @@ fn speech_end(text: &str, max: usize) -> usize {
     };
     let head = &text[..limit];
     let sentence = head.char_indices().filter_map(|(i, c)| ends(i, c)).last().filter(|end| !text[..*end].trim().is_empty());
-    sentence.or_else(|| head.rfind(char::is_whitespace)).unwrap_or(limit)
+    sentence.or_else(|| head.rfind(char::is_whitespace).filter(|at| !text[..*at].trim().is_empty())).unwrap_or(limit)
 }
 
-/// O fim em bytes do começo que a resposta longa fala (spec 140 T14, C-27): o primeiro parágrafo
-/// (até a primeira linha em branco), cortado em `max` caracteres no último fim de frase, como a
-/// [`speech_text`]. `text` já vem limpo e sem espaço no começo: `text[..fim]` é o trecho falado, e o
-/// que vem depois é o resto da resposta.
-pub fn lead_end(text: &str, max: usize) -> usize {
-    let paragraph = text.find("\n\n").map_or(text, |end| &text[..end]);
-    speech_end(paragraph, max)
+/// O teto total de uma fala de `chunks` trechos: o prazo de um trecho para cada um (eles saem em
+/// sequência), nunca além de `limit`.
+pub fn total_deadline(per_chunk: Duration, chunks: usize, limit: Duration) -> Duration {
+    per_chunk.saturating_mul(u32::try_from(chunks.clamp(1, MAX_CHUNKS)).unwrap_or(1)).min(limit)
 }
 
-/// A resposta longa fala só o começo (spec 140 T14, C-27): o texto do modelo abre a mensagem (o
-/// resumo da manhã e o cenário, que abrem pelo título do servidor, seguem a fala de sempre) e não
-/// cabe na legenda. Devolve o fim do trecho falado em `text`, o texto limpo da mensagem como vai ao
-/// Telegram; `None` = a fala de sempre. Sem chamada extra de resumo: o prompt pede que a resposta
-/// longa comece pelo essencial.
-///
-/// Revisão 1 (F-02): o trecho falado sempre cabe inteiro na legenda, com a linha de que o resto vem a
-/// seguir (nos dois idiomas): passou, ele recua para o último fim de frase que cabe. Assim nada do que
-/// o áudio fala fica sem aparecer escrito, entre a legenda e as partes.
-pub fn long_lead(message: &ConversationMessage, text: &str, max_chars: usize) -> Option<usize> {
-    if !render::opens_with_model(message) || format::units(text) <= format::MAX_CAPTION_CHARS {
-        return None;
+/// Os prazos de uma fala (revisão 1): cada trecho tem até `per_chunk`, e a fala inteira, até `until`
+/// (o limite do aviso, quando há).
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    per_chunk: Duration,
+    until: Option<tokio::time::Instant>,
+}
+
+impl Deadline {
+    /// Quando o trecho que começa agora vence: o prazo dele, nunca além do total.
+    fn chunk_end(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let own = now.checked_add(self.per_chunk).unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
+        self.until.map_or(own, |until| own.min(until))
     }
-    let mut end = lead_end(text, max_chars);
-    let budget = lead_caption_budget();
-    if format::units(&text[..end]) > budget {
-        // Os caracteres que cabem no orçamento, contados como o Telegram conta.
-        let mut used = 0;
-        let fits = text[..end].chars().take_while(|c| {
-            used += c.len_utf16();
-            used <= budget
-        });
-        let chars = fits.count();
-        end = speech_end(&text[..end], chars);
-    }
-    (!text[..end].trim().is_empty()).then_some(end)
 }
 
-/// Quanto o trecho falado pode ocupar na legenda: o limite dela, menos a linha de que o resto vem a
-/// seguir, a maior dos dois idiomas, e a linha em branco entre os dois.
-pub fn lead_caption_budget() -> usize {
-    let line = [Lang::PtBr, Lang::En].into_iter().map(|l| format::units(&crate::i18n::tr(l, "nanty.telegram.rest_follows", &[]))).max().unwrap_or(0);
-    format::MAX_CAPTION_CHARS.saturating_sub(line + 2)
-}
-
-/// Como [`speech_text`], preservando o fecho do texto (a frase do servidor, spec 139 T12): o corte
-/// fica no que vem antes dele.
-pub fn speech_keeping(text: &str, tail: Option<&str>, max: usize) -> String {
-    let head = tail.and_then(|t| Some((text.strip_suffix(t)?.trim_end(), t)));
-    match head {
-        Some((head, tail)) if text.chars().count() > max && tail.chars().count() < max => {
-            format!("{}\n{tail}", speech_text(head, max.saturating_sub(tail.chars().count() + 1)))
+/// Fala os trechos em sequência, com a mesma voz e o mesmo tom, junta o PCM e codifica uma nota só.
+/// Cada trecho entra no gasto (e em `voice_calls`) assim que o provedor responde. O trecho que passa
+/// do prazo encerra a fala na hora, e os seguintes nem são pedidos: ele entra no gasto pela
+/// estimativa, porque o provedor pode tê-lo cobrado. Qualquer falha devolve o motivo e o trecho em
+/// que parou: nenhum áudio parcial sai.
+async fn speak_chunks(cfg: &Config, nanty: &Nanty, step: &Step, chunks: &[String], tone: Tone, deadline: Deadline) -> Result<(Spoken, Tone), (&'static str, usize)> {
+    let mut tone = tone;
+    let mut joined: Option<encode::Pcm> = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 && exhausted(cfg, nanty) {
+            return Err(("budget", i));
         }
-        _ => speech_text(text, max),
+        let asked = tokio::time::timeout_at(deadline.chunk_end(), ask_provider(cfg, nanty, step, chunk, tone)).await;
+        let Ok(answer) = asked else {
+            let secs = (chunk.chars().count() as u64).div_ceil(SPOKEN_CHARS_PER_SEC);
+            charge(cfg, nanty, &step.model, estimate_tokens(chunk), secs * AUDIO_TOKENS_PER_SEC);
+            return Err(("deadline", i));
+        };
+        let (audio, used) = answer.map_err(|code| (code, i))?;
+        tone = used;
+        let bytes = audio.bytes.clone();
+        let pcm = tokio::task::spawn_blocking(move || encode::pcm_of_gemini(&bytes)).await.map_err(|_| ("encode", i))?;
+        // O provedor já cobrou: o gasto entra mesmo se a leitura do áudio falhar.
+        let secs = pcm.as_ref().map(encode::Pcm::duration_secs).unwrap_or(0);
+        let output = audio.output_tokens.unwrap_or(u64::from(secs) * AUDIO_TOKENS_PER_SEC);
+        charge(cfg, nanty, &step.model, audio.input_tokens.unwrap_or_else(|| estimate_tokens(chunk)), output);
+        let pcm = pcm.map_err(|code| (code, i))?;
+        let all = match joined.take() {
+            None => pcm,
+            Some(mut all) => {
+                if all.rate != pcm.rate {
+                    return Err(("format", i));
+                }
+                let gap = usize::try_from(all.rate / 1000 * CHUNK_GAP_MS).unwrap_or(0);
+                all.samples.extend(std::iter::repeat_n(0, gap));
+                all.samples.extend_from_slice(&pcm.samples);
+                all
+            }
+        };
+        if all.duration_secs() > MAX_SPEECH_SECS {
+            return Err(("too_long", i));
+        }
+        joined = Some(all);
     }
+    let pcm = joined.ok_or(("empty", 0))?;
+    let duration_secs = pcm.duration_secs();
+    let last = chunks.len().saturating_sub(1);
+    let ogg = tokio::task::spawn_blocking(move || encode::ogg_opus(&pcm)).await.map_err(|_| ("encode", last))?.map_err(|code| (code, last))?;
+    if ogg.len() as u64 > MAX_AUDIO_BYTES {
+        return Err(("too_big", last));
+    }
+    Ok((Spoken { ogg, duration_secs }, tone))
 }
 
-/// A fala do texto pelo Gemini, no tom dado. `Err` com os motivos (códigos) quando ele não falou: o
-/// texto segue sem áudio.
+/// A fala do texto inteiro pelo Gemini, no tom dado (spec 141 T08, C-08): os trechos de
+/// [`speech_chunks`], falados em sequência e juntados numa nota só, cada um com o prazo da fala
+/// (`Tuning::speech_deadline`). `Err` com os motivos (códigos) quando ele não falou tudo: o texto
+/// segue sem áudio, inteiro. O texto acima de [`MAX_SPOKEN_UNITS`] ou de [`MAX_CHUNKS`] trechos é
+/// `too_long`, sem chamada.
 pub async fn speak(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> Result<Spoken, Vec<&'static str>> {
+    speak_within(state, nanty, text, tone, Duration::MAX).await
+}
+
+/// Como [`speak`], com o mesmo nome do caminho da resposta (spec 139 T08, C-14): o prazo vale por
+/// trecho ([`speak_within`]).
+pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> Result<Spoken, Vec<&'static str>> {
+    speak_within(state, nanty, text, tone, Duration::MAX).await
+}
+
+/// A fala com prazo (spec 139 T08, C-14; por trecho desde a spec 141 T08, revisão 1): cada trecho
+/// tem até `Tuning::speech_deadline` (provisório: 45 s), e a fala inteira, até `limit` (o que sobrou
+/// do limite total do aviso, spec 140 T02). O teto total é o menor entre `limit` e o prazo de um
+/// trecho vezes o número de trechos ([`total_deadline`]). Vencido qualquer um, a fala para ali, sem
+/// pedir nem cobrar os trechos que faltam, o motivo `deadline` fica no registro e a saída vai em
+/// texto, inteira, na hora.
+pub async fn speak_within(state: &AppState, nanty: &Nanty, text: &str, tone: Tone, limit: Duration) -> Result<Spoken, Vec<&'static str>> {
     let cfg = state.config().read().await.clone();
-    let text = speech_text(text, MAX_SPEECH_CHARS);
+    let chunks = speech_chunks(text, CHUNK_CHARS);
+    let per_chunk = nanty.telegram().tuning().speech_deadline;
+    let until = tokio::time::Instant::now().checked_add(total_deadline(per_chunk, chunks.len(), limit));
+    let deadline = Deadline { per_chunk, until };
     let result = match speaker(&cfg) {
         Err(code) => Err(code),
+        Ok(_) if chunks.is_empty() => Err("empty"),
+        Ok(_) if format::units(text) > MAX_SPOKEN_UNITS || chunks.len() > MAX_CHUNKS => Err("too_long"),
         Ok(_) if exhausted(&cfg, nanty) => Err("budget"),
         Ok(step) => {
             let speaking = nanty.speaking();
-            let result = speak_step(&cfg, nanty, &step, &text, tone).await;
+            let result = speak_chunks(&cfg, nanty, &step, &chunks, tone, deadline).await;
             drop(speaking);
-            match &result {
-                Ok(done) => {
+            match result {
+                Ok((done, used)) => {
                     let mut p = param("provider", PROVIDER);
                     p.insert("secs".into(), json!(done.duration_secs));
+                    p.insert("chunks".into(), json!(chunks.len()));
                     // O tom pedido; a linha `voice.style_refused` diz quando ele caiu para o neutro.
                     p.insert("tone".into(), json!(tone.code()));
+                    if used != tone {
+                        p.insert("spoken_tone".into(), json!(used.code()));
+                    }
                     nanty.record(&journal(nanty, "voice.ok", p));
+                    Ok(done)
                 }
-                Err(code) => {
+                Err((code, at)) => {
                     let mut p = param("provider", PROVIDER);
                     p.insert("reason".into(), json!(code));
+                    p.insert("chunk".into(), json!(at));
+                    p.insert("chunks".into(), json!(chunks.len()));
                     nanty.record(&journal(nanty, "voice.failed", p));
+                    Err(code)
                 }
             }
-            result
         }
     };
     result.map_err(|code| {
@@ -361,30 +428,6 @@ pub async fn speak(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> R
         nanty.record(&journal(nanty, "voice.text", param("reasons", json!(reasons))));
         reasons
     })
-}
-
-/// Como [`speak`], dentro do prazo da fala (spec 139 T08, C-14). Vencido, o motivo `deadline` fica
-/// no registro e a saída vai em texto na hora. A chamada segue numa tarefa à parte, sem ser abortada:
-/// ela termina sozinha, com o gasto e o registro reais, e a fala tardia é descartada. Assim toda fala
-/// enviada ao provedor entra no orçamento.
-pub async fn speak_on_time(state: &AppState, nanty: &Nanty, text: &str, tone: Tone) -> Result<Spoken, Vec<&'static str>> {
-    speak_within(state, nanty, text, tone, Duration::MAX).await
-}
-
-/// Como [`speak_on_time`], com o prazo limitado também por `limit`: o que sobrou do limite total do
-/// aviso (spec 140 T02).
-pub async fn speak_within(state: &AppState, nanty: &Nanty, text: &str, tone: Tone, limit: Duration) -> Result<Spoken, Vec<&'static str>> {
-    let deadline = nanty.telegram().tuning().speech_deadline.min(limit);
-    let (job_state, job_text) = (state.clone(), text.to_string());
-    let mut job = tokio::spawn(async move { speak(&job_state, job_state.nanty(), &job_text, tone).await });
-    let reason = match tokio::time::timeout(deadline, &mut job).await {
-        Ok(Ok(result)) => return result,
-        Ok(Err(_)) => "failed",
-        Err(_) => "deadline",
-    };
-    let reasons = vec![reason];
-    nanty.record(&journal(nanty, "voice.text", param("reasons", json!(reasons))));
-    Err(reasons)
 }
 
 /// Entrega a fala do Nanty (spec 139 T08): a resposta, o resumo e a recusa da nota de voz.
@@ -419,8 +462,9 @@ async fn keep(nanty: &Arc<Nanty>, message: &ConversationMessage) {
     let _ = tokio::task::spawn_blocking(move || n.keep_message(&saved)).await;
 }
 
-/// Com a voz ligada, a mensagem ganha a fala: o texto dela (como vai ao Telegram, já redigido) vira
-/// áudio, que a janela toca e o Telegram recebe como nota de voz.
+/// Com a voz ligada, a mensagem ganha a fala (spec 141 T08, C-08): o texto inteiro dela (como vai ao
+/// Telegram, já redigido) vira um áudio só, que a janela toca e o Telegram
+/// recebe como nota de voz. Sem a fala inteira, nada muda: a mensagem segue em texto.
 async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut ConversationMessage, tone: Tone) {
     let cfg = state.config().read().await.clone();
     if !cfg.nanty.voice.enabled {
@@ -432,12 +476,12 @@ async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut Conve
     if text.is_empty() {
         return;
     }
-    let tail = render::closing(lang, message).map(|line| format::clean(&secrets, &line));
-    // Spec 140 T14 (C-27): a resposta longa fala só o começo do primeiro parágrafo.
-    let text = match long_lead(message, &text, cfg.nanty.voice.lead_chars()) {
-        Some(end) => text[..end].trim_end().to_string(),
-        None => speech_keeping(&text, tail.as_deref(), MAX_SPEECH_CHARS),
-    };
+    // Revisão 2 (F-02): só fala o que a divisão real do Telegram mostra inteiro. A janela segue a
+    // mesma regra: é a mesma mensagem.
+    if !speakable(&text) {
+        too_long(nanty);
+        return;
+    }
     let Ok(spoken) = speak_on_time(state, nanty, &text, tone).await else { return };
     let n = Arc::clone(nanty);
     let audio = tokio::task::spawn_blocking(move || save_audio(&n, &spoken.ogg, spoken.duration_secs)).await.ok().flatten();
@@ -445,6 +489,19 @@ async fn attach_speech(state: &AppState, nanty: &Arc<Nanty>, message: &mut Conve
         unsaved(nanty);
     }
     message.audio = audio;
+}
+
+/// A fala cabe no que o Telegram mostra (spec 141 T08, revisão 2, F-02): o texto inteiro sai nas
+/// [`format::MAX_PARTS`] partes do [`format::split`], com a folga do teclado na última
+/// ([`format::LAST_PART_ROOM`], o pior caso), sem corte, e fica abaixo do teto de segurança
+/// ([`MAX_SPOKEN_UNITS`]). Assim a nota nunca fala o que o texto não mostra.
+pub fn speakable(text: &str) -> bool {
+    format::units(text) <= MAX_SPOKEN_UNITS && format::fits_parts(text, format::LAST_PART_ROOM, format::MAX_PARTS)
+}
+
+/// O texto passa do que o Telegram mostra: a fala não sai, sem chamada, com o motivo no registro.
+pub fn too_long(nanty: &Nanty) {
+    nanty.record(&journal(nanty, "voice.text", param("reasons", json!(["too_long"]))));
 }
 
 /// O áudio não foi guardado: a mensagem segue em texto, com o motivo no registro.

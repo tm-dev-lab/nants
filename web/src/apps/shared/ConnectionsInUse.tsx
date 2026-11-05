@@ -158,7 +158,7 @@ function RoleRow({ role, agents, connections, pause, running }: { role: AgentRol
             </button>
           ) : null}
           {page !== null ? (
-            <a className="nd-btn nd-btn-sm" data-variant="ghost" href={page.url} target="_blank" rel="noopener noreferrer" data-conn-use-page="">
+            <a className="nd-btn nd-btn-sm nd-btn-wrap" data-variant="ghost" href={page.url} target="_blank" rel="noopener noreferrer" data-conn-use-page="">
               <Icon name="external" size={14} />
               {page.label}
             </a>

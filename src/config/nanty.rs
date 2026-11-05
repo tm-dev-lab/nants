@@ -1134,9 +1134,6 @@ pub const DEFAULT_GEMINI_VOICE: &str = "Kore";
 pub const DEFAULT_TRANSCRIBE_MODEL: &str = "gemini-3.8-flash";
 /// Nota de voz mais longa aceita para transcrição, em segundos (provisório).
 pub const DEFAULT_VOICE_MAX_INPUT_SECS: u64 = 300;
-/// Até quantos caracteres do primeiro parágrafo a resposta longa fala (spec 140 T14, C-27;
-/// provisório): a fala para no último fim de frase antes disso.
-pub const DEFAULT_VOICE_LEAD_CHARS: usize = 450;
 
 /// Um passo da ordem antiga da voz (até a rc.22): só lido, para a migração ([`NantyVoice::migrate`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1170,6 +1167,9 @@ pub struct VoiceMigration {
 /// - **Forma antiga** (`order` e `transcribe`, até a rc.22): só lida, nunca gravada. Ao carregar
 ///   ([`super::Config::load_from`]), [`Self::migrate`] passa o primeiro passo do Gemini para o
 ///   campo novo e tira os da OpenAI; o Nanty registra o que saiu ao subir.
+/// - **`lead_chars`** (a fala só do começo da resposta longa, spec 140 T14, até a spec 141 T08): saiu
+///   com a voz tudo ou nada. Um arquivo antigo que ainda o tenha carrega normalmente: a chave é
+///   ignorada na leitura e some na próxima gravação.
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NantyVoice {
@@ -1184,9 +1184,6 @@ pub struct NantyVoice {
     pub transcribe_model: String,
     #[serde(skip_serializing_if = "is_default_max_input")]
     pub max_input_secs: u64,
-    /// A fala da resposta longa (spec 140 T14): até quantos caracteres do primeiro parágrafo.
-    #[serde(skip_serializing_if = "is_default_lead_chars")]
-    pub lead_chars: usize,
     /// A ordem antiga (lida, nunca gravada).
     #[serde(skip_serializing)]
     pub order: Vec<VoiceRoute>,
@@ -1207,7 +1204,6 @@ impl Default for NantyVoice {
             voice: DEFAULT_GEMINI_VOICE.to_string(),
             transcribe_model: DEFAULT_TRANSCRIBE_MODEL.to_string(),
             max_input_secs: DEFAULT_VOICE_MAX_INPUT_SECS,
-            lead_chars: DEFAULT_VOICE_LEAD_CHARS,
             order: Vec::new(),
             transcribe: NantyRoute::default(),
             migrated: None,
@@ -1224,7 +1220,6 @@ impl PartialEq for NantyVoice {
             && self.voice == other.voice
             && self.transcribe_model == other.transcribe_model
             && self.max_input_secs == other.max_input_secs
-            && self.lead_chars == other.lead_chars
             && self.order == other.order
             && self.transcribe == other.transcribe
     }
@@ -1244,10 +1239,6 @@ fn is_default_transcribe_model(v: &str) -> bool {
 
 fn is_default_max_input(v: &u64) -> bool {
     *v == DEFAULT_VOICE_MAX_INPUT_SECS
-}
-
-fn is_default_lead_chars(v: &usize) -> bool {
-    *v == DEFAULT_VOICE_LEAD_CHARS
 }
 
 /// O valor escolhido, ou o inicial quando vazio.
@@ -1274,13 +1265,6 @@ impl NantyVoice {
     /// O modelo da transcrição (o inicial quando vazio).
     pub fn transcribe_model(&self) -> String {
         or_default(&self.transcribe_model, DEFAULT_TRANSCRIBE_MODEL)
-    }
-
-    /// A fala da resposta longa, em caracteres (spec 140 T14): entre 100 e 900, para o trecho caber na
-    /// legenda de 1024 com a linha de que o resto vem a seguir (revisão 1, F-02). Mesmo assim, o
-    /// `voice::long_lead` confere em unidades do Telegram.
-    pub fn lead_chars(&self) -> usize {
-        self.lead_chars.clamp(100, 900)
     }
 
     /// Migra a forma antiga (`order` e `transcribe`, até a rc.22) para a nova (C-16): o primeiro
@@ -1555,6 +1539,18 @@ offset = 7
             (empty.speech_model(), empty.voice_name(), empty.transcribe_model()),
             (DEFAULT_GEMINI_TTS_MODEL.to_string(), DEFAULT_GEMINI_VOICE.to_string(), DEFAULT_TRANSCRIBE_MODEL.to_string())
         );
+    }
+
+    /// Spec 141 T08 (C-08): o `lead_chars` da 140/T14 saiu. O arquivo antigo que o tem carrega igual,
+    /// e a chave some na próxima gravação.
+    #[test]
+    fn the_old_lead_chars_is_ignored_on_read() {
+        let old = "[nanty.voice]\nenabled = true\nlead_chars = 600\n";
+        let cfg: Config = toml::from_str(old).expect("o arquivo antigo carrega");
+        assert!(cfg.nanty.voice.enabled);
+        assert_eq!(cfg.nanty.voice, NantyVoice { enabled: true, ..NantyVoice::default() });
+        let text = toml::to_string(&cfg).expect("ser");
+        assert!(!text.contains("lead_chars"), "{text}");
     }
 
     /// A forma do config da rc.22 (só a forma, sem segredos): a ordem com o Gemini e a OpenAI e a

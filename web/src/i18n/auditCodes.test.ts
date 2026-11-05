@@ -39,7 +39,7 @@ afterEach(() => {
 });
 
 /** Códigos que o servidor passou a mandar na T06, por família (cada um com chave nos dois idiomas). */
-const ACTIVITY_STAGE_CODES = ["report", "architecture", "plan_review", "final_verification", "tests", "tests_base", "check", "check_base"];
+const ACTIVITY_STAGE_CODES = ["report", "architecture", "plan_review", "final_verification", "tests", "tests_base", "check", "check_base", "restriction_official", "restriction_new"];
 const ACTIVITY_CODES = [
   "tool.read_file", "tool.list_dir", "tool.search_code", "tool.write_file", "tool.write_sdd_artifacts", "tool.run_command",
   "tool.fetch_url", "tool.package_versions", "tool.web_source", "tool.web_search_unavailable", "tool.view_reference",

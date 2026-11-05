@@ -306,6 +306,7 @@ mod tests {
                 tested_signature: None,
                 tested_at: None,
                 test_evidence: None,
+                failure_signature: None,
                 test_run: None,
                 next_action: None,
                 next_action_code: None,

@@ -842,6 +842,8 @@ async fn running_app_that_exits_turns_finished_with_code_and_files() {
     fs::create_dir_all(root.join("out")).expect("d");
     fs::write(root.join("out/report.txt"), "pronto").expect("w");
     fs::write(root.join("data.csv"), "a\nb\n").expect("w");
+    // A pasta pessoal antiga (legado, spec 141 T01) segue fora da lista.
+    fs::create_dir_all(root.join(".nants-home")).expect("d");
     fs::write(root.join(".nants-home/.cache-x"), "x").expect("w");
     fs::write(root.join(".sdd/extra.md"), "x").expect("w");
     *rec.ps_output.lock().expect("lock") = format!("{}\n", ps_workspace("exited", 0));

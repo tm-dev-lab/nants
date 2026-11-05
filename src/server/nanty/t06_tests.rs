@@ -3,8 +3,8 @@
 //!
 //! - as saídas das ferramentas e as reservas do dicionário não têm snake_case, "0 tentativas" nem
 //!   chaves internas, nos dois idiomas;
-//! - o aviso e o resumo com o texto do modelo não repetem as linhas fixas; o porquê segue do
-//!   dicionário, numa frase curta junto;
+//! - o aviso e o resumo com o texto do modelo não repetem as linhas fixas; o porquê do aviso segue no
+//!   cartão, e o do resumo fica como dado para a janela (spec 141 T10);
 //! - o `/status` e o `/resumo` são escritos pelo modelo quando há modelo e orçamento, a partir dos
 //!   mesmos fatos (sem zeros), e caem na reserva sem ele.
 
@@ -175,8 +175,10 @@ fn every_nanty_phrase_in_both_dictionaries_speaks_without_snake_case_or_raw_zero
     }
 }
 
+/// Spec 141 T09 (C-09, C-10): `project_status` e `system_status` devolvem dados com códigos, sem zero
+/// e sem o id da spec; as outras ferramentas seguem em frases curtas, sem código nem zero.
 #[tokio::test]
-async fn tool_outputs_are_short_phrases_without_codes_or_zeros_in_both_languages() {
+async fn status_tools_return_data_with_codes_and_the_others_short_phrases_in_both_languages() {
     let w = World::new("tools", None, |_| {});
     // Um cartão aberto e algo feito hoje, para o `nanty_activity` ter linhas.
     let cfg = w.state.config().read().await.nanty.clone();
@@ -184,16 +186,17 @@ async fn tool_outputs_are_short_phrases_without_codes_or_zeros_in_both_languages
     let cards: Vec<String> = w.nanty().snapshot().cards.iter().map(|c| c.id.clone()).collect();
     let ids: Vec<String> = ["p1", "p14", "001-demo", "T01", "T02"].iter().map(|s| (*s).to_string()).chain(cards).collect();
     for lang in [Lang::PtBr, Lang::En] {
-        let status = w.tool(lang, "project_status", json!({"project_id": "p14"})).await;
-        // O motivo e as tentativas em frases do dicionário, nunca `tests_failed` nem "Tentativas: 2".
-        assert!(status.contains(&crate::i18n::tr(lang, "nanty.reason.tests_failed", &[])), "{status}");
-        assert!(status.contains(&crate::i18n::tr_plural(lang, "nanty.status.attempts_of", 2, &[("max", "3")])), "{status}");
-        assert_human(&status, &ids, "project_status");
+        let status: Value = serde_json::from_str(&w.tool(lang, "project_status", json!({"project_id": "p14"})).await).expect("JSON");
+        let s = &status["status"];
+        assert_eq!((s["reason"].as_str(), s["attempts"].as_u64(), s["max_attempts"].as_u64()), (Some("tests_failed"), Some(2), Some(3)), "{status}");
+        assert!(s.get("spec_id").is_none() && s.get("cost_usd").is_none(), "{status}");
+        let system: Value = serde_json::from_str(&w.tool(lang, "system_status", json!({})).await).expect("JSON");
+        assert_eq!(system["version"], json!(env!("CARGO_PKG_VERSION")));
+        let p14 = system["projects"].as_array().and_then(|l| l.iter().find(|p| p["id"] == "p14")).expect("p14");
+        assert_eq!((p14["phase"].as_str(), p14["reason"].as_str()), (Some("paused"), Some("tests_failed")), "{system}");
         for (name, args) in [
-            ("project_status", json!({"project_id": "p1"})),
             ("project_status", json!({"project_id": "nada"})),
             ("project_status", json!({})),
-            ("system_status", json!({})),
             ("nanty_activity", json!({})),
             ("set_silence", json!({"hours": 99})),
             ("propose_action", json!({"action_id": "approve_plan", "project_id": "p14"})),
@@ -264,8 +267,11 @@ async fn the_notice_with_model_text_does_not_repeat_the_fixed_lines() {
     assert!(system.contains("não o repita") && system.contains("sem repetir códigos, ids, nomes de campo"), "{system}");
 }
 
+/// Spec 141 T10 (C-10): com o texto do modelo, o resumo é o selo e o texto dele; as linhas fixas de
+/// contagem, custo e disco e o porquê de cada aviso guardado saem do texto (o porquê fica como dado,
+/// para a janela).
 #[test]
-fn the_digest_with_model_text_keeps_the_short_sentence_and_the_why_of_held_notices() {
+fn the_digest_with_model_text_is_the_seal_and_the_model_text_only() {
     let item = DigestItem {
         at_ms: 1,
         project_id: Some("p1".into()),
@@ -284,25 +290,17 @@ fn the_digest_with_model_text_keeps_the_short_sentence_and_the_why_of_held_notic
     assert_eq!(counted.len(), 4, "contagem, espera, custo e disco: {counted:?}");
     let model = "Bom dia! Uma tarefa saiu de madrugada e um aviso espera você.";
     digest::with_model_text(&mut message, &facts, model.to_string());
-    // O porquê de cada aviso guardado sai sempre, do dicionário (C-06 da 138): o aviso guardado não
-    // virou cartão, então só existe aqui.
-    for (lang, fixed) in [
-        (Lang::PtBr, "Resumo da manhã.\nGuardei 1 aviso para este resumo:\nUma tarefa foi entregue às 02:00."),
-        (Lang::En, "Morning summary.\nI saved 1 notice for this summary:\nA task was delivered at 02:00."),
-    ] {
-        let shown = render::message_text(lang, &message);
-        assert_eq!(shown, format!("{fixed}\n{model}"));
+    for (lang, seal) in [(Lang::PtBr, "Resumo da manhã"), (Lang::En, "Morning summary")] {
+        assert_eq!(render::message_text(lang, &message), format!("{seal}\n{model}"));
     }
-    // As linhas de contagem, custo e disco não entram junto do texto do modelo.
-    let shown = render::message_text(Lang::PtBr, &message);
-    for line in &counted {
-        assert!(!shown.contains(line.as_str()), "linha fixa repetida: {line}");
-    }
-    // Sem aviso guardado, a frase curta é só a do resumo.
+    assert!(message.params.get(digest::WHY).is_none(), "{:?}", message.params);
+    assert_eq!(message.params[digest::HELD][0]["notices"][0]["kind"], "task_delivered");
+    // Sem aviso guardado, só o selo e o texto.
     let facts = DigestFacts { paused: 1, ..DigestFacts::default() };
     let mut message = digest::compose(&facts, &crate::config::NantyConfig::default(), "m".into(), 1).expect("resumo");
     digest::with_model_text(&mut message, &facts, "Um projeto parou.".into());
-    assert_eq!(render::message_text(Lang::En, &message), "Morning summary.\nUm projeto parou.");
+    assert_eq!(render::message_text(Lang::En, &message), "Morning summary\nUm projeto parou.");
+    assert!(message.params.is_empty(), "{:?}", message.params);
 }
 
 // ---- Os atalhos pelo modelo ----
@@ -357,28 +355,21 @@ async fn status_and_summary_are_written_by_the_model_from_the_same_facts() {
 
 /// Revisão 1 da T06 (F-04): as chaves que o `status_lines` monta com `format!` existem nos dois
 /// idiomas para todo código das listas fixas; um código novo sem frase quebra aqui, e não vaza a
-/// chave crua ao modelo.
+/// chave crua na reserva. Spec 141 T09: a reserva leva o motivo; a parada do provedor, o papel e o
+/// que espera a pessoa vão ao modelo só em dados.
 #[test]
 fn every_built_status_key_exists_in_both_languages() {
     use super::observe::Phase;
     let mut keys: Vec<String> = crate::agents::runner::BLOCK_CODES.iter().map(|c| format!("nanty.reason.{c}")).collect();
-    for code in crate::server::attention::PROVIDER_STOP_CODES {
-        let rest = code.strip_prefix("run.").expect("parada com o prefixo run.");
-        keys.push(format!("nanty.stop.{rest}"));
-    }
-    keys.extend(["architect", "developer", "reviewer"].iter().map(|r| format!("nanty.status.stop_role.{r}")));
     for phase in [Phase::Paused, Phase::ProviderStopped, Phase::PlanWaiting, Phase::Stalled, Phase::Running, Phase::Stopped] {
         keys.push(tools::phase_code(phase));
-    }
-    for item in ["plan_approval", "choice", "recovery_choice"] {
-        keys.push(format!("nanty.status.waiting.{item}"));
     }
     for lang in [Lang::PtBr, Lang::En] {
         for key in &keys {
             assert!(crate::i18n::lookup(lang, key).is_some(), "{lang:?}: falta {key}");
         }
         // As montadas com plural (`count`): as duas formas.
-        for base in ["nanty.status.attempts", "nanty.status.attempts_of", "nanty.status.progress", "nanty.status.progress_none", "nanty.status.waiting.permission", "nanty.status.cost_alerts"] {
+        for base in ["nanty.status.progress", "nanty.status.progress_none"] {
             for form in ["one", "other"] {
                 assert!(crate::i18n::lookup(lang, &format!("{base}.{form}")).is_some(), "{lang:?}: falta {base}.{form}");
             }

@@ -8,7 +8,8 @@
 //!   estruturados. Os ids de tarefa só entram na forma do SDD ([`super::turn::is_task_id`]), e o
 //!   `spec_id` não vai ao modelo.
 //! - **Linha antiga (C-01):** a mensagem do Nanty sem o campo conta como contaminada, com a fonte
-//!   [`TaintKind::Unknown`], até sair das últimas mensagens.
+//!   [`TaintKind::Unknown`]. Desde a spec 141 T06 (C-07), ela nem entra na janela da conversa
+//!   ([`super::history::context`]); a fonte continua valendo para quem a lê por outro caminho.
 //! - **Quarentena (C-02):** o texto contaminado fica inteiro só nas últimas mensagens; depois, vira uma
 //!   linha do servidor só com campos estruturados: a hora, os projetos e o tipo de leitura.
 //! - **A herança acompanha a origem:** a resposta escrita num turno contaminado é contaminada, porque
@@ -180,8 +181,10 @@ pub trait Scoped {
 impl Scoped for ConversationMessage {
     fn projects(&self) -> Vec<&str> {
         let sources = self.taint.iter().flat_map(|t| t.sources.iter()).filter_map(|s| s.project_id.as_deref());
+        // Spec 141 T06: os projetos dos fatos de aviso também (C-16).
+        let notices = self.notices.iter().filter_map(|f| f.project_id.as_deref());
         let mut out: Vec<&str> = Vec::new();
-        for id in self.project_id.as_deref().into_iter().chain(self.project_ids.iter().map(String::as_str)).chain(sources) {
+        for id in self.project_id.as_deref().into_iter().chain(self.project_ids.iter().map(String::as_str)).chain(sources).chain(notices) {
             if !out.contains(&id) {
                 out.push(id);
             }

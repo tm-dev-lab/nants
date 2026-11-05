@@ -448,7 +448,7 @@ mod tests {
 
     /// Chaves com o mesmo texto nos dois idiomas, com o motivo (a sentinela acima exige pt-BR
     /// diferente do en no resto).
-    const SAME_IN_BOTH: [(&str, &str); 10] = [
+    const SAME_IN_BOTH: [(&str, &str); 11] = [
         ("doctor.status.ok", "marca de status do doctor, igual nos dois"),
         ("doctor.status.info", "marca de status do doctor, igual nos dois"),
         ("doctor.label.git", "nome de ferramenta"),
@@ -459,6 +459,7 @@ mod tests {
         ("doctor.detail.disk", "só a lista, montada por idioma nos itens"),
         ("report.traceability.commit", "id e hash do commit, sem texto traduzível"),
         ("architecture.section.stack", "título de seção do ARCHITECTURE.md: \"Stack\" é o mesmo termo nos dois idiomas"),
+        ("nanty.digest.item", "só o nome do projeto e a frase do porquê, já traduzida, com dois pontos entre eles (spec 141 T10)"),
     ];
 
     /// Spec 115 T01: plural com `.one` e `.other` sempre juntos, nos dois dicionários, sem a chave

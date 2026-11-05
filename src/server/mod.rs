@@ -52,6 +52,7 @@ pub mod projects_root;
 pub mod provider_errors;
 pub mod readiness;
 pub mod recovery;
+pub mod config_restriction;
 pub mod report;
 pub mod runs;
 pub mod safe_fs;

@@ -41,7 +41,7 @@ fn facts_carry_the_install_footprint_warning_with_the_rule() {
     std::fs::write(&spec, format!("---\nid: s1\n---\n## Contexto\nx\n\n## {section}\n- registro\n- {warning}\n")).expect("spec");
     let loaded = load(&root, "s1", "T01", &SecretSet::default()).expect("com aviso");
     assert!(loaded.facts.contains("/tmp/.local/lib (288)"), "{}", loaded.facts);
-    assert!(loaded.facts.contains("o que um comando grava fora de /work se perde no comando seguinte"), "{}", loaded.facts);
+    assert!(loaded.facts.contains("o que um comando grava em outro lugar se perde no comando seguinte"), "{}", loaded.facts);
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn parse_revise_config_valid_and_invalid() {
 fn validate_config_applies_docker_policy_denylist_and_no_change() {
     let root = config_root("validate", DOCKER_SETTINGS);
     let secrets = SecretSet::default();
-    let prop = |t: &str| ConfigProposal { test_command: Some(t.into()), checks: None };
+    let prop = |t: &str| ConfigProposal { full_test_command: None, test_command: Some(t.into()), checks: None };
     // Embrulhado é desembrulhado; docker restante é recusado.
     let wrapped = "docker compose -f .nants/compose.yaml run --rm workspace sh -lc 'npm ci && npm test'";
     let ok = validate_config(&root, &prop(wrapped), &secrets).expect("desembrulha");
@@ -321,7 +321,14 @@ fn write_config_preserves_other_fields_and_config_suspect_detects_docker_command
     let wrapped = "base_branch: main\nmerge_strategy: squash\ntest_command: docker compose run --rm workspace sh -lc 'x y'\nyolo: true\nenvironment: docker\n";
     let root = config_root("write", wrapped);
     assert!(config_suspect(&root));
-    let change = ConfigChange { test_command: Some("npm test".into()), checks: None, diff: String::new(), commands: vec![] };
+    let change = ConfigChange {
+        test_command: Some("npm test".into()),
+        full_test_command: None,
+        checks: None,
+        diff: String::new(),
+        commands: vec![],
+        restriction: None,
+    };
     write_config(&root, &change, &SecretSet::default()).expect("grava");
     let text = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("lê");
     assert!(text.contains("npm test") && text.contains("yolo: true") && text.contains("environment: docker"), "{text}");
@@ -364,6 +371,7 @@ fn repeated_test_command_is_refused_and_previous_is_kept() {
     let test01 = "base_branch: main\nmerge_strategy: squash\ntest_command: npm ci --no-audit --no-fund && npm test\n";
     let root = config_root("repeat", test01);
     let doubled = ConfigProposal {
+        full_test_command: None,
         test_command: Some("npm ci --no-audit --no-fund && npm test && npm ci --no-audit --no-fund && npm test".into()),
         checks: None,
     };
@@ -371,7 +379,7 @@ fn repeated_test_command_is_refused_and_previous_is_kept() {
     assert!(refused.starts_with(CAUSE_CONFIG_REPEATS), "{refused}");
     let text = std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("lê");
     assert!(text.contains("test_command: npm ci --no-audit --no-fund && npm test\n"), "{text}");
-    let extra = ConfigProposal { test_command: Some("npm ci --no-audit --no-fund && npm test && npm run e2e".into()), checks: None };
+    let extra = ConfigProposal { full_test_command: None, test_command: Some("npm ci --no-audit --no-fund && npm test && npm run e2e".into()), checks: None };
     assert!(validate_config(&root, &extra, &SecretSet::default()).is_ok());
 }
 
@@ -469,12 +477,12 @@ fn docker_exemption_applies_only_to_the_rewritten_command() {
     let current = Settings::parse(settings).expect("settings");
     let lint = |blocking| vec![Check { name: "lint".into(), command: "npm run lint".into(), blocking }];
     // Reescrita equivalente do comando docker, demais itens preservados.
-    assert!(check_not_weakened(&current, "npm ci && npm test", &lint(true)).is_ok());
+    assert!(check_not_weakened(&current, "npm ci && npm test", None, &lint(true)).is_ok());
     // O comando interno precisa ser preservado.
-    assert!(check_not_weakened(&current, "echo ok", &lint(true)).is_err());
+    assert!(check_not_weakened(&current, "echo ok", None, &lint(true)).is_err());
     // A isenção não vale para o check que não invoca docker.
-    assert!(check_not_weakened(&current, "npm test", &[]).is_err());
-    assert!(check_not_weakened(&current, "npm test", &lint(false)).is_err());
+    assert!(check_not_weakened(&current, "npm test", None, &[]).is_err());
+    assert!(check_not_weakened(&current, "npm test", None, &lint(false)).is_err());
 }
 
 #[test]
@@ -482,7 +490,7 @@ fn validate_config_refuses_proposals_that_weaken_verification() {
     let settings = "base_branch: main\nmerge_strategy: squash\ntest_command: npm test\nchecks:\n  - name: lint\n    command: npm run lint\n    blocking: true\n";
     let root = config_root("weaken", settings);
     let secrets = SecretSet::default();
-    let proposal = |t: Option<&str>, c: Option<Vec<Check>>| ConfigProposal { test_command: t.map(str::to_string), checks: c };
+    let proposal = |t: Option<&str>, c: Option<Vec<Check>>| ConfigProposal { full_test_command: None, test_command: t.map(str::to_string), checks: c };
     let weak = validate_config(&root, &proposal(Some("echo ok"), None), &secrets).err().unwrap_or_default();
     assert!(weak.starts_with(CAUSE_CONFIG_WEAKENS), "{weak}");
     assert!(validate_config(&root, &proposal(Some("npm test || true"), None), &secrets).is_err());
@@ -671,6 +679,8 @@ fn raw(kind: OptionKind, id: &str) -> RecoveryOption {
         allowed_scope: None,
         diff: None,
         files: None,
+        full_test_command: None,
+        restriction: None,
     }
 }
 
@@ -816,6 +826,9 @@ fn apply_choice_applies_each_kind_and_rejects_stale_or_unblocked() {
             .is_some_and(|s| s.contains("configuração de testes foi alterada")),
         "{body}"
     );
+    // Spec 141 T05: a troca do comando não pede mudança de código: a retomada testa primeiro.
+    assert!(section_text(&body, crate::agents::runner::TEST_FIRST_SECTION).is_some(), "{body}");
+    assert!(crate::agents::runner::test_first_armed(&crate::agents::runner::mark_human_resumed(&body)));
     // Reaplicar a mesma config: a proposta já não muda nada, a opção venceu.
     assert_eq!(apply(Choice::Option("cfg".into(), 1)), Err(ChoiceError::Stale));
     assert_eq!(apply(Choice::Option("gui".into(), 1)), Ok("guidance"));
@@ -1447,7 +1460,7 @@ const INSTALL_SETTINGS: &str = "base_branch: main\nmerge_strategy: squash\ntest_
 fn revise_config_with_repeated_install_keeps_the_command_and_warns() {
     let root = config_root("repeated-install", INSTALL_SETTINGS);
     let secrets = SecretSet::default();
-    let proposal = ConfigProposal { test_command: Some("pip install -e . && python -m pytest".into()), checks: None };
+    let proposal = ConfigProposal { full_test_command: None, test_command: Some("pip install -e . && python -m pytest".into()), checks: None };
     let change = validate_config(&root, &proposal, &secrets).expect("aceita");
     assert_eq!(change.test_command.as_deref(), Some("pip install -e . && python -m pytest"));
     write_config(&root, &change, &secrets).expect("grava");
@@ -1464,7 +1477,7 @@ fn revise_config_with_repeated_install_keeps_the_command_and_warns() {
     let en = repeated_install_warnings(&root, &proposal, Lang::En);
     assert!(en[0].contains("which Nants already runs before the tests"), "{}", en[0]);
     // A proposta só de checks não reclama do test_command que ela não mudou.
-    let only_checks = ConfigProposal { test_command: None, checks: Some(vec![]) };
+    let only_checks = ConfigProposal { full_test_command: None, test_command: None, checks: Some(vec![]) };
     assert!(repeated_install_warnings(&root, &only_checks, Lang::PtBr).is_empty());
     // Sem install_command, nada.
     let plain = config_root("repeated-install-none", DOCKER_SETTINGS);
@@ -1515,6 +1528,18 @@ mod refused_config {
         (state, scripted, root)
     }
 
+    /// Runner sem rodadas do servidor (as propostas destes testes não restringem nada).
+    struct NoProbe;
+    impl SpecRunner for NoProbe {
+        fn run<'a>(&'a self, _spec_id: &'a str) -> crate::agents::runner::Fut<'a, Result<crate::agents::runner::SpecOutcome, crate::agents::runner::RunnerError>> {
+            Box::pin(async { Err(crate::agents::runner::RunnerError::Invalid("não usado".into())) })
+        }
+    }
+
+    pub(super) fn no_probe() -> Arc<dyn SpecRunner> {
+        Arc::new(NoProbe)
+    }
+
     fn loaded() -> Loaded {
         Loaded {
             facts: "fatos".into(),
@@ -1544,7 +1569,9 @@ mod refused_config {
         let scope = Scope { state, project_id: "p1", spec_id: "s1", root, secrets: &secrets, events: &events, dialog: &dialog };
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
         let loaded = loaded();
-        let job = config_with_feedback(&scope, &loaded, "T01", decision, &mut rx, "fatos da análise");
+        let runner = no_probe();
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let job = config_with_feedback(&scope, &loaded, probe, decision, &mut rx, "fatos da análise");
         match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
             Ok(Ok(decision)) => decision,
             Ok(Err(_)) => panic!("parou sem decisão"),
@@ -1615,7 +1642,9 @@ mod refused_config {
         let loaded = loaded();
         let (decision, facts) = decide(&scope, "fatos", "T01", &mut rx, true, false).await.ok().expect("decisão");
         assert!(decision.config.is_some() && facts.contains(YOLO_REINFORCED_NOTE), "{facts}");
-        let job = config_with_feedback(&scope, &loaded, "T01", decision, &mut rx, &facts);
+        let runner = no_probe();
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let job = config_with_feedback(&scope, &loaded, probe, decision, &mut rx, &facts);
         let decision = match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
             Ok(Ok(decision)) => decision,
             _ => panic!("sem decisão"),
@@ -1657,6 +1686,8 @@ fn revise_task_option_fixture_matches_the_server_serialization() {
         allowed_scope: Some(vec!["src/api/**".into(), "tests/**".into()]),
         diff: None,
         files: None,
+        full_test_command: None,
+        restriction: None,
     };
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/apps/conversation/fixtures/reviseTaskOption.json");
     let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture")).expect("json");
@@ -1664,4 +1695,527 @@ fn revise_task_option_fixture_matches_the_server_serialization() {
     assert!(fixture["acceptance"].is_string());
     let back: RecoveryOption = serde_json::from_value(fixture).expect("o fixture volta ao tipo do servidor");
     assert_eq!(back, option);
+}
+
+// ---- Spec 141 T03: `reset_workspace` e os fatos do ambiente do Nants ----
+
+/// C-06: a opção `reset_workspace` aceita só um texto opcional e, na escolha, exige que o servidor
+/// já a tenha executado (`adopted`); o registro conta ao Desenvolvedor o que foi feito.
+#[test]
+fn reset_workspace_option_is_validated_and_needs_the_server_to_run_it() {
+    let secrets = SecretSet::default();
+    let root = config_root("reset-opt", OPT_SETTINGS);
+    let plain = RecoveryOption { text: Some("limpa a pasta pessoal".into()), ..raw(OptionKind::ResetWorkspace, "reset_workspace") };
+    let mixed = RecoveryOption { test_command: Some("npm ci && npm test".into()), ..raw(OptionKind::ResetWorkspace, "misto") };
+    let (valid, discarded) = validate_options(&root, &secrets, vec![plain, mixed], true, &|| true);
+    assert_eq!(valid.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["reset_workspace"]);
+    assert!(discarded[0].contains("campos de outro tipo"), "{discarded:?}");
+    let parsed = parse_options_of(
+        r#"{"decision":"ESCALATE","root_cause":"c","proposal":"p","options":[{"id":"r","label":"Limpar","kind":"reset_workspace"}]}"#,
+    );
+    assert_eq!(parsed.0[0].kind, OptionKind::ResetWorkspace, "{parsed:?}");
+    let root = choice_root("reset-choice", "BLOCKED", &analysis_with(&valid));
+    let choice = Choice::Option("reset_workspace".into(), 1);
+    assert_eq!(is_reset_choice(&root, "s1", "T01", &choice, &secrets, &|| true), Ok(true));
+    assert_eq!(apply_choice(&root, "s1", "T01", &choice, &secrets, &|| true, false, Lang::PtBr), Err(ChoiceError::Io), "sem executar, recusa");
+    assert_eq!(apply_choice(&root, "s1", "T01", &choice, &secrets, &|| true, true, Lang::En), Ok("reset_workspace"));
+    let (_, body) = read_task_body(&root);
+    let guidance = section_text(&body, crate::agents::runner::GUIDANCE_SECTION).unwrap_or_default();
+    assert!(guidance.contains("the server cleaned this task's home folder (/nants/home)"), "{guidance}");
+    assert_eq!(is_reset_choice(&root, "s1", "T01", &Choice::Guidance("x".into()), &secrets, &|| true), Ok(false));
+}
+
+/// O prompt da recuperação diz que `guidance` só orienta e documenta `reset_workspace`.
+#[test]
+fn recovery_prompt_says_guidance_only_guides_and_documents_reset_workspace() {
+    let flat = crate::agents::prompts::recovery_system().split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("`guidance` SÓ ORIENTA o Desenvolvedor: não executa nada"), "{flat}");
+    assert!(flat.contains("`reset_workspace` (opcional `text`): o SERVIDOR limpa a pasta pessoal (HOME) da worktree"), "{flat}");
+    assert!(flat.contains("config|environment|guidance|revise_task|reset_workspace"), "{flat}");
+}
+
+/// Critério 3: os fatos da recuperação dizem onde fica cada configuração, a montagem da área de
+/// trabalho e do HOME, a worktree e o compose sem valores sensíveis, tudo de constantes.
+#[test]
+fn recovery_facts_carry_the_nants_environment() {
+    let secret = ["valor", "sensivel", "abc123"].join("-");
+    let root = choice_root("facts-nants-env", "BLOCKED", "");
+    std::fs::create_dir_all(root.join(".nants")).expect("nants");
+    // Revisão 1 (F-01): segredo em `command`, `entrypoint`, `healthcheck.test`, `labels` em lista,
+    // bloco `x-*` com âncora e nome fora de qualquer lista, e volume com credencial na URL.
+    let compose = format!(
+        "x-db: &db\n  DB_PASS: {secret}\n  MYSQL_ROOT_PWD: {secret}\n\
+         services:\n  workspace:\n    build:\n      context: .\n      args:\n        NPM_TOKEN: {secret}\n    environment:\n      - API_KEY={secret}\n      - MODE=test\n    image: node:20\n\
+         \x20   ports:\n      - \"8080:80\"\n    volumes:\n      - ./data:/var/lib/data\n      - nfs://admin:{secret}@nas.local/share:/mnt\n\
+         \x20   command: redis-server --requirepass {secret}\n    entrypoint: [\"sh\", \"-c\", \"run --pass {secret}\"]\n\
+         \x20   labels:\n      - traefik.http.middlewares.auth.basicauth.users=admin:{secret}\n\
+         \x20 db:\n    image: postgres:16\n    environment:\n      POSTGRES_PASSWORD: {secret}\n    x-extra: *db\n\
+         \x20   healthcheck:\n      test: [\"CMD\", \"mysqladmin\", \"ping\", \"-p{secret}\"]\n      interval: 10s\n"
+    );
+    std::fs::write(root.join(".nants/compose.yaml"), compose).expect("compose");
+    let secrets = SecretSet::new(vec!["outro-segredo".into()]);
+    let facts = load(&root, "s1", "T01", &secrets).expect("lida").facts;
+    assert!(facts.contains("## Ambiente do Nants (fatos do servidor)"), "{facts}");
+    assert!(facts.contains("`.sdd/settings.yaml` guarda test_command, full_test_command, install_command e checks"), "{facts}");
+    assert!(facts.contains("Nada disso fica no front matter do spec.md nem da tarefa"), "{facts}");
+    assert!(facts.contains("Pasta pessoal (HOME): `/nants/home`, fora de `/work`"), "{facts}");
+    assert!(facts.contains("`/work/.git` e `/work/.nants` só leitura"), "{facts}");
+    assert!(facts.contains("- Worktree da tarefa: `.sdd/worktrees/s1/T01` (ausente)"), "{facts}");
+    assert!(facts.contains("## Compose do projeto (`.nants/compose.yaml`"), "{facts}");
+    // Ficam a estrutura, os nomes e os valores estruturais (imagem, porta, volume comum).
+    for kept in [
+        "NPM_TOKEN", "API_KEY=", "MODE=", "POSTGRES_PASSWORD", "DB_PASS", "MYSQL_ROOT_PWD", "image: postgres:16", "8080:80",
+        "./data:/var/lib/data", "command:", "entrypoint:", "labels:", "healthcheck:", "interval: 10s", "traefik.http.middlewares.auth.basicauth.users=",
+    ] {
+        assert!(facts.contains(kept), "{kept}: {facts}");
+    }
+    // Saem todos os valores que podem ser credencial.
+    for gone in [secret.as_str(), "redis-server", "requirepass", "mysqladmin", "nas.local", "admin:"] {
+        assert!(!facts.contains(gone), "{gone}: {facts}");
+    }
+    assert!(facts.matches(REDACTED_VALUE).count() >= 10, "{facts}");
+    assert!(!facts.contains(&root.display().to_string()), "nenhum caminho absoluto do usuário: {facts}");
+    // Compose ilegível não aparece cru.
+    std::fs::write(root.join(".nants/compose.yaml"), format!("services: [\n  {secret}")).expect("compose");
+    let facts = load(&root, "s1", "T01", &secrets).expect("lida").facts;
+    assert!(facts.contains("(compose ilegível: não mostrado)") && !facts.contains(&secret), "{facts}");
+    // O diagnóstico de ambiente recebe os mesmos fatos.
+    let diag = load_diagnosis(&root, "s1", "T01", "motivo", &secrets).expect("diagnóstico");
+    assert!(diag.facts.contains("## Ambiente do Nants (fatos do servidor)"), "{}", diag.facts);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Critério 3: com a worktree e o registro de rodadas, os fatos dizem se a última rodada rodou na
+/// mesma worktree ou se ela é nova.
+#[test]
+fn worktree_fact_says_whether_the_last_round_ran_in_the_same_worktree() {
+    let root = choice_root("facts-worktree", "BLOCKED", "");
+    let worktree = task_worktree_path(&root, "s1", "T01");
+    std::fs::create_dir_all(&worktree).expect("worktree");
+    std::fs::write(worktree.join(".git"), "gitdir: x\n").expect(".git");
+    let record = |at: &str| {
+        let run = crate::sdd::capabilities::SuiteRun::measured(std::time::Duration::from_secs(1), None, false, false, at.to_string());
+        crate::sdd::capabilities::update(&root, |c| c.push_run(run)).expect("registro");
+    };
+    record("2000-01-01T00:00:00Z");
+    let new = worktree_fact(&root, "s1", "T01");
+    assert!(new.contains("Ela é NOVA: foi criada depois da última rodada de testes registrada (2000-01-01T00:00:00Z)"), "{new}");
+    record("2999-01-01T00:00:00Z");
+    let same = worktree_fact(&root, "s1", "T01");
+    assert!(same.contains("A última rodada de testes registrada (2999-01-01T00:00:00Z) rodou nesta MESMA worktree"), "{same}");
+    assert!(same.contains("um commit novo não cria worktree nova"), "{same}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- Spec 141 T04 (C-03): REVISE_CONFIG com restrição e `full_test_command` ----
+
+mod restriction {
+    use super::*;
+    use crate::agents::architect::testing::{text, Scripted};
+    use crate::agents::runner::{Fut, RunnerError, SpecOutcome};
+    use crate::config::{AgentConfig, Config, Connection, Effort, WireApi};
+    use crate::sdd::test_levels::{RestrictionProbe, SuiteLedger, SuiteRun};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// O caso do Mini Street Fighter: o `node --test` pega os testes do Playwright, e a bateria
+    /// completa roda os dois.
+    const SETTINGS: &str = "base_branch: main\nmerge_strategy: squash\ntest_command: node --test\nfull_test_command: \"node --test && npx playwright test\"\nchecks:\n  - name: unit\n    command: node --test\n    blocking: true\nyolo: true\n";
+    const EVIDENCE: &str = "[falha dos testes: código 1]\nnot ok 3 - e2e/game.spec.js\n  duration_ms: 812\n# fail 1";
+
+    /// Projeto com a T01 bloqueada (com a evidência da falha), `test/` e `e2e/` na branch base
+    /// (`main`) e a worktree da tarefa num Git próprio, com as mesmas pastas.
+    fn project(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("nants-rec-restriction-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tasks = root.join(".sdd/specs/s1/tasks");
+        std::fs::create_dir_all(&tasks).expect("tasks");
+        for dir in ["test", "e2e"] {
+            std::fs::create_dir_all(root.join(dir)).expect("pasta");
+            std::fs::write(root.join(dir).join("base.js"), "x\n").expect("arquivo");
+        }
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git").args(args).current_dir(&root).status().expect("git").success();
+            assert!(ok, "{args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "test", "e2e"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"]);
+        std::fs::write(root.join(".sdd/settings.yaml"), SETTINGS).expect("settings");
+        let evidence = EVIDENCE.replace('\n', "\\n");
+        std::fs::write(
+            tasks.join("T01.md"),
+            format!(
+                "---\nid: \"T01\"\nspec_id: \"s1\"\ntitle: \"t\"\nstatus: \"BLOCKED\"\ndepends_on: []\nallowed_scope: [\"src/**\"]\nbranch: \"\"\nattempts: 3\nmax_attempts: 3\nlast_review_verdict: \"NONE\"\nnext_action: \"bloqueada\"\ntest_evidence: \"{evidence}\"\n---\n\n## Objetivo\nx\n\n## Critérios de Aceitação\n- x\n"
+            ),
+        )
+        .expect("tarefa");
+        let wt = task_worktree_path(&root, "s1", "T01");
+        std::fs::create_dir_all(wt.join("test")).expect("test");
+        std::fs::create_dir_all(wt.join("e2e")).expect("e2e");
+        std::fs::write(wt.join("test/a.test.js"), "x\n").expect("teste");
+        std::fs::write(wt.join("e2e/game.spec.js"), "x\n").expect("e2e");
+        let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&wt).status().expect("git").success();
+        assert!(ok);
+        (root, wt)
+    }
+
+    fn state(root: &Path, replies: Vec<&str>) -> (AppState, Arc<Scripted>) {
+        let mut cfg = Config::default();
+        cfg.connections.push(Connection {
+            id: "c1".into(),
+            name: "C".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "k".into(),
+            wire_api: WireApi::Responses,
+            kind: Default::default(),
+            base_url_override: None,
+        });
+        cfg.agents.architect = AgentConfig { connection_id: "c1".into(), model: "m".into(), effort: Effort::Low, max_steps: None };
+        let scripted = Scripted::new(replies.into_iter().map(text).collect());
+        let state = AppState::new(root.join("config.toml"), cfg, 3000).with_report_backend(scripted.clone());
+        (state, scripted)
+    }
+
+    fn loaded() -> Loaded {
+        Loaded {
+            facts: "fatos".into(),
+            allowed_scope: Vec::new(),
+            cycles: 0,
+            environmental: false,
+            config_suspect: false,
+            yolo: true,
+            rounds: 0,
+            env_fixes: 0,
+            command: "node --test".into(),
+            exit_code: "1".into(),
+            error_tail: String::new(),
+            env_note: String::new(),
+        }
+    }
+
+    /// Runner que simula as rodadas do servidor: grava no registro de rodadas a etapa oficial
+    /// falhando como na tarefa e a restrita passando (`green`) ou falhando, sobre a árvore real da
+    /// worktree, e devolve o que o registro mostra.
+    struct ServerRuns {
+        ledger: SuiteLedger,
+        green: bool,
+        tree: String,
+        calls: AtomicUsize,
+    }
+
+    impl SpecRunner for ServerRuns {
+        fn run<'a>(&'a self, _spec_id: &'a str) -> Fut<'a, Result<SpecOutcome, RunnerError>> {
+            Box::pin(async { Err(RunnerError::Invalid("não usado".into())) })
+        }
+
+        fn probe_restriction<'a>(
+            &'a self,
+            _spec_id: &'a str,
+            _task_id: &'a str,
+            original: &'a str,
+            restricted: &'a str,
+        ) -> Fut<'a, Option<RestrictionProbe>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let run = |command: &str, passed: bool, output: &str| SuiteRun {
+                    command: command.into(),
+                    tree_before: Some(self.tree.clone()),
+                    tree_after: Some(self.tree.clone()),
+                    in_container: false,
+                    passed,
+                    elapsed: std::time::Duration::from_secs(1),
+                    started: std::time::SystemTime::now(),
+                    output: output.into(),
+                };
+                let official = "not ok 3 - e2e/game.spec.js\n  duration_ms: 790\n# tests 9\n# fail 1";
+                self.ledger.record_server(run(original, false, official), "Host|");
+                let narrowed = if self.green { "ok 1 - test/a.test.js\n# tests 8\n# pass 8" } else { "not ok 1 - test/a.test.js\n# fail 1" };
+                self.ledger.record_server(run(restricted, self.green, narrowed), "Host|");
+                self.ledger.restriction_probe(original, restricted, &self.tree, "Host|", false)
+            })
+        }
+    }
+
+    fn server_runs(wt: &Path, green: bool) -> Arc<ServerRuns> {
+        let tree = crate::sdd::test_levels::tree_hash(wt).expect("hash da árvore");
+        Arc::new(ServerRuns { ledger: SuiteLedger::default(), green, tree, calls: AtomicUsize::new(0) })
+    }
+
+    fn escalate_with(command: &str) -> Decision {
+        let json = format!(
+            r#"{{"decision":"ESCALATE","root_cause":"o node --test pega os testes do Playwright","proposal":"p","options":[{{"id":"so-unit","label":"Rodar só os testes de unidade","kind":"config","test_command":"{command}"}}]}}"#
+        );
+        parse_decision(&json).expect("escalada")
+    }
+
+    fn scope_of<'a>(
+        state: &'a AppState,
+        root: &'a Path,
+        secrets: &'a Arc<SecretSet>,
+        events: &'a crate::server::events::EventBus,
+        dialog: &'a DialogTarget,
+    ) -> Scope<'a> {
+        Scope { state, project_id: "p1", spec_id: "s1", root, secrets, events, dialog }
+    }
+
+    /// R1 a R4 na validação: a restrição é reconhecida e a etapa muda também no `full_test_command`
+    /// e na checagem; `|| true`, `;`, etapa removida, opção acrescentada, caminho que não existe e
+    /// duas restrições diferentes são recusados; sem a worktree, não há restrição.
+    #[test]
+    fn guard_accepts_only_the_narrowing_by_an_existing_path_and_updates_every_field() {
+        let (root, wt) = project("guard");
+        let secrets = SecretSet::default();
+        let proposal = |test: &str, full: Option<&str>| ConfigProposal {
+            test_command: Some(test.into()),
+            full_test_command: full.map(str::to_string),
+            checks: None,
+        };
+        let change = validate_config_in(&root, &proposal("node --test test/", None), &secrets, Some(&wt)).expect("restrição");
+        let step = change.restriction.clone().expect("é restrição");
+        assert_eq!((step.original.as_str(), step.appended.clone()), ("node --test", vec!["test/".to_string()]));
+        assert_eq!(change.test_command.as_deref(), Some("node --test test/"));
+        assert_eq!(change.full_test_command.as_deref(), Some("node --test test/ && npx playwright test"), "R4: a bateria completa muda junto");
+        assert_eq!(change.checks.as_ref().map(|c| c[0].command.as_str()), Some("node --test test/"), "R4: a checagem muda junto");
+        assert!(change.diff.contains("full_test_command: node --test && npx playwright test"), "{}", change.diff);
+        // R1 continua igual: conter o original inteiro não é restrição.
+        let plain = validate_config_in(&root, &proposal("node --test && node --check src/x.js", None), &secrets, Some(&wt)).expect("R1");
+        assert!(plain.restriction.is_none());
+        // R3.
+        for bad in [
+            "node --test test/ || true",
+            "node --test test/; true",
+            "npx playwright test",
+            "exit 0 && node --test test/",
+            "node --test --test-skip-pattern e2e",
+            "node --test --grep unit",
+            "node --test -x",
+            "node --test --passWithNoTests",
+            "node --test nao-existe/",
+            "node --test ../fora",
+        ] {
+            let refused = validate_config_in(&root, &proposal(bad, None), &secrets, Some(&wt)).err().unwrap_or_default();
+            assert!(refused.starts_with(CAUSE_CONFIG_WEAKENS) || refused.contains("política"), "{bad}: {refused}");
+        }
+        // A bateria completa não pode perder a etapa do Playwright nem restringir outra etapa.
+        let lost = validate_config_in(&root, &proposal("node --test test/", Some("node --test test/")), &secrets, Some(&wt));
+        assert!(lost.err().is_some_and(|e| e.contains("full_test_command")));
+        let two = validate_config_in(&root, &proposal("node --test test/", Some("node --test e2e/ && npx playwright test")), &secrets, Some(&wt));
+        assert!(two.err().is_some_and(|e| e.contains("mais de uma etapa")));
+        // F-01: um caminho criado pela própria tarefa (está na worktree, não na base) é recusado.
+        std::fs::create_dir_all(wt.join("test/fake")).expect("fake");
+        std::fs::write(wt.join("test/fake/x.test.js"), "console.log('# tests 40')\n").expect("teste de fachada");
+        let fake = validate_config_in(&root, &proposal("node --test test/fake/", None), &secrets, Some(&wt)).err().unwrap_or_default();
+        assert!(fake.starts_with(CAUSE_CONFIG_WEAKENS) && fake.contains("branch base"), "{fake}");
+        // Sem a worktree para conferir o caminho: recusada.
+        assert!(validate_config(&root, &proposal("node --test test/", None), &secrets).err().is_some_and(|e| e.starts_with(CAUSE_CONFIG_WEAKENS)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-02: a bateria completa atual que não dá para analisar não bloqueia uma correção que não a
+    /// toca; com uma restrição cuja etapa aparece nela, a proposta é recusada com o motivo.
+    #[test]
+    fn unparseable_full_battery_only_matters_when_the_restriction_would_skip_it() {
+        let (root, wt) = project("full-unparseable");
+        let settings = SETTINGS.replace("\"node --test && npx playwright test\"", "\"node --test 2>&1 | tee saida.txt\"");
+        std::fs::write(root.join(".sdd/settings.yaml"), settings).expect("settings");
+        let secrets = SecretSet::default();
+        let only_test = ConfigProposal { test_command: Some("npm ci && node --test".into()), full_test_command: None, checks: None };
+        let change = validate_config_in(&root, &only_test, &secrets, Some(&wt)).expect("só o test_command");
+        assert!(change.restriction.is_none() && change.full_test_command.is_none());
+        let narrowed = ConfigProposal { test_command: Some("node --test test/".into()), full_test_command: None, checks: None };
+        let refused = validate_config_in(&root, &narrowed, &secrets, Some(&wt)).err().unwrap_or_default();
+        assert!(refused.starts_with(CAUSE_CONFIG_WEAKENS) && refused.contains("node --test 2>&1 | tee saida.txt"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-03: com duas opções de restrição na mesma decisão, só a primeira é provada; a outra é
+    /// descartada com o motivo.
+    #[tokio::test]
+    async fn only_the_first_restriction_of_a_decision_is_proved() {
+        let (root, wt) = project("two-options");
+        let (state, _scripted) = state(&root, vec![]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let green = server_runs(&wt, true);
+        let runner: Arc<dyn SpecRunner> = green.clone();
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let json = r#"{"decision":"ESCALATE","root_cause":"c","proposal":"p","options":[{"id":"a","label":"A","kind":"config","test_command":"node --test test/"},{"id":"b","label":"B","kind":"config","test_command":"node --test e2e/"}]}"#;
+        let decision = prepare_options(&scope, &loaded(), parse_decision(json).expect("decisão"), probe, &mut rx).await;
+        assert_eq!(green.calls.load(Ordering::SeqCst), 1, "uma prova só");
+        assert_eq!(decision.options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert!(decision.discarded.iter().any(|d| d.contains("opção b") && d.contains("só a primeira restrição")), "{:?}", decision.discarded);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Critério 4: em YOLO, a opção `node --test test/` não é aplicada sozinha; com a rodada verde
+    /// do servidor no registro, ela é oferecida com a evidência (e a bateria completa junto); sem a
+    /// rodada verde, ou sem rodada nenhuma, é descartada.
+    #[tokio::test]
+    async fn option_is_offered_only_with_the_green_server_run_and_never_applied_in_yolo() {
+        let (root, wt) = project("option");
+        let (state, scripted) = state(&root, vec![]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let loaded = loaded();
+
+        let green = server_runs(&wt, true);
+        let runner: Arc<dyn SpecRunner> = green.clone();
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let decision = prepare_options(&scope, &loaded, escalate_with("node --test test/"), probe, &mut rx).await;
+        assert!(is_escalate(&decision) && decision.config.is_none(), "não aplicada em YOLO: {decision:?}");
+        assert_eq!(decision.options.len(), 1, "{decision:?}");
+        let option = &decision.options[0];
+        let evidence = option.restriction.clone().expect("evidência do servidor");
+        assert_eq!((evidence.original.as_str(), evidence.restricted.as_str()), ("node --test", "node --test test/"));
+        assert_eq!(evidence.appended, vec!["test/".to_string()]);
+        assert_eq!((evidence.tests, evidence.original_tests, evidence.original_failed), (Some(8), Some(9), Some(1)));
+        assert!(evidence.original_output.contains("not ok 3 - e2e/game.spec.js") && evidence.restricted_output.contains("# pass 8"), "{evidence:?}");
+        assert_eq!(option.full_test_command.as_deref(), Some("node --test test/ && npx playwright test"));
+        assert_eq!(green.calls.load(Ordering::SeqCst), 1);
+        assert!(scripted.requests().is_empty(), "nenhuma chamada ao modelo");
+        assert!(!std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings").contains("test/"));
+
+        for runner in [server_runs(&wt, false) as Arc<dyn SpecRunner>, super::refused_config::no_probe()] {
+            let probe = Probe { runner: &runner, task_id: "T01" };
+            let decision = prepare_options(&scope, &loaded, escalate_with("node --test test/"), probe, &mut rx).await;
+            assert!(decision.options.is_empty(), "{decision:?}");
+            assert!(decision.discarded.iter().any(|d| d.contains(CAUSE_CONFIG_WEAKENS)), "{:?}", decision.discarded);
+        }
+        // A evidência que o modelo mandar junto é ignorada: sem a rodada do servidor, nada feito.
+        let forged = r#"{"decision":"ESCALATE","root_cause":"c","proposal":"p","options":[{"id":"f","label":"F","kind":"config","test_command":"node --test test/","restriction":{"original":"node --test","restricted":"node --test test/","appended":["test/"],"tree":"x","original_output":"o","restricted_output":"r"}}]}"#;
+        let runner = super::refused_config::no_probe();
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let decision = prepare_options(&scope, &loaded, parse_decision(forged).expect("decisão"), probe, &mut rx).await;
+        assert!(decision.options.is_empty(), "{decision:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No ciclo inteiro em YOLO: a escalada com a restrição comprovada não vira rodada autônoma
+    /// (a premissa do modo Automático); ela fica para a pessoa, com a opção e a evidência no evento.
+    #[tokio::test]
+    async fn yolo_cycle_keeps_the_escalation_with_the_restriction_for_the_person() {
+        let (root, wt) = project("cycle");
+        let json = r#"{"decision":"ESCALATE","root_cause":"o node --test pega os testes do Playwright","proposal":"p","options":[{"id":"so-unit","label":"Rodar só os testes de unidade","kind":"config","test_command":"node --test test/"}]}"#;
+        let (state, scripted) = state(&root, vec![json]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let mut bus = events.subscribe();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let runner: Arc<dyn SpecRunner> = server_runs(&wt, true);
+        let next = recover(&scope, &runner, "T01", None, &mut rx).await;
+        assert_eq!(next, Next::Stay, "fica para a pessoa");
+        assert_eq!(scripted.requests().len(), 1, "sem a pergunta reforçada");
+        let mut decided = None;
+        while let Ok(event) = bus.try_recv() {
+            if event.event_type() == "recovery_decided" {
+                decided = Some(event.payload.clone());
+            }
+        }
+        let decided = decided.expect("recovery_decided");
+        assert_eq!(decided["decision"], "ESCALATE", "{decided}");
+        assert_eq!(decided["options"][0]["restriction"]["restricted"], "node --test test/", "{decided}");
+        assert!(!std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings").contains("test/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A escolha da pessoa no cartão aplica a restrição com a evidência gravada: grava o
+    /// `test_command`, o `full_test_command` e a checagem juntos. Se a worktree mudou depois das
+    /// rodadas do servidor, a opção venceu.
+    #[tokio::test]
+    async fn choosing_the_option_writes_every_field_and_needs_the_same_tree() {
+        let (root, wt) = project("choice");
+        let (state, _scripted) = state(&root, vec![]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let runner: Arc<dyn SpecRunner> = server_runs(&wt, true);
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let decision = prepare_options(&scope, &loaded(), escalate_with("node --test test/"), probe, &mut rx).await;
+        assert_eq!(decision.options.len(), 1);
+        let path = root.join(".sdd/specs/s1/tasks/T01.md");
+        let raw = std::fs::read_to_string(&path).expect("tarefa");
+        std::fs::write(&path, format!("{raw}\n{}", super::analysis_with(&decision.options))).expect("análise");
+        let choose = || apply_choice(&root, "s1", "T01", &Choice::Option("so-unit".into(), 1), &secrets, &|| true, false, Lang::PtBr);
+        std::fs::write(wt.join("test/novo.test.js"), "x\n").expect("muda a árvore");
+        assert_eq!(choose(), Err(ChoiceError::Stale), "a árvore mudou depois das rodadas");
+        std::fs::remove_file(wt.join("test/novo.test.js")).expect("volta a árvore");
+        assert_eq!(choose(), Ok("config"));
+        let settings = Settings::parse(&std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings")).expect("parse");
+        assert_eq!(settings.test_command, "node --test test/");
+        assert_eq!(settings.full_test_command.as_deref(), Some("node --test test/ && npx playwright test"));
+        assert_eq!(settings.checks[0].command, "node --test test/");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A REVISE_CONFIG direta com a restrição: em YOLO, vai à pessoa (pedido pendente, com a troca e
+    /// as duas rodadas), e nada é gravado antes.
+    #[tokio::test]
+    async fn direct_restriction_goes_to_the_person_even_in_yolo() {
+        let (root, wt) = project("direct");
+        let (state, _scripted) = state(&root, vec![]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let loaded = loaded();
+        let runner: Arc<dyn SpecRunner> = server_runs(&wt, true);
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let decision = parse_decision(r#"{"decision":"REVISE_CONFIG","root_cause":"c","test_command":"node --test test/"}"#).expect("decisão");
+        let job = config_with_feedback(&scope, &loaded, probe, decision, &mut rx, "fatos");
+        tokio::pin!(job);
+        let mut pending = Vec::new();
+        for _ in 0..2000 {
+            tokio::select! {
+                _ = &mut job => panic!("terminou sem a pessoa decidir"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    pending = state.approvals().list_pending("p1");
+                }
+            }
+            if !pending.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(pending.len(), 1, "pedido à pessoa");
+        let diff = pending[0].diff.clone().unwrap_or_default();
+        assert!(diff.contains("node --test test/ && npx playwright test"), "{diff}");
+        assert!(diff.contains("not ok 3 - e2e/game.spec.js") && diff.contains("# pass 8") && diff.contains("só vale com a sua aprovação"), "{diff}");
+        assert!(!std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings").contains("test/"), "nada gravado antes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sem a rodada verde do servidor, a REVISE_CONFIG direta com a restrição é recusada e volta ao
+    /// Arquiteto uma vez, sem pedido à pessoa e sem gravar nada.
+    #[tokio::test]
+    async fn direct_restriction_without_the_green_run_is_refused_and_goes_back_once() {
+        let (root, wt) = project("direct-red");
+        let reply = r#"{"decision":"ESCALATE","root_cause":"sem saída"}"#;
+        let (state, scripted) = state(&root, vec![reply]);
+        let secrets = Arc::new(SecretSet::default());
+        let dialog = DialogTarget::new(&root, "s1");
+        let events = state.events().clone();
+        let scope = scope_of(&state, &root, &secrets, &events, &dialog);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let runner: Arc<dyn SpecRunner> = server_runs(&wt, false);
+        let probe = Probe { runner: &runner, task_id: "T01" };
+        let decision = parse_decision(r#"{"decision":"REVISE_CONFIG","root_cause":"c","test_command":"node --test test/"}"#).expect("decisão");
+        let loaded = loaded();
+        let job = config_with_feedback(&scope, &loaded, probe, decision, &mut rx, "fatos");
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(20), job).await.expect("sem esperar a pessoa").ok().expect("decisão");
+        assert!(is_escalate(&decision) && decision.root_cause.starts_with(CAUSE_CONFIG_WEAKENS), "{decision:?}");
+        assert_eq!(scripted.requests().len(), 1, "uma volta ao Arquiteto");
+        assert!(state.approvals().list_pending("p1").is_empty());
+        assert!(!std::fs::read_to_string(root.join(".sdd/settings.yaml")).expect("settings").contains("test/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

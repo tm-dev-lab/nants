@@ -145,6 +145,7 @@ async fn removed_project_state_leaves_with_the_event() {
         project_ids: Vec::new(),
         taint: None,
         seq: None,
+        notices: Vec::new(),
     });
     assert_eq!(nanty.journal_tail(10).len(), 1);
     assert_eq!(nanty.conversation().len(), 1);
@@ -204,6 +205,7 @@ async fn lagged_triggers_a_full_sweep() {
                 project_ids: Vec::new(),
                 taint: None,
                 seq: None,
+                notices: Vec::new(),
             })
             .expect("conversa");
     }
@@ -340,6 +342,7 @@ async fn read_routes_show_config_masked_feed_conversation_and_status() {
         project_ids: Vec::new(),
         taint: None,
         seq: None,
+        notices: Vec::new(),
     });
     let app = crate::server::router(st.clone());
 

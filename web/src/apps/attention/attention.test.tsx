@@ -170,7 +170,11 @@ describe("painel do sino", () => {
     expect(within(blog).getByRole("button", { name: "Abrir o projeto Blog" })).toBeTruthy();
     // Escolha de escalada com confirmação.
     server.reply("POST", /\/api\/projects\/p2\/specs\/s1\/tasks\/T02\/recovery-choice$/, () => ({ status: 202, body: { ok: true } }));
-    fireEvent.click(within(blog).getByRole("button", { name: "Escolher: Usar SQLite" }));
+    const chooseSqlite = within(blog).getByRole("button", { name: "Escolher: Usar SQLite" });
+    // 141/T11 (C-12): o texto visível é curto e o botão quebra a linha; o nome completo fica no aria-label.
+    expect(chooseSqlite.textContent).toBe("Escolher");
+    expect(chooseSqlite.classList.contains("nd-btn-wrap")).toBe(true);
+    fireEvent.click(chooseSqlite);
     await act(async () => {
       fireEvent.click(within(blog).getByRole("button", { name: "Aplicar e retomar" }));
     });

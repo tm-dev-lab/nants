@@ -23,6 +23,8 @@ use crate::harness::progress::CommandProgress;
 
 use crate::sdd::environment::{env_hash, COMPOSE_REL, WORKSPACE_SERVICE, WORKTREE_VAR};
 
+/// A área de trabalho dentro dos containers do projeto: a worktree (ou a raiz) montada por bind.
+pub const WORKDIR: &str = "/work";
 /// Limite de saída capturada por comando.
 const MAX_OUTPUT: usize = 64 * 1024;
 /// Timeout dos passos de preparo (down, build, up).
@@ -36,6 +38,9 @@ const POLL: Duration = Duration::from_millis(20);
 pub const OFFLINE_NETWORK: &str = "nants-offline";
 /// Arquivo do override da rodada offline, ao lado do override de sempre.
 const OFFLINE_OVERRIDE_FILE: &str = "override-offline.yaml";
+/// Spec 141 T02: tamanho da pasta vazia (tmpfs) posta por cima das worktrees nas rodadas da raiz.
+/// Ninguém deveria gravar lá; o teto só impede que a memória vire disco por engano.
+const HIDDEN_TMPFS_BYTES: u64 = 1024 * 1024;
 
 /// Uma chamada a `docker` (args fixos, sem shell).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +397,9 @@ pub struct ComposeEnv {
     persist: Option<PersistHash>,
     /// Diretório privado dos overrides gerados (fora da worktree e do /tmp).
     base_dir: Option<PathBuf>,
+    /// Spec 141 T01: diretório das pastas pessoais (`<dados>/homes`), montadas em
+    /// [`home::CONTAINER_HOME`], fora de `/work`.
+    homes_dir: Option<PathBuf>,
     kind: ComposeKind,
     /// Modo `--lan` no `-run`: faixa das portas de visualização; cada porta do workspace é
     /// republicada em 0.0.0.0 com uma porta de host desta faixa (spec 097).
@@ -458,6 +466,7 @@ impl ComposeEnv {
             approved: Mutex::new(None),
             persist: None,
             base_dir: default_base_dir(),
+            homes_dir: home::homes_base(),
             kind: ComposeKind::Test,
             lan_ports: None,
             remaps: Mutex::new(Vec::new()),
@@ -546,6 +555,40 @@ impl ComposeEnv {
         self
     }
 
+    /// Diretório das pastas pessoais (testes; o padrão é `<dados>/homes`).
+    pub fn with_homes_dir(mut self, dir: PathBuf) -> Self {
+        self.homes_dir = Some(dir);
+        self
+    }
+
+    fn homes(&self) -> Result<&Path, String> {
+        self.homes_dir.as_deref().ok_or_else(|| "diretório de dados do Nants indisponível (HOME)".to_string())
+    }
+
+    /// Spec 141 T01: a pasta pessoal (no host) da área de trabalho `dir`, montada em
+    /// [`home::CONTAINER_HOME`]. Só o caminho; não cria nada.
+    pub fn host_home(&self, dir: &Path) -> Result<PathBuf, String> {
+        home::host_home(self.homes()?, &self.project_id, dir).map_err(|e| format!("pasta pessoal indisponível: {e}"))
+    }
+
+    /// Spec 141 T01: a pasta pessoal de `dir` pronta para o próximo comando ([`home::ready`]: criada
+    /// e, se a área de trabalho ainda tem a pasta antiga, migrada, com o estado da instalação
+    /// esquecido). Idempotente.
+    pub fn ready_home(&self, dir: &Path) -> Result<PathBuf, String> {
+        home::ready(self.homes()?, &self.project_id, dir).map_err(|e| format!("pasta pessoal indisponível: {e}"))
+    }
+
+    /// Spec 129 T01: a pasta pessoal de `dir` volta ao início (menos o cache de download).
+    pub fn reset_home(&self, dir: &Path) -> Result<(), String> {
+        let h = self.host_home(dir)?;
+        home::reset(&h).map_err(|e| format!("pasta pessoal sem limpeza: {e}"))
+    }
+
+    /// Spec 141 T01: apaga a pasta pessoal de `dir` (a worktree que saiu).
+    pub fn remove_home(&self, dir: &Path) -> Result<(), String> {
+        home::remove(self.homes()?, &self.project_id, dir).map_err(|e| format!("pasta pessoal não removida: {e}"))
+    }
+
     /// Com o executor real do `docker`.
     pub fn real(project_id: impl Into<String>) -> Self {
         Self::new(project_id, Arc::new(RealComposeRunner::default())).with_approved_hashes(Vec::new())
@@ -611,12 +654,15 @@ impl ComposeEnv {
         let text = fs::read_to_string(dir.join(COMPOSE_REL)).map_err(|e| format!("compose.yaml ilegível: {e}"))?;
         let doc: Value = serde_yaml::from_str(&text).map_err(|_| "compose.yaml inválido".to_string())?;
         // Spec 129 T01: a pasta pessoal persistente existe antes de qualquer comando do workspace.
-        home::ensure(dir).map_err(|e| format!("pasta pessoal ({}) indisponível: {e}", home::HOME_DIR))?;
+        // Spec 141 T01: fora da área de trabalho, com a pasta antiga migrada (todo comando passa
+        // por aqui, inclusive o `prepare` antes de cada `test_command`).
+        let host_home = self.ready_home(dir)?;
         let mut remaps = Vec::new();
         let ov = write_override(
             &self.override_dir()?,
             &self.project_id,
             dir,
+            &host_home,
             &doc,
             run_command,
             self.lan_ports.filter(|_| run_command.is_some()),
@@ -1066,11 +1112,17 @@ pub fn parse_docker_diff(text: &str) -> Vec<DiffEntry> {
 
 /// Spec 129 T02 (C-02): caminhos gravados fora de `/work` que ainda existem ao fim (entradas `A` ou
 /// `C`; as `D` são ignoradas). O `docker diff` de um container encerrado já é o estado final.
+/// Spec 141 T01: a pasta pessoal ([`home::CONTAINER_HOME`]) também persiste (é uma montagem) e
+/// fica fora da conta, com as pastas acima dela que o Docker cria para montá-la.
 pub fn written_outside_work(entries: &[DiffEntry]) -> Vec<String> {
+    let home = home::CONTAINER_HOME;
+    let persists = |p: &str| {
+        p == "/work" || p.starts_with("/work/") || p == home || p.starts_with(&format!("{home}/")) || home.starts_with(&format!("{p}/"))
+    };
     entries
         .iter()
         .filter(|e| e.kind != DiffKind::Deleted)
-        .filter(|e| e.path != "/work" && !e.path.starts_with("/work/"))
+        .filter(|e| !persists(&e.path))
         .map(|e| e.path.clone())
         .collect()
 }
@@ -1434,8 +1486,12 @@ fn override_yaml(
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
 ) -> Result<String, String> {
-    override_yaml_with(project_id, worktree, doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host(), None)
+    override_yaml_with(project_id, worktree, Path::new(TEST_HOST_HOME), doc, run_command, lan_ports, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host(), None)
 }
+
+/// Pasta pessoal (no host) dos testes do override, que não montam nada de verdade.
+#[cfg(test)]
+const TEST_HOST_HOME: &str = "/nants-test/homes/p1/root";
 
 /// Porta do host livre para bind em `ip`?
 fn host_port_free(ip: &str, port: u16) -> bool {
@@ -1524,6 +1580,7 @@ fn remap_busy_ports(
 fn override_yaml_with(
     project_id: &str,
     worktree: &Path,
+    host_home: &Path,
     doc: &Value,
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
@@ -1561,8 +1618,10 @@ fn override_yaml_with(
             bind.insert("target".into(), "/work".into());
             let mut vols = vec![Value::Mapping(bind)];
             // Isolamento estrutural (spec 062): `.git` (arquivo ou diretório) e `.nants` só leitura.
+            // Só arquivo ou diretório de verdade: o Docker segue um link da origem no host e
+            // montaria o alvo dele (spec 141 T01, revisão 1).
             for prot in [".git", ".nants"] {
-                if abs.join(prot).symlink_metadata().is_ok() {
+                if abs.join(prot).symlink_metadata().is_ok_and(|m| m.is_file() || m.is_dir()) {
                     let mut ro = Mapping::new();
                     ro.insert("type".into(), "bind".into());
                     ro.insert("source".into(), Value::String(abs.join(prot).to_string_lossy().replace('$', "$$")));
@@ -1571,13 +1630,35 @@ fn override_yaml_with(
                     vols.push(Value::Mapping(ro));
                 }
             }
+            // Spec 141 T02 (C-02): na raiz, as worktrees das tarefas ficam fora da vista (uma pasta
+            // vazia por cima): um executor de testes sem caminho não roda os testes delas.
+            if let Some(hidden) = home::hidden_from_root(&abs) {
+                let mut opts = Mapping::new();
+                opts.insert("size".into(), Value::Number(HIDDEN_TMPFS_BYTES.into()));
+                let mut tmpfs = Mapping::new();
+                tmpfs.insert("type".into(), "tmpfs".into());
+                tmpfs.insert("target".into(), Value::String(format!("/work/{hidden}")));
+                tmpfs.insert("tmpfs".into(), Value::Mapping(opts));
+                vols.push(Value::Mapping(tmpfs));
+            }
+            // Spec 141 T01: a pasta pessoal, fora de `/work` (fora da varredura dos executores de
+            // teste e do Git), por bind de uma pasta do diretório de dados do Nants.
+            if !host_home.is_absolute() {
+                return Err("pasta pessoal sem caminho absoluto".into());
+            }
+            let mut home_bind = Mapping::new();
+            home_bind.insert("type".into(), "bind".into());
+            home_bind.insert("source".into(), Value::String(host_home.to_string_lossy().replace('$', "$$")));
+            home_bind.insert("target".into(), home::CONTAINER_HOME.into());
+            vols.push(Value::Mapping(home_bind));
             svc.insert("volumes".into(), Value::Sequence(vols));
             svc.insert("working_dir".into(), "/work".into());
             // Runtime com o uid do host: arquivos criados na worktree não ficam como root.
             let (uid, gid) = host_ids()?;
             svc.insert("user".into(), Value::String(format!("{uid}:{gid}")));
-            // Spec 129 T01: `HOME` dentro de `/work` (persiste entre os containers, um por comando).
-            // O `.profile` dela põe `$HOME/.local/bin` na frente do `PATH` nos shells de login.
+            // Spec 129 T01: `HOME` persistente entre os containers (um por comando); spec 141 T01:
+            // montado fora de `/work`. O `.profile` dela põe `$HOME/.local/bin` na frente do `PATH`
+            // nos shells de login.
             let mut env = Mapping::new();
             env.insert("HOME".into(), home::CONTAINER_HOME.into());
             svc.insert("environment".into(), Value::Mapping(env));
@@ -1681,6 +1762,7 @@ fn write_override(
     dir: &Path,
     project_id: &str,
     worktree: &Path,
+    host_home: &Path,
     doc: &Value,
     run_command: Option<&str>,
     lan_ports: Option<ViewPorts>,
@@ -1688,7 +1770,7 @@ fn write_override(
     limits: ContainerLimits,
     offline: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let text = override_yaml_with(project_id, worktree, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc, limits, offline)?;
+    let text = override_yaml_with(project_id, worktree, host_home, doc, run_command, lan_ports, remaps, &host_port_free, &host_port_alloc, limits, offline)?;
     let path = dir.join(if offline.is_some() { OFFLINE_OVERRIDE_FILE } else { "override.yaml" });
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -1753,7 +1835,8 @@ pub(crate) mod fake {
         static N: AtomicUsize = AtomicUsize::new(0);
         let base = std::env::temp_dir()
             .join(format!("nants-compose-base-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
-        ComposeEnv::new(id, runner).with_base_dir(base)
+        let homes = base.join("homes");
+        ComposeEnv::new(id, runner).with_base_dir(base).with_homes_dir(homes)
     }
 
     /// Token após o segundo `-f <arquivo>`; numa chamada direta ao `docker` (sem `compose`), o
@@ -1925,7 +2008,7 @@ mod tests {
         let dir = project("offline-ov", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let cap = ContainerLimits { memory: 256 * MIB, pids: 64 };
-        let text = override_yaml_with("p1", &dir, &doc, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("nants-p1-test-nants-offline")).expect("ov");
+        let text = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("nants-p1-test-nants-offline")).expect("ov");
         let ov: Value = serde_yaml::from_str(&text).expect("yaml");
         assert_eq!(offline_nets(&ov, "workspace"), vec![OFFLINE_NETWORK]);
         assert_eq!(offline_nets(&ov, "db"), vec!["back", OFFLINE_NETWORK]);
@@ -1950,7 +2033,7 @@ mod tests {
 
         // O nome reservado no compose do projeto é recusado (não se mistura com a rede dele).
         let clash: Value = serde_yaml::from_str("services:\n  workspace:\n    image: alpine\nnetworks:\n  nants-offline: {}\n").expect("yaml");
-        let err = override_yaml_with("p1", &dir, &clash, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("x")).expect_err("reservado");
+        let err = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &clash, None, None, &mut Vec::new(), &|_, _| true, &|_| None, cap, Some("x")).expect_err("reservado");
         assert!(err.contains(OFFLINE_NETWORK), "{err}");
     }
 
@@ -2091,7 +2174,8 @@ mod tests {
         let (uid, gid) = host_ids().expect("ids");
         let ws = &v["services"]["workspace"];
         assert_eq!(ws["user"].as_str(), Some(format!("{uid}:{gid}").as_str()));
-        assert_eq!(ws["environment"]["HOME"].as_str(), Some("/work/.nants-home"));
+        assert_eq!(ws["environment"]["HOME"].as_str(), Some("/nants/home"));
+        assert!(!home::CONTAINER_HOME.starts_with("/work"), "fora da área de trabalho");
         // O `PATH` da imagem não é tocado pelo override.
         assert!(ws["environment"].get("PATH").is_none());
         assert!(v["services"]["db"].get("user").is_none());
@@ -2115,10 +2199,14 @@ mod tests {
             let ov: Value = serde_yaml::from_str(&fs::read_to_string(&call.args[6]).expect("override")).expect("yaml");
             let home = ov["services"][WORKSPACE_SERVICE]["environment"]["HOME"].as_str().expect("HOME").to_string();
             let root = call.cwd.canonicalize().expect("raiz");
-            let host_home = match home.strip_prefix("/work") {
-                Some(rest) => format!("{}{rest}", root.display()),
-                None => home,
-            };
+            // O `HOME` é o destino de um bind do override: no host, a origem dele.
+            let vols = ov["services"][WORKSPACE_SERVICE]["volumes"].as_sequence().expect("volumes").clone();
+            let host_home = vols
+                .iter()
+                .find(|v| v["target"].as_str() == Some(home.as_str()))
+                .and_then(|v| v["source"].as_str())
+                .expect("bind do HOME")
+                .to_string();
             let script = call.args.last().expect("comando");
             let out = Command::new("sh")
                 .args(["-lc", script])
@@ -2141,13 +2229,15 @@ mod tests {
         let dir = project("home", COMPOSE);
         let runner = Arc::new(ShellRunner::default());
         let env = super::fake::test_env("p1", runner.clone());
-        // A pasta não existe antes; nasce com o primeiro comando, do uid do host e fora do Git.
-        assert!(!dir.join(home::HOME_DIR).exists());
+        // A pasta não existe antes; nasce com o primeiro comando, do uid do host, privada e fora da
+        // área de trabalho (spec 141 T01).
+        let h = env.host_home(&dir).expect("caminho");
+        assert!(!h.exists());
         env.prepare(&dir).expect("prepare");
-        let h = dir.join(home::HOME_DIR);
         let uid = fs::metadata("/proc/self").expect("self").uid();
         assert_eq!(fs::metadata(&h).expect("pasta").uid(), uid);
-        assert_eq!(fs::read_to_string(h.join(".gitignore")).expect("gi"), "*\n");
+        assert_eq!(fs::metadata(&h).expect("pasta").mode() & 0o777, 0o700);
+        assert!(!h.starts_with(dir.canonicalize().expect("c")) && !dir.join(home::LEGACY_HOME_DIR).exists());
         let write = "echo gravado > \"$HOME/estado.txt\" && mkdir -p \"$HOME/.local/bin\" \
                      && printf '#!/bin/sh\\necho ferramenta-ok\\n' > \"$HOME/.local/bin/nants-probe-tool\" \
                      && chmod +x \"$HOME/.local/bin/nants-probe-tool\"";
@@ -2156,11 +2246,41 @@ mod tests {
         let second = env.exec(&dir, "cat \"$HOME/estado.txt\" && nants-probe-tool", Duration::from_secs(20)).expect("exec");
         assert!(second.success(), "{}", second.output);
         assert!(second.output.contains("gravado") && second.output.contains("ferramenta-ok"), "{}", second.output);
-        // O que o comando gravou ficou na área de trabalho, dentro da pasta pessoal.
+        // O que o comando gravou ficou na pasta pessoal, fora da área de trabalho.
         assert!(h.join("estado.txt").exists() && h.join(".local/bin/nants-probe-tool").exists());
-        // A remoção da área de trabalho leva a pasta junto.
-        fs::remove_dir_all(&dir).expect("apagável sem sudo");
+        // A remoção da pasta pessoal (a worktree que saiu) a leva, sem sudo.
+        env.remove_home(&dir).expect("apagável sem sudo");
         assert!(!h.exists());
+        fs::remove_dir_all(&dir).expect("rm");
+    }
+
+    /// Spec 141 T01: a área de trabalho com a pasta pessoal antiga (`/work/.nants-home`) é migrada
+    /// no `prepare`: o cache de download vem para a pasta nova, o resto sai da árvore, e o estado
+    /// da instalação é esquecido (a instalação roda de novo no `HOME` novo). Idempotente.
+    #[test]
+    fn prepare_migrates_the_legacy_personal_folder() {
+        let dir = project("legacy", COMPOSE);
+        assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&dir).status().expect("git").success());
+        let legacy = dir.join(home::LEGACY_HOME_DIR);
+        fs::create_dir_all(legacy.join(".cache/npm")).expect("mk");
+        fs::write(legacy.join(".cache/npm/pkg"), "baixado").expect("w");
+        fs::create_dir_all(legacy.join(".config/pulse")).expect("mk");
+        std::os::unix::fs::symlink("/tmp/pulse-sumiu/native", legacy.join(".config/pulse/x-runtime")).expect("ln");
+        fs::create_dir_all(legacy.join(".local/bin")).expect("mk");
+        let state = dir.join(".git/nants-install.state");
+        fs::write(&state, "chave\n").expect("w");
+        let fake = Arc::new(FakeRunner::default());
+        let env = env_with(&fake);
+        env.prepare(&dir).expect("prepare");
+        let h = env.host_home(&dir).expect("home");
+        assert!(!legacy.exists());
+        assert_eq!(fs::read_to_string(h.join(".cache/npm/pkg")).expect("cache"), "baixado");
+        assert!(!h.join(".local").exists() && !h.join(".config").exists());
+        assert!(!state.exists(), "estado da instalação esquecido");
+        fs::write(&state, "chave\n").expect("w");
+        env.prepare(&dir).expect("de novo");
+        assert!(state.exists(), "sem legado, nada muda");
+        fs::remove_dir_all(&dir).expect("rm");
     }
 
     #[test]
@@ -2400,7 +2520,9 @@ mod tests {
 
     /// Spec 140 T07 (C-21): a pasta de dados do Nants, onde mora a memória do Nanty, nunca é montada
     /// num container. O override do Nants só monta a worktree (e partes dela, só leitura), nos dois
-    /// modos; o compose do projeto não monta caminho do host fora do projeto.
+    /// modos, e (spec 141 T01) a pasta pessoal da área de trabalho, que é uma pasta própria dentro de
+    /// `<dados>/homes/<projeto>/`, nunca a pasta de dados nem algo acima da memória; o compose do
+    /// projeto não monta caminho do host fora do projeto.
     #[test]
     fn no_container_mount_reaches_the_nants_data_folder() {
         let dir = project("ov-data", COMPOSE);
@@ -2409,8 +2531,12 @@ mod tests {
         let doc: Value = serde_yaml::from_str(COMPOSE).expect("yaml");
         let data = crate::config::data_dir_from(None, Some("/home/alguem".into())).expect("data");
         let memory = data.join("nanty").join("memory");
-        for run in [None, Some("run")] {
-            let text = override_yaml("p1", &dir, &doc, run, None).expect("ov");
+        let homes = data.join(home::HOMES_DIR);
+        for (run, wt) in [(None, abs.clone()), (Some("run"), abs.join(".sdd/worktrees/s1/T01"))] {
+            let real_home = home::host_home(&homes, "p1", &wt).expect("home");
+            assert!(real_home.starts_with(homes.join("p1")) && real_home != homes.join("p1"), "{}", real_home.display());
+            assert!(!memory.starts_with(&real_home) && !real_home.starts_with(data.join("nanty")));
+            let text = override_yaml_with("p1", &dir, &real_home, &doc, run, None, &mut Vec::new(), &|_, _| true, &|_| None, ContainerLimits::host(), None).expect("ov");
             let v: Value = serde_yaml::from_str(&text).expect("parse");
             let services = v["services"].as_mapping().expect("services");
             let mut sources = 0;
@@ -2418,11 +2544,15 @@ mod tests {
                 for vol in svc.get("volumes").and_then(Value::as_sequence).into_iter().flatten() {
                     let source = vol.get("source").and_then(Value::as_str).unwrap_or_default();
                     sources += 1;
+                    if vol.get("target").and_then(Value::as_str) == Some(home::CONTAINER_HOME) {
+                        assert_eq!(Path::new(source), real_home.as_path(), "só a pasta pessoal desta área de trabalho");
+                        continue;
+                    }
                     assert!(Path::new(source).starts_with(&abs), "só a worktree: {source}");
                     assert!(!Path::new(source).starts_with(&data) && !memory.starts_with(source), "{source}");
                 }
             }
-            assert!(sources >= 1, "{text}");
+            assert!(sources >= 2, "{text}");
         }
         for source in [data.to_string_lossy().to_string(), memory.to_string_lossy().to_string(), "../../..".to_string()] {
             let line = "      - ${NANTS_WORKTREE}:/work\n";
@@ -2479,7 +2609,7 @@ mod tests {
         let dir = project("busy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
+        let text = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), None, &mut remaps, &|_, p| p != 3000, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert_eq!(remaps, vec![(3000, 41234)]);
         let v: Value = serde_yaml::from_str(&text).expect("parse");
         let Value::Tagged(t) = &v["services"]["workspace"]["ports"] else { panic!("sem tag: {text}") };
@@ -2488,9 +2618,9 @@ mod tests {
         assert_eq!(list[1].as_str(), Some("127.0.0.1:5173:5173"));
         // Tudo livre: nenhum override de portas; sem comando (-test): idem.
         let mut none = Vec::new();
-        let free = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None, ContainerLimits::host(), None).expect("ov");
+        let free = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), None, &mut none, &|_, _| true, &|_| None, ContainerLimits::host(), None).expect("ov");
         assert!(none.is_empty() && !free.contains("ports"), "{free}");
-        let test = override_yaml_with("p1", &dir, &doc, None, None, &mut none, &|_, _| false, &|_| Some(1), ContainerLimits::host(), None).expect("ov");
+        let test = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, None, None, &mut none, &|_, _| false, &|_| Some(1), ContainerLimits::host(), None).expect("ov");
         assert!(none.is_empty() && !test.contains("ports"), "{test}");
     }
 
@@ -2507,12 +2637,56 @@ mod tests {
             let text = override_yaml("p1", &dir, &doc, run, None).expect("ov");
             let v: Value = serde_yaml::from_str(&text).expect("parse");
             let vols = v["services"]["workspace"]["volumes"].as_sequence().expect("vols");
-            assert_eq!(vols.len(), 3, "{text}");
+            assert_eq!(vols.len(), 4, "{text}");
             for (i, t) in [(1, "/work/.git"), (2, "/work/.nants")] {
                 assert_eq!(vols[i]["target"].as_str(), Some(t));
                 assert_eq!(vols[i]["read_only"].as_bool(), Some(true));
             }
+            // Spec 141 T01: a pasta pessoal, por bind, fora de `/work` e gravável.
+            assert_eq!(vols[3]["target"].as_str(), Some(home::CONTAINER_HOME));
+            assert_eq!(vols[3]["source"].as_str(), Some(TEST_HOST_HOME));
+            assert!(vols[3].get("read_only").is_none());
         }
+        // Spec 141 T01 (revisão 1): `.git` ou `.nants` que é link não vira montagem (o Docker
+        // seguiria o link no host e montaria o alvo).
+        let outside = project("romounts-alvo", compose);
+        fs::remove_file(dir.join(".git")).expect("rm");
+        fs::remove_dir_all(dir.join(".nants")).expect("rm");
+        std::os::unix::fs::symlink(outside.join(".nants"), dir.join(".git")).expect("ln");
+        std::os::unix::fs::symlink(outside.join(".nants"), dir.join(".nants")).expect("ln");
+        let text = override_yaml("p1", &dir, &doc, None, None).expect("ov");
+        let v: Value = serde_yaml::from_str(&text).expect("parse");
+        let targets: Vec<&str> = v["services"]["workspace"]["volumes"].as_sequence().expect("vols").iter().filter_map(|m| m["target"].as_str()).collect();
+        assert_eq!(targets, ["/work", home::CONTAINER_HOME], "{text}");
+        assert!(!text.contains(outside.to_string_lossy().as_ref()), "{text}");
+    }
+
+    /// Spec 141 T02 (C-02): nas rodadas da raiz com worktrees, uma pasta vazia (tmpfs) por cima de
+    /// `/work/.sdd/worktrees`, nos dois modos; na worktree de uma tarefa e na raiz sem worktrees,
+    /// nada muda.
+    #[test]
+    fn root_rounds_hide_task_worktrees() {
+        let compose = "services:\n  workspace:\n    image: x\n";
+        let dir = project("hide-wt", compose);
+        let doc: Value = serde_yaml::from_str(compose).expect("yaml");
+        let tmpfs_of = |wt: &Path, run: Option<&str>| -> Vec<Value> {
+            let text = override_yaml("p1", wt, &doc, run, None).expect("ov");
+            let v: Value = serde_yaml::from_str(&text).expect("parse");
+            v["services"]["workspace"]["volumes"].as_sequence().expect("vols").iter().filter(|m| m["type"].as_str() == Some("tmpfs")).cloned().collect()
+        };
+        assert!(tmpfs_of(&dir, None).is_empty(), "sem worktrees");
+        let wt = dir.join(".sdd/worktrees/s1/T01");
+        fs::create_dir_all(wt.join(".nants")).expect("wt");
+        fs::write(wt.join(COMPOSE_REL), compose).expect("w");
+        for run in [None, Some("npm start")] {
+            let t = tmpfs_of(&dir, run);
+            assert_eq!(t.len(), 1, "{t:?}");
+            assert_eq!(t[0]["target"].as_str(), Some("/work/.sdd/worktrees"));
+            assert_eq!(t[0]["tmpfs"]["size"].as_u64(), Some(HIDDEN_TMPFS_BYTES));
+            assert!(t[0].get("source").is_none());
+            assert!(tmpfs_of(&wt, run).is_empty(), "a worktree da tarefa enxerga a si mesma");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2554,7 +2728,7 @@ mod tests {
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         // A porta pedida (5173) está livre, mas em `--lan` a do host vem da faixa mesmo assim.
         let mut remaps = Vec::new();
-        let text = override_yaml_with("p1", &dir, &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
+        let text = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("npm run dev"), Some(VIEW), &mut remaps, &|_, _| true, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert!(text.contains("ports: !override"), "{text}");
         assert!(remaps.is_empty(), "{remaps:?}");
         let list = lan_list(&text);
@@ -2580,7 +2754,7 @@ mod tests {
         let dir = project("lanbusy", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let busy = |ip: &str, p: u16| ip == "0.0.0.0" && p != 3001 && p != 3003;
-        let text = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
+        let text = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), Some(VIEW), &mut Vec::new(), &busy, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         let list = lan_list(&text);
         assert_eq!(list.iter().filter_map(Value::as_str).collect::<Vec<_>>(), ["0.0.0.0:3002:5173", "0.0.0.0:3004:8000", "0.0.0.0:3005:8001"]);
     }
@@ -2591,11 +2765,11 @@ mod tests {
         let dir = project("lanfull", compose);
         let doc: Value = serde_yaml::from_str(compose).expect("yaml");
         let expected = "Todas as portas de visualização (3001 a 3010) estão em uso. Pare outro app na Execução e tente de novo.";
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), Some(VIEW), &mut Vec::new(), &|_, _| false, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
         assert_eq!(err, expected);
         // Uma livre só, duas portas pedidas: também esgota (nunca repete nem sai da faixa).
         let one = |_: &str, p: u16| p == 3010;
-        let err = override_yaml_with("p1", &dir, &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
+        let err = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), Some(VIEW), &mut Vec::new(), &one, &|_| Some(41234), ContainerLimits::host(), None).expect_err("esgotada");
         assert_eq!(err, expected);
         // No `up_run` real (sonda de verdade): faixa de uma porta ocupada por um listener.
         let l = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind");
@@ -2615,7 +2789,7 @@ mod tests {
         let off = override_yaml("p1", &dir, &doc, Some("npm run dev"), None).expect("ov");
         assert!(!off.contains("ports"), "{off}");
         // Byte a byte igual ao de antes: o `--lan` não interfere sem faixa, e o `-test` ignora a faixa.
-        let with_busy = override_yaml_with("p1", &dir, &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
+        let with_busy = override_yaml_with("p1", &dir, Path::new(TEST_HOST_HOME), &doc, Some("run"), None, &mut Vec::new(), &|_, p| p != 5173, &|_| Some(41234), ContainerLimits::host(), None).expect("ov");
         assert_eq!(lan_list(&with_busy)[0].as_str(), Some("127.0.0.1:41234:5173"));
         assert_eq!(lan_list(&with_busy)[1].as_str(), Some("127.0.0.1::8080"));
         let test_kind = override_yaml("p1", &dir, &doc, None, None).expect("ov");
@@ -2866,7 +3040,7 @@ mod tests {
         let out = result.expect("docker");
         down.expect("down");
         assert!(out.success() && out.output.contains("/opt/nants-sonda/bin/nants-sonda") && out.output.contains("sonda-ok"), "{}", out.output);
-        assert!(out.output.contains("/work/.nants-home/.local/bin:/opt/nants-sonda/bin:"), "{}", out.output);
+        assert!(out.output.contains("/nants/home/.local/bin:/opt/nants-sonda/bin:"), "{}", out.output);
         assert_eq!(label.expect("inspect").as_str(), format!("itestpath{}", std::process::id()));
         assert!(!left.expect("inspect"), "a imagem construída saiu com o down --rmi local");
         fs::remove_dir_all(&dir).expect("apagável");
@@ -3211,6 +3385,9 @@ mod tests {
         assert!(!main.iter().any(|(k, _)| k == "/tmp" || k == "/tmp/.local" || k == "/tmp/.cache"), "ancestral não entra: {main:?}");
         assert_eq!(main_paths(&outside, 3, 1).len(), 1);
         assert!(written_outside_work(&parse_docker_diff("")).is_empty());
+        // Spec 141 T01: a pasta pessoal montada (e a pasta acima dela) não conta; vizinhas sim.
+        let home = parse_docker_diff("A /nants\nA /nants/home\nA /nants/home/.cache/x\nA /nants/outra\nA /nantsx\n");
+        assert_eq!(written_outside_work(&home), ["/nants/outra", "/nantsx"]);
     }
 
     #[test]

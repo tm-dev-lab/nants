@@ -87,10 +87,8 @@ async fn one_message_carries_the_text_the_footer_and_one_button_per_entry() {
     assert_eq!(all.len(), 1, "uma mensagem só: {all:?}");
     let body = &all[0];
     let text = body["text"].as_str().unwrap_or_default();
-    assert!(text.starts_with("Guardei as duas coisas."), "{text}");
-    for title in ["Disco", "Docker"] {
-        assert!(text.contains(&tr(Lang::PtBr, "nanty.chat.memory_saved", &[("title", title)])), "{text}");
-    }
+    // Spec 141 T10 (C-10): o texto do modelo, sem o rodapé fixo; o que foi guardado está nos botões.
+    assert_eq!(text, "Guardei as duas coisas.");
     let cards = forget_cards(&w);
     assert_eq!(cards.len(), 2);
     let keys = datas(&body["reply_markup"]);
@@ -137,7 +135,7 @@ async fn with_voice_the_note_carries_the_caption_and_the_button() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let note = &bodies(&fake, "sendVoice")[0];
     let caption = note["caption"].as_str().unwrap_or_default();
-    assert_eq!(caption, format!("Guardei.\n{}", tr(Lang::PtBr, "nanty.chat.memory_saved", &[("title", "Disco")])));
+    assert_eq!(caption, "Guardei.");
     let markup: Value = serde_json::from_str(note["reply_markup"].as_str().unwrap_or_default()).expect("JSON");
     assert_eq!(datas(&markup).len(), 1);
     assert!(sends(&fake).is_empty(), "nada sai de novo em texto: {:?}", sends(&fake));

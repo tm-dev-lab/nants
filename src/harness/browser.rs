@@ -1,5 +1,6 @@
 //! Testes de navegador dos agentes (spec 036): `run_browser_tests` roda o comando num container
-//! Playwright efêmero (`docker run --rm`), com só a worktree montada em /work. Argv fixo (sem
+//! Playwright efêmero (`docker run --rm`), com só a worktree montada em /work (`.git` e `.nants` só
+//! leitura, spec 141 T01) e a pasta pessoal em `/nants/home`. Argv fixo (sem
 //! shell no host), ambiente do host limpo, timeout próprio e `docker rm -f` no estouro e no
 //! encerramento. A imagem é escolhida pela versão exata de `@playwright/test` da worktree.
 
@@ -59,8 +60,9 @@ fn image_name(version: &str) -> String {
     format!("mcr.microsoft.com/playwright:v{version}-noble")
 }
 
-/// Argv do `docker run` (sem o programa `docker`).
-pub fn run_args(name: &str, worktree: &Path, version: &str, command: &str, user: Option<(u32, u32)>) -> Vec<String> {
+/// Argv do `docker run` (sem o programa `docker`). `host_home` é a pasta pessoal (no host) da
+/// área de trabalho, montada em [`home::CONTAINER_HOME`].
+pub fn run_args(name: &str, worktree: &Path, host_home: &Path, version: &str, command: &str, user: Option<(u32, u32)>) -> Vec<String> {
     let mut a: Vec<String> = ["run", "--rm", "--name"].map(String::from).to_vec();
     a.push(name.into());
     a.extend(["--init", "--ipc=host"].map(String::from));
@@ -70,8 +72,23 @@ pub fn run_args(name: &str, worktree: &Path, version: &str, command: &str, user:
     if let Some((uid, gid)) = user {
         a.extend(["--user".into(), format!("{uid}:{gid}")]);
     }
-    a.extend(["-v".into(), format!("{}:/work", worktree.to_string_lossy()), "-w".into(), "/work".into()]);
-    // Spec 129 T01: a mesma pasta pessoal persistente dos comandos do workspace.
+    a.extend(["-v".into(), format!("{}:/work", worktree.to_string_lossy())]);
+    // Spec 141 T01: o mesmo isolamento estrutural do Compose (spec 062): `.git` (arquivo ou
+    // diretório) e `.nants` só leitura. O teste do Playwright é código escrito pelo agente. Só
+    // arquivo ou diretório de verdade: o Docker segue um link da origem no host e montaria o alvo.
+    for prot in [".git", ".nants"] {
+        let p = worktree.join(prot);
+        if p.symlink_metadata().is_ok_and(|m| m.is_file() || m.is_dir()) {
+            a.extend(["-v".into(), format!("{}:/work/{prot}:ro", p.to_string_lossy())]);
+        }
+    }
+    // Spec 141 T02 (C-02): na raiz, as worktrees das tarefas ficam fora da vista, como no Compose.
+    if let Some(hidden) = home::hidden_from_root(worktree) {
+        a.extend(["--mount".into(), format!("type=tmpfs,destination=/work/{hidden},tmpfs-size=1048576")]);
+    }
+    // Spec 129 T01: a mesma pasta pessoal persistente dos comandos do workspace; spec 141 T01: fora
+    // de `/work`, por bind da pasta do diretório de dados do Nants.
+    a.extend(["-v".into(), format!("{}:{}", host_home.to_string_lossy(), home::CONTAINER_HOME), "-w".into(), "/work".into()]);
     a.extend(["-e".into(), "CI=1".into(), "-e".into(), format!("HOME={}", home::CONTAINER_HOME)]);
     a.push(image_name(version));
     a.extend(["sh".into(), "-c".into(), command.into()]);
@@ -86,6 +103,8 @@ pub struct BrowserTests {
     active: Mutex<BTreeSet<String>>,
     timeout: Duration,
     pull_timeout: Duration,
+    /// Spec 141 T01: diretório das pastas pessoais (`<dados>/homes`).
+    homes_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for BrowserTests {
@@ -103,7 +122,14 @@ impl BrowserTests {
             active: Mutex::new(BTreeSet::new()),
             timeout: BROWSER_TIMEOUT,
             pull_timeout: PULL_TIMEOUT,
+            homes_dir: home::homes_base(),
         }
+    }
+
+    /// Diretório das pastas pessoais (testes; o padrão é `<dados>/homes`).
+    pub fn with_homes_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.homes_dir = Some(dir);
+        self
     }
 
     pub fn real(project_id: impl Into<String>) -> Self {
@@ -184,13 +210,14 @@ impl BrowserTests {
                 }
             }
         }
-        if let Err(e) = home::ensure(worktree) {
-            return Err(format!("pasta pessoal ({}) indisponível: {e}", home::HOME_DIR));
-        }
+        // Spec 141 T01: a mesma pasta pessoal do Compose para esta área de trabalho (com a pasta
+        // antiga migrada, se houver).
+        let homes = self.homes_dir.as_deref().ok_or("pasta pessoal indisponível: diretório de dados do Nants indisponível (HOME)")?;
+        let host_home = home::ready(homes, &self.project_id, worktree).map_err(|e| format!("pasta pessoal indisponível: {e}"))?;
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let name = format!("{}{n}", container_prefix(&self.project_id));
         let me = fs::metadata("/proc/self").ok().map(|m| (m.uid(), m.gid()));
-        let args = run_args(&name, worktree, &version, command, me);
+        let args = run_args(&name, worktree, &host_home, &version, command, me);
         self.active.lock().unwrap_or_else(PoisonError::into_inner).insert(name.clone());
         // Spec 123 T02: imagem pronta (o download tem limite próprio); o relógio dos testes começa.
         if let Some(p) = progress {
@@ -322,8 +349,9 @@ mod tests {
     #[test]
     fn argv_is_fixed_and_mounts_only_worktree() {
         let d = tree("1.49.1");
+        let homes = d.join("dados-homes");
         let fake = Arc::new(Fake::default());
-        let b = BrowserTests::new("p1", fake.clone());
+        let b = BrowserTests::new("p1", fake.clone()).with_homes_dir(homes.clone());
         let text = b.run(&d, "npx playwright test").expect("run");
         assert!(text.starts_with("exit: 0"));
         let calls = fake.calls.lock().unwrap_or_else(PoisonError::into_inner);
@@ -336,13 +364,70 @@ mod tests {
             assert!(a.contains(&limit), "{limit} em {a:?}");
         }
         let mounts: Vec<_> = a.windows(2).filter(|w| w[0] == "-v").collect();
-        assert_eq!(mounts.len(), 1);
+        // Sem `.git` nem `.nants`: a worktree e a pasta pessoal (fora de `/work`).
+        let home = homes.join("p1/root/home");
+        assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0][1], format!("{}:/work", d.display()));
+        assert_eq!(mounts[1][1], format!("{}:/nants/home", home.display()));
         assert!(a.contains(&"mcr.microsoft.com/playwright:v1.49.1-noble".to_string()));
         assert_eq!(&a[a.len() - 3..], ["sh", "-c", "npx playwright test"]);
-        assert!(a.contains(&"HOME=/work/.nants-home".to_string()));
-        assert!(d.join(".nants-home/.gitignore").exists());
+        assert!(a.contains(&"HOME=/nants/home".to_string()));
+        assert!(home.join(".profile").exists() && !d.join(home::LEGACY_HOME_DIR).exists());
         assert!(run.env.iter().all(|(k, _)| k == "PATH" || k == "HOME" || k.starts_with("DOCKER_") || k == "NANTS_WORKTREE"));
+    }
+
+    /// Spec 141 T01: o container do navegador monta `.git` e `.nants` só leitura, como o Compose
+    /// (spec 062), e migra a pasta pessoal antiga da área de trabalho.
+    #[test]
+    fn git_and_nants_are_mounted_read_only_and_the_legacy_home_is_migrated() {
+        let d = tree("1.49.1");
+        fs::write(d.join(".git"), "gitdir: /x\n").expect("git");
+        fs::create_dir_all(d.join(".nants")).expect("nants");
+        fs::create_dir_all(d.join(home::LEGACY_HOME_DIR).join(".cache")).expect("legado");
+        let homes = d.join("dados-homes");
+        let fake = Arc::new(Fake::default());
+        BrowserTests::new("p1", fake.clone()).with_homes_dir(homes.clone()).run(&d, "x").expect("run");
+        let calls = fake.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        let a = &calls.iter().find(|c| c.args[0] == "run").expect("run").args;
+        let mounts: Vec<String> = a.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect();
+        assert_eq!(
+            mounts,
+            [
+                format!("{}:/work", d.display()),
+                format!("{}/.git:/work/.git:ro", d.display()),
+                format!("{}/.nants:/work/.nants:ro", d.display()),
+                format!("{}:/nants/home", homes.join("p1/root/home").display()),
+            ]
+        );
+        assert!(!d.join(home::LEGACY_HOME_DIR).exists());
+        assert!(homes.join("p1/root/home/.cache").is_dir());
+    }
+
+    /// Spec 141 T01 (revisão 1): `.git` ou `.nants` que é link não vira montagem (o Docker seguiria
+    /// o link no host e montaria o alvo).
+    #[test]
+    fn linked_git_or_nants_is_not_mounted() {
+        let d = tree("1.49.1");
+        let target = tree("1.49.1");
+        std::os::unix::fs::symlink(&target, d.join(".git")).expect("ln");
+        std::os::unix::fs::symlink(&target, d.join(".nants")).expect("ln");
+        let a = run_args("n", &d, Path::new("/dados/homes/p1/root/home"), "1.49.1", "x", None);
+        let mounts: Vec<String> = a.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect();
+        assert_eq!(mounts, [format!("{}:/work", d.display()), "/dados/homes/p1/root/home:/nants/home".to_string()]);
+    }
+
+    /// Spec 141 T02: na raiz com worktrees, uma pasta vazia por cima delas; na worktree, nada.
+    #[test]
+    fn root_hides_task_worktrees_and_the_worktree_does_not() {
+        let d = tree("1.49.1");
+        let wt = d.join(".sdd/worktrees/s1/T01");
+        fs::create_dir_all(&wt).expect("wt");
+        let tmpfs = |dir: &Path| -> Vec<String> {
+            let a = run_args("n", dir, Path::new("/dados/homes/p1/root/home"), "1.49.1", "x", None);
+            a.windows(2).filter(|w| w[0] == "--mount").map(|w| w[1].clone()).collect()
+        };
+        assert_eq!(tmpfs(&d), ["type=tmpfs,destination=/work/.sdd/worktrees,tmpfs-size=1048576"]);
+        assert!(tmpfs(&wt).is_empty());
     }
 
     #[test]

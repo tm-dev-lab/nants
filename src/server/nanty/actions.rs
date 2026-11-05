@@ -227,6 +227,9 @@ pub fn suggest(alert: &Alert, cfg: &Config, retries: &BTreeMap<String, RetryCoun
     };
     match kind {
         SignalKind::PlanWaiting => spec.is_some().then(|| base(ActionId::ApprovePlan)),
+        // Spec 141 T09 (C-09): parada por defeito do ambiente do Nants não se resolve retomando;
+        // fica só o aviso, e a pessoa decide pelas opções da recuperação.
+        SignalKind::RunBlocked if super::turn::is_nants_fault(&alert.facts) => None,
         SignalKind::RunBlocked => spec.is_some().then(|| base(ActionId::ResumeRun)),
         SignalKind::Budget => Some(base(ActionId::RaiseLimit)),
         SignalKind::DockerOrphans => Some(base(ActionId::CleanOrphans)),

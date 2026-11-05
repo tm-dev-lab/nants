@@ -314,9 +314,32 @@ pub trait SpecRunner: Send + Sync {
     ) -> Result<(usize, String), RunnerError> {
         Err(RunnerError::Invalid("recuperação não suportada por este runner".into()))
     }
+
+    /// Spec 141 T04 (C-03, R2): o servidor roda a etapa oficial e a restrita na worktree da tarefa,
+    /// no ambiente do projeto, e devolve o par do registro de rodadas (ver
+    /// `TaskRunner::probe_restriction`). `None`: sem evidência (este runner não roda nada).
+    fn probe_restriction<'a>(
+        &'a self,
+        _spec_id: &'a str,
+        _task_id: &'a str,
+        _original: &'a str,
+        _restricted: &'a str,
+    ) -> Fut<'a, Option<crate::sdd::test_levels::RestrictionProbe>> {
+        Box::pin(async { None })
+    }
 }
 
 impl SpecRunner for TaskRunner {
+    fn probe_restriction<'a>(
+        &'a self,
+        spec_id: &'a str,
+        task_id: &'a str,
+        original: &'a str,
+        restricted: &'a str,
+    ) -> Fut<'a, Option<crate::sdd::test_levels::RestrictionProbe>> {
+        Box::pin(TaskRunner::probe_restriction(self, spec_id, task_id, original, restricted))
+    }
+
     fn run<'a>(&'a self, spec_id: &'a str) -> Fut<'a, Result<SpecOutcome, RunnerError>> {
         Box::pin(self.run_spec(spec_id))
     }
@@ -947,6 +970,29 @@ async fn choose(
         })
         .await?;
         let mut adopted = false;
+        // Spec 141 T03 (C-06): a opção `reset_workspace` é executada pelo servidor antes de registrar
+        // a escolha: limpa a pasta pessoal da worktree e esquece a instalação.
+        let (reset_root, reset_spec, reset_task, reset_choice, reset_secrets) =
+            (root.clone(), spec_job.clone(), task_job.clone(), choice.clone(), Arc::clone(&secrets));
+        let reset_probe = state_job.prereqs().clone();
+        let compose = state_job.compose().clone();
+        let reset_project = id_job.clone();
+        let reset = blocking(move || {
+            let chosen = recovery::is_reset_choice(&reset_root, &reset_spec, &reset_task, &reset_choice, &reset_secrets, &|| {
+                reset_probe.docker_available()
+            })
+            .map_err(map_choice_error)?;
+            if chosen {
+                let env = compose.for_project(&reset_root, &reset_project, crate::harness::compose::ComposeKind::Test);
+                recovery::reset_workspace(env.as_deref(), &reset_root, &reset_spec, &reset_task)
+                    .map_err(|_| internal(CHOICE_FAILED))?;
+            }
+            Ok(chosen)
+        })
+        .await?;
+        if reset {
+            adopted = true;
+        }
         if let Some(option) = env_option {
             let dialog = DialogTarget::new(root.clone(), spec_job.clone());
             let reason = env_choice_reason(state_job.project_lang(&id_job).get(), &option.label);
@@ -1930,10 +1976,57 @@ fn spawn_run(bg: Background) -> bool {
         // Bloqueio por qualidade: o Arquiteto analisa dentro do mesmo run (mesma reserva). RETRY
         // reabre a tarefa e o run continua; ESCALATE deixa BLOCKED. Ambiental nunca passa por aqui.
         let mut relaunch = false;
+        // Spec 141 T03 (C-04) e T05 (C-05): a falha do ambiente do Nants e a mesma falha depois da
+        // escolha da pessoa vão a ela sem o modelo (nem diagnóstico depois).
+        let mut nants_faulted = false;
         loop {
             let RunEnd::Outcome(SpecOutcome::Blocked { task_id, kind, reason, .. }) = &end else {
                 break;
             };
+            // Spec 141 T05 (C-05): a mesma falha voltou depois da escolha da pessoa. Nem recuperação
+            // nem diagnóstico (nenhuma chamada ao modelo): a tarefa volta a ela, sem reabrir os ciclos.
+            let (probe, probe_spec, probe_task) = (root.clone(), spec_id.clone(), task_id.clone());
+            let same = tokio::task::spawn_blocking(move || recovery::same_failure_blocked(&probe, &probe_spec, &probe_task))
+                .await
+                .unwrap_or(false);
+            if same {
+                let scope = recovery::Scope {
+                    state: &state,
+                    project_id: &project_id,
+                    spec_id: &spec_id,
+                    root: &root,
+                    secrets: &secrets,
+                    events: &events,
+                    dialog: &dialog,
+                };
+                if let recovery::Next::Shutdown = recovery::same_failure(&scope, &runner, task_id, &mut halt).await {
+                    end = RunEnd::Cancelled;
+                }
+                nants_faulted = true;
+                break;
+            }
+            // Spec 141 T03 (C-04): a saída dos testes citou um caminho do Nants. Nem recuperação nem
+            // diagnóstico (nenhuma chamada ao modelo): a escalada vai à pessoa com `reset_workspace`.
+            if *kind == BlockKind::Environmental {
+                let (probe, probe_spec, probe_task) = (root.clone(), spec_id.clone(), task_id.clone());
+                let nants = tokio::task::spawn_blocking(move || recovery::nants_fault_blocked(&probe, &probe_spec, &probe_task))
+                    .await
+                    .unwrap_or(false);
+                if nants {
+                    let scope = recovery::Scope {
+                        state: &state,
+                        project_id: &project_id,
+                        spec_id: &spec_id,
+                        root: &root,
+                        secrets: &secrets,
+                        events: &events,
+                        dialog: &dialog,
+                    };
+                    let _ = recovery::nants_fault(&scope, &runner, task_id).await;
+                    nants_faulted = true;
+                    break;
+                }
+            }
             // Ambiental só entra aqui quando a causa é a configuração de testes do plano (docker no
             // comando dentro do workspace): o Arquiteto pode corrigi-la via REVISE_CONFIG.
             let eligible = match kind {
@@ -2009,7 +2102,8 @@ fn spawn_run(bg: Background) -> bool {
             }
         }
         // Bloqueio de ambiente: diagnóstico do Arquiteto (somente leitura; nunca reabre a tarefa).
-        if let RunEnd::Outcome(SpecOutcome::Blocked { task_id, reason, kind: BlockKind::Environmental, .. }) = &end {
+        // A falha do ambiente do Nants já foi à pessoa, sem modelo (spec 141 T03).
+        if let (false, RunEnd::Outcome(SpecOutcome::Blocked { task_id, reason, kind: BlockKind::Environmental, .. })) = (nants_faulted, &end) {
             let scope = recovery::Scope {
                 state: &state,
                 project_id: &project_id,
@@ -2577,7 +2671,13 @@ fn reset_plan(
             reopened.body = crate::agents::runner::mark_revised(&reopened.body);
         }
         // Retomar é intervenção humana (spec 073): zera o orçamento de ciclos; o histórico fica.
-        reopened.body = crate::agents::runner::mark_human_resumed(&reopened.body);
+        // Spec 141 T05 (revisão 1, F-01): bloqueada pela mesma falha sem escalada nova gravada
+        // (reinício no meio), a marca leva a assinatura do frontmatter.
+        reopened.body = crate::agents::runner::mark_human_resumed_after(
+            &reopened.body,
+            meta.next_action_code.as_deref(),
+            meta.failure_signature.as_deref(),
+        );
         reopened.frontmatter.status = TaskStatus::Todo;
         reopened.frontmatter.attempts = 0;
         reopened.frontmatter.rejected_sha = None;
@@ -3806,6 +3906,10 @@ mod tests {
         /// Bloqueia a T01 por qualidade; conclui quando a tarefa volta a TODO e o ambiente docker já
         /// foi ajustado pela recuperação (spec 074: imagem node:22 adotada na base).
         RecoverAdjustsEnv,
+        /// Spec 141 T03: a saída dos testes citou um caminho do Nants (código `nants_environment`).
+        NantsFault,
+        /// Spec 141 T05: a mesma falha voltou depois da escolha da pessoa (código `same_failure`).
+        SameFailure,
     }
 
     struct NoDev;
@@ -3839,6 +3943,42 @@ mod tests {
         if !task.body.contains("## Findings Abertos") {
             task.body.push_str("\n## Findings Abertos\n- id: F-01\n  severity: HIGH\n  location: src/lib.rs:1\n  description: falta validar a entrada\n  recommendation: validar\n");
         }
+        fs::write(&path, task.render().expect("render")).expect("gravar T01");
+    }
+
+    /// Spec 141 T03: escreve a T01 como o runner a deixa na falha do ambiente do Nants.
+    fn write_nants_fault_t01(root: &Path) {
+        let path = root.join(".sdd/specs").join(SPEC).join("tasks/T01.md");
+        let mut task = Task::parse(&fs::read_to_string(&path).expect("T01")).expect("parse T01");
+        task.frontmatter.status = TaskStatus::Blocked;
+        task.frontmatter.next_action =
+            Some("defeito do ambiente do Nants: os testes tropeçaram em /work/.nants-home, que é do Nants".into());
+        task.frontmatter.next_action_code = Some(crate::agents::runner::BLOCK_NANTS_ENVIRONMENT.into());
+        task.frontmatter.test_evidence = Some(
+            "[falha dos testes: código 1]\nCould not find '/work/.nants-home/.config/pulse/f9c8-runtime'\n".into(),
+        );
+        fs::write(&path, task.render().expect("render")).expect("gravar T01");
+    }
+
+    /// Spec 141 T05: escreve a T01 como o runner a deixa quando a mesma falha volta depois da escolha
+    /// da pessoa: a escalada anterior (com as opções e a assinatura), a marca de retomada conferida e
+    /// o bloqueio com o código `same_failure`.
+    fn write_same_failure_t01(root: &Path) {
+        use crate::agents::runner::{disarm_signature, mark_human_resumed, FAILURE_SIGNATURE_LINE, OPTIONS_CLOSE, OPTIONS_OPEN};
+        let path = root.join(".sdd/specs").join(SPEC).join("tasks/T01.md");
+        let mut task = Task::parse(&fs::read_to_string(&path).expect("T01")).expect("parse T01");
+        if !task.body.contains(FAILURE_SIGNATURE_LINE) {
+            let options = r#"[{"id":"cfg","label":"Autossuficiente","kind":"config","test_command":"true && node --test --test-force-exit"},{"id":"gui","label":"Nova worktree","kind":"guidance","text":"descarte a worktree e recomece"}]"#;
+            task.body.push_str(&format!(
+                "\n## Análise de recuperação #1\n- Causa raiz: o comando varre a pasta pessoal\n- Decisão: escalar ao humano\n{OPTIONS_OPEN}\n{options}\n{OPTIONS_CLOSE}\n{FAILURE_SIGNATURE_LINE}abc-123\n"
+            ));
+            task.body = disarm_signature(&mark_human_resumed(&task.body));
+        }
+        task.frontmatter.status = TaskStatus::Blocked;
+        task.frontmatter.next_action = Some("a mesma falha voltou depois da sua escolha".into());
+        task.frontmatter.next_action_code = Some(crate::agents::runner::BLOCK_SAME_FAILURE.into());
+        task.frontmatter.failure_signature = Some("abc-123".into());
+        task.frontmatter.test_evidence = Some("[falha dos testes: código 1]\nError: ENOENT: no such file or directory, stat pulse/native\n".into());
         fs::write(&path, task.render().expect("render")).expect("gravar T01");
     }
 
@@ -4030,6 +4170,24 @@ mod tests {
                             task_id: "T01".into(),
                             reason: reason.into(),
                             kind,
+                            open_findings: vec![],
+                        })
+                    }
+                    Script::SameFailure => {
+                        write_same_failure_t01(&self.root);
+                        Ok(SpecOutcome::Blocked {
+                            task_id: "T01".into(),
+                            reason: "a mesma falha voltou depois da sua escolha".into(),
+                            kind: crate::agents::runner::BlockKind::Quality,
+                            open_findings: vec![],
+                        })
+                    }
+                    Script::NantsFault => {
+                        write_nants_fault_t01(&self.root);
+                        Ok(SpecOutcome::Blocked {
+                            task_id: "T01".into(),
+                            reason: "defeito do ambiente do Nants: os testes tropeçaram em /work/.nants-home, que é do Nants".into(),
+                            kind: crate::agents::runner::BlockKind::Environmental,
                             open_findings: vec![],
                         })
                     }
@@ -7729,6 +7887,127 @@ mod tests {
         assert_eq!(recovery_requests(&backend).len(), 3, "o orçamento zerado chama o modelo de novo (2 ciclos + opções do limite)");
     }
 
+    // ---- Spec 141 T03: falha do ambiente do Nants sem modelo e `reset_workspace` ----
+
+    /// C-04: a falha que cita um caminho do Nants vai à pessoa com o modelo chamado zero vezes, mesmo
+    /// com a aprovação automática: nem recuperação nem diagnóstico. A escalada diz o que aconteceu,
+    /// não conta como ciclo e oferece `reset_workspace`.
+    #[tokio::test]
+    async fn nants_fault_goes_to_the_person_with_zero_model_calls() {
+        use crate::agents::architect::testing::text;
+        for yolo in [false, true] {
+            let root = setup(&format!("nants-fault-{yolo}"), true);
+            git(&root, &["branch", "-M", "main"]);
+            if yolo {
+                enable_yolo(&root);
+            }
+            let (state, backend) = recovery_state(&root, Script::NantsFault, vec![text(DIAG_JSON), text(RETRY_JSON)]);
+            let events = run_until(&state, "blocked").await;
+            assert!(recovery_requests(&backend).is_empty(), "{yolo}: zero chamadas ao modelo");
+            let task = read_t01(&root);
+            assert_eq!(task.frontmatter.status, TaskStatus::Blocked);
+            assert!(task.body.contains(&format!("- Causa raiz: {}", recovery::CAUSE_NANTS_ENVIRONMENT)), "{}", task.body);
+            assert!(task.body.contains("A saída dos testes cita /work/.nants-home, que pertence ao Nants"), "{}", task.body);
+            assert!(task.body.contains(crate::agents::runner::NOT_COUNTED_LINE), "{}", task.body);
+            assert!(!task.body.contains("Diagnóstico de ambiente"), "{}", task.body);
+            assert_eq!(crate::agents::runner::recovery_cycles(&task.body), 0);
+            let options = recovery::current_options(&task.body);
+            assert_eq!(options.len(), 1, "{}", task.body);
+            assert_eq!((options[0].id.as_str(), options[0].kind), (recovery::RESET_WORKSPACE_ID, recovery::OptionKind::ResetWorkspace));
+            assert_eq!(options[0].label, "Limpar a área de trabalho e testar de novo");
+            let decided = payloads(&events, "recovery_decided");
+            assert_eq!(decided[0]["decision"], "ESCALATE");
+            assert_eq!(decided[0]["options"][0]["kind"], "reset_workspace");
+            let said = payloads(&events, "agent_message").iter().any(|p| {
+                p["agent"] == "architect"
+                    && p["code"] == recovery::CODE_ANALYSIS
+                    && p["text"].as_str().is_some_and(|t| t.contains(recovery::CAUSE_NANTS_ENVIRONMENT) && t.contains("- Contexto:"))
+            });
+            assert!(said, "a conversa mostra o cartão com o que aconteceu");
+            assert!(wait_idle(&state).await);
+        }
+    }
+
+    /// Spec 141 T05 (C-05): a mesma falha depois da escolha da pessoa volta a ela com o modelo
+    /// chamado zero vezes, mesmo com a aprovação automática: nem recuperação nem diagnóstico. A
+    /// escalada diz que a mesma falha voltou, não conta como ciclo, guarda a assinatura e oferece de
+    /// novo as opções da escalada anterior (validadas outra vez) e `reset_workspace`.
+    #[tokio::test]
+    async fn same_failure_goes_back_to_the_person_with_zero_model_calls() {
+        use crate::agents::architect::testing::text;
+        use crate::agents::runner::{recovery_cycles, FAILURE_SIGNATURE_LINE, NOT_COUNTED_LINE};
+        for yolo in [false, true] {
+            let root = setup(&format!("same-failure-{yolo}"), true);
+            git(&root, &["branch", "-M", "main"]);
+            if yolo {
+                enable_yolo(&root);
+            }
+            let (state, backend) = recovery_state(&root, Script::SameFailure, vec![text(DIAG_JSON), text(RETRY_JSON)]);
+            let events = run_until(&state, "blocked").await;
+            assert!(recovery_requests(&backend).is_empty(), "{yolo}: zero chamadas ao modelo");
+            let task = read_t01(&root);
+            assert_eq!(task.frontmatter.status, TaskStatus::Blocked);
+            let section = task.body.split("## Análise de recuperação #2").nth(1).unwrap_or_default().to_string();
+            assert!(section.contains(&format!("- Causa raiz: {}", recovery::CAUSE_SAME_FAILURE)), "{}", task.body);
+            assert!(section.contains("A mesma falha voltou depois da sua escolha"), "{section}");
+            assert!(section.contains(NOT_COUNTED_LINE), "{section}");
+            assert!(section.contains(&format!("{FAILURE_SIGNATURE_LINE}abc-123")), "a escalada nova guarda a assinatura: {section}");
+            assert!(!task.body.contains("Diagnóstico de ambiente"), "{}", task.body);
+            assert_eq!(recovery_cycles(&task.body), 0, "os ciclos não reabrem");
+            let ids: Vec<String> = recovery::current_options(&task.body).into_iter().map(|o| o.id).collect();
+            assert_eq!(ids, ["cfg", "gui", recovery::RESET_WORKSPACE_ID], "{}", task.body);
+            assert!(!settings_text(&root).contains("force-exit"), "{yolo}: nada é aplicado sozinho");
+            let decided = payloads(&events, "recovery_decided");
+            assert_eq!(decided[0]["decision"], "ESCALATE");
+            let said = payloads(&events, "agent_message").iter().any(|p| {
+                p["agent"] == "architect"
+                    && p["code"] == recovery::CODE_ANALYSIS
+                    && p["text"].as_str().is_some_and(|t| t.contains(recovery::CAUSE_SAME_FAILURE) && t.contains("- Contexto:"))
+            });
+            assert!(said, "a conversa mostra o cartão com o que aconteceu");
+            assert!(wait_idle(&state).await);
+        }
+    }
+
+    /// C-06: escolher `reset_workspace` faz o servidor limpar a pasta pessoal da worktree (menos o
+    /// cache de download) e esquecer a instalação, registra o que foi feito para o Desenvolvedor e
+    /// retoma a spec.
+    #[tokio::test]
+    async fn reset_workspace_choice_cleans_the_home_and_forgets_the_install() {
+        use crate::agents::architect::testing::text;
+        use crate::harness::home;
+        let root = setup("nants-reset", true);
+        git(&root, &["branch", "-M", "main"]);
+        let (state, _backend) = recovery_state(&root, Script::NantsFault, vec![text(DIAG_JSON)]);
+        let _ = run_until(&state, "blocked").await;
+        assert!(wait_idle(&state).await);
+        let worktree = crate::agents::runner::task_worktree_path(&root, SPEC, "T01");
+        git(&root, &["worktree", "add", "-b", &format!("sdd/{SPEC}/T01"), &worktree.display().to_string()]);
+        crate::sdd::test_levels::remember_install(&worktree, "chave", "2026-11-04T00:00:00Z");
+        assert!(crate::sdd::test_levels::installed_key(&worktree).is_some());
+        let state = resume_state(&root);
+        // As pastas pessoais do provider deste estado (cada teste tem as suas).
+        let homes = state.compose().homes_dir().expect("pasta das pastas pessoais");
+        let host_home = home::host_home(&homes, PROJECT, &worktree).expect("pasta pessoal");
+        fs::create_dir_all(host_home.join(".config/pulse")).expect("pulse");
+        fs::create_dir_all(host_home.join(home::KEEP_ON_RESET)).expect("cache");
+        fs::write(host_home.join(".config/pulse/runtime"), "x").expect("resíduo");
+        let (code, body) = call(&state, choice_req("T01", &format!(r#"{{"option_id":"{}","analysis":1}}"#, recovery::RESET_WORKSPACE_ID))).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(json_of(&body)["applied"], "reset_workspace");
+        assert!(!host_home.join(".config").exists(), "a pasta pessoal foi limpa");
+        assert!(host_home.join(home::KEEP_ON_RESET).is_dir(), "o cache de download fica");
+        assert!(crate::sdd::test_levels::installed_key(&worktree).is_none(), "a instalação roda de novo");
+        let task = read_t01(&root);
+        assert_eq!(task.frontmatter.status, TaskStatus::Todo);
+        let guidance = crate::agents::runner::section_text(&task.body, crate::agents::runner::GUIDANCE_SECTION).unwrap_or_default();
+        assert!(guidance.contains("o servidor limpou a pasta pessoal desta tarefa (/nants/home)"), "{guidance}");
+        // Spec 141 T05: a escolha não pede mudança de código: a retomada testa antes do Desenvolvedor.
+        assert!(crate::agents::runner::test_first_armed(&task.body), "{}", task.body);
+        stop(&state).await;
+        let _ = home::remove(&homes, PROJECT, &worktree);
+    }
+
     // ---- Spec 073/T02: opções de recuperação e endpoint recovery-choice ----
 
     /// ESCALATE com opções de todos os tipos (o `echo ok` rebaixa a verificação e deve cair).
@@ -8755,9 +9034,9 @@ mod tests {
                 for entry in fs::read_dir(&dir).expect("dir").flatten() {
                     let path = entry.path();
                     let rel = path.strip_prefix(root).expect("rel").display().to_string();
-                    // A pasta pessoal do workspace (129/T01) é do Nants, fora do escopo das tarefas, e
-                    // nasce no primeiro comando, em paralelo com a foto "antes".
-                    if rel == ".git" || crate::harness::home::is_home_path(&rel) || rel.ends_with("dialog.jsonl") || rel.ends_with("report.md") {
+                    // A pasta pessoal antiga do workspace (129/T01) é do Nants, fora do escopo das
+                    // tarefas; fica enquanto houver legado (141/T01: a nova mora fora da árvore).
+                    if rel == ".git" || crate::harness::home::is_legacy_home_path(&rel) || rel.ends_with("dialog.jsonl") || rel.ends_with("report.md") {
                         continue;
                     }
                     if path.is_dir() {

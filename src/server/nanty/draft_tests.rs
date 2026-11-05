@@ -253,14 +253,77 @@ async fn a_hostile_project_cannot_change_the_destination() {
     assert_eq!(w.architect_chat("p2"), "");
 }
 
+/// Spec 141 T07 (C-11), o caso real da validação da rc.24 (Telegram, 2026-11-03): às 20:13 a conversa
+/// leu a Nerd Stickers (aqui o Blog, `p2`); 45 minutos depois a pessoa pediu a instrução de retomada
+/// para o Arquiteto do Mini Street Fighter (aqui a Loja, `p1`), o Nanty a escreveu e ofereceu o cartão,
+/// e o "Sim" foi recusado porque a procedência do Blog vinha herdada da janela. Agora vira rascunho
+/// marcado, com a faixa da janela do projeto e as mensagens ao Arquiteto sem internet enquanto pendente.
 #[tokio::test]
-async fn the_click_refuses_a_card_whose_contamination_came_from_another_project() {
-    let w = World::new("click-refusal", "Plano da loja", vec![propose_call("p1", "Ideia."), say("Ok.")]);
-    w.ask("leve ao Arquiteto").await;
-    // Um cartão adulterado no estado: a fonte é do Blog, o destino é a Loja.
+async fn an_old_read_of_another_project_inherited_by_the_window_makes_a_marked_draft() {
+    let resume = "Retome a T03: o golpe especial ainda não acerta o oponente; confira a colisão antes de seguir.";
+    let w = World::new(
+        "inherited",
+        "Plano da loja",
+        vec![say("Aqui está a instrução de retomada. Posso transformar essa mensagem em um cartão para o Arquiteto?"), propose_call("p1", resume), say("Deixei o cartão.")],
+    );
+    // A leitura do Blog, 45 minutos antes: a resposta gravada com a procedência do Blog.
+    let earlier = w.nanty().now().epoch_ms.saturating_sub(45 * 60 * 1000);
+    let mut read = ConversationMessage::from_nanty(crate::server::nanty::new_id(), earlier, Channel::Web, "nanty.chat.failed", serde_json::Map::new());
+    read.code = None;
+    read.text = Some("O Blog está com a vitrine de adesivos pronta.".into());
+    read.lang = Some("pt-BR".into());
+    let mut taint = Taint::default();
+    taint.read(TaintKind::ProjectFile, Some("p2"));
+    read.taint = Some(taint);
+    w.nanty().push_message(&read);
+
+    let offer = w.ask("escreva a instrução de retomada para o Arquiteto da Loja").await;
+    assert!(offer.taint.as_ref().is_some_and(|t| t.sources.iter().any(|s| s.project_id.as_deref() == Some("p2"))), "a procedência do Blog é herdada: {:?}", offer.taint);
+    w.ask("Sim").await;
+    assert!(!w.model.everything().contains(&tr(Lang::PtBr, "nanty.tool.draft_other_project", &[])), "sem recusa");
+    assert_eq!(w.journal("architect_draft.refused"), 0);
+    let card = w.draft_cards().remove(0);
+    assert_eq!((card.project_id.as_deref(), card.params["marked"].clone()), (Some("p1"), json!(true)));
+    for lang in [Lang::PtBr, Lang::En] {
+        let text = render::card_text(lang, &card);
+        assert!(text.contains(resume) && text.contains(&tr(lang, "nanty.architect_draft.marked", &[])), "{text}");
+    }
+    assert_eq!(w.decide(&card, "yes").await.expect("sim")["outcome"], json!("architect_draft_saved"));
+    let draft = w.drafts().remove(0);
+    assert!(draft.marked() && draft.fresh.is_empty(), "{draft:?}");
+    assert!(draft.taint.iter().any(|t| t.project_id.as_deref() == Some("p2")), "a fonte herdada fica registrada");
+    // A janela da Loja mostra a faixa do rascunho marcado; o do Blog não tem nada.
+    let view = w.get_draft("p1").await;
+    assert_eq!((view["draft"]["text"].as_str(), view["draft"]["marked"].as_bool()), (Some(resume), Some(true)));
+    assert_eq!(w.get_draft("p2").await["draft"], Value::Null);
+    // Enquanto pendente, toda mensagem da pessoa ao Arquiteto da Loja sai sem internet, com o aviso.
+    let turn = for_turn(&w.state, "p1", false, None, "outra coisa", false);
+    assert!(turn.offline && turn.note && turn.carries.is_none(), "{turn:?}");
+    let carried = for_turn(&w.state, "p1", false, None, resume, false);
+    assert_eq!((carried.offline, carried.carries.as_deref()), (true, Some(draft.id.as_str())));
+    assert!(for_turn(&w.state, "p1", true, None, "", false).offline, "os turnos internos também");
+    assert_eq!(w.architect_chat("p1"), "", "nada enviado sem a pessoa");
+}
+
+/// Spec 141 T07 (C-11): ler outro projeto no próprio turno que propõe continua recusado.
+#[tokio::test]
+async fn reading_another_project_in_the_proposing_turn_is_still_refused() {
+    let w = World::new(
+        "fresh-refusal",
+        "Plano da loja",
+        vec![call("project_details", json!({ "project_id": "p2" })), propose_call("p1", "Traga do Blog a vitrine para a loja."), say("Ok.")],
+    );
+    w.ask("leia o Blog e leve a ideia ao Arquiteto da Loja").await;
+    assert!(w.model.everything().contains(&tr(Lang::PtBr, "nanty.tool.draft_other_project", &[])));
+    assert!(w.draft_cards().is_empty() && w.drafts().is_empty());
+    assert_eq!(w.journal("architect_draft.refused"), 1);
+}
+
+/// Troca o pedido guardado no cartão (um cartão adulterado no estado) e devolve o cartão novo.
+fn tamper(w: &World, edit: impl FnOnce(&mut ArchitectDraft)) -> Card {
     let mut card = w.draft_cards().remove(0);
     let mut draft = draft_of(&card).expect("pedido");
-    draft.taint = vec![TaintSource { kind: TaintKind::AgentDialog, project_id: Some("p2".into()) }];
+    edit(&mut draft);
     card.params.insert(PARAM_DRAFT.into(), json!(draft));
     let stored = card.clone();
     w.nanty().update(|st| {
@@ -268,8 +331,31 @@ async fn the_click_refuses_a_card_whose_contamination_came_from_another_project(
         st.cards.push(stored);
         true
     });
+    card
+}
+
+#[tokio::test]
+async fn the_click_refuses_a_card_whose_own_turn_read_another_project() {
+    let w = World::new("click-refusal", "Plano da loja", vec![propose_call("p1", "Ideia."), say("Ok.")]);
+    w.ask("leve ao Arquiteto").await;
+    // A fonte lida pelo próprio turno é do Blog, o destino é a Loja.
+    let blog = TaintSource { kind: TaintKind::AgentDialog, project_id: Some("p2".into()) };
+    let card = tamper(&w, |d| {
+        d.taint = vec![blog.clone()];
+        d.fresh = vec![blog.clone()];
+    });
     assert_eq!(w.decide(&card, "yes").await.expect_err("recusa").code(), Some("nanty_draft_other_project"));
     assert!(w.drafts().is_empty());
+}
+
+/// Spec 141 T07 (C-11): a mesma fonte do Blog, só herdada da janela, não recusa no clique; marca.
+#[tokio::test]
+async fn the_click_marks_a_card_whose_other_project_came_only_from_the_window() {
+    let w = World::new("click-inherited", "Plano da loja", vec![propose_call("p1", "Ideia."), say("Ok.")]);
+    w.ask("leve ao Arquiteto").await;
+    let card = tamper(&w, |d| d.taint = vec![TaintSource { kind: TaintKind::AgentDialog, project_id: Some("p2".into()) }]);
+    assert_eq!(w.decide(&card, "yes").await.expect("sim")["outcome"], json!("architect_draft_saved"));
+    assert!(w.drafts()[0].marked());
 }
 
 #[tokio::test]
@@ -299,6 +385,7 @@ async fn forget_project_and_the_sweep_take_the_draft_and_the_card() {
         project_id: "p2".into(),
         text: "x".into(),
         taint: vec![TaintSource { kind: TaintKind::ProjectFile, project_id: Some("p9".into()) }],
+        fresh: Vec::new(),
         channel: Channel::Web,
         at_ms: 1,
     };
@@ -339,7 +426,7 @@ fn the_draft_scope_covers_the_destination_and_the_sources() {
     let mut taint = Taint::default();
     taint.add(TaintKind::ProjectFile, Some("p1"));
     taint.add(TaintKind::Relayed, None);
-    let d = ArchitectDraft { id: "d".into(), project_id: "p1".into(), text: "x".into(), taint: taint.sources, channel: Channel::Web, at_ms: 1 };
+    let d = ArchitectDraft { id: "d".into(), project_id: "p1".into(), text: "x".into(), taint: taint.sources, fresh: Vec::new(), channel: Channel::Web, at_ms: 1 };
     assert_eq!(d.projects(), ["p1"]);
     assert!(d.marked());
     assert!(foreign(&d.taint, "p1").is_empty(), "sem projeto não é outro projeto");

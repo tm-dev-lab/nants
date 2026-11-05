@@ -313,6 +313,23 @@ fn free_text_in_facts_never_reaches_the_input() {
 
 // ---- Resposta validada ----
 
+/// Spec 141 T08 (revisão 1): a marca de tom, curta ou completa, no começo do `summary` do turno (o
+/// texto do aviso e o resumo da manhã) nunca chega à pessoa; a marca sozinha não é resumo.
+#[test]
+fn the_tone_marker_never_reaches_the_person_in_the_turn_summary() {
+    let allowed = [ActionId::OpenNants];
+    for raw in [
+        r#"{"summary": "[neutral]\nUm plano espera a sua aprovação."}"#,
+        r#"{"summary": "**[Calm]** Um plano espera a sua aprovação."}"#,
+        r#"{"summary": "[tone: serious]\nUm plano espera a sua aprovação."}"#,
+        r#"{"summary": "[tone: furious] Um plano espera a sua aprovação."}"#,
+    ] {
+        assert_eq!(turn::validate(raw, &allowed).expect("válida").summary, "Um plano espera a sua aprovação.", "{raw}");
+    }
+    assert_eq!(turn::validate(r#"{"summary": "Fica [calm] no meio."}"#, &allowed).expect("válida").summary, "Fica [calm] no meio.");
+    assert_eq!(turn::validate(r#"{"summary": "[neutral]"}"#, &allowed), Err(Invalid::Summary));
+}
+
 #[test]
 fn reply_validation_accepts_only_the_format_and_catalog_ids_offered() {
     let allowed = [ActionId::ApprovePlan, ActionId::RemindLater, ActionId::OpenNants];
@@ -566,6 +583,8 @@ fn telegram_text_is_built_from_code_and_params_in_each_language() {
         unpriced_yesterday: false,
         disk_free_gb: Some(40),
         disk_low: false,
+        nants_faults: Vec::new(),
+        names: [("p1".to_string(), "Loja".to_string())].into_iter().collect(),
     };
     let message = digest::compose(&facts, &crate::config::NantyConfig::default(), "m1".into(), 5).expect("resumo");
     assert_eq!(message.code.as_deref(), Some(digest::MORNING));
@@ -582,10 +601,10 @@ fn telegram_text_is_built_from_code_and_params_in_each_language() {
          Ontem os projetos gastaram US$ 1,50, em 25.000 tokens no total.\n\
          O disco com menos espaço está com 40 GB livres.\n\
          Guardei 1 aviso para este resumo:\n\
-         1 tarefa passou do patamar de custo; percebi às 03:10."
+         Loja: 1 tarefa passou do patamar de custo; percebi às 03:10."
     );
     assert!(en.starts_with("Good morning. Here is how the projects are doing.\n1 project is running.") && en.contains("US$ 1.50, using 25,000 tokens"), "{en}");
-    assert!(en.ends_with("1 task went over the cost threshold; I noticed at 03:10."), "{en}");
+    assert!(en.ends_with("Loja: 1 task went over the cost threshold; I noticed at 03:10."), "{en}");
     assert!(!pt.contains(": 0") && !pt.contains(" 0 ") && !en.contains(": 0"), "nenhum zero");
 }
 
@@ -667,22 +686,18 @@ async fn morning_digest_is_built_from_facts_with_the_model_only_when_there_is_so
     assert!(snap.digest.is_empty(), "os avisos guardados entraram no resumo");
     let messages = w.nanty().conversation();
     let message = messages.last().expect("resumo");
-    // Spec 139 T06 (C-11): com o texto do modelo, as linhas de contagem, custo e disco saem; ficam a
-    // frase curta do servidor e o porquê de cada aviso guardado, do dicionário (C-06 da 138), junto
-    // do texto dele.
+    // Spec 141 T10 (C-10): com o texto do modelo, o texto é todo dele. A mensagem leva o selo e os
+    // avisos guardados como dados (para a janela); nenhuma lista fixa, nem contagem, custo ou disco.
     assert_eq!(message.code.as_deref(), Some(digest::LEAD));
-    assert!(message.params.get("lines").is_none(), "{:?}", message.params);
-    let why = message.params[digest::WHY].as_array().expect("o porquê dos avisos guardados");
-    assert_eq!((why[0]["code"].as_str(), why[0]["params"]["count"].as_u64()), (Some("nanty.digest.held"), Some(1)));
-    assert_eq!(why[1]["code"], "nanty.why.task_delivered");
+    assert!(message.params.get("lines").is_none() && message.params.get(digest::WHY).is_none(), "{:?}", message.params);
+    let held = message.params[digest::HELD].as_array().expect("os avisos guardados como dados");
+    assert_eq!((held[0]["project_id"].as_str(), held[0]["notices"][0]["kind"].as_str()), (Some("p1"), Some("task_delivered")));
+    assert_eq!(held[0]["notices"][0]["at"], "02:00");
     assert_eq!(message.text.as_deref(), Some("O disco está baixo e um plano espera você."));
-    assert_eq!(
-        render::message_text(Lang::PtBr, message),
-        "Resumo da manhã.\nGuardei 1 aviso para este resumo:\nUma tarefa foi entregue às 02:00.\nO disco está baixo e um plano espera você."
-    );
+    assert_eq!(render::message_text(Lang::PtBr, message), "Resumo da manhã\nO disco está baixo e um plano espera você.");
     assert_eq!(
         render::message_text(Lang::En, &crate::server::nanty::store::ConversationMessage { lang: None, ..message.clone() }),
-        "Morning summary.\nI saved 1 notice for this summary:\nA task was delivered at 02:00.\nO disco está baixo e um plano espera você."
+        "Morning summary\nO disco está baixo e um plano espera você."
     );
     // A reserva (sem o modelo) é montada dos mesmos fatos. Ontem: 100.000 × 10 + 10.000 × 20 por
     // milhão = US$ 1,20; o modelo sem preço conta só tokens.

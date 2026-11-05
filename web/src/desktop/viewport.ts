@@ -91,25 +91,43 @@ const KEYBOARD_OPEN_RATIO = 0.75;
 /** Acima desta fração da maior altura vista, o teclado conta como fechado (histerese). */
 const KEYBOARD_CLOSED_RATIO = 0.9;
 
+/** Aparelho de toque (sem mouse): focar um campo de digitar abre o teclado virtual. */
+const TOUCH_QUERY = "(hover: none) and (pointer: coarse)";
+
+function touchNow(): boolean {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(TOUCH_QUERY).matches;
+}
+
 function inKeyboardArea(target: EventTarget | null): boolean {
   return opensKeyboard(target) && target.closest(`[${KEYBOARD_AREA_ATTR}]`) !== null;
 }
 
 /**
- * Modo "teclado aberto" no celular (spec 083): com foco num campo de digitar dentro de um contêiner
- * `[data-keyboard-area]` e a altura visível abaixo de {@link KEYBOARD_OPEN_RATIO} da maior altura vista
- * (na largura atual), marca `<html data-keyboard="open">`; o CSS esconde a barra compacta e as abas
- * para a conversa ocupar a altura. Desliga quando o foco sai ou a altura volta acima de
- * {@link KEYBOARD_CLOSED_RATIO}. No desktop ou sem `visualViewport`, nunca marca. Devolve a remoção.
+ * Modo "teclado aberto" no celular (spec 083; 141/T11): com foco num campo de digitar dentro de um
+ * contêiner `[data-keyboard-area]`, marca `<html data-keyboard="open">`; o CSS esconde a barra de
+ * cima, as abas e o cabeçalho da janela para a conversa e o campo ocuparem a altura.
+ *
+ * - **Aparelho de toque ({@link TOUCH_QUERY}):** liga já no foco. Medir a viewport visual não basta:
+ *   no Chrome do iPhone o modo não ligava (141/T11), e a única entrada dele era a viewport visual
+ *   encolher abaixo de {@link KEYBOARD_OPEN_RATIO} da maior altura vista, com a mesma largura.
+ * - **Sem toque:** liga só quando a altura visível cai abaixo de {@link KEYBOARD_OPEN_RATIO}.
+ * - **Desliga** quando o foco sai da área, ou quando a altura, depois de ter encolhido, volta acima de
+ *   {@link KEYBOARD_CLOSED_RATIO} (o teclado fechou com o foco no campo); aí só um novo encolhimento ou
+ *   um novo foco religa.
+ *
+ * No desktop, nunca marca. Sem `visualViewport`, vale só o foco num aparelho de toque. Devolve a remoção.
  */
 export function installKeyboardMode(): () => void {
-  const vv = typeof window === "undefined" ? undefined : window.visualViewport;
-  if (vv === undefined || vv === null) return () => undefined;
+  if (typeof window === "undefined") return () => undefined;
+  const vv = window.visualViewport ?? null;
   const root = document.documentElement;
   let focused = false;
+  let shrunk = false;
+  let dismissed = false;
   let maxHeight = 0;
-  let width: number | undefined = vv.width;
+  let width: number | undefined = vv?.width;
   const height = (): number => {
+    if (vv === null) return 0;
     const scale = vv.scale > 0 ? vv.scale : 1;
     return vv.height * scale;
   };
@@ -119,21 +137,34 @@ export function installKeyboardMode(): () => void {
   };
   const evaluate = (): void => {
     // Rotação muda a altura de referência: recomeça a medir na nova largura.
-    if (vv.width !== width) {
+    if (vv !== null && vv.width !== width) {
       width = vv.width;
       maxHeight = 0;
     }
     const current = height();
     if (current > maxHeight) maxHeight = current;
-    if (!focused || !mobileNow() || maxHeight <= 0) {
+    if (!focused || !mobileNow()) {
       setOpen(false);
       return;
     }
-    if (current < maxHeight * KEYBOARD_OPEN_RATIO) setOpen(true);
-    else if (current > maxHeight * KEYBOARD_CLOSED_RATIO) setOpen(false);
+    const measured = maxHeight > 0;
+    if (measured && current < maxHeight * KEYBOARD_OPEN_RATIO) {
+      shrunk = true;
+      dismissed = false;
+      setOpen(true);
+    } else if (measured && shrunk && current > maxHeight * KEYBOARD_CLOSED_RATIO) {
+      shrunk = false;
+      dismissed = true;
+      setOpen(false);
+    } else if (touchNow() && !dismissed) {
+      setOpen(true);
+    }
+    // Entre as duas frações (ou sem toque, sem encolher), o estado fica como está (histerese).
   };
   const onFocusIn = (event: FocusEvent): void => {
     focused = inKeyboardArea(event.target);
+    shrunk = false;
+    dismissed = false;
     evaluate();
   };
   const onFocusOut = (event: FocusEvent): void => {
@@ -141,11 +172,11 @@ export function installKeyboardMode(): () => void {
     evaluate();
   };
   evaluate();
-  vv.addEventListener("resize", evaluate);
+  vv?.addEventListener("resize", evaluate);
   document.addEventListener("focusin", onFocusIn);
   document.addEventListener("focusout", onFocusOut);
   return () => {
-    vv.removeEventListener("resize", evaluate);
+    vv?.removeEventListener("resize", evaluate);
     document.removeEventListener("focusin", onFocusIn);
     document.removeEventListener("focusout", onFocusOut);
     setOpen(false);

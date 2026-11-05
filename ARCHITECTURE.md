@@ -120,8 +120,10 @@ person message (Telegram or window)
   Architect: `propose_to_architect(project_id, text)` (only in `tools::Mode::Conversation`, one per
   person message) checks the project is observed, runs the text through `format::clean_whole` (the
   redactor included) and refuses, never cuts, above `[nanty.chat] architect_draft_chars`. A taint
-  source of another project than the destination is refused with a dictionary line and the journal
-  code `architect_draft.refused`. It creates a card (`<project>:architect_draft`, action
+  source of another project than the destination that the proposing turn read itself
+  (`Session::fresh`, stored as `ArchitectDraft::fresh`; spec 141 T07, C-11) is refused with a
+  dictionary line and the journal code `architect_draft.refused`; one inherited from the window only
+  marks the draft. It creates a card (`<project>:architect_draft`, action
   `architect_draft`, outside the catalog) with the frozen text, the mark and the sources in
   `card_lines`; a new proposal replaces the card and its token. The yes (`draft::decide`, before the
   memory and `act`) checks the project and the sources again (`nanty_draft_project_gone`,
@@ -186,8 +188,24 @@ person message (Telegram or window)
   it follows the mark of `summary.json` (in `seq` order, never back). With no model or no budget,
   the step leaves the server line instead. `summary.json` stays under 128 KiB, the oldest items
   leaving first, and the context takes the newest that fit in 6 thousand characters.
-- **Tools.** `project_status`, `system_status` and `nanty_activity` are trusted; `project_details`
-  is not: it goes in the untrusted data envelope and taints the turn (`Session::tainted`), as does a
+- **What the person saw (spec 141 T06).** `notice.rs`: a Nanty message about a notice opens, in the
+  history, with the `server_facts` header of its cards (the project with a validated name, the
+  signal, since when), which stays even when the text is in quarantine. A decision, a resolution or
+  an expiry of a card enters as a `server_event`, on the person side and as data. The quarantine
+  applies only to the model text, and a Nanty line with no provenance (from before spec 140) leaves
+  the window. The last message carries `focus`, the project of the current subject, as a fact. A
+  Telegram reply to a notice brings its facts as `replied_to` in the person message. Only the
+  server writes those keys: model text or a file that imitates them has the key renamed before it
+  reaches the history.
+- **Tools.** `project_status`, `system_status`, `nants_docs` and `nanty_activity` are trusted;
+  `project_status` and `system_status` return JSON with enumerated server fields and codes from the
+  fixed lists (spec 141 T09), and the dictionary phrases stay for the reserve without a model.
+  `system_status` carries the version, each role with its connection kind and model, and, per
+  observed project, the environment mode, `yolo`, the escalation options waiting for the person and
+  `nants_fault` (a stop caused by the Nants environment itself, never offered as a resume).
+  `nants_docs` searches this file, the README and SECURITY, embedded with `include_str!` and split
+  by heading, with a cap of 4 excerpts and 6 thousand characters; addresses and IPs are removed.
+  `project_details` is not: it goes in the untrusted data envelope and taints the turn (`Session::tainted`), as does a
   forwarded message or a third party quote. `tools::Mode` lists the tools of each mode, and the
   dispatcher checks that list before the `match`: a tool not offered, called by name, runs nothing.
   Deep reads (`deep.rs`, spec 140 T10) are four conversation tools, one per family: `agent_log`
@@ -270,10 +288,20 @@ person message (Telegram or window)
   the last `Host` of an authorized device (`NantyState::device_host`, read only in network mode), and
   if Telegram refuses the button the message goes again with the address as text. With no address, it
   says to open Nants on the computer. In the window it opens the project screen, with no link.
-- **Text of a message.** With model text, `render::message_text` puts Nanty's words first and the
-  server sentence last (`render::closing`), so the cut of the caption and of the speech keeps it.
-  Only the summary (`digest::LEAD`) opens with the title and the kept whys. The why of each notice always comes
-  from the dictionary.
+- **Text of a message.** With model text, `render::message_text` is Nanty's words alone: no fixed
+  sentence closes them (spec 141 T10). Only the titles of the summary (`digest::LEAD`) and of the
+  automatic analysis (`scenario::LEAD`) open it, as a short label, and only a safety line with no
+  card or button to carry it closes it (`render::KEPT`: with no reachable address, how to open
+  Nants). The tool results tell the model what happened and what the person can do, never that the
+  server says it, unless a card, a button or that line does. With no model text, it is the fixed
+  reply: the sentence of the code and the extra lines. The why of each notice always comes from the
+  dictionary, on its card.
+- **Morning summary.** With the model, `digest::with_model_text` keeps only the label and the kept
+  notices as data (`params.held`, from `digest::held_groups`: grouped by project, the Nants defect
+  first, then what needs attention, each notice with its type and time), which the window shows
+  under the text. The model gets the same groups in `TurnInput::held`, with ids and codes only, no
+  project name. With no model, `digest::compose` lists every kept notice in order (by the time of the
+  fact), each one `nanty.digest.item` with the project name, and the count matches the lines.
 - **A card too long for Telegram.** `outbox::fit_card` drops the "yes" of a card whose redacted
   text passes one message and adds the dictionary line that points to the window; the card id goes
   to `NantyState::window_only_cards`, apart from `telegram_sent` (which has a ceiling and forgets the
@@ -284,18 +312,34 @@ person message (Telegram or window)
   by `format::clean_whole` and never cut at 4096, and the window shows it whole. Telegram splits it
   with `format::split` into up to `MAX_PARTS` (3) messages, at a paragraph, line or sentence break or
   a space, never inside a word or a masked secret, keeping `LAST_PART_ROOM` in the last one for the
-  lines of a refused keyboard. Above three, the last part ends with a dictionary line that points to
-  the window. The keyboard (the way in and the delete buttons) and the server sentence go in the last
-  part, the one recorded for later edits; the parts leave one per call and in order, before anything
-  else, and never go into the queue summary. With voice on, a reply that opens with the model and
-  does not fit a caption speaks only the start of its first paragraph, up to `[nanty.voice]
-  lead_chars` (provisional: 450) at a sentence end, with no extra summary call (`voice::long_lead`):
-  the caption carries the same text and says that the rest follows, and the parts carry only the
-  rest. The spoken part always fits the caption (`lead_chars` is capped at 900 and the part steps
-  back to a sentence end within the caption), so nothing is spoken without being written. With a
-  keyboard, even a single message keeps the room for the refusal lines, so the server sentence
+  lines of a refused keyboard. Above three, the last part ends with the cut mark `…`. The keyboard
+  (the way in and the delete buttons) goes in the last part, the one recorded for later edits; the
+  parts leave one per call and in order, before anything else, and never go into the queue summary.
+  With a keyboard, even a single message keeps the room for the refusal lines, so the end of the text
   survives a refused button. In the history, a reply above 1500 characters keeps its first 1000 and last 400 with a
   server mark in between (`history::trim_reply`).
+- **Voice, all or nothing.** With voice on, the whole text of a message is spoken in one note:
+  `voice::speech_chunks` cuts it at sentence ends into chunks of up to `CHUNK_CHARS` (provisional:
+  1000), spoken in sequence with the same voice and tone (a tone the provider refuses drops to
+  neutral for the rest of the note), and the PCM is joined, with a short pause, before it becomes
+  Opus. Each chunk counts in the daily spend and in `voice_calls`. Only a text that Telegram shows
+  whole is spoken (`voice::speakable`): `format::fits_parts`, the same loop as `format::split`, with
+  `LAST_PART_ROOM` as the room (the worst case), must deliver it in `MAX_PARTS` parts without a cut. Otherwise there is no speech call and the reason
+  is `too_long`, so the note never says what the text does not show; the window follows the same
+  rule, since it is the same message. A notice speaks the model text only when its full text apart
+  passes the same check, and the fixed sentence otherwise. Safety ceilings on size
+  (`MAX_SPOKEN_UNITS`, three full parts minus the keyboard room), on chunks (`MAX_CHUNKS`, 16) and on length
+  (`MAX_SPEECH_SECS`, 15 minutes, about 3.6 MB at 32 kbit/s, far from the 20 MB kept and the 50 MB
+  of a Telegram note) also apply. The deadline is per chunk (`Tuning::speech_deadline`,
+  provisional: 45 s), with a total ceiling of that deadline times the number of chunks, never
+  past the notice `limit` (`voice::total_deadline`). A chunk past either ends the speech at once:
+  the remaining chunks are never requested nor charged, and the ended chunk is charged by
+  estimate, since the provider may have billed it. A failure, a deadline or a ceiling in any chunk
+  leaves no partial audio: the whole text goes right away, and the reason is journaled
+  (`voice.failed` with the chunk, `voice.text`). The transcript is always whole: in the caption
+  when the text fits 1024, with the keyboard; otherwise the note goes with no caption and no keyboard, and the whole text
+  follows in `format::split` parts that reply to the note (`reply_parameters`). With voice off,
+  text only. The old `[nanty.voice] lead_chars` key is ignored on read.
 - **Voice.** Gemini only, then text; the OpenAI steps of an old `order` are read, dropped with a line
   in the record and never written. `voice::deliver` stores the text first, then generates the speech
   outside the send queue, one at a time and with a deadline, and sends the message once.
@@ -378,6 +422,39 @@ person message (Telegram or window)
   same `BlockKind`, count and evidence as the limit of 5 cycles; a tree with no change is extra
   evidence, and the Developer's prose is never read. The failed step is a fact for the Developer and
   for recovery.
+- **Home outside the tree (spec 141 T01 and T02).** `harness::home` mounts the container home at
+  `CONTAINER_HOME` (`/nants/home`) from a folder per worktree and one for the root in the data
+  folder, never under `/work`; the old `.nants-home/` is moved out once, keeping only the download
+  cache. In a round at the project root, `home::hidden_from_root` covers `TASK_WORKTREES`
+  (`.sdd/worktrees`) with a `tmpfs` when `.sdd` and that folder are real folders, so a runner that
+  scans the tree never runs the task worktrees. The browser container mounts `.git` and `.nants`
+  read-only like the compose.
+- **A Nants defect with no model (spec 141 T03).** `agents::nants_fault::detect` reads the tail of
+  the test output (20 non-empty lines, redacted): a path of Nants inside the tree
+  (`nants_fault::tree_paths`) is enough; the home mount counts only with an access error on the same
+  line and the same signature as the cycle before; a test command that itself cites such a path
+  goes the usual way. The runner blocks the task with `BLOCK_NANTS_ENVIRONMENT`
+  (`nants_environment`), and `recovery::nants_fault` writes a deterministic escalation with no model
+  call and no cycle, with the cited path and the `reset_workspace` option. That option is run by the
+  server (`runs.rs`): it empties the worktree home except `home::KEEP_ON_RESET`, forgets the install
+  state and goes back to the tests; `guidance` only guides the Developer. `recovery::env_facts`
+  gives the Architect, in recovery and diagnosis, where each setting lives, the mounts, the worktree
+  and the compose redacted by an allow list.
+- **Narrowing the test command (spec 141 T04).** `server::config_restriction` accepts, besides the
+  usual guard (every original step whole), one step with the same words and up to `MAX_APPENDED`
+  paths at the end. Options are refused, and each path must exist in the worktree and in the base
+  branch (`git cat-file`). The server runs the official step and the narrowed one in the task
+  worktree (stages `restriction_official` and `restriction_new`, read back by `SuiteLedger::restriction_probe`);
+  the option exists only when the official one fails with the blocked signature and the narrowed one
+  passes. It is never applied by `yolo`: the person approves a card with both runs and the counts,
+  and the change goes to `test_command`, `full_test_command` and the checks where the step appears.
+- **The same failure after a choice (spec 141 T05).** The runner stores the signature of the
+  failure that blocked the task (`TaskFrontmatter::failure_signature`: the failure, the commands
+  and the environment); the escalation copies it and the human resume marks it. The first failure
+  after the choice with the same signature blocks with `same_failure`, and
+  `recovery::same_failure` escalates with no model and no new cycles, offering again the options of
+  the last escalation, validated again, and `reset_workspace`. A choice that needs no code change
+  (a new command, a clean workspace) runs the official suite before the Developer.
 - **Plan review.** `src/server/plan_review.rs` sends the steps of the test commands to the model,
   which answers with an `infeasible_test_command` finding when a step only becomes runnable after the
   first task that runs the command, with no list of tools in the code. The objective check,

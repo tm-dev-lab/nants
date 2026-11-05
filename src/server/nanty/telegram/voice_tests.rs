@@ -549,7 +549,9 @@ async fn the_digest_is_kept_before_its_speech() {
     assert!(lines.len() == 1 && lines[0].audio.is_some());
 }
 
-/// O prazo vence, o texto segue na hora, e a fala termina sozinha, com o gasto e o registro reais.
+/// O prazo vence, o texto segue na hora (spec 141 T08, revisão 1: o prazo é por trecho). A fala para
+/// ali: o trecho encerrado entra no gasto pela estimativa, porque o provedor pode tê-lo cobrado, e a
+/// resposta tardia não conta de novo nem vira áudio.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_speech_past_the_deadline_still_counts_in_the_budget() {
     let (w, _fake, voice_fake) = world("v-charge", |_| {}).await;
@@ -557,17 +559,16 @@ async fn a_speech_past_the_deadline_still_counts_in_the_budget() {
     voice_fake.hold_speech();
     let nanty = w.state.nanty();
     let spend = || nanty.snapshot().spend_on(&nanty.now().day_key());
-    // A fala só termina na liberação, mais abaixo: voltar aqui prova que o texto não a espera.
     let late = voice::speak_on_time(&w.state, nanty, "Oi.", voice::Tone::Neutral).await;
     assert_eq!(late.map(|_| ()), Err(vec!["deadline"]));
-    assert_eq!(spend().voice_calls, 0);
     assert_eq!(text_reasons(&w), [json!(["deadline"])]);
-    voice_fake.release_speech(1);
-    until("gasto da fala tardia", || spend().voice_calls == 1).await;
+    assert_eq!(spend().voice_calls, 1);
     assert!(spend().input_tokens > 0 && spend().output_tokens > 0);
-    // A linha do registro sai logo depois do gasto: espera, sem lê-la no mesmo instante.
-    let ok = || nanty.journal_tail(100).iter().filter(|e| e.kind == JournalKind::Voice && e.code == "voice.ok").count();
-    until("o registro real da chamada", || ok() == 1).await;
+    voice_fake.release_speech(1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(spend().voice_calls, 1, "a resposta tardia não conta de novo");
+    let ok = nanty.journal_tail(100).iter().filter(|e| e.kind == JournalKind::Voice && e.code == "voice.ok").count();
+    assert_eq!(ok, 0);
 }
 
 /// Spec 140 T01: o aviso fala no tom do tipo do sinal, e o pedido de decisão fica sem anotação.

@@ -1,8 +1,8 @@
 //! A resposta longa (spec 140 T14, C-27), só com o servidor falso do Telegram, o Gemini simulado
 //! (com a fala presa até a liberação explícita) e o modelo simulado; nunca o Telegram real nem chave
-//! real. A conversa grava o texto inteiro; o Telegram o divide em até três partes, com o teclado e a
-//! frase do servidor na última; com a voz ligada, o áudio e a legenda levam só o começo do primeiro
-//! parágrafo, e as partes trazem o resto; a janela mostra tudo.
+//! real. A conversa grava o texto inteiro; o Telegram o divide em até três partes, com o teclado na
+//! última e nenhuma frase fixa depois do texto do modelo (spec 141 T10, C-10); com a voz ligada (spec 141 T08, C-08), a nota fala o texto inteiro e
+//! sai sem legenda, e as partes trazem o texto inteiro respondendo a ela; a janela mostra tudo.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,12 +102,6 @@ fn stored_reply(w: &World) -> ConversationMessage {
     w.state.nanty().conversation().into_iter().rev().find(|m| m.from == Speaker::Nanty && m.reply_to.is_some()).expect("resposta")
 }
 
-/// A frase do servidor como vai ao Telegram.
-fn closing_of(message: &ConversationMessage) -> String {
-    let line = render::closing(Lang::PtBr, message).expect("frase do servidor");
-    format::clean(&SecretSet::default(), &line)
-}
-
 async fn person(w: &World, channel: Channel, text: &str) -> ConversationMessage {
     let cfg = w.state.config().read().await.clone();
     conversation::person_message(w.state.nanty(), &cfg.nanty, &SecretSet::from_config(&cfg), channel, text).expect("mensagem")
@@ -118,38 +112,10 @@ fn words(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_string).collect()
 }
 
-// ---- Puros: quando a fala usa só o começo ----
-
-#[test]
-fn only_the_long_reply_that_opens_with_the_model_speaks_just_the_lead() {
-    let model = |code: Option<&str>, text: &str| {
-        let mut m = ConversationMessage::from_nanty(new_id(), 1, Channel::Telegram, code.unwrap_or("x"), Map::new());
-        m.code = code.map(str::to_string);
-        m.text = Some(text.to_string());
-        m
-    };
-    let long = long_reply(3);
-    let end = voice::long_lead(&model(None, &long), &long, 450).expect("longa");
-    assert_eq!(long[..end].trim_end(), LEAD);
-    // O primeiro parágrafo longo: a fala para no último fim de frase antes de 450 caracteres.
-    let glued = long.replace("\n\n", " ");
-    let end = voice::long_lead(&model(None, &glued), &glued, 450).expect("longa");
-    assert!(glued[..end].chars().count() <= 450 && glued[..end].ends_with('.'), "{}", &glued[..end]);
-    // A curta, a que cabe na legenda e a que abre pelo título do servidor seguem a fala de sempre.
-    assert_eq!(voice::long_lead(&model(None, LEAD), LEAD, 450), None);
-    let digest = model(Some(crate::server::nanty::digest::LEAD), &long);
-    assert_eq!(voice::long_lead(&digest, &long, 450), None);
-    // Com a frase do servidor no fim, a fala é a mesma.
-    let closed = model(Some("nanty.chat.confirm"), &long);
-    let text = render::message_text(Lang::PtBr, &closed);
-    let end = voice::long_lead(&closed, &text, 450).expect("longa");
-    assert_eq!(text[..end].trim_end(), LEAD);
-}
-
 // ---- Sem voz, no Telegram ----
 
 /// Sem voz: a conversa grava a resposta inteira; o Telegram a divide em três partes, a última termina
-/// com a linha que aponta a janela e a frase do servidor, e leva o teclado (o link e o botão de
+/// com a marca do corte, e leva o teclado (o link e o botão de
 /// apagar). O botão de apagar edita essa mensagem.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_voice_a_long_reply_goes_in_three_parts_with_the_keyboard_on_the_last() {
@@ -180,13 +146,11 @@ async fn without_voice_a_long_reply_goes_in_three_parts_with_the_keyboard_on_the
     assert_eq!(forget.len(), 1);
     let token = forget[0].token.clone().unwrap_or_default();
     assert_eq!(datas(&all[2]["reply_markup"]), [callback_data(&forget[0].id, &token, Answer::Yes)]);
-    // A frase do servidor fecha a última parte, depois da linha da janela.
-    let more = tr(Lang::PtBr, "nanty.telegram.rest_in_window", &[]);
-    assert!(texts[2].ends_with(&format!("{more}\n{}", closing_of(&stored))), "{}", texts[2]);
+    // Spec 141 T10 (C-10): a última parte termina com a marca do corte, sem frase fixa depois.
+    assert!(texts[2].ends_with('…'), "{}", texts[2]);
     // Nada partido: as palavras das partes são o começo das palavras da resposta, na ordem.
     let sent: Vec<String> = texts.iter().flat_map(|t| words(t)).collect();
-    let tail_words = words(&format!("{more}\n{}", closing_of(&stored))).len();
-    let body = &sent[..sent.len() - tail_words];
+    let body = &sent[..sent.len() - 1];
     assert_eq!(body, &words(&whole)[..body.len()]);
 
     // A edição de depois mira a mensagem que tem o teclado: o toque tira só o botão de apagar.
@@ -225,7 +189,7 @@ async fn in_a_burst_the_long_reply_goes_whole_and_in_order_before_the_summary() 
     let all = sends(&fake);
     assert!(text_of(&all[0]).starts_with(LEAD) && all[0].get("reply_markup").is_none());
     let saved = tr(Lang::PtBr, "nanty.chat.memory_saved", &[("title", "Disco")]);
-    assert!(text_of(&all[1]).ends_with(&saved), "a frase do servidor fecha: {}", text_of(&all[1]));
+    assert!(!text_of(&all[1]).contains(&saved) && long.trim_end().ends_with(text_of(&all[1]).trim_end()), "o texto do modelo fecha: {}", text_of(&all[1]));
     assert_eq!(datas(&all[1]["reply_markup"]).len(), 1, "o botão na última parte");
     let batch = tr_plural(Lang::PtBr, "nanty.telegram.batch", u64::try_from(outbox::MAX_BURST + 1).unwrap_or(0), &[]);
     assert!(text_of(&all[2]).starts_with(&batch), "o resumo da fila depois: {}", text_of(&all[2]));
@@ -269,11 +233,22 @@ async fn a_refused_keyboard_on_the_last_part_sends_it_again_whole() {
 
 // ---- Com voz, no Telegram e na janela ----
 
-/// Com a voz ligada no Telegram: a conversa recebe o texto inteiro antes da fala; o áudio fala só o
-/// primeiro parágrafo; a legenda leva o mesmo trecho e avisa que o resto vem a seguir, sem teclado; as
-/// partes trazem o resto, sem repetir o trecho, e a última leva o botão e a frase do servidor.
+/// O que o Gemini simulado falou, na ordem dos trechos.
+fn spoken_texts(voice_fake: &voice::tests::FakeVoice) -> Vec<String> {
+    voice_fake.calls("gemini").iter().map(|c| c["input"][0]["content"][0]["text"].as_str().unwrap_or_default().to_string()).collect()
+}
+
+/// A resposta como vai ao Telegram e à fala: o texto redigido.
+fn whole_of(message: &ConversationMessage) -> String {
+    format::clean_whole(&SecretSet::default(), &render::message_text(Lang::PtBr, message))
+}
+
+/// Spec 141 T08 (C-08), com a voz ligada no Telegram: a conversa recebe o texto inteiro antes da fala;
+/// o áudio fala o texto inteiro, em trechos, numa nota só, sem legenda e sem teclado, porque o texto
+/// não cabe na legenda; as partes trazem o texto inteiro, uma vez, respondendo à nota, e a última leva
+/// o botão.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_voice_the_note_speaks_the_lead_and_the_rest_follows_in_parts() {
+async fn with_voice_the_note_speaks_everything_and_the_text_answers_it() {
     let long = long_reply(6);
     let model = Scripted::new(vec![call("remember", remember("Disco")), say(&long)]);
     let (w, fake, voice_fake) = voice_world("t14-voice", model, |_| {}).await;
@@ -287,33 +262,157 @@ async fn with_voice_the_note_speaks_the_lead_and_the_rest_follows_in_parts() {
     let stored = stored_reply(&w);
     assert_eq!(stored.text.as_deref(), Some(long.as_str()));
     assert!(stored.audio.is_none() && bodies(&fake, "sendVoice").is_empty());
-    assert_eq!(voice_fake.calls("gemini")[0]["input"][0]["content"][0]["text"], json!(LEAD), "o áudio só com o primeiro parágrafo");
-    voice_fake.release_speech(1);
+    voice_fake.release_speech(voice::MAX_CHUNKS);
     let _ = replying.await;
     until("as partes", || sends(&fake).len() == 2).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let note = &bodies(&fake, "sendVoice");
+    // A fala: o texto inteiro, em trechos que somam tudo.
+    let whole = whole_of(&stored_reply(&w));
+    let said = spoken_texts(&voice_fake);
+    assert_eq!(said.len(), voice::speech_chunks(&whole, voice::CHUNK_CHARS).len());
+    assert!(said.len() > 1 && said.iter().all(|t| t.chars().count() <= voice::CHUNK_CHARS));
+    assert_eq!(words(&said.join(" ")), words(&whole), "a fala é o texto inteiro");
+
+    // Uma nota só, sem legenda e sem teclado.
+    let note = bodies(&fake, "sendVoice");
     assert_eq!(note.len(), 1);
-    let caption = note[0]["caption"].as_str().unwrap_or_default();
-    assert_eq!(caption, format!("{LEAD}\n\n{}", tr(Lang::PtBr, "nanty.telegram.rest_follows", &[])));
-    assert!(format::units(caption) <= format::MAX_CAPTION_CHARS);
+    assert!(note[0]["caption"].as_str().unwrap_or_default().is_empty(), "sem legenda: {}", note[0]);
     assert!(note[0].get("reply_markup").is_none(), "o teclado vai na última parte: {}", note[0]);
+    // O texto inteiro, uma vez, em partes que respondem à nota (a 1).
     let all = sends(&fake);
     assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all.iter().all(|b| b["reply_parameters"]["message_id"] == json!(1)), "{all:?}");
     let texts: Vec<String> = all.iter().map(text_of).collect();
-    assert!(texts[0].starts_with(&detail(1)[..40]) && !texts.iter().any(|t| t.contains(LEAD)), "o trecho não se repete");
+    assert!(texts[0].starts_with(LEAD));
+    assert_eq!(words(&texts.join("\n")), words(&whole), "a transcrição completa, uma vez");
     assert!(all[0].get("reply_markup").is_none() && datas(&all[1]["reply_markup"]).len() == 1);
     let stored = stored_reply(&w);
-    assert!(texts[1].ends_with(&closing_of(&stored)), "a frase do servidor fecha: {}", texts[1]);
+    assert!(whole.trim_end().ends_with(texts[1].trim_end()), "o texto do modelo fecha, sem frase fixa: {}", texts[1]);
     // A janela: a resposta inteira, com o tocador.
     assert!(stored.audio.is_some() && stored.text.as_deref() == Some(long.as_str()));
     let rec = w.state.nanty().snapshot().telegram_sent.into_iter().find(|r| r.embedded).expect("anotada");
     assert_eq!(rec.message_id, Some(3), "a nota é a 1; as partes, 2 e 3");
+    let journal = serde_json::to_string(&w.state.nanty().journal_tail(1000)).expect("json");
+    assert!(!journal.contains(LEAD), "o registro guarda só códigos");
 }
 
-/// Na janela, com a voz ligada: o áudio fala o primeiro parágrafo, a mensagem tem o texto inteiro, e
-/// nada vai ao Telegram.
+/// Spec 141 T08, revisão 1 (F-01): a resposta que passa do que as três partes mostram não fala (o que
+/// a nota fala sempre aparece escrito): nenhuma chamada de fala, nenhuma nota, o texto sai como sem
+/// voz, em três partes com a linha da janela, e o motivo `too_long` fica no registro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_voice_a_reply_past_the_three_parts_goes_as_text_only() {
+    let huge = long_reply(16);
+    let (w, fake, voice_fake) = voice_world("t14-voice-huge", Scripted::new(vec![say(&huge)]), |_| {}).await;
+    let _out = start_outbox(&w);
+    let asked = person(&w, Channel::Telegram, "como você faria a fila crescer?").await;
+    conversation::reply(&w.state, &asked).await.expect("resposta");
+    assert!(format::units(&whole_of(&stored_reply(&w))) > voice::MAX_SPOKEN_UNITS);
+    until("as três partes", || sends(&fake).len() == format::MAX_PARTS).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(voice_fake.calls("gemini").is_empty(), "nenhuma chamada de fala");
+    assert!(bodies(&fake, "sendVoice").is_empty() && stored_reply(&w).audio.is_none());
+    let all = sends(&fake);
+    assert_eq!(all.len(), format::MAX_PARTS);
+    assert!(all.iter().all(|b| b.get("reply_parameters").is_none()));
+    assert!(text_of(&all[2]).ends_with('…'), "como hoje: {}", text_of(&all[2]));
+    let reasons: Vec<Value> = w.state.nanty().journal_tail(1000).into_iter().filter(|e| e.code == "voice.text").map(|e| e.params["reasons"].clone()).collect();
+    assert_eq!(reasons, [json!(["too_long"])]);
+}
+
+/// Spec 141 T08, revisão 2 (F-02): abaixo das três partes cheias, mas com parágrafos que levam a
+/// divisão real a cortar (sete de 1500 caracteres precisam de quatro partes): nenhuma chamada de fala
+/// nem nota, o texto sai como sem voz, com a linha da janela, e `too_long` no registro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_voice_a_reply_the_split_cuts_goes_as_text_only() {
+    let para = |n: usize| format!("Ponto {n}: {}", "a fila grava cada passo no disco local e avisa os outros pela rede. ".repeat(22).trim_end());
+    let reply = (1..=7).map(para).collect::<Vec<_>>().join("\n\n");
+    let (w, fake, voice_fake) = voice_world("t14-voice-split", Scripted::new(vec![say(&reply)]), |_| {}).await;
+    let _out = start_outbox(&w);
+    let asked = person(&w, Channel::Telegram, "como você faria a fila crescer?").await;
+    conversation::reply(&w.state, &asked).await.expect("resposta");
+    let whole = whole_of(&stored_reply(&w));
+    assert!(format::units(&whole) < voice::MAX_SPOKEN_UNITS, "abaixo do teto de segurança: {}", format::units(&whole));
+    assert!(!voice::speakable(&whole));
+    until("as três partes", || sends(&fake).len() == format::MAX_PARTS).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(voice_fake.calls("gemini").is_empty(), "nenhuma chamada de fala");
+    assert!(bodies(&fake, "sendVoice").is_empty() && stored_reply(&w).audio.is_none());
+    let all = sends(&fake);
+    assert!(text_of(&all[format::MAX_PARTS - 1]).ends_with('…'), "a divisão real cortou: {}", text_of(&all[2]));
+    let reasons: Vec<Value> = w.state.nanty().journal_tail(1000).into_iter().filter(|e| e.code == "voice.text").map(|e| e.params["reasons"].clone()).collect();
+    assert_eq!(reasons, [json!(["too_long"])]);
+}
+
+/// Spec 141 T08: um trecho da fala falha no meio. Nenhum áudio parcial: nenhuma nota, a mensagem fica
+/// sem áudio, o texto inteiro sai em partes (sem responder a nota nenhuma) e o motivo fica no
+/// registro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_chunk_sends_the_whole_text_and_no_audio() {
+    let long = long_reply(6);
+    let (w, fake, voice_fake) = voice_world("t14-voice-fail", Scripted::new(vec![say(&long)]), |_| {}).await;
+    let _out = start_outbox(&w);
+    lock(&voice_fake.gemini).push_back(voice::tests::Reply::Raw(voice::tests::wav(24_000, 1, &voice::tests::tone(24_000, 5))));
+    lock(&voice_fake.gemini).push_back(voice::tests::Reply::Status(500));
+    let asked = person(&w, Channel::Telegram, "como você faria a fila crescer?").await;
+    conversation::reply(&w.state, &asked).await.expect("resposta");
+    until("as partes", || sends(&fake).len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(voice_fake.calls("gemini").len(), 2, "parou no trecho que falhou");
+    assert!(bodies(&fake, "sendVoice").is_empty(), "nenhum áudio parcial");
+    let stored = stored_reply(&w);
+    assert!(stored.audio.is_none());
+    let all = sends(&fake);
+    assert!(all.iter().all(|b| b.get("reply_parameters").is_none()));
+    let texts: Vec<String> = all.iter().map(text_of).collect();
+    assert_eq!(words(&texts.join("\n")), words(&whole_of(&stored)), "o texto inteiro");
+    let journal = w.state.nanty().journal_tail(1000);
+    let failed: Vec<_> = journal.iter().filter(|e| e.code == "voice.failed").collect();
+    assert_eq!((failed[0].params["reason"].clone(), failed[0].params["chunk"].clone()), (json!("provider_error"), json!(1)));
+    assert_eq!(journal.iter().filter(|e| e.code == "voice.text").count(), 1);
+}
+
+/// Spec 141 T08: o prazo vence num trecho. A fala tardia é descartada, e o texto inteiro sai sem áudio.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_chunk_sends_the_whole_text_and_no_audio() {
+    let long = long_reply(6);
+    let (w, fake, voice_fake) = voice_world("t14-voice-late", Scripted::new(vec![say(&long)]), |_| {}).await;
+    w.state.nanty().telegram().set_tuning(Tuning { speech_deadline: Duration::from_millis(200), ..FAST });
+    let _out = start_outbox(&w);
+    voice_fake.hold_speech();
+    let asked = person(&w, Channel::Telegram, "como você faria a fila crescer?").await;
+    conversation::reply(&w.state, &asked).await.expect("resposta");
+    until("as partes", || sends(&fake).len() == 2).await;
+    // Soltas depois do prazo, as falas terminam (e contam no gasto), mas nada sai.
+    voice_fake.release_speech(voice::MAX_CHUNKS);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(bodies(&fake, "sendVoice").is_empty(), "nenhum áudio parcial nem tardio");
+    assert!(stored_reply(&w).audio.is_none());
+    let reasons: Vec<Value> = w.state.nanty().journal_tail(1000).into_iter().filter(|e| e.code == "voice.text").map(|e| e.params["reasons"].clone()).collect();
+    assert!(reasons.contains(&json!(["deadline"])), "{reasons:?}");
+}
+
+/// Spec 141 T08: a resposta que cabe na legenda vai inteira nela, com o teclado, e nada mais sai.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_voice_a_short_reply_goes_whole_in_the_caption() {
+    let model = Scripted::new(vec![call("remember", remember("Disco")), say(LEAD)]);
+    let (w, fake, voice_fake) = voice_world("t14-voice-short", model, |_| {}).await;
+    let _out = start_outbox(&w);
+    let asked = person(&w, Channel::Telegram, "e a fila?").await;
+    conversation::reply(&w.state, &asked).await.expect("resposta");
+    until("a nota", || !bodies(&fake, "sendVoice").is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let whole = whole_of(&stored_reply(&w));
+    assert_eq!(spoken_texts(&voice_fake), [whole.clone()], "um trecho, o texto inteiro");
+    let note = &bodies(&fake, "sendVoice")[0];
+    assert_eq!(note["caption"], json!(whole));
+    let markup: Value = serde_json::from_str(note["reply_markup"].as_str().unwrap_or_default()).expect("JSON");
+    assert_eq!(datas(&markup).len(), 1, "o botão na nota");
+    assert!(sends(&fake).is_empty(), "a legenda levou tudo");
+}
+
+/// Na janela, com a voz ligada: o áudio fala o texto inteiro, a mensagem tem o texto inteiro, e nada
+/// vai ao Telegram.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_the_window_with_voice_the_reply_is_whole_with_the_player() {
     let long = long_reply(6);
@@ -323,10 +422,51 @@ async fn in_the_window_with_voice_the_reply_is_whole_with_the_player() {
     let reply = conversation::reply(&w.state, &asked).await.expect("resposta");
     assert_eq!(reply.text.as_deref(), Some(long.as_str()));
     assert!(reply.audio.is_some(), "com o tocador");
-    assert_eq!(voice_fake.calls("gemini")[0]["input"][0]["content"][0]["text"], json!(LEAD));
+    assert_eq!(words(&spoken_texts(&voice_fake).join(" ")), words(&whole_of(&reply)), "a fala é o texto inteiro");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(sends(&fake).is_empty() && bodies(&fake, "sendVoice").is_empty(), "a resposta da janela fica nela");
     assert_eq!(stored_reply(&w).text.as_deref(), Some(long.as_str()));
+}
+
+/// A frase real do teste (item 10 da spec 141): o modelo escreveu `[neutral]` sem o `tone: `.
+const SHORT_MARKER_REPLY: &str = "[neutral]\nEssa ideia de jogo de viagem no tempo parece um projeto novo, não uma proposta para o Mini Street Fighter.";
+const SHORT_MARKER_SAID: &str = "Essa ideia de jogo de viagem no tempo parece um projeto novo, não uma proposta para o Mini Street Fighter.";
+
+/// Spec 141 T08 (critério 7): a marca curta não chega à pessoa, com a voz ligada, na janela, no
+/// Telegram (a legenda) e na fala.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_short_tone_marker_never_reaches_the_person_with_voice() {
+    let model = Scripted::new(vec![say(SHORT_MARKER_REPLY), say(SHORT_MARKER_REPLY)]);
+    let (w, fake, voice_fake) = voice_world("t14-marker-voice", model, |_| {}).await;
+    let _out = start_outbox(&w);
+    let asked = person(&w, Channel::Telegram, "e aquela ideia do jogo?").await;
+    let reply = conversation::reply(&w.state, &asked).await.expect("resposta");
+    assert_eq!(reply.text.as_deref(), Some(SHORT_MARKER_SAID), "a janela");
+    until("a nota", || !bodies(&fake, "sendVoice").is_empty()).await;
+    assert_eq!(bodies(&fake, "sendVoice")[0]["caption"], json!(SHORT_MARKER_SAID), "o Telegram");
+    assert_eq!(spoken_texts(&voice_fake), [SHORT_MARKER_SAID.to_string()], "a fala");
+    // Pela janela, também.
+    let asked = person(&w, Channel::Web, "e aquela ideia do jogo?").await;
+    let reply = conversation::reply(&w.state, &asked).await.expect("resposta");
+    assert_eq!(reply.text.as_deref(), Some(SHORT_MARKER_SAID));
+    assert!(spoken_texts(&voice_fake).iter().all(|t| !t.contains("neutral")));
+}
+
+/// Spec 141 T08 (critério 7): com a voz desligada, o caminho de texto puro também tira a marca curta,
+/// no Telegram e na janela.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_short_tone_marker_never_reaches_the_person_without_voice() {
+    let model = Scripted::new(vec![say(SHORT_MARKER_REPLY), say(SHORT_MARKER_REPLY)]);
+    let (w, fake) = world("t14-marker-text", model, |_, _| {}).await;
+    let _out = start_outbox(&w);
+    fake.push(owner_text(50, "e aquela ideia do jogo?"));
+    until("a resposta", || !sends(&fake).is_empty()).await;
+    assert_eq!(sends(&fake).iter().map(text_of).collect::<Vec<_>>(), [SHORT_MARKER_SAID.to_string()], "o Telegram");
+    assert_eq!(stored_reply(&w).text.as_deref(), Some(SHORT_MARKER_SAID));
+    assert!(bodies(&fake, "sendVoice").is_empty());
+    let asked = person(&w, Channel::Web, "e aquela ideia do jogo?").await;
+    let reply = conversation::reply(&w.state, &asked).await.expect("resposta");
+    assert_eq!(reply.text.as_deref(), Some(SHORT_MARKER_SAID), "a janela");
 }
 
 /// Na janela, com a voz desligada: o texto inteiro, sem áudio e sem chamada de fala.
@@ -346,10 +486,10 @@ async fn in_the_window_without_voice_the_reply_is_whole() {
 // ---- Revisão 1 ----
 
 /// F-01: uma resposta de cerca de 4000 unidades, com o link recusado pelo Telegram, sai de novo inteira
-/// com o endereço, e a frase do servidor continua no fim do texto. Antes, a mensagem única não tinha
-/// folga e o corte da recusa levava a frase junto.
+/// com o endereço, sem corte. Antes, a mensagem única não tinha folga e o corte da recusa levava o fim
+/// do texto junto.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reply_near_the_limit_with_a_refused_link_keeps_the_server_sentence() {
+async fn a_reply_near_the_limit_with_a_refused_link_goes_again_whole() {
     let text = long_reply(4);
     let model = Scripted::new(vec![call("open_nants", json!({})), say(&text)]);
     let (w, fake) = world("t14-near", model, |c, _| c.nanty.address = BASE.into()).await;
@@ -369,43 +509,9 @@ async fn a_reply_near_the_limit_with_a_refused_link_keeps_the_server_sentence() 
     let again = text_of(&all[2]);
     let address = tr(Lang::PtBr, "nanty.telegram.open_address", &[("url", &format!("{BASE}/"))]);
     assert_eq!(again, format!("{}\n{address}", text_of(&all[1])), "a parte inteira, sem corte");
-    assert!(again.ends_with(&format!("{}\n{address}", closing_of(&stored))) && !again.contains('…'), "{again}");
+    assert!(whole.trim_end().ends_with(text_of(&all[1]).trim_end()) && !again.contains('…'), "{again}");
     assert!(format::units(&again) <= format::MAX_MESSAGE_CHARS);
     // Nada se perdeu entre as duas mensagens.
     let sent: Vec<String> = [text_of(&all[0]), text_of(&all[1])].iter().flat_map(|t| words(t)).collect();
     assert_eq!(sent, words(&whole));
-}
-
-/// F-02: com `lead_chars` no máximo aceito, o trecho falado cabe na legenda, sem `…`, e a legenda e as
-/// partes juntas trazem o texto inteiro: nada é falado sem aparecer escrito.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_the_largest_lead_the_spoken_part_is_all_written() {
-    let mut cfg = Config::default();
-    cfg.nanty.voice.lead_chars = 2000;
-    assert_eq!(cfg.nanty.voice.lead_chars(), 900, "o teto coerente com a legenda");
-    // Um primeiro parágrafo longo, sem linha em branco, com caracteres de duas unidades.
-    let long = format!("{} {}", "O plano \u{10400} segue firme e a fila aguenta bem o volume de hoje. ".repeat(40).trim_end(), detail(1));
-    let model = Scripted::new(vec![say(&long)]);
-    let (w, fake, voice_fake) = voice_world("t14-lead-max", model, |c| c.nanty.voice.lead_chars = 2000).await;
-    let _out = start_outbox(&w);
-    let asked = person(&w, Channel::Telegram, "como vai o plano?").await;
-    conversation::reply(&w.state, &asked).await.expect("resposta");
-    until("o resto", || !sends(&fake).is_empty()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let caption = bodies(&fake, "sendVoice")[0]["caption"].as_str().unwrap_or_default().to_string();
-    let follows = tr(Lang::PtBr, "nanty.telegram.rest_follows", &[]);
-    let lead = caption.strip_suffix(&format!("\n\n{follows}")).expect("a linha do resto").to_string();
-    assert!(!caption.contains('…') && format::units(&caption) <= format::MAX_CAPTION_CHARS, "{}", format::units(&caption));
-    assert_eq!(voice_fake.calls("gemini")[0]["input"][0]["content"][0]["text"], json!(lead), "o falado é o escrito");
-    let mut written = words(&lead);
-    for body in sends(&fake) {
-        written.extend(words(&text_of(&body)));
-    }
-    assert_eq!(written, words(&long));
-    // O mesmo direto na função, com o valor sem teto.
-    let mut m = ConversationMessage::from_nanty(new_id(), 1, Channel::Telegram, "x", Map::new());
-    m.code = None;
-    m.text = Some(long.clone());
-    let end = voice::long_lead(&m, &long, 2000).expect("longa");
-    assert!(format::units(&long[..end]) <= voice::lead_caption_budget() && long[..end].ends_with('.'));
 }

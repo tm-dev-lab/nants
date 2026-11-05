@@ -141,6 +141,19 @@ describe("Execução pausada na Conversa", () => {
     expect(server.calls.find((c) => c.method === "POST" && CHOICE.test(c.url))?.body).toEqual({ option_id: "o1", analysis: 7 });
   });
 
+  it("botão de escolha curto (141/T11, C-12): diz só Escolher, com o rótulo completo no aria-label, e quebra a linha", async () => {
+    const label = "Descartar a worktree atual e reexecutar a T07 em uma nova";
+    const options = [{ id: "o1", kind: "guidance", label, text: "nova worktree" }];
+    await open(stateWith(pausedSpec({ recovery_options: options, recovery_options_analysis: 7 } as never)));
+    const button = within(card()).getByRole("button", { name: `Escolher: ${label}` });
+    expect(button.textContent).toBe("Escolher");
+    expect(button.getAttribute("aria-label")).toBe(`Escolher: ${label}`);
+    expect(button.classList.contains("nd-btn-wrap")).toBe(true);
+    expect(within(card()).getByRole("button", { name: "Prefiro outro caminho" }).classList.contains("nd-btn-wrap")).toBe(true);
+    fireEvent.click(button);
+    expect(within(card()).getByRole("button", { name: "Aplicar e retomar" }).classList.contains("nd-btn-wrap")).toBe(true);
+  });
+
   it("motivo com HTML aparece como texto", async () => {
     const hostile = "<img src=x onerror=alert(1)> <script>window.__pwn = 1</script>";
     await open(stateWith(makeSpec("s1", "Plano", "IN_PROGRESS", [makeTask("T01", "A", "BLOCKED", { next_action: hostile })])));
@@ -507,6 +520,100 @@ describe("Execução pausada: natureza do bloqueio e recuperação", () => {
     expect(items).toEqual(["GET /api/itens responde 200 com a lista", "POST /api/itens recusa corpo sem nome", "A lista vem ordenada pelo nome"]);
     expect(within(card()).getByText("Entregar só a API de itens, sem a tela.")).toBeTruthy();
     expect(within(card()).getByRole("button", { name: "Escolher: Revisar a tarefa: só a API" })).toBeTruthy();
+  });
+
+  it("reset_workspace (spec 141 T03): o tipo e o que o servidor faz aparecem, e a escolha manda só o id", async () => {
+    const reset: RecoveryOption = {
+      id: "reset_workspace",
+      label: "Limpar a área de trabalho e testar de novo",
+      kind: "reset_workspace",
+      text: "O Nants apaga a pasta pessoal desta tarefa e instala as dependências de novo.",
+    };
+    const { server } = await open(stateWith(withOptions([reset], 2)));
+    server.reply("POST", CHOICE, () => ({ status: 202, body: { ok: true } }));
+    expect(within(card()).getByText("Limpar a área de trabalho")).toBeTruthy();
+    expect(within(card()).getByText("O Nants apaga a pasta pessoal desta tarefa e instala as dependências de novo.")).toBeTruthy();
+    await chooseOption("Limpar a área de trabalho e testar de novo");
+    expect(choiceBodies(server)).toEqual([{ option_id: "reset_workspace", analysis: 2 }]);
+  });
+
+  it("restrição (spec 141 T04): mostra antes e depois, o caminho e as duas rodadas; o aprovar só com a evidência", async () => {
+    const restricted: RecoveryOption = {
+      id: "so-unit",
+      label: "Rodar só os testes de unidade",
+      kind: "config",
+      test_command: "node --test test/",
+      full_test_command: "node --test test/ && npx playwright test",
+      diff: "Antes:\ntest_command: node --test\n\nDepois:\ntest_command: node --test test/",
+      restriction: {
+        original: "node --test",
+        restricted: "node --test test/",
+        appended: ["test/"],
+        tree: "abc123",
+        original_output: "not ok 3 - e2e/game.spec.js",
+        restricted_output: "# tests 8\n# pass 8",
+        tests: 8,
+        original_tests: 9,
+        original_failed: 1,
+      },
+    };
+    const { server } = await open(stateWith(withOptions([restricted], 3)));
+    server.reply("POST", CHOICE, () => ({ status: 202, body: { ok: true } }));
+    const details = card().querySelector<HTMLElement>("[data-restriction]");
+    expect(details).not.toBeNull();
+    const box = within(details as HTMLElement);
+    expect(box.getByText("Troca no comando de testes")).toBeTruthy();
+    expect(box.getByText("node --test")).toBeTruthy();
+    expect(box.getByText("node --test test/")).toBeTruthy();
+    expect(box.getByText("Acrescenta no fim: test/")).toBeTruthy();
+    expect(box.getByText("Etapa atual: a saída informa 9 testes, 1 falhou")).toBeTruthy();
+    expect(box.getByText("Etapa nova: a saída informa 8 testes")).toBeTruthy();
+    expect(box.queryByRole("note")).toBeNull();
+    expect(box.getByText("not ok 3 - e2e/game.spec.js")).toBeTruthy();
+    expect(within(card()).queryByRole("button", { name: "Escolher: Rodar só os testes de unidade" })).toBeNull();
+    fireEvent.click(within(card()).getByRole("button", { name: "Aprovar a troca" }));
+    expect(server.count("POST", CHOICE)).toBe(0);
+    await act(async () => {
+      fireEvent.click(within(card()).getByRole("button", { name: "Aprovar e retomar" }));
+    });
+    await settle();
+    expect(choiceBodies(server)).toEqual([{ option_id: "so-unit", analysis: 3 }]);
+  });
+
+  it("restrição que roda menos testes do que os que passavam: aviso destacado", async () => {
+    const fewer: RecoveryOption = {
+      id: "so-fake",
+      label: "Rodar só uma pasta",
+      kind: "config",
+      test_command: "node --test test/unit/",
+      restriction: {
+        original: "node --test",
+        restricted: "node --test test/unit/",
+        appended: ["test/unit/"],
+        tree: "abc123",
+        original_output: "not ok 3 - e2e/game.spec.js",
+        restricted_output: "# tests 2",
+        tests: 2,
+        original_tests: 40,
+        original_failed: 1,
+      },
+    };
+    await open(stateWith(withOptions([fewer], 3)));
+    const note = within(card().querySelector<HTMLElement>("[data-restriction]") as HTMLElement).getByRole("note");
+    expect(note.textContent).toContain("roda menos testes");
+  });
+
+  it("restrição sem a evidência do servidor não mostra a troca nem o aprovar", async () => {
+    const pending: RecoveryOption = {
+      id: "sem-prova",
+      label: "Rodar só os testes de unidade",
+      kind: "config",
+      test_command: "node --test test/",
+      restriction: { original: "node --test", restricted: "node --test test/", appended: ["test/"], tree: "", original_output: "", restricted_output: "" },
+    };
+    await open(stateWith(withOptions([pending], 3)));
+    expect(card().querySelector("[data-restriction]")).toBeNull();
+    expect(within(card()).queryByRole("button", { name: "Aprovar a troca" })).toBeNull();
   });
 
   it("revise_task com os critérios em lista (forma antiga) continua aceita", async () => {

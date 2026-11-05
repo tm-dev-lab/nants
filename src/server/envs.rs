@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::config::ViewPorts;
 use crate::harness::compose::{controlled_env, ComposeCall, ComposeEnv, ComposeKind, ComposeRunner, RealComposeRunner};
+use crate::harness::home;
 use crate::sdd::{read_settings, sdd_dir, Environment};
 
 use super::runs::persist_environment_hash;
@@ -25,6 +26,10 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ComposeProvider {
     runner: Option<Arc<dyn ComposeRunner>>,
     base_dir: Option<PathBuf>,
+    /// Diretório das pastas pessoais (spec 141 T01). `None` em produção: `<dados>/homes`
+    /// ([`home::homes_base`]). Os testes usam um próprio por provider (`<base>/homes`), para que a
+    /// varredura de um teste nunca apague as pastas de outro que roda em paralelo.
+    homes_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ComposeProvider {
@@ -36,7 +41,24 @@ impl std::fmt::Debug for ComposeProvider {
 impl ComposeProvider {
     /// Executor e diretório de overrides substitutos (testes).
     pub fn with_runner(runner: Arc<dyn ComposeRunner>, base_dir: PathBuf) -> Self {
-        Self { runner: Some(runner), base_dir: Some(base_dir) }
+        let homes_dir = Some(base_dir.join(home::HOMES_DIR));
+        Self { runner: Some(runner), base_dir: Some(base_dir), homes_dir }
+    }
+
+    /// O diretório das pastas pessoais: o próprio do provider ou `<dados>/homes`.
+    pub fn homes_dir(&self) -> Option<PathBuf> {
+        self.homes_dir.clone().or_else(home::homes_base)
+    }
+
+    /// O diretório que a varredura de órfãs pode limpar. Em produção, o mesmo de
+    /// [`Self::homes_dir`]. Nos testes, só o próprio do provider: a base compartilhada pelo processo
+    /// ([`home::homes_base`]) nunca é varrida, porque outro teste pode estar usando as pastas dela.
+    fn sweepable_homes(&self) -> Option<PathBuf> {
+        if cfg!(test) {
+            self.homes_dir.clone()
+        } else {
+            self.homes_dir()
+        }
     }
 
     fn runner(&self) -> Arc<dyn ComposeRunner> {
@@ -64,6 +86,9 @@ impl ComposeProvider {
             .with_persist(Arc::new(move |hash| persist_environment_hash(&project_root, hash)));
         if let Some(base) = &self.base_dir {
             env = env.with_base_dir(base.clone());
+        }
+        if let Some(homes) = &self.homes_dir {
+            env = env.with_homes_dir(homes.clone());
         }
         Some(Arc::new(env))
     }
@@ -320,9 +345,25 @@ pub async fn registered_projects(state: &AppState) -> Vec<(String, PathBuf)> {
     state.config().read().await.projects.iter().map(|p| (p.id.clone(), PathBuf::from(&p.path))).collect()
 }
 
+/// Spec 141 T01: pastas pessoais (no diretório de dados do Nants) de projetos não cadastrados e de
+/// worktrees que não existem mais saem no início do servidor ([`home::sweep_orphans`]); a de uma
+/// worktree viva, a da raiz e as de projeto em execução ficam. Não depende do Docker.
+pub async fn sweep_homes(state: &AppState, projects: &[(String, PathBuf)]) {
+    let Some(homes) = state.compose().sweepable_homes() else { return };
+    let (projects, st) = (projects.to_vec(), state.clone());
+    let job = tokio::task::spawn_blocking(move || home::sweep_orphans(&homes, &projects, &|id| st.project_active(id)));
+    match tokio::time::timeout(SWEEP_TIMEOUT, job).await {
+        Ok(Ok(removed)) if !removed.is_empty() => eprintln!("nants: pastas pessoais órfãs removidas: {}", removed.len()),
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => eprintln!("aviso: varredura das pastas pessoais interrompida"),
+        Err(_) => eprintln!("aviso: varredura das pastas pessoais excedeu {}s", SWEEP_TIMEOUT.as_secs()),
+    }
+}
+
 /// Varredura de startup com o estado do servidor (nenhum app ativo ainda).
 pub async fn startup_sweep(state: &AppState) {
     let projects = registered_projects(state).await;
+    sweep_homes(state, &projects).await;
     let provider = state.compose().clone();
     let st = state.clone();
     let job = tokio::task::spawn_blocking(move || sweep_orphans(&provider, &projects, &|id| st.project_active(id)));

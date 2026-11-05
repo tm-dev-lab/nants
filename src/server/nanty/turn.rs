@@ -174,20 +174,29 @@ pub struct SignalFact {
     pub delivery: Option<Delivery>,
     /// Fatos estruturados ([`structured`]).
     pub facts: Map<String, Value>,
+    /// Spec 141 T09 (C-09): o projeto parou por um defeito do ambiente do próprio Nants (o motivo
+    /// `nants_environment`). É fato do servidor: retomar não resolve, e o prompt diz isso ao modelo.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub nants_fault: bool,
+}
+
+/// O motivo dos fatos é o defeito do ambiente do Nants (spec 141 T09).
+pub fn is_nants_fault(facts: &Map<String, Value>) -> bool {
+    facts.get("reason").and_then(Value::as_str) == Some(crate::agents::runner::BLOCK_NANTS_ENVIRONMENT)
 }
 
 impl SignalFact {
+    /// Um sinal já com os fatos limpos; o sinal de falha do Nants sai dos próprios fatos.
+    pub fn new(kind: String, project_id: Option<String>, urgency: Option<Urgency>, delivery: Option<Delivery>, facts: Map<String, Value>) -> Self {
+        let nants_fault = is_nants_fault(&facts);
+        Self { kind, project_id, urgency, delivery, facts, nants_fault }
+    }
+
     /// O aviso de um cartão: o tipo vem do código do porquê (`nanty.why.<tipo>`).
     pub fn of_card(card: &Card) -> Option<Self> {
         let kind = card.code.strip_prefix("nanty.why.")?;
         super::signals::SignalKind::parse(kind)?;
-        Some(Self {
-            kind: kind.to_string(),
-            project_id: card.project_id.clone().filter(|p| is_code(p)),
-            urgency: card.urgency,
-            delivery: card.delivery,
-            facts: structured(&card.params),
-        })
+        Some(Self::new(kind.to_string(), card.project_id.clone().filter(|p| is_code(p)), card.urgency, card.delivery, structured(&card.params)))
     }
 
     /// Uma condição aberta (o resumo da manhã).
@@ -196,13 +205,7 @@ impl SignalFact {
         let mut facts = alert.facts.clone();
         facts.insert("since".into(), json!(alert.since));
         let facts = structured(&facts);
-        Some(Self {
-            kind: kind.as_str().to_string(),
-            project_id: alert.project_id.clone().filter(|p| is_code(p)),
-            urgency: None,
-            delivery: None,
-            facts,
-        })
+        Some(Self::new(kind.as_str().to_string(), alert.project_id.clone().filter(|p| is_code(p)), None, None, facts))
     }
 }
 
@@ -231,6 +234,10 @@ pub enum TurnKind {
 pub struct TurnInput {
     pub kind: TurnKind,
     pub signals: Vec<SignalFact>,
+    /// Os avisos guardados para o resumo (spec 141 T10), agrupados por projeto e com o que pede
+    /// atenção primeiro: o resumo da manhã e o `/resumo`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<super::digest::HeldGroup>,
     /// Contagens (projetos, em andamento, pausados, esperando a pessoa...).
     pub counts: BTreeMap<&'static str, u64>,
     /// Custo em US$ (ontem nos projetos, hoje do Nanty), quando há preço.
@@ -252,6 +259,7 @@ impl TurnInput {
         Self {
             kind,
             signals: Vec::new(),
+            held: Vec::new(),
             counts: BTreeMap::new(),
             cost_usd: BTreeMap::new(),
             tokens: BTreeMap::new(),
@@ -264,7 +272,8 @@ impl TurnInput {
     /// Os projetos dos sinais, sem repetir: a mensagem escrita a partir desta entrada fica ligada a
     /// todos (spec 140 T04, C-16).
     pub fn project_ids(&self) -> Vec<String> {
-        super::provenance::unique(self.signals.iter().filter_map(|s| s.project_id.clone()))
+        let held = self.held.iter().filter_map(|g| g.project_id.clone());
+        super::provenance::unique(self.signals.iter().filter_map(|s| s.project_id.clone()).chain(held))
     }
 
     /// O JSON que vai ao modelo.
@@ -337,7 +346,7 @@ impl Invalid {
 }
 
 /// Valida a resposta: o objeto `{summary, actions}` e nada mais; o resumo de 1 a
-/// [`MAX_SUMMARY_CHARS`] caracteres, sem controle (fora a quebra de linha); até
+/// [`MAX_SUMMARY_CHARS`] caracteres, sem controle (fora a quebra de linha) e sem a marca de tom; até
 /// [`MAX_MODEL_ACTIONS`] ids, todos do catálogo e de `allowed`. Qualquer desvio descarta tudo. O prompt
 /// não pede `actions` (spec 140 T03): o campo só segue aceito, e conferido, para o modelo que o mandar.
 pub fn validate(raw: &str, allowed: &[ActionId]) -> Result<Reply, Invalid> {
@@ -347,7 +356,9 @@ pub fn validate(raw: &str, allowed: &[ActionId]) -> Result<Reply, Invalid> {
         return Err(Invalid::Format);
     }
     let parsed: RawReply = serde_json::from_value(value).map_err(|_| Invalid::Format)?;
-    let summary = parsed.summary.trim().to_string();
+    // Spec 141 T08 (revisão 1): o prompt deste turno não pede a marca de tom, mas o modelo às vezes a
+    // escreve; curta ou completa, no começo ela nunca chega à pessoa (o tom do aviso é o do sinal).
+    let summary = super::voice::tone::take_marker(parsed.summary.trim()).1;
     let count = summary.chars().count();
     if count == 0 || count > MAX_SUMMARY_CHARS || summary.chars().any(|c| c.is_control() && c != '\n') {
         return Err(Invalid::Summary);
@@ -668,6 +679,7 @@ pub fn model_message(nanty: &Nanty, lang: crate::i18n::Lang, reply: &Reply, card
         // A entrada destes turnos só tem sinais estruturados: a mensagem nasce limpa.
         taint: Some(super::provenance::Taint::default()),
         seq: None,
+        notices: Vec::new(),
     }
 }
 

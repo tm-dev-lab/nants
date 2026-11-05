@@ -98,6 +98,15 @@ describe("texto de um código do Nanty", () => {
     expect(nantyCodeText("nanty.status.progress_only", {})).toBe("A única tarefa já está pronta.");
     expect(nantyCodeText("nanty.status.progress_only", {}, {}, "en")).toBe("The only task is done.");
     expect(nantyCodeText("nanty.status.progress_none", { count: 4 }, {}, "en")).toBe("None of the 4 tasks is done yet.");
+    // Spec 141 T09: a reserva diz o motivo da parada, e o resumo sem modelo diz que o defeito é do Nants.
+    expect(nantyCodeText("nanty.reason.nants_environment", {})).toBe("Parou por um defeito do ambiente do próprio Nants, não do código do projeto.");
+    expect(nantyCodeText("nanty.reason.tests_failed", {}, {}, "en")).toBe("It stopped because the tests failed.");
+    expect(nantyCodeText("nanty.digest.nants_fault", { project: "Loja" })).toBe(
+      "O projeto Loja parou por um defeito do ambiente do próprio Nants, não do código dele: retomar não resolve.",
+    );
+    expect(nantyCodeText("nanty.digest.nants_fault", { project: "Shop" }, {}, "en")).toBe(
+      "The Shop project stopped because of a defect in the Nants environment itself, not in its code: resuming will not fix it.",
+    );
   });
 });
 

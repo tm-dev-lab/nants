@@ -148,6 +148,8 @@ const CAUSE_KEYS: readonly MessageKey[] = [
   "recoveryText.cause.migrationFailed",
   "recoveryText.cause.envDenied",
   "recoveryText.cause.dockerUnavailable",
+  "recoveryText.cause.nantsEnvironment",
+  "recoveryText.cause.sameFailure",
 ];
 const CAUSES: readonly (readonly [string, MessageKey])[] = CAUSE_KEYS.flatMap((key) =>
   forms(key).map((text): readonly [string, MessageKey] => [text, key]),

@@ -556,6 +556,11 @@ pub struct TaskMeta {
     pub tested_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_evidence: Option<String>,
+    /// Spec 141 T05 (C-05): assinatura da falha dos testes que bloqueou a tarefa (a falha, os
+    /// comandos e o ambiente). Gravada pelo runner no bloqueio, apagada na tentativa seguinte; a
+    /// escalada a copia para a própria seção e a retomada pelo humano, para a marca.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_signature: Option<String>,
     /// Última execução dos testes na integração (base, após o squash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_run: Option<TestRun>,

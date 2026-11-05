@@ -184,9 +184,19 @@ async fn removal_writes_config_without_project_and_keeps_others_in_order() {
     crate::kb::index::index_for(&b_root).expect("índice de B");
     crate::kb::index::index_for(&a_root).expect("índice de A");
     assert_eq!(ids_in_file(&config_path), vec![a.clone(), b.clone(), c.clone()]);
+    // Spec 141 T01: as pastas pessoais (no diretório de dados) saem com o projeto; as dos outros ficam.
+    let homes = state.compose().homes_dir().expect("homes");
+    let b_home = crate::harness::home::host_home(&homes, &b, &b_root.join(".sdd/worktrees/s/T01")).expect("b");
+    let a_home = crate::harness::home::host_home(&homes, &a, &a_root).expect("a");
+    for h in [&b_home, &a_home] {
+        crate::harness::home::ensure(h).expect("home");
+    }
 
     let (status, text) = call(&state, delete(&b)).await;
     assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!homes.join(&b).exists(), "pastas pessoais do projeto removido saem");
+    assert!(a_home.join(".profile").exists());
+    crate::harness::home::remove_project(&homes, &a).expect("limpa");
     assert_eq!(json_of(&text), json!({"ok": true, "removed": b}));
     assert_eq!(ids_in_file(&config_path), vec![a.clone(), c.clone()]);
     assert_eq!(ids_in_memory(&state).await, vec![a.clone(), c.clone()]);

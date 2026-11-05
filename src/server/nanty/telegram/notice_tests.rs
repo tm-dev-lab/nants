@@ -618,3 +618,36 @@ async fn with_the_voice_off_nothing_waits_and_there_is_no_audio() {
     assert!(fake.calls("sendVoice").is_empty() && voice_fake.calls("gemini").is_empty());
     assert!(notices(&w).is_empty());
 }
+
+/// Spec 141 T12 (sugestão do Revisor na T08): o texto do modelo é longo (no teto do resumo) e o
+/// cartão também, e juntos passam do que o Telegram mostra em [`format::MAX_PARTS`] partes. A nota
+/// nunca fala o que o texto não mostra: ela fala a frase fixa do cartão, o motivo `too_long` fica no
+/// registro, e o texto do modelo segue inteiro como mensagem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_model_text_that_does_not_fit_speaks_the_fixed_line_and_goes_as_a_message() {
+    let long = "Uma frase do modelo sobre o aviso. ".repeat(17);
+    let long = long.trim().to_string();
+    assert!(long.chars().count() <= turn::MAX_SUMMARY_CHARS);
+    let model = HeldModel::saying(&long);
+    model.release();
+    let (w, fake, voice_fake) = with_model("n-toolong", &model, Tuning { notice_text_wait: FOREVER, notice_total: FOREVER, ..FAST }, |_| {}).await;
+    let mut c = card(KEY, None);
+    c.params.insert("since".into(), json!("quase pronto ".repeat(1000).trim()));
+    let id = c.id.clone();
+    add(&w, vec![c]);
+    spawn_turn(&w).await.expect("turno");
+    let _out = start_outbox(&w);
+    until("nota", || fake.calls("sendVoice").len() == 1).await;
+    until("o texto do modelo", || fake.sent_texts().iter().any(|t| t.contains(&long))).await;
+    assert_eq!(fake.calls("sendVoice").len(), 1, "uma nota só");
+    // A frase fixa do cartão (cortada para uma mensagem) sai em trechos de fim de frase, numa nota só.
+    let spoken: Vec<String> = (0..voice_fake.calls("gemini").len()).map(|n| spoken_text(&voice_fake, n)).collect();
+    let spoken = spoken.join(" ");
+    assert!(!spoken.contains("Uma frase do modelo"), "a nota não fala o texto do modelo: {spoken}");
+    assert!(spoken.contains("quase pronto"), "a nota fala a frase fixa do cartão: {spoken}");
+    assert!(crate::server::nanty::voice::speakable(&spoken), "o que a nota fala aparece inteiro");
+    assert_eq!(notices(&w)[0]["source"], "fixed");
+    assert_eq!(notices(&w)[0]["reason"], "too_long");
+    until("registro", || sent(&w, &id).is_some()).await;
+    assert_eq!(sent(&w, &id).and_then(|r| r.tail), None, "a nota é a do cartão, sem o texto do modelo");
+}

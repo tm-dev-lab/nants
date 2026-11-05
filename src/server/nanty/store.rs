@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 
 use super::jsonl::{read_private, write_atomic, JsonlError, JsonlLog, Limits, Release};
 use super::provenance::Taint;
+use super::notice::{NoticeFact, NoticeRef};
 use super::summary::{Summary, SummaryItem, SummarySource, SummaryStore};
 use crate::config::{NantyStorage, Urgency};
 
@@ -404,6 +405,10 @@ pub struct NantyState {
     /// a pessoa enviar ou descartar.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub architect_drafts: Vec<super::draft::ArchitectDraft>,
+    /// Os avisos enviados ao Telegram, até [`super::notice::MAX_NOTICE_REFS`] (spec 141 T06): a
+    /// resposta a um deles liga a pergunta ao cartão, mesmo depois de ele sair.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notice_refs: Vec<NoticeRef>,
 }
 
 /// Prefixo do grupo de um projeto (`<id>:`): o grupo nasce do projeto e do tipo.
@@ -463,6 +468,8 @@ impl NantyState {
         self.handled.retain(|g, _| !group_of_project(g, project_id));
         self.retries.retain(|k, _| !group_of_project(k, project_id));
         self.undo.retain(|u| !mine(&u.project_id));
+        // Spec 141 T06: as respostas que ligam ao aviso do projeto.
+        self.notice_refs.retain(|r| !mine(&r.fact.project_id));
         // Spec 140 T12: os casos analisados do projeto saem com ele.
         self.scenarios.retain(|m| !super::provenance::Scoped::touches(m, project_id));
         // Spec 140 T15: o rascunho do Arquiteto, por todos os projetos dele (o destino e a fonte).
@@ -488,6 +495,7 @@ impl NantyState {
         self.digest.iter().for_each(|d| note(&d.project_id));
         self.decided.iter().for_each(|d| note(&d.project_id));
         self.undo.iter().for_each(|u| note(&u.project_id));
+        self.notice_refs.iter().for_each(|r| note(&r.fact.project_id));
         self.scenarios.iter().for_each(|m| note(&Some(m.project_id.clone())));
         for d in &self.architect_drafts {
             super::provenance::Scoped::projects(d).into_iter().for_each(|id| note(&Some(id.to_string())));
@@ -595,6 +603,15 @@ impl NantyState {
     }
 
     pub fn put_sent(&mut self, item: SentCard) {
+        // Spec 141 T06: a mensagem do aviso, para ligar a resposta da pessoa ao cartão.
+        let fact = self.cards.iter().find(|c| c.id == item.card_id).and_then(NoticeFact::of);
+        if let (Some(fact), Some(message_id)) = (fact, item.message_id) {
+            let chat_id = item.chat_id;
+            self.notice_refs.retain(|r| !(r.chat_id == chat_id && r.message_id == message_id));
+            self.notice_refs.push(NoticeRef { chat_id, message_id, fact });
+            let extra = self.notice_refs.len().saturating_sub(super::notice::MAX_NOTICE_REFS);
+            self.notice_refs.drain(..extra);
+        }
         self.telegram_sent.retain(|s| s.card_id != item.card_id);
         self.telegram_sent.push(item);
         let extra = self.telegram_sent.len().saturating_sub(MAX_SENT);
@@ -681,6 +698,11 @@ pub struct ConversationMessage {
     /// número da primeira. `None` = linha de antes da T05 ainda sem número: nunca coberta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// Os fatos do servidor dos cartões que a mensagem cita ou de que trata (spec 141 T06, C-07): o
+    /// cabeçalho de dado dela no histórico ([`super::notice`]). Na mensagem da pessoa, o aviso a que
+    /// ela respondeu no Telegram.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<NoticeFact>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -752,6 +774,7 @@ impl ConversationMessage {
             project_ids: Vec::new(),
             taint: Some(Taint::default()),
             seq: None,
+            notices: Vec::new(),
         }
     }
 }
@@ -1307,6 +1330,7 @@ mod tests {
             project_ids: Vec::new(),
             taint: None,
             seq: None,
+            notices: Vec::new(),
         };
         log.append(&msg).expect("append");
         let back: Vec<ConversationMessage> = log.tail(CONVERSATION_TAIL);

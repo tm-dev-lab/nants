@@ -131,11 +131,27 @@ Each project can keep a knowledge base of documents and links in `.sdd/kb/`: the
 
 ## Workspace home folder
 
-Each command in the `workspace` container runs with your user id and a home folder inside the
-task folder (`.nants-home/`), so what a tool installs there is still there for the next command.
+Each command in the `workspace` container, and each browser test container, runs with your user
+id and a home folder mounted at `/nants/home`, outside `/work`, so what a tool installs there is
+still there for the next command.
 
-- The folder is persistent and lives on the project disk, inside the task's worktree. It is kept
-  out of Git and deleted with the worktree.
+- The folder is persistent and lives in Nants' data folder (`~/.local/share/nants/homes/`), one
+  per task worktree and one for the project root, created by Nants with mode 0700. It is never
+  inside the project, so it never reaches Git or the test runners, and it is deleted with the
+  worktree and with the project. When the server starts, folders of projects or worktrees that no
+  longer exist are removed.
+- The browser test container mounts the task folder like the `workspace` does: `.git` and `.nants`
+  read-only, since the browser tests are code written by the agent.
+- In the rounds at the project root, the task folders in `.sdd/worktrees` are covered by an empty
+  in-memory folder (`tmpfs`) inside the container, only when `.sdd` and `.sdd/worktrees` are real
+  folders, never links. A test runner that scans the whole tree does not run, read or write the code
+  of a task in progress from the root, and the folder on your disk does not change.
+- A project from an older version still has the old `.nants-home/` folder inside the task folder.
+  On the next command, once per task folder, Nants first moves the whole old folder out of the
+  containers' reach in a single step (a link is moved as a link, never followed), then keeps only
+  its download cache in the new folder and deletes the rest, and the install runs again. A
+  `.nants-home/` created later is just a project folder. `.git` and `.nants` are mounted read-only
+  only when they are a real file or folder, never a link.
 - Nants never writes credentials to it: API keys, ChatGPT plan tokens and the other secrets stay
   in Nants' own configuration, outside the project.
 - Like any command output, what comes out of that folder into logs, events and agent context goes
@@ -168,6 +184,24 @@ and the browser tests) has two limits:
 - The command for running the project outside Nants
   (`docker compose -f .nants/compose.yaml run --rm workspace sh -lc '<command>'`) uses only the
   limits of the project's own `compose.yaml`.
+
+## Recovery that changes the test command
+
+The test command decides what proves a task, so the recovery cannot loosen it on its own.
+
+- A change that only narrows one step (the same words with a path added at the end, such as
+  `node --test` becoming `node --test test/`) becomes an option only with evidence from Nants
+  itself: it runs the current step and the new one in the task's environment, on the same code, and
+  the current one must fail with the same signature as the task while the new one passes.
+- It never applies on its own, not even with automatic approval: you approve it on a card that shows
+  both steps, both runs and the test counts, with a warning when the new step runs fewer tests.
+- Any option added to the step (`--grep`, `-k`, `--test-skip-pattern`, `--passWithNoTests` and the
+  like) is refused, since Nants cannot prove it does not drop tests. An added path must exist in the
+  task and in the base branch, so a path created by the task itself, with a fake test, is refused.
+- A test failure that cites a path of Nants itself is reported to you as a defect of the Nants
+  environment with no model call: the task pauses and waits for you, and nothing runs on its own.
+  Cleaning the workspace removes only the task's home folder (the download cache stays), never the
+  code or the commits.
 
 ## Running the app
 
@@ -489,9 +523,14 @@ did not confirm:
   check, the consensus rounds, "continue where it stopped") also run without internet, even after a
   restart, until your next message without the mark. Your messages after that follow the project
   switch again: the Architect already reads project content written by the agents with the internet
-  on, by your choice, and the draft text in the history does not change that threat model. Content read from another
-  project than the destination is refused, by the tool and again on the tap, so a hostile project
-  cannot pick where its text goes. The draft records its project and sources, and removing a
+  on, by your choice, and the draft text in the history does not change that threat model. Content that
+  the proposing message itself read from another project than the destination is refused, by the
+  tool and again on the tap, so a hostile project cannot pick where its text goes in the same turn
+  that read it. A read of another project inherited from earlier messages in the conversation window
+  only marks the draft (spec 141 T07): the window counts messages, not time, and an old read used to
+  refuse an offer Nanty had just made. **Accepted risk:** text from another project can reach this
+  project's Architect, but only after you review it in the box, as a marked draft, and with the turns
+  that carry it running without internet. The draft records its project and sources, and removing a
   project takes it away.
 - **Offers come from the server, and so does the link to Nants.** Each turn gets `can_do`, what the
   server calculated for that channel, and Nanty may offer only what a yes can fulfil there; a card
@@ -500,6 +539,18 @@ did not confirm:
   with no token and no entry link, so the device still has to be authorized. The address is the one
   in Settings or the last `Host` of an authorized device, and only after the `Host` and `Origin`
   checks: it must be a network IP, so a header forged by a page never becomes that link.
+- **Nants docs and system state.** Nanty can search the README, the architecture and this file,
+  built into the executable, and read the state of the whole system as data with fixed fields: the
+  version, each role with its connection kind and model, and the environment mode, automatic
+  approval, waiting recovery and the Nants defect signal of each watched project. Both are trusted
+  sources and do not taint the turn; addresses and IPs are removed from the excerpts, and the state
+  never carries a secret, a path, an address, a connection id or name, or a project Nanty does not
+  watch (a test sweeps for them).
+- **What you saw is data from the server.** A Nanty message about a notice carries the facts of its
+  card (the project, the signal, since when), and a decision, a resolution or an expiry of a card
+  enters the conversation as an event. Only the server writes them, and they stay even when the
+  text of the message is in quarantine. Model text or a file that imitates those fields is renamed
+  before it reaches the model, so it never passes for a fact.
 - **Read only tools, with checked ids.** In the conversation, the model chooses what to look up, but
   every tool that takes a project accepts only the ids of the projects Nanty watches: an excluded or
   unknown id gets a plain refusal, with no read. What comes from the state tools is trusted, because

@@ -383,7 +383,7 @@ async fn deep_think_is_not_offered_in_the_analysis_mode() {
 #[test]
 fn the_partner_prompt_separates_fact_from_hypothesis_without_ready_phrases() {
     for lang in [Lang::PtBr, Lang::En] {
-        let prompt = crate::agents::prompts::nanty_chat_system(lang);
+        let prompt = crate::agents::prompts::nanty_chat_system(lang, true);
         for rule in [
             "Separe o que você sabe do que você supõe",
             "não invente nenhum deles",

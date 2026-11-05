@@ -15,8 +15,8 @@
 //! - **Resposta longa (spec 140 T14, C-27):** a limpeza é uma coisa e o corte é outra. A conversa
 //!   grava o texto inteiro, limpo ([`clean_whole`]), e o Telegram o divide em até [`MAX_PARTS`]
 //!   mensagens ([`split`]), numa quebra de parágrafo, de linha ou de frase, ou num espaço: nunca no
-//!   meio de uma palavra nem de um segredo mascarado. Acima disso, a última parte termina com a linha
-//!   que aponta a janela, e a frase do servidor fecha a última parte.
+//!   meio de uma palavra nem de um segredo mascarado. Acima disso, a última parte termina com a marca
+//!   do corte (spec 141 T10, C-10: sem frase fixa no fim).
 
 use crate::server::events::{normalize_text, SecretSet};
 use crate::server::nanty::redact;
@@ -28,8 +28,8 @@ pub const MAX_CAPTION_CHARS: usize = 1024;
 /// Mensagens de uma resposta longa no Telegram, no máximo (spec 140 T14, C-27).
 pub const MAX_PARTS: usize = 3;
 /// Folga da última mensagem com teclado (spec 140 T14): as linhas da recusa do teclado (o endereço do
-/// Nants e a aba Memória) entram depois da divisão, e o corte do limite nunca chega ao texto dela nem
-/// à frase do servidor que a fecha. Vale também para a mensagem única (revisão 1, F-01).
+/// Nants e a aba Memória) entram depois da divisão, e o corte do limite nunca chega ao texto dela. Vale
+/// também para a mensagem única (revisão 1, F-01).
 pub const LAST_PART_ROOM: usize = 512;
 /// Marca do corte.
 const CUT_MARK: char = '…';
@@ -184,33 +184,48 @@ pub fn fit(text: &str, max: usize) -> String {
 ///   nunca no meio de uma palavra, e por isso nunca no meio de um segredo mascarado (`***`).
 /// - **A última parte** guarda `room` unidades (com teclado, [`LAST_PART_ROOM`]) para as linhas da
 ///   recusa do teclado, que vêm depois, e a mensagem única também: só fica inteira numa parte o texto
-///   que cabe com essa folga. Ela leva o fecho (`tail`, a frase do servidor), sempre por último.
-/// - **Acima do teto:** o que não coube sai, e a última parte termina com `more` (a linha que aponta a
-///   janela), antes do fecho.
-pub fn split(text: &str, tail: Option<&str>, more: &str, max: usize, room: usize, max_parts: usize) -> Vec<String> {
-    if units(text) <= max.saturating_sub(room) || max_parts <= 1 {
-        return vec![text.to_string()];
+///   que cabe com essa folga.
+/// - **Acima do teto:** o que não coube sai, e a última parte termina com a marca do corte (`…`).
+///   Spec 141 T10 (C-10): sem frase fixa que aponte a janela nem frase do servidor que feche o texto;
+///   a resposta inteira fica na conversa da janela.
+pub fn split(text: &str, max: usize, room: usize, max_parts: usize) -> Vec<String> {
+    split_parts(text, max, room, max_parts).0
+}
+
+/// O texto cabe inteiro nas partes (spec 141 T08, revisão 2, F-02): o mesmo laço do [`split`]
+/// ([`split_parts`]), em mensagens de [`MAX_MESSAGE_CHARS`], entrega tudo, sem corte. É o critério
+/// da fala: só é falado o que o Telegram mostra escrito por inteiro.
+pub fn fits_parts(text: &str, room: usize, max_parts: usize) -> bool {
+    split_parts(text, MAX_MESSAGE_CHARS, room, max_parts).1
+}
+
+/// O núcleo do [`split`] e do [`fits_parts`]: as partes e se o texto coube inteiro nelas. Com
+/// `max_parts <= 1`, a parte única é o texto como veio (quem manda corta no limite), e só conta como
+/// inteiro o que cabe numa mensagem.
+fn split_parts(text: &str, max: usize, room: usize, max_parts: usize) -> (Vec<String>, bool) {
+    if units(text) <= max.saturating_sub(room) {
+        return (vec![text.to_string()], true);
     }
-    let (body, tail) = match tail.and_then(|t| Some((text.strip_suffix(t)?.trim_end(), t))) {
-        Some((body, tail)) if units(tail) < max / 4 => (body, Some(tail)),
-        _ => (text, None),
-    };
-    let tail_room = tail.map_or(0, |t| units(t) + 1);
-    let last_budget = max.saturating_sub(room + tail_room).max(max / 4);
+    if max_parts <= 1 {
+        return (vec![text.to_string()], units(text) <= max);
+    }
+    let last_budget = max.saturating_sub(room).max(max / 4);
     let mut parts: Vec<String> = Vec::new();
-    let mut rest = body.trim();
+    let mut whole = true;
+    let mut rest = text.trim();
     while !rest.is_empty() {
         if units(rest) <= last_budget {
             parts.push(rest.to_string());
             break;
         }
         if parts.len() + 1 >= max_parts {
-            let cut = cut_point(rest, last_budget.saturating_sub(units(more) + 1));
-            parts.push(format!("{}\n{more}", rest[..cut].trim_end()));
+            let cut = cut_point(rest, last_budget.saturating_sub(CUT_MARK.len_utf16()));
+            parts.push(format!("{}{CUT_MARK}", rest[..cut].trim_end()));
+            whole = false;
             break;
         }
-        // O que cabe numa mensagem mas não na última, com a folga e o fecho: esta parte fica com o
-        // que cabe na última, e o resto vai com o fecho na seguinte.
+        // O que cabe numa mensagem mas não na última, com a folga: esta parte fica com o que cabe na
+        // última, e o resto vai na seguinte.
         let cut = match cut_point(rest, max) {
             whole if whole >= rest.len() => cut_point(rest, last_budget),
             cut => cut,
@@ -218,16 +233,7 @@ pub fn split(text: &str, tail: Option<&str>, more: &str, max: usize, room: usize
         parts.push(rest[..cut].trim_end().to_string());
         rest = rest[cut..].trim_start();
     }
-    if let Some(tail) = tail {
-        match parts.last_mut() {
-            Some(last) => {
-                last.push('\n');
-                last.push_str(tail);
-            }
-            None => parts.push(tail.to_string()),
-        }
-    }
-    parts
+    (parts, whole)
 }
 
 /// Onde dividir `text` para a parte caber em `budget` unidades (spec 140 T14): o fim em bytes da
@@ -362,10 +368,7 @@ mod tests {
         assert_eq!(units(&fit(&"a".repeat(2000), 1024)), 1024);
     }
 
-    const MORE: &str = "O resto está na janela.";
-    const TAIL: &str = "Guardei isto.";
-
-    /// Os pedaços de texto de cada parte, sem a linha da janela e o fecho, juntos de novo.
+    /// Os pedaços de texto de cada parte, juntos de novo.
     fn words_of(parts: &[String]) -> Vec<String> {
         parts.iter().flat_map(|p| p.split_whitespace().map(str::to_string).collect::<Vec<_>>()).collect()
     }
@@ -376,62 +379,56 @@ mod tests {
         chars[chars.len().saturating_sub(60)..].iter().collect()
     }
 
-    /// Spec 140 T14 (C-27): o que cabe numa mensagem volta inteiro; o longo vira partes que cabem, com
-    /// o fecho só no fim da última, e nenhuma palavra partida.
+    /// Spec 140 T14 (C-27): o que cabe numa mensagem volta inteiro; o longo vira partes que cabem, e
+    /// nenhuma palavra partida.
     #[test]
-    fn a_long_text_splits_into_parts_that_fit_and_the_tail_closes_the_last() {
-        assert_eq!(split("curto\nGuardei isto.", Some(TAIL), MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS), ["curto\nGuardei isto."]);
+    fn a_long_text_splits_into_parts_that_fit() {
+        assert_eq!(split("curto\nfim.", MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS), ["curto\nfim."]);
         let paragraph = |n: usize| format!("Parágrafo {n}: {}", "a arquitetura segue estável e o plano continua. ".repeat(20).trim_end());
         let body: Vec<String> = (1..=6).map(paragraph).collect();
-        let text = format!("{}\n{TAIL}", body.join("\n\n"));
+        let text = body.join("\n\n");
         assert!(units(&text) > MAX_MESSAGE_CHARS);
-        let parts = split(&text, Some(TAIL), MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
+        let parts = split(&text, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
         assert!((2..=MAX_PARTS).contains(&parts.len()), "{}", parts.len());
         assert!(parts.iter().all(|p| units(p) <= MAX_MESSAGE_CHARS));
         let last = parts.last().map(String::as_str).unwrap_or_default();
-        assert!(last.ends_with(&format!("\n{TAIL}")) && units(last) + LAST_PART_ROOM <= MAX_MESSAGE_CHARS, "{last}");
-        assert!(parts.iter().rev().skip(1).all(|p| !p.contains(TAIL)), "o fecho só na última");
-        // Coube tudo: nada falta, e a linha da janela não aparece.
+        assert!(units(last) + LAST_PART_ROOM <= MAX_MESSAGE_CHARS, "{last}");
+        // Coube tudo: nada falta, e a marca do corte não aparece.
         assert_eq!(words_of(&parts), text.split_whitespace().map(str::to_string).collect::<Vec<_>>());
-        assert!(!parts.iter().any(|p| p.contains(MORE)));
+        assert!(!parts.iter().any(|p| p.contains(CUT_MARK)));
         // A divisão cai na quebra de parágrafo: cada parte começa por um parágrafo.
         assert!(parts.iter().all(|p| p.starts_with("Parágrafo ")), "{parts:?}");
     }
 
     /// Revisão 1 (F-01): perto do limite, com teclado (folga), a mensagem única vira duas, e a última
-    /// cabe com a folga e o fecho; sem teclado, fica uma só.
+    /// cabe com a folga; sem teclado, fica uma só.
     #[test]
-    fn near_the_limit_the_keyboard_room_keeps_the_tail_whole() {
-        let text = format!("{}\n{TAIL}", "Uma frase curta e completa. ".repeat(142).trim_end());
+    fn near_the_limit_the_keyboard_room_splits_the_single_message() {
+        let text = "Uma frase curta e completa. ".repeat(142).trim_end().to_string();
         assert!(units(&text) > MAX_MESSAGE_CHARS - LAST_PART_ROOM && units(&text) <= MAX_MESSAGE_CHARS);
-        assert_eq!(split(&text, Some(TAIL), MORE, MAX_MESSAGE_CHARS, 0, MAX_PARTS), [text.clone()]);
-        let parts = split(&text, Some(TAIL), MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
+        assert_eq!(split(&text, MAX_MESSAGE_CHARS, 0, MAX_PARTS), [text.clone()]);
+        let parts = split(&text, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
         assert_eq!(parts.len(), 2);
-        assert!(parts[1].ends_with(&format!("completa.\n{TAIL}")) && units(&parts[1]) + LAST_PART_ROOM <= MAX_MESSAGE_CHARS);
+        assert!(parts[1].ends_with("completa.") && units(&parts[1]) + LAST_PART_ROOM <= MAX_MESSAGE_CHARS);
         assert!(parts[0].ends_with("completa.") && units(&parts[0]) + LAST_PART_ROOM <= MAX_MESSAGE_CHARS);
         assert_eq!(words_of(&parts), words_of(&[text]));
     }
 
-    /// Acima de três mensagens, a última termina com a linha que aponta a janela, e o fecho vem depois.
+    /// Acima de três mensagens, a última termina com a marca do corte, sem frase fixa (spec 141 T10).
     #[test]
-    fn above_the_ceiling_the_last_part_points_to_the_window_before_the_tail() {
+    fn above_the_ceiling_the_last_part_ends_with_the_cut_mark() {
         let sentence = "O módulo de filas depende do armazenamento e da rede local. ";
-        let text = format!("{}\n{TAIL}", sentence.repeat(400).trim_end());
+        let text = sentence.repeat(400).trim_end().to_string();
         assert!(units(&text) > MAX_PARTS * MAX_MESSAGE_CHARS);
-        let parts = split(&text, Some(TAIL), MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
+        let parts = split(&text, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
         assert_eq!(parts.len(), MAX_PARTS);
         assert!(parts.iter().all(|p| units(p) <= MAX_MESSAGE_CHARS));
         let last = &parts[MAX_PARTS - 1];
-        assert!(last.ends_with(&format!("{MORE}\n{TAIL}")), "{}", tail_of(last));
-        // Sem frase partida: cada parte termina num fim de frase (a última, antes da linha da janela).
+        assert!(last.ends_with(&format!("local.{CUT_MARK}")), "{}", tail_of(last));
+        // Sem frase partida: cada parte termina num fim de frase.
         for p in &parts[..MAX_PARTS - 1] {
             assert!(p.ends_with("local."), "{}", tail_of(p));
         }
-        let cut = last.strip_suffix(&format!("\n{MORE}\n{TAIL}")).unwrap_or_default();
-        assert!(cut.ends_with("local."), "{}", tail_of(cut));
-        // Sem fecho: a linha da janela termina a última.
-        let parts = split(sentence.repeat(400).trim_end(), None, MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
-        assert!(parts.len() == MAX_PARTS && parts[MAX_PARTS - 1].ends_with(MORE));
     }
 
     /// A divisão nunca parte uma palavra nem o segredo mascarado, mesmo sem quebra nenhuma, com
@@ -443,14 +440,64 @@ mod tests {
         let raw = format!("{} fim", format!("palavra {secret} \u{10400}x ").repeat(900));
         let text = clean_whole(&secrets, &raw);
         assert!(!text.contains(&secret) && text.contains("***"));
-        let parts = split(&text, None, MORE, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
+        let parts = split(&text, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS);
         assert!(parts.len() == MAX_PARTS && parts.iter().all(|p| units(p) <= MAX_MESSAGE_CHARS));
         let allowed = ["palavra", "***", "\u{10400}x"];
-        for word in words_of(&parts).iter().filter(|w| !MORE.contains(w.as_str()) && *w != "fim") {
-            assert!(allowed.contains(&word.as_str()), "palavra partida: {word:?}");
+        for word in words_of(&parts).iter().map(|w| w.trim_end_matches(CUT_MARK)).filter(|w| *w != "fim") {
+            assert!(allowed.contains(&word), "palavra partida: {word:?}");
         }
         // Uma palavra só, maior que a mensagem: corta no limite, fora da marca.
         let glued = format!("{}{}", "x".repeat(MAX_MESSAGE_CHARS - 2), "*".repeat(10));
         assert_eq!(cut_point(&glued, MAX_MESSAGE_CHARS), MAX_MESSAGE_CHARS - 2);
+    }
+
+    /// Um parágrafo de `n` caracteres, em palavras, terminado em ponto.
+    fn paragraph(n: usize, seed: usize) -> String {
+        let word = ["fila", "disco", "projeto", "teste", "rede", "build", "plano"];
+        let mut out = String::new();
+        let mut i = seed;
+        while out.chars().count() + 8 < n {
+            out.push_str(word[i % word.len()]);
+            out.push(' ');
+            i = i.wrapping_mul(31).wrapping_add(7);
+        }
+        format!("{}.", out.trim_end())
+    }
+
+    /// O texto saiu inteiro nas partes: nenhuma termina com a marca do corte, e as palavras são as
+    /// do texto, na ordem.
+    fn whole_in(parts: &[String], text: &str) -> bool {
+        let words = |t: &str| t.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        !parts.iter().any(|p| p.ends_with(CUT_MARK)) && words(&parts.join("\n")) == words(text)
+    }
+
+    /// Spec 141 T08 (revisão 2, F-02): o `fits_parts` diz o mesmo que a divisão real, em textos com
+    /// parágrafos de tamanhos variados, com e sem a folga do teclado.
+    #[test]
+    fn fits_parts_agrees_with_the_real_split() {
+        let mut seed: usize = 12345;
+        let mut next = |m: usize| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) % (1 << 31);
+            seed % m
+        };
+        let (mut fit, mut cut) = (0, 0);
+        for case in 0..300 {
+            let count = 1 + next(14);
+            let paragraphs: Vec<String> = (0..count).map(|i| paragraph(80 + next(2400), case * 17 + i)).collect();
+            let sep = if case % 3 == 0 { "\n" } else { "\n\n" };
+            let body = paragraphs.join(sep);
+            for room in [0, LAST_PART_ROOM] {
+                let parts = split(&body, MAX_MESSAGE_CHARS, room, MAX_PARTS);
+                let expected = whole_in(&parts, &body);
+                assert_eq!(fits_parts(&body, room, MAX_PARTS), expected, "caso {case}, {} unidades", units(&body));
+                if expected { fit += 1 } else { cut += 1 }
+            }
+        }
+        assert!(fit > 50 && cut > 50, "os dois lados aparecem: {fit} e {cut}");
+        // O caso do F-02: abaixo das três partes cheias, mas os parágrafos de 1500 levam a quatro.
+        let text = (0..7).map(|i| paragraph(1500, i)).collect::<Vec<_>>().join("\n\n");
+        assert!(units(&text) < MAX_PARTS * MAX_MESSAGE_CHARS - LAST_PART_ROOM, "{}", units(&text));
+        assert!(!fits_parts(&text, LAST_PART_ROOM, MAX_PARTS));
+        assert!(split(&text, MAX_MESSAGE_CHARS, LAST_PART_ROOM, MAX_PARTS).last().is_some_and(|p| p.ends_with(CUT_MARK)));
     }
 }

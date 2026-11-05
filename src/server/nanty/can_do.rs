@@ -104,6 +104,7 @@ fn conversation(state: &AppState, cfg: &Config, channel: Channel) -> Vec<&'stati
         super::deep::PROJECT_FILES,
         super::deep::GIT_HISTORY,
         tools::SYSTEM_STATUS,
+        tools::NANTS_DOCS,
         tools::NANTY_ACTIVITY,
         tools::SET_SILENCE,
         tools::REMEMBER,

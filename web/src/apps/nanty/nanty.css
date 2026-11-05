@@ -735,6 +735,117 @@
   color: var(--muted);
 }
 
+/* Evento de cartão (spec 141 T06): a decisão, a resolução e o vencimento, como selo no meio. */
+.nd-nanty-event {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+
+.nd-nanty-event-seal {
+  max-width: 92%;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* Selo do título (spec 141 T10, C-10): o resumo da manhã e a análise automática, numa linha curta. */
+.nd-nanty-seal {
+  align-self: flex-start;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-medium);
+}
+
+/* Os avisos guardados do resumo como cabeçalho de dados (spec 141 T10), fechado por padrão. */
+.nd-nanty-held {
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--control);
+  color: var(--ink2);
+  font-size: var(--fs-caption);
+}
+
+/* O resumo em flex centraliza o texto na altura de toque do celular (44 px), sem sobrar espaço
+   abaixo dele; o flex apaga o marcador nativo, e o chevron mostra que o bloco abre. */
+.nd-nanty-held-head {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  color: var(--muted);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+/* No celular, o resumo tem a altura de toque (44 px, `mobile.css`); a margem negativa devolve o espaço
+   a mais ao bloco, e o toque continua com os 44 px, sem o vão entre o resumo e o primeiro projeto. */
+.nd-root[data-mobile="true"] .nd-nanty-held-head {
+  margin-block: calc(var(--sp-2) * -1);
+}
+
+.nd-nanty-held-head .nd-details-chevron {
+  flex-shrink: 0;
+  margin-right: var(--sp-1);
+  transition: transform 0.12s ease;
+}
+
+.nd-nanty-held[open] > .nd-nanty-held-head .nd-details-chevron {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nd-nanty-held-head .nd-details-chevron {
+    transition: none;
+  }
+}
+
+.nd-nanty-held-group {
+  margin-top: var(--sp-1);
+}
+
+.nd-nanty-held-project {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  margin: 0;
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-nanty-held-fault {
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-xs);
+  background: var(--danger-soft);
+  color: var(--danger-ink);
+  font-weight: var(--fw-medium);
+}
+
+.nd-nanty-held-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-nanty-held-row {
+  display: flex;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.nd-nanty-held-time {
+  flex: none;
+  color: var(--muted);
+}
+
 .nd-nanty-voice {
   display: flex;
   flex-wrap: wrap;

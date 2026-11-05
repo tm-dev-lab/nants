@@ -58,12 +58,13 @@ pub struct ChangedFiles {
 }
 
 /// `true` para o que nunca entra: `.git` em qualquer nível, e na raiz as pastas do Nants
-/// (`.nants`, `.nants-home`, `.nants-outputs`...) e `.sdd`.
+/// (`.nants`, `.nants-home`, `.nants-outputs`...) e `.sdd`. A pasta pessoal antiga `.nants-home`
+/// fica aqui enquanto houver legado (spec 141 T01: a migração a tira das áreas de trabalho).
 fn skipped(rel: &str, name: &str, at_root: bool) -> bool {
     if name == ".git" {
         return true;
     }
-    at_root && (name == ".sdd" || name.starts_with(".nants") || home::is_home_path(rel))
+    at_root && (name == ".sdd" || name.starts_with(".nants") || home::is_legacy_home_path(rel))
 }
 
 impl TreeSnapshot {

@@ -186,7 +186,7 @@ pub fn recall(nanty: &Nanty, cfg: &Config, lang: Lang, arguments: &str, session:
         .map(|e| {
             let trusted = e.source.kind.trusted();
             if !trusted {
-                session.tainted.read(TaintKind::ImportedMemory, e.source.project_id.as_deref());
+                session.read_taint(TaintKind::ImportedMemory, e.source.project_id.as_deref());
             }
             let wrap = |s: &str| if trusted { json!(s) } else { json!(envelope(s)) };
             let mut item = json!({ "id": e.id, "topic": e.topic.as_str(), "title": wrap(&e.title), "text": wrap(&e.text), "source": e.source.kind });

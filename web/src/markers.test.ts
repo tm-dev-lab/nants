@@ -90,6 +90,12 @@ describe("análise de recuperação nas duas formas (spec 129 T04)", () => {
     );
     expect(localizeRecoveryCause("docker unavailable: no socket", "pt-BR")).toBe("docker indisponível: no socket");
     expect(localizeRecoveryCause("(citada pelo modelo) x", "en")).toBe("(cited by the model) x");
+    // Spec 141 T03: a causa fixa da falha do ambiente do Nants, gravada em pt-BR pelo servidor.
+    expect(localizeRecoveryCause("um defeito do ambiente do Nants travou os testes, não o código", "en")).toBe(
+      "a defect in the Nants environment broke the tests, not the code",
+    );
+    // Spec 141 T05: a causa fixa da mesma falha depois da escolha da pessoa.
+    expect(localizeRecoveryCause("a mesma falha voltou depois da sua escolha", "en")).toBe("the same failure came back after your choice");
   });
 
   it("a forma antiga da rodada autônoma (YOLO) continua legível", () => {

@@ -18,18 +18,19 @@ pub fn select<'a>(formatters: &'a [Formatter], changed: &[String]) -> Vec<&'a Fo
 }
 
 /// `true` quando `path` cabe em `allowed_scope`. Nunca cabem `.git`, `.nants/**` (ambiente aprovado),
-/// `.sdd/**` (estado do Nants) nem `.nants-home/**` (pasta pessoal do workspace, spec 129 T01),
-/// mesmo com escopo largo.
+/// `.sdd/**` (estado do Nants) nem `.nants-home/**` (pasta pessoal antiga do workspace, spec 129
+/// T01; fica enquanto houver legado, spec 141 T01), mesmo com escopo largo.
 pub fn in_scope(path: &str, scope: &[String]) -> bool {
     let first = path.split('/').next().unwrap_or_default();
-    if first == ".nants" || first == ".sdd" || first == crate::harness::home::HOME_DIR || path.split('/').any(|c| c == ".git") {
+    if first == ".nants" || first == ".sdd" || first == crate::harness::home::LEGACY_HOME_DIR || path.split('/').any(|c| c == ".git") {
         return false;
     }
     scope.iter().any(|glob| glob_match_path(glob, path))
 }
 
 /// Pastas do Nants que formatadores e linters nunca alteram (spec 127 T03; a pasta pessoal do
-/// workspace desde a spec 129 T01).
+/// workspace desde a spec 129 T01, que fica enquanto houver legado: desde a spec 141 T01 ela mora
+/// fora da área de trabalho e a migração tira a antiga).
 pub const NANTS_DIRS: [&str; 4] = [".nants/", ".nants-outputs/", ".sdd/", ".nants-home/"];
 
 /// Spec 127 T03: a saída de um formatador que falhou mostra que ele tentou escrever numa pasta do

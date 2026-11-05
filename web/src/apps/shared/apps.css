@@ -1104,7 +1104,13 @@ ol.nd-md-list {
   gap: var(--sp-2);
 }
 
+/*
+ * `position: relative` (141/T11): a entrada escondida (`.nd-sr-only`, absoluta) fica presa ao rótulo.
+ * Sem isso, ela se posicionava num ancestral distante, fora da rolagem da conversa, e o foco do clique
+ * rolava o `.nd-content` (overflow hidden) da janela: a tela ficava em branco no computador.
+ */
 .nd-option {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
