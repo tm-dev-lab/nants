@@ -198,6 +198,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   Nanty; they play only while on screen and stay still when your system asks for less motion. The
   screenshots and clips now come from a script that runs an isolated Nants with made-up data and
   no keys, so they are redone for every version, in both languages.
+- **A video of how Nants works inside.** The How to use page now opens with a video of about two
+  minutes, in Portuguese and in English, with narration, captions and music: it follows one task
+  from the spec to the merge and shows the roles, the own folder and container of each task, the
+  tests Nants runs itself, the review by another agent, what happens when something fails, the
+  costs and where your keys stay. Nothing of it downloads until you press play.
+- **Screenshots open on the same page.** Clicking a screenshot or a clip on the How to use page
+  now opens it larger in a window over the page, with its caption, instead of leaving the page.
 - **No more dock.** Its place is the Nants menu, and the windows use the whole screen down to the
   bottom edge. Saved layouts are adjusted once to the new space.
 - **The top bar stays on one line** at any desktop width; only the status text shortens, with the
